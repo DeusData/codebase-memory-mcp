@@ -434,7 +434,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
             "conversion operator and an indexer have nodes of their own. C# member lookup: an "
             "explicit interface implementation and an interface's members are no class's, an "
             "applicable method hides the base type's, and an identical parameter is the better "
-            "conversion.";
+            "conversion, and a named argument lands on the parameter it names. Kotlin's USES_TYPE "
+            "covers a type spelled in a type position, not a supertype's or annotation's head, "
+            "which have INHERITS and DECORATES.";
         break;
     case CBM_LANG_RUST:
         out->adapter = "rust";

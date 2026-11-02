@@ -2019,10 +2019,92 @@ static char *go_parse_view(const char *source, uint32_t length) {
     return view;
 }
 
+/* Kotlin: `object X { fun f() {} }` with no line break before its closing brace reads, with no
+ * error, as an infix call of the literal `object` on X with a lambda, so the object has no class. A
+ * `;` in the blank before that brace makes it read as what it is, at the same spans. A modifier in
+ * front already makes it read as a declaration. Returns NULL when no line needs this. Each search
+ * resumes past the brace it read, and an unclosed one ends the pass, so it stays linear. */
+static char *kotlin_parse_view(const char *source, uint32_t length) {
+    static const char WORD[] = "object";
+    enum { WORD_LENGTH = sizeof(WORD) - 1 };
+    char *view = NULL;
+    bool changed = false;
+    for (uint32_t at = 0; at + WORD_LENGTH < length;) {
+        const char *hit = memchr(source + at, 'o', length - at);
+        if (!hit)
+            break;
+        uint32_t start = (uint32_t)(hit - source);
+        at = start + 1;
+        if (start + WORD_LENGTH >= length || memcmp(hit, WORD, WORD_LENGTH) != 0)
+            continue;
+        uint32_t p = start;
+        while (p > 0 && (source[p - 1] == ' ' || source[p - 1] == '\t'))
+            p--;
+        if (p > 0 && source[p - 1] != '\n')
+            continue;
+        uint32_t i = start + WORD_LENGTH;
+        if (source[i] != ' ' && source[i] != '\t')
+            continue;
+        while (i < length && (source[i] == ' ' || source[i] == '\t'))
+            i++;
+        uint32_t name = i;
+        while (i < length && csharp_word_char(source[i]))
+            i++;
+        if (i == name)
+            continue;
+        while (i < length && (source[i] == ' ' || source[i] == '\t'))
+            i++;
+        if (i >= length || source[i] != '{')
+            continue;
+        if (!view) {
+            view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)length + 1);
+            if (!view)
+                return NULL;
+            memcpy(view, source, length);
+            view[length] = '\0';
+        }
+        uint32_t end = csharp_matching_brace(view, length, i);
+        /* An unclosed brace read to the end of the file, which has an error anyway. Trying again
+         * from every later `object` would be quadratic. */
+        if (end >= length)
+            break;
+        /* An empty body reads properly, and so does a line break before the brace. */
+        uint32_t body = end;
+        while (body > i + 1 && isspace((unsigned char)view[body - 1]))
+            body--;
+        if ((view[end - 1] == ' ' || view[end - 1] == '\t') && body > i + 1 &&
+            view[body - 1] != ';') {
+            view[end - 1] = ';';
+            changed = true;
+        }
+        at = end + 1;
+    }
+    if (view && !changed) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, view);
+        view = NULL;
+    }
+    return view;
+}
+
 TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, const char *source,
                                       uint32_t source_len, TSParseOptions opts,
                                       TSTree **unrepaired) {
     TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
+    if (tree && language == CBM_LANG_KOTLIN) {
+        char *kotlin_view = kotlin_parse_view(source, source_len);
+        if (!kotlin_view)
+            return tree;
+        ts_parser_reset(parser);
+        TSTree *declared = cbm_parse_source(parser, kotlin_view, source_len, opts);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, kotlin_view);
+        if (declared && parse_error_bytes(declared) <= parse_error_bytes(tree)) {
+            ts_tree_delete(tree);
+            return declared;
+        }
+        if (declared)
+            ts_tree_delete(declared);
+        return tree;
+    }
     bool rust = language == CBM_LANG_RUST, go = language == CBM_LANG_GO;
     if (!tree || (language != CBM_LANG_CSHARP && !rust && !go) ||
         !ts_node_has_error(ts_tree_root_node(tree)))

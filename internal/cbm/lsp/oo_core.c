@@ -1592,6 +1592,19 @@ static bool oo_scalar_mismatch(CBMLanguage language, const char *parameter,
     return true;
 }
 
+int oo_parameter_named(const oo_callable_t *callable, const char *name) {
+    for (int p = 0; name && callable->param_names && p < callable->param_count; p++)
+        if (callable->param_names[p] && !strcmp(callable->param_names[p], name))
+            return p;
+    return -1;
+}
+
+/* The parameter this argument lands on: the one it names (C# 12.6.2.2), or else its position's.
+ * -1 for a name the declaration does not have. */
+static int oo_parameter_of(const oo_callable_t *callable, const oo_value_t *args, int i) {
+    return args[i].argument_name ? oo_parameter_named(callable, args[i].argument_name) : i;
+}
+
 /* NO only when both sides are known to differ; an unknown keeps the candidate
  * so that it continues to compete. */
 /* C# 8.2.3: object, ValueType and Enum stand above every type of their kind, unspelled. */
@@ -1631,6 +1644,12 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
         if (args[i].function_literal && i == argc - 1 && callable->file &&
             callable->file->language == CBM_LANG_KOTLIN)
             index = callable->param_count - 1;
+        /* A name this declaration does not have rules it out. */
+        if (args[i].argument_name) {
+            index = oo_parameter_of(callable, args, i);
+            if (index < 0)
+                return true;
+        }
         if (index < 0 || !callable->params || !callable->params[index])
             continue;
         if (args[i].by_ref != callable->params[index]->by_ref &&
@@ -1722,7 +1741,8 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
              * library) has them implement its own interfaces. */
             bool converts =
                 csharp && ((parameter.type->flags & (OO_F_CONVERTS | OO_F_INTERFACE | OO_F_ENUM)) ||
-                           argument->dims);
+                           (argument->dims && (!strcmp(parameter.type->qn, "System.Array") ||
+                                               !strcmp(parameter.type->qn, "System.Object"))));
             if (!converts && oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE)
                 return true;
         } else if (parameter.external && argument->external) {
@@ -1766,9 +1786,11 @@ static bool oo_arguments_exact(oo_walk_t *w, const oo_callable_t *callable, cons
     oo_scope_t scope = oo_scope_of_callable(callable);
     for (int i = 0; i < argc; i++) {
         const oo_value_t *argument = &args[i];
-        if (!callable->params[i] || oo_ref_is_tparam(callable, callable->params[i]))
+        int index = oo_parameter_of(callable, args, i);
+        if (index < 0 || !callable->params[index] ||
+            oo_ref_is_tparam(callable, callable->params[index]))
             return false;
-        oo_value_t parameter = oo_value_from_ref(w, callable->params[i], &scope, subst);
+        oo_value_t parameter = oo_value_from_ref(w, callable->params[index], &scope, subst);
         bool same = argument->type
                         ? argument->type == parameter.type && argument->dims == parameter.dims
                         : oo_same_external(argument, &parameter);
@@ -1787,8 +1809,9 @@ static uint32_t oo_identical_arguments(oo_walk_t *w, const oo_callable_t *callab
         return 0;
     oo_scope_t scope = oo_scope_of_callable(callable);
     for (int i = 0; i < argc && i < callable->param_count && i < MASK_BITS; i++) {
-        const oo_typeref_t *ref = callable->params[i];
-        if (!ref || (callable->max_args < 0 && i == callable->param_count - 1))
+        int index = oo_parameter_of(callable, args, i);
+        const oo_typeref_t *ref = index < 0 ? NULL : callable->params[index];
+        if (!ref || (callable->max_args < 0 && index == callable->param_count - 1))
             continue;
         /* C# infers T as the argument's own type: its conversion is an identity. */
         if (oo_ref_is_tparam(callable, ref)) {
@@ -1828,10 +1851,12 @@ static bool oo_arguments_certainly_fit(oo_walk_t *w, const oo_callable_t *callab
     oo_scope_t scope = oo_scope_of_callable(callable);
     for (int i = 0; i < argc; i++) {
         const oo_value_t *argument = &args[i];
-        const oo_typeref_t *ref = callable->params[i];
+        int index = oo_parameter_of(callable, args, i);
+        const oo_typeref_t *ref = index < 0 ? NULL : callable->params[index];
         if (!ref)
             return false;
-        if (argument->function_literal || oo_ref_is_tparam(callable, ref))
+        if (argument->function_literal || argument->default_literal ||
+            oo_ref_is_tparam(callable, ref))
             continue;
         oo_value_t parameter = oo_value_from_ref(w, ref, &scope, subst);
         const char *to = parameter.type ? parameter.type->name : oo_leaf(parameter.external);
@@ -2283,8 +2308,11 @@ const oo_subst_t *oo_infer_call_subst(oo_walk_t *w, const oo_callable_t *callee,
         bool conflict = false;
         oo_value_t found = oo_value_unknown();
         for (int i = -1; i < argc && i < callee->param_count && !conflict; i++) {
+            int index = i < 0 ? i : oo_parameter_of(callee, args, i);
+            if (i >= 0 && index < 0)
+                continue;
             const oo_typeref_t *ref = i < 0            ? callee->receiver
-                                      : callee->params ? callee->params[i]
+                                      : callee->params ? callee->params[index]
                                                        : NULL;
             const oo_value_t *value = i < 0 ? receiver : &args[i];
             oo_value_t one = oo_tparam_from(w, ref, name, value);

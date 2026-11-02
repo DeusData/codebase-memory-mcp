@@ -281,6 +281,8 @@ static const MKC_TypeMention mkc_type_mentions[] = {
     {"mkc_c1_swift_initializer", "make", "Widget", "USES_TYPE", "Widget", "class Widget {", 1, 1},
     {"mkc_c8_kotlin_constructor_samefile", "make", "Widget", "USAGE", "Widget",
      "class Widget(val name: String) {", 1, 1},
+    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget", "USES_TYPE", "Widget",
+     "class Widget(val name: String) {", 1, 1},
 };
 typedef struct {
     const char *test, *caller, *needle;

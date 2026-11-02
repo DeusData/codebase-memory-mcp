@@ -2392,6 +2392,8 @@ static oo_value_t kw_call(kw_t *k, TSNode node) {
         kw_children(k, node);
         return oo_value_unknown();
     }
+    /* `Box<Argument>()`: an explicit type argument spells a type this call uses. */
+    kw_type_mentions(k, kt_child(suffix, "type_arguments"), 0);
     if (kt_is(callee, "simple_identifier"))
         return kw_bare_call(k, node, callee, suffix);
     if (kt_is(callee, "navigation_expression"))

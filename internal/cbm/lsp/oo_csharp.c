@@ -284,6 +284,7 @@ static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, b
     uint32_t count = ts_node_is_null(list) ? 0 : ts_node_child_count(list);
     const oo_typeref_t **refs =
         count ? cbm_arena_calloc(h->text.arena, count * sizeof(*refs)) : NULL;
+    const char **names = count ? cbm_arena_calloc(h->text.arena, count * sizeof(*names)) : NULL;
     int total = 0, optional = 0;
     bool variadic = false;
     if (extension)
@@ -310,6 +311,8 @@ static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, b
             }
             /* A named child after the name is its default value. */
             TSNode name = cs_field(child, "name");
+            if (names)
+                names[total] = cs_name(&h->text, name);
             uint32_t parts = ts_node_named_child_count(child);
             for (uint32_t p = 0; p < parts; p++) {
                 TSNode part = ts_node_named_child(child, p);
@@ -334,6 +337,7 @@ static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, b
         }
     }
     callable->params = refs;
+    callable->param_names = names;
     callable->param_count = total;
     callable->min_args = total - optional - (variadic ? 1 : 0);
     if (callable->min_args < 0)
@@ -377,6 +381,7 @@ static void ch_method(ch_t *h, oo_type_t *type, TSNode node) {
         oo_callable_t reduced = *callable;
         reduced.receiver = callable->params ? callable->params[0] : NULL;
         reduced.params = callable->params ? callable->params + 1 : NULL;
+        reduced.param_names = callable->param_names ? callable->param_names + 1 : NULL;
         reduced.param_count = callable->param_count - 1;
         reduced.min_args = callable->min_args > 0 ? callable->min_args - 1 : 0;
         reduced.max_args = callable->max_args < 0 ? -1 : callable->max_args - 1;
@@ -677,7 +682,8 @@ bool oo_csharp_harvest(cbm_oo_index_t *ix, const char *rel, const CBMFileResult 
 /* One call's lambda arguments. Their parameter types come from the declaration the call selects,
  * so they are walked after selection, once each. */
 typedef struct {
-    TSNode *nodes; /* By argument position; a null node is no lambda. */
+    TSNode *nodes;      /* By argument position; a null node is no lambda. */
+    const char **names; /* What each named one calls its parameter. */
     int count;
     bool walked;
     oo_value_t last; /* The last lambda's expression body. */
@@ -896,7 +902,8 @@ static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count,
         count ? cbm_arena_calloc(c->w->arena, (size_t)count * sizeof(*values)) : NULL;
     if (deferred && count) {
         deferred->nodes = cbm_arena_calloc(c->w->arena, (size_t)count * sizeof(TSNode));
-        deferred->count = deferred->nodes ? count : 0;
+        deferred->names = cbm_arena_calloc(c->w->arena, (size_t)count * sizeof(*deferred->names));
+        deferred->count = deferred->nodes && deferred->names ? count : 0;
     }
     int at = 0;
     for (uint32_t i = 0; i < children; i++) {
@@ -908,15 +915,17 @@ static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count,
                      (cs_is(ts_node_named_child(argument, 0), "name_colon") ||
                       !ts_node_is_null(cs_field(argument, "name")));
         bool lambda = cw_is_lambda(expression);
+        const char *argument_name =
+            named ? cs_name(&c->text, ts_node_child_by_field_name(argument, "name", 4)) : NULL;
         oo_value_t value = oo_value_unknown();
-        if (lambda && !named && deferred && deferred->nodes) {
+        if (lambda && deferred && deferred->count) {
             deferred->nodes[at] = expression;
+            deferred->names[at] = argument_name;
         } else {
             value = cw_expr(c, expression);
-            if (named)
-                value = oo_value_unknown();
         }
-        value.function_literal = lambda && !named;
+        value.function_literal = lambda;
+        value.argument_name = argument_name;
         if (value.function_literal)
             value.lambda_parameters = cw_lambda_arity(expression) + 1;
         value.by_ref = cs_has_ref_modifier(&c->text, argument);
@@ -1032,7 +1041,9 @@ static void cw_finish_lambdas(cw_t *c, cw_lambdas_t *lambdas, const oo_callable_
         int count = -1;
         if (callee && callee->params && callee->param_count) {
             int index = i < callee->param_count ? i : callee->param_count - 1;
-            if (callee->params[index]) {
+            if (lambdas->names[i])
+                index = oo_parameter_named(callee, lambdas->names[i]);
+            if (index >= 0 && callee->params[index]) {
                 oo_scope_t scope = oo_scope_of_callable(callee);
                 oo_value_t function = oo_value_from_ref(w, callee->params[index], &scope, subst);
                 count = cw_functional_parameters(c, &function, callee->file, types,
@@ -2059,7 +2070,9 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
     if (!strcmp(kind, "default_expression")) {
         TSNode type = cs_field(node, "type");
         cw_type_mentions(c, type, 0);
-        return cw_ref(c, cs_typeref(&c->text, type));
+        oo_value_t value = cw_ref(c, cs_typeref(&c->text, type));
+        value.default_literal = ts_node_is_null(type);
+        return value;
     }
     if (!strcmp(kind, "sizeof_expression")) {
         cw_type_mentions(c, cs_field(node, "type"), 0);

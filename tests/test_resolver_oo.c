@@ -2747,6 +2747,266 @@ TEST(resolver_oo_lambda_receivers_and_collection_initializers_parallel) {
     PASS();
 }
 
+/* Kotlin names a type wherever it spells one. A supertype has INHERITS and an annotation DECORATES;
+ * a type parameter and a namesake the file does not import are not the class. */
+static const OOFile KOTLIN_TYPE_FILES[] = {
+    {"lib/Types.kt",
+     "package lib\n"
+     "open class Base<T>\n"
+     "interface Runner\n"
+     "annotation class Marker\n"
+     "class Doc\n"
+     "class Param\n"
+     "class Ret\n"
+     "class Local\n"
+     "class Casted\n"
+     "class Checked\n"
+     "class Argument\n"
+     "class Receiver\n"
+     "class FnParam\n"
+     "class Held\n"
+     "class Thing\n"
+     "class Box<T>\n"
+     "class Made\n"
+     "class Factory {\n"
+     "    fun <T> make(): T? = null\n"
+     "}\n"
+     "class Outer {\n"
+     "    class Inner\n"
+     "}\n"},
+    {"other/Types.kt", "package other\nclass Doc\nclass Param\n"},
+    {"app/Main.kt",
+     "package app\n"
+     "import lib.*\n"
+     "class Sub : Base<Held>(), Runner\n"
+     "class Holder {\n"
+     "    val field: Doc = Doc()\n"
+     "}\n"
+     "fun signature(a: Param): Ret = Ret()\n"
+     "fun local() {\n"
+     "    val l: Local = Local()\n"
+     "}\n"
+     "fun castAndCheck(a: Any) {\n"
+     "    val c = a as Casted\n"
+     "    if (a is Checked) {}\n"
+     "}\n"
+     "fun generic() {\n"
+     "    val b = Box<Argument>()\n"
+     "}\n"
+     "fun memberGeneric() {\n"
+     "    Factory().make<Made>()\n"
+     "}\n"
+     "fun Receiver.extension() {}\n"
+     "val function: (FnParam) -> Unit = {}\n"
+     "fun nested(n: Outer.Inner) {}\n"
+     "@Marker\n"
+     "fun annotated() {}\n"
+     "fun <Thing> shadowed(x: Thing) {\n"
+     "    val b = Box<Thing>()\n"
+     "}\n"},
+};
+
+static int oo_kotlin_type_check(bool parallel) {
+    OOIndex index;
+    int failed = 0;
+    if (!oo_open(&index, KOTLIN_TYPE_FILES,
+                 (int)(sizeof(KOTLIN_TYPE_FILES) / sizeof(KOTLIN_TYPE_FILES[0])), parallel, "kt")) {
+        oo_close(&index);
+        return 1;
+    }
+    OO_EXPECT("USES_TYPE", "Main.signature", "lib.Types.Param", 1);
+    OO_EXPECT("USES_TYPE", "Main.signature", "lib.Types.Ret", 1);
+    OO_EXPECT("USES_TYPE", "Main.local", "lib.Types.Local", 1);
+    OO_EXPECT("USES_TYPE", "Main.castAndCheck", "lib.Types.Casted", 1);
+    OO_EXPECT("USES_TYPE", "Main.castAndCheck", "lib.Types.Checked", 1);
+    OO_EXPECT("USES_TYPE", "Main.generic", "lib.Types.Argument", 1);
+    OO_EXPECT("USES_TYPE", "Main.memberGeneric", "lib.Types.Made", 1);
+    OO_EXPECT("USES_TYPE", "Main.extension", "lib.Types.Receiver", 1);
+    OO_EXPECT("USES_TYPE", "app.Main", "lib.Types.FnParam", 1);
+    OO_EXPECT("USES_TYPE", "app.Main", "lib.Types.Doc", 1);
+    OO_EXPECT("USES_TYPE", "Main.nested", "Outer.Inner", 1);
+    /* A type argument of a supertype is a use. The supertype itself has INHERITS. */
+    OO_EXPECT("USES_TYPE", "app.Main", "lib.Types.Held", 1);
+    OO_EXPECT("USES_TYPE", "app.Main", "lib.Types.Base", 0);
+    OO_EXPECT("USES_TYPE", "app.Main", "lib.Types.Runner", 0);
+    OO_EXPECT("USAGE", "app.Main", "lib.Types.Base", 1);
+    /* An annotation has DECORATES, which targets its Decorator node, and USAGE of the class. */
+    OO_EXPECT("USES_TYPE", "Main.annotated", "lib.Types.Marker", 0);
+    OO_EXPECT("USAGE", "Main.annotated", "lib.Types.Marker", 1);
+    OO_EXPECT("DECORATES", "Main.annotated", "<decorator:Marker>", 1);
+    /* A namesake in a package this file does not import. */
+    OO_EXPECT("USES_TYPE", "Main.signature", "other.Types.Param", 0);
+    OO_EXPECT("USES_TYPE", "app.Main", "other.Types.Doc", 0);
+    /* A type parameter hides the class of its name. */
+    OO_EXPECT("USES_TYPE", "Main.shadowed", "lib.Types.Thing", 0);
+    oo_close(&index);
+    return failed;
+}
+
+TEST(resolver_oo_kotlin_uses_type) {
+    ASSERT_EQ(oo_kotlin_type_check(false), 0);
+    PASS();
+}
+
+TEST(resolver_oo_kotlin_uses_type_parallel) {
+    ASSERT_EQ(oo_kotlin_type_check(true), 0);
+    PASS();
+}
+
+/* A named argument names its parameter, whatever its position. */
+static const OOFile CSHARP_NAMED_FILES[] = {
+    {"Named/Types.cs",
+     "namespace Named {\n"
+     "    public class Other {}\n"
+     "    public class Doc { public void Go() {} }\n"
+     "    public class BaseSink { public void Take(object a, Other s) {} }\n"
+     "    public class DerivedSink : BaseSink { public void Take(string a, Other s) {} }\n"
+     "    public class Sequence<T> {}\n"
+     "    public class Span2<T> { public static implicit operator Span2<T>(T[] items) { return null; } }\n"
+     "}\n"},
+    {"Named/Reader.cs",
+     "namespace Named {\n"
+     "    public partial class Reader {\n"
+     "        public Reader(Span2<byte> data, bool isFinal, Other state) {}\n"
+     "        public void Put(int count) {}\n"
+     "        public void Move(int x, string y) {}\n"
+     "        public void Each(System.Action<Doc> first, int count = 0) {}\n"
+     "    }\n"
+     "}\n"},
+    {"Named/Reader.Seq.cs",
+     "namespace Named {\n"
+     "    public partial class Reader {\n"
+     "        public Reader(Sequence<byte> data, bool isFinal, Other state) {}\n"
+     "        public void Put(string label) {}\n"
+     "        public void Move(string x, int y) {}\n"
+     "    }\n"
+     "}\n"},
+    {"Named/Use.cs",
+     "using System;\n"
+     "namespace Named {\n"
+     "    public class Use {\n"
+     "        void FromArray(byte[] bytes, Other state) { new Reader(bytes, isFinal: true, state); }\n"
+     "        void FromSequence(Sequence<byte> s, Other state) { new Reader(s, isFinal: true, state); }\n"
+     "        void WithDefault(byte[] bytes) { new Reader(bytes, isFinal: true, state: default); }\n"
+     "        void DefaultHides(DerivedSink d) { d.Take(\"x\", s: default); }\n"
+     "        void UnknownData(Mystery m, Other state) { new Reader(m.X, isFinal: true, state); }\n"
+     "        void ByCount(Reader r, Mystery m) { r.Put(count: m.X); }\n"
+     "        void ByLabel(Reader r, Mystery m) { r.Put(label: m.X); }\n"
+     "        void ByNothing(Reader r) { r.Put(nope: 1); }\n"
+     "        void Swapped(Reader r) { r.Move(y: 1, x: \"a\"); }\n"
+     "        void Positional(Reader r) { r.Move(1, \"a\"); }\n"
+     "        void NamedLambda(Reader r) { r.Each(count: 1, first: d => d.Go()); }\n"
+     "    }\n"
+     "}\n"},
+};
+
+static int oo_csharp_named_check(bool parallel) {
+    OOIndex index;
+    int failed = 0;
+    if (!oo_open(&index, CSHARP_NAMED_FILES,
+                 (int)(sizeof(CSHARP_NAMED_FILES) / sizeof(CSHARP_NAMED_FILES[0])), parallel,
+                 "cs")) {
+        oo_close(&index);
+        return 1;
+    }
+    /* `isFinal:` is known now, so the data argument decides. */
+    OO_EXPECT("CALLS", "Use.FromArray", "Named.Reader.Reader.Reader", 1);
+    OO_EXPECT("CALLS", "Use.FromArray", "Reader.Seq.Reader.Reader", 0);
+    OO_EXPECT("CALLS", "Use.FromSequence", "Reader.Seq.Reader.Reader", 1);
+    OO_EXPECT("CALLS", "Use.FromSequence", "Named.Reader.Reader.Reader", 0);
+    /* `default` reaches any parameter. */
+    OO_EXPECT("CALLS", "Use.WithDefault", "Named.Reader.Reader.Reader", 1);
+    /* So the derived method is certainly applicable, and hides the base's (C# 12.8.10.2). */
+    OO_EXPECT("CALLS", "Use.DefaultHides", "DerivedSink.Take", 1);
+    OO_EXPECT("CALLS", "Use.DefaultHides", "BaseSink.Take", 0);
+    /* A value nothing reads leaves the overloads standing. */
+    OO_EXPECT("CALLS", "Use.UnknownData", "Named.Reader.Reader.Reader", 0);
+    OO_EXPECT("CALLS", "Use.UnknownData", "Reader.Seq.Reader.Reader", 0);
+    /* The name alone selects, however little is known of the value. */
+    OO_EXPECT("CALLS", "Use.ByCount", "Named.Reader.Reader.Put", 1);
+    OO_EXPECT("CALLS", "Use.ByCount", "Reader.Seq.Reader.Put", 0);
+    OO_EXPECT("CALLS", "Use.ByLabel", "Reader.Seq.Reader.Put", 1);
+    OO_EXPECT("CALLS", "Use.ByLabel", "Named.Reader.Reader.Put", 0);
+    /* A name no declaration has. */
+    OO_EXPECT("CALLS", "Use.ByNothing", "Named.Reader.Reader.Put", 0);
+    OO_EXPECT("CALLS", "Use.ByNothing", "Reader.Seq.Reader.Put", 0);
+    /* Position would read these the other way round. */
+    OO_EXPECT("CALLS", "Use.Swapped", "Reader.Seq.Reader.Move", 1);
+    OO_EXPECT("CALLS", "Use.Swapped", "Named.Reader.Reader.Move", 0);
+    OO_EXPECT("CALLS", "Use.Positional", "Named.Reader.Reader.Move", 1);
+    /* A named lambda takes the shape of the parameter it names. */
+    OO_EXPECT("CALLS", "Use.NamedLambda", "Doc.Go", 1);
+    oo_close(&index);
+    return failed;
+}
+
+TEST(resolver_oo_csharp_named_arguments) {
+    ASSERT_EQ(oo_csharp_named_check(false), 0);
+    PASS();
+}
+
+TEST(resolver_oo_csharp_named_arguments_parallel) {
+    ASSERT_EQ(oo_csharp_named_check(true), 0);
+    PASS();
+}
+
+/* A one-line object reads as an infix call to the grammar, with no error, and loses its class. */
+static const OOFile KOTLIN_ONE_LINE_FILES[] = {
+    {"lib/Worker.kt",
+     "package lib\n"
+     "object Worker { fun go() {} }\n"
+     "object Two { fun a() {}; fun b() {} }\n"
+     "object Empty { }\n"
+     "object Lines {\n"
+     "    fun multi() {}\n"
+     "}\n"
+     "const val TEXT = \"\"\"\n"
+     "object InText { fun notCode() {} }\n"
+     "\"\"\"\n"
+     "class After { fun run() {} }\n"},
+    {"app/Main.kt",
+     "package app\n"
+     "import lib.*\n"
+     "fun oneLine() { Worker.go() }\n"
+     "fun second() { Two.b() }\n"
+     "fun multi() { Lines.multi() }\n"
+     "fun after(a: After) { a.run() }\n"
+     "fun literal() {\n"
+     "    val x = object { fun f() {} }\n"
+     "    x.f()\n"
+     "}\n"},
+};
+
+static int oo_kotlin_one_line_check(bool parallel) {
+    OOIndex index;
+    int failed = 0;
+    if (!oo_open(&index, KOTLIN_ONE_LINE_FILES,
+                 (int)(sizeof(KOTLIN_ONE_LINE_FILES) / sizeof(KOTLIN_ONE_LINE_FILES[0])), parallel,
+                 "kt")) {
+        oo_close(&index);
+        return 1;
+    }
+    OO_EXPECT("CALLS", "Main.oneLine", "Worker.Worker.go", 1);
+    OO_EXPECT("CALLS", "Main.second", "Worker.Two.b", 1);
+    OO_EXPECT("CALLS", "Main.multi", "Worker.Lines.multi", 1);
+    OO_EXPECT("CALLS", "Main.after", "Worker.After.run", 1);
+    OO_EXPECT("DEFINES_METHOD", "Worker.Worker", "Worker.Worker.go", 1);
+    /* The same words in a string declare nothing. */
+    OO_EXPECT("DEFINES_METHOD", "Worker.InText", "InText.notCode", 0);
+    oo_close(&index);
+    return failed;
+}
+
+TEST(resolver_oo_kotlin_one_line_object) {
+    ASSERT_EQ(oo_kotlin_one_line_check(false), 0);
+    PASS();
+}
+
+TEST(resolver_oo_kotlin_one_line_object_parallel) {
+    ASSERT_EQ(oo_kotlin_one_line_check(true), 0);
+    PASS();
+}
+
 static const OOFile MIXED_FILES[] = {
     {"native/Cargo.toml", "[package]\nname = \"native\"\nversion = \"0.1.0\"\n"},
     {"native/src/lib.rs", "pub fn f() -> i32 { 1 }\n"},
@@ -2878,4 +3138,10 @@ SUITE(resolver_oo) {
     RUN_TEST(resolver_oo_java_factories_and_class_literals_parallel);
     RUN_TEST(resolver_oo_lambda_receivers_and_collection_initializers);
     RUN_TEST(resolver_oo_lambda_receivers_and_collection_initializers_parallel);
+    RUN_TEST(resolver_oo_kotlin_uses_type);
+    RUN_TEST(resolver_oo_kotlin_uses_type_parallel);
+    RUN_TEST(resolver_oo_csharp_named_arguments);
+    RUN_TEST(resolver_oo_csharp_named_arguments_parallel);
+    RUN_TEST(resolver_oo_kotlin_one_line_object);
+    RUN_TEST(resolver_oo_kotlin_one_line_object_parallel);
 }

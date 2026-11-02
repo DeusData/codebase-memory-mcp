@@ -449,10 +449,18 @@ static const CP_Golden cp_goldens[] = {
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
     {"cp_operator_kotlin_plus", "Vec.minus", "CALLS", 154, 183, "Vec", "Class",
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
-    /* Kotlin records no USES_TYPE occurrence for a result type; USAGE names the class. */
+    /* A parameter's type and a result type are USES_TYPE occurrences; USAGE names the class. */
     {"cp_operator_kotlin_plus", "Vec.plus", "USAGE", 76, 79, "Vec", "Class",
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
     {"cp_operator_kotlin_plus", "Vec.minus", "USAGE", 148, 151, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    {"cp_operator_kotlin_plus", "Vec.plus", "USES_TYPE", 70, 73, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    {"cp_operator_kotlin_plus", "Vec.plus", "USES_TYPE", 76, 79, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    {"cp_operator_kotlin_plus", "Vec.minus", "USES_TYPE", 142, 145, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    {"cp_operator_kotlin_plus", "Vec.minus", "USES_TYPE", 148, 151, "Vec", "Class",
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
     {"cp_interface_dispatch_rust_dyn", "run", "CALLS", 406, 418, "describe", "Function",
      "pub fn describe(s: &dyn Shape) -> f64 { s.area() + s.perimeter() }", 13, false, true},
@@ -523,7 +531,7 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
                               "export function exact_caller() { return exact_target(); }\n"}};
     const RQ_Source sources[] = {{.path = files[0].name, .text = files[0].content},
                                  {.path = files[1].name, .text = files[1].content}};
-    RQ_Expected expected[8] = {
+    RQ_Expected expected[10] = {
         {.case_id = "required-exact-control",
          .site = {.file = "quality_control.js",
                   .caller = "exact_caller",
@@ -548,7 +556,7 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
                     .label = "Function",
                     .declaration_line = 2,
                     .declaration_text = "export function wrong_target() { return 9; }"}}};
-    char ids[8][128], negative_ids[8][128];
+    char ids[10][128], negative_ids[8][128];
     size_t n = 1, nf = 1, required = 1;
     for (size_t i = 0; i < sizeof(cp_goldens) / sizeof(cp_goldens[0]); i++) {
         const CP_Golden *golden = cp_goldens + i;

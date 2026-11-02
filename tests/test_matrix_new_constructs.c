@@ -415,23 +415,29 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
     if (n == 1)
         return false;
     /* The harness audits a known target under every role: `anon(): User` names the class
-     * it also constructs, and that signature is a USAGE of it. */
+     * it also constructs, and that signature is a USAGE of it and a USES_TYPE. */
     if (!strcmp(test, "mn_record_kotlin_data_class")) {
-        if (n == sizeof(expected) / sizeof(expected[0]))
-            return false;
-        snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
-        expected[n] = (RQ_Expected){
-            .case_id = ids[n],
-            .site = {.file = filename, .caller = "anon", .needle = "User", .occurrence_index = 1},
-            .relation = "USAGE",
-            .target = {.file = filename,
-                       .suffix = "User",
-                       .label = "Class",
-                       .declaration_line = 1,
-                       .declaration_text = "data class User(val name: String, val age: Int) {"},
-            .mode = RQ_REQUIRED};
-        required++;
-        n++;
+        static const char *const RELATIONS[] = {"USAGE", "USES_TYPE"};
+        for (size_t r = 0; r < sizeof(RELATIONS) / sizeof(RELATIONS[0]); r++) {
+            if (n == sizeof(expected) / sizeof(expected[0]))
+                return false;
+            snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
+            expected[n] = (RQ_Expected){
+                .case_id = ids[n],
+                .site = {.file = filename,
+                         .caller = "anon",
+                         .needle = "User",
+                         .occurrence_index = 1},
+                .relation = RELATIONS[r],
+                .target = {.file = filename,
+                           .suffix = "User",
+                           .label = "Class",
+                           .declaration_line = 1,
+                           .declaration_text = "data class User(val name: String, val age: Int) {"},
+                .mode = RQ_REQUIRED};
+            required++;
+            n++;
+        }
     }
     MN_LangProj lp;
     cbm_store_t *store = mn_index_files(&lp, files, 2);

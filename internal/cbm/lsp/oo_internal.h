@@ -113,7 +113,7 @@ typedef struct oo_callable {
     int min_args, max_args; /* max_args -1: variadic. */
     int vararg_position;    /* Kotlin: 1 + the vararg's index; it need not be last. */
     const oo_typeref_t **params;
-    const char **param_names; /* Kotlin: for a named argument. */
+    const char **param_names; /* Kotlin and C#: for a named argument. */
     int param_count;
     const oo_typeref_t *ret;
     const oo_exprsum_t *ret_expr; /* Kotlin expression body without an annotation. */
@@ -186,11 +186,13 @@ typedef struct oo_value {
     const struct oo_value *args;
     int arg_count;
     int dims;
-    bool classref;         /* Denotes the type itself rather than an instance. */
-    bool null_literal;     /* C#: `null`, which reaches any reference parameter. */
-    bool function_literal; /* An argument spelled as a lambda: its own type is not read. */
-    bool small_literal;    /* An integer literal: it fits a narrower or wider parameter. */
-    bool by_ref;           /* C#: passed with `ref` or `out`. */
+    bool classref;             /* Denotes the type itself rather than an instance. */
+    bool null_literal;         /* C#: `null`, which reaches any reference parameter. */
+    bool default_literal;      /* C#: `default`, which reaches any parameter. */
+    const char *argument_name; /* C#: `name: value`, which lands on the parameter it names. */
+    bool function_literal;     /* An argument spelled as a lambda: its own type is not read. */
+    bool small_literal;        /* An integer literal: it fits a narrower or wider parameter. */
+    bool by_ref;               /* C#: passed with `ref` or `out`. */
     int lambda_parameters; /* A function literal's parameter count plus one; 0 when not known. */
     const oo_hidden_t *hidden;
     /* Kotlin function value. */
@@ -416,6 +418,8 @@ bool oo_callable_visible(const oo_walk_t *w, const oo_callable_t *callable);
 oo_value_t oo_callable_return(oo_walk_t *w, const oo_callable_t *callable, const oo_subst_t *subst);
 /* `subst` plus the callee's own type parameters that one argument (or the receiver of an
  * extension) settles. Two arguments that disagree settle nothing: that is a least upper bound. */
+/* The parameter called `name`, or -1. */
+int oo_parameter_named(const oo_callable_t *callable, const char *name);
 /* `ref` names one of the callee's type parameters that nothing settled: its value is only a bound,
  * which says what the type at least has, not what it lacks. */
 bool oo_ref_unsettled(const oo_callable_t *callee, const oo_typeref_t *ref,

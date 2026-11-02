@@ -515,6 +515,43 @@ static void process_ts_type_name(CBMExtractCtx *ctx, TSNode node, const char *fu
     add_type_ref(ctx, cbm_node_text(ctx->arena, node, ctx->source), func_qn, node);
 }
 
+/* Kotlin spells every type as a user_type, and the last segment of `a.b.C` names it. A
+ * declaration's own name is a bare type_identifier, so it is never one. A supertype has INHERITS
+ * and an annotation DECORATES: their heads are mentioned, not used as a type, while a type argument
+ * inside them is. */
+static void process_kotlin_type_name(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    if (strcmp(ts_node_type(node), "user_type") != 0) {
+        return;
+    }
+    if (state->current_cursor && state->occurrence_cursor) {
+        ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
+        if (ts_tree_cursor_goto_parent(state->occurrence_cursor)) {
+            const char *parent =
+                ts_node_type(ts_tree_cursor_current_node(state->occurrence_cursor));
+            if (strcmp(parent, "delegation_specifier") == 0 ||
+                strcmp(parent, "constructor_invocation") == 0 ||
+                strcmp(parent, "explicit_delegation") == 0 || strcmp(parent, "annotation") == 0) {
+                return;
+            }
+        }
+    }
+    TSNode last = {0};
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(child), "type_identifier") == 0) {
+                last = child;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (!ts_node_is_null(last)) {
+        add_type_ref(ctx, cbm_node_text(ctx->arena, last, ctx->source), state->enclosing_func_qn,
+                     last);
+    }
+}
+
 void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->function_node_types || !spec->function_node_types[0]) {
         return;
@@ -523,6 +560,8 @@ void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, 
     int before = ctx->result->type_refs.count;
     if (ts_family(ctx->language)) {
         process_ts_type_name(ctx, node, state->enclosing_func_qn);
+    } else if (ctx->language == CBM_LANG_KOTLIN) {
+        process_kotlin_type_name(ctx, node, state);
     } else if (cbm_kind_in_set(node, spec->function_node_types)) {
         extract_signature_type_refs(ctx, node, state);
     } else {
