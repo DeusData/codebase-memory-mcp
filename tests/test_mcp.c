@@ -7843,6 +7843,200 @@ TEST(tool_index_status_includes_git_metadata) {
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
 
+/* #2816: stored recursion must remain visible even when the CALLS graph has
+ * no self-edges. Removing metadata emission must fail these assertions. */
+TEST(tool_trace_path_recursion_metadata_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion"), CBM_STORE_OK);
+    const struct {
+        const char *name;
+        const char *props;
+        const char *self;
+        const char *recursive;
+    } cases[] = {
+        {"countdown", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"visit", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"mutual", "{\"self_recursive\":false,\"recursive\":true}", "false", "true"},
+        {"leaf", "{\"self_recursive\":false,\"recursive\":false}", "false", "false"},
+        {"legacy", "{}", "null", "null"},
+        {"partial", "{\"self_recursive\":true}", "true", "null"},
+        {"invalid", "{\"self_recursive\":\"true\",\"recursive\":1}", "null", "null"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "%s.%s", proj, cases[i].name);
+        cbm_node_t n = {.project = proj,
+                        .label = i == 1 ? "Method" : "Function",
+                        .name = cases[i].name,
+                        .qualified_name = qn,
+                        .file_path = "recursion.ts",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = cases[i].props};
+        ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+        for (int json = 0; json < 2; json++) {
+            for (int inbound = 0; inbound < 2; inbound++) {
+                char args[512];
+                snprintf(args, sizeof(args),
+                         "{\"project\":\"%s\",\"function_name\":\"%s\","
+                         "\"direction\":\"%s\",\"format\":\"%s\"}",
+                         proj, cases[i].name, inbound ? "inbound" : "outbound",
+                         json ? "json" : "tree");
+                char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                char *inner = extract_text_content(response);
+                ASSERT_NOT_NULL(inner);
+                char expected[128];
+                snprintf(expected, sizeof(expected),
+                         json ? "\"self_recursive\":%s" : "self_recursive: %s\n", cases[i].self);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                         cases[i].recursive);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                                   : "self_call_policy: omitted\n"));
+                snprintf(expected, sizeof(expected), json ? "\"%s_total\":0" : "%s_total: 0\n",
+                         inbound ? "callers" : "callees");
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                free(inner);
+                free(response);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_union_and_edges_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-union";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-union"), CBM_STORE_OK);
+    cbm_node_t def = {.project = proj,
+                      .label = "Function",
+                      .name = "countdown",
+                      .qualified_name = "recursion-union.impl.countdown",
+                      .file_path = "impl.ts",
+                      .start_line = 1,
+                      .end_line = 10,
+                      .properties_json = "{\"self_recursive\":false,\"recursive\":false}"};
+    int64_t def_id = cbm_store_upsert_node(st, &def);
+    ASSERT_GT(def_id, 0);
+    cbm_node_t stub = def;
+    stub.qualified_name = "recursion-union.stub.countdown";
+    stub.file_path = "stub.d.ts";
+    stub.end_line = 1;
+    stub.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+    cbm_node_t leaf = def;
+    leaf.name = "leaf";
+    leaf.qualified_name = "recursion-union.impl.leaf";
+    leaf.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    int64_t leaf_id = cbm_store_upsert_node(st, &leaf);
+    ASSERT_GT(leaf_id, 0);
+    cbm_edge_t edge = {.project = proj, .source_id = def_id, .target_id = leaf_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    const char *expected_flags[] = {"true", "null", "false", "true"};
+    for (int state = 0; state < 4; state++) {
+        def.properties_json = state == 3 ? "{\"self_recursive\":true,\"recursive\":true}"
+                                         : "{\"self_recursive\":false,\"recursive\":false}";
+        stub.properties_json = state == 0   ? "{\"self_recursive\":true,\"recursive\":true}"
+                               : state == 2 ? "{\"self_recursive\":false,\"recursive\":false}"
+                                            : "{}";
+        ASSERT_GT(cbm_store_upsert_node(st, &def), 0);
+        ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+        for (int json = 0; json < 2; json++) {
+            char args[512];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                     "\"direction\":\"outbound\",\"format\":\"%s\"}",
+                     proj, json ? "json" : "tree");
+            char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"callees_total\":1" : "callees_total: 1\n"));
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"leaf\"" : ".leaf"));
+            char expected[128];
+            snprintf(expected, sizeof(expected),
+                     json ? "\"self_recursive\":%s" : "self_recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            free(inner);
+            free(response);
+        }
+    }
+    /* Recursion is root metadata, but the omission policy concerns CALLS only. */
+    char *response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"recursion-union\",\"function_name\":\"countdown\","
+                            "\"edge_types\":[\"IMPORTS\"],\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NULL(strstr(inner, "self_call_policy"));
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_survives_budget_floor_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-budget";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-budget"), CBM_STORE_OK);
+    char huge[4096];
+    memset(huge, 'x', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = '\0';
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "countdown",
+                    .qualified_name = "recursion-budget.countdown",
+                    .file_path = "recursion.ts",
+                    .start_line = 1,
+                    .end_line = 10,
+                    .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    int64_t root_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(root_id, 0);
+    n.name = huge;
+    n.qualified_name = huge;
+    int64_t callee_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {
+        .project = proj, .source_id = root_id, .target_id = callee_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    for (int json = 0; json < 2; json++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                 "\"direction\":\"outbound\",\"format\":\"%s\",\"max_output_tokens\":128}",
+                 proj, json ? "json" : "tree");
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "output_budget"));
+        ASSERT_NULL(strstr(inner, huge));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_recursive\":true" : "self_recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"recursive\":true" : "recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                           : "self_call_policy: omitted\n"));
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_trace_call_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -8540,7 +8734,8 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                       .qualified_name = "trace-budget-cursor.hub",
                       .file_path = "src/hub.c",
                       .start_line = 1,
-                      .end_line = 2};
+                      .end_line = 2,
+                      .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
     cbm_node_t short_node = {.project = project,
                              .label = "Function",
                              .name = "short_row",
@@ -8580,6 +8775,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                             "\"format\":\"json\"}");
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NOT_NULL(strstr(inner, "short_row"));
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
@@ -8600,6 +8798,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, long_qn));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -8619,6 +8820,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, "short_row"));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -24436,6 +24640,161 @@ TEST(autoindex_limit_guards_git_root_issue713) {
     PASS();
 }
 
+/* A servable project row is a committed index. user_version stays 0, so a
+ * later run cannot take the incremental no-op and skip recording workers. */
+static bool mcp_publish_committed_index(const char *root) {
+    char *project = root ? cbm_project_name_from_path(root) : NULL;
+    cbm_store_t *store = project ? cbm_store_open(project) : NULL;
+    bool published = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    free(project);
+    return published;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    const char *root;
+    bool published;
+} mcp_committed_seed_t;
+
+/* maybe_auto_index returns before the thread when <project>.db already
+ * exists. Publish the committed index from the count hook, which runs after
+ * that check and before autoindex_thread chooses a width. */
+static void mcp_autoindex_publish_committed(void *context) {
+    mcp_committed_seed_t *seed = context;
+    if (seed) {
+        seed->published = mcp_publish_committed_index(seed->root);
+    }
+}
+#endif
+
+/* First index, including one started automatically, uses every core. Headroom
+ * applies only once a servable project database already exists.
+ * automatic: in-process auto-index (initialize → autoindex_thread).
+ * Otherwise index_repository with _cbm_background, the daemon/watcher path. */
+static int mcp_assert_inprocess_worker_policy(bool committed, bool automatic) {
+    char cache[256];
+    char repo[512];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-worker-policy-%d%d-XXXXXX", cbm_tmpdir(),
+                   committed ? 1 : 0, automatic ? 1 : 0);
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    (void)snprintf(repo, sizeof(repo), "%s/repo", cache);
+    char source[640];
+    (void)snprintf(source, sizeof(source), "%s/main.py", repo);
+    bool repo_ready = cache_ready && th_mkdir_p(repo) == 0 &&
+                      th_write_file(source, "def background_index():\n    return True\n") == 0;
+
+    mcp_test_env_backup_t environment[] = {
+        {.name = "CBM_CACHE_DIR"},
+        {.name = "CBM_WORKERS"},
+        {.name = "CBM_INDEX_SINGLE_THREAD"},
+    };
+    bool environment_saved = true;
+    for (size_t i = 0; i < sizeof(environment) / sizeof(environment[0]); i++) {
+        const char *value = getenv(environment[i].name);
+        environment[i].present = value != NULL;
+        environment[i].value = value ? strdup(value) : NULL;
+        environment_saved = environment_saved && (!value || environment[i].value);
+    }
+    bool environment_ready = environment_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                             cbm_unsetenv("CBM_WORKERS") == 0 &&
+                             cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") == 0;
+
+    bool seeded = !committed;
+    char old_cwd[CBM_SZ_4K] = {0};
+    bool cwd_ready = true;
+    cbm_config_t *config = NULL;
+    bool config_ready = true;
+    cbm_mcp_server_t *server = NULL;
+    char *response = NULL;
+    if (automatic) {
+        cwd_ready = repo_ready && environment_ready && cbm_getcwd(old_cwd, sizeof(old_cwd)) &&
+                    cbm_chdir(repo) == 0;
+        config = cwd_ready ? cbm_config_open(cache) : NULL;
+        config_ready = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                       cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+        cbm_pipeline_worker_count_test_reset();
+        server = config_ready ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            cbm_mcp_server_set_config(server, config);
+#ifdef CBM_ENABLE_TEST_SEAMS
+            mcp_committed_seed_t seed = {.root = repo, .published = !committed};
+            if (committed) {
+                cbm_mcp_server_set_auto_index_count_test_hook(
+                    server, mcp_autoindex_publish_committed, &seed);
+            }
+#endif
+            response = cbm_mcp_server_handle(
+                server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+#ifdef CBM_ENABLE_TEST_SEAMS
+            seeded = seed.published;
+#endif
+            cbm_mcp_server_free(server); /* joins the automatic index thread */
+        }
+    } else {
+        if (committed && repo_ready && environment_ready) {
+            seeded = mcp_publish_committed_index(repo);
+        }
+        cbm_pipeline_worker_count_test_reset();
+        server = repo_ready && environment_ready && seeded ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            char repo_json[512];
+            char args[CBM_SZ_1K];
+            (void)snprintf(repo_json, sizeof(repo_json), "%s", repo);
+            cbm_normalize_path_sep(repo_json);
+            (void)snprintf(args, sizeof(args), "{\"_cbm_background\":true,\"repo_path\":\"%s\"}",
+                           repo_json);
+            response = cbm_mcp_handle_tool(server, "index_repository", args);
+            cbm_mcp_server_free(server);
+        }
+    }
+    int selected_workers = cbm_pipeline_worker_count_test_last();
+    bool server_ready = server != NULL;
+    bool response_ready = response != NULL;
+
+    free(response);
+    cbm_config_close(config);
+    if (automatic && cwd_ready) {
+        (void)cbm_chdir(old_cwd);
+    }
+    /* Capture while CBM_WORKERS is still unset. Restoring first makes the
+     * expected count follow the lane override instead of this policy. */
+    int expected = committed ? cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                                    cbm_default_worker_count(false))
+                             : cbm_default_worker_count(true);
+    mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
+    bool cleaned = !cache_ready || th_rmtree(cache) == 0;
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(repo_ready);
+    ASSERT_TRUE(environment_saved);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(cwd_ready);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(response_ready);
+    ASSERT_EQ(selected_workers, expected);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+TEST(mcp_auto_index_in_process_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, true);
+}
+
+TEST(mcp_auto_index_in_process_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, true);
+}
+
+TEST(mcp_background_flag_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, false);
+}
+
+TEST(mcp_background_flag_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, false);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
@@ -26542,6 +26901,9 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
+    RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
+    RUN_TEST(tool_trace_path_recursion_union_and_edges_issue2816);
+    RUN_TEST(tool_trace_path_recursion_survives_budget_floor_issue2816);
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);
@@ -26787,6 +27149,10 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    RUN_TEST(mcp_auto_index_in_process_fresh_project_uses_full_width);
+    RUN_TEST(mcp_auto_index_in_process_existing_index_keeps_headroom);
+    RUN_TEST(mcp_background_flag_fresh_project_uses_full_width);
+    RUN_TEST(mcp_background_flag_existing_index_keeps_headroom);
     RUN_TEST(search_code_context_window_is_bounded);
     RUN_TEST(search_code_context_extreme_values_answer_normally);
     RUN_TEST(tool_query_graph_max_rows_above_ceiling_is_capped);

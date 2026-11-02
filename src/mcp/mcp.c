@@ -10368,6 +10368,72 @@ static void trace_call_coverage(cbm_store_t *store, const char *project,
     cbm_ht_free(match.targets);
 }
 
+enum { TRACE_RECURSION_FLAG_COUNT = 2 };
+typedef enum {
+    TRACE_RECURSION_UNKNOWN = -1,
+    TRACE_RECURSION_FALSE,
+    TRACE_RECURSION_TRUE,
+} trace_recursion_flag_t;
+static const char *const trace_recursion_keys[TRACE_RECURSION_FLAG_COUNT] = {"self_recursive",
+                                                                             "recursive"};
+typedef struct {
+    /* -1: unknown, 0: all roots record false, 1: at least one records true. */
+    trace_recursion_flag_t flags[TRACE_RECURSION_FLAG_COUNT];
+} trace_recursion_t;
+
+static trace_recursion_t trace_recursion_metadata(const cbm_node_t *nodes, int node_count) {
+    trace_recursion_t metadata = {0};
+    /* Use the same roots as bfs_union_same_name, rather than borrowing a
+     * callee's flag or selecting just one definition/stub. These are stored
+     * analysis signals, not evidence that a resolved self-call was dropped. */
+    for (int i = 0; i < node_count; i++) {
+        const char *properties = nodes[i].properties_json;
+        yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        for (int j = 0; j < TRACE_RECURSION_FLAG_COUNT; j++) {
+            yyjson_val *value = yyjson_obj_get(root, trace_recursion_keys[j]);
+            if (yyjson_is_bool(value) && yyjson_get_bool(value)) {
+                metadata.flags[j] = TRACE_RECURSION_TRUE;
+            } else if (!yyjson_is_bool(value) && metadata.flags[j] != TRACE_RECURSION_TRUE) {
+                metadata.flags[j] = TRACE_RECURSION_UNKNOWN;
+            }
+        }
+        yyjson_doc_free(doc);
+    }
+    return metadata;
+}
+
+static void trace_recursion_tree(cbm_sb_t *sb, const trace_recursion_t *metadata,
+                                 bool includes_calls) {
+    for (int i = 0; i < TRACE_RECURSION_FLAG_COUNT; i++) {
+        if (metadata->flags[i] == TRACE_RECURSION_UNKNOWN) {
+            cbm_sb_append(sb, trace_recursion_keys[i]);
+            cbm_sb_append(sb, ": null\n");
+        } else {
+            cbm_tree_scalar_bool(sb, trace_recursion_keys[i],
+                                 metadata->flags[i] == TRACE_RECURSION_TRUE);
+        }
+    }
+    if (includes_calls) {
+        cbm_tree_scalar_str(sb, "self_call_policy", "omitted");
+    }
+}
+
+static void trace_recursion_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                 const trace_recursion_t *metadata, bool includes_calls) {
+    for (int i = 0; i < TRACE_RECURSION_FLAG_COUNT; i++) {
+        if (metadata->flags[i] == TRACE_RECURSION_UNKNOWN) {
+            yyjson_mut_obj_add_null(doc, root, trace_recursion_keys[i]);
+        } else {
+            yyjson_mut_obj_add_bool(doc, root, trace_recursion_keys[i],
+                                    metadata->flags[i] == TRACE_RECURSION_TRUE);
+        }
+    }
+    if (includes_calls) {
+        yyjson_mut_obj_add_str(doc, root, "self_call_policy", "omitted");
+    }
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
@@ -10722,6 +10788,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                                              .do_inbound = do_inbound};
     trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
                         &unresolved_in);
+    trace_recursion_t recursion = trace_recursion_metadata(nodes, node_count);
     const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
     const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
 
@@ -10805,6 +10872,7 @@ render_trace_output:;
         if (mode) {
             cbm_tree_scalar_str(&sb, "mode", mode);
         }
+        trace_recursion_tree(&sb, &recursion, trace_includes_calls);
         /* Grouped tree is THE default; risk_labels/data_flow keep the flat
          * table (extra columns) in the same tree syntax. */
         bool render_risk = risk_labels && emit_optional_fields;
@@ -10888,6 +10956,7 @@ render_trace_output:;
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
         }
+        trace_recursion_json(doc, root, &recursion, trace_includes_calls);
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
             yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
@@ -10955,6 +11024,7 @@ render_trace_output:;
             if (!trace_legacy_json) {
                 cbm_sb_t floor;
                 cbm_sb_init(&floor);
+                trace_recursion_tree(&floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
                     cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
@@ -10983,6 +11053,7 @@ render_trace_output:;
                 yyjson_mut_doc *floor_doc = yyjson_mut_doc_new(NULL);
                 yyjson_mut_val *floor = yyjson_mut_obj(floor_doc);
                 yyjson_mut_doc_set_root(floor_doc, floor);
+                trace_recursion_json(floor_doc, floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
@@ -11782,6 +11853,28 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
         add_parse_partial_summary(doc, root, file_errors, file_error_count);
         add_parse_unusable_summary(doc, root, file_errors, file_error_count);
     }
+    /* Denominator for quality gates. parse_partial_count on its own cannot
+     * say whether sixty flagged files are a rounding error or half the
+     * repository; file_hashes holds exactly one row per indexed file. */
+    if (store) {
+        cbm_file_hash_t *hashes = NULL;
+        int hash_count = 0;
+        if (cbm_store_get_file_hashes(store, project_name, &hashes, &hash_count) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_int(doc, root, "files_indexed", hash_count);
+            /* The share, stated outright. A gate that only passes or fails
+             * cannot tell anyone HOW partial the parse was, and "the graph is
+             * fresh, but 6.2% of files parsed partially" is a usable hint
+             * where a bare verdict is not. Tenths of a percent are derived by
+             * integer division so the number never depends on rounding. */
+            yyjson_mut_val *partial_val = yyjson_mut_obj_get(root, "parse_partial_count");
+            if (partial_val && hash_count > 0) {
+                int partial = yyjson_mut_get_int(partial_val);
+                long tenths = (long)partial * 1000 / hash_count;
+                yyjson_mut_obj_add_real(doc, root, "parse_partial_pct", (double)tenths / 10.0);
+            }
+            cbm_store_free_file_hashes(hashes, hash_count);
+        }
+    }
     int nodes = 0;
     int edges = 0;
     bool degraded = false;
@@ -12470,7 +12563,8 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
      * worker reads no config); unset, the worker's index mode decides. */
     if (!yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path) ||
         !cbm_mcp_index_policy_add_to_args(doc, root, &policy) ||
-        !cbm_mcp_index_doc_candidates_add_to_args(doc, root, srv ? srv->config : NULL)) {
+        !cbm_mcp_index_doc_candidates_add_to_args(doc, root, srv ? srv->config : NULL) ||
+        !yyjson_mut_obj_add_bool(doc, root, "_cbm_background", true)) {
         yyjson_mut_doc_free(doc);
         return NULL;
     }
@@ -12773,6 +12867,22 @@ static bool index_root_owner_resolve(const char *repo_path, char **owner_out, ch
     return false;
 }
 
+/* Background CPU headroom is for a refresh of a graph that already serves.
+ * A project's first index keeps every core, even when it was started
+ * automatically: the caller is waiting on a graph that does not exist yet.
+ * An empty or unreadable file is not a committed index. Both sites that
+ * honour automatic indexing — handle_index_repository's _cbm_background
+ * flag and the in-process autoindex_thread — go through this so they
+ * cannot drift. */
+static bool project_has_committed_index(const char *project) {
+    if (!project || !project[0]) {
+        return false;
+    }
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    return db_path[0] && project_db_is_servable(project, db_path);
+}
+
 /* The three heap strings handle_index_repository owns from
  * cbm_mcp_get_string_arg / resolved_repo_path_from_project_arg. One release
  * point keeps the dozen early-return paths in step; free(NULL) is a no-op, so
@@ -12902,6 +13012,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
+    bool background = cbm_mcp_get_bool_arg(args, "_cbm_background");
     cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
@@ -13074,6 +13185,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("invalid project name", true);
     }
     free(name_override);
+    /* Headroom follows the final project name, decided before artifact
+     * bootstrap can create the first local copy of this index. */
+    cbm_pipeline_set_background(p, background &&
+                                       project_has_committed_index(cbm_pipeline_project_name(p)));
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
     index_doc_candidates_apply(p, doc_candidates);
@@ -13236,6 +13351,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_strcpy(doc, root, "message", message);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
+        /* A repository that is not there at all is a different failure from a
+         * pipeline that fell over inside one that is — the hint below reads
+         * identically for both, so callers could not tell them apart. The
+         * split is deliberately about the ROOT: an unreadable subtree is a
+         * pipeline failure, not a missing target. */
+        cbm_path_info_t target = {0};
+        bool target_reachable =
+            cbm_path_info_utf8(repo_path, &target) == CBM_PATH_INFO_OK && target.is_directory;
+        yyjson_mut_obj_add_str(doc, root, "reason",
+                               target_reachable ? "pipeline_failed" : "target_unavailable");
         /* #1665: a post-publish artifact export failure (read-only repo, etc.)
          * must not be blamed on the repository path. The pipeline snapshots the
          * export error of THIS run, so its presence names the phase exactly —
@@ -21484,6 +21609,7 @@ static void *autoindex_thread(void *arg) {
         return NULL;
     }
     index_doc_candidates_apply(p, index_doc_candidates_choice(srv, NULL));
+    cbm_pipeline_set_background(p, project_has_committed_index(cbm_pipeline_project_name(p)));
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();
