@@ -3302,6 +3302,8 @@ void cbm_shared_resolver_free(cbm_shared_resolver_t *resolver) {
     cbm_ht_free(resolver->python_queries);
     cbm_ht_free(resolver->python_namespaces);
     cbm_ht_free(resolver->python_star_provided);
+    cbm_ht_free(resolver->python_written);
+    cbm_ht_free(resolver->python_parent_loaded);
     cbm_ht_free(resolver->python_nested);
     cbm_py_members_free(resolver->python_members);
     cbm_ht_free(resolver->http_defaults);
