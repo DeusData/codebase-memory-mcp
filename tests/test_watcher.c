@@ -2273,15 +2273,17 @@ TEST(success_delay_fast_index_keeps_interval) {
 TEST(success_delay_slow_index_scales_by_factor) {
     ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1667), 5001);
     ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 10000), 30000);
-    /* 5-minute rebuild → next poll 15 min after it finishes. */
-    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 300000), 900000);
+    /* 90 s rebuild → next poll 4.5 min after it finishes. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 90000), 270000);
     PASS();
 }
 
 TEST(success_delay_clamped_and_degenerate) {
-    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 600000), 1800000);
-    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 600001), 1800000);
-    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MAX), 1800000);
+    /* Capped at 5 min (INDEX_FAIL_CEILING_MS) from 100 s of indexing up. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 100000), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 100001), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 300000), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MAX), 300000);
     ASSERT_EQ(cbm_watcher_success_delay_ms(5000, -1), 5000);
     ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MIN), 5000);
     ASSERT_EQ(cbm_watcher_success_delay_ms(-1, 0), 0);
@@ -2295,32 +2297,43 @@ TEST(success_delay_is_monotonic) {
     for (int64_t e = 0; e <= 2000000; e += 997) {
         int delay = cbm_watcher_success_delay_ms(5000, e);
         ASSERT_TRUE(delay >= previous);
-        ASSERT_TRUE(delay >= 5000 && delay <= 1800000);
+        ASSERT_TRUE(delay >= 5000 && delay <= 300000);
         previous = delay;
     }
     PASS();
 }
 
-/* Wire-up: the cooldown must be measured around the real index_fn call. An
- * instant callback keeps the plain cadence (no cooldown line); a callback
- * slower than interval/3 (5000/3 ms) extends it and logs once. */
-static int cooldown_log_hits = 0;
-static void cooldown_log_sink(const char *line) {
-    if (line && strstr(line, "watcher.cooldown") != NULL) {
-        cooldown_log_hits++;
-    }
-}
-static int slow_index_sleep_ms = 0;
-static int slow_index_calls = 0;
-static int slow_index_callback(const char *name, const char *path, void *ud) {
+/* Wire-up: the cooldown must be measured around the real index_fn call and
+ * counted from when the index finished. The watcher's clock is frozen via a
+ * test seam and the callback advances it, so an index "takes" a chosen time
+ * with no sleep and the scheduled poll time can be asserted exactly. */
+#define COOL_NS_PER_MS 1000000LL
+static int64_t cool_clock_ns = 0;
+static int64_t cool_index_ms = 0;
+static int cool_index_calls = 0;
+static int cool_index_callback(const char *name, const char *path, void *ud) {
     (void)name;
     (void)path;
     (void)ud;
-    slow_index_calls++;
-    if (slow_index_sleep_ms > 0) {
-        cbm_usleep((unsigned)slow_index_sleep_ms * 1000U);
-    }
+    cool_index_calls++;
+    cool_clock_ns += cool_index_ms * COOL_NS_PER_MS;
+    cbm_watcher_test_set_clock_ns(cool_clock_ns);
     return 0;
+}
+
+/* Re-index once (touch + poll until the callback runs; a transient git probe
+ * failure makes a poll a no-op, see the sustained-failure test) and return
+ * the scheduled next poll relative to when the index finished, in ms. */
+static int64_t cool_reindex_delay_ms(cbm_watcher_t *w, const char *file, const char *line,
+                                     int64_t index_ms) {
+    cool_index_ms = index_ms;
+    th_append_file(file, line);
+    int target = cool_index_calls + 1;
+    while (cool_index_calls < target) {
+        cbm_watcher_touch(w, "cool-repo");
+        cbm_watcher_poll_once(w);
+    }
+    return (cbm_watcher_test_next_poll_ns(w, "cool-repo") - cool_clock_ns) / COOL_NS_PER_MS;
 }
 
 TEST(watcher_success_cooldown_measures_index_issue2835) {
@@ -2337,40 +2350,30 @@ TEST(watcher_success_cooldown_measures_index_issue2835) {
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
+    cool_clock_ns = 1000LL * 1000 * COOL_NS_PER_MS; /* any nonzero start */
+    cbm_watcher_test_set_clock_ns(cool_clock_ns);
+    cool_index_calls = 0;
+
     cbm_store_t *store = cbm_store_open_memory();
-    cbm_watcher_t *w = cbm_watcher_new(store, slow_index_callback, NULL);
+    cbm_watcher_t *w = cbm_watcher_new(store, cool_index_callback, NULL);
     cbm_watcher_watch(w, "cool-repo", tmpdir);
-    slow_index_calls = 0;
-    slow_index_sleep_ms = 0;
     cbm_watcher_poll_once(w); /* baseline */
 
-    CBMLogLevel old_level = cbm_log_get_level();
-    cbm_log_set_level(CBM_LOG_INFO);
-    cooldown_log_hits = 0;
-    cbm_log_set_sink(cooldown_log_sink);
+    wt_path(p, sizeof(p), tmpdir, "file.txt");
+    /* Instant index: plain cadence. */
+    int64_t fast = cool_reindex_delay_ms(w, p, "a\n", 0);
+    /* 60 s index → 3 x 60 s, counted from the END of the index (anchoring at
+     * the start would give 120 s here). */
+    int64_t slow = cool_reindex_delay_ms(w, p, "b\n", 60000);
+    /* 200 s index → 600 s, capped at 5 min. */
+    int64_t capped = cool_reindex_delay_ms(w, p, "c\n", 200000);
 
-    /* Instant index: no cooldown. Loop on the attempt count (a transient git
-     * probe failure makes a poll a no-op, see the sustained-failure test). */
-    th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "a\n");
-    while (slow_index_calls < 1) {
-        cbm_watcher_touch(w, "cool-repo");
-        cbm_watcher_poll_once(w);
-    }
-    int fast_hits = cooldown_log_hits;
+    /* Restore the real clock before any assert can return early. */
+    cbm_watcher_test_set_clock_ns(0);
 
-    /* 1.8 s index → 3 x 1800 = 5400 ms > 5000 ms interval: cooldown. */
-    slow_index_sleep_ms = 1800;
-    th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "b\n");
-    while (slow_index_calls < 2) {
-        cbm_watcher_touch(w, "cool-repo");
-        cbm_watcher_poll_once(w);
-    }
-
-    cbm_log_set_sink(NULL);
-    cbm_log_set_level(old_level);
-
-    ASSERT_EQ(fast_hits, 0);
-    ASSERT_EQ(cooldown_log_hits, 1);
+    ASSERT_EQ(fast, cbm_watcher_poll_interval_ms(1));
+    ASSERT_EQ(slow, 180000);
+    ASSERT_EQ(capped, 300000);
 
     cbm_watcher_free(w);
     cbm_store_close(store);

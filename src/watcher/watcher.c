@@ -155,14 +155,13 @@ struct cbm_watcher {
 #define INDEX_FAIL_SUSTAINED 10
 
 /* Success cooldown (#2835): after a successful re-index the next poll waits
- * at least INDEX_COOLDOWN_FACTOR x the index's own duration, counted from when
- * the index finished, so the watcher spends at most ~1/(K+1) of wall time
- * indexing one project — a 5-minute rebuild idles 15 minutes. Sub-second
- * indexes stay at the plain cadence. The ceiling bounds staleness after one
- * pathological run; it is NOT INDEX_FAIL_CEILING_MS (5 min), which would cut
- * the cooldown of any rebuild over 100 s below K x its duration. */
+ * INDEX_COOLDOWN_FACTOR x the index's own duration, counted from when the
+ * index finished, so short rebuilds spend at most ~1/(K+1) of wall time
+ * indexing one project. Sub-second indexes stay at the plain cadence. The
+ * cooldown is capped at INDEX_FAIL_CEILING_MS (5 min) so that, under
+ * continuous writes, a project never falls more than one rebuild plus five
+ * minutes behind. */
 #define INDEX_COOLDOWN_FACTOR 3
-#define INDEX_COOLDOWN_CEILING_MS 1800000 /* 30 min */
 
 /* Stale-root pruning (#286): a watched project whose root directory stays
  * missing is pruned — its cached DB is deleted and the watch entry removed.
@@ -185,7 +184,17 @@ struct cbm_watcher {
 
 /* ── Time helper ────────────────────────────────────────────────── */
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: nonzero freezes the watcher's scheduling clock at this value. */
+static int64_t test_clock_ns = 0;
+#endif
+
 static int64_t now_ns(void) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (test_clock_ns != 0) {
+        return test_clock_ns;
+    }
+#endif
     struct timespec ts;
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((int64_t)ts.tv_sec * NS_PER_SEC) + ts.tv_nsec;
@@ -222,8 +231,8 @@ int cbm_watcher_success_delay_ms(int interval_ms, int64_t index_elapsed_ms) {
         return interval_ms;
     }
     /* Divide instead of multiply so a huge elapsed cannot overflow. */
-    int64_t cooldown = index_elapsed_ms > INDEX_COOLDOWN_CEILING_MS / INDEX_COOLDOWN_FACTOR
-                           ? INDEX_COOLDOWN_CEILING_MS
+    int64_t cooldown = index_elapsed_ms > INDEX_FAIL_CEILING_MS / INDEX_COOLDOWN_FACTOR
+                           ? INDEX_FAIL_CEILING_MS
                            : index_elapsed_ms * INDEX_COOLDOWN_FACTOR;
     return (int)(cooldown > interval_ms ? cooldown : interval_ms);
 }
@@ -1911,5 +1920,20 @@ int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
     int count = w->pending_free_count;
     cbm_mutex_unlock(&w->projects_lock);
     return count;
+}
+
+void cbm_watcher_test_set_clock_ns(int64_t ns) {
+    test_clock_ns = ns;
+}
+
+int64_t cbm_watcher_test_next_poll_ns(cbm_watcher_t *w, const char *project) {
+    if (!w || !project) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project);
+    int64_t next = s ? s->next_poll_ns : -1;
+    cbm_mutex_unlock(&w->projects_lock);
+    return next;
 }
 #endif
