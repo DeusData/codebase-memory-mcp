@@ -1,4 +1,5 @@
 #include "pipeline/binding_cache.h"
+#include "cbm.h"
 
 #include "foundation/compat.h"
 #include "foundation/constants.h"
@@ -87,7 +88,10 @@ static void cache_worker(int worker, void *context) {
         cache_file(cache, f);
     }
     cbm_resolve_stats_bind(previous);
-    /* A worker's slab pages must not keep an owner pointer into its dead TLS. */
+    /* A helper thread ends here: what it cached per thread goes with it, before the slab the
+     * parser allocated from. A worker's slab pages must not keep an owner pointer into its
+     * dead TLS. */
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
 }
 

@@ -2702,6 +2702,8 @@ static uint64_t cx_field_fold_probes(int lines, int *folded) {
                 (*folded)++;
             }
         }
+        free(defs);
+        free(modules[0]);
         cbm_arena_destroy(&arena);
         result->source = saved_source;
         result->source_len = saved_length;

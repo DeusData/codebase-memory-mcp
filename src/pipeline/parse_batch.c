@@ -1,4 +1,5 @@
 #include "pipeline/parse_batch.h"
+#include "cbm.h"
 
 #include "foundation/mem_core.h"
 #include "foundation/slab_alloc.h"
@@ -71,7 +72,9 @@ static void parse_worker(int worker, void *context) {
         }
         ts_parser_delete(parser);
     }
-    /* A helper thread ends here; the trees it made are freed by the pass's thread. */
+    /* A helper thread ends here; the trees it made are freed by the pass's thread. What the
+     * extraction it ran cached per thread goes with it, before the slab. */
+    cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
 }
 
