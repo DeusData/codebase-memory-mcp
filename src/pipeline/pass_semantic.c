@@ -1895,6 +1895,18 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const cbm_semantic_bi
             (*inherits_count)++;
         }
     }
+    for (size_t b = 0;; b++) {
+        const char *base_qn =
+            cbm_shared_resolver_source_base(ctx->shared_resolver, lang, def->qualified_name, b);
+        if (!base_qn)
+            break;
+        const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
+        if (base_node && node->id != base_node->id) {
+            cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id,
+                                 cbm_semantic_base_edge_type(base_node), "{}");
+            (*inherits_count)++;
+        }
+    }
     if (def->decorators) {
         for (int dc = 0; def->decorators[dc]; dc++) {
             resolve_decorator(ctx, node, def->decorators[dc], module_qn, imp_keys, imp_vals,

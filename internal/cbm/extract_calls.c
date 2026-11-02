@@ -1602,6 +1602,17 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
         }
     }
 
+    /* Scala `f[T](x)` and `a.f[T](x)`: the callee is what the type arguments follow. */
+    if (lang == CBM_LANG_SCALA && strcmp(nk, "call_expression") == 0) {
+        TSNode fnf = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (!ts_node_is_null(fnf) && strcmp(ts_node_type(fnf), "generic_function") == 0) {
+            TSNode inner = ts_node_child_by_field_name(fnf, TS_FIELD("function"));
+            if (!ts_node_is_null(inner)) {
+                return cbm_node_text(a, inner, source);
+            }
+        }
+    }
+
     if (lang == CBM_LANG_JSONNET) {
         char *c = extract_jsonnet_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);

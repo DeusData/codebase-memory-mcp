@@ -1251,6 +1251,17 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
             return cbm_arena_sprintf(ctx->arena, "%s.Companion", state->enclosing_class_qn);
         }
     }
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OCAML) {
+        name_node = cbm_find_child_by_kind(node, "module_name");
+    }
+    /* `const Foo = struct {...}`, as the def side names it. */
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_ZIG) {
+        TSNode declaration = ts_node_parent(node);
+        if (!ts_node_is_null(declaration) &&
+            strcmp(ts_node_type(declaration), "variable_declaration") == 0) {
+            name_node = cbm_find_child_by_kind(declaration, "identifier");
+        }
+    }
     /* Objective-C: class_interface / class_implementation have no `name` field;
      * the class name is a plain `identifier` child. Without this the walk pushes
      * no class scope, so a method body's calls source to the Module and the

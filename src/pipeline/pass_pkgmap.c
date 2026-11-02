@@ -1626,6 +1626,108 @@ static void parse_python_manifest(const char *basename, const char *source, int 
     cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
 }
 
+/* dune: which directories hold which library, and how their subdirectories count. Reads
+ * the S-expressions as data: a form's head, and the `(name x)` and `(wrapped false)` of a
+ * library. Anything else in the file is skipped by its parentheses. */
+static void dune_push(cbm_pkg_entries_t *entries, const char *kind, const char *key,
+                      const char *value) {
+    char name[PKGMAP_PATH_BUF];
+    int length = snprintf(name, sizeof(name), "%s%s:%s", CBM_PKGMAP_RAW_PREFIX, kind, key);
+    if (length <= 0 || (size_t)length >= sizeof(name))
+        return;
+    pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
+                     cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, value));
+}
+
+static bool dune_is_library_name(const char *text, int length) {
+    for (int i = 0; i < length; i++)
+        if (!isalnum((unsigned char)text[i]) && text[i] != '_')
+            return false;
+    return length > 0;
+}
+
+/* A directory named x.t is a cram test: data to the build around it, whatever it holds. */
+static bool dune_in_cram_directory(const char *rel_path) {
+    for (const char *mark = strstr(rel_path, ".t/"); mark; mark = strstr(mark + 1, ".t/"))
+        if (mark != rel_path && mark[-1] != '/')
+            return true;
+    return false;
+}
+
+static void parse_dune(const char *source, int source_len, const char *rel_path,
+                       cbm_pkg_entries_t *entries) {
+    if (dune_in_cram_directory(rel_path))
+        return;
+    char *dir = path_dirname(rel_path);
+    const char *where = dir && dir[0] ? dir : ".";
+    char top[32] = "", field[32] = "", library[128] = "";
+    bool unwrapped = false, named = false;
+    int depth = 0, atoms_at_depth1 = 0, atoms_at_depth2 = 0;
+    for (const char *p = source, *end = source + source_len; p < end;) {
+        char c = *p;
+        if (c == ';') {
+            while (p < end && *p != '\n')
+                p++;
+        } else if (c == '"') {
+            for (p++; p < end && *p != '"'; p++)
+                if (*p == '\\')
+                    p++;
+            p++;
+        } else if (c == '(') {
+            depth++;
+            if (depth == 1)
+                atoms_at_depth1 = 0;
+            if (depth == 2)
+                atoms_at_depth2 = 0;
+            p++;
+        } else if (c == ')') {
+            if (depth == 1) {
+                if (!strcmp(top, "library") && library[0]) {
+                    dune_push(entries, "ocaml-lib", library, where);
+                    dune_push(entries, "ocaml-dir", where, library);
+                    if (unwrapped)
+                        dune_push(entries, "ocaml-unwrapped", library, "1");
+                } else if (!strcmp(top, "executable") || !strcmp(top, "executables") ||
+                           !strcmp(top, "test") || !strcmp(top, "tests")) {
+                    dune_push(entries, "ocaml-dir", where, "executable");
+                }
+                top[0] = library[0] = '\0';
+                unwrapped = named = false;
+            }
+            depth--;
+            p++;
+        } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            p++;
+        } else {
+            const char *start = p;
+            while (p < end && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '(' &&
+                   *p != ')' && *p != ';' && *p != '"')
+                p++;
+            int length = (int)(p - start);
+            if (depth == 1 && atoms_at_depth1++ == 0) {
+                snprintf(top, sizeof(top), "%.*s", length, start);
+            } else if (depth == 1 && !strcmp(top, "include_subdirs")) {
+                char mode[32];
+                snprintf(mode, sizeof(mode), "%.*s", length, start);
+                dune_push(entries, "ocaml-subdirs", where, mode);
+            } else if (depth == 2 && atoms_at_depth2++ == 0) {
+                snprintf(field, sizeof(field), "%.*s", length, start);
+            } else if (depth == 2 && atoms_at_depth2 == 2 && !strcmp(top, "library")) {
+                if (!strcmp(field, "name") && length < (int)sizeof(library)) {
+                    snprintf(library, sizeof(library), "%.*s", length, start);
+                    named = true;
+                } else if (!strcmp(field, "public_name") && !named &&
+                           length < (int)sizeof(library) && dune_is_library_name(start, length)) {
+                    /* With no `name`, a library takes this one, when it can be a module's. */
+                    snprintf(library, sizeof(library), "%.*s", length, start);
+                } else if (!strcmp(field, "wrapped") && length == 5 && !strncmp(start, "false", 5))
+                    unwrapped = true;
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
+}
+
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
@@ -1685,6 +1787,10 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     }
     if (strcmp(basename, "Package.swift") == 0) {
         parse_package_swift(source, source_len, rel_path, entries);
+        return true;
+    }
+    if (strcmp(basename, "dune") == 0) {
+        parse_dune(source, source_len, rel_path, entries);
         return true;
     }
     return false;
@@ -2100,10 +2206,17 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
         strcmp(basename, "pyproject.toml") == 0 || strcmp(basename, "composer.json") == 0 ||
         strcmp(basename, "pubspec.yaml") == 0 || strcmp(basename, "pom.xml") == 0 ||
         strcmp(basename, "build.gradle") == 0 || strcmp(basename, "build.gradle.kts") == 0 ||
-        strcmp(basename, "mix.exs") == 0 || strcmp(basename, "Package.swift") == 0) {
+        strcmp(basename, "mix.exs") == 0 || strcmp(basename, "Package.swift") == 0 ||
+        strcmp(basename, "dune") == 0) {
         return true;
     }
     return ends_with(basename, ".gemspec");
+}
+
+/* `dune` also names directories, in repositories with nothing to do with OCaml. Only
+ * the file is a manifest, so anything else of that name withholds nothing. */
+static bool pkgmap_name_must_be_a_manifest(const char *basename) {
+    return is_pkgmap_manifest_basename(basename) && strcmp(basename, "dune") != 0;
 }
 
 static void node_excluded_path(cbm_pkg_entries_t *entries, const char *path) {
@@ -2169,7 +2282,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
             cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
             node_excluded_path(entries, rel_path);
-            if (is_pkgmap_manifest_basename(name))
+            if (pkgmap_name_must_be_a_manifest(name))
                 entries->incomplete = true;
             continue;
         }
@@ -2180,12 +2293,12 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         }
         if (info.is_symlink) {
             node_excluded_path(entries, rel_path);
-            if (is_pkgmap_manifest_basename(name))
+            if (pkgmap_name_must_be_a_manifest(name))
                 entries->incomplete = true;
             continue;
         }
         if (info.is_directory) {
-            if (is_pkgmap_manifest_basename(name)) {
+            if (pkgmap_name_must_be_a_manifest(name)) {
                 entries->incomplete = true;
                 continue;
             }
@@ -2199,13 +2312,16 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (!is_pkgmap_manifest_basename(name) && !optional)
             continue;
         if (!info.is_regular) {
-            entries->incomplete = entries->incomplete || !optional;
+            if (pkgmap_name_must_be_a_manifest(name))
+                entries->incomplete = true;
             continue;
         }
         int source_len = 0;
         char *source = pkgmap_read_file(abs_path, &source_len);
         if (!source) {
-            entries->incomplete = entries->incomplete || !optional;
+            /* An empty dune file is valid and says nothing. */
+            if (pkgmap_name_must_be_a_manifest(name))
+                entries->incomplete = true;
             continue;
         }
         if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
@@ -2341,7 +2457,8 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
         int source_len = 0;
         char *source = pkgmap_read_file(files[i].path, &source_len);
         if (!source) {
-            entries.incomplete = true;
+            if (pkgmap_name_must_be_a_manifest(basename))
+                entries.incomplete = true;
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
@@ -2377,7 +2494,8 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         int source_len = 0;
         char *source = pkgmap_read_file(files[i].path, &source_len);
         if (!source) {
-            entries.incomplete = true;
+            if (pkgmap_name_must_be_a_manifest(basename))
+                entries.incomplete = true;
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
@@ -3594,9 +3712,71 @@ static const char *elixir_full_module(const CBMFileResult *result, int index, ch
     return length > 0 && (size_t)length < capacity ? out : NULL;
 }
 
+/* The name in a Haskell file's `module A.B` header, past comments and pragmas. A file
+ * with no header is Main, which nothing imports. */
+static bool haskell_header_module(const char *source, size_t size, char *out, size_t capacity) {
+    size_t at = 0;
+    unsigned nested = 0;
+    while (at < size) {
+        if (nested) {
+            if (at + 1 < size && source[at] == '-' && source[at + 1] == '}') {
+                nested--;
+                at += 2;
+            } else if (at + 1 < size && source[at] == '{' && source[at + 1] == '-') {
+                nested++;
+                at += 2;
+            } else {
+                at++;
+            }
+        } else if (at + 1 < size && source[at] == '{' && source[at + 1] == '-') {
+            nested = 1;
+            at += 2;
+        } else if (at + 1 < size && source[at] == '-' && source[at + 1] == '-') {
+            while (at < size && source[at] != '\n')
+                at++;
+        } else if (source[at] == ' ' || source[at] == '\t' || source[at] == '\n' ||
+                   source[at] == '\r') {
+            at++;
+        } else {
+            break;
+        }
+    }
+    if (size - at < 7 || strncmp(source + at, "module", 6) ||
+        (source[at + 6] != ' ' && source[at + 6] != '\t' && source[at + 6] != '\n' &&
+         source[at + 6] != '\r'))
+        return false;
+    at += 6;
+    while (at < size &&
+           (source[at] == ' ' || source[at] == '\t' || source[at] == '\n' || source[at] == '\r'))
+        at++;
+    size_t length = 0;
+    while (at + length < size &&
+           (isalnum((unsigned char)source[at + length]) || source[at + length] == '.' ||
+            source[at + length] == '_' || source[at + length] == '\''))
+        length++;
+    if (!length || length >= capacity)
+        return false;
+    memcpy(out, source + at, length);
+    out[length] = '\0';
+    return true;
+}
+
 static bool source_module_facts(const cbm_file_info_t *files, int count, CBMFileResult **cache,
                                 CBMHashTable *map) {
     for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_HASKELL) {
+            int size = 0;
+            char *source = pkgmap_read_file(files[i].path, &size);
+            char module[PKGMAP_PATH_BUF];
+            bool named = source && size > 0 &&
+                         haskell_header_module(source, (size_t)size, module, sizeof(module));
+            bool put =
+                !named || source_module_put(map, "haskell_module", module, files[i].rel_path);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+            if (!put)
+                return false;
+            continue;
+        }
         if (files[i].language == CBM_LANG_ERLANG) {
             char module[PKGMAP_PATH_BUF];
             const char *leaf = path_leaf(files[i].rel_path);
@@ -5448,6 +5628,10 @@ static bool resolve_source_language_import(const cbm_pipeline_ctx_t *ctx, const 
     case CBM_LANG_ELIXIR:
         *reason = "elixir_declared_module";
         *out = resolve_source_module(ctx, namespace_map, "elixir_module", path, ambiguous);
+        return true;
+    case CBM_LANG_HASKELL:
+        *reason = "haskell_declared_module";
+        *out = resolve_source_module(ctx, namespace_map, "haskell_module", path, ambiguous);
         return true;
     default:
         return false;

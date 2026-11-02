@@ -9,6 +9,8 @@
  * to be exported, by -export or export_all. `?MODULE:f(X)` is the same call on
  * the current module. A variable module or function is runtime dispatch.
  *
+ * `fun f/1` and `fun m:f/1` name a function by the same rules without calling it.
+ *
  * The graph's QN holds no arity, so f/1 and f/2 are one node: the edge names that
  * function name in that module, which is what the graph can represent. */
 #include "source_adapter_internal.h"
@@ -30,6 +32,7 @@ typedef struct {
     size_t export_count;
     erlang_import_t *imports;
     size_t import_count;
+    const char *scope; /* the enclosing function's QN, or NULL */
 } erlang_ctx_t;
 
 /* The attribute kinds a module header can use. */
@@ -232,11 +235,61 @@ static void erlang_visit_call(erlang_ctx_t *ctx, TSNode call) {
                          "erlang_fun_value_call");
 }
 
+/* `fun f/1`: the module's own f/1, else an imported one. `fun m:f/1`: m's exported f/1. */
+static void erlang_visit_fun_reference(erlang_ctx_t *ctx, TSNode node) {
+    cbm_source_walk_t *walk = ctx->walk;
+    const char *name = cbm_source_text(walk, cbm_source_field(node, "fun"));
+    const char *digits =
+        cbm_source_text(walk, cbm_source_field(cbm_source_field(node, "arity"), "value"));
+    if (!name || !digits)
+        return;
+    int arity = atoi(digits);
+    const char *reason = NULL;
+    const char *target = NULL;
+    const char *domain = NULL;
+    if (cbm_source_is(node, "external_fun")) {
+        TSNode wrapper = cbm_source_field(node, "module");
+        TSNode module_node =
+            ts_node_named_child_count(wrapper) ? ts_node_named_child(wrapper, 0) : (TSNode){0};
+        domain = cbm_source_is(module_node, "atom") ? cbm_source_text(walk, module_node) : NULL;
+        target = domain ? erlang_select(ctx, domain, name, arity, true, &reason) : NULL;
+    } else if (ctx->module) {
+        domain = ctx->module;
+        target = erlang_select(ctx, ctx->module, name, arity, false, &reason);
+        for (size_t i = 0; !target && i < ctx->import_count; i++) {
+            const erlang_import_t *import = &ctx->imports[i];
+            if (import->arity != arity || strcmp(import->name, name) || !import->module)
+                continue;
+            domain = import->module;
+            target = erlang_select(ctx, import->module, name, arity, true, &reason);
+        }
+    }
+    if (!target)
+        return;
+    walk->extra_scope = ctx->scope ? ctx->scope : walk->result->module_qn;
+    walk->extra_name = name;
+    walk->extra_line = ts_node_start_point(node).row + 1;
+    cbm_source_emit_node(walk, node, CBM_SOURCE_SITE_REFERENCE, target,
+                         CBM_RESOLVE_RULE_LANGUAGE_BINDING, domain, "erlang_function_reference");
+    walk->extra_scope = NULL;
+    walk->extra_name = NULL;
+    walk->extra_line = 0;
+}
+
 static void erlang_visit(erlang_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
     if (cbm_source_is(node, "call"))
         erlang_visit_call(ctx, node);
+    else if (cbm_source_is(node, "internal_fun") || cbm_source_is(node, "external_fun"))
+        erlang_visit_fun_reference(ctx, node);
+    const char *saved_scope = ctx->scope;
+    if (cbm_source_is(node, "function_clause")) {
+        const char *name = cbm_source_text(ctx->walk, cbm_source_field(node, "name"));
+        ctx->scope = name ? cbm_source_def_qn_label(ctx->walk, name,
+                                                    ts_node_start_point(node).row + 1, "Function")
+                          : NULL;
+    }
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
@@ -246,6 +299,7 @@ static void erlang_visit(erlang_ctx_t *ctx, TSNode node, unsigned depth) {
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
     ts_tree_cursor_delete(&cursor);
+    ctx->scope = saved_scope;
 }
 
 static void erlang_resolve(cbm_source_walk_t *walk) {
@@ -257,4 +311,6 @@ static void erlang_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_erlang = {.language = CBM_LANG_ERLANG,
                                                         .collect = erlang_collect,
                                                         .resolve = erlang_resolve,
-                                                        .one_name_one_node = true};
+                                                        .one_name_one_node = true,
+                                                        .decides_references = true,
+                                                        .contains_parse_damage = true};

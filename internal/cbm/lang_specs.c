@@ -538,9 +538,8 @@ static const char *haskell_var_types[] = {"function", NULL};
 // ==================== OCAML ====================
 static const char *ocaml_func_types[] = {"value_definition", "constructor_declaration",
                                          "method_definition", NULL};
-static const char *ocaml_class_types[] = {"type_definition",    "class_definition",
-                                          "module_definition",  "exception_definition",
-                                          "record_declaration", NULL};
+static const char *ocaml_class_types[] = {"type_definition", "class_definition",
+                                          "exception_definition", "record_declaration", NULL};
 static const char *ocaml_module_types[] = {"compilation_unit", NULL};
 static const char *ocaml_call_types[] = {"application_expression", "infix_expression",
                                          "method_invocation",      "module_application",

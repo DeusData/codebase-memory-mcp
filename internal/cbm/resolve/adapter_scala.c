@@ -19,14 +19,28 @@
  * so a member found on the chain is the one selected, and an absent one is not guessed.
  * Overloads are told apart by arity; those that share a graph node need no more.
  *
- * Known gaps, each abstaining: inferred return types, type members and path-dependent
- * types, generic element types, infix and postfix calls, and calls to Java classes. */
+ * A pattern `case e: Foo` and a parameter `(y: Foo) =>` declare a type too.
+ *
+ * `a op b` is `a.op(b)`, and `a op: b` is `b.op:(a)`. `x.m` with m a method taking no
+ * arguments is a call of it, so `x.m.n()` reads n on m's return type.
+ *
+ * `def f = new Foo(...)` and `val v = new Foo(...)` have type Foo, as has a block ending
+ * in that. A type written in another file is read with that file's imports, which the
+ * table holds, so a base class or return type imported there is not left unknown there.
+ * An explicit import binds its name even when it leaves the project.
+ *
+ * `new Foo { ... }` opens a scope whose members are its own and those on Foo's chain. They
+ * hide every enclosing template, so a Foo outside the project leaves its bare names open.
+ *
+ * Known gaps, each abstaining: other inferred return types, type members and path-dependent
+ * types, generic element types, postfix calls, and calls to Java classes. */
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 
 #define SCALA_RECORD "&template"
 #define SCALA_PACKAGE "&package"
+#define SCALA_IMPORT "&import"
 #define SCALA_TYPE_NAME "type:"
 #define SCALA_OBJECT_NAME "object:"
 
@@ -45,6 +59,12 @@ typedef struct scala_import {
     struct scala_import *next;
 } scala_import_t;
 
+/* An anonymous class around this point. */
+typedef struct scala_anonymous {
+    const char *base; /* its template key, NULL when it is outside the project */
+    struct scala_anonymous *next;
+} scala_anonymous_t;
+
 typedef struct {
     cbm_source_walk_t *walk;
     const char *packages[SCALA_MAX_PACKAGES]; /* innermost first */
@@ -54,6 +74,11 @@ typedef struct {
     scala_local_t *locals;
     scala_import_t *imports;       /* the file's */
     scala_import_t *block_imports; /* in the blocks around this point */
+    scala_anonymous_t *anonymous;
+    TSNode callee;           /* the function of the call being walked */
+    bool child_of_block;     /* the node being visited stands directly in a block */
+    bool child_of_template;  /* or directly in a template's body */
+    CBMHashTable *type_memo; /* (file, owner, name) to template key, for this file's walk */
 } scala_ctx_t;
 
 typedef enum {
@@ -72,6 +97,7 @@ typedef struct {
     const char *package;           /* SCALA_PACKAGE_REF */
     const cbm_source_decl_t *decl; /* SCALA_FUNCTION; SCALA_CLASS: the class */
     const cbm_source_decl_t *object_decl;
+    const cbm_source_decl_t *value_decl; /* the val or var a name read reaches */
     bool via_import, via_receiver, from_super;
     const char *reason;
 } scala_ref_t;
@@ -151,7 +177,8 @@ static const char *scala_path(cbm_source_walk_t *walk, TSNode node) {
 /* ── Phase one ─────────────────────────────────────────────────────── */
 
 static void scala_note_params(cbm_source_walk_t *walk, TSNode function, cbm_source_decl_t *decl) {
-    TSNode parameters = cbm_source_field(function, "parameters");
+    /* The grammar names this field on a plain def but not on a generic one. */
+    TSNode parameters = scala_child_of_kind(function, "parameters");
     decl->arity_min = decl->arity_max = 0;
     if (ts_node_is_null(parameters))
         return;
@@ -182,21 +209,37 @@ static uint32_t scala_flags(cbm_source_walk_t *walk, TSNode node) {
 static void scala_collect_template(cbm_source_walk_t *walk, const char *package, const char *outer,
                                    TSNode node);
 
+/* The type of a right-hand side that says it: `new Foo(...)`, alone or ending a block. */
+static const char *scala_constructed_type(cbm_source_walk_t *walk, TSNode value,
+                                          const char *type_params) {
+    while (cbm_source_is(value, "block")) {
+        uint32_t count = ts_node_named_child_count(value);
+        TSNode last = (TSNode){0};
+        for (uint32_t i = count; i > 0 && ts_node_is_null(last); i--) {
+            TSNode child = ts_node_named_child(value, i - 1);
+            if (!cbm_source_is(child, "comment") && !cbm_source_is(child, "block_comment"))
+                last = child;
+        }
+        value = last;
+    }
+    return cbm_source_is(value, "instance_expression")
+               ? scala_type_text(walk, ts_node_named_child(value, 0), type_params)
+               : NULL;
+}
+
 static void scala_collect_value(cbm_source_walk_t *walk, const char *owner, TSNode node,
                                 const char *type_params) {
     TSNode pattern = cbm_source_field(node, "pattern");
     if (!cbm_source_is(pattern, "identifier"))
         return;
     const char *type = scala_type_text(walk, cbm_source_field(node, "type"), type_params);
-    if (ts_node_is_null(cbm_source_field(node, "type"))) {
-        TSNode value = cbm_source_field(node, "value");
-        /* `val x = new Foo(...)`: the type it constructs. */
-        if (cbm_source_is(value, "instance_expression"))
-            type = scala_type_text(walk, ts_node_named_child(value, 0), type_params);
-    }
-    cbm_source_decl_t *decl = cbm_source_declare(walk, owner, cbm_source_text(walk, pattern), NULL,
-                                                 CBM_SOURCE_DECL_F_VALUE | scala_flags(walk, node),
-                                                 ts_node_start_point(node).row + 1);
+    if (ts_node_is_null(cbm_source_field(node, "type")))
+        type = scala_constructed_type(walk, cbm_source_field(node, "value"), type_params);
+    const char *name = cbm_source_text(walk, pattern);
+    uint32_t line = ts_node_start_point(pattern).row + 1;
+    cbm_source_decl_t *decl =
+        cbm_source_declare(walk, owner, name, cbm_source_def_qn(walk, name, line),
+                           CBM_SOURCE_DECL_F_VALUE | scala_flags(walk, node), line);
     if (decl && type)
         decl->type = cbm_source_table_intern(walk, type);
 }
@@ -213,8 +256,11 @@ static void scala_collect_function(cbm_source_walk_t *walk, const char *owner, T
     if (!decl)
         return;
     scala_note_params(walk, node, decl);
-    const char *type = scala_type_text(walk, cbm_source_field(node, "return_type"),
-                                       scala_type_params(walk, node, type_params));
+    const char *params = scala_type_params(walk, node, type_params);
+    TSNode returned = cbm_source_field(node, "return_type");
+    const char *type = ts_node_is_null(returned)
+                           ? scala_constructed_type(walk, cbm_source_field(node, "body"), params)
+                           : scala_type_text(walk, returned, params);
     if (type)
         decl->type = cbm_source_table_intern(walk, type);
 }
@@ -275,9 +321,10 @@ static void scala_collect_class_parameters(cbm_source_walk_t *walk, const char *
             continue;
         const char *name = cbm_source_text(walk, cbm_source_field(param, "name"));
         const char *type = scala_type_text(walk, cbm_source_field(param, "type"), type_params);
+        uint32_t line = ts_node_start_point(param).row + 1;
         cbm_source_decl_t *decl =
-            name ? cbm_source_declare(walk, key, name, NULL, CBM_SOURCE_DECL_F_VALUE,
-                                      ts_node_start_point(param).row + 1)
+            name ? cbm_source_declare(walk, key, name, cbm_source_def_qn(walk, name, line),
+                                      CBM_SOURCE_DECL_F_VALUE, line)
                  : NULL;
         if (decl && type)
             decl->type = cbm_source_table_intern(walk, type);
@@ -341,7 +388,41 @@ static int scala_file_packages(cbm_source_walk_t *walk, const char **out) {
     return used;
 }
 
+static void scala_add_import(scala_ctx_t *ctx, TSNode node, scala_import_t **list);
+
+/* A file's imports stay in the table: a type written in that file is read through them. */
+static const char *scala_imports_owner(CBMArena *arena, const char *file) {
+    return cbm_arena_sprintf(arena, "i:%s", file);
+}
+
+static void scala_collect_imports(cbm_source_walk_t *walk) {
+    scala_ctx_t ctx = {.walk = walk};
+    scala_import_t *imports = NULL;
+    TSTreeCursor cursor = ts_tree_cursor_new(walk->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (cbm_source_is(child, "import_declaration"))
+                scala_add_import(&ctx, child, &imports);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    const char *owner = imports ? scala_imports_owner(walk->arena, walk->file) : NULL;
+    for (const scala_import_t *import = imports; import && owner; import = import->next) {
+        cbm_source_decl_t *decl =
+            cbm_source_declare(walk, owner, SCALA_IMPORT, NULL, CBM_SOURCE_DECL_F_TYPE, 1);
+        const char **parts = cbm_source_table_alloc(walk, 3 * sizeof(*parts));
+        if (!decl || !parts)
+            return;
+        decl->type = cbm_source_table_intern(walk, import->path);
+        parts[0] = cbm_source_table_intern(walk, import->member);
+        parts[1] = cbm_source_table_intern(walk, import->alias);
+        decl->bases = parts;
+    }
+}
+
 static void scala_collect(cbm_source_walk_t *walk) {
+    scala_collect_imports(walk);
     const char *packages[SCALA_MAX_PACKAGES];
     (void)scala_file_packages(walk, packages);
     const char *package = packages[0];
@@ -447,7 +528,8 @@ static scala_ref_t scala_resolve_path(scala_ctx_t *ctx, const char *path) {
 }
 
 /* A written type name, seen from a declaring owner's packages. */
-static const char *scala_lookup_type(scala_ctx_t *ctx, const char *owner, const char *text);
+static const char *scala_lookup_type(scala_ctx_t *ctx, const char *owner, const char *text,
+                                     const char *file);
 
 /* ── Phase two: templates ──────────────────────────────────────────── */
 
@@ -504,7 +586,7 @@ static scala_lookup_t scala_find_member(scala_ctx_t *ctx, const char *key, const
     while (record->bases && record->bases[count])
         count++;
     for (size_t step = count; step > 0; step--) {
-        const char *parent = scala_lookup_type(ctx, key, record->bases[step - 1]);
+        const char *parent = scala_lookup_type(ctx, key, record->bases[step - 1], record->file);
         if (!parent)
             return SCALA_OPEN;
         scala_lookup_t found = scala_find_member(ctx, parent, name, arguments, false, chain, out);
@@ -529,23 +611,80 @@ static const char *scala_class_key_of(const scala_ref_t *ref) {
     return NULL;
 }
 
-/* Imports a declaring file made are not in this table; the current file's are. For a
- * type named in another file, its own package and the enclosing templates decide, and
- * a name that only that file's import would reach stays unknown. */
-static const char *scala_lookup_type(scala_ctx_t *ctx, const char *owner, const char *text) {
-    if (!owner || !text)
-        return NULL;
-    cbm_source_walk_t *walk = ctx->walk;
-    const char *dot = strrchr(text, '.');
-    if (dot) {
-        scala_ref_t path = scala_resolve_path(ctx, text);
-        return scala_class_key_of(&path);
+/* A path written in a file resolves from that file's package. */
+static scala_ref_t scala_resolve_path_in(scala_ctx_t *ctx, const char *path, const char *owner,
+                                         const char *file) {
+    if (!strcmp(file, ctx->walk->file))
+        return scala_resolve_path(ctx, path);
+    const char *held = ctx->packages[0];
+    int count = ctx->package_count;
+    ctx->packages[0] = scala_key_package(ctx->walk, owner);
+    ctx->package_count = 1;
+    scala_ref_t found = scala_resolve_path(ctx, path);
+    ctx->packages[0] = held;
+    ctx->package_count = count;
+    return found;
+}
+
+/* A type or object a template inherits. Each template on the chain is read once. */
+static scala_ref_t scala_inherited_names(scala_ctx_t *ctx, const char *key, const char *text,
+                                         cbm_source_chain_t *chain) {
+    scala_ref_t none = {.reason = "scala_name_not_in_project"};
+    if (!cbm_source_chain_first_visit(chain, key))
+        return none;
+    const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, key, SCALA_RECORD);
+    if (!record || record->next)
+        return none;
+    for (size_t i = 0; record->bases && record->bases[i]; i++) {
+        const char *parent = scala_lookup_type(ctx, key, record->bases[i], record->file);
+        if (!parent)
+            continue;
+        scala_ref_t found = scala_member_names(ctx, parent, text);
+        if (found.kind == SCALA_UNKNOWN)
+            found = scala_inherited_names(ctx, parent, text, chain);
+        if (found.kind != SCALA_UNKNOWN)
+            return found;
     }
-    /* Templates from inside out. */
+    return none;
+}
+
+/* A type name as `file` reads it from `owner`: the templates around it, that file's explicit
+ * imports, its package, then its wildcard imports. */
+static const char *scala_lookup_type_uncached(scala_ctx_t *ctx, const char *owner, const char *text,
+                                              const char *file) {
+    cbm_source_walk_t *walk = ctx->walk;
+    const char *imports_owner = scala_imports_owner(walk->arena, file);
+    const cbm_source_decl_t *imports =
+        imports_owner ? cbm_source_lookup(walk, imports_owner, SCALA_IMPORT) : NULL;
+    const char *dot = strchr(text, '.');
+    if (dot) {
+        scala_ref_t path = scala_resolve_path_in(ctx, text, owner, file);
+        const char *key = scala_class_key_of(&path);
+        if (key)
+            return key;
+        /* The first segment may be a name that file imported. */
+        size_t head = (size_t)(dot - text);
+        for (const cbm_source_decl_t *import = imports; import; import = import->next) {
+            const char *alias = import->bases[1];
+            if (!alias || strlen(alias) != head || strncmp(alias, text, head))
+                continue;
+            scala_ref_t full = scala_resolve_path_in(
+                ctx, cbm_arena_sprintf(walk->arena, "%s.%s%s", import->type, import->bases[0], dot),
+                owner, file);
+            return scala_class_key_of(&full);
+        }
+        return NULL;
+    }
+    /* Templates from inside out, each with what it inherits. */
     char *scope = !strncmp(owner, "t:", 2) ? cbm_arena_strdup(walk->arena, owner) : NULL;
     while (scope) {
         scala_ref_t nested = scala_member_names(ctx, scope, text);
         const char *key = scala_class_key_of(&nested);
+        if (!key) {
+            cbm_source_chain_t chain = {0};
+            scala_ref_t inherited = scala_inherited_names(ctx, scope, text, &chain);
+            key = scala_class_key_of(&inherited);
+        }
         if (key)
             return key;
         char *up = strrchr(scope, '.');
@@ -554,51 +693,63 @@ static const char *scala_lookup_type(scala_ctx_t *ctx, const char *owner, const 
             break;
         *up = '\0';
     }
-    const char *package = scala_key_package(walk, owner);
-    /* From this file: its imports come before other files of the package. */
-    bool here = false;
-    for (int i = 0; i < ctx->package_count; i++)
-        here |= !strcmp(ctx->packages[i], package);
-    if (here) {
-        for (const scala_import_t *import = ctx->imports; import; import = import->next) {
-            if (!import->member || strcmp(import->alias, text))
-                continue;
-            scala_ref_t path = scala_resolve_path(
-                ctx, cbm_arena_sprintf(walk->arena, "%s.%s", import->path, import->member));
-            const char *key = scala_class_key_of(&path);
-            if (key)
-                return key;
-        }
+    /* An explicit import binds the name, also when it leaves the project. */
+    for (const cbm_source_decl_t *import = imports; import; import = import->next) {
+        if (!import->bases[0] || strcmp(import->bases[1], text))
+            continue;
+        scala_ref_t path = scala_resolve_path_in(
+            ctx, cbm_arena_sprintf(walk->arena, "%s.%s", import->type, import->bases[0]), owner,
+            file);
+        return scala_class_key_of(&path);
     }
-    const char *package_owner = scala_package_owner(ctx, package);
+    const char *package_owner = scala_package_owner(ctx, scala_key_package(walk, owner));
     scala_ref_t own =
         package_owner ? scala_member_names(ctx, package_owner, text) : (scala_ref_t){0};
     const char *key = scala_class_key_of(&own);
     if (key)
         return key;
-    if (here) {
-        for (const scala_import_t *import = ctx->imports; import; import = import->next) {
-            if (import->member)
-                continue;
-            scala_ref_t from = scala_resolve_path(ctx, import->path);
-            if (from.kind != SCALA_PACKAGE_REF)
-                continue;
-            scala_ref_t found =
-                scala_member_names(ctx, scala_package_owner(ctx, from.package), text);
-            key = scala_class_key_of(&found);
-            if (key)
-                return key;
-        }
+    for (const cbm_source_decl_t *import = imports; import; import = import->next) {
+        if (import->bases[0])
+            continue;
+        scala_ref_t from = scala_resolve_path_in(ctx, import->type, owner, file);
+        const char *inside = from.kind == SCALA_PACKAGE_REF
+                                 ? scala_package_owner(ctx, from.package)
+                                 : (from.kind == SCALA_TEMPLATE ? from.key : NULL);
+        scala_ref_t found = inside ? scala_member_names(ctx, inside, text) : (scala_ref_t){0};
+        key = scala_class_key_of(&found);
+        if (key)
+            return key;
     }
     return NULL;
+}
+
+static const char *scala_lookup_type(scala_ctx_t *ctx, const char *owner, const char *text,
+                                     const char *file) {
+    if (!owner || !text || !file)
+        return NULL;
+    const char *memo_key =
+        ctx->type_memo ? cbm_arena_sprintf(ctx->walk->arena, "%s\x1f%s\x1f%s", file, owner, text)
+                       : NULL;
+    const char *known = memo_key ? cbm_ht_get(ctx->type_memo, memo_key) : NULL;
+    if (known)
+        return known[0] ? known : NULL;
+    /* A base named through what it inherits itself finds nothing there while it is read. */
+    if (memo_key)
+        cbm_ht_set(ctx->type_memo, memo_key, (void *)"");
+    const char *key = scala_lookup_type_uncached(ctx, owner, text, file);
+    if (memo_key)
+        cbm_ht_set(ctx->type_memo, memo_key, (void *)(key ? key : ""));
+    return key;
 }
 
 static scala_ref_t scala_ref_of_member(scala_ctx_t *ctx, const cbm_source_decl_t *decl) {
     scala_ref_t ref = {.reason = "scala_name_not_in_project"};
     if (decl->flags & CBM_SOURCE_DECL_F_VALUE) {
-        const char *type = decl->type ? scala_lookup_type(ctx, decl->owner, decl->type) : NULL;
+        const char *type =
+            decl->type ? scala_lookup_type(ctx, decl->owner, decl->type, decl->file) : NULL;
         ref.kind = type ? SCALA_VALUE : SCALA_UNKNOWN;
         ref.key = type;
+        ref.value_decl = decl;
         ref.reason = type ? "scala_call_of_a_value" : "scala_value_of_unknown_type";
         return ref;
     }
@@ -744,6 +895,22 @@ static scala_ref_t scala_name(scala_ctx_t *ctx, const char *name, int arguments)
         ref.reason = "scala_outside_import_may_provide_name";
         return ref;
     }
+    for (const scala_anonymous_t *anonymous = ctx->anonymous; anonymous;
+         anonymous = anonymous->next) {
+        const cbm_source_decl_t *member = NULL;
+        cbm_source_chain_t chain = {0};
+        scala_lookup_t found =
+            anonymous->base
+                ? scala_find_member(ctx, anonymous->base, name, arguments, false, &chain, &member)
+                : SCALA_OPEN;
+        if (found == SCALA_FOUND)
+            return scala_ref_of_member(ctx, member);
+        if (found != SCALA_ABSENT) {
+            ref.reason = found == SCALA_OPEN ? "scala_inheritance_leaves_project"
+                                             : "scala_overload_not_decided";
+            return ref;
+        }
+    }
     /* Enclosing templates, inner to outer. */
     char *scope = ctx->template_key ? cbm_arena_strdup(ctx->walk->arena, ctx->template_key) : NULL;
     while (scope) {
@@ -769,6 +936,10 @@ static scala_ref_t scala_name(scala_ctx_t *ctx, const char *name, int arguments)
             break;
         }
         scala_ref_t nested = scala_member_names(ctx, scope, name);
+        if (nested.kind != SCALA_UNKNOWN)
+            return nested;
+        cbm_source_chain_t names = {0};
+        nested = scala_inherited_names(ctx, scope, name, &names);
         if (nested.kind != SCALA_UNKNOWN)
             return nested;
         char *up = strrchr(scope, '.');
@@ -834,6 +1005,8 @@ static int scala_argument_count(TSNode call) {
     return (int)ts_node_named_child_count(arguments);
 }
 
+static scala_ref_t scala_call_result(scala_ctx_t *ctx, const scala_ref_t *callee, int arguments);
+
 static scala_ref_t scala_member_of(scala_ctx_t *ctx, const scala_ref_t *target, const char *name,
                                    int arguments) {
     scala_ref_t ref = {.reason = "scala_receiver_type_unknown"};
@@ -852,6 +1025,18 @@ static scala_ref_t scala_member_of(scala_ctx_t *ctx, const scala_ref_t *target, 
         return scala_template_member(ctx, target->key, name, arguments, target->from_super);
     if (target->kind == SCALA_TEMPLATE && target->key)
         return scala_template_member(ctx, target->key, name, arguments, false);
+    /* `x.m.n`: a method read without arguments is called. */
+    if (target->kind == SCALA_FUNCTION && target->decl && target->decl->arity_min == 0) {
+        scala_ref_t value = scala_call_result(ctx, target, 0);
+        if (value.kind == SCALA_VALUE && value.key)
+            return scala_template_member(ctx, value.key, name, arguments, false);
+        if (value.reason)
+            ref.reason = value.reason;
+        return ref;
+    }
+    /* Why the receiver is unknown is why this member is. */
+    if (target->reason)
+        ref.reason = target->reason;
     return ref;
 }
 
@@ -862,7 +1047,8 @@ static scala_ref_t scala_call_result(scala_ctx_t *ctx, const scala_ref_t *callee
     scala_ref_t result = {.reason = "scala_return_type_unknown"};
     if (callee->kind == SCALA_FUNCTION) {
         const char *type = callee->decl->type
-                               ? scala_lookup_type(ctx, callee->decl->owner, callee->decl->type)
+                               ? scala_lookup_type(ctx, callee->decl->owner, callee->decl->type,
+                                                   callee->decl->file)
                                : NULL;
         result.kind = type ? SCALA_VALUE : SCALA_UNKNOWN;
         result.key = type;
@@ -884,6 +1070,23 @@ static scala_ref_t scala_call_result(scala_ctx_t *ctx, const scala_ref_t *callee
         }
     }
     return result;
+}
+
+/* `f[T]` in `f[T](x)` is still f. */
+static TSNode scala_written_callee(TSNode function) {
+    return cbm_source_is(function, "generic_function") ? cbm_source_field(function, "function")
+                                                       : function;
+}
+
+/* `a op b` selects op on a, and `a op: b` selects it on b. */
+static scala_ref_t scala_infix_member(scala_ctx_t *ctx, TSNode node, unsigned depth) {
+    const char *name = cbm_source_text(ctx->walk, cbm_source_field(node, "operator"));
+    if (!name || !name[0])
+        return (scala_ref_t){.reason = "scala_computed_receiver"};
+    bool right = name[strlen(name) - 1] == ':';
+    TSNode operand = cbm_source_field(node, right ? "right" : "left");
+    scala_ref_t target = scala_expr(ctx, operand, -1, depth);
+    return scala_member_of(ctx, &target, name, 1);
 }
 
 static scala_ref_t scala_expr(scala_ctx_t *ctx, TSNode node, int arguments, unsigned depth) {
@@ -911,15 +1114,20 @@ static scala_ref_t scala_expr(scala_ctx_t *ctx, TSNode node, int arguments, unsi
     }
     if (cbm_source_is(node, "call_expression")) {
         int count = scala_argument_count(node);
-        scala_ref_t callee = scala_expr(ctx, cbm_source_field(node, "function"), count, depth + 1);
+        scala_ref_t callee = scala_expr(
+            ctx, scala_written_callee(cbm_source_field(node, "function")), count, depth + 1);
         return scala_call_result(ctx, &callee, count);
+    }
+    if (cbm_source_is(node, "infix_expression")) {
+        scala_ref_t callee = scala_infix_member(ctx, node, depth + 1);
+        return scala_call_result(ctx, &callee, 1);
     }
     if (cbm_source_is(node, "instance_expression")) {
         const char *type =
             scala_type_text(ctx->walk, ts_node_named_child(node, 0), ctx->type_params);
         const char *owner =
             ctx->template_key ? ctx->template_key : scala_package_owner(ctx, ctx->packages[0]);
-        const char *key = type ? scala_lookup_type(ctx, owner, type) : NULL;
+        const char *key = type ? scala_lookup_type(ctx, owner, type, ctx->walk->file) : NULL;
         if (key)
             return (scala_ref_t){.kind = SCALA_VALUE, .key = key};
         return unknown;
@@ -976,18 +1184,17 @@ static void scala_emit(scala_ctx_t *ctx, TSNode site, const scala_ref_t *ref, in
 
 /* A name read as a value or a type follows the same lookup as a call's. A template
  * reached by a type name is the class; by a term, the object. */
-static void scala_visit_reference(scala_ctx_t *ctx, TSNode node, bool type_position) {
-    const char *name = cbm_source_text(ctx->walk, node);
-    if (!name || !strcmp(name, "this") || !strcmp(name, "super"))
-        return;
-    scala_ref_t ref = scala_name(ctx, name, -1);
+static void scala_emit_reference(scala_ctx_t *ctx, TSNode node, const scala_ref_t *ref,
+                                 bool type_position) {
     const cbm_source_decl_t *decl = NULL;
-    if (ref.kind == SCALA_FUNCTION && !type_position)
-        decl = ref.decl;
-    else if (ref.kind == SCALA_CLASS)
-        decl = ref.decl;
-    else if (ref.kind == SCALA_TEMPLATE)
-        decl = type_position ? ref.decl : ref.object_decl;
+    if (ref->kind == SCALA_FUNCTION && !type_position)
+        decl = ref->decl;
+    else if (ref->kind == SCALA_CLASS)
+        decl = ref->decl;
+    else if (ref->kind == SCALA_TEMPLATE)
+        decl = type_position ? ref->decl : ref->object_decl;
+    else if (ref->value_decl && !type_position)
+        decl = ref->value_decl;
     if (!decl)
         return;
     const char *identity = NULL;
@@ -995,9 +1202,41 @@ static void scala_visit_reference(scala_ctx_t *ctx, TSNode node, bool type_posit
     single.next = NULL;
     const char *target = cbm_source_unique_qn(&single, &identity);
     cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, target,
-                         ref.via_import ? CBM_RESOLVE_RULE_IMPORT_BINDING
-                                        : CBM_RESOLVE_RULE_SCOPE_BINDING,
-                         decl->owner, target ? ref.reason : identity);
+                         ref->via_import     ? CBM_RESOLVE_RULE_IMPORT_BINDING
+                         : ref->via_receiver ? CBM_RESOLVE_RULE_TYPE_MEMBER
+                                             : CBM_RESOLVE_RULE_SCOPE_BINDING,
+                         decl->owner, target ? ref->reason : identity);
+}
+
+static void scala_visit_reference(scala_ctx_t *ctx, TSNode node, bool type_position) {
+    const char *name = cbm_source_text(ctx->walk, node);
+    if (!name || !strcmp(name, "this") || !strcmp(name, "super"))
+        return;
+    scala_ref_t ref = scala_name(ctx, name, -1);
+    scala_emit_reference(ctx, node, &ref, type_position);
+}
+
+/* `x.name` read as a value, when it is no call's function. */
+static void scala_visit_selection(scala_ctx_t *ctx, TSNode node) {
+    TSNode field = cbm_source_field(node, "field");
+    const char *name = cbm_source_text(ctx->walk, field);
+    if (!name)
+        return;
+    scala_ref_t target = scala_expr(ctx, cbm_source_field(node, "value"), -1, 0);
+    scala_ref_t ref = scala_member_of(ctx, &target, name, -1);
+    scala_emit_reference(ctx, field, &ref, false);
+}
+
+/* `a.b.Foo` in a type: the path names it, never a Foo in scope here. */
+static void scala_visit_type_path(scala_ctx_t *ctx, TSNode node) {
+    const char *text = scala_type_text(ctx->walk, node, ctx->type_params);
+    uint32_t count = ts_node_named_child_count(node);
+    if (!text || !count)
+        return;
+    scala_ref_t ref = scala_resolve_path(ctx, text);
+    /* A mention sits on the last name, a type use on the whole path. */
+    scala_emit_reference(ctx, ts_node_named_child(node, count - 1), &ref, true);
+    scala_emit_reference(ctx, node, &ref, true);
 }
 
 /* ── Phase two: the walk ───────────────────────────────────────────── */
@@ -1005,6 +1244,8 @@ static void scala_visit_reference(scala_ctx_t *ctx, TSNode node, bool type_posit
 static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth);
 
 static void scala_visit_children(scala_ctx_t *ctx, TSNode node, unsigned depth) {
+    bool in_block = cbm_source_is(node, "block");
+    bool in_template = cbm_source_is(node, "template_body");
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
@@ -1014,13 +1255,18 @@ static void scala_visit_children(scala_ctx_t *ctx, TSNode node, unsigned depth) 
             /* A field's name and a named argument's are spelled, not read. */
             const char *field = ts_tree_cursor_current_field_name(&cursor);
             if (cbm_source_is(child, "identifier") && field &&
-                (!strcmp(field, "field") || !strcmp(field, "left") || !strcmp(field, "name")))
+                (!strcmp(field, "field") || !strcmp(field, "name") || !strcmp(field, "operator") ||
+                 (!strcmp(field, "left") && cbm_source_is(node, "assignment_expression"))))
                 continue;
+            ctx->child_of_block = in_block;
+            ctx->child_of_template = in_template;
             scala_visit(ctx, child, depth + 1);
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
     ts_tree_cursor_delete(&cursor);
 }
+
+static const char *scala_type_key_here(scala_ctx_t *ctx, TSNode type_node);
 
 static void scala_bind_pattern(scala_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
@@ -1028,6 +1274,15 @@ static void scala_bind_pattern(scala_ctx_t *ctx, TSNode node, unsigned depth) {
     if (cbm_source_is(node, "identifier")) {
         scala_bind(ctx, cbm_source_text(ctx->walk, node), NULL);
         return;
+    }
+    /* `case e: Foo` and `(y: Foo) =>` say the type of what they bind. */
+    if (cbm_source_is(node, "typed_pattern") || cbm_source_is(node, "binding")) {
+        TSNode name = ts_node_named_child(node, 0);
+        if (cbm_source_is(name, "identifier")) {
+            scala_bind(ctx, cbm_source_text(ctx->walk, name),
+                       scala_type_key_here(ctx, ts_node_named_child(node, 1)));
+            return;
+        }
     }
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++)
@@ -1038,24 +1293,35 @@ static const char *scala_type_key_here(scala_ctx_t *ctx, TSNode type_node) {
     const char *type = scala_type_text(ctx->walk, type_node, ctx->type_params);
     const char *owner =
         ctx->template_key ? ctx->template_key : scala_package_owner(ctx, ctx->packages[0]);
-    return type ? scala_lookup_type(ctx, owner, type) : NULL;
+    return type ? scala_lookup_type(ctx, owner, type, ctx->walk->file) : NULL;
 }
 
-static void scala_bind_parameters(scala_ctx_t *ctx, TSNode function) {
-    uint32_t count = ts_node_named_child_count(function);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode list = ts_node_named_child(function, i);
-        if (!cbm_source_is(list, "parameters"))
-            continue;
-        uint32_t params = ts_node_named_child_count(list);
-        for (uint32_t p = 0; p < params; p++) {
-            TSNode param = ts_node_named_child(list, p);
-            if (!cbm_source_is(param, "parameter"))
+/* One parameter list: its types and defaults are read before its names come into scope,
+ * which the lists after it, and the body, see. A class's parameters go the same way. */
+static void scala_visit_parameter_list(scala_ctx_t *ctx, TSNode list, unsigned depth) {
+    TSTreeCursor cursor = ts_tree_cursor_new(list);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode param = ts_tree_cursor_current_node(&cursor);
+            if (!cbm_source_is(param, "parameter") && !cbm_source_is(param, "class_parameter"))
                 continue;
-            scala_bind(ctx, cbm_source_text(ctx->walk, cbm_source_field(param, "name")),
-                       scala_type_key_here(ctx, cbm_source_field(param, "type")));
-        }
+            TSNode type = cbm_source_field(param, "type");
+            if (!ts_node_is_null(type))
+                scala_visit(ctx, type, depth + 1);
+            TSNode value = cbm_source_field(param, "default_value");
+            if (!ts_node_is_null(value))
+                scala_visit(ctx, value, depth + 1);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        ts_tree_cursor_reset(&cursor, list);
+        (void)ts_tree_cursor_goto_first_child(&cursor);
+        do {
+            TSNode param = ts_tree_cursor_current_node(&cursor);
+            if (cbm_source_is(param, "parameter") || cbm_source_is(param, "class_parameter"))
+                scala_bind(ctx, cbm_source_text(ctx->walk, cbm_source_field(param, "name")),
+                           scala_type_key_here(ctx, cbm_source_field(param, "type")));
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static void scala_add_import(scala_ctx_t *ctx, TSNode node, scala_import_t **list) {
@@ -1133,20 +1399,18 @@ static void scala_visit_function(scala_ctx_t *ctx, TSNode node, unsigned depth, 
     scala_import_t *saved_imports = ctx->block_imports;
     const char *saved_params = ctx->type_params;
     ctx->type_params = scala_type_params(ctx->walk, node, ctx->type_params);
-    uint32_t parts = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < parts; i++) {
-        TSNode list = ts_node_named_child(node, i);
-        uint32_t params = cbm_source_is(list, "parameters") ? ts_node_named_child_count(list) : 0;
-        for (uint32_t p = 0; p < params; p++) {
-            TSNode type = cbm_source_field(ts_node_named_child(list, p), "type");
-            if (!ts_node_is_null(type))
-                scala_visit(ctx, type, depth + 1);
-        }
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode list = ts_tree_cursor_current_node(&cursor);
+            if (cbm_source_is(list, "parameters"))
+                scala_visit_parameter_list(ctx, list, depth);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
+    ts_tree_cursor_delete(&cursor);
     TSNode returned = cbm_source_field(node, "return_type");
     if (!ts_node_is_null(returned))
         scala_visit(ctx, returned, depth + 1);
-    scala_bind_parameters(ctx, node);
     TSNode body = cbm_source_field(node, "body");
     if (!ts_node_is_null(body))
         scala_visit(ctx, body, depth + 1);
@@ -1164,11 +1428,24 @@ static void scala_visit_template(scala_ctx_t *ctx, TSNode node, unsigned depth) 
     const char *saved_params = ctx->type_params;
     scala_local_t *saved_locals = ctx->locals;
     scala_import_t *saved_imports = ctx->block_imports;
+    ctx->type_params = scala_type_params(ctx->walk, node, NULL);
+    /* A class's parameters and its parents' arguments are read outside its members. */
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode part = ts_tree_cursor_current_node(&cursor);
+            if (cbm_source_is(part, "class_parameters"))
+                scala_visit_parameter_list(ctx, part, depth);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    TSNode extend = cbm_source_field(node, "extend");
+    if (!ts_node_is_null(extend))
+        scala_visit_children(ctx, extend, depth + 1);
     ctx->template_key =
         saved ? cbm_arena_sprintf(ctx->walk->arena, "%s.%s%s", saved, object ? "$" : "", name)
               : cbm_arena_sprintf(ctx->walk->arena, "t:%s#%s%s", ctx->packages[0],
                                   object ? "$" : "", name);
-    ctx->type_params = scala_type_params(ctx->walk, node, NULL);
     ctx->locals = NULL;
     TSNode body = cbm_source_field(node, "body");
     if (!ts_node_is_null(body))
@@ -1196,11 +1473,11 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
     }
     if (!strcmp(kind, "function_definition")) {
         /* A member's name is declared in the template; a local one binds here. */
-        TSNode parent_is_body = ts_node_parent(node);
-        scala_visit_function(ctx, node, depth, cbm_source_is(parent_is_body, "block"));
+        scala_visit_function(ctx, node, depth, ctx->child_of_block);
         return;
     }
     if (!strcmp(kind, "val_definition") || !strcmp(kind, "var_definition")) {
+        bool in_block = ctx->child_of_block;
         TSNode value = cbm_source_field(node, "value");
         TSNode pattern = cbm_source_field(node, "pattern");
         TSNode type = cbm_source_field(node, "type");
@@ -1212,7 +1489,7 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
         }
         if (!ts_node_is_null(value))
             scala_visit(ctx, value, depth + 1);
-        if (ctx->template_key && !cbm_source_is(ts_node_parent(node), "block"))
+        if (ctx->template_key && !in_block)
             return; /* A template's own member, declared in the table. */
         if (cbm_source_is(pattern, "identifier"))
             scala_bind(ctx, cbm_source_text(ctx->walk, pattern), key);
@@ -1221,13 +1498,32 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
         return;
     }
     if (!strcmp(kind, "call_expression")) {
-        TSNode function = cbm_source_field(node, "function");
+        TSNode function = scala_written_callee(cbm_source_field(node, "function"));
         if (cbm_source_is(function, "identifier") || cbm_source_is(function, "field_expression")) {
             int count = scala_argument_count(node);
             scala_ref_t ref = scala_expr(ctx, function, count, 0);
             scala_emit(ctx, node, &ref, count);
         }
+        TSNode saved = ctx->callee;
+        ctx->callee = function;
         scala_visit_children(ctx, node, depth);
+        ctx->callee = saved;
+        return;
+    }
+    if (!strcmp(kind, "infix_expression")) {
+        scala_ref_t ref = scala_infix_member(ctx, node, 0);
+        scala_emit(ctx, node, &ref, 1);
+        scala_visit_children(ctx, node, depth);
+        return;
+    }
+    if (!strcmp(kind, "field_expression") &&
+        (ts_node_is_null(ctx->callee) || !ts_node_eq(node, ctx->callee))) {
+        scala_visit_selection(ctx, node);
+        scala_visit_children(ctx, node, depth);
+        return;
+    }
+    if (!strcmp(kind, "stable_type_identifier")) {
+        scala_visit_type_path(ctx, node);
         return;
     }
     if (!strcmp(kind, "instance_expression")) {
@@ -1243,7 +1539,41 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
                 ref = (scala_ref_t){.reason = "scala_class_not_in_project"};
             scala_emit(ctx, node, &ref, -1);
         }
-        scala_visit_children(ctx, node, depth);
+        TSNode body = scala_child_of_kind(node, "template_body");
+        if (ts_node_is_null(body)) {
+            scala_visit_children(ctx, node, depth);
+            return;
+        }
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode part = ts_tree_cursor_current_node(&cursor);
+                if (ts_node_is_named(part) && !ts_node_eq(part, body))
+                    scala_visit(ctx, part, depth + 1);
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        scala_anonymous_t anonymous = {.next = ctx->anonymous};
+        anonymous.base = scala_type_key_here(ctx, ts_node_named_child(node, 0));
+        scala_local_t *saved = ctx->locals;
+        ctx->anonymous = &anonymous;
+        /* Its own members are in no table, and hide what is around it. */
+        cursor = ts_tree_cursor_new(body);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode member = ts_tree_cursor_current_node(&cursor);
+                if (cbm_source_is(member, "function_definition"))
+                    scala_bind(ctx, cbm_source_text(ctx->walk, cbm_source_field(member, "name")),
+                               NULL);
+                else if (cbm_source_is(member, "val_definition") ||
+                         cbm_source_is(member, "var_definition"))
+                    scala_bind_pattern(ctx, cbm_source_field(member, "pattern"), depth + 1);
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        scala_visit_children(ctx, body, depth + 1);
+        ctx->anonymous = anonymous.next;
+        ctx->locals = saved;
         return;
     }
     if (!strcmp(kind, "lambda_expression")) {
@@ -1274,15 +1604,18 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
     }
     if (!strcmp(kind, "for_expression")) {
         scala_local_t *saved = ctx->locals;
-        TSNode enumerators = cbm_source_field(node, "enumerators");
+        TSNode enumerators = scala_child_of_kind(node, "enumerators");
         uint32_t count = ts_node_is_null(enumerators) ? 0 : ts_node_named_child_count(enumerators);
         for (uint32_t i = 0; i < count; i++) {
             TSNode enumerator = ts_node_named_child(enumerators, i);
             uint32_t parts = ts_node_named_child_count(enumerator);
-            for (uint32_t p = 1; p < parts; p++)
-                scala_visit(ctx, ts_node_named_child(enumerator, p), depth + 1);
+            /* The generator reads what is outside; its guards see what it binds. */
+            if (parts > 1)
+                scala_visit(ctx, ts_node_named_child(enumerator, 1), depth + 1);
             if (parts > 0)
                 scala_bind_pattern(ctx, ts_node_named_child(enumerator, 0), depth + 1);
+            for (uint32_t p = 2; p < parts; p++)
+                scala_visit(ctx, ts_node_named_child(enumerator, p), depth + 1);
         }
         TSNode body = cbm_source_field(node, "body");
         if (!ts_node_is_null(body))
@@ -1291,8 +1624,7 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
         return;
     }
     if (!strcmp(kind, "import_declaration")) {
-        if (cbm_source_is(ts_node_parent(node), "block") ||
-            cbm_source_is(ts_node_parent(node), "template_body"))
+        if (ctx->child_of_block || ctx->child_of_template)
             scala_add_import(ctx, node, &ctx->block_imports);
         return;
     }
@@ -1308,7 +1640,7 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
 }
 
 static void scala_resolve(cbm_source_walk_t *walk) {
-    scala_ctx_t ctx = {.walk = walk};
+    scala_ctx_t ctx = {.walk = walk, .type_memo = cbm_ht_create(64)};
     ctx.package_count = scala_file_packages(walk, ctx.packages);
     uint32_t count = ts_node_named_child_count(walk->root);
     for (uint32_t i = 0; i < count; i++) {
@@ -1317,10 +1649,12 @@ static void scala_resolve(cbm_source_walk_t *walk) {
             scala_add_import(&ctx, child, &ctx.imports);
     }
     scala_visit_children(&ctx, walk->root, 0);
+    cbm_ht_free(ctx.type_memo);
 }
 
 const cbm_source_adapter_t cbm_source_adapter_scala = {.language = CBM_LANG_SCALA,
                                                        .collect = scala_collect,
                                                        .resolve = scala_resolve,
                                                        .one_name_one_node = true,
-                                                       .decides_references = true};
+                                                       .decides_references = true,
+                                                       .contains_parse_damage = true};

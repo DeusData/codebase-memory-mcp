@@ -715,6 +715,11 @@ bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         return strcmp(kind, "internal_module") == 0;
     }
+    /* `module Name = struct let f x = x end` is `Name.f`. Without its segment every f of
+     * a file is one node, and neither a call to it nor a call from it can be stated. */
+    if (lang == CBM_LANG_OCAML) {
+        return strcmp(kind, "module_binding") == 0;
+    }
     return false;
 }
 

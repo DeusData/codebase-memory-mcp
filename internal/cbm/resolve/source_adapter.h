@@ -56,6 +56,12 @@ bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
                         size_t source_len);
 bool cbm_source_table_incomplete(const cbm_source_table_t *table, CBMLanguage language);
 
+/* The QN of a declared type's base class by this language's rules, for the graph's
+ * inheritance edges. offset counts the bases this language's rules can name; NULL means
+ * there are no more. */
+const char *cbm_source_table_base(const cbm_source_table_t *table, CBMLanguage language,
+                                  const char *qualified_name, size_t offset);
+
 /* Phase two. The table is read only and may be shared by parallel workers.
  * NULL only on allocation failure; an unanalyzable file yields a unit whose
  * sites all abstain with its failure reason. */
@@ -63,13 +69,17 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
                                          const CBMFileResult *result, CBMLanguage language,
                                          const char *file, const char *source, size_t source_len);
 
-/* Calls this language's rules prove at sites extraction has no carrier for, such as
- * Ruby's bare method name or a call deep in a Dart selector chain. scope is the
- * enclosing definition's QN, empty for the file. Only decided sites are listed. */
+/* Occurrences this language's rules prove at sites extraction has no carrier for, such as
+ * Ruby's bare method name, a Ruby constant or a call deep in a Dart selector chain. scope
+ * is the enclosing definition's QN, empty for the file. kind says whether the site calls
+ * or mentions its target, line is the site's line when the adapter stated one, else 0.
+ * Only decided sites are listed. */
 typedef struct {
     const char *scope;
     const char *name;
     uint32_t start, end;
+    cbm_source_site_kind_t kind;
+    uint32_t line;
 } cbm_source_extra_call_t;
 const cbm_source_extra_call_t *cbm_source_unit_extra_calls(const cbm_source_unit_t *unit,
                                                            size_t *count);

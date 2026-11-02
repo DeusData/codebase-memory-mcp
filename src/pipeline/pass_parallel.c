@@ -4086,6 +4086,18 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             ws->semantic_resolved++;
         }
     }
+    for (size_t b = 0; rc->pctx; b++) {
+        const char *base_qn = cbm_shared_resolver_source_base(rc->pctx->shared_resolver, fs->lang,
+                                                              def->qualified_name, b);
+        if (!base_qn)
+            break;
+        const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, base_qn);
+        if (bn && node->id != bn->id) {
+            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id,
+                                 cbm_semantic_base_edge_type(bn), "{}");
+            ws->semantic_resolved++;
+        }
+    }
     if (!def->base_classes) {
         return;
     }

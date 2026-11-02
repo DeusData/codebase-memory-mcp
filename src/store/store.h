@@ -34,8 +34,11 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *      __image__<repository as written>, registry "unknown" -- no longer
  *      __image__docker.io/[library/]<repository>.
  *   4  #1913: Go method QNs are receiver-qualified (pkg.Recv.method, generic
- *      receivers unwrapped); free functions stay pkg.func. */
-#define CBM_INDEX_FORMAT_VERSION 4
+ *      receivers unwrapped); free functions stay pkg.func.
+ *   5  OCaml functions carry their module path (file.Module.f), Zig functions
+ *      their container (file.Foo.init), Scala class-body vals their class
+ *      (file.Foo.x); same-named ones were one node. */
+#define CBM_INDEX_FORMAT_VERSION 5
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)

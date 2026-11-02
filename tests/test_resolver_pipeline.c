@@ -359,6 +359,10 @@ TEST(resolver_pipeline_ruby_parenthesized_call_binds_its_top_level_def) {
     ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target\n target = 2\nend\n",
                                 "main.rb"),
               1);
+    /* A file runs top to bottom, so the later of two definitions is the one that stands. */
+    ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef target\n 2\nend\ndef caller\n target()\nend\n",
+                                "main.rb"),
+              1);
     /* A local of that name cannot capture a call with parentheses. */
     ASSERT_EQ(
         ruby_target_edges("def target\n 1\nend\ndef caller\n target = 2\n target()\nend\n", "main.rb"),
@@ -374,13 +378,13 @@ TEST(resolver_pipeline_ruby_redefinition_and_metaprogramming_abstain) {
         "def target\n 1\nend\ndef caller(target)\n target\nend\n",
         "def target\n 1\nend\ndef caller\n [1].each { |target| target }\nend\n",
         "def target\n 1\nend\ndef caller(s)\n /(?<target>x)/ =~ s\n target\nend\n",
-        /* Two definitions of one name. */
-        "def target\n 1\nend\ndef target\n 2\nend\ndef caller\n target()\nend\n",
+        /* Two definitions of one name, one of which may not run. */
+        "def target\n 1\nend\nif x\n def target\n 2\n end\nend\ndef caller\n target()\nend\n",
         /* `define_method` replaces the literal name in the class. */
         "class A\n def target\n 1\n end\n define_method(:target) { 2 }\n def caller\n target()\n "
         "end\nend\n",
-        /* An attribute macro declares it too. */
-        "class A\n attr_reader :target\n def target\n 1\n end\n def caller\n target()\n "
+        /* An attribute macro after the def replaces it, and has no node of its own. */
+        "class A\n def target\n 1\n end\n attr_reader :target\n def caller\n target()\n "
         "end\nend\n",
         /* A prepended module outside the project comes before the class. */
         "class A\n prepend Outside\n def target\n 1\n end\n def caller\n target()\n end\nend\n",

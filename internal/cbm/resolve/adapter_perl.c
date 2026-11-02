@@ -18,8 +18,18 @@
  * that isa P, so P's chain is what static rules can select from. Override in a
  * subclass is runtime dispatch.
  *
+ * `shift->m` and `$_[0]->m` read that same first argument directly. They count when
+ * nothing has shifted it away first, in a named sub of a package other than main that
+ * the project never calls as a plain function or exports. Only such a sub is known to
+ * be reached as a method; `_select($list)` hands over whatever it was given. The sub
+ * given for an operator in `use overload` gets the object first, by that pragma's own
+ * contract, and `my ($self, $x) = (shift, shift)` takes the first argument too.
+ *
  * An import binds only through Exporter: the exporting package uses Exporter,
- * has no sub import of its own, and lists the name in @EXPORT or @EXPORT_OK.
+ * has no sub import of its own, and lists the name in @EXPORT or @EXPORT_OK. What it
+ * lists can be a name it imported itself, which is then that module's export.
+ *
+ * `\&name` takes a reference to the sub the same lookup selects, without calling it.
  *
  * Literal glob assignment and lexical `my sub` replace a name, so that name
  * abstains. A glob assigned from a computed name can touch any package anywhere
@@ -33,6 +43,8 @@ enum { PERL_MAX_BASES = 32 };
 
 #define PERL_EXPORTER_KEY "&exporter"
 #define PERL_EXPORT_PREFIX "&export:"
+#define PERL_IMPORTED_PREFIX "&imported:"
+#define PERL_FUNCTION_CALL_PREFIX "&function:"
 
 typedef struct perl_import {
     const char *package; /* importing package */
@@ -45,6 +57,10 @@ typedef struct {
     cbm_source_walk_t *walk;
     const char *package;
     perl_import_t *imports;
+    CBMHashTable *function_calls; /* phase one: "package\x1fname" already noted in this file */
+    uint32_t first_shift;         /* byte of the sub's first shift of its arguments */
+    bool reads_invocant;          /* shift-> and $_[0]-> name the invocant here */
+    bool overload_list;           /* directly in the list of a `use overload` */
 } perl_ctx_t;
 
 static const char *perl_field_text(perl_ctx_t *ctx, TSNode node, const char *name) {
@@ -193,6 +209,18 @@ static void perl_note_exporter(perl_ctx_t *ctx, const char *package, uint32_t li
                              line);
 }
 
+/* A name this package imported is in its symbol table, so it can export it onward. */
+// cppcheck-suppress constParameterCallback
+static void perl_declare_imported(perl_ctx_t *ctx, const char *word, void *user) {
+    const char *name = word[0] == '&' ? word + 1 : word;
+    const char *key = cbm_arena_sprintf(ctx->walk->arena, "%s%s", PERL_IMPORTED_PREFIX, name);
+    cbm_source_decl_t *decl =
+        key ? cbm_source_declare(ctx->walk, ctx->package, key, NULL, CBM_SOURCE_DECL_F_VALUE, 0)
+            : NULL;
+    if (decl)
+        decl->type = cbm_source_table_intern(ctx->walk, (const char *)user);
+}
+
 /* `use parent`, `use base` and Mojo::Base set @ISA at compile time. */
 static void perl_collect_use(perl_ctx_t *ctx, TSNode use) {
     const char *module = perl_field_text(ctx, use, "module");
@@ -205,8 +233,11 @@ static void perl_collect_use(perl_ctx_t *ctx, TSNode use) {
         return;
     }
     bool mojo = !strcmp(module, "Mojo::Base");
-    if (strcmp(module, "parent") && strcmp(module, "base") && !mojo)
+    if (strcmp(module, "parent") && strcmp(module, "base") && !mojo) {
+        if (!ts_node_is_null(arguments))
+            (void)perl_literal_words(ctx, arguments, perl_declare_imported, (void *)module);
         return;
+    }
     perl_words_t words = {0};
     bool literal =
         ts_node_is_null(arguments) || perl_literal_words(ctx, arguments, perl_gather_word, &words);
@@ -300,6 +331,23 @@ static void perl_collect_sub(perl_ctx_t *ctx, TSNode node) {
                              CBM_SOURCE_DECL_F_PUBLIC, line);
 }
 
+/* Which subs the project calls as plain functions, once per file and name. */
+static void perl_note_function_call(perl_ctx_t *ctx, TSNode call) {
+    const char *raw = cbm_source_text(ctx->walk, cbm_source_field(call, "function"));
+    if (!raw)
+        return;
+    const char *owner = NULL, *leaf = NULL;
+    perl_split(ctx, raw[0] == '&' ? raw + 1 : raw, ctx->package, &owner, &leaf);
+    const char *seen = cbm_arena_sprintf(ctx->walk->arena, "%s\x1f%s", owner, leaf);
+    if (!seen || !ctx->function_calls || cbm_ht_get(ctx->function_calls, seen))
+        return;
+    cbm_ht_set(ctx->function_calls, seen, (void *)seen);
+    const char *key = cbm_arena_sprintf(ctx->walk->arena, "%s%s", PERL_FUNCTION_CALL_PREFIX, leaf);
+    if (key)
+        (void)cbm_source_declare(ctx->walk, owner, key, NULL, CBM_SOURCE_DECL_F_VALUE,
+                                 ts_node_start_point(call).row + 1);
+}
+
 static void perl_collect_node(perl_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
@@ -352,7 +400,10 @@ static void perl_collect_node(perl_ctx_t *ctx, TSNode node, unsigned depth) {
                             cbm_source_named_field(child, "right"),
                             ts_node_start_point(child).row + 1);
                 }
+            } else if (cbm_source_is(child, "function_call_expression")) {
+                perl_note_function_call(ctx, child);
             } else if (cbm_source_is(child, "ambiguous_function_call_expression")) {
+                perl_note_function_call(ctx, child);
                 /* `push @ISA, 'X'` */
                 const char *function = perl_field_text(ctx, child, "function");
                 TSNode arguments = cbm_source_field(child, "arguments");
@@ -380,8 +431,9 @@ static void perl_collect_node(perl_ctx_t *ctx, TSNode node, unsigned depth) {
 }
 
 static void perl_collect(cbm_source_walk_t *walk) {
-    perl_ctx_t ctx = {.walk = walk, .package = "main"};
+    perl_ctx_t ctx = {.walk = walk, .package = "main", .function_calls = cbm_ht_create(64)};
     perl_collect_node(&ctx, walk->root, 0);
+    cbm_ht_free(ctx.function_calls);
 }
 
 /* ── Phase two ─────────────────────────────────────────────────────── */
@@ -483,24 +535,40 @@ static void perl_gather_imports(perl_ctx_t *ctx, TSNode node, unsigned depth) {
     ts_tree_cursor_delete(&cursor);
 }
 
-/* The named export of an Exporter-based module, or nothing. */
-static const char *perl_imported_target(perl_ctx_t *ctx, const char *name, const char **module) {
+/* What a module exports under a name: its own sub, or one it imported in turn. A chain
+ * of modules visits each once, so a cycle ends and the cost is the chain's length. */
+static bool perl_exported_sub(const perl_ctx_t *ctx, const char *module, const char *name,
+                              cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
     char key[256];
     int length = snprintf(key, sizeof(key), "%s%s", PERL_EXPORT_PREFIX, name);
+    if (length < 0 || (size_t)length >= sizeof(key) ||
+        !cbm_source_chain_first_visit(chain, module) ||
+        !cbm_source_lookup(ctx->walk, module, PERL_EXPORTER_KEY) ||
+        cbm_source_lookup(ctx->walk, module, "import") ||
+        !cbm_source_lookup(ctx->walk, module, key))
+        return false;
+    perl_lookup_t own = perl_own_sub(ctx, module, name, out);
+    if (own != PERL_ABSENT)
+        return own == PERL_FOUND;
+    length = snprintf(key, sizeof(key), "%s%s", PERL_IMPORTED_PREFIX, name);
     if (length < 0 || (size_t)length >= sizeof(key))
-        return NULL;
+        return false;
+    const cbm_source_decl_t *imported = cbm_source_lookup(ctx->walk, module, key);
+    return imported && !imported->next && imported->type &&
+           perl_exported_sub(ctx, imported->type, name, chain, out);
+}
+
+/* The named export of an Exporter-based module, or nothing. */
+static const char *perl_imported_target(perl_ctx_t *ctx, const char *name, const char **module) {
     const char *selected = NULL;
     for (const perl_import_t *import = ctx->imports; import; import = import->next) {
         if (strcmp(import->package, ctx->package))
             continue;
         if (import->name && strcmp(import->name, name))
             continue;
-        if (!cbm_source_lookup(ctx->walk, import->module, PERL_EXPORTER_KEY) ||
-            cbm_source_lookup(ctx->walk, import->module, "import") ||
-            !cbm_source_lookup(ctx->walk, import->module, key))
-            continue;
         const cbm_source_decl_t *decl = NULL;
-        if (perl_own_sub(ctx, import->module, name, &decl) != PERL_FOUND)
+        cbm_source_chain_t chain = {0};
+        if (!perl_exported_sub(ctx, import->module, name, &chain, &decl))
             continue;
         if (selected && strcmp(selected, decl->qn))
             return NULL;
@@ -513,6 +581,39 @@ static const char *perl_imported_target(perl_ctx_t *ctx, const char *name, const
 static void perl_emit(perl_ctx_t *ctx, TSNode node, const char *target, cbm_resolve_rule_t rule,
                       const char *domain, const char *reason) {
     cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_CALL, target, rule, domain, reason);
+}
+
+/* A sub named in the current package or spelled with its own. */
+static void perl_emit_sub(perl_ctx_t *ctx, TSNode node, cbm_source_site_kind_t kind,
+                          const char *text) {
+    const char *owner = NULL, *leaf = NULL;
+    perl_split(ctx, text, ctx->package, &owner, &leaf);
+    bool qualified = strstr(text, "::") != NULL;
+    const cbm_source_decl_t *decl = NULL;
+    perl_lookup_t own = perl_own_sub(ctx, owner, leaf, &decl);
+    if (own == PERL_FOUND) {
+        cbm_source_emit_node(ctx->walk, node, kind, decl->qn,
+                             qualified ? CBM_RESOLVE_RULE_LANGUAGE_BINDING
+                                       : CBM_RESOLVE_RULE_SCOPE_BINDING,
+                             owner, qualified ? "perl_qualified_sub" : "perl_current_package_sub");
+        return;
+    }
+    if (own == PERL_AMBIGUOUS) {
+        cbm_source_emit_node(ctx->walk, node, kind, NULL, CBM_RESOLVE_RULE_NONE, NULL,
+                             "perl_sub_name_not_one_declaration");
+        return;
+    }
+    if (!qualified) {
+        const char *module = NULL;
+        const char *target = perl_imported_target(ctx, leaf, &module);
+        if (target) {
+            cbm_source_emit_node(ctx->walk, node, kind, target, CBM_RESOLVE_RULE_IMPORT_BINDING,
+                                 module, "perl_exporter_import");
+            return;
+        }
+    }
+    cbm_source_emit_node(ctx->walk, node, kind, NULL, CBM_RESOLVE_RULE_NONE, NULL,
+                         "perl_sub_not_in_package");
 }
 
 static void perl_visit_function_call(perl_ctx_t *ctx, TSNode node) {
@@ -540,30 +641,25 @@ static void perl_visit_function_call(perl_ctx_t *ctx, TSNode node) {
         perl_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL, "perl_core_namespace");
         return;
     }
-    const cbm_source_decl_t *decl = NULL;
-    perl_lookup_t own = perl_own_sub(ctx, owner, leaf, &decl);
-    if (own == PERL_FOUND) {
-        perl_emit(ctx, node, decl->qn,
-                  qualified ? CBM_RESOLVE_RULE_LANGUAGE_BINDING : CBM_RESOLVE_RULE_SCOPE_BINDING,
-                  owner, qualified ? "perl_qualified_sub" : "perl_current_package_sub");
-        return;
-    }
-    if (own == PERL_AMBIGUOUS) {
-        perl_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL,
-                  "perl_sub_name_not_one_declaration");
-        return;
-    }
-    if (!qualified) {
-        const char *module = NULL;
-        const char *target = perl_imported_target(ctx, leaf, &module);
-        if (target) {
-            perl_emit(ctx, node, target, CBM_RESOLVE_RULE_IMPORT_BINDING, module,
-                      "perl_exporter_import");
-            return;
-        }
-    }
-    perl_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL, "perl_sub_not_in_package");
+    perl_emit_sub(ctx, node, CBM_SOURCE_SITE_CALL, text);
 }
+
+/* `\&name`: the sub the lookup selects, referred to rather than called. */
+static void perl_visit_code_reference(perl_ctx_t *ctx, TSNode node) {
+    const char *text = cbm_source_text(ctx->walk, node);
+    const char *amp = text ? strchr(text, '&') : NULL;
+    if (!amp || amp == text || amp[-1] != '\\')
+        return;
+    const char *name = amp + 1;
+    for (const char *p = name; *p; p++)
+        if (!(*p == ':' || *p == '_' || (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= 'A' && *p <= 'Z')))
+            return; /* `\&$name` and `\&{...}` compute it. */
+    if (name[0])
+        perl_emit_sub(ctx, node, CBM_SOURCE_SITE_REFERENCE, name);
+}
+
+static bool perl_shifts_arguments(const perl_ctx_t *ctx, TSNode node);
 
 /* The invocant variable a sub declares in its first statement or signature. */
 static const char *perl_invocant(perl_ctx_t *ctx, TSNode sub) {
@@ -584,14 +680,19 @@ static const char *perl_invocant(perl_ctx_t *ctx, TSNode sub) {
     TSNode left = cbm_source_named_field(assign, "left");
     if (!cbm_source_is(left, "variable_declaration"))
         return NULL;
-    const char *right = cbm_source_text(ctx->walk, cbm_source_named_field(assign, "right"));
+    TSNode value = cbm_source_named_field(assign, "right");
+    const char *right = cbm_source_text(ctx->walk, value);
     TSNode single = cbm_source_field(left, "variable");
     if (cbm_source_is(single, "scalar"))
         return right && !strcmp(right, "shift") ? cbm_source_text(ctx->walk, single) : NULL;
     TSNode first = cbm_source_named_field(left, "variables");
-    return right && !strcmp(right, "@_") && cbm_source_is(first, "scalar")
-               ? cbm_source_text(ctx->walk, first)
-               : NULL;
+    if (!cbm_source_is(first, "scalar"))
+        return NULL;
+    bool takes_first = right && !strcmp(right, "@_");
+    /* `my ($self, $name) = (shift, shift);` */
+    if (cbm_source_is(value, "list_expression") && ts_node_named_child_count(value))
+        takes_first = perl_shifts_arguments(ctx, ts_node_named_child(value, 0));
+    return takes_first ? cbm_source_text(ctx->walk, first) : NULL;
 }
 
 static bool perl_left_binds(perl_ctx_t *ctx, TSNode left, const char *variable, unsigned depth) {
@@ -625,17 +726,80 @@ static bool perl_rebinds(perl_ctx_t *ctx, TSNode node, const char *variable, uns
     return false;
 }
 
+static bool perl_has_signature(TSNode sub) {
+    bool signature = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(sub);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            signature |= cbm_source_is(ts_tree_cursor_current_node(&cursor), "signature");
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return signature;
+}
+
 /* The statement that took the invocant is the one write that is allowed. */
 static bool perl_body_rebinds(perl_ctx_t *ctx, TSNode sub, TSNode body, const char *variable) {
-    bool signature = false;
-    uint32_t parts = ts_node_named_child_count(sub);
-    for (uint32_t i = 0; i < parts; i++)
-        signature |= cbm_source_is(ts_node_named_child(sub, i), "signature");
+    bool signature = perl_has_signature(sub);
     uint32_t count = ts_node_named_child_count(body);
     for (uint32_t i = signature ? 0 : 1; i < count; i++)
         if (perl_rebinds(ctx, ts_node_named_child(body, i), variable, 0))
             return true;
     return false;
+}
+
+/* `shift`, `shift()`, `shift @_` or `shift(@_)`: the sub's arguments, not another array. */
+static bool perl_shifts_arguments(const perl_ctx_t *ctx, TSNode node) {
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    size_t length = end - start;
+    const char *text = ctx->walk->source + start;
+    if (length < 5 || length > 9 || strncmp(text, "shift", 5) ||
+        strstr(ts_node_type(node), "bareword"))
+        return false;
+    return length == 5 || (length == 7 && !strncmp(text + 5, "()", 2)) ||
+           (length == 8 && !strncmp(text + 5, " @_", 3)) ||
+           (length == 9 && !strncmp(text + 5, "(@_)", 4));
+}
+
+/* The first shift of a sub's own arguments; a nested sub has an @_ of its own. */
+static uint32_t perl_first_shift(perl_ctx_t *ctx, TSNode node, unsigned depth) {
+    if (!cbm_source_step(ctx->walk, depth) ||
+        cbm_source_is(node, "anonymous_subroutine_expression") ||
+        cbm_source_is(node, "subroutine_declaration_statement"))
+        return UINT32_MAX;
+    if (ts_node_is_named(node) && perl_shifts_arguments(ctx, node))
+        return ts_node_start_byte(node);
+    uint32_t first = UINT32_MAX;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            first = perl_first_shift(ctx, ts_tree_cursor_current_node(&cursor), depth + 1);
+        } while (first == UINT32_MAX && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return first;
+}
+
+/* Reached only as a method, by what the project's own calls and exports show. */
+static bool perl_only_a_method(const perl_ctx_t *ctx, const char *name) {
+    char key[256];
+    int length = snprintf(key, sizeof(key), "%s%s", PERL_FUNCTION_CALL_PREFIX, name);
+    if (length < 0 || (size_t)length >= sizeof(key) ||
+        cbm_source_lookup(ctx->walk, ctx->package, key))
+        return false;
+    length = snprintf(key, sizeof(key), "%s%s", PERL_EXPORT_PREFIX, name);
+    return length > 0 && (size_t)length < sizeof(key) &&
+           !cbm_source_lookup(ctx->walk, ctx->package, key);
+}
+
+static bool perl_reads_invocant(const perl_ctx_t *ctx, TSNode invocant) {
+    if (!ctx->reads_invocant)
+        return false;
+    if (perl_shifts_arguments(ctx, invocant))
+        return ts_node_start_byte(invocant) == ctx->first_shift;
+    uint32_t start = ts_node_start_byte(invocant);
+    return ts_node_end_byte(invocant) - start == 5 &&
+           !strncmp(ctx->walk->source + start, "$_[0]", 5) && start < ctx->first_shift;
 }
 
 static void perl_visit_method_call(perl_ctx_t *ctx, TSNode node, const char *invocant_var) {
@@ -666,6 +830,8 @@ static void perl_visit_method_call(perl_ctx_t *ctx, TSNode node, const char *inv
         if (text && !strcmp(text, invocant_var))
             start = ctx->package;
     }
+    if (!start && perl_reads_invocant(ctx, invocant))
+        start = ctx->package;
     if (!start) {
         perl_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL, "perl_invocant_class_unknown");
         return;
@@ -743,10 +909,46 @@ static void perl_visit(perl_ctx_t *ctx, TSNode node, const char *invocant_var, u
                 if (conventional && !ts_node_is_null(body) &&
                     perl_body_rebinds(ctx, child, body, variable))
                     conventional = false;
-                if (!ts_node_is_null(body))
+                if (!ts_node_is_null(body)) {
+                    uint32_t saved_shift = ctx->first_shift;
+                    bool saved_reads = ctx->reads_invocant;
+                    const char *name = perl_field_text(ctx, child, "name");
+                    ctx->first_shift = perl_first_shift(ctx, body, depth + 1);
+                    ctx->reads_invocant = name && strcmp(ctx->package, "main") &&
+                                          !strstr(name, "::") && !perl_has_signature(child) &&
+                                          perl_only_a_method(ctx, name);
                     perl_visit(ctx, body, conventional ? variable : NULL, depth + 1);
+                    ctx->first_shift = saved_shift;
+                    ctx->reads_invocant = saved_reads;
+                }
                 continue;
             }
+            /* An anonymous sub closes over $self, but its @_ is its own. */
+            if (cbm_source_is(child, "anonymous_subroutine_expression")) {
+                bool saved_reads = ctx->reads_invocant, saved_list = ctx->overload_list;
+                uint32_t saved_shift = ctx->first_shift;
+                TSNode body = ts_node_named_child(child, 0);
+                ctx->reads_invocant = saved_list && strcmp(ctx->package, "main");
+                ctx->overload_list = false;
+                ctx->first_shift = ctx->reads_invocant && !ts_node_is_null(body)
+                                       ? perl_first_shift(ctx, body, depth + 1)
+                                       : saved_shift;
+                perl_visit(ctx, child, invocant_var, depth + 1);
+                ctx->reads_invocant = saved_reads;
+                ctx->overload_list = saved_list;
+                ctx->first_shift = saved_shift;
+                continue;
+            }
+            if (cbm_source_is(child, "use_statement")) {
+                const char *pragma = cbm_source_text(ctx->walk, ts_node_named_child(child, 0));
+                bool saved_list = ctx->overload_list;
+                ctx->overload_list = pragma && !strcmp(pragma, "overload");
+                perl_visit(ctx, child, invocant_var, depth + 1);
+                ctx->overload_list = saved_list;
+                continue;
+            }
+            if (cbm_source_is(child, "refgen_expression"))
+                perl_visit_code_reference(ctx, child);
             if (cbm_source_is(child, "function_call_expression") ||
                 cbm_source_is(child, "ambiguous_function_call_expression"))
                 perl_visit_function_call(ctx, child);
@@ -765,5 +967,8 @@ static void perl_resolve(cbm_source_walk_t *walk) {
     perl_visit(&ctx, walk->root, NULL, 0);
 }
 
-const cbm_source_adapter_t cbm_source_adapter_perl = {
-    .language = CBM_LANG_PERL, .collect = perl_collect, .resolve = perl_resolve};
+const cbm_source_adapter_t cbm_source_adapter_perl = {.language = CBM_LANG_PERL,
+                                                      .collect = perl_collect,
+                                                      .resolve = perl_resolve,
+                                                      .decides_references = true,
+                                                      .contains_parse_damage = true};

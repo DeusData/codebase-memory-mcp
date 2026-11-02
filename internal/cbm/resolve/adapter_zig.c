@@ -12,8 +12,11 @@
  * x's container is known from the declared type of a parameter, variable or field
  * (through pointers and optionals, which auto-dereference on member access), from
  * a struct literal, or from the declared return type of the function it was
- * initialized by. `@This()` is the enclosing container. Anything computed at
- * comptime, including a generic `Foo(T)` and `anytype`, stays unknown.
+ * initialized by. `x orelse y`, `x catch y` and `x.*` have x's container, since the
+ * other arm must have that type or leave. `if (x) |m|` and `while (x) |m|` give m x's
+ * container: the capture unwraps an optional or error union. `@This()` is the
+ * enclosing container. Anything computed at comptime, including a generic `Foo(T)` and
+ * `anytype`, stays unknown, as does an element of a `for`.
  *
  * The graph's Zig QN holds the file but not the struct, so members of two structs
  * in one file sharing a name share a node. That identity cannot name either one,
@@ -47,6 +50,10 @@ typedef struct {
     zig_local_t *locals;
     size_t local_count, local_capacity;
     unsigned local_struct_depth;
+    TSNode callee; /* the function of the call being walked: its member is the call's site */
+    /* The `|x|` right after an if or while condition, and what that condition unwraps. */
+    TSNode capture;
+    const char *capture_container;
     bool in_function;
 } zig_ctx_t;
 
@@ -258,9 +265,24 @@ static const char *zig_parent(zig_ctx_t *ctx, const char *owner) {
 static zig_ref_t zig_resolve_encoded(zig_ctx_t *ctx, const char *scope, const char *encoded,
                                      unsigned depth);
 
-/* What (container, name) denotes, from a site in `from`'s file. */
-static zig_ref_t zig_member(zig_ctx_t *ctx, const char *container, const char *name,
-                            unsigned depth) {
+static size_t zig_file_length(const char *scope) {
+    const char *root_end = strchr(scope, '#');
+    return root_end ? (size_t)(root_end - scope) : strlen(scope);
+}
+
+/* A declaration without `pub` is visible only in its own file. `reader` is any scope of the
+ * file the name is written in, which for a field's type is the file that declares the field. */
+static bool zig_visible_from(const char *reader, const char *container,
+                             const cbm_source_decl_t *decl) {
+    size_t file_length = zig_file_length(container);
+    bool same_file = reader && zig_file_length(reader) == file_length &&
+                     !strncmp(reader, container, file_length);
+    return same_file || (decl->flags & CBM_SOURCE_DECL_F_PUBLIC);
+}
+
+/* What (container, name) denotes, as written in `reader`'s file. */
+static zig_ref_t zig_member(zig_ctx_t *ctx, const char *reader, const char *container,
+                            const char *name, unsigned depth) {
     zig_ref_t ref = {.reason = "zig_member_absent_from_container"};
     const cbm_source_decl_t *decl = cbm_source_lookup(ctx->walk, container, name);
     if (!decl)
@@ -269,11 +291,7 @@ static zig_ref_t zig_member(zig_ctx_t *ctx, const char *container, const char *n
         ref.reason = "zig_member_not_one_declaration";
         return ref;
     }
-    const char *root_end = strchr(container, '#');
-    size_t file_length = root_end ? (size_t)(root_end - container) : strlen(container);
-    bool same_file = ctx->walk->file && strlen(ctx->walk->file) == file_length &&
-                     !strncmp(ctx->walk->file, container, file_length);
-    if (!same_file && !(decl->flags & CBM_SOURCE_DECL_F_PUBLIC)) {
+    if (!zig_visible_from(reader, container, decl)) {
         ref.reason = "zig_declaration_not_pub_in_other_file";
         return ref;
     }
@@ -292,7 +310,7 @@ static zig_ref_t zig_member(zig_ctx_t *ctx, const char *container, const char *n
 static zig_ref_t zig_lexical(zig_ctx_t *ctx, const char *scope, const char *name, unsigned depth) {
     for (const char *owner = scope; owner; owner = zig_parent(ctx, owner)) {
         if (cbm_source_lookup(ctx->walk, owner, name))
-            return zig_member(ctx, owner, name, depth);
+            return zig_member(ctx, scope, owner, name, depth);
     }
     return (zig_ref_t){.reason = "zig_name_not_declared_in_enclosing_containers"};
 }
@@ -341,7 +359,7 @@ static zig_ref_t zig_resolve_encoded(zig_ctx_t *ctx, const char *scope, const ch
         next = strchr(segment, '|');
         if (next)
             *next++ = '\0';
-        ref = zig_member(ctx, ref.container, segment, depth + 1);
+        ref = zig_member(ctx, scope, ref.container, segment, depth + 1);
     }
     return ref;
 }
@@ -392,13 +410,21 @@ static const char *zig_expr_container(zig_ctx_t *ctx, TSNode node, unsigned dept
                 zig_ref_t typed = zig_resolve_encoded(ctx, owner, decl->type, depth + 1);
                 return typed.kind == ZIG_CONTAINER ? typed.container : NULL;
             }
-            zig_ref_t ref = zig_member(ctx, owner, name, depth + 1);
+            zig_ref_t ref = zig_member(ctx, walk->file, owner, name, depth + 1);
             return ref.kind == ZIG_CONTAINER ? ref.container : NULL;
         }
         return NULL;
     }
+    /* The grammar reads `*A.B` and `?A.B` as `(*A).B`: the same type path. */
+    if (cbm_source_is(node, "pointer_type") || cbm_source_is(node, "nullable_type")) {
+        uint32_t count = ts_node_named_child_count(node);
+        return count ? zig_expr_container(ctx, ts_node_named_child(node, count - 1), depth + 1)
+                     : NULL;
+    }
     if (cbm_source_is(node, "parenthesized_expression") || cbm_source_is(node, "try_expression") ||
-        cbm_source_is(node, "null_coercion_expression")) {
+        cbm_source_is(node, "null_coercion_expression") ||
+        cbm_source_is(node, "catch_expression") || cbm_source_is(node, "dereference_expression") ||
+        (cbm_source_is(node, "binary_expression") && cbm_source_token(node, "orelse"))) {
         return ts_node_named_child_count(node)
                    ? zig_expr_container(ctx, ts_node_named_child(node, 0), depth + 1)
                    : NULL;
@@ -427,7 +453,7 @@ static const char *zig_expr_container(zig_ctx_t *ctx, TSNode node, unsigned dept
             zig_ref_t typed = zig_resolve_encoded(ctx, decl->owner, decl->type, depth + 1);
             return typed.kind == ZIG_CONTAINER ? typed.container : NULL;
         }
-        zig_ref_t ref = zig_member(ctx, object, member, depth + 1);
+        zig_ref_t ref = zig_member(ctx, walk->file, object, member, depth + 1);
         return ref.kind == ZIG_CONTAINER ? ref.container : NULL;
     }
     if (cbm_source_is(node, "call_expression")) {
@@ -443,7 +469,7 @@ static const char *zig_expr_container(zig_ctx_t *ctx, TSNode node, unsigned dept
                 zig_expr_container(ctx, cbm_source_field(function, "object"), depth + 1);
             const char *member = cbm_source_text(walk, cbm_source_field(function, "member"));
             if (object && member)
-                callee = zig_member(ctx, object, member, depth + 1);
+                callee = zig_member(ctx, walk->file, object, member, depth + 1);
         }
         if (callee.kind != ZIG_FUNCTION || !callee.function->type)
             return NULL;
@@ -515,7 +541,7 @@ static void zig_visit_call(zig_ctx_t *ctx, TSNode call) {
                                  NULL, "zig_receiver_container_unknown");
             return;
         }
-        zig_ref_t ref = zig_member(ctx, object, member, 0);
+        zig_ref_t ref = zig_member(ctx, ctx->walk->file, object, member, 0);
         zig_emit_ref(ctx, call, &ref, CBM_RESOLVE_RULE_TYPE_MEMBER);
         return;
     }
@@ -542,6 +568,25 @@ static void zig_visit_reference(zig_ctx_t *ctx, TSNode node) {
                              target ? "zig_enclosing_container_declaration" : identity);
         return;
     }
+}
+
+/* `Container.name` read as a value or type is that container's declaration. Zig forbids a
+ * field and a declaration of one name, and a field has no node, so a field read abstains. */
+static void zig_visit_member(zig_ctx_t *ctx, TSNode node) {
+    if (ctx->local_struct_depth)
+        return;
+    const char *object = zig_expr_container(ctx, cbm_source_field(node, "object"), 0);
+    TSNode member = cbm_source_field(node, "member");
+    const char *name = cbm_source_text(ctx->walk, member);
+    const cbm_source_decl_t *decl =
+        object && name ? cbm_source_lookup(ctx->walk, object, name) : NULL;
+    if (!decl || !zig_visible_from(ctx->walk->file, object, decl))
+        return;
+    const char *identity = NULL;
+    const char *target = cbm_source_unique_qn(decl, &identity);
+    cbm_source_emit_node(ctx->walk, member, CBM_SOURCE_SITE_REFERENCE, target,
+                         CBM_RESOLVE_RULE_TYPE_MEMBER, decl->owner,
+                         target ? "zig_container_declaration_through_a_path" : identity);
 }
 
 static void zig_visit_children(zig_ctx_t *ctx, TSNode node, unsigned depth) {
@@ -635,17 +680,34 @@ static void zig_visit(zig_ctx_t *ctx, TSNode node, unsigned depth) {
         cbm_source_is(node, "if_expression") || cbm_source_is(node, "for_expression") ||
         cbm_source_is(node, "while_expression") || cbm_source_is(node, "switch_case")) {
         size_t saved = ctx->local_count;
+        TSNode saved_capture = ctx->capture;
+        const char *saved_container = ctx->capture_container;
+        /* Only the capture beside the condition unwraps it: `else |err|` is the error. */
+        if (cbm_source_is(node, "if_statement") || cbm_source_is(node, "if_expression") ||
+            cbm_source_is(node, "while_statement") || cbm_source_is(node, "while_expression")) {
+            TSNode capture = ts_node_named_child(node, 1);
+            if (cbm_source_is(capture, "payload")) {
+                ctx->capture = capture;
+                ctx->capture_container = zig_expr_container(ctx, ts_node_named_child(node, 0), 0);
+            }
+        }
         zig_visit_children(ctx, node, depth);
         ctx->local_count = saved;
+        ctx->capture = saved_capture;
+        ctx->capture_container = saved_container;
         return;
     }
     if (cbm_source_is(node, "payload")) {
-        /* A capture's type comes from the expression it unwraps: not modelled. */
+        const char *unwrapped = !ts_node_is_null(ctx->capture) && ts_node_eq(node, ctx->capture)
+                                    ? ctx->capture_container
+                                    : NULL;
         uint32_t count = ts_node_named_child_count(node);
+        /* `|a, b|` destructures, which this walk has no type for. */
         for (uint32_t i = 0; i < count; i++) {
             TSNode child = ts_node_named_child(node, i);
             if (cbm_source_is(child, "identifier"))
-                zig_push_local(ctx, cbm_source_text(ctx->walk, child), NULL);
+                zig_push_local(ctx, cbm_source_text(ctx->walk, child),
+                               count == 1 ? unwrapped : NULL);
         }
         return;
     }
@@ -675,8 +737,17 @@ static void zig_visit(zig_ctx_t *ctx, TSNode node, unsigned depth) {
         }
         return;
     }
-    if (cbm_source_is(node, "call_expression"))
+    if (cbm_source_is(node, "call_expression")) {
         zig_visit_call(ctx, node);
+        TSNode saved = ctx->callee;
+        ctx->callee = cbm_source_field(node, "function");
+        zig_visit_children(ctx, node, depth);
+        ctx->callee = saved;
+        return;
+    }
+    if (cbm_source_is(node, "field_expression") &&
+        (ts_node_is_null(ctx->callee) || !ts_node_eq(node, ctx->callee)))
+        zig_visit_member(ctx, node);
     zig_visit_children(ctx, node, depth);
 }
 
@@ -688,4 +759,5 @@ static void zig_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_zig = {.language = CBM_LANG_ZIG,
                                                      .collect = zig_collect,
                                                      .resolve = zig_resolve,
-                                                     .decides_references = true};
+                                                     .decides_references = true,
+                                                     .contains_parse_damage = true};

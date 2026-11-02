@@ -13,13 +13,26 @@
  * followed, so a name reached only through a re-export abstains.
  *
  * All equations of a function and its signature are one name, and the graph has
- * one node per name in a file. */
+ * one node per name in a file.
+ *
+ * Constructors have a namespace of their own, looked up the same way. The graph has a
+ * node for a type, none for a constructor, so `data T = T a` selects T and a
+ * constructor named otherwise is known but selects nothing. An export or import entry
+ * reaches a type's constructors only when it lists children, as in `T(..)`; a
+ * pattern matches a constructor without calling it.
+ *
+ * A class's methods are top-level names of its module. `status x` selects the method's
+ * declaration in the class; which instance runs is dispatch. A signature alone has no node;
+ * the file's default or instance bodies of that name are its node, and with none the method
+ * is known but selects nothing. `C(..)` and `C(m)` reach methods the same way an entry
+ * reaches constructors. */
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 
 #define HS_EXPORT_KEY_PREFIX "&export:"
 #define HS_EXPORTS_ALL "&exports_all"
+#define HS_EXPORT_CHILDREN_PREFIX "&export_children:"
 
 typedef struct {
     const char *module;
@@ -36,7 +49,8 @@ typedef struct hs_local {
 
 typedef struct {
     cbm_source_walk_t *walk;
-    bool reference; /* the name being read is a value, not a call head */
+    bool reference;   /* the name being read is a value, not a call head */
+    bool constructor; /* the name being read is a constructor */
     const char *module;
     hs_import_t *imports;
     size_t import_count;
@@ -69,11 +83,95 @@ static void hs_collect_exports(cbm_source_walk_t *walk, const char *module) {
     for (uint32_t i = 0; i < count; i++) {
         TSNode entry = ts_node_named_child(exports, i);
         const char *name = cbm_source_text(walk, cbm_source_field(entry, "variable"));
+        /* `T(..)` exports T's constructors; a bare `T` keeps them private. */
+        TSNode children = cbm_source_field(entry, "children");
+        if (!name && !ts_node_is_null(children))
+            name = cbm_source_text(walk, hs_child(entry, "name"));
         const char *key =
             name ? cbm_arena_sprintf(walk->arena, "%s%s", HS_EXPORT_KEY_PREFIX, name) : NULL;
         if (key)
             (void)cbm_source_declare(walk, module, key, NULL, CBM_SOURCE_DECL_F_VALUE, 1);
+        /* `C(..)` exports every method of C, and `C(m)` exports m. */
+        uint32_t listed = ts_node_is_null(children) ? 0 : ts_node_named_child_count(children);
+        for (uint32_t c = 0; name && c < listed; c++) {
+            TSNode child = ts_node_named_child(children, c);
+            const char *child_key =
+                cbm_source_is(child, "all_names")
+                    ? cbm_arena_sprintf(walk->arena, "%s%s", HS_EXPORT_CHILDREN_PREFIX, name)
+                    : cbm_arena_sprintf(walk->arena, "%s%s", HS_EXPORT_KEY_PREFIX,
+                                        cbm_source_text(walk, child));
+            if (child_key)
+                (void)cbm_source_declare(walk, module, child_key, NULL, CBM_SOURCE_DECL_F_VALUE, 1);
+        }
     }
+}
+
+static void hs_collect_method(cbm_source_walk_t *walk, const char *module, const char *class_name,
+                              TSNode name) {
+    const char *text = cbm_source_text(walk, name);
+    uint32_t line = ts_node_start_point(name).row + 1;
+    cbm_source_decl_t *decl =
+        text ? cbm_source_declare(walk, module, text, cbm_source_def_qn_of_name(walk, text),
+                                  CBM_SOURCE_DECL_F_PUBLIC, line)
+             : NULL;
+    if (decl)
+        decl->type = cbm_source_table_intern(walk, class_name);
+}
+
+/* What a class declares a signature for; a default body repeats a name, adding nothing. */
+static void hs_collect_class(cbm_source_walk_t *walk, const char *module, TSNode declaration) {
+    const char *class_name = cbm_source_text(walk, hs_child(declaration, "name"));
+    TSNode body = hs_child(declaration, "class_declarations");
+    if (!class_name || ts_node_is_null(body))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode signature = ts_tree_cursor_current_node(&cursor);
+            if (!cbm_source_is(signature, "signature"))
+                continue;
+            TSNode head = ts_node_named_child(signature, 0);
+            if (cbm_source_is(head, "variable"))
+                hs_collect_method(walk, module, class_name, head);
+            uint32_t names =
+                cbm_source_is(head, "binding_list") ? ts_node_named_child_count(head) : 0;
+            for (uint32_t n = 0; n < names; n++)
+                hs_collect_method(walk, module, class_name, ts_node_named_child(head, n));
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* Every constructor is declared, so that one with no node still hides an imported
+ * name. Only the constructor sharing its type's name has a node to select. */
+static void hs_collect_constructor(cbm_source_walk_t *walk, const char *module, TSNode constructor,
+                                   const char *type_name, const char *type_qn, uint32_t line) {
+    const char *text = cbm_source_text(walk, constructor);
+    if (text)
+        (void)cbm_source_declare(walk, module, text,
+                                 type_name && !strcmp(text, type_name) ? type_qn : NULL,
+                                 CBM_SOURCE_DECL_F_TYPE | CBM_SOURCE_DECL_F_PUBLIC, line);
+}
+
+static void hs_collect_constructors(cbm_source_walk_t *walk, const char *module, TSNode node,
+                                    const char *type_name, const char *type_qn, uint32_t line,
+                                    unsigned depth) {
+    if (!cbm_source_step(walk, depth))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (cbm_source_is(child, "constructor"))
+                hs_collect_constructor(walk, module, child, type_name, type_qn, line);
+            else if (cbm_source_is(child, "data_constructors") ||
+                     cbm_source_is(child, "data_constructor") ||
+                     cbm_source_is(child, "newtype_constructor") ||
+                     cbm_source_is(child, "prefix") || cbm_source_is(child, "record"))
+                hs_collect_constructors(walk, module, child, type_name, type_qn, line, depth + 1);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static void hs_collect(cbm_source_walk_t *walk) {
@@ -84,6 +182,18 @@ static void hs_collect(cbm_source_walk_t *walk) {
     uint32_t count = ts_node_is_null(declarations) ? 0 : ts_node_named_child_count(declarations);
     for (uint32_t i = 0; i < count; i++) {
         TSNode declaration = ts_node_named_child(declarations, i);
+        if (cbm_source_is(declaration, "data_type") || cbm_source_is(declaration, "newtype")) {
+            const char *type_name = cbm_source_text(walk, cbm_source_field(declaration, "name"));
+            uint32_t type_line = ts_node_start_point(declaration).row + 1;
+            hs_collect_constructors(walk, module, declaration, type_name,
+                                    cbm_source_def_qn_label(walk, type_name, type_line, "Class"),
+                                    type_line, 1);
+            continue;
+        }
+        if (cbm_source_is(declaration, "class")) {
+            hs_collect_class(walk, module, declaration);
+            continue;
+        }
         if (!cbm_source_is(declaration, "function") && !cbm_source_is(declaration, "bind") &&
             !cbm_source_is(declaration, "signature"))
             continue;
@@ -128,12 +238,33 @@ static void hs_gather_imports(hs_ctx_t *ctx) {
     }
 }
 
-static bool hs_list_names(hs_ctx_t *ctx, TSNode names, const char *name) {
+/* An import entry `C(..)` or `C(m)` naming method m of class C. */
+static bool hs_entry_lists_method(hs_ctx_t *ctx, TSNode entry, const char *class_name,
+                                  const char *name) {
+    TSNode children = cbm_source_field(entry, "children");
+    const char *listed = cbm_source_text(ctx->walk, hs_child(entry, "name"));
+    if (ts_node_is_null(children) || !class_name || !listed || strcmp(listed, class_name))
+        return false;
+    uint32_t count = ts_node_named_child_count(children);
+    for (uint32_t c = 0; c < count; c++) {
+        TSNode child = ts_node_named_child(children, c);
+        const char *text = cbm_source_text(ctx->walk, child);
+        if (cbm_source_is(child, "all_names") || (text && !strcmp(text, name)))
+            return true;
+    }
+    return false;
+}
+
+static bool hs_list_names(hs_ctx_t *ctx, TSNode names, const char *module, const char *name) {
     uint32_t count = ts_node_is_null(names) ? 0 : ts_node_named_child_count(names);
+    const cbm_source_decl_t *decl = cbm_source_lookup(ctx->walk, module, name);
     for (uint32_t i = 0; i < count; i++) {
         TSNode entry = ts_node_named_child(names, i);
         const char *text = cbm_source_text(ctx->walk, cbm_source_field(entry, "variable"));
-        if (text && !strcmp(text, name))
+        if (!text && !ts_node_is_null(cbm_source_field(entry, "children")))
+            text = cbm_source_text(ctx->walk, hs_child(entry, "name"));
+        if ((text && !strcmp(text, name)) ||
+            (decl && hs_entry_lists_method(ctx, entry, decl->type, name)))
             return true;
     }
     return false;
@@ -150,12 +281,16 @@ static const char *hs_visible_member(hs_ctx_t *ctx, const char *module, const ch
     int length = snprintf(key, sizeof(key), "%s%s", HS_EXPORT_KEY_PREFIX, name);
     if (length < 0 || (size_t)length >= sizeof(key))
         return NULL;
-    if (!cbm_source_lookup(ctx->walk, module, HS_EXPORTS_ALL) &&
-        !cbm_source_lookup(ctx->walk, module, key)) {
-        *reason = "haskell_name_not_in_export_list";
-        return NULL;
+    if (cbm_source_lookup(ctx->walk, module, HS_EXPORTS_ALL) ||
+        cbm_source_lookup(ctx->walk, module, key))
+        return qn;
+    if (decl->type) {
+        length = snprintf(key, sizeof(key), "%s%s", HS_EXPORT_CHILDREN_PREFIX, decl->type);
+        if (length > 0 && (size_t)length < sizeof(key) && cbm_source_lookup(ctx->walk, module, key))
+            return qn;
     }
-    return qn;
+    *reason = "haskell_name_not_in_export_list";
+    return NULL;
 }
 
 static bool hs_is_local(const hs_ctx_t *ctx, const char *name) {
@@ -199,9 +334,10 @@ static void hs_bind_decls(hs_ctx_t *ctx, TSNode binds) {
 
 static void hs_emit(hs_ctx_t *ctx, TSNode site, const char *target, cbm_resolve_rule_t rule,
                     const char *domain, const char *reason) {
-    cbm_source_emit_node(ctx->walk, site,
-                         ctx->reference ? CBM_SOURCE_SITE_REFERENCE : CBM_SOURCE_SITE_CALL, target,
-                         rule, domain, reason);
+    cbm_source_emit_facts(ctx->walk, ts_node_start_byte(site), ts_node_end_byte(site),
+                          ctx->reference ? CBM_SOURCE_SITE_REFERENCE : CBM_SOURCE_SITE_CALL, target,
+                          rule, domain, reason,
+                          ctx->constructor ? CBM_RESOLVE_FACT_CLASS_CALLABLE : 0);
 }
 
 static void hs_resolve_bare(hs_ctx_t *ctx, TSNode site, const char *name) {
@@ -222,9 +358,11 @@ static void hs_resolve_bare(hs_ctx_t *ctx, TSNode site, const char *name) {
         const hs_import_t *import = &ctx->imports[i];
         if (import->qualified)
             continue;
-        if (import->has_list && !import->hiding && !hs_list_names(ctx, import->names, name))
+        if (import->has_list && !import->hiding &&
+            !hs_list_names(ctx, import->names, import->module, name))
             continue;
-        if (import->has_list && import->hiding && hs_list_names(ctx, import->names, name))
+        if (import->has_list && import->hiding &&
+            hs_list_names(ctx, import->names, import->module, name))
             continue;
         const char *why = NULL;
         const char *qn = hs_visible_member(ctx, import->module, name, &why);
@@ -261,9 +399,11 @@ static void hs_resolve_qualified(hs_ctx_t *ctx, TSNode site, TSNode qualified) {
         const char *visible_as = import->alias ? import->alias : import->module;
         if (strcmp(visible_as, qualifier))
             continue;
-        if (import->has_list && !import->hiding && !hs_list_names(ctx, import->names, name))
+        if (import->has_list && !import->hiding &&
+            !hs_list_names(ctx, import->names, import->module, name))
             continue;
-        if (import->has_list && import->hiding && hs_list_names(ctx, import->names, name))
+        if (import->has_list && import->hiding &&
+            hs_list_names(ctx, import->names, import->module, name))
             continue;
         const char *why = NULL;
         const char *qn = hs_visible_member(ctx, import->module, name, &why);
@@ -300,8 +440,9 @@ static void hs_visit_children(hs_ctx_t *ctx, TSNode node, unsigned depth) {
                 continue;
             /* These fields hold names being bound or spelled, not read. */
             const char *field = ts_tree_cursor_current_field_name(&cursor);
-            if (cbm_source_is(child, "variable") && field &&
-                (!strcmp(field, "name") || !strcmp(field, "pattern") || !strcmp(field, "patterns")))
+            if (field && (!strcmp(field, "pattern") || !strcmp(field, "patterns")))
+                continue;
+            if (cbm_source_is(child, "variable") && field && !strcmp(field, "name"))
                 continue;
             hs_visit(ctx, child, depth + 1);
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
@@ -322,9 +463,19 @@ static void hs_visit(hs_ctx_t *ctx, TSNode node, unsigned depth) {
         ctx->reference = false;
         return;
     }
-    /* A qualified name's parts and a signature's names are not reads. */
+    if (!strcmp(kind, "constructor")) {
+        const char *name = cbm_source_text(ctx->walk, node);
+        ctx->reference = true;
+        if (name)
+            hs_resolve_bare(ctx, node, name);
+        ctx->reference = false;
+        return;
+    }
+    /* A qualified name's parts and a signature's names are not reads, and a declaration
+     * of a type spells constructors rather than reading them. */
     if (!strcmp(kind, "qualified") || !strcmp(kind, "signature") || !strcmp(kind, "patterns") ||
-        !strcmp(kind, "imports") || !strcmp(kind, "exports") || !strcmp(kind, "header"))
+        !strcmp(kind, "imports") || !strcmp(kind, "exports") || !strcmp(kind, "header") ||
+        !strcmp(kind, "data_type") || !strcmp(kind, "newtype"))
         return;
     /* A do statement's or generator's pattern holds for the statements after it.
      * Leaving it bound until the enclosing `do` ends can only make more names
@@ -374,8 +525,14 @@ static void hs_visit(hs_ctx_t *ctx, TSNode node, unsigned depth) {
         TSNode head = hs_apply_head(node);
         if (cbm_source_is(head, "variable")) {
             hs_resolve_bare(ctx, node, cbm_source_text(ctx->walk, head));
+        } else if (cbm_source_is(head, "constructor")) {
+            ctx->constructor = true;
+            hs_resolve_bare(ctx, node, cbm_source_text(ctx->walk, head));
+            ctx->constructor = false;
         } else if (cbm_source_is(head, "qualified")) {
+            ctx->constructor = cbm_source_is(cbm_source_field(head, "id"), "constructor");
             hs_resolve_qualified(ctx, node, head);
+            ctx->constructor = false;
         } else {
             hs_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL, "haskell_computed_function");
         }
@@ -395,4 +552,5 @@ const cbm_source_adapter_t cbm_source_adapter_haskell = {.language = CBM_LANG_HA
                                                          .collect = hs_collect,
                                                          .resolve = hs_resolve,
                                                          .one_name_one_node = true,
-                                                         .decides_references = true};
+                                                         .decides_references = true,
+                                                         .contains_parse_damage = true};

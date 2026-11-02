@@ -7107,7 +7107,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
          ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX ||
-         ctx->language == CBM_LANG_PYTHON)) {
+         ctx->language == CBM_LANG_PYTHON || ctx->language == CBM_LANG_OCAML ||
+         ctx->language == CBM_LANG_ZIG)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
@@ -10175,6 +10176,22 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
         // Ruby `class << self` holds the class's singleton methods. The walk
         // otherwise stops at the class body, leaving each of them without a node
         // even though the calls inside it are attributed to that name.
+        /* `private def x`: the def is an argument of the visibility call, and evaluates in
+         * the class body like any other. */
+        if (ctx->language == CBM_LANG_RUBY && strcmp(ts_node_type(child), "call") == 0) {
+            TSNode arguments = ts_node_child_by_field_name(child, TS_FIELD("arguments"));
+            uint32_t members =
+                ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
+            for (uint32_t m = 0; m < members; m++) {
+                TSNode member = ts_node_named_child(arguments, m);
+                if (!cbm_kind_in_set(member, spec->function_node_types))
+                    continue;
+                TSNode member_name = resolve_method_name(member, ctx->language);
+                if (!ts_node_is_null(member_name))
+                    push_method_def(ctx, member, class_node, class_qn, spec, member_name);
+            }
+            continue;
+        }
         if (ctx->language == CBM_LANG_RUBY && strcmp(ts_node_type(child), "singleton_class") == 0) {
             TSNode singleton_body = ts_node_child_by_field_name(child, TS_FIELD("body"));
             uint32_t members =
@@ -10835,8 +10852,13 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
                 }
                 branch = cbm_find_child_by_kind(branch, "else_block");
             }
-        } else if (strcmp(macro, "defmodule") == 0) {
-            TSNode do_block = emit_elixir_module_class(ctx, cur);
+        } else if (strcmp(macro, "defmodule") == 0 || strcmp(macro, "defprotocol") == 0 ||
+                   strcmp(macro, "defimpl") == 0) {
+            /* A protocol is a module of its own. An implementation holds functions, under
+             * the protocol's name rather than one of its own. */
+            TSNode do_block = strcmp(macro, "defimpl") == 0
+                                  ? cbm_find_child_by_kind(cur, "do_block")
+                                  : emit_elixir_module_class(ctx, cur);
             if (!ts_node_is_null(do_block)) {
                 uint32_t dbc = ts_node_child_count(do_block);
                 for (int di = (int)dbc - SKIP_CHAR; di >= 0; di--) {
@@ -10869,7 +10891,8 @@ static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
     def.qualified_name =
-        ctx->language == CBM_LANG_KOTLIN && ctx->var_parent_class
+        (ctx->language == CBM_LANG_KOTLIN || ctx->language == CBM_LANG_SCALA) &&
+                ctx->var_parent_class
             ? cbm_arena_sprintf(a, "%s.%s", ctx->var_parent_class, qn_name ? qn_name : name)
             : cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name ? qn_name : name,
                                           ctx->language);
@@ -13703,6 +13726,17 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
         return cbm_nix_binding_scope_qn(ctx, node, saved_enclosing);
     }
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OCAML) {
+        name_node = cbm_find_child_by_kind(node, "module_name");
+    }
+    /* `const Foo = struct {...}`: the container's name is its declaration's. */
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_ZIG) {
+        TSNode declaration = ts_node_parent(node);
+        if (!ts_node_is_null(declaration) &&
+            strcmp(ts_node_type(declaration), "variable_declaration") == 0) {
+            name_node = cbm_find_child_by_kind(declaration, "identifier");
+        }
+    }
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
         name_node = cbm_find_child_by_kind(node, "identifier");
     }

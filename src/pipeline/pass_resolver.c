@@ -473,6 +473,11 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         bool same_owner = same_file && !strcmp(prior->label, definition->label);
         bool same_span =
             prior->start_line == definition->start_line && prior->end_line == definition->end_line;
+        /* `const Foo = struct {...}` is extracted as a variable and as its struct. */
+        if (language == CBM_LANG_ZIG && same_file && same_span) {
+            prior->one_name = true;
+            return true;
+        }
         prior->cross_file |= !same_file;
         if (same_owner &&
             (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA)) {
@@ -3233,6 +3238,14 @@ void cbm_shared_resolver_fact(const cbm_shared_resolver_t *resolver, const char 
     cbm_resolve_solver_get(resolver ? resolver->solver : NULL, key, out);
 }
 
+const char *cbm_shared_resolver_source_base(const cbm_shared_resolver_t *resolver,
+                                            CBMLanguage language, const char *qualified_name,
+                                            size_t offset) {
+    return resolver
+               ? cbm_source_table_base(resolver->source_table, language, qualified_name, offset)
+               : NULL;
+}
+
 const char *cbm_shared_resolver_python_base(const cbm_shared_resolver_t *resolver,
                                             const char *qualified_name, size_t offset) {
     return resolver ? cbm_py_members_base(resolver->python_members, qualified_name, offset) : NULL;
@@ -4418,7 +4431,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
             target->label && !strcmp(target->label, "Class")) ||
            ((resolver->file->language == CBM_LANG_DART ||
              resolver->file->language == CBM_LANG_SWIFT ||
-             resolver->file->language == CBM_LANG_SCALA) &&
+             resolver->file->language == CBM_LANG_SCALA ||
+             resolver->file->language == CBM_LANG_RUBY ||
+             resolver->file->language == CBM_LANG_HASKELL) &&
             target->label &&
             (!strcmp(target->label, "Class") ||
              (resolver->file->language == CBM_LANG_SWIFT && !strcmp(target->label, "Struct")))) ||
@@ -4549,10 +4564,20 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
         cbm_source_unit_extra_calls(resolver->source_unit, &extra_count);
     for (size_t e = 0; e < extra_count; e++) {
         const cbm_source_extra_call_t *extra = &extras[e];
+        bool invocation = extra->kind == CBM_SOURCE_SITE_CALL;
         cbm_resolve_result_t outcome = source_adapter_result(
-            resolver, extra->name, extra->start, extra->end, CBM_SOURCE_ORIGIN_RAW, true);
-        if (!record_result(resolver, extra->scope, extra->name, "CALLS", extra->start, extra->end,
-                           CBM_SOURCE_ORIGIN_RAW, outcome, NULL))
+            resolver, extra->name, extra->start, extra->end, CBM_SOURCE_ORIGIN_RAW, invocation);
+        CBMCall site = {.start_line = (int)extra->line};
+        /* Naming something callable without calling it is a call reference. */
+        const char *relation =
+            invocation ? "CALLS"
+            : callable_node(outcome.target
+                                ? cbm_gbuf_find_by_qn(resolver->file->graph, outcome.target)
+                                : NULL)
+                ? "CALL_REFERENCE"
+                : "USAGE";
+        if (!record_result(resolver, extra->scope, extra->name, relation, extra->start, extra->end,
+                           CBM_SOURCE_ORIGIN_RAW, outcome, &site))
             return false;
     }
     return true;
@@ -4634,7 +4659,8 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
         /* Source binding can establish a direct callable argument without a
          * hybrid row. Composite expressions remain USAGE: the extraction
          * carrier deliberately leaves may_be_call_reference false for them. */
-        if (!site && usage->may_be_call_reference && cbm_resolve_admit(&outcome) &&
+        if (!site && (usage->may_be_call_reference || resolver->file->language == CBM_LANG_PERL) &&
+            cbm_resolve_admit(&outcome) &&
             callable_node(cbm_gbuf_find_by_qn(resolver->file->graph, outcome.target)))
             relation = "CALL_REFERENCE";
         /* Reading a property hands over its result, not the function. */

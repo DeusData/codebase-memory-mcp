@@ -51,6 +51,7 @@ typedef struct cbm_source_decl {
     uint32_t flags;
     uint32_t line;
     struct cbm_source_decl *next;
+    struct cbm_source_decl *last; /* on a chain's head: its end, so appending stays constant */
 } cbm_source_decl_t;
 
 typedef struct {
@@ -76,16 +77,25 @@ typedef struct cbm_source_walk {
     /* Set around an emit for a site extraction has no carrier for. */
     const char *extra_scope;
     const char *extra_name;
+    uint32_t extra_line;
 } cbm_source_walk_t;
 
 typedef void (*cbm_source_pass_fn)(cbm_source_walk_t *walk);
+typedef const char *(*cbm_source_base_fn)(const cbm_source_table_t *table,
+                                          const cbm_source_decl_t *decl, size_t offset);
 typedef struct {
     CBMLanguage language;
     cbm_source_pass_fn collect;
     cbm_source_pass_fn resolve;
+    cbm_source_base_fn base; /* optional: a language whose inheritance only its rules can read */
     bool decides_references;
     bool one_name_one_node;
     bool before_binding_rules;
+    /* A grammar's parse error stays where it is: see source_damage_scan. */
+    bool contains_parse_damage;
+    /* optional: collects a file whose tree is unusable, when the adapter has another way to
+     * read it. It sets walk->failure when it has none. */
+    cbm_source_pass_fn collect_unusable;
 } cbm_source_adapter_t;
 
 /* Per-language rule tables. A row here is what makes a language supported. */
@@ -143,6 +153,8 @@ bool cbm_source_token(TSNode node, const char *token);
 /* Join one declaration to the definition extraction actually produced for it.
  * The line must fall inside that definition's span. NULL means not materialized. */
 const char *cbm_source_def_qn(cbm_source_walk_t *walk, const char *name, uint32_t line);
+/* The one QN this file's definitions of a name share, wherever they stand, or NULL. */
+const char *cbm_source_def_qn_of_name(cbm_source_walk_t *walk, const char *name);
 const char *cbm_source_def_qn_label(cbm_source_walk_t *walk, const char *name, uint32_t line,
                                     const char *label);
 
@@ -156,6 +168,10 @@ void *cbm_source_table_alloc(cbm_source_walk_t *walk, size_t size);
  * the whole project, for this language. */
 const cbm_source_decl_t *cbm_source_lookup(const cbm_source_walk_t *walk, const char *owner,
                                            const char *name);
+/* The same, in another language's declarations, for a call one language's rules state
+ * across to another: Elixir's `:mod.f()` names an Erlang module. */
+const cbm_source_decl_t *cbm_source_lookup_in(const cbm_source_walk_t *walk, CBMLanguage language,
+                                              const char *owner, const char *name);
 const char *cbm_source_table_package(const cbm_source_table_t *table, const char *name);
 
 /* Phase two. Later rows for the same exact site replace earlier ones. */

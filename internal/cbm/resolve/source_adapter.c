@@ -17,11 +17,17 @@ struct cbm_source_table {
     bool failed;
 };
 
+typedef struct {
+    uint32_t start, end;
+} source_damage_t;
+
 struct cbm_source_unit {
     cbm_source_site_t *sites;
     size_t count, capacity;
     cbm_source_extra_call_t *extras;
     size_t extra_count, extra_capacity;
+    source_damage_t *damage; /* sorted, disjoint: no site overlapping one is decided */
+    size_t damage_count, damage_capacity;
     const char *failure;
 };
 
@@ -60,6 +66,15 @@ bool cbm_source_adapter_has_binding_rules(CBMLanguage language) {
 void cbm_source_table_set_packages(cbm_source_table_t *table, const CBMHashTable *packages) {
     if (table)
         table->packages = packages;
+}
+
+const char *cbm_source_table_base(const cbm_source_table_t *table, CBMLanguage language,
+                                  const char *qualified_name, size_t offset) {
+    const cbm_source_adapter_t *adapter = adapter_for(language);
+    if (!table || !adapter || !adapter->base || !qualified_name)
+        return NULL;
+    const cbm_source_decl_t *decl = cbm_ht_get(table->qn_owners, qualified_name);
+    return decl ? adapter->base(table, decl, offset) : NULL;
 }
 
 const char *cbm_source_table_package(const cbm_source_table_t *table, const char *name) {
@@ -206,6 +221,19 @@ const char *cbm_source_def_qn_label(cbm_source_walk_t *walk, const char *name, u
     return found;
 }
 
+const char *cbm_source_def_qn_of_name(cbm_source_walk_t *walk, const char *name) {
+    if (!name || !source_def_index(walk))
+        return NULL;
+    const char *found = NULL;
+    for (const source_def_link_t *link = cbm_ht_get(walk->def_index, name); link;
+         link = link->next) {
+        if (found && strcmp(found, link->def->qualified_name))
+            return NULL;
+        found = link->def->qualified_name;
+    }
+    return found;
+}
+
 const char *cbm_source_def_qn(cbm_source_walk_t *walk, const char *name, uint32_t line) {
     return cbm_source_def_qn_label(walk, name, line, NULL);
 }
@@ -279,23 +307,27 @@ cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner
         }
         return decl;
     }
-    while (head->next)
-        head = head->next;
-    head->next = decl;
+    (head->last ? head->last : head)->next = decl;
+    head->last = decl;
     return decl;
 }
 
-const cbm_source_decl_t *cbm_source_lookup(const cbm_source_walk_t *walk, const char *owner,
-                                           const char *name) {
+const cbm_source_decl_t *cbm_source_lookup_in(const cbm_source_walk_t *walk, CBMLanguage language,
+                                              const char *owner, const char *name) {
     if (!walk->table || !name)
         return NULL;
     /* Short keys avoid arena growth in the hottest path of the adapters. */
     char buffer[768];
-    int length = snprintf(buffer, sizeof(buffer), "%d\x1f%s\x1f%s", (int)walk->language,
-                          owner ? owner : "", name);
+    int length =
+        snprintf(buffer, sizeof(buffer), "%d\x1f%s\x1f%s", (int)language, owner ? owner : "", name);
     if (length < 0 || (size_t)length >= sizeof(buffer))
         return NULL;
     return cbm_ht_get(walk->table->decls, buffer);
+}
+
+const cbm_source_decl_t *cbm_source_lookup(const cbm_source_walk_t *walk, const char *owner,
+                                           const char *name) {
+    return cbm_source_lookup_in(walk, walk->language, owner, name);
 }
 
 const char *cbm_source_unique_qn(const cbm_source_decl_t *first, const char **reason) {
@@ -350,8 +382,13 @@ void cbm_source_emit_facts(cbm_source_walk_t *walk, uint32_t start, uint32_t end
             unit->extras = extras;
             unit->extra_capacity = capacity;
         }
-        unit->extras[unit->extra_count++] = (cbm_source_extra_call_t){
-            walk->extra_scope ? walk->extra_scope : "", walk->extra_name, start, end};
+        unit->extras[unit->extra_count++] =
+            (cbm_source_extra_call_t){.scope = walk->extra_scope ? walk->extra_scope : "",
+                                      .name = walk->extra_name,
+                                      .start = start,
+                                      .end = end,
+                                      .kind = kind,
+                                      .line = walk->extra_line};
     }
     if (unit->count == unit->capacity) {
         size_t capacity = unit->capacity ? unit->capacity * 2 : 64;
@@ -392,12 +429,128 @@ static TSTree *parse_source(const CBMFileResult *result, CBMLanguage language, c
     return tree;
 }
 
-static const char *source_gate(const CBMFileResult *result, const char *source, size_t source_len) {
+static const char *source_gate(const cbm_source_adapter_t *adapter, const CBMFileResult *result,
+                               const char *source, size_t source_len) {
     if (!result || !source || !result->module_qn || source_len > UINT32_MAX)
         return "source_adapter_input_unavailable";
-    if (result->has_error || result->parse_incomplete || result->parse_unusable)
+    if (result->has_error || result->parse_unusable ||
+        (result->parse_incomplete && !adapter->contains_parse_damage))
         return "source_adapter_parse_incomplete";
     return NULL;
+}
+
+/* A grammar rejects a little valid code, and one rejection must not cost the whole file.
+ * What a rejection can break decides how far its damage reaches. Inside a function it can
+ * hide locals, so that whole function decides nothing. At class or file level it hides
+ * only what it spans, unless it may have changed the structure around it: an unbalanced
+ * delimiter or block keyword moves everything after it to another scope, a declaration
+ * keyword means a declaration was lost, and a MISSING token means an opener never closed.
+ * Those leave the file as a whole undecided, as before. */
+enum { SOURCE_DAMAGE_MAX_DEPTH = 400 };
+
+typedef struct {
+    CBMArena *arena; /* NULL: only ask whether the file can be trusted at all */
+    cbm_source_unit_t *unit;
+    const char *source;
+    const CBMLangSpec *spec;
+} source_damage_scan_t;
+
+static bool source_word_in(const char *text, size_t length, const char *const *words) {
+    for (size_t at = 0; at < length;) {
+        if (!isalpha((unsigned char)text[at]) && text[at] != '_') {
+            at++;
+            continue;
+        }
+        size_t end = at;
+        while (end < length && (isalnum((unsigned char)text[end]) || text[end] == '_'))
+            end++;
+        for (size_t w = 0; words[w]; w++)
+            if (strlen(words[w]) == end - at && !strncmp(text + at, words[w], end - at))
+                return true;
+        at = end;
+    }
+    return false;
+}
+
+static bool source_delimiters_balance(const char *text, size_t length) {
+    int round = 0, square = 0, curly = 0;
+    for (size_t i = 0; i < length; i++) {
+        round += (text[i] == '(') - (text[i] == ')');
+        square += (text[i] == '[') - (text[i] == ']');
+        curly += (text[i] == '{') - (text[i] == '}');
+        if (round < 0 || square < 0 || curly < 0)
+            return false;
+    }
+    return !round && !square && !curly;
+}
+
+static bool source_damage_add(source_damage_scan_t *scan, TSNode node) {
+    if (!scan->arena)
+        return true;
+    cbm_source_unit_t *unit = scan->unit;
+    if (unit->damage_count == unit->damage_capacity) {
+        size_t capacity = unit->damage_capacity ? unit->damage_capacity * 2 : 8;
+        source_damage_t *items = cbm_arena_alloc(scan->arena, capacity * sizeof(*items));
+        if (!items)
+            return false;
+        if (unit->damage_count)
+            memcpy(items, unit->damage, unit->damage_count * sizeof(*items));
+        unit->damage = items;
+        unit->damage_capacity = capacity;
+    }
+    unit->damage[unit->damage_count++] =
+        (source_damage_t){ts_node_start_byte(node), ts_node_end_byte(node)};
+    return true;
+}
+
+/* True when the damage below this node is contained. Reads only the nodes that hold an
+ * error, so a clean subtree costs nothing. */
+static bool source_damage_scan(source_damage_scan_t *scan, TSNode node, bool in_function,
+                               unsigned depth) {
+    static const char *const blocks[] = {"end", NULL};
+    static const char *const declarations[] = {
+        "class",   "object",   "trait",    "def",  "defp", "defmodule",
+        "module",  "sub",      "struct",   "fn",   "impl", "interface",
+        "package", "function", "defmacro", "enum", NULL};
+    if (depth > SOURCE_DAMAGE_MAX_DEPTH || ts_node_is_missing(node))
+        return false;
+    if (ts_node_is_error(node)) {
+        const char *text = scan->source + ts_node_start_byte(node);
+        size_t length = ts_node_end_byte(node) - ts_node_start_byte(node);
+        if (!source_delimiters_balance(text, length) || source_word_in(text, length, blocks) ||
+            (!in_function && source_word_in(text, length, declarations)))
+            return false;
+        return in_function || source_damage_add(scan, node);
+    }
+    if (!ts_node_has_error(node))
+        return true;
+    bool function = !in_function && cbm_kind_in_set(node, scan->spec->function_node_types);
+    if (function && !source_damage_add(scan, node))
+        return false;
+    bool contained = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            contained = source_damage_scan(scan, ts_tree_cursor_current_node(&cursor),
+                                           in_function || function, depth + 1);
+        } while (contained && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return contained;
+}
+
+static bool source_tree_usable(const cbm_source_adapter_t *adapter, TSTree *tree, CBMArena *arena,
+                               cbm_source_unit_t *unit, const char *source) {
+    if (!tree)
+        return false;
+    TSNode root = ts_tree_root_node(tree);
+    if (!ts_node_has_error(root))
+        return true;
+    if (!adapter->contains_parse_damage)
+        return false;
+    source_damage_scan_t scan = {
+        .arena = arena, .unit = unit, .source = source, .spec = cbm_lang_spec(adapter->language)};
+    return scan.spec && source_damage_scan(&scan, root, false, 0);
 }
 
 bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
@@ -406,14 +559,17 @@ bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
     const cbm_source_adapter_t *adapter = adapter_for(language);
     if (!table || !adapter)
         return false;
-    if (source_gate(result, source, source_len)) {
+    bool gated = source_gate(adapter, result, source, source_len) != NULL;
+    if (gated && (!adapter->collect_unusable || !result || !source || !result->module_qn ||
+                  source_len > UINT32_MAX)) {
         /* Its declarations remain unknown competitors of every other file. */
         table->incomplete[language] = true;
         return !table->failed;
     }
     TSTree *owned = NULL;
     TSTree *tree = parse_source(result, language, source, source_len, &owned);
-    if (!tree || ts_node_has_error(ts_tree_root_node(tree))) {
+    bool usable = !gated && source_tree_usable(adapter, tree, NULL, NULL, source);
+    if (!usable && (!tree || !adapter->collect_unusable)) {
         table->incomplete[language] = true;
         if (owned)
             ts_tree_delete(owned);
@@ -429,7 +585,7 @@ bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
                               .source_len = source_len,
                               .writable = table,
                               .root = ts_tree_root_node(tree)};
-    adapter->collect(&walk);
+    (usable ? adapter->collect : adapter->collect_unusable)(&walk);
     cbm_ht_free(walk.def_index);
     if (walk.failure)
         table->incomplete[language] = true;
@@ -461,12 +617,12 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
         unit->failure = "source_adapter_unavailable";
         return unit;
     }
-    unit->failure = source_gate(result, source, source_len);
+    unit->failure = source_gate(adapter, result, source, source_len);
     if (unit->failure)
         return unit;
     TSTree *owned = NULL;
     TSTree *tree = parse_source(result, language, source, source_len, &owned);
-    if (!tree || ts_node_has_error(ts_tree_root_node(tree))) {
+    if (!source_tree_usable(adapter, tree, arena, unit, source)) {
         unit->failure = "source_adapter_parse_incomplete";
         if (owned)
             ts_tree_delete(owned);
@@ -507,6 +663,19 @@ void cbm_source_unit_site(const cbm_source_unit_t *unit, uint32_t start, uint32_
         return;
     if (unit->failure) {
         out->reason = unit->failure;
+        return;
+    }
+    /* The first damage ending after this site's start is the only one it can overlap. */
+    size_t low = 0, high = unit->damage_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (unit->damage[middle].end <= start)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low < unit->damage_count && unit->damage[low].start < end) {
+        out->reason = "source_adapter_parse_incomplete";
         return;
     }
     out->reason = "source_occurrence_not_modelled";

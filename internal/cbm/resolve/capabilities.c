@@ -70,21 +70,26 @@ static const edge_row_t edge_rows[] = {
      "Exact declared namespace members; unproved aliases and competing candidates abstain."},
     {CBM_LANG_PHP, TYPED_EDGES | EDGE(USAGE),
      "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
-    {CBM_LANG_ELIXIR, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_ELIXIR, EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE),
      "alias, import, require and use of a module declared once in the project; a module declared "
      "twice or outside the project abstains."},
-    {CBM_LANG_ERLANG, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_ERLANG, EDGE(IMPORTS) | CALLABLE_EDGES,
      "-import and -behaviour of the module whose file bears its name, and -include next to the "
      "source; a name borne by two files, -include_lib and macro paths abstain."},
     {CBM_LANG_ZIG, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "@import of a literal .zig path relative to the importing file; names mapped by the build "
      "abstain."},
-    {CBM_LANG_PERL, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_PERL, EDGE(IMPORTS) | CALLABLE_EDGES,
      "use of a module found under the lib directory of an ancestor of the importing file; other "
      "@INC entries are not known and abstain."},
-    {CBM_LANG_HASKELL, EDGE(CALLS) | EDGE(USAGE), NULL},
-    {CBM_LANG_OCAML, EDGE(CALLS) | EDGE(USAGE), NULL},
-    {CBM_LANG_RUBY, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_HASKELL, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
+     "The file whose header declares the imported module; a module declared by two files and "
+     "modules outside the project abstain."},
+    {CBM_LANG_OCAML, EDGE(CALLS) | EDGE(USAGE),
+     "Units beside the file, under include_subdirs, and libraries by their dune name; opens, "
+     "includes and functor results of what those reach, as far as an interface shows them. What "
+     "a functor's parameter or a module outside the project holds abstains."},
+    {CBM_LANG_RUBY, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(WRITES),
      "require_relative of a literal path, and require of a path under the lib directory of an "
      "ancestor of the importing file; other load paths and interpolation abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
@@ -122,7 +127,8 @@ static const edge_row_t edge_rows[] = {
      "traversal, keyword arguments, conditions and prior unknown effects abstain."},
     {CBM_LANG_SCALA, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "Packages, imports by precedence, templates and their linearized parents; declared receiver "
-     "types and `new`. Inferred return types, infix calls and Java classes abstain."},
+     "types and `new`, infix calls and value members. Other inferred return types and Java classes "
+     "abstain."},
     {CBM_LANG_HCL, EDGE(IMPORTS) | EDGE(USAGE),
      "Terraform/OpenTofu literal local module sources and Terragrunt literal paths with audited "
      "parent-directory evaluation; remote, dynamic and ambiguous inputs abstain."},
@@ -333,14 +339,17 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->adapter = "elixir_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
         out->limitation =
-            "Module functions by name and arity through defmodule, alias and import; quote, "
-            "protocols, computed modules and a graph node shared by two modules abstain.";
+            "Module functions by name and arity through defmodule, defprotocol, defimpl, alias, "
+            "import and what a `use` is known to return, captures, module names and exported "
+            "functions of an Erlang module; quote, computed modules, a __using__ that does not end "
+            "in a quote and a graph node shared by two modules abstain.";
         break;
     case CBM_LANG_ERLANG:
         out->adapter = "erlang_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
-        out->limitation = "Functions by name and arity, -import and exported m:f and ?MODULE:f; a "
-                          "variable module or function and macros abstain.";
+        out->limitation = "Functions by name and arity, -import, exported m:f and ?MODULE:f, and "
+                          "fun references to them; a variable module or function and macros "
+                          "abstain.";
         break;
     case CBM_LANG_ZIG:
         out->adapter = "zig_source";
@@ -348,40 +357,50 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW;
         out->limitation =
-            "Container declarations, relative @import and members through declared types and "
-            "return types; build-mapped imports, comptime types, captures and a graph node shared "
-            "by two structs of a file abstain.";
+            "Container declarations, relative @import and members through declared types, return "
+            "types, orelse, catch, dereference and if or while captures; build-mapped imports, "
+            "comptime types and for and switch captures abstain.";
         break;
     case CBM_LANG_PERL:
         out->adapter = "perl_source";
         out->proof_subsets =
             CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT | CBM_RESOLVE_CAP_MEMBER;
         out->limitation =
-            "Package subs, qualified subs, Exporter imports and Class->m or $self->m through @ISA; "
-            "builtins, computed names and a graph node shared by two packages abstain. A glob "
-            "assigned through a computed name is unbounded and is not modelled.";
+            "Package subs, qualified subs, Exporter imports and re-exports, code references, and "
+            "Class->m, $self->m, shift->m or $_[0]->m through @ISA, also in the operator subs of "
+            "use overload; builtins, computed names, a sub the project also calls as a function "
+            "and a graph node shared by two packages abstain. A glob assigned through a computed "
+            "name is unbounded and is not modelled.";
         break;
     case CBM_LANG_RUBY:
         out->adapter = "ruby_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_MEMBER;
         out->limitation =
-            "Implicit self, self and Const receivers on the lexical class's ancestor chain; blocks "
-            "that can rebind self, metaprogrammed names, unknown ancestors and reopened duplicates "
-            "abstain. Constants inherited from an ancestor are not modelled.";
+            "Implicit self, self, self.class, Const and Const.new receivers on the lexical class's "
+            "ancestor chain, super from a class, attribute writers, index operators, aliases and "
+            "module functions; "
+            "constant mentions by lexical scope and ancestors. A block handed to anything but a "
+            "core iterator or a "
+            "project method that keeps its self, metaprogrammed names, unknown ancestors, reopened "
+            "duplicates and locals with no node abstain.";
         break;
     case CBM_LANG_HASKELL:
         out->adapter = "haskell_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
         out->limitation =
-            "Local bindings, top-level declarations, import lists and qualified imports against "
-            "the export list; re-exports, type-class dispatch and two providers abstain.";
+            "Local bindings, top-level declarations, data constructors, class methods, import "
+            "lists "
+            "and qualified imports against the export list; re-exports, which instance runs and "
+            "two providers abstain.";
         break;
     case CBM_LANG_OCAML:
         out->adapter = "ocaml_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
         out->limitation =
-            "Sequential let scope, local shadowing, module aliases and compilation units in the "
-            "same directory; an open or include of an unknown module and functors abstain.";
+            "Sequential let scope, local shadowing, module aliases, scoped opens, includes, "
+            "functor results, module types and interfaces, compilation units beside the file or "
+            "under include_subdirs and dune libraries by name; an open or include of an unknown "
+            "module, and a value of a functor's parameter or of the standard library, abstain.";
         break;
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
@@ -444,8 +463,10 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->adapter = "scala_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
-        out->limitation = "Packages, imports by precedence, linearized parents; declared receiver "
-                          "types; inferred return types and infix calls abstain.";
+        out->limitation =
+            "Packages, imports by precedence with each file's own imports, linearized parents; "
+            "declared and `new` types, named infix calls, generic calls and value members; other "
+            "inferred return types, a chain leaving the project and Java classes abstain.";
         break;
     case CBM_LANG_SWIFT:
         out->adapter = "swift_source";

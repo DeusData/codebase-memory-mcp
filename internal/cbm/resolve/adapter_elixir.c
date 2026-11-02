@@ -13,6 +13,21 @@
  * Inside `quote` a name belongs to the eventual expansion site, so nothing there
  * is decided. A remote call reaches only `def`/`defmacro`, never `defp`.
  *
+ * `use M` expands M's `__using__`. What that macro returns is known when its last
+ * statement is a `quote`: an `import X` or `use Y` standing directly in that quote holds
+ * at the use site, and a `def` standing there is a function of the using module, which
+ * has no node of its own, so a call of that name abstains.
+ *
+ * `:name.f(x)` is a call of Erlang module name, so it selects that module's exported
+ * f/1 when the project has one. `Proto.f(x)` selects the function a `defprotocol`
+ * declares; which `defimpl` runs is dispatch. A `defimpl P, for: T` is module P.T, so
+ * its own functions call each other like any module's.
+ *
+ * `&f/1` and `&Mod.f/1` capture by the same selection, without calling. A module's
+ * name wherever it is read is a mention of that module, if the project declares it
+ * once. A bare identifier is a variable, and the graph has no node for one; only `x
+ * |> f` makes one a call, of f/1.
+ *
  * The graph's Elixir QN holds neither module nor arity, so all clauses and
  * arities of one name in a module are one node. Two modules of a file sharing a
  * name share a node too, and that identity cannot name either: such a target
@@ -28,11 +43,21 @@ typedef struct {
 typedef struct {
     const char *module;
     TSNode only, except;
+    /* The same filters when the import stands in another file's `__using__`. */
+    const char *only_text, *except_text;
+    /* Not an import: a function `use` put into this module. */
+    const char *injected;
+    int injected_min, injected_max;
 } elixir_import_t;
+
+/* A statement in a module's `__using__`, kept on that module under this name. */
+#define ELIXIR_USING "&using"
+enum { ELIXIR_USING_KIND, ELIXIR_USING_ONLY, ELIXIR_USING_EXCEPT, ELIXIR_USING_PARTS };
 
 typedef struct {
     cbm_source_walk_t *walk;
     const char *module; /* NULL at file level */
+    const char *scope;  /* the enclosing definition's QN, or NULL */
     elixir_alias_t *aliases;
     size_t alias_count, alias_capacity;
     elixir_import_t *imports;
@@ -102,7 +127,34 @@ static const char *elixir_module_of_declaration(elixir_ctx_t *ctx, TSNode call) 
     return ctx->module ? cbm_arena_sprintf(ctx->walk->arena, "%s.%s", ctx->module, text) : text;
 }
 
-static void elixir_declare_function(elixir_ctx_t *ctx, TSNode call, const char *definer) {
+/* `defimpl P, for: T` is module P.T; with no `for:` T is the enclosing module. A list of
+ * types is several modules, which one body cannot be. */
+static const char *elixir_module_of_impl(elixir_ctx_t *ctx, TSNode call) {
+    TSNode arguments = elixir_arguments(call);
+    uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
+    TSNode protocol = count ? ts_node_named_child(arguments, 0) : (TSNode){0};
+    if (!cbm_source_is(protocol, "alias"))
+        return NULL;
+    const char *name = cbm_source_text(ctx->walk, protocol);
+    const char *type = ctx->module;
+    for (uint32_t i = 1; i < count; i++) {
+        TSNode keywords = ts_node_named_child(arguments, i);
+        uint32_t pairs =
+            cbm_source_is(keywords, "keywords") ? ts_node_named_child_count(keywords) : 0;
+        for (uint32_t p = 0; p < pairs; p++) {
+            TSNode pair = ts_node_named_child(keywords, p);
+            const char *key = cbm_source_text(ctx->walk, cbm_source_field(pair, "key"));
+            if (!key || strncmp(key, "for:", 4))
+                continue;
+            TSNode value = cbm_source_field(pair, "value");
+            type = cbm_source_is(value, "alias") ? cbm_source_text(ctx->walk, value) : NULL;
+        }
+    }
+    return name && type ? cbm_arena_sprintf(ctx->walk->arena, "%s.%s", name, type) : NULL;
+}
+
+/* A definition's name and the arities its head accepts. */
+static const char *elixir_signature(elixir_ctx_t *ctx, TSNode call, int *fewest, int *most) {
     TSNode head = elixir_head(call);
     const char *name = NULL;
     int arity_min = 0, arity_max = 0;
@@ -123,6 +175,14 @@ static void elixir_declare_function(elixir_ctx_t *ctx, TSNode call, const char *
                 arity_min++;
         }
     }
+    *fewest = arity_min;
+    *most = arity_max;
+    return name;
+}
+
+static void elixir_declare_function(elixir_ctx_t *ctx, TSNode call, const char *definer) {
+    int arity_min = 0, arity_max = 0;
+    const char *name = elixir_signature(ctx, call, &arity_min, &arity_max);
     if (!name || !ctx->module)
         return;
     uint32_t line = ts_node_start_point(call).row + 1;
@@ -136,6 +196,137 @@ static void elixir_declare_function(elixir_ctx_t *ctx, TSNode call, const char *
     }
 }
 
+/* `only: [a: 1, b: 2]` as ",a/1,b/2,"; "?" when the list is not written out. */
+static const char *elixir_filter_text(elixir_ctx_t *ctx, TSNode filter) {
+    CBMArena *arena = ctx->walk->arena;
+    if (!cbm_source_is(filter, "list"))
+        return "?";
+    const char *text = ",";
+    uint32_t count = ts_node_named_child_count(filter);
+    for (uint32_t i = 0; text && i < count; i++) {
+        TSNode keywords = ts_node_named_child(filter, i);
+        if (!cbm_source_is(keywords, "keywords"))
+            return "?";
+        uint32_t pairs = ts_node_named_child_count(keywords);
+        for (uint32_t p = 0; text && p < pairs; p++) {
+            TSNode pair = ts_node_named_child(keywords, p);
+            const char *key = cbm_source_text(ctx->walk, cbm_source_field(pair, "key"));
+            const char *value = cbm_source_text(ctx->walk, cbm_source_field(pair, "value"));
+            const char *colon = key ? strchr(key, ':') : NULL;
+            if (!colon || !value)
+                return "?";
+            text =
+                cbm_arena_sprintf(arena, "%s%.*s/%d,", text, (int)(colon - key), key, atoi(value));
+        }
+    }
+    return text ? text : "?";
+}
+
+static cbm_source_decl_t *elixir_declare_using(elixir_ctx_t *ctx, TSNode statement,
+                                               const char *value, const char *kind) {
+    cbm_source_decl_t *decl =
+        cbm_source_declare(ctx->walk, ctx->module, ELIXIR_USING, NULL, CBM_SOURCE_DECL_F_TYPE,
+                           ts_node_start_point(statement).row + 1);
+    const char **parts =
+        decl ? cbm_source_table_alloc(ctx->walk, ELIXIR_USING_PARTS * sizeof(*parts)) : NULL;
+    if (!parts)
+        return NULL;
+    decl->type = cbm_source_table_intern(ctx->walk, value);
+    parts[ELIXIR_USING_KIND] = kind;
+    decl->bases = parts;
+    return decl;
+}
+
+static void elixir_collect_using_statement(elixir_ctx_t *ctx, TSNode statement) {
+    const char *name =
+        cbm_source_is(statement, "call") ? elixir_target_name(ctx->walk, statement) : NULL;
+    if (!name)
+        return;
+    if (elixir_definer(name)) {
+        int arity_min = 0, arity_max = 0;
+        const char *defined = elixir_signature(ctx, statement, &arity_min, &arity_max);
+        cbm_source_decl_t *decl =
+            defined ? elixir_declare_using(ctx, statement, defined, "def") : NULL;
+        if (decl) {
+            decl->arity_min = arity_min;
+            decl->arity_max = arity_max;
+        }
+        return;
+    }
+    bool import = !strcmp(name, "import");
+    if (!import && strcmp(name, "use"))
+        return;
+    TSNode arguments = elixir_arguments(statement);
+    uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
+    TSNode first = count ? ts_node_named_child(arguments, 0) : (TSNode){0};
+    const char *written = cbm_source_text(ctx->walk, first);
+    /* Inside the quote `unquote(__MODULE__)` is the module this macro is in. */
+    const char *module = !written                                  ? NULL
+                         : cbm_source_is(first, "alias")           ? written
+                         : !strcmp(written, "unquote(__MODULE__)") ? ctx->module
+                                                                   : NULL;
+    cbm_source_decl_t *decl =
+        module ? elixir_declare_using(ctx, statement, module, import ? "import" : "use") : NULL;
+    if (!decl || !import)
+        return;
+    const char **parts = (const char **)decl->bases;
+    for (uint32_t i = 1; i < count; i++) {
+        TSNode keywords = ts_node_named_child(arguments, i);
+        uint32_t pairs =
+            cbm_source_is(keywords, "keywords") ? ts_node_named_child_count(keywords) : 0;
+        for (uint32_t p = 0; p < pairs; p++) {
+            TSNode pair = ts_node_named_child(keywords, p);
+            const char *key = cbm_source_text(ctx->walk, cbm_source_field(pair, "key"));
+            TSNode value = cbm_source_field(pair, "value");
+            if (key && !strncmp(key, "only:", 5))
+                parts[ELIXIR_USING_ONLY] =
+                    cbm_source_table_intern(ctx->walk, elixir_filter_text(ctx, value));
+            else if (key && !strncmp(key, "except:", 7))
+                parts[ELIXIR_USING_EXCEPT] =
+                    cbm_source_table_intern(ctx->walk, elixir_filter_text(ctx, value));
+        }
+    }
+}
+
+/* What `defmacro __using__` returns, when its last statement says so. */
+static void elixir_collect_using(elixir_ctx_t *ctx, TSNode definition) {
+    int arity_min = 0, arity_max = 0;
+    const char *name = elixir_signature(ctx, definition, &arity_min, &arity_max);
+    TSNode body = elixir_do_block(definition);
+    if (!name || strcmp(name, "__using__") || !ctx->module || ts_node_is_null(body))
+        return;
+    uint32_t statements = ts_node_named_child_count(body);
+    TSNode last = statements ? ts_node_named_child(body, statements - 1) : (TSNode){0};
+    const char *returned = cbm_source_is(last, "call") ? elixir_target_name(ctx->walk, last) : NULL;
+    if (!returned || strcmp(returned, "quote"))
+        return;
+    TSNode quoted = elixir_do_block(last);
+    if (!ts_node_is_null(quoted)) {
+        TSTreeCursor cursor = ts_tree_cursor_new(quoted);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                elixir_collect_using_statement(ctx, ts_tree_cursor_current_node(&cursor));
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    /* `quote do: import(X)` */
+    TSNode arguments = elixir_arguments(last);
+    uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode keywords = ts_node_named_child(arguments, i);
+        uint32_t pairs =
+            cbm_source_is(keywords, "keywords") ? ts_node_named_child_count(keywords) : 0;
+        for (uint32_t p = 0; p < pairs; p++) {
+            TSNode pair = ts_node_named_child(keywords, p);
+            const char *key = cbm_source_text(ctx->walk, cbm_source_field(pair, "key"));
+            if (key && !strncmp(key, "do:", 3))
+                elixir_collect_using_statement(ctx, cbm_source_field(pair, "value"));
+        }
+    }
+}
+
 static void elixir_collect_node(elixir_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
@@ -146,12 +337,17 @@ static void elixir_collect_node(elixir_ctx_t *ctx, TSNode node, unsigned depth) 
             const char *name = elixir_target_name(ctx->walk, child);
             if (name && !strcmp(name, "quote"))
                 continue;
-            if (name && !strcmp(name, "defmodule")) {
+            if (name && (!strcmp(name, "defmodule") || !strcmp(name, "defprotocol"))) {
                 const char *module = elixir_module_of_declaration(ctx, child);
                 if (!module)
                     continue;
                 uint32_t line = ts_node_start_point(child).row + 1;
-                (void)cbm_source_declare(ctx->walk, module, "", NULL, CBM_SOURCE_DECL_F_TYPE, line);
+                TSNode spelled = ts_node_named_child(elixir_arguments(child), 0);
+                (void)cbm_source_declare(
+                    ctx->walk, module, "",
+                    cbm_source_def_qn_label(ctx->walk, cbm_source_text(ctx->walk, spelled), line,
+                                            "Class"),
+                    CBM_SOURCE_DECL_F_TYPE, line);
                 const char *saved = ctx->module;
                 ctx->module = module;
                 TSNode body = elixir_do_block(child);
@@ -162,12 +358,21 @@ static void elixir_collect_node(elixir_ctx_t *ctx, TSNode node, unsigned depth) 
             }
             if (name && elixir_definer(name)) {
                 elixir_declare_function(ctx, child, name);
+                if (!strcmp(name, "defmacro"))
+                    elixir_collect_using(ctx, child);
                 continue;
             }
-            /* Protocol and implementation bodies have their own dispatch, which
-             * these rules do not state; their functions are not modelled. */
-            if (name && (!strcmp(name, "defprotocol") || !strcmp(name, "defimpl")))
+            if (name && !strcmp(name, "defimpl")) {
+                const char *module = elixir_module_of_impl(ctx, child);
+                TSNode body = elixir_do_block(child);
+                if (!module || ts_node_is_null(body))
+                    continue;
+                const char *saved = ctx->module;
+                ctx->module = module;
+                elixir_collect_node(ctx, body, depth + 1);
+                ctx->module = saved;
                 continue;
+            }
         }
         elixir_collect_node(ctx, child, depth + 1);
     }
@@ -272,6 +477,22 @@ static void elixir_note_alias(elixir_ctx_t *ctx, TSNode call) {
     elixir_add_alias(ctx, local, module);
 }
 
+static void elixir_push_import(elixir_ctx_t *ctx, elixir_import_t import) {
+    if (ctx->import_count == ctx->import_capacity) {
+        size_t capacity = ctx->import_capacity ? ctx->import_capacity * 2 : 8;
+        elixir_import_t *items = cbm_arena_alloc(ctx->walk->arena, capacity * sizeof(*items));
+        if (!items) {
+            cbm_source_fail(ctx->walk, "elixir_import_allocation");
+            return;
+        }
+        if (ctx->import_count)
+            memcpy(items, ctx->imports, ctx->import_count * sizeof(*items));
+        ctx->imports = items;
+        ctx->import_capacity = capacity;
+    }
+    ctx->imports[ctx->import_count++] = import;
+}
+
 static void elixir_note_import(elixir_ctx_t *ctx, TSNode call) {
     TSNode arguments = elixir_arguments(call);
     uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
@@ -294,19 +515,30 @@ static void elixir_note_import(elixir_ctx_t *ctx, TSNode call) {
                 import.except = cbm_source_field(pair, "value");
         }
     }
-    if (ctx->import_count == ctx->import_capacity) {
-        size_t capacity = ctx->import_capacity ? ctx->import_capacity * 2 : 8;
-        elixir_import_t *items = cbm_arena_alloc(ctx->walk->arena, capacity * sizeof(*items));
-        if (!items) {
-            cbm_source_fail(ctx->walk, "elixir_import_allocation");
-            return;
+    elixir_push_import(ctx, import);
+}
+
+/* `use M`: what M's `__using__` is known to return. A `use` in there follows on, and each
+ * module is read once, so this costs the modules reachable from M. */
+static void elixir_apply_using(elixir_ctx_t *ctx, const char *module, cbm_source_chain_t *chain) {
+    if (!cbm_source_chain_first_visit(chain, module))
+        return;
+    for (const cbm_source_decl_t *decl = cbm_source_lookup(ctx->walk, module, ELIXIR_USING); decl;
+         decl = decl->next) {
+        const char *kind = decl->bases[ELIXIR_USING_KIND];
+        if (!strcmp(kind, "use")) {
+            elixir_apply_using(ctx, decl->type, chain);
+        } else if (!strcmp(kind, "def")) {
+            elixir_push_import(ctx, (elixir_import_t){.injected = decl->type,
+                                                      .injected_min = decl->arity_min,
+                                                      .injected_max = decl->arity_max});
+        } else {
+            elixir_push_import(ctx,
+                               (elixir_import_t){.module = decl->type,
+                                                 .only_text = decl->bases[ELIXIR_USING_ONLY],
+                                                 .except_text = decl->bases[ELIXIR_USING_EXCEPT]});
         }
-        if (ctx->import_count)
-            memcpy(items, ctx->imports, ctx->import_count * sizeof(*items));
-        ctx->imports = items;
-        ctx->import_capacity = capacity;
     }
-    ctx->imports[ctx->import_count++] = import;
 }
 
 /* `only: [a: 1]` or `except: [a: 1]`. `only: :functions` and any computed list
@@ -335,6 +567,14 @@ static elixir_list_t elixir_filter_has(elixir_ctx_t *ctx, TSNode filter, const c
         }
     }
     return ELIXIR_LIST_NO;
+}
+
+static elixir_list_t elixir_text_filter_has(elixir_ctx_t *ctx, const char *filter, const char *name,
+                                            int arity) {
+    if (!strcmp(filter, "?"))
+        return ELIXIR_LIST_UNKNOWN;
+    const char *entry = cbm_arena_sprintf(ctx->walk->arena, ",%s/%d,", name, arity);
+    return entry && strstr(filter, entry) ? ELIXIR_LIST_YES : ELIXIR_LIST_NO;
 }
 
 /* Every declaration of (module, name) accepting this arity; several QNs mean
@@ -405,6 +645,30 @@ static void elixir_visit_bare_call(elixir_ctx_t *ctx, TSNode call, const char *n
     const char *selected = NULL, *from = NULL;
     for (size_t i = 0; i < ctx->import_count; i++) {
         const elixir_import_t *import = &ctx->imports[i];
+        if (import->injected) {
+            if (!strcmp(import->injected, name) && arity >= import->injected_min &&
+                arity <= import->injected_max) {
+                elixir_emit(ctx, call, NULL, CBM_RESOLVE_RULE_NONE, NULL,
+                            "elixir_function_put_here_by_use");
+                return;
+            }
+            continue;
+        }
+        if (import->only_text || import->except_text) {
+            elixir_list_t only = import->only_text
+                                     ? elixir_text_filter_has(ctx, import->only_text, name, arity)
+                                     : ELIXIR_LIST_YES;
+            elixir_list_t except =
+                import->except_text ? elixir_text_filter_has(ctx, import->except_text, name, arity)
+                                    : ELIXIR_LIST_NO;
+            if (only == ELIXIR_LIST_UNKNOWN || except == ELIXIR_LIST_UNKNOWN) {
+                elixir_emit(ctx, call, NULL, CBM_RESOLVE_RULE_NONE, NULL,
+                            "elixir_import_filter_not_literal");
+                return;
+            }
+            if (only == ELIXIR_LIST_NO || except == ELIXIR_LIST_YES)
+                continue;
+        }
         if (!ts_node_is_null(import->only)) {
             elixir_list_t member = elixir_filter_has(ctx, import->only, name, arity);
             if (member == ELIXIR_LIST_UNKNOWN) {
@@ -446,11 +710,43 @@ static void elixir_visit_bare_call(elixir_ctx_t *ctx, TSNode call, const char *n
                     "elixir_name_not_in_module_or_project_imports");
 }
 
+/* `:name` read as a module: an Erlang module of that name. */
+static const char *elixir_erlang_module(elixir_ctx_t *ctx, TSNode node) {
+    if (!cbm_source_is(node, "atom"))
+        return NULL;
+    const char *text = cbm_source_text(ctx->walk, node);
+    return text && text[0] == ':' && text[1] != '"' ? text + 1 : NULL;
+}
+
+/* An Erlang module's exported function of this name and arity. */
+static const char *elixir_erlang_function(elixir_ctx_t *ctx, const char *module, const char *name,
+                                          int arity) {
+    const char *selected = NULL;
+    for (const cbm_source_decl_t *decl =
+             cbm_source_lookup_in(ctx->walk, CBM_LANG_ERLANG, module, name);
+         decl; decl = decl->next) {
+        if (decl->arity_min != arity || !(decl->flags & CBM_SOURCE_DECL_F_PUBLIC))
+            continue;
+        if (!decl->qn || (selected && strcmp(selected, decl->qn)))
+            return NULL;
+        selected = decl->qn;
+    }
+    return selected;
+}
+
 static void elixir_visit_remote_call(elixir_ctx_t *ctx, TSNode call, TSNode dot, int arity) {
     TSNode left = cbm_source_field(dot, "left");
     TSNode right = cbm_source_field(dot, "right");
     if (!cbm_source_is(right, "identifier")) {
         elixir_emit(ctx, call, NULL, CBM_RESOLVE_RULE_NONE, NULL, "elixir_anonymous_function_call");
+        return;
+    }
+    const char *erlang = elixir_erlang_module(ctx, left);
+    if (erlang) {
+        const char *target =
+            elixir_erlang_function(ctx, erlang, cbm_source_text(ctx->walk, right), arity);
+        elixir_emit(ctx, call, target, CBM_RESOLVE_RULE_LANGUAGE_BINDING, erlang,
+                    target ? "elixir_erlang_module_function" : "elixir_erlang_function_absent");
         return;
     }
     const char *module = elixir_module_operand(ctx, left);
@@ -465,6 +761,62 @@ static void elixir_visit_remote_call(elixir_ctx_t *ctx, TSNode call, TSNode dot,
     elixir_emit(ctx, call, target,
                 direct ? CBM_RESOLVE_RULE_LANGUAGE_BINDING : CBM_RESOLVE_RULE_IMPORT_BINDING,
                 module, target ? "elixir_remote_module_function" : reason);
+}
+
+static void elixir_extra_begin(elixir_ctx_t *ctx, TSNode node, const char *name) {
+    cbm_source_walk_t *walk = ctx->walk;
+    walk->extra_scope = ctx->scope ? ctx->scope : walk->result->module_qn;
+    walk->extra_name = name;
+    walk->extra_line = ts_node_start_point(node).row + 1;
+}
+
+static void elixir_extra_end(elixir_ctx_t *ctx) {
+    ctx->walk->extra_scope = NULL;
+    ctx->walk->extra_name = NULL;
+    ctx->walk->extra_line = 0;
+}
+
+/* A module's name, read anywhere other than its own declaration. */
+static void elixir_visit_module_mention(elixir_ctx_t *ctx, TSNode node) {
+    const char *text = cbm_source_text(ctx->walk, node);
+    const char *module = text ? elixir_expand_alias(ctx, text) : NULL;
+    const char *reason = NULL;
+    const char *qn =
+        module ? cbm_source_unique_qn(cbm_source_lookup(ctx->walk, module, ""), &reason) : NULL;
+    if (!qn)
+        return;
+    elixir_extra_begin(ctx, node, text);
+    cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, qn,
+                         CBM_RESOLVE_RULE_LANGUAGE_BINDING, module, "elixir_module_name");
+    elixir_extra_end(ctx);
+}
+
+/* `&f/1` or `&Mod.f/1`. The grammar spells f as an identifier or a call without arguments. */
+static void elixir_visit_capture(elixir_ctx_t *ctx, TSNode site, TSNode left, int arity) {
+    const char *target = NULL;
+    const char *domain = NULL;
+    const char *reason = NULL;
+    const char *name = NULL;
+    TSNode callee = cbm_source_is(left, "call") ? cbm_source_field(left, "target") : left;
+    if (cbm_source_is(callee, "identifier") && ctx->module) {
+        name = cbm_source_text(ctx->walk, callee);
+        domain = ctx->module;
+        target = name ? elixir_select(ctx, ctx->module, name, arity, false, &reason) : NULL;
+    } else if (cbm_source_is(callee, "dot") &&
+               cbm_source_is(cbm_source_field(callee, "right"), "identifier")) {
+        domain = elixir_module_operand(ctx, cbm_source_field(callee, "left"));
+        name = cbm_source_text(ctx->walk, cbm_source_field(callee, "right"));
+        target = domain && name
+                     ? elixir_select(ctx, domain, name, arity,
+                                     !ctx->module || strcmp(ctx->module, domain), &reason)
+                     : NULL;
+    }
+    if (!target)
+        return;
+    elixir_extra_begin(ctx, site, name);
+    cbm_source_emit_node(ctx->walk, site, CBM_SOURCE_SITE_REFERENCE, target,
+                         CBM_RESOLVE_RULE_LANGUAGE_BINDING, domain, "elixir_function_capture");
+    elixir_extra_end(ctx);
 }
 
 static void elixir_visit(elixir_ctx_t *ctx, TSNode node, bool piped, unsigned depth);
@@ -499,20 +851,24 @@ static void elixir_visit_call(elixir_ctx_t *ctx, TSNode node, bool piped, unsign
     if (!ts_node_is_null(body))
         arity++; /* A do block is the trailing keyword argument. */
     if (name) {
-        if (!strcmp(name, "quote") || !strcmp(name, "defprotocol") || !strcmp(name, "defimpl"))
+        if (!strcmp(name, "quote"))
             return;
-        if (!strcmp(name, "defmodule")) {
-            const char *module = elixir_module_of_declaration(ctx, node);
+        bool protocol = !strcmp(name, "defprotocol");
+        bool implementation = !strcmp(name, "defimpl");
+        if (!strcmp(name, "defmodule") || protocol || implementation) {
+            const char *module = implementation ? elixir_module_of_impl(ctx, node)
+                                                : elixir_module_of_declaration(ctx, node);
             if (!module)
                 return;
             /* A nested defmodule leaves an alias of its last segment in the parent. */
-            if (ctx->module)
+            if (ctx->module && !implementation)
                 elixir_add_alias(ctx, cbm_source_text(ctx->walk, ts_node_named_child(arguments, 0)),
                                  module);
+            /* Imports are lexical, so a nested module sees those around it, and what it adds
+             * ends with it. */
             const char *saved = ctx->module;
             size_t imports = ctx->import_count;
             ctx->module = module;
-            ctx->import_count = 0;
             if (!ts_node_is_null(body))
                 elixir_visit_scoped(ctx, body, depth + 1);
             ctx->module = saved;
@@ -524,10 +880,20 @@ static void elixir_visit_call(elixir_ctx_t *ctx, TSNode node, bool piped, unsign
             TSNode head_arguments = elixir_arguments(node);
             uint32_t count =
                 ts_node_is_null(head_arguments) ? 0 : ts_node_named_child_count(head_arguments);
+            const char *saved_scope = ctx->scope;
+            TSNode head = elixir_head(node);
+            TSNode head_name =
+                cbm_source_is(head, "call") ? cbm_source_field(head, "target") : head;
+            ctx->scope =
+                cbm_source_is(head_name, "identifier")
+                    ? cbm_source_def_qn_label(ctx->walk, cbm_source_text(ctx->walk, head_name),
+                                              ts_node_start_point(node).row + 1, "Function")
+                    : NULL;
             for (uint32_t i = 1; i < count; i++)
                 elixir_visit_scoped(ctx, ts_node_named_child(head_arguments, i), depth + 1);
             if (!ts_node_is_null(body))
                 elixir_visit_scoped(ctx, body, depth + 1);
+            ctx->scope = saved_scope;
             return;
         }
         if (!strcmp(name, "alias")) {
@@ -545,11 +911,22 @@ static void elixir_visit_call(elixir_ctx_t *ctx, TSNode node, bool piped, unsign
             elixir_note_import(ctx, node);
             return;
         }
-        if (!strcmp(name, "use"))
+        if (!strcmp(name, "use")) {
+            const char *used = !ts_node_is_null(arguments) && ts_node_named_child_count(arguments)
+                                   ? elixir_module_operand(ctx, ts_node_named_child(arguments, 0))
+                                   : NULL;
+            cbm_source_chain_t chain = {0};
+            if (used)
+                elixir_apply_using(ctx, used, &chain);
             return;
+        }
         elixir_visit_bare_call(ctx, node, name, arity);
     } else if (cbm_source_is(cbm_source_field(node, "target"), "dot")) {
         elixir_visit_remote_call(ctx, node, cbm_source_field(node, "target"), arity);
+        /* The receiver is read first: `f(x).y` calls f, and `Mod.g(x)` mentions Mod. */
+        TSNode receiver = cbm_source_field(cbm_source_field(node, "target"), "left");
+        if (!ts_node_is_null(receiver))
+            elixir_visit(ctx, receiver, false, depth + 1);
     }
     if (!ts_node_is_null(arguments))
         elixir_visit_children(ctx, arguments, depth);
@@ -564,6 +941,26 @@ static void elixir_visit(elixir_ctx_t *ctx, TSNode node, bool piped, unsigned de
         elixir_visit_call(ctx, node, piped, depth);
         return;
     }
+    if (cbm_source_is(node, "alias")) {
+        elixir_visit_module_mention(ctx, node);
+        return;
+    }
+    if (cbm_source_is(node, "identifier")) {
+        const char *name = cbm_source_text(ctx->walk, node);
+        if (piped && name) {
+            elixir_extra_begin(ctx, node, name);
+            elixir_visit_bare_call(ctx, node, name, 1);
+            elixir_extra_end(ctx);
+            cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, NULL,
+                                 CBM_RESOLVE_RULE_NONE, NULL, "elixir_piped_name_is_a_call");
+        } else {
+            elixir_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL,
+                        "elixir_bare_name_is_a_variable");
+            cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, NULL,
+                                 CBM_RESOLVE_RULE_NONE, NULL, "elixir_variable_has_no_node");
+        }
+        return;
+    }
     /* A module attribute evaluates at compile time and typespecs are not code. */
     if (cbm_source_is(node, "unary_operator") && cbm_source_token(node, "@"))
         return;
@@ -575,6 +972,11 @@ static void elixir_visit(elixir_ctx_t *ctx, TSNode node, bool piped, unsigned de
             if (cbm_source_is(left, "call"))
                 elixir_emit(ctx, left, NULL, CBM_RESOLVE_RULE_NONE, NULL,
                             "elixir_capture_is_not_an_invocation");
+            TSNode arity = cbm_source_field(operand, "right");
+            const char *digits =
+                cbm_source_is(arity, "integer") ? cbm_source_text(ctx->walk, arity) : NULL;
+            if (digits)
+                elixir_visit_capture(ctx, node, left, atoi(digits));
             return;
         }
     }
@@ -599,4 +1001,6 @@ static void elixir_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_elixir = {.language = CBM_LANG_ELIXIR,
                                                         .collect = elixir_collect,
                                                         .resolve = elixir_resolve,
-                                                        .one_name_one_node = true};
+                                                        .one_name_one_node = true,
+                                                        .decides_references = true,
+                                                        .contains_parse_damage = true};
