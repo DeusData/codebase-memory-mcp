@@ -164,9 +164,9 @@ else
     EXT="tar.gz"
 fi
 
-# Linux ships a fully-static "-portable" build; the standard linux binary
-# dynamically links glibc 2.38+ and fails on older distros (Debian 11, RHEL 8,
-# Ubuntu 20.04). macOS/Windows have no such variant.
+# Linux ships a fully-static "-portable" build; the standard linux binary is
+# built on Ubuntu 22.04, dynamically links glibc 2.35+ and fails on older
+# distros (Debian 11, RHEL 8, Ubuntu 20.04). macOS/Windows have no such variant.
 PORTABLE=""
 [ "$OS" = "linux" ] && PORTABLE="-portable"
 
