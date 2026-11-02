@@ -9140,6 +9140,35 @@ static int remove_claude_owned_hook_scripts(const char *config_dir, const char *
     return rc;
 }
 
+/* Augment's SessionStart and PostToolUse view scripts are exact-owned: each is
+ * rebuilt from the binary path the install embedded and deleted only on a
+ * byte-for-byte match, so a script the user edited stays. Uninstall and the
+ * install-hook opt-out share this rule. */
+static void remove_augment_owned_hook_scripts(const char *binary_path, const char *session_path,
+                                              const char *coverage_path, bool uninstall) {
+    const struct {
+        const char *path;
+        int (*build)(const char *, char *, size_t);
+        const char *build_op;
+        const char *remove_op;
+    } scripts[] = {
+        {session_path, cbm_build_augment_session_script, "session_script_build",
+         uninstall ? "session_script_uninstall" : "session_script_disable"},
+        {coverage_path, cbm_build_augment_coverage_script, "coverage_script_build",
+         uninstall ? "coverage_script_uninstall" : "coverage_script_disable"},
+    };
+    for (size_t i = 0; i < sizeof(scripts) / sizeof(scripts[0]); i++) {
+        char script[CLI_BUF_8K];
+        if (scripts[i].build(binary_path, script, sizeof(script)) != CLI_OK) {
+            record_agent_config_error(uninstall, "Augment/Auggie", scripts[i].build_op,
+                                      scripts[i].path);
+        } else if (cbm_text_remove_owned_document(scripts[i].path, script) < 0) {
+            record_agent_config_error(uninstall, "Augment/Auggie", scripts[i].remove_op,
+                                      scripts[i].path);
+        }
+    }
+}
+
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
                                        bool dry_run) {
     char config_dir[CLI_BUF_1K];
@@ -11326,6 +11355,7 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
                     int session_result = cbm_remove_augment_session_hook(cp, session_hp);
                     int coverage_result = cbm_remove_augment_coverage_hook(cp, coverage_hp);
                     hook_ok = session_result == CLI_OK && coverage_result == CLI_OK;
+                    remove_augment_owned_hook_scripts(binary_path, session_hp, coverage_hp, false);
                 } else if (!cbm_install_augment_session_script(binary_path, session_hp)) {
                     hook_ok = false;
                     record_agent_config_error(false, "Augment/Auggie", "session_script_install",
@@ -13701,30 +13731,7 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
             if (cbm_remove_augment_coverage_hook(cp, coverage_hp) != CLI_OK) {
                 record_agent_config_error(true, "Augment/Auggie", "coverage_hook_uninstall", cp);
             }
-            char session_script[CLI_BUF_8K];
-            if (cbm_build_augment_session_script(binary_path, session_script,
-                                                 sizeof(session_script)) != CLI_OK) {
-                record_agent_config_error(true, "Augment/Auggie", "session_script_build",
-                                          session_hp);
-            } else {
-                int script_rc = cbm_text_remove_owned_document(session_hp, session_script);
-                if (script_rc < 0) {
-                    record_agent_config_error(true, "Augment/Auggie", "session_script_uninstall",
-                                              session_hp);
-                }
-            }
-            char coverage_script[CLI_BUF_8K];
-            if (cbm_build_augment_coverage_script(binary_path, coverage_script,
-                                                  sizeof(coverage_script)) != CLI_OK) {
-                record_agent_config_error(true, "Augment/Auggie", "coverage_script_build",
-                                          coverage_hp);
-            } else {
-                int script_rc = cbm_text_remove_owned_document(coverage_hp, coverage_script);
-                if (script_rc < 0) {
-                    record_agent_config_error(true, "Augment/Auggie", "coverage_script_uninstall",
-                                              coverage_hp);
-                }
-            }
+            remove_augment_owned_hook_scripts(binary_path, session_hp, coverage_hp, true);
         }
         printf("  removed SessionStart + PostToolUse hooks + dedicated subagent\n");
     }

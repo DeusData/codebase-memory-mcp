@@ -2891,6 +2891,131 @@ TEST(cli_no_hooks_removes_codex_pretool_hook) {
     PASS();
 }
 
+/* The Augment SessionStart and PostToolUse view scripts follow the persisted
+ * opt-out the way uninstall treats them: --no-hooks deletes both exact-owned
+ * scripts and keeps the MCP entry, a bare install keeps them off, --hooks
+ * restores them, and a script the user edited is kept. */
+TEST(cli_no_hooks_removes_augment_owned_scripts) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-augment-no-hooks-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "PATH"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char augment_dir[640];
+    char settings_path[768];
+    char session_path[768];
+    char coverage_path[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(augment_dir, sizeof(augment_dir), "%s/.augment", tmpdir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", augment_dir);
+#ifdef _WIN32
+    snprintf(session_path, sizeof(session_path), "%s/hooks/codebase-memory-session.ps1",
+             augment_dir);
+    snprintf(coverage_path, sizeof(coverage_path), "%s/hooks/codebase-memory-coverage.ps1",
+             augment_dir);
+#else
+    snprintf(session_path, sizeof(session_path), "%s/hooks/codebase-memory-session.sh",
+             augment_dir);
+    snprintf(coverage_path, sizeof(coverage_path), "%s/hooks/codebase-memory-coverage.sh",
+             augment_dir);
+#endif
+    test_mkdirp(augment_dir);
+    /* An installed binary at the default target is the path the scripts embed;
+     * without it --skip-binary would configure the test runner itself. */
+    char binary_dir[640];
+    char binary_path[768];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(binary_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    write_test_file(binary_path, "installed binary\n");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    char *default_args[] = {"--skip-binary", "--clients=augment", "--yes"};
+    int default_rc = cli_test_cmd_install(3, default_args);
+    bool default_scripts =
+        default_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
+
+    char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=augment", "--yes"};
+    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    bool scripts_removed =
+        no_hooks_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
+    char *settings = read_test_file_alloc(settings_path);
+    bool mcp_kept = settings && strstr(settings, "mcpServers") &&
+                    strstr(settings, "codebase-memory-mcp") &&
+                    !strstr(settings, "codebase-memory-session") &&
+                    !strstr(settings, "codebase-memory-coverage");
+    free(settings);
+
+    int bare_rc = cli_test_cmd_install(3, default_args);
+    bool bare_disabled =
+        bare_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
+
+    char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=augment", "--yes"};
+    int hooks_rc = cli_test_cmd_install(4, hooks_args);
+    settings = read_test_file_alloc(settings_path);
+    bool restored = hooks_rc == 0 && cbm_file_exists(session_path) &&
+                    cbm_file_exists(coverage_path) && settings &&
+                    strstr(settings, "codebase-memory-session") &&
+                    strstr(settings, "codebase-memory-coverage");
+    free(settings);
+
+    /* A script the user edited is no longer the owned document: the opt-out
+     * keeps it, as uninstall does, and still deletes the untouched one. */
+    char *owned_session = read_test_file_alloc(session_path);
+    char user_session[4096];
+    snprintf(user_session, sizeof(user_session), "%s# local edit\n",
+             owned_session ? owned_session : "");
+    free(owned_session);
+    write_test_file(session_path, user_session);
+    int user_rc = cli_test_cmd_install(4, no_hooks_args);
+    char *kept_session = read_test_file_alloc(session_path);
+    bool user_script_kept = user_rc == 0 && kept_session &&
+                            strcmp(kept_session, user_session) == 0 &&
+                            !cbm_file_exists(coverage_path);
+    free(kept_session);
+
+    /* End on --hooks, as the Codex case does: the opt-out is process state,
+     * and later tests install without the command line. */
+    (void)remove(session_path);
+    int final_rc = cli_test_cmd_install(4, hooks_args);
+    bool final_restored =
+        final_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(default_scripts);
+    ASSERT_TRUE(mcp_kept);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(scripts_removed);
+    ASSERT_TRUE(bare_disabled);
+    ASSERT_TRUE(user_script_kept);
+    ASSERT_TRUE(final_restored);
+    PASS();
+}
+
 TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-reset-XXXXXX");
@@ -20582,6 +20707,7 @@ SUITE(cli) {
     RUN_TEST(cli_install_hooks_preference_persists_and_migrates_owned_state);
     RUN_TEST(cli_no_hooks_plan_covers_every_hook_installer_family);
     RUN_TEST(cli_no_hooks_removes_codex_pretool_hook);
+    RUN_TEST(cli_no_hooks_removes_augment_owned_scripts);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
     RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
