@@ -768,6 +768,49 @@ static const char PHP_RULES_MAIN[] =
     "$this->own(); } }; }\n"
     "    public function noStaticThis() { return static function () { return $this->own(); }; }\n"
     "}\n";
+static const char PHP_RULES_MIXED[] =
+    "<?php\n"
+    "namespace App\\Services;\n"
+    "use App\\Concerns\\Loads;\n"
+    "use Vendor\\Lib\\Refreshes;\n"
+    "use Vendor\\Lib\\Framework;\n"
+    "use function App\\Support\\make_store;\n"
+    "use function App\\Support\\make_untyped;\n"
+    "use function App\\Support\\make_nullable;\n"
+    "use function App\\Support\\make_either;\n"
+    "class Blended extends Framework {\n"
+    "    use Refreshes;\n"
+    "    use Loads;\n"
+    "    public function viaTraitBesideOutside() { return $this->fromTrait(); }\n"
+    "    public function viaFunctionResult() { $s = make_store(); return $s->get(); }\n"
+    "    public function viaFunctionChain() { return make_store()->get(); }\n"
+    "    public function viaNullableResult() { return make_nullable()?->get(); }\n"
+    "    public function noFrameworkMember() { return $this->fromFramework(); }\n"
+    "    public function noUntypedResult() { $s = make_untyped(); return $s->get(); }\n"
+    "    public function noUnionResult() { $s = make_either(); return $s->get(); }\n"
+    "    public function noUnknownFunction() { $s = not_declared(); return $s->get(); }\n"
+    "}\n"
+    "trait Declares {\n"
+    "    abstract public function declared();\n"
+    "}\n"
+    "class AbstractBeside {\n"
+    "    use Refreshes;\n"
+    "    use Declares;\n"
+    "    public function noAbstractMember() { return $this->declared(); }\n"
+    "}\n"
+    "class Adapted {\n"
+    "    use Loads, Refreshes { Refreshes::fromTrait insteadof Loads; }\n"
+    "    public function noAdapted() { return $this->fromTrait(); }\n"
+    "}\n";
+static const char PHP_RULES_MAKERS[] =
+    "<?php\n"
+    "namespace App\\Support;\n"
+    "use App\\Services\\Store;\n"
+    "use App\\Services\\Other;\n"
+    "function make_store(): Store { return new Store(); }\n"
+    "function make_nullable(): ?Store { return null; }\n"
+    "function make_untyped() { return new Store(); }\n"
+    "function make_either(): Store|Other { return new Store(); }\n";
 
 #define PHP_MAIN "app/Services/AlbumService.php"
 #define PHP_RULE_AT(id, method, text, at, tfile, tsuffix, tlabel, tline, tdecl)               \
@@ -796,7 +839,59 @@ static const char PHP_RULES_MAIN[] =
         .relation = "CALLS", .any_target = true                                                \
     }
 
+#define PHP_MIXED "app/Services/Blended.php"
+#define PHP_MIXED_RULE(id, method, text, at, tfile, tsuffix, tlabel, tline, tdecl)             \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = PHP_MIXED,                                                            \
+                 .caller = "Blended." method,                                                    \
+                 .needle = text,                                                               \
+                 .occurrence_index = at},                                                      \
+        .relation = "CALLS",                                                                   \
+        .target = {.file = tfile,                                                              \
+                   .suffix = tsuffix,                                                          \
+                   .label = tlabel,                                                            \
+                   .declaration_line = tline,                                                  \
+                   .declaration_text = tdecl}                                                  \
+    }
+#define PHP_MIXED_DENY(id, caller_name, text, at)                                              \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = PHP_MIXED,                                                            \
+                 .caller = caller_name,                                                        \
+                 .needle = text,                                                               \
+                 .occurrence_index = at},                                                      \
+        .relation = "CALLS", .any_target = true                                                \
+    }
+
 static const RQ_Expected PHP_RULES_EXPECTED[] = {
+    PHP_MIXED_RULE("project-trait-beside-a-trait-outside-the-project", "viaTraitBesideOutside",
+                   "$this->fromTrait()", 0, "app/Concerns/Loads.php", "Loads.fromTrait", "Method",
+                   4, "    public function fromTrait() { return 1; }"),
+    PHP_MIXED_RULE("function-with-a-declared-return-type", "viaFunctionResult", "make_store()", 0,
+                   "app/Support/make.php", "make.make_store", "Function", 5,
+                   "function make_store(): Store { return new Store(); }"),
+    PHP_MIXED_RULE("local-from-a-declared-function-result", "viaFunctionResult", "$s->get()", 0,
+                   "app/Services/Store.php", "Store.get", "Method", 4,
+                   "    public function get() { return 1; }"),
+    PHP_MIXED_RULE("declared-function-result-in-a-chain", "viaFunctionChain", "make_store()->get()",
+                   0, "app/Services/Store.php", "Store.get", "Method", 4,
+                   "    public function get() { return 1; }"),
+    PHP_MIXED_RULE("the-function-with-no-declared-result", "noUntypedResult", "make_untyped()", 0,
+                   "app/Support/make.php", "make.make_untyped", "Function", 7,
+                   "function make_untyped() { return new Store(); }"),
+    PHP_MIXED_RULE("the-function-with-a-union-result", "noUnionResult", "make_either()", 0,
+                   "app/Support/make.php", "make.make_either", "Function", 8,
+                   "function make_either(): Store|Other { return new Store(); }"),
+    PHP_MIXED_RULE("the-function-in-that-chain", "viaFunctionChain", "make_store()", 1,
+                   "app/Support/make.php", "make.make_store", "Function", 5,
+                   "function make_store(): Store { return new Store(); }"),
+    PHP_MIXED_RULE("nullable-function-result", "viaNullableResult", "make_nullable()?->get()", 0,
+                   "app/Services/Store.php", "Store.get", "Method", 4,
+                   "    public function get() { return 1; }"),
+    PHP_MIXED_RULE("the-nullable-function", "viaNullableResult", "make_nullable()", 0,
+                   "app/Support/make.php", "make.make_nullable", "Function", 6,
+                   "function make_nullable(): ?Store { return null; }"),
     PHP_RULE("promoted-property-inherited-method", "viaPromoted",
              "$this->albumRepository->getOne(1)", "app/Repositories/Repository.php",
              "Repository.getOne", "Method", 4, "    public function getOne($id) { return null; }"),
@@ -866,6 +961,14 @@ static const RQ_Expected PHP_RULES_EXPECTED[] = {
 };
 
 static const RQ_Forbidden PHP_RULES_FORBIDDEN[] = {
+    PHP_MIXED_DENY("member-the-outside-parent-may-declare", "Blended.noFrameworkMember",
+                   "$this->fromFramework()", 0),
+    PHP_MIXED_DENY("function-with-no-declared-return-type", "Blended.noUntypedResult", "$s->get()", 1),
+    PHP_MIXED_DENY("function-with-a-union-return-type", "Blended.noUnionResult", "$s->get()", 2),
+    PHP_MIXED_DENY("function-not-in-the-project", "Blended.noUnknownFunction", "$s->get()", 3),
+    PHP_MIXED_DENY("abstract-trait-member-gives-way-to-the-other-trait",
+                   "AbstractBeside.noAbstractMember", "$this->declared()", 0),
+    PHP_MIXED_DENY("trait-adaptation-rules-decide", "Adapted.noAdapted", "$this->fromTrait()", 1),
     PHP_DENY("chain-leaves-project-before-member", "noExternal", "$this->save()", 0),
     PHP_DENY("two-assigned-types", "noReassign", "$x->get()", 0),
     PHP_DENY("use-before-assignment", "noEarly", "$x->get()", 1),
@@ -913,6 +1016,8 @@ TEST(resolver_php_source_rules_bind_real_forms_and_refuse_decoys) {
             {.path = "app/Services/Magic.php", .text = PHP_RULES_MAGIC},
             {.path = "app/Services/DupA.php", .text = PHP_RULES_DUP_A},
             {.path = "app/Services/DupB.php", .text = PHP_RULES_DUP_B},
+            {.path = PHP_MIXED, .text = PHP_RULES_MIXED},
+            {.path = "app/Support/make.php", .text = PHP_RULES_MAKERS},
         };
         bool ok = cbm_mkdir_p(repo, 0755);
         for (size_t i = 0; ok && i < sizeof(sources) / sizeof(sources[0]); i++) {

@@ -3151,32 +3151,10 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
                   "  void ownM() {}"),
         DART_CALL("inherited-member-with-no-outside-import", "callsInherited", "fromBase()",
                   DART_BASE_FILE, "Base.fromBase", "Method", 2, "  void fromBase() {}"),
-        /* The rule selects these, but extraction makes no node for a mixin's members. */
-        {.case_id = "mixin-member",
-         .site = {.file = DART_FILE, .caller = "Counter.callsMixin", .needle = "fromMix()"},
-         .relation = "CALLS",
-         .target = {.file = DART_BASE_FILE,
-                    .suffix = "Mix.fromMix",
-                    .label = "Method",
-                    .declaration_line = 6,
-                    .declaration_text = "  void fromMix() {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "dart-mixin-member-has-no-node",
-         .why = "The chain reaches Mix.fromMix, but the graph has no node to point the edge at.",
-         .tried = "Selection is covered by the abstention reason; a Class node for mixins is an "
-                  "extraction change left out of this lane."},
-        {.case_id = "last-mixin-wins",
-         .site = {.file = DART_FILE, .caller = "Counter.callsLastMixin", .needle = "both()"},
-         .relation = "CALLS",
-         .target = {.file = DART_BASE_FILE,
-                    .suffix = "Later.both",
-                    .label = "Method",
-                    .declaration_line = 10,
-                    .declaration_text = "  void both() {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "dart-last-mixin-member-has-no-node",
-         .why = "Later is applied last so its both() is selected, but it has no node either.",
-         .tried = "As for mixin-member."},
+        DART_CALL("mixin-member", "callsMixin", "fromMix()", DART_BASE_FILE, "Mix.fromMix", "Method",
+                  6, "  void fromMix() {}"),
+        DART_CALL("last-mixin-wins", "callsLastMixin", "both()", DART_BASE_FILE, "Later.both",
+                  "Method", 10, "  void both() {}"),
         DART_CALL("library-function-beats-inherited-member", "callsLibraryFirst", "fromLibrary()",
                   DART_FILE, "main.fromLibrary", "Function", 37, "void fromLibrary() {}"),
         DART_SAVE("declared-field-receiver", "callsField", "store.save"),
@@ -3207,6 +3185,8 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
         SL_CALL_AT("cascade-selects-on-its-receiver", DART_FILE, "Chains.callsCascade", "..casc()",
                    0, DART_STORE_FILE, "Extra.casc", "Method", 13, "  void casc() {}"),
         SL_USE_AT("declared-type-of-a-local", DART_FILE, "Counter.callsTyped", "Store", 4,
+                  DART_STORE_FILE, "store.Store", "Class", 1, "class Store {"),
+        SL_USE_AT("head-of-a-named-constructor-is-read", DART_FILE, "Counter.callsTyped", "Store", 5,
                   DART_STORE_FILE, "store.Store", "Class", 1, "class Store {"),
         SL_USE_AT("function-read-as-a-value", DART_FILE, "Chains.mentions", "topLocal", 4,
                   DART_FILE, "main.topLocal", "Function", 38, "void topLocal() {}"),
@@ -3425,6 +3405,1230 @@ TEST(resolver_source_swift_modules_lookup_and_receivers) {
                    "loose2()", 0),
     };
     ASSERT(sl_check("swift-rules", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* Forms from Alamofire and Vapor. Without the parse view each of these files is voided. */
+static const char SW_COND[] =
+    "class Conditional {\n"                                                     /* 1 */
+    "    #if os(iOS)\n"                                                         /* 2 */
+    "    private let lock = LockA()\n"                                          /* 3 */
+    "    func inBranch() {}\n"                                                  /* 4 */
+    "    #elseif os(macOS)\n"                                                   /* 5 */
+    "    private let lock = LockB()\n"                                          /* 6 */
+    "    func otherBranch() {}\n"                                               /* 7 */
+    "    #else\n"                                                               /* 8 */
+    "    #error(\n"                                                              /* 9 */
+    "      \"no lock\"\n"                                                        /* 10 */
+    "    )\n"                                                                    /* 11 */
+    "    #endif\n"                                                               /* 12 */
+    "    private nonisolated(unsafe) var state: Holder = Holder()\n"            /* 13 */
+    "    func callsBranches() {\n"                                              /* 14 */
+    "        inBranch()\n"                                                      /* 15 */
+    "        otherBranch()\n"                                                   /* 16 */
+    "    }\n"                                                                   /* 17 */
+    "    func unitArgument() -> Holder { use(.success(())); return state }\n"   /* 18 */
+    "    func consumes(h: Holder) { let k = consume h; k.go() }\n"              /* 19 */
+    "    func typedThrows() throws(MyError) { state.go() }\n"                   /* 20 */
+    "    func unsafeForm(h: Holder) { unsafe h.go() }\n"                        /* 21 */
+    "    func sends(h: sending Holder) { h.go() }\n"                            /* 22 */
+    "    func labelNamedCopy(copy h: Holder) { h.go() }\n"                      /* 23 */
+    "    func callsLabel(h: Holder) { labelNamedCopy(copy: h) }\n"              /* 24 */
+    "    func noTwoBranchTypes() { lock.go() }\n"                               /* 25 */
+    "    init(seed: Holder) { seed.go() }\n"                                    /* 26 */
+    "    deinit { state.go() }\n"                                               /* 27 */
+    "    subscript(i: Int) -> Int { state.go(); return i }\n"                   /* 28 */
+    "}\n"                                                                       /* 29 */
+    "struct Holder { func go() {} }\n"                                          /* 30 */
+    "struct LockA { func go() {} }\n"                                           /* 31 */
+    "struct LockB { func go() {} }\n";                                          /* 32 */
+static const char SW_INITS[] =
+    "class Parent {\n"                                                          /* 1 */
+    "    init(a: Int) {}\n"                                                     /* 2 */
+    "}\n"                                                                       /* 3 */
+    "class Child: Parent {\n"                                                   /* 4 */
+    "    override init(a: Int) { super.init(a: a) }\n"                          /* 5 */
+    "    func noInitOfAValue(c: Child) { c.init(z: 1) }\n"                      /* 6 */
+    "    func madeByType() -> Child { Child(a: 1) }\n"                          /* 7 */
+    "}\n";                                                                      /* 8 */
+static const char SW_READS[] =
+    "import Lib\n"                                                              /* 1 */
+    "enum Mode { case fast, slow(reason: String) }\n"                           /* 2 */
+    "class Settings: Base {\n"                                                  /* 3 */
+    "    static let shared = Settings()\n"                                      /* 4 */
+    "    let timeout = 10\n"                                                    /* 5 */
+    "    var mode: Mode = .fast\n"                                              /* 6 */
+    "    func annotated() { let m: Mode? = nil; use(m) }\n"                     /* 7 */
+    "    func generic() { var xs: [Int: Mode] = [:]; xs.removeAll() }\n"        /* 8 */
+    "    func bareRead() { use(timeout) }\n"                                    /* 9 */
+    "    func selfRead() { use(self.timeout) }\n"                               /* 10 */
+    "    func memberRead(s: Settings) { use(s.timeout) }\n"                     /* 11 */
+    "    func staticRead() { use(Settings.shared) }\n"                          /* 12 */
+    "    func enumRead() { use(Mode.fast) }\n"                                  /* 13 */
+    "    func keyPathRead() { use(\\Settings.timeout) }\n"                      /* 14 */
+    "    func noLabelIsARead() { take(timeout: 1) }\n"                          /* 15 */
+    "    func noTupleLabel() { use((timeout: 1, x: 2)) }\n"                     /* 16 */
+    "    func noParameter(timeout: Int) { use(timeout) }\n"                     /* 17 */
+    "    func noLocal() { let timeout = 1; use(timeout) }\n"                    /* 18 */
+    "    func noUnknownReceiver(x: Any) { use(x.timeout) }\n"                   /* 19 */
+    "    func noImplicitMember() { use(.timeout) }\n"                           /* 20 */
+    "    func noLocalType() { struct Holder {}; use(Holder()) }\n"              /* 21 */
+    "    func noCalledMember(s: Settings) { s.bareRead() }\n"                   /* 22 */
+    "    func nilDefault(a: Int, b: Settings? = nil) {}\n"                      /* 23 */
+    "    func callsNilDefault() { nilDefault(a: 1) }\n"                         /* 24 */
+    "    weak var monitor: (any Greeting)?\n"                                   /* 25 */
+    "    func optionalExistential() { monitor?.greet() }\n"                     /* 26 */
+    "}\n"                                                                       /* 27 */
+    "protocol Greeting { func greet() }\n"                                      /* 28 */
+    "struct Holder { let timeout = 1 }\n"                                       /* 29 */
+    "struct Aliased { typealias Holder = Int; func f() { use(Holder.self) } }\n"; /* 30 */
+static const char SW_EXT_LIB[] = "public class Session {\n"
+                                 "    public init() {}\n"
+                                 "    public func request(_ url: String) -> Req { Req() }\n"
+                                 "    public func only() {}\n"
+                                 "}\n"
+                                 "public class Req {\n"
+                                 "    public init() {}\n"
+                                 "    public var session: Session { Session() }\n"
+                                 "    public func validate() -> Req { self }\n"
+                                 "}\n"
+                                 "public extension Session {\n"
+                                 "    var shadowed: Int { 1 }\n"
+                                 "    var typedTwice: Int { 1 }\n"
+                                 "    var onlyThere: Int { 1 }\n"
+                                 "}\n";
+static const char SW_EXT_APP[] =
+    "import Lib\n"                                                              /* 1 */
+    "extension Session {\n"                                                     /* 2 */
+    "    func request(_ endpoint: Endpoint) -> Req { only(); return Req() }\n"  /* 3 */
+    "    func added() {}\n"                                                     /* 4 */
+    "}\n"                                                                       /* 5 */
+    "struct Endpoint {}\n"                                                      /* 6 */
+    "class Uses {\n"                                                            /* 7 */
+    "    func exactTypeSelects(s: Session) { s.request(Endpoint()) }\n"         /* 8 */
+    "    func addedHere(s: Session) { s.added() }\n"                            /* 9 */
+    "    func declaredThere(s: Session) { s.only() }\n"                         /* 10 */
+    "    func noSharedLabels(s: Session) { let e = unknownFn(); s.request(e) }\n" /* 11 */
+    "}\n"                                                                       /* 12 */
+    "extension Session {\n"                                                     /* 13 */
+    "    var shadowed: Int { 2 }\n"                                             /* 14 */
+    "    var typedTwice: String { \"\" }\n"                                     /* 15 */
+    "}\n"                                                                       /* 16 */
+    "class Shadows {\n"                                                         /* 17 */
+    "    func readsLocal(r: Req) { use(r.session.shadowed) }\n"                 /* 18 */
+    "    func readsImported(r: Req) { use(r.session.onlyThere) }\n"             /* 19 */
+    "    func noTwoTypes(r: Req) { use(r.session.typedTwice) }\n"               /* 20 */
+    "}\n";                                                                      /* 21 */
+
+/* `try await` before a body's brace, which the grammar reads as a trailing closure. */
+static const char SW_ASYNC[] =
+    "struct Job { func run() {} }\n"                                            /* 1 */
+    "func load() async throws -> Job? { nil }\n"                                /* 2 */
+    "class Asyncs {\n"                                                          /* 3 */
+    "    func ifTryAwait() async throws {\n"                                    /* 4 */
+    "        if let j = try await load() {\n"                                   /* 5 */
+    "            j.run()\n"                                                     /* 6 */
+    "        }\n"                                                               /* 7 */
+    "    }\n"                                                                   /* 8 */
+    "    func elseBranch() async throws {\n"                                    /* 9 */
+    "        if let j = try? await load() {\n"                                  /* 10 */
+    "            j.run()\n"                                                     /* 11 */
+    "        } else {\n"                                                        /* 12 */
+    "            helper()\n"                                                    /* 13 */
+    "        }\n"                                                               /* 14 */
+    "    }\n"                                                                   /* 15 */
+    "    func switchTryAwait() async throws {\n"                                /* 16 */
+    "        switch try await load() {\n"                                       /* 17 */
+    "        default: helper()\n"                                               /* 18 */
+    "        }\n"                                                               /* 19 */
+    "    }\n"                                                                   /* 20 */
+    "    func awaitAsALabel(await x: Job) { x.run() }\n"                        /* 21 */
+    "    func helper() {}\n"                                                    /* 22 */
+    "}\n";                                                                      /* 23 */
+#define SW_ASYNC_FILE "Sources/App/Async.swift"
+#define SW_ASYNC_CALL(id, method, needle, at, suffix, label, line, decl)                       \
+    SL_CALL_AT(id, SW_ASYNC_FILE, "Asyncs." method, needle, at, SW_ASYNC_FILE, suffix, label, line, decl)
+#define SW_ASYNC_LOAD "func load() async throws -> Job? { nil }"
+#define SW_ASYNC_RUN "struct Job { func run() {} }"
+#define SW_ASYNC_HELPER "    func helper() {}"
+
+/* An import names a target of the manifest. A directory of that name is not one. */
+static const char SW_IMPORTS[] = "@testable import Lib\n"
+                                 "public import class Lib.Session\n"
+                                 "import Foundation\n"
+                                 "import NotATarget\n";
+#define SW_IMPORTS_FILE "Sources/App/Imports.swift"
+#define SW_IMPORT_OF_LIB(id, text)                                                             \
+    {                                                                                          \
+        .case_id = id, .site = {.file = SW_IMPORTS_FILE, .caller = "Imports.swift.__file__",   \
+                                .needle = text},                                               \
+        .relation = "IMPORTS",                                                                 \
+        .target = {.domain = RQ_TARGET_CONFIGURED_FOLDER,                                      \
+                   .file = "Sources/Lib",                                                      \
+                   .suffix = "Sources.Lib",                                                    \
+                   .label = "Folder",                                                          \
+                   .declaration_line = 5,                                                      \
+                   .declaration_text = "    .target(name: \"Lib\", path: \"Sources/Lib\"),",     \
+                   .configuration_file = "Package.swift"}                                      \
+    }
+#define SW_NO_IMPORT(id, text)                                                                 \
+    {                                                                                          \
+        .case_id = id, .site = {.file = SW_IMPORTS_FILE, .caller = "Imports.swift.__file__",   \
+                                .needle = text},                                               \
+        .relation = "IMPORTS", .any_target = true                                              \
+    }
+
+#define SW_COND_FILE "Sources/App/Cond.swift"
+#define SW_READS_FILE "Sources/App/Reads.swift"
+#define SW_EXT_LIB_FILE "Sources/Lib/Session.swift"
+#define SW_EXT_APP_FILE "Sources/App/Ext.swift"
+#define SW_GO_AT(id, caller, text, at, line, decl)                                             \
+    SL_CALL_AT(id, SW_COND_FILE, caller, text, at, SW_COND_FILE, "Holder.go", "Method", line, decl)
+#define SW_HOLDER_GO "struct Holder { func go() {} }"
+#define SW_TYPE_AT(id, sfile, scaller, text, at, tfile, tsuffix, tlabel, tline, tdecl)         \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = sfile, .caller = scaller, .needle = text, .occurrence_index = at},    \
+        .relation = "USES_TYPE",                                                               \
+        .target = {.file = tfile,                                                              \
+                   .suffix = tsuffix,                                                          \
+                   .label = tlabel,                                                            \
+                   .declaration_line = tline,                                                  \
+                   .declaration_text = tdecl}                                                  \
+    }
+#define SW_READ_OF_SESSION(id, caller, at)                                                     \
+    SL_USE_AT(id, SW_EXT_APP_FILE, caller, "session", at, SW_EXT_LIB_FILE, "Req.session", "Variable", \
+              8, "    public var session: Session { Session() }")
+#define SW_READ(id, method, needle, at, suffix, label, line, decl)                             \
+    SL_USE_AT(id, SW_READS_FILE, "Settings." method, needle, at, SW_READS_FILE, suffix, label, line, \
+              decl)
+
+TEST(resolver_source_swift_parse_view_reads_and_extensions) {
+    static const RQ_Source sources[] = {
+        {.path = "Package.swift", .text = SW_MANIFEST},
+        {.path = SW_COND_FILE, .text = SW_COND},
+        {.path = SW_READS_FILE, .text = SW_READS},
+        {.path = SW_EXT_LIB_FILE, .text = SW_EXT_LIB},
+        {.path = SW_EXT_APP_FILE, .text = SW_EXT_APP},
+        {.path = "Sources/App/Base.swift", .text = "class Base {}\n"},
+        {.path = "Sources/App/Inits.swift", .text = SW_INITS},
+        {.path = SW_ASYNC_FILE, .text = SW_ASYNC},
+        {.path = SW_IMPORTS_FILE, .text = SW_IMPORTS},
+        {.path = "Sources/Foundation/Decoy.swift", .text = "func decoy() {}\n"},
+        {.path = "Scripts/imports.swift", .text = "import Lib\n"},
+        {.path = "Other/Package.swift",
+         .text = "let package = Package(name: \"Other\", targets: [.target(name: \"Other\")])\n"},
+        {.path = "Other/Sources/Other/Uses.swift", .text = "import Lib\n"},
+    };
+    static const RQ_Expected expected[] = {
+        SW_IMPORT_OF_LIB("import-of-a-target-reaches-its-directory", "@testable import Lib"),
+        SW_IMPORT_OF_LIB("import-of-a-member-names-the-module-first",
+                         "public import class Lib.Session"),
+        SW_ASYNC_CALL("try-await-before-a-body", "ifTryAwait", "load()", 1, "Async.load", "Function", 2,
+                      SW_ASYNC_LOAD),
+        SW_ASYNC_CALL("the-body-after-try-await", "ifTryAwait", "j.run()", 0, "Job.run", "Method", 1,
+                      SW_ASYNC_RUN),
+        SW_ASYNC_CALL("try-optional-await-before-a-body", "elseBranch", "load()", 2, "Async.load",
+                      "Function", 2, SW_ASYNC_LOAD),
+        SW_ASYNC_CALL("the-body-after-try-optional-await", "elseBranch", "j.run()", 1, "Job.run",
+                      "Method", 1, SW_ASYNC_RUN),
+        SW_ASYNC_CALL("the-else-after-try-optional-await", "elseBranch", "helper()", 0, "Asyncs.helper",
+                      "Method", 22, SW_ASYNC_HELPER),
+        SW_ASYNC_CALL("switch-on-try-await", "switchTryAwait", "load()", 3, "Async.load", "Function", 2,
+                      SW_ASYNC_LOAD),
+        SW_ASYNC_CALL("a-case-after-switch-on-try-await", "switchTryAwait", "helper()", 1,
+                      "Asyncs.helper", "Method", 22, SW_ASYNC_HELPER),
+        SW_ASYNC_CALL("a-label-named-await-stays-a-label", "awaitAsALabel", "x.run()", 0, "Job.run",
+                      "Method", 1, SW_ASYNC_RUN),
+        SL_CALL_AT("member-in-an-if-branch-of-a-type-body", SW_COND_FILE,
+                   "Conditional.callsBranches", "inBranch()", 1, SW_COND_FILE,
+                   "Conditional.inBranch", "Method", 4, "    func inBranch() {}"),
+        SL_CALL_AT("member-in-another-branch-of-a-type-body", SW_COND_FILE,
+                   "Conditional.callsBranches", "otherBranch()", 1, SW_COND_FILE,
+                   "Conditional.otherBranch", "Method", 7, "    func otherBranch() {}"),
+        SW_GO_AT("unit-value-does-not-void-the-file", "Conditional.consumes", "k.go()", 0, 30,
+                 SW_HOLDER_GO),
+        SW_GO_AT("typed-throws", "Conditional.typedThrows", "state.go()", 0, 30, SW_HOLDER_GO),
+        SW_GO_AT("unsafe-expression", "Conditional.unsafeForm", "h.go()", 0, 30, SW_HOLDER_GO),
+        SW_GO_AT("sending-parameter", "Conditional.sends", "h.go()", 1, 30, SW_HOLDER_GO),
+        SW_GO_AT("a-label-named-copy-stays-a-label", "Conditional.labelNamedCopy", "h.go()", 2, 30,
+                 SW_HOLDER_GO),
+        SL_CALL_AT("label-copy-selects-its-function", SW_COND_FILE, "Conditional.callsLabel",
+                   "labelNamedCopy(copy: h)", 0, SW_COND_FILE, "Conditional.labelNamedCopy",
+                   "Method", 23, "    func labelNamedCopy(copy h: Holder) { h.go() }"),
+        SW_GO_AT("call-inside-init-belongs-to-init", "Conditional.init", "seed.go()", 0, 30,
+                 SW_HOLDER_GO),
+        SW_GO_AT("call-inside-deinit-belongs-to-deinit", "Conditional.deinit", "state.go()", 1, 30,
+                 SW_HOLDER_GO),
+        SW_GO_AT("call-inside-subscript-belongs-to-subscript", "Conditional.subscript", "state.go()",
+                 2, 30, SW_HOLDER_GO),
+        SL_CALL_AT("super-init-selects-an-initializer", "Sources/App/Inits.swift", "Child.init",
+                   "super.init(a: a)", 0, "Sources/App/Inits.swift", "Parent.init", "Method", 2,
+                   "    init(a: Int) {}"),
+        SL_CALL_AT("calling-the-type-stays-a-class-call", "Sources/App/Inits.swift",
+                   "Child.madeByType", "Child(a: 1)", 0, "Sources/App/Inits.swift", "Inits.Child",
+                   "Class", 4, "class Child: Parent {"),
+        SL_USE_AT("the-return-type-beside-that-call", "Sources/App/Inits.swift", "Child.madeByType",
+                  "Child", 2, "Sources/App/Inits.swift", "Inits.Child", "Class", 4,
+                  "class Child: Parent {"),
+        SW_TYPE_AT("that-return-type-is-a-use-of-the-type", "Sources/App/Inits.swift", "Child.madeByType",
+                   "Child", 2, "Sources/App/Inits.swift", "Inits.Child", "Class", 4,
+                   "class Child: Parent {"),
+        SW_READ("type-annotation-of-a-local", "annotated", "Mode", 2, "Reads.Mode", "Class", 2,
+                "enum Mode { case fast, slow(reason: String) }"),
+        SW_READ("type-inside-a-generic-annotation", "generic", "Mode", 3, "Reads.Mode", "Class", 2,
+                "enum Mode { case fast, slow(reason: String) }"),
+        SW_READ("bare-name-of-a-property", "bareRead", "timeout", 1, "Settings.timeout", "Variable",
+                5, "    let timeout = 10"),
+        SW_READ("self-property", "selfRead", "timeout", 2, "Settings.timeout", "Variable", 5,
+                "    let timeout = 10"),
+        SW_READ("property-of-a-declared-receiver", "memberRead", "timeout", 3, "Settings.timeout",
+                "Variable", 5, "    let timeout = 10"),
+        SW_READ("key-path-with-a-written-root", "keyPathRead", "timeout", 4, "Settings.timeout",
+                "Variable", 5, "    let timeout = 10"),
+        SW_READ("the-root-of-that-key-path", "keyPathRead", "Settings", 4, "Reads.Settings", "Class",
+                3, "class Settings: Base {"),
+        SW_READ("static-member-read", "staticRead", "shared", 1, "Settings.shared", "Variable", 4,
+                "    static let shared = Settings()"),
+        SW_READ("the-type-read-for-that-member", "staticRead", "Settings", 3, "Reads.Settings",
+                "Class", 3, "class Settings: Base {"),
+        SW_READ("enum-case-read", "enumRead", "fast", 2, "Mode.fast", "Variable", 2,
+                "enum Mode { case fast, slow(reason: String) }"),
+        SW_READ("the-enum-read-for-that-case", "enumRead", "Mode", 4, "Reads.Mode", "Class", 2,
+                "enum Mode { case fast, slow(reason: String) }"),
+        SL_USE_AT("a-property-here-shadows-the-imported-one", SW_EXT_APP_FILE, "Shadows.readsLocal",
+                  "shadowed", 1, SW_EXT_APP_FILE, "Ext.Session.shadowed", "Variable", 14,
+                  "    var shadowed: Int { 2 }"),
+        SW_READ_OF_SESSION("the-receiver-of-that-property", "Shadows.readsLocal", 0),
+        SL_USE_AT("a-public-extension-makes-its-members-public", SW_EXT_APP_FILE, "Shadows.readsImported",
+                  "onlyThere", 0, SW_EXT_LIB_FILE, "Session.Session.onlyThere", "Variable", 14,
+                  "    var onlyThere: Int { 1 }"),
+        SW_READ_OF_SESSION("the-receiver-of-the-imported-property", "Shadows.readsImported", 1),
+        SW_READ_OF_SESSION("the-receiver-of-a-property-of-two-types", "Shadows.noTwoTypes", 2),
+        SL_CALL_AT("exact-parameter-type-selects-across-modules", SW_EXT_APP_FILE,
+                   "Uses.exactTypeSelects", "s.request(Endpoint())", 0, SW_EXT_APP_FILE,
+                   "Ext.Session.request", "Method", 3,
+                   "    func request(_ endpoint: Endpoint) -> Req { only(); return Req() }"),
+        SL_CALL_AT("the-argument-of-that-call", SW_EXT_APP_FILE, "Uses.exactTypeSelects",
+                   "Endpoint()", 0, SW_EXT_APP_FILE, "Ext.Endpoint", "Struct", 6,
+                   "struct Endpoint {}"),
+        SL_CALL_AT("the-other-call-in-that-extension", SW_EXT_APP_FILE, "Ext.Session.request",
+                   "Req()", 0, SW_EXT_LIB_FILE, "Session.Req", "Class", 6, "public class Req {"),
+        SL_USE_AT("the-return-type-of-that-extension-member", SW_EXT_APP_FILE, "Ext.Session.request",
+                  "Req", 0, SW_EXT_LIB_FILE, "Session.Req", "Class", 6, "public class Req {"),
+        SW_TYPE_AT("the-return-type-is-a-use-of-the-type", SW_EXT_APP_FILE, "Ext.Session.request", "Req",
+                   0, SW_EXT_LIB_FILE, "Session.Req", "Class", 6, "public class Req {"),
+        SL_CALL_AT("a-nil-default-makes-a-parameter-optional", SW_READS_FILE,
+                   "Settings.callsNilDefault", "nilDefault(a: 1)", 0, SW_READS_FILE,
+                   "Settings.nilDefault", "Method", 23,
+                   "    func nilDefault(a: Int, b: Settings? = nil) {}"),
+        SL_CALL_AT("optional-existential-receiver", SW_READS_FILE, "Settings.optionalExistential",
+                   "monitor?.greet()", 0, SW_READS_FILE, "Greeting.greet", "Method", 28,
+                   "protocol Greeting { func greet() }"),
+        SL_CALL_AT("extension-in-this-module-of-an-imported-type", SW_EXT_APP_FILE, "Uses.addedHere",
+                   "s.added()", 0, SW_EXT_APP_FILE, "Ext.Session.added", "Method", 4,
+                   "    func added() {}"),
+        SL_CALL_AT("member-the-imported-type-declares", SW_EXT_APP_FILE, "Uses.declaredThere",
+                   "s.only()", 0, SW_EXT_LIB_FILE, "Session.only", "Method", 4,
+                   "    public func only() {}"),
+        SL_CALL_AT("bare-name-in-an-extension-of-an-imported-type", SW_EXT_APP_FILE,
+                   "Ext.Session.request", "only()", 0, SW_EXT_LIB_FILE, "Session.only", "Method", 4,
+                   "    public func only() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SW_NO_IMPORT("a-directory-of-that-name-is-no-target", "import Foundation"),
+        SW_NO_IMPORT("a-module-outside-the-manifest", "import NotATarget"),
+        {.case_id = "a-file-of-no-target-proves-no-package",
+         .site = {.file = "Scripts/imports.swift", .caller = "imports.swift.__file__", .needle = "import Lib"},
+         .relation = "IMPORTS",
+         .any_target = true},
+        {.case_id = "another-manifest-needs-its-dependency-chain",
+         .site = {.file = "Other/Sources/Other/Uses.swift",
+                  .caller = "Uses.swift.__file__",
+                  .needle = "import Lib"},
+         .relation = "IMPORTS",
+         .any_target = true},
+        SL_DENY_AT("no-initializer-has-these-labels", "Sources/App/Inits.swift",
+                   "Child.noInitOfAValue", "c.init(z: 1)", 0),
+        SL_DENY_AT("branches-disagree-on-the-type", SW_COND_FILE, "Conditional.noTwoBranchTypes",
+                   "lock.go()", 0),
+        SL_NO_USE_AT("a-property-of-another-type-does-not-shadow", SW_EXT_APP_FILE, "Shadows.noTwoTypes",
+                     "typedTwice", 1),
+        SL_DENY_AT("overloads-across-modules-share-labels", SW_EXT_APP_FILE, "Uses.noSharedLabels",
+                   "s.request(e)", 0),
+        SL_NO_USE_AT("argument-label-is-not-a-read", SW_READS_FILE, "Settings.noLabelIsARead",
+                     "timeout", 5),
+        SL_NO_USE_AT("tuple-label-is-not-a-read", SW_READS_FILE, "Settings.noTupleLabel", "timeout",
+                     6),
+        SL_NO_USE_AT("parameter-shadows-property", SW_READS_FILE, "Settings.noParameter", "timeout",
+                     8),
+        SL_NO_USE_AT("local-shadows-property", SW_READS_FILE, "Settings.noLocal", "timeout", 10),
+        SL_NO_USE_AT("unknown-receiver", SW_READS_FILE, "Settings.noUnknownReceiver", "timeout", 11),
+        SL_NO_USE_AT("implicit-member-is-not-a-name-in-scope", SW_READS_FILE,
+                     "Settings.noImplicitMember", "timeout", 12),
+        SL_DENY_AT("local-type-hides-the-module-type", SW_READS_FILE, "Settings.noLocalType",
+                   "Holder()", 0),
+        SL_NO_USE_AT("called-member-is-not-a-read", SW_READS_FILE, "Settings.noCalledMember",
+                     "bareRead", 1),
+        SL_NO_USE_AT("alias-in-a-type-hides-the-module-type", SW_READS_FILE, "Aliased.f", "Holder",
+                     4),
+    };
+    ASSERT(sl_check("swift-reads", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* Implicit members and overloads that share labels across files, as Alamofire's tests use them. */
+static const char SW_CTX[] =
+    "enum Mode {\n"                                                             /* 1 */
+    "    case fast, none\n"                                                     /* 2 */
+    "    case slow(reason: String)\n"                                           /* 3 */
+    "    static let shared = Mode.fast\n"                                       /* 4 */
+    "    static func make() -> Mode { .fast }\n"                                /* 5 */
+    "    func label() {}\n"                                                     /* 6 */
+    "}\n"                                                                       /* 7 */
+    "class Alpha { static let onlyAlpha = Alpha(); static let both = Alpha() }\n" /* 8 */
+    "class Omega: Alpha {}\n"                                                   /* 9 */
+    "class Beta { static let both = Beta() }\n"                                 /* 10 */
+    "protocol Proto { func required() }\n"                                      /* 11 */
+    "struct Impl: Proto { func required() {} }\n"                               /* 12 */
+    "struct Named: ExpressibleByStringLiteral { init(stringLiteral v: String) {} }\n" /* 13 */
+    "func pick(_ a: Alpha) {}\n"                                                /* 14 */
+    "func conv(_ p: any Proto) {}\n"                                            /* 15 */
+    "func lit(_ n: Named) {}\n"                                                 /* 16 */
+    "func out(_ a: Alpha) {}\n"                                                 /* 17 */
+    "func takes(m: Mode) {}\n"                                                  /* 18 */
+    "func optional(m: Mode?) {}\n"                                              /* 19 */
+    "func closureLast(queue: Beta = .both, done: () -> Void) {}\n"              /* 20 */
+    "\n"                                                                        /* 21 */
+    "struct Point { let mode = 1; static func mode(of: Int) -> Point { Point() } }\n" /* 22 */
+    "class Uses {\n"                                                            /* 23 */
+    "    var current: Mode = .fast\n"                                           /* 24 */
+    "    func annotated() { let m: Mode = .shared; use(m) }\n"                  /* 25 */
+    "    func returned() -> Mode { return .shared }\n"                          /* 26 */
+    "    func implicitlyReturned() -> Mode { .shared }\n"                       /* 27 */
+    "    func compared(m: Mode) { if m == .fast { use(m) } }\n"                 /* 28 */
+    "    func assigned() { current = .shared }\n"                               /* 29 */
+    "    func switched(m: Mode) { switch m { case .fast: break; default: break } }\n" /* 30 */
+    "    func withPayload(m: Mode) { switch m { case .slow(let fast): use(fast); default: break } }\n" /* 31 */
+    "    func argument() { takes(m: .shared) }\n"                               /* 32 */
+    "    func called() { let m: Mode = .make(); m.label() }\n"                  /* 33 */
+    "    func payload() { let m: Mode = .slow(reason: \"x\"); use(m) }\n"       /* 34 */
+    "    func noOptionalNone() { optional(m: .none) }\n"                        /* 35 */
+    "    func noContext() { use(.shared) }\n"                                   /* 36 */
+    "    func noMember() { let m: Mode = .other; use(m) }\n"                    /* 37 */
+    "    func pickByMember() { pick(.onlyAlpha) }\n"                            /* 38 */
+    "    func noPickBoth() { pick(.both) }\n"                                   /* 39 */
+    "    func pickAlpha() { pick(Alpha()) }\n"                                  /* 40 */
+    "    func pickBeta() { pick(Beta()) }\n"                                    /* 41 */
+    "    func pickSubclass() { pick(Omega()) }\n"                               /* 42 */
+    "    func noOutsideForEither(u: URL) { pick(u) }\n"                         /* 43 */
+    "    func exactBeatsExistential() { conv(Impl()) }\n"                       /* 44 */
+    "    func existentialTakesIt(p: any Proto) { conv(p) }\n"                   /* 45 */
+    "    func literalTakesIt() { lit(\"x\") }\n"                                /* 46 */
+    "    func outsideGoesToTheProtocol(u: URL) { out(u) }\n"                    /* 47 */
+    "    func trailing() { closureLast { } }\n"                                 /* 48 */
+    "    func functionBesideValue() { _ = Point.mode(of: 1) }\n"                /* 49 */
+    "}\n";                                                                      /* 50 */
+static const char SW_CTX2[] = "func pick(_ b: Beta) {}\n"          /* 1 */
+                              "func conv(_ i: Impl) {}\n"          /* 2 */
+                              "func lit(_ a: Alpha) {}\n"          /* 3 */
+                              "func out(_ p: any Proto) {}\n"      /* 4 */
+                              "func closureLast(other: Int, more: Int) {}\n"; /* 5 */
+
+#define SW_CTX_FILE "Sources/App/Ctx.swift"
+#define SW_CTX2_FILE "Sources/App/Ctx2.swift"
+#define SW_CTX_USE(id, method, needle, at, suffix, line, decl)                                 \
+    SL_USE_AT(id, SW_CTX_FILE, "Uses." method, needle, at, SW_CTX_FILE, suffix, "Variable", line, decl)
+#define SW_CTX_TYPE_USE(id, method, at)                                                        \
+    SL_USE_AT(id, SW_CTX_FILE, "Uses." method, "Mode", at, SW_CTX_FILE, "Ctx.Mode", "Class", 1,    \
+              "enum Mode {")
+#define SW_CTX_USES_TYPE(id, method, at)                                                        \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = SW_CTX_FILE,                                                          \
+                 .caller = "Uses." method,                                                     \
+                 .needle = "Mode",                                                             \
+                 .occurrence_index = at},                                                      \
+        .relation = "USES_TYPE",                                                               \
+        .target = {.file = SW_CTX_FILE,                                                        \
+                   .suffix = "Ctx.Mode",                                                       \
+                   .label = "Class",                                                           \
+                   .declaration_line = 1,                                                      \
+                   .declaration_text = "enum Mode {"}                                          \
+    }
+#define SW_CTX_MADE(id, method, needle, at, suffix, label, line, decl)                         \
+    SL_CALL_AT(id, SW_CTX_FILE, "Uses." method, needle, at, SW_CTX_FILE, suffix, label, line, decl)
+#define SW_MODE_SHARED_DECL "    static let shared = Mode.fast"
+#define SW_MODE_CASES "    case fast, none"
+#define SW_CTX_CALL(id, method, needle, tfile, tsuffix, tline, tdecl)                          \
+    SL_CALL_AT(id, SW_CTX_FILE, "Uses." method, needle, 0, tfile, tsuffix, "Function", tline, tdecl)
+
+TEST(resolver_source_swift_implicit_members_and_overloads_by_type) {
+    static const RQ_Source sources[] = {
+        {.path = "Package.swift", .text = SW_MANIFEST},
+        {.path = SW_CTX_FILE, .text = SW_CTX},
+        {.path = SW_CTX2_FILE, .text = SW_CTX2},
+    };
+    static const RQ_Expected expected[] = {
+        SW_CTX_USE("annotation-gives-the-context", "annotated", "shared", 1, "Mode.shared", 4,
+                   SW_MODE_SHARED_DECL),
+        SW_CTX_TYPE_USE("the-annotation-itself", "annotated", 6),
+        SW_CTX_USE("return-type-gives-the-context", "returned", "shared", 2, "Mode.shared", 4,
+                   SW_MODE_SHARED_DECL),
+        SW_CTX_TYPE_USE("the-return-type-itself", "returned", 7),
+        SW_CTX_USES_TYPE("the-return-type-is-a-use-of-the-type", "returned", 7),
+        SW_CTX_USE("implicit-return-gives-the-context", "implicitlyReturned", "shared", 3,
+                   "Mode.shared", 4, SW_MODE_SHARED_DECL),
+        SW_CTX_TYPE_USE("the-implicit-return-type-itself", "implicitlyReturned", 8),
+        SW_CTX_USES_TYPE("the-implicit-return-type-is-a-use-of-the-type", "implicitlyReturned", 8),
+        SW_CTX_USE("other-side-of-equality-gives-the-context", "compared", "fast", 4, "Mode.fast",
+                   2, SW_MODE_CASES),
+        SW_CTX_USE("assignment-target-gives-the-context", "assigned", "shared", 4, "Mode.shared",
+                   4, SW_MODE_SHARED_DECL),
+        SW_CTX_USE("switch-subject-gives-the-context", "switched", "fast", 5, "Mode.fast", 2,
+                   SW_MODE_CASES),
+        SW_CTX_USE("case-pattern-with-a-payload-names-the-case", "withPayload", "slow", 1,
+                   "Mode.slow", 3, "    case slow(reason: String)"),
+        SW_CTX_USE("parameter-gives-the-context", "argument", "shared", 5, "Mode.shared", 4,
+                   SW_MODE_SHARED_DECL),
+        SL_CALL_AT("implicit-member-call", SW_CTX_FILE, "Uses.called", ".make()", 0, SW_CTX_FILE,
+                   "Mode.make", "Method", 5, "    static func make() -> Mode { .fast }"),
+        SL_CALL_AT("enum-case-has-the-enum-type", SW_CTX_FILE, "Uses.called", "m.label()", 0,
+                   SW_CTX_FILE, "Mode.label", "Method", 6, "    func label() {}"),
+        SW_CTX_USE("case-with-a-payload-is-read", "payload", "slow", 2, "Mode.slow", 3,
+                   "    case slow(reason: String)"),
+        SW_CTX_TYPE_USE("the-annotation-beside-a-payload", "payload", 13),
+        SW_CTX_TYPE_USE("the-annotation-beside-an-unknown-member", "noMember", 14),
+        SW_CTX_USE("the-member-that-picked-the-overload", "pickByMember", "onlyAlpha", 1,
+                   "Alpha.onlyAlpha", 8,
+                   "class Alpha { static let onlyAlpha = Alpha(); static let both = Alpha() }"),
+        SW_CTX_MADE("the-argument-made-for-that-type", "pickAlpha", "Alpha()", 3, "Ctx.Alpha", "Class",
+                    8, "class Alpha { static let onlyAlpha = Alpha(); static let both = Alpha() }"),
+        SW_CTX_MADE("the-argument-made-for-the-other-type", "pickBeta", "Beta()", 2, "Ctx.Beta",
+                    "Class", 10, "class Beta { static let both = Beta() }"),
+        SW_CTX_MADE("the-subclass-argument", "pickSubclass", "Omega()", 0, "Ctx.Omega", "Class", 9,
+                    "class Omega: Alpha {}"),
+        SW_CTX_MADE("the-struct-argument", "exactBeatsExistential", "Impl()", 0, "Ctx.Impl", "Struct",
+                    12, "struct Impl: Proto { func required() {} }"),
+        SW_CTX_CALL("member-only-one-parameter-type-has", "pickByMember", "pick(.onlyAlpha)",
+                    SW_CTX_FILE, "Ctx.pick", 14, "func pick(_ a: Alpha) {}"),
+        SW_CTX_CALL("argument-of-this-type", "pickAlpha", "pick(Alpha())", SW_CTX_FILE, "Ctx.pick",
+                    14, "func pick(_ a: Alpha) {}"),
+        SW_CTX_CALL("argument-of-that-type", "pickBeta", "pick(Beta())", SW_CTX2_FILE, "Ctx2.pick",
+                    1, "func pick(_ b: Beta) {}"),
+        SW_CTX_CALL("subclass-goes-to-its-base", "pickSubclass", "pick(Omega())", SW_CTX_FILE,
+                    "Ctx.pick", 14, "func pick(_ a: Alpha) {}"),
+        SW_CTX_CALL("exact-type-beats-an-existential", "exactBeatsExistential", "conv(Impl())",
+                    SW_CTX2_FILE, "Ctx2.conv", 2, "func conv(_ i: Impl) {}"),
+        SW_CTX_CALL("existential-goes-to-the-existential", "existentialTakesIt", "conv(p)",
+                    SW_CTX_FILE, "Ctx.conv", 15, "func conv(_ p: any Proto) {}"),
+        SW_CTX_CALL("literal-goes-to-the-type-that-takes-it", "literalTakesIt", "lit(\"x\")",
+                    SW_CTX_FILE, "Ctx.lit", 16, "func lit(_ n: Named) {}"),
+        SW_CTX_CALL("outside-type-cannot-be-a-project-class", "outsideGoesToTheProtocol", "out(u)",
+                    SW_CTX2_FILE, "Ctx2.out", 4, "func out(_ p: any Proto) {}"),
+        SW_CTX_CALL("trailing-closure-skips-a-default-to-reach-the-function", "trailing",
+                    "closureLast { }", SW_CTX_FILE, "Ctx.closureLast", 20,
+                    "func closureLast(queue: Beta = .both, done: () -> Void) {}"),
+        SL_CALL_AT("function-beside-a-value-of-its-name", SW_CTX_FILE, "Uses.functionBesideValue",
+                   "Point.mode(of: 1)", 0, SW_CTX_FILE, "Point.mode", "Method", 22,
+                   "struct Point { let mode = 1; static func mode(of: Int) -> Point { Point() } }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_NO_USE_AT("optional-none-is-not-the-enum-case", SW_CTX_FILE, "Uses.noOptionalNone",
+                     "none", 1),
+        SL_NO_USE_AT("no-context-no-member", SW_CTX_FILE, "Uses.noContext", "shared", 6),
+        SL_NO_USE_AT("member-the-context-type-lacks", SW_CTX_FILE, "Uses.noMember", "other", 0),
+        SL_NO_USE_AT("a-payload-binding-is-not-the-case-of-its-name", SW_CTX_FILE,
+                     "Uses.withPayload", "fast", 7),
+        SL_DENY_AT("both-parameter-types-have-the-member", SW_CTX_FILE, "Uses.noPickBoth",
+                   "pick(.both)", 0),
+        SL_DENY_AT("outside-type-fits-neither", SW_CTX_FILE, "Uses.noOutsideForEither", "pick(u)", 0),
+    };
+    ASSERT(sl_check("swift-context", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+
+/* Types an initializer states, and `.foo` nested inside what a call of a type or a case takes. */
+static const char SW_TYPED[] =
+    "enum Reason {\n"                                                           /* 1 */
+    "    case bad\n"                                                            /* 2 */
+    "    case worse(detail: Detail)\n"                                          /* 3 */
+    "    case either(Detail, other: Detail)\n"                                  /* 4 */
+    "}\n"                                                                       /* 5 */
+    "struct Detail {\n"                                                         /* 6 */
+    "    let code: Int\n"                                                       /* 7 */
+    "    static let standard = Detail(code: 1)\n"                               /* 8 */
+    "    func show() {}\n"                                                      /* 9 */
+    "}\n"                                                                       /* 10 */
+    "enum Failure {\n"                                                          /* 11 */
+    "    case failed(reason: Reason)\n"                                         /* 12 */
+    "    case count(Int)\n"                                                     /* 13 */
+    "    func describe() {}\n"                                                  /* 14 */
+    "}\n"                                                                       /* 15 */
+    "struct Place {\n"                                                          /* 16 */
+    "    static let home = Place(name: 1)\n"                                    /* 17 */
+    "    var name: Int\n"                                                       /* 18 */
+    "    func walk() {}\n"                                                      /* 19 */
+    "}\n"                                                                       /* 20 */
+    "struct Memberwise { var place: Place; var other: Int }\n"                  /* 21 */
+    "class Explicit { init(place: Place) {} }\n"                                /* 22 */
+    "class Inherits: Explicit {}\n"                                             /* 23 */
+    "class NoMemberwise { var place: Place = .home }\n"                         /* 24 */
+    "class Box<T> {\n"                                                          /* 25 */
+    "    init(place: Place) {}\n"                                               /* 26 */
+    "    func go() {}\n"                                                        /* 27 */
+    "}\n"                                                                       /* 28 */
+    "class Plain {\n"                                                           /* 29 */
+    "    func run() {}\n"                                                       /* 30 */
+    "    static var standard: Plain { Plain() }\n"                              /* 31 */
+    "    static let other = Plain()\n"                                          /* 32 */
+    "    static func make() -> Plain { Plain() }\n"                             /* 33 */
+    "    static func twice(a: Int) -> Plain { Plain() }\n"                      /* 34 */
+    "    static func twice(a: String) -> Detail { .standard }\n"                /* 35 */
+    "}\n"                                                                       /* 36 */
+    "class Uses {\n"                                                            /* 37 */
+    "    let read = Plain.standard\n"                                           /* 38 */
+    "    let stored = Plain.other\n"                                            /* 39 */
+    "    let made = Plain.make()\n"                                             /* 40 */
+    "    let generic = Box<Int>(place: .home)\n"                                /* 41 */
+    "    let chained = Uses.read2\n"                                            /* 42 */
+    "    static let read2 = Plain.standard\n"                                   /* 43 */
+    "    let noOverload = Plain.twice(a: 1)\n"                                  /* 44 */
+    "    let noFunctionValue = Plain.make\n"                                    /* 45 */
+    "    let noOutside = Other.standard\n"                                      /* 46 */
+    "    func typedByRead() { read.run() }\n"                                   /* 47 */
+    "    func typedByStored() { stored.run() }\n"                               /* 48 */
+    "    func typedByCall() { made.run() }\n"                                   /* 49 */
+    "    func typedByGeneric() { generic.go() }\n"                              /* 50 */
+    "    func typedThroughTwo() { chained.run() }\n"                            /* 51 */
+    "    func noOverloadType() { noOverload.run() }\n"                          /* 52 */
+    "    func noFunctionValueType() { noFunctionValue.run() }\n"                /* 53 */
+    "    func noOutsideType() { noOutside.run() }\n"                            /* 54 */
+    "    func localGeneric() { let b = Box<Int>(place: .home); b.go() }\n"      /* 55 */
+    "    func caseInCase() { let f: Failure = .failed(reason: .worse(detail: .standard)); use(f) }\n" /* 56 */
+    "    func namedCase() { use(Failure.failed(reason: .bad)) }\n"              /* 57 */
+    "    func unlabelledPayload() { use(Reason.either(.standard, other: .standard)) }\n" /* 58 */
+    "    func caseHasItsEnum() { let f = Failure.failed(reason: .bad); f.describe() }\n" /* 59 */
+    "    func noPayloadType() { use(Failure.count(.home)) }\n"                  /* 60 */
+    "    func memberwise() { use(Memberwise(place: .home, other: 1)) }\n"       /* 61 */
+    "    func initializer() { use(Explicit(place: .home)) }\n"                  /* 62 */
+    "    func inherited() { use(Inherits(place: .home)) }\n"                    /* 63 */
+    "    func noMemberwiseOfAClass() { use(NoMemberwise(place: .home)) }\n"     /* 64 */
+    "    func noSuchLabel() { use(Memberwise(wrong: .home)) }\n"                /* 65 */
+    "    func implicitInit() { let m: Memberwise = .init(place: .home, other: 1); use(m) }\n" /* 66 */
+    "}\n"                                                                       /* 67 */
+    "extension Outcome {\n"                                                     /* 68 */
+    "    var success: Int? { nil }\n"                                           /* 69 */
+    "    func instanceOnly() -> Outcome { self }\n"                             /* 70 */
+    "    static func make() -> Outcome { fatalError() }\n"                      /* 71 */
+    "}\n"                                                                       /* 72 */
+    "func takesOutcome(_ o: Outcome) {}\n"                                      /* 73 */
+    "class OutcomeUses {\n"                                                     /* 74 */
+    "    func instanceRead(o: Outcome) { use(o.success) }\n"                    /* 75 */
+    "    func noInstanceByImplicitMember() { takesOutcome(.success(1)) }\n"     /* 76 */
+    "    func noInstanceByTypeName() { use(Outcome.success(1)) }\n"             /* 77 */
+    "    func noInstanceFunctionByImplicitMember() { let r: Outcome = .instanceOnly(); use(r) }\n" /* 78 */
+    "    func staticByImplicitMember() { let r: Outcome = .make(); use(r) }\n"  /* 79 */
+    "    func noWitnessOfAnOutsideType(o: Outcome) { o.decode() }\n"            /* 80 */
+    "}\n"                                                                       /* 81 */
+    "protocol Decodes { func decode() }\n"                                      /* 82 */
+    "extension Outcome: Decodes {}\n";                                          /* 83 */
+/* Overloads across files that nothing tells apart, with one result type or with two. */
+static const char SW_MANY[] = "class Many {\n"                                       /* 1 */
+                              "    func pick(_ a: any First) -> Picked { Picked() }\n" /* 2 */
+                              "    func split(_ a: any First) -> Picked { Picked() }\n" /* 3 */
+                              "}\n"                                                  /* 4 */
+                              "protocol First {}\n"                                  /* 5 */
+                              "protocol Second {}\n"                                 /* 6 */
+                              "struct Picked { func run() {} }\n"                    /* 7 */
+                              "struct Other { func run() {} }\n"                     /* 8 */
+                              "class ManyUses {\n"                                   /* 9 */
+                              "    func commonResult(m: Many, v: Unknown) { m.pick(v).run() }\n" /* 10 */
+                              "    func noCommonResult(m: Many, v: Unknown) { m.split(v).run() }\n" /* 11 */
+                              "}\n";                                                 /* 12 */
+static const char SW_MANY_EXT[] = "extension Many {\n"
+                                  "    func pick(_ b: any Second) -> Picked { Picked() }\n"
+                                  "    func split(_ b: any Second) -> Other { Other() }\n"
+                                  "}\n";
+/* One private name in two files of a module, and a file with no such type of its own. */
+static const char SW_PRIVATE_A[] = "private enum Keys {\n"                       /* 1 */
+                                   "    static let shared = 1\n"                 /* 2 */
+                                   "    static func make() {}\n"                 /* 3 */
+                                   "}\n"                                         /* 4 */
+                                   "extension Keys {\n"                          /* 5 */
+                                   "    static func added() {}\n"                /* 6 */
+                                   "}\n"                                         /* 7 */
+                                   "class UsesA {\n"                             /* 8 */
+                                   "    func callsOwn() { Keys.make() }\n"       /* 9 */
+                                   "    func readsOwn() { use(Keys.shared) }\n"  /* 10 */
+                                   "    func callsExtension() { Keys.added() }\n" /* 11 */
+                                   "}\n";                                        /* 12 */
+static const char SW_PRIVATE_B[] = "fileprivate struct Keys {\n"                 /* 1 */
+                                   "    static let shared = 2\n"                 /* 2 */
+                                   "    static func make() {}\n"                 /* 3 */
+                                   "}\n"                                         /* 4 */
+                                   "class UsesB {\n"                             /* 5 */
+                                   "    func callsOwn() { Keys.make() }\n"       /* 6 */
+                                   "    func readsOwn() { use(Keys.shared) }\n"  /* 7 */
+                                   "    func noOtherFilesExtension() { Keys.added() }\n" /* 8 */
+                                   "}\n";                                        /* 9 */
+static const char SW_PRIVATE_C[] = "class UsesC {\n"
+                                   "    func noPrivateOfAnotherFile() { Keys.make() }\n"
+                                   "}\n";
+/* `#require` in a file that imports Swift Testing, and one in a file that does not. */
+static const char SW_REQUIRE[] = "import Testing\n"
+                                 "struct Item { func go() {}; static func make() -> Item? { nil } }\n"
+                                 "class RequireUses {\n"
+                                 "    func typedByRequire() throws { let i = try #require(Item.make()); i.go() }\n"
+                                 "}\n";
+static const char SW_NO_REQUIRE[] =
+    "class NoRequireUses {\n"
+    "    func noTestingImport() throws { let i = try #require(Item.make()); i.go() }\n"
+    "}\n";
+#define SW_TYPED_FILE "Sources/App/Typed.swift"
+#define SW_PLAIN_RUN "    func run() {}"
+#define SW_HOME_DECL "    static let home = Place(name: 1)"
+#define SW_TYPED_CALL(id, method, needle, at, suffix, label, line, decl)                       \
+    SL_CALL_AT(id, SW_TYPED_FILE, "Uses." method, needle, at, SW_TYPED_FILE, suffix, label, line, decl)
+#define SW_TYPED_READ(id, method, needle, at, suffix, line, decl)                              \
+    SL_USE_AT(id, SW_TYPED_FILE, "Uses." method, needle, at, SW_TYPED_FILE, suffix, "Variable", line, decl)
+#define SW_TYPED_TYPE(id, method, needle, at, suffix, label, line, decl)                       \
+    SL_USE_AT(id, SW_TYPED_FILE, "Uses." method, needle, at, SW_TYPED_FILE, suffix, label, line, decl)
+#define SW_TYPED_RUN(id, method, needle)                                                       \
+    SW_TYPED_CALL(id, method, needle, 0, "Plain.run", "Method", 30, SW_PLAIN_RUN)
+
+TEST(resolver_source_swift_initializer_types_and_nested_context) {
+    static const RQ_Source sources[] = {
+        {.path = "Package.swift", .text = SW_MANIFEST},
+        {.path = SW_TYPED_FILE, .text = SW_TYPED},
+        {.path = "Sources/App/Many.swift", .text = SW_MANY},
+        {.path = "Sources/App/ManyExt.swift", .text = SW_MANY_EXT},
+        {.path = "Sources/App/PrivateA.swift", .text = SW_PRIVATE_A},
+        {.path = "Sources/App/PrivateB.swift", .text = SW_PRIVATE_B},
+        {.path = "Sources/App/PrivateC.swift", .text = SW_PRIVATE_C},
+        {.path = "Sources/App/Require.swift", .text = SW_REQUIRE},
+        {.path = "Sources/App/NoRequire.swift", .text = SW_NO_REQUIRE},
+    };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("overloads-that-all-return-one-type-say-what-follows", "Sources/App/Many.swift",
+                   "ManyUses.commonResult", "m.pick(v).run()", 0, "Sources/App/Many.swift", "Picked.run",
+                   "Method", 7, "struct Picked { func run() {} }"),
+        SL_CALL_AT("a-private-type-is-its-files-own-call", "Sources/App/PrivateA.swift", "UsesA.callsOwn",
+                   "Keys.make()", 0, "Sources/App/PrivateA.swift", "PrivateA.Keys.make", "Method", 3,
+                   "    static func make() {}"),
+        SL_USE_AT("a-private-type-is-its-files-own-read", "Sources/App/PrivateA.swift", "UsesA.readsOwn",
+                  "shared", 1, "Sources/App/PrivateA.swift", "PrivateA.Keys.shared", "Variable", 2,
+                  "    static let shared = 1"),
+        SL_USE_AT("the-private-type-read-for-that-member", "Sources/App/PrivateA.swift",
+                  "UsesA.readsOwn", "Keys", 3, "Sources/App/PrivateA.swift", "PrivateA.Keys", "Class", 5,
+                  "extension Keys {"),
+        SL_CALL_AT("an-extension-in-its-file-is-that-type", "Sources/App/PrivateA.swift",
+                   "UsesA.callsExtension", "Keys.added()", 0, "Sources/App/PrivateA.swift",
+                   "PrivateA.Keys.added", "Method", 6, "    static func added() {}"),
+        SL_CALL_AT("the-same-name-in-another-file-call", "Sources/App/PrivateB.swift", "UsesB.callsOwn",
+                   "Keys.make()", 0, "Sources/App/PrivateB.swift", "PrivateB.Keys.make", "Method", 3,
+                   "    static func make() {}"),
+        SL_USE_AT("the-same-name-in-another-file-read", "Sources/App/PrivateB.swift", "UsesB.readsOwn",
+                  "shared", 1, "Sources/App/PrivateB.swift", "PrivateB.Keys.shared", "Variable", 2,
+                  "    static let shared = 2"),
+        SL_USE_AT("the-type-read-for-that-member", "Sources/App/PrivateB.swift", "UsesB.readsOwn", "Keys",
+                  2, "Sources/App/PrivateB.swift", "PrivateB.Keys", "Struct", 1,
+                  "fileprivate struct Keys {"),
+        SL_CALL_AT("require-is-the-value-it-unwraps", "Sources/App/Require.swift",
+                   "RequireUses.typedByRequire", "i.go()", 0, "Sources/App/Require.swift", "Item.go",
+                   "Method", 2, "struct Item { func go() {}; static func make() -> Item? { nil } }"),
+        SL_CALL_AT("that-call-without-the-testing-import", "Sources/App/NoRequire.swift",
+                   "NoRequireUses.noTestingImport", "Item.make()", 0, "Sources/App/Require.swift",
+                   "Item.make", "Method", 2,
+                   "struct Item { func go() {}; static func make() -> Item? { nil } }"),
+        SL_CALL_AT("the-call-require-holds", "Sources/App/Require.swift", "RequireUses.typedByRequire",
+                   "Item.make()", 0, "Sources/App/Require.swift", "Item.make", "Method", 2,
+                   "struct Item { func go() {}; static func make() -> Item? { nil } }"),
+        SW_TYPED_RUN("property-is-what-the-member-it-reads-is", "typedByRead", "read.run()"),
+        SW_TYPED_RUN("property-from-a-stored-static", "typedByStored", "stored.run()"),
+        SW_TYPED_RUN("property-is-what-the-function-it-calls-returns", "typedByCall", "made.run()"),
+        SW_TYPED_CALL("property-from-a-generic-call-of-a-type", "typedByGeneric", "generic.go()", 0,
+                      "Box.go", "Method", 27, "    func go() {}"),
+        SW_TYPED_RUN("property-through-another-property", "typedThroughTwo", "chained.run()"),
+        SW_TYPED_CALL("local-from-a-generic-call-of-a-type", "localGeneric", "b.go()", 0, "Box.go",
+                      "Method", 27, "    func go() {}"),
+        SW_TYPED_CALL("generic-call-of-a-type-names-it", "localGeneric", "Box<Int>(place: .home)", 1,
+                      "Typed.Box", "Class", 25, "class Box<T> {"),
+        SW_TYPED_TYPE("the-generic-type-it-spells", "localGeneric", "Box", 2, "Typed.Box", "Class", 25,
+                      "class Box<T> {"),
+        SW_TYPED_READ("argument-of-a-generic-call-of-a-type", "localGeneric", "home", 3,
+                      "Place.home", 17, SW_HOME_DECL),
+        SW_TYPED_TYPE("the-annotation-of-a-case-value", "caseInCase", "Failure", 1, "Typed.Failure",
+                      "Class", 11, "enum Failure {"),
+        SW_TYPED_READ("a-case-called-with-its-payload-is-read", "caseInCase", "failed", 1,
+                      "Failure.failed", 12, "    case failed(reason: Reason)"),
+        SW_TYPED_READ("case-inside-a-case", "caseInCase", "worse", 1, "Reason.worse", 3,
+                      "    case worse(detail: Detail)"),
+        SW_TYPED_READ("static-inside-a-case-inside-a-case", "caseInCase", "standard", 6,
+                      "Detail.standard", 8, "    static let standard = Detail(code: 1)"),
+        SW_TYPED_TYPE("the-head-of-a-named-case", "namedCase", "Failure", 2, "Typed.Failure", "Class",
+                      11, "enum Failure {"),
+        SW_TYPED_READ("a-named-case-is-read-when-called", "namedCase", "failed", 2, "Failure.failed",
+                      12, "    case failed(reason: Reason)"),
+        SW_TYPED_READ("case-a-named-case-takes", "namedCase", "bad", 1, "Reason.bad", 2,
+                      "    case bad"),
+        SW_TYPED_TYPE("the-head-of-a-case-with-two-payloads", "unlabelledPayload", "Reason", 2,
+                      "Typed.Reason", "Class", 1, "enum Reason {"),
+        SW_TYPED_READ("a-case-with-two-payloads", "unlabelledPayload", "either", 1, "Reason.either", 4,
+                      "    case either(Detail, other: Detail)"),
+        SW_TYPED_READ("the-unlabelled-payload", "unlabelledPayload", "standard", 7,
+                      "Detail.standard", 8, "    static let standard = Detail(code: 1)"),
+        SW_TYPED_READ("the-labelled-payload-beside-it", "unlabelledPayload", "standard", 8,
+                      "Detail.standard", 8, "    static let standard = Detail(code: 1)"),
+        SW_TYPED_CALL("a-case-with-its-payload-is-of-its-enum", "caseHasItsEnum", "f.describe()", 0,
+                      "Failure.describe", "Method", 14, "    func describe() {}"),
+        SW_TYPED_READ("stored-property-of-a-struct-with-no-initializer", "memberwise", "home", 5,
+                      "Place.home", 17, SW_HOME_DECL),
+        SW_TYPED_READ("parameter-of-the-initializer", "initializer", "home", 6, "Place.home", 17,
+                      SW_HOME_DECL),
+        SW_TYPED_READ("parameter-of-an-inherited-initializer", "inherited", "home", 7, "Place.home",
+                      17, SW_HOME_DECL),
+        SW_TYPED_TYPE("the-annotation-of-an-implicit-init", "implicitInit", "Memberwise", 6,
+                      "Typed.Memberwise", "Struct", 21,
+                      "struct Memberwise { var place: Place; var other: Int }"),
+        SW_TYPED_READ("argument-of-an-implicit-init", "implicitInit", "home", 10, "Place.home", 17,
+                      SW_HOME_DECL),
+        SW_TYPED_TYPE("the-head-of-a-case-of-an-outside-payload", "noPayloadType", "Failure", 4,
+                      "Typed.Failure", "Class", 11, "enum Failure {"),
+        SW_TYPED_READ("the-case-of-an-outside-payload", "noPayloadType", "count", 1, "Failure.count",
+                      13, "    case count(Int)"),
+        SL_USE_AT("an-instance-reads-the-instance-property", SW_TYPED_FILE, "OutcomeUses.instanceRead",
+                  "success", 1, SW_TYPED_FILE, "Outcome.success", "Variable", 69,
+                  "    var success: Int? { nil }"),
+        SL_CALL_AT("a-static-function-by-implicit-member", SW_TYPED_FILE,
+                   "OutcomeUses.staticByImplicitMember", ".make()", 1, SW_TYPED_FILE, "Outcome.make",
+                   "Method", 71, "    static func make() -> Outcome { fatalError() }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("overloads-that-return-different-types", SW_TYPED_FILE, "Uses.noOverloadType",
+                   "noOverload.run()", 0),
+        SL_DENY_AT("overloads-across-files-with-two-result-types", "Sources/App/Many.swift",
+                   "ManyUses.noCommonResult", "m.split(v).run()", 0),
+        SL_DENY_AT("an-extension-of-the-other-files-private-type", "Sources/App/PrivateB.swift",
+                   "UsesB.noOtherFilesExtension", "Keys.added()", 0),
+        SL_DENY_AT("a-private-type-of-another-file", "Sources/App/PrivateC.swift",
+                   "UsesC.noPrivateOfAnotherFile", "Keys.make()", 0),
+        SL_DENY_AT("no-testing-import-no-require", "Sources/App/NoRequire.swift",
+                   "NoRequireUses.noTestingImport", "i.go()", 0),
+        SL_DENY_AT("a-function-not-called-is-not-its-result", SW_TYPED_FILE,
+                   "Uses.noFunctionValueType", "noFunctionValue.run()", 0),
+        SL_DENY_AT("a-type-outside-the-project", SW_TYPED_FILE, "Uses.noOutsideType",
+                   "noOutside.run()", 0),
+        SL_NO_USE_AT("a-payload-of-an-outside-type", SW_TYPED_FILE, "Uses.noPayloadType", "home", 4),
+        SL_NO_USE_AT("a-class-has-no-memberwise-initializer", SW_TYPED_FILE,
+                     "Uses.noMemberwiseOfAClass", "home", 8),
+        SL_NO_USE_AT("a-label-no-stored-property-has", SW_TYPED_FILE, "Uses.noSuchLabel", "home", 9),
+        SL_NO_USE_AT("implicit-member-is-never-an-instance-property", SW_TYPED_FILE,
+                     "OutcomeUses.noInstanceByImplicitMember", "success", 2),
+        SL_NO_USE_AT("a-type-name-does-not-reach-an-instance-property", SW_TYPED_FILE,
+                     "OutcomeUses.noInstanceByTypeName", "success", 3),
+        SL_DENY_AT("an-outside-type-meets-a-protocol-with-its-own-member", SW_TYPED_FILE,
+                   "OutcomeUses.noWitnessOfAnOutsideType", "o.decode()", 0),
+        SL_DENY_AT("implicit-member-is-never-an-instance-function", SW_TYPED_FILE,
+                   "OutcomeUses.noInstanceFunctionByImplicitMember", ".instanceOnly()", 0),
+    };
+    ASSERT(sl_check("swift-typed", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* Types a closure's signature and a value's form state, and what they leave open. */
+static const char SW_FLOW[] =
+    "struct Dog { func bark() {} }\n"                                           /* 1 */
+    "struct Cat { func bark() {} }\n"                                           /* 2 */
+    "protocol Pet {}\n"                                                         /* 3 */
+    "enum Oops: Error { case bad; func report() {} }\n"                         /* 4 */
+    "func withDog(_ body: (Dog) -> Void) {}\n"                                  /* 5 */
+    "func withBoth(_ body: (Dog, Cat) -> Void) {}\n"                            /* 6 */
+    "func labelled(done: @escaping (Dog) -> Void) {}\n"                         /* 7 */
+    "func optionalDog() -> Dog? { nil }\n"                                      /* 8 */
+    "func anyValue() -> Any { 1 }\n"                                            /* 9 */
+    "class Flow {\n"                                                            /* 10 */
+    "    func named() { withDog { d in d.bark() } }\n"                          /* 11 */
+    "    func shorthand() { withDog { $0.bark() } }\n"                          /* 12 */
+    "    func second() { withBoth { _, c in c.bark() } }\n"                     /* 13 */
+    "    func secondShorthand() { withBoth { $1.bark() } }\n"                   /* 14 */
+    "    func byLabel() { labelled(done: { d in d.bark() }) }\n"                /* 15 */
+    "    func written() { unknown { (d: Dog) in d.bark() } }\n"                 /* 16 */
+    "    func noSignature() { unknown { d in d.bark() } }\n"                    /* 17 */
+    "    func noShorthand() { unknown { $0.bark() } }\n"                        /* 18 */
+    "    func noOuterShorthand() { withDog { _ in unknown { $0.bark() } } }\n"  /* 19 */
+    "    func cast() { if let d = anyValue() as? Dog { d.bark() } }\n"          /* 20 */
+    "    func forced() { (anyValue() as! Dog).bark() }\n"                       /* 21 */
+    "    func either(c: Bool) { let d = c ? Dog() : Dog(); d.bark() }\n"        /* 22 */
+    "    func noEither(c: Bool) { let d = c ? Dog() : Cat(); d.bark() }\n"      /* 23 */
+    "    func coalesced() { let d = optionalDog() ?? Dog(); d.bark() }\n"       /* 24 */
+    "    func caught() { do { try thrower() } catch let e as Oops { e.report() } catch { } }\n" /* 25 */
+    "    func noCaught() { do { try thrower() } catch { error.report() } }\n"   /* 26 */
+    "    func caseAs(v: Any) { switch v { case let d as Dog: d.bark(); default: break } }\n" /* 27 */
+    "    func thrower() throws {}\n"                                            /* 28 */
+    "}\n";                                                                      /* 29 */
+#define SW_FLOW_FILE "Sources/App/Flow.swift"
+#define SW_FLOW_CALL(id, method, needle, at, suffix, label, line, decl)                        \
+    SL_CALL_AT(id, SW_FLOW_FILE, "Flow." method, needle, at, SW_FLOW_FILE, suffix, label, line, decl)
+#define SW_DOG_BARK "struct Dog { func bark() {} }"
+#define SW_FLOW_DOG(id, method, needle, at) SW_FLOW_CALL(id, method, needle, at, "Dog.bark", "Method", 1, SW_DOG_BARK)
+#define SW_FLOW_NO(id, method, needle, at) SL_DENY_AT(id, SW_FLOW_FILE, "Flow." method, needle, at)
+
+TEST(resolver_source_swift_closures_and_value_forms) {
+    static const RQ_Source sources[] = {
+        {.path = "Package.swift", .text = SW_MANIFEST},
+        {.path = SW_FLOW_FILE, .text = SW_FLOW},
+    };
+    static const RQ_Expected expected[] = {
+        SW_FLOW_CALL("the-function-given-a-closure", "named", "withDog { d in d.bark() }", 0, "Flow.withDog",
+                     "Function", 5, "func withDog(_ body: (Dog) -> Void) {}"),
+        SW_FLOW_DOG("signature-types-a-named-closure-parameter", "named", "d.bark()", 0),
+        SW_FLOW_CALL("the-function-given-a-shorthand-closure", "shorthand", "withDog { $0.bark() }", 0,
+                     "Flow.withDog", "Function", 5, "func withDog(_ body: (Dog) -> Void) {}"),
+        SW_FLOW_DOG("signature-types-a-shorthand", "shorthand", "$0.bark()", 0),
+        SW_FLOW_CALL("the-function-of-two-parameters", "second", "withBoth { _, c in c.bark() }", 0,
+                     "Flow.withBoth", "Function", 6, "func withBoth(_ body: (Dog, Cat) -> Void) {}"),
+        SW_FLOW_CALL("signature-types-by-position", "second", "c.bark()", 0, "Cat.bark", "Method", 2,
+                     "struct Cat { func bark() {} }"),
+        SW_FLOW_CALL("that-function-with-a-shorthand", "secondShorthand", "withBoth { $1.bark() }", 0,
+                     "Flow.withBoth", "Function", 6, "func withBoth(_ body: (Dog, Cat) -> Void) {}"),
+        SW_FLOW_CALL("signature-types-the-second-shorthand", "secondShorthand", "$1.bark()", 0, "Cat.bark",
+                     "Method", 2, "struct Cat { func bark() {} }"),
+        SW_FLOW_CALL("the-function-given-a-labelled-closure", "byLabel", "labelled(done: { d in d.bark() })", 0,
+                     "Flow.labelled", "Function", 7, "func labelled(done: @escaping (Dog) -> Void) {}"),
+        SW_FLOW_DOG("signature-types-a-labelled-closure", "byLabel", "d.bark()", 1),
+        SW_FLOW_DOG("a-written-closure-parameter-type", "written", "d.bark()", 2),
+        SW_FLOW_CALL("the-function-beside-a-conditional-cast", "cast", "anyValue()", 1, "Flow.anyValue",
+                     "Function", 9, "func anyValue() -> Any { 1 }"),
+        SW_FLOW_DOG("a-conditional-cast-names-its-type", "cast", "d.bark()", 4),
+        SW_FLOW_CALL("the-function-beside-a-forced-cast", "forced", "anyValue()", 2, "Flow.anyValue",
+                     "Function", 9, "func anyValue() -> Any { 1 }"),
+        SW_FLOW_DOG("a-forced-cast-in-parentheses", "forced", "(anyValue() as! Dog).bark()", 0),
+        SW_FLOW_CALL("one-arm-of-a-ternary", "either", "Dog()", 1, "Flow.Dog", "Struct", 1, SW_DOG_BARK),
+        SW_FLOW_CALL("the-other-arm-of-a-ternary", "either", "Dog()", 2, "Flow.Dog", "Struct", 1, SW_DOG_BARK),
+        SW_FLOW_CALL("one-arm-of-two-types", "noEither", "Dog()", 3, "Flow.Dog", "Struct", 1, SW_DOG_BARK),
+        SW_FLOW_CALL("the-other-arm-of-two-types", "noEither", "Cat()", 0, "Flow.Cat", "Struct", 2,
+                     "struct Cat { func bark() {} }"),
+        SW_FLOW_CALL("the-function-given-a-closure-holding-another", "noOuterShorthand",
+                     "withDog { _ in unknown { $0.bark() } }", 0, "Flow.withDog", "Function", 5,
+                     "func withDog(_ body: (Dog) -> Void) {}"),
+        SW_FLOW_DOG("both-arms-of-one-type", "either", "d.bark()", 5),
+        SW_FLOW_CALL("the-function-before-a-coalescing", "coalesced", "optionalDog()", 1, "Flow.optionalDog",
+                     "Function", 8, "func optionalDog() -> Dog? { nil }"),
+        SW_FLOW_CALL("the-value-after-a-coalescing", "coalesced", "Dog()", 5, "Flow.Dog", "Struct", 1, SW_DOG_BARK),
+        SW_FLOW_DOG("coalescing-two-of-one-type", "coalesced", "d.bark()", 7),
+        SW_FLOW_CALL("the-call-a-catch-follows", "caught", "thrower()", 0, "Flow.thrower", "Method", 28,
+                     "    func thrower() throws {}"),
+        SW_FLOW_CALL("a-catch-with-a-type-names-it", "caught", "e.report()", 0, "Oops.report", "Method", 4,
+                     "enum Oops: Error { case bad; func report() {} }"),
+        SW_FLOW_CALL("the-call-a-plain-catch-follows", "noCaught", "thrower()", 1, "Flow.thrower", "Method", 28,
+                     "    func thrower() throws {}"),
+        SW_FLOW_DOG("a-case-with-a-type-names-it", "caseAs", "d.bark()", 8),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SW_FLOW_NO("no-signature-no-type", "noSignature", "d.bark()", 3),
+        SW_FLOW_NO("no-signature-no-shorthand-type", "noShorthand", "$0.bark()", 1),
+        SW_FLOW_NO("a-shorthand-is-its-own-closures", "noOuterShorthand", "$0.bark()", 2),
+        SW_FLOW_NO("arms-of-two-types", "noEither", "d.bark()", 6),
+        SW_FLOW_NO("a-plain-catch-has-no-type", "noCaught", "error.report()", 0),
+    };
+    ASSERT(sl_check("swift-flow", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* Forms from bloc and dio. */
+static const char DART2_MAIN[] =
+    "import 'package:shared/shared.dart';\n"                                    /* 1 */
+    "import 'base.dart';\n"                                                     /* 2 */
+    "export 'base.dart' hide Hidden;\n"                                         /* 3 */
+    "part 'main_part.dart';\n"                                                  /* 4 */
+    "enum Status { ready, busy }\n"                                             /* 5 */
+    "void busy() {}\n"                                                          /* 6 */
+    "const topValue = 1;\n"                                                     /* 7 */
+    "class Caller extends Base<Status> with Helper implements Marker {\n"       /* 8 */
+    "  Caller(int seed) : super(Status.busy) { ctorBody(); }\n"                 /* 9 */
+    "  void ctorBody() {}\n"                                                    /* 10 */
+    "  void onBase() {}\n"                                                      /* 11 */
+    "  void readsEnum() { use(Status.ready); }\n"                               /* 12 */
+    "  void readsCase(Status s) {\n"                                            /* 13 */
+    "    switch (s) {\n"                                                        /* 14 */
+    "      case Status.busy:\n"                                                 /* 15 */
+    "        break;\n"                                                          /* 16 */
+    "      default:\n"                                                          /* 17 */
+    "    }\n"                                                                   /* 18 */
+    "  }\n"                                                                     /* 19 */
+    "  void superCall() { super.onBase(); }\n"                                  /* 20 */
+    "  void callsValue(Emitter<int> emit) { emit(1); }\n"                       /* 21 */
+    "  void noValueCall(Plain plain) { plain(1); }\n"                           /* 22 */
+    "  void typedPattern(Object o) {\n"                                         /* 23 */
+    "    switch (o) {\n"                                                        /* 24 */
+    "      case Sub s:\n"                                                       /* 25 */
+    "        s.subGo();\n"                                                      /* 26 */
+    "      default:\n"                                                          /* 27 */
+    "    }\n"                                                                   /* 28 */
+    "  }\n"                                                                     /* 29 */
+    "  void abstractMember(Emitter<int> e) { e.finish(); }\n"                   /* 30 */
+    "  void mixinMember() { fromHelper(); }\n"                                  /* 31 */
+    "  void mixinPrivate() { _hidden(); }\n"                                    /* 32 */
+    "  void getterRead(Sub s) { use(s.flag); }\n"                               /* 33 */
+    "  void topRead() { use(topValue); }\n"                                     /* 34 */
+    "  void pathDep() { sharedFn(); }\n"                                        /* 35 */
+    "  void noBareConstant() { use(ready); }\n"                                 /* 36 */
+    "  void noUnknownReceiver(x) { use(x.ready); }\n"                           /* 37 */
+    "  void noCalledMember(Sub s) { s.subGo(); }\n"                             /* 38 */
+    "}\n"                                                                       /* 39 */
+    "class Bound<Store extends Sub> { void noTypeParam(Store s) { s.subGo(); } }\n" /* 40 */
+    "class Sub { bool get flag => true; void subGo() {} }\n"                    /* 41 */
+    "class Store { void subGo() {} }\n"                                         /* 42 */
+    "class Plain { void other() {} }\n"                                         /* 43 */
+    "class Defaults {\n"                                                        /* 44 */
+    "  const Defaults({this.kept = Status.ready, Sub? nothing});\n"             /* 45 */
+    "  final Status kept;\n"                                                    /* 46 */
+    "  void named({Status s = Status.busy}) {}\n"                               /* 47 */
+    "  void noParameterRead({Status shadowed = Status.ready}) { use(shadowed); }\n" /* 48 */
+    "  bool get shadowed => true;\n"                                            /* 49 */
+    "}\n"                                                                       /* 50 */
+    "void positional([Status s = Status.busy]) {}\n"                            /* 51 */
+    "class Pair {\n"                                                            /* 52 */
+    "  int get both => 1;\n"                                                    /* 53 */
+    "  set both(int v) {}\n"                                                    /* 54 */
+    "  void readsBoth() { use(both); }\n"                                       /* 55 */
+    "}\n";                                                                      /* 56 */
+static const char DART2_HEADER[] = "import 'main.dart';\n"
+                                   "import 'base.dart';\n"
+                                   "class Head extends Base<Status> with Helper implements Marker {}\n";
+static const char DART2_TOP[] = "import 'main.dart';\n"
+                                "final Status typed = Status.ready;\n";
+static const char DART2_CTOR[] = "import 'main.dart';\n"
+                                 "class WithDefault {\n"
+                                 "  const WithDefault({this.kept = Status.ready});\n"
+                                 "  final Status kept;\n"
+                                 "}\n";
+static const char DART2_BOX[] =
+    "class Box<T> {\n"                                              /* 1 */
+    "  Box(this.held);\n"                                           /* 2 */
+    "  final T held;\n"                                             /* 3 */
+    "  T get value => held;\n"                                      /* 4 */
+    "  T make() => held;\n"                                         /* 5 */
+    "  void noOwnParameter() { value.itemGo(); }\n"                 /* 6 */
+    "}\n"                                                           /* 7 */
+    "class Item { void itemGo() {} }\n"                             /* 8 */
+    "class T { void itemGo() {} }\n"                                /* 9 */
+    "class ItemBox extends Box<Item> {\n"                           /* 10 */
+    "  ItemBox() : super(Item());\n"                                /* 11 */
+    "  void viaGetter() { value.itemGo(); }\n"                      /* 12 */
+    "  void viaMethod() { make().itemGo(); }\n"                     /* 13 */
+    "  void viaField() { this.held.itemGo(); }\n"                   /* 14 */
+    "}\n"                                                           /* 15 */
+    "class Mid<U> extends Box<U> { Mid(U u) : super(u); }\n"        /* 16 */
+    "class Deep extends Mid<Item> {\n"                              /* 17 */
+    "  Deep() : super(Item());\n"                                   /* 18 */
+    "  void viaTwoLevels() { value.itemGo(); }\n"                   /* 19 */
+    "}\n"                                                           /* 20 */
+    "class Open<V> extends Box<V> {\n"                              /* 21 */
+    "  Open(V v) : super(v);\n"                                     /* 22 */
+    "  void noParameterLeftOpen() { value.itemGo(); }\n"            /* 23 */
+    "}\n"                                                           /* 24 */
+    "class Listed extends Box<List<Item>> {\n"                      /* 25 */
+    "  Listed() : super([]);\n"                                     /* 26 */
+    "  void noElementType() { value.itemGo(); }\n"                  /* 27 */
+    "}\n";                                                          /* 28 */
+static const char DART2_BASE[] = "abstract class Base<T> {\n"                   /* 1 */
+                                 "  Base(T value);\n"                           /* 2 */
+                                 "  void onBase() {}\n"                         /* 3 */
+                                 "}\n"                                          /* 4 */
+                                 "abstract class Emitter<S> {\n"                /* 5 */
+                                 "  void call(S state);\n"                      /* 6 */
+                                 "  void finish();\n"                           /* 7 */
+                                 "}\n"                                          /* 8 */
+                                 "mixin Helper on Base<int> {\n"                /* 9 */
+                                 "  void fromHelper() { _hidden(); }\n"         /* 10 */
+                                 "  void _hidden() {}\n"                        /* 11 */
+                                 "}\n"                                          /* 12 */
+                                 "class Marker {}\n"                            /* 13 */
+                                 "class Hidden {}\n";                           /* 14 */
+
+#define DART2_FILE "lib/main.dart"
+#define DART2_BASE_FILE "lib/base.dart"
+#define DART2_CALL(id, method, text, at, tfile, tsuffix, label, tline, tdecl)                  \
+    SL_CALL_AT(id, DART2_FILE, "Caller." method, text, at, tfile, tsuffix, label, tline, tdecl)
+#define DART2_USE(id, method, text, at, tsuffix, label, tline, tdecl)                          \
+    SL_USE_AT(id, DART2_FILE, "Caller." method, text, at, DART2_FILE, tsuffix, label, tline, tdecl)
+#define DART2_IMPORT(id, sfile, scaller, text, at, tfile, tsuffix, tdecl)                      \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = sfile, .caller = scaller, .needle = text, .occurrence_index = at},    \
+        .relation = "IMPORTS",                                                                 \
+        .target = {.file = tfile,                                                              \
+                   .suffix = tsuffix,                                                          \
+                   .label = "File",                                                            \
+                   .declaration_line = 1,                                                      \
+                   .declaration_text = tdecl}                                                  \
+    }
+
+TEST(resolver_source_dart_headers_reads_members_and_pubspec_paths) {
+    static const RQ_Source sources[] = {
+        {.path = "pubspec.yaml",
+         .text = "name: app\ndependencies:\n  shared:\n    path: packages/one\n"},
+        {.path = DART2_FILE, .text = DART2_MAIN},
+        {.path = "lib/main_part.dart", .text = "part of 'main.dart';\nvoid fromPart() {}\n"},
+        {.path = DART2_BASE_FILE, .text = DART2_BASE},
+        {.path = "lib/box.dart", .text = DART2_BOX},
+        {.path = "lib/top.dart", .text = DART2_TOP},
+        {.path = "lib/header.dart", .text = DART2_HEADER},
+        {.path = "lib/ctor.dart", .text = DART2_CTOR},
+        {.path = "packages/one/pubspec.yaml", .text = "name: shared\n"},
+        {.path = "packages/one/lib/shared.dart",
+         .text = "import 'package:shared/extra.dart';\n"
+                 "void sharedFn() { extraFn(); }\n"},
+        {.path = "packages/one/lib/extra.dart", .text = "void extraFn() {}\n"},
+        {.path = "packages/two/pubspec.yaml", .text = "name: shared\n"},
+        {.path = "packages/two/lib/shared.dart",
+         .text = "import 'package:shared/extra.dart';\n"
+                 "void sharedFn() { extraFn(); }\n"},
+        {.path = "packages/two/lib/extra.dart", .text = "void extraFn() {}\n"},
+        {.path = "packages/three/pubspec.yaml",
+         .text = "name: three\ndependencies:\n  shared:\n    path: ../two\n"},
+        {.path = "packages/three/lib/three.dart",
+         .text = "import 'package:shared/shared.dart';\n"
+                 "void callsTwo() { sharedFn(); }\n"},
+        {.path = "packages/four/pubspec.yaml",
+         .text = "name: four\ndependencies:\n  shared: ^1.0.0\n"},
+        {.path = "packages/four/lib/four.dart",
+         .text = "import 'package:shared/shared.dart';\n"
+                 "void noPathDep() { sharedFn(); }\n"},
+    };
+    static const RQ_Expected expected[] = {
+        DART2_IMPORT("import-names-a-file", DART2_FILE, "main.dart.__file__", "'base.dart'", 0,
+                     DART2_BASE_FILE, "base.dart.__file__", "abstract class Base<T> {"),
+        DART2_IMPORT("export-names-a-file", DART2_FILE, "main.dart.__file__", "'base.dart'", 1,
+                     DART2_BASE_FILE, "base.dart.__file__", "abstract class Base<T> {"),
+        DART2_IMPORT("part-names-a-file", DART2_FILE, "main.dart.__file__", "'main_part.dart'", 0,
+                     "lib/main_part.dart", "main_part.dart.__file__", "part of 'main.dart';"),
+        DART2_IMPORT("path-dependency-decides-a-shared-name", DART2_FILE, "main.dart.__file__",
+                     "'package:shared/shared.dart'", 0, "packages/one/lib/shared.dart",
+                     "lib.shared.dart.__file__", "import 'package:shared/extra.dart';"),
+        DART2_USE("enum-constant-read", "readsEnum", "ready", 1, "Status.ready", "Variable", 5,
+                  "enum Status { ready, busy }"),
+        DART2_USE("enum-head-read", "readsEnum", "Status", 3, "main.Status", "Enum", 5,
+                  "enum Status { ready, busy }"),
+        DART2_USE("enum-constant-in-a-case", "readsCase", "busy", 3, "Status.busy", "Variable", 5,
+                  "enum Status { ready, busy }"),
+        DART2_USE("enum-head-in-a-case", "readsCase", "Status", 5, "main.Status", "Enum", 5,
+                  "enum Status { ready, busy }"),
+        DART2_CALL("super-selects-past-the-own-member", "superCall", "super.onBase()", 0,
+                   DART2_BASE_FILE, "Base.onBase", "Method", 3, "  void onBase() {}"),
+        DART2_CALL("a-value-invoked-runs-its-call-method", "callsValue", "emit(1)", 0,
+                   DART2_BASE_FILE, "Emitter.call", "Method", 6, "  void call(S state);"),
+        DART2_CALL("typed-pattern-binds-its-name", "typedPattern", "s.subGo", 0, DART2_FILE,
+                   "Sub.subGo", "Method", 41, "class Sub { bool get flag => true; void subGo() {} }"),
+        DART2_CALL("abstract-member-has-a-node", "abstractMember", "e.finish", 0, DART2_BASE_FILE,
+                   "Emitter.finish", "Method", 7, "  void finish();"),
+        DART2_CALL("mixin-member-has-a-node", "mixinMember", "fromHelper()", 0, DART2_BASE_FILE,
+                   "Helper.fromHelper", "Method", 10, "  void fromHelper() { _hidden(); }"),
+        DART2_USE("getter-read", "getterRead", "flag", 0, "Sub.flag", "Method", 41,
+                  "class Sub { bool get flag => true; void subGo() {} }"),
+        SL_USE_AT("a-getter-beside-its-setter", DART2_FILE, "Pair.readsBoth", "both", 2, DART2_FILE,
+                  "Pair.both", "Method", 54, "  set both(int v) {}"),
+        SL_USE_AT("default-of-a-named-parameter", DART2_FILE, "Defaults.named", "busy", 4, DART2_FILE,
+                  "Status.busy", "Variable", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("head-of-a-default", DART2_FILE, "Defaults.named", "Status", 9, DART2_FILE,
+                  "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("default-beside-a-parameter-of-another-name", DART2_FILE,
+                  "Defaults.noParameterRead", "ready", 5, DART2_FILE, "Status.ready", "Variable", 5,
+                  "enum Status { ready, busy }"),
+        SL_USE_AT("head-of-that-default", DART2_FILE, "Defaults.noParameterRead", "Status", 11,
+                  DART2_FILE, "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("default-of-a-positional-parameter", DART2_FILE, "main.positional", "busy", 5,
+                  DART2_FILE, "Status.busy", "Variable", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("head-of-that-positional-default", DART2_FILE, "main.positional", "Status", 13,
+                  DART2_FILE, "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("default-of-a-constructor-parameter", "lib/ctor.dart", "lib.ctor", "ready", 0,
+                  DART2_FILE, "Status.ready", "Variable", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("head-of-that-constructor-default", "lib/ctor.dart", "lib.ctor", "Status", 0,
+                  DART2_FILE, "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("type-of-a-field-beside-it", "lib/ctor.dart", "lib.ctor", "Status", 1, DART2_FILE,
+                  "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("a-class-header-reads-its-base", "lib/header.dart", "lib.header", "Base", 0,
+                  DART2_BASE_FILE, "base.Base", "Class", 1, "abstract class Base<T> {"),
+        SL_USE_AT("a-class-header-reads-a-type-argument", "lib/header.dart", "lib.header", "Status", 0,
+                  DART2_FILE, "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("a-class-header-reads-its-mixin", "lib/header.dart", "lib.header", "Helper", 0,
+                  DART2_BASE_FILE, "base.Helper", "Class", 9, "mixin Helper on Base<int> {"),
+        SL_USE_AT("a-class-header-reads-its-interface", "lib/header.dart", "lib.header", "Marker", 0,
+                  DART2_BASE_FILE, "base.Marker", "Class", 13, "class Marker {}"),
+        SL_USE_AT("type-of-a-top-level-variable", "lib/top.dart", "lib.top", "Status", 0, DART2_FILE,
+                  "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("head-of-its-value", "lib/top.dart", "lib.top", "Status", 1, DART2_FILE,
+                  "main.Status", "Enum", 5, "enum Status { ready, busy }"),
+        SL_USE_AT("its-value", "lib/top.dart", "lib.top", "ready", 0, DART2_FILE, "Status.ready",
+                  "Variable", 5, "enum Status { ready, busy }"),
+        DART2_CALL("path-dependency-selects-its-package", "pathDep", "sharedFn()", 0,
+                   "packages/one/lib/shared.dart", "shared.sharedFn", "Function", 2,
+                   "void sharedFn() { extraFn(); }"),
+        SL_CALL_AT("another-pubspec-selects-the-other-package", "packages/three/lib/three.dart",
+                   "three.callsTwo", "sharedFn()", 0, "packages/two/lib/shared.dart",
+                   "shared.sharedFn", "Function", 2, "void sharedFn() { extraFn(); }"),
+        SL_CALL_AT("a-package-resolves-its-own-name", "packages/two/lib/shared.dart",
+                   "shared.sharedFn", "extraFn()", 0, "packages/two/lib/extra.dart",
+                   "extra.extraFn", "Function", 1, "void extraFn() {}"),
+        SL_CALL_AT("call-inside-a-mixin-member", DART2_BASE_FILE, "Helper.fromHelper", "_hidden()",
+                   0, DART2_BASE_FILE, "Helper._hidden", "Method", 11, "  void _hidden() {}"),
+        SL_CALL_AT("getter-typed-by-a-fixed-parameter", "lib/box.dart", "ItemBox.viaGetter",
+                   "value.itemGo", 1, "lib/box.dart", "Item.itemGo", "Method", 8,
+                   "class Item { void itemGo() {} }"),
+        SL_CALL_AT("method-typed-by-a-fixed-parameter", "lib/box.dart", "ItemBox.viaMethod",
+                   ".itemGo()", 2, "lib/box.dart", "Item.itemGo", "Method", 8,
+                   "class Item { void itemGo() {} }"),
+        SL_CALL_AT("the-inherited-method-it-goes-through", "lib/box.dart", "ItemBox.viaMethod",
+                   "make()", 1, "lib/box.dart", "Box.make", "Method", 5, "  T make() => held;"),
+        SL_CALL_AT("field-typed-by-a-fixed-parameter", "lib/box.dart", "ItemBox.viaField",
+                   ".itemGo()", 3, "lib/box.dart", "Item.itemGo", "Method", 8,
+                   "class Item { void itemGo() {} }"),
+        SL_CALL_AT("parameter-fixed-two-levels-up", "lib/box.dart", "Deep.viaTwoLevels",
+                   "value.itemGo", 2, "lib/box.dart", "Item.itemGo", "Method", 8,
+                   "class Item { void itemGo() {} }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("call-of-a-value-with-no-call-method", DART2_FILE, "Caller.noValueCall",
+                   "plain(1)", 0),
+        SL_NO_USE_AT("bare-name-is-not-an-enum-constant", DART2_FILE, "Caller.noBareConstant",
+                     "ready", 2),
+        SL_NO_USE_AT("unknown-receiver-reads-nothing", DART2_FILE, "Caller.noUnknownReceiver",
+                     "ready", 3),
+        SL_NO_USE_AT("a-parameter-shadows-the-getter-of-its-name", DART2_FILE,
+                     "Defaults.noParameterRead", "shadowed", 1),
+        SL_NO_USE_AT("called-member-is-not-a-read", DART2_FILE, "Caller.noCalledMember", "subGo", 1),
+        SL_DENY_AT("bound-type-parameter-hides-the-class", DART2_FILE, "Bound.noTypeParam",
+                   "s.subGo", 2),
+        SL_DENY_AT("private-mixin-member-of-another-library", DART2_FILE, "Caller.mixinPrivate",
+                   "_hidden()", 0),
+        SL_DENY_AT("hosted-name-that-two-pubspecs-share", "packages/four/lib/four.dart",
+                   "four.noPathDep", "sharedFn()", 0),
+        SL_DENY_AT("a-type-parameter-hides-the-class-of-its-name", "lib/box.dart",
+                   "Box.noOwnParameter", "value.itemGo", 0),
+        SL_DENY_AT("a-parameter-left-open", "lib/box.dart", "Open.noParameterLeftOpen",
+                   "value.itemGo", 3),
+        SL_DENY_AT("a-generic-argument-is-not-its-element", "lib/box.dart", "Listed.noElementType",
+                   "value.itemGo", 4),
+    };
+    ASSERT(sl_check("dart-reads", ".dart", "void filler() {}\n", sources,
                     sizeof(sources) / sizeof(sources[0]), expected,
                     sizeof(expected) / sizeof(expected[0]), forbidden,
                     sizeof(forbidden) / sizeof(forbidden[0])));
@@ -4033,6 +5237,11 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_parse_damage_stays_where_it_is);
     RUN_TEST(resolver_source_dart_lexical_scope_libraries_and_receivers);
     RUN_TEST(resolver_source_swift_modules_lookup_and_receivers);
+    RUN_TEST(resolver_source_swift_parse_view_reads_and_extensions);
+    RUN_TEST(resolver_source_swift_implicit_members_and_overloads_by_type);
+    RUN_TEST(resolver_source_swift_initializer_types_and_nested_context);
+    RUN_TEST(resolver_source_swift_closures_and_value_forms);
+    RUN_TEST(resolver_source_dart_headers_reads_members_and_pubspec_paths);
     RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
     RUN_TEST(resolver_source_haskell_imports_and_scope);
     RUN_TEST(resolver_source_ocaml_sequential_scope_and_modules);

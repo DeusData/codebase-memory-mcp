@@ -138,6 +138,27 @@ TEST(yaml_string_list) {
     PASS();
 }
 
+TEST(yaml_map_keys_in_file_order) {
+    const char *yaml =
+        "dependencies:\n"
+        "  shared:\n"
+        "    path: ../shared\n"
+        "  hosted: ^1.0.0\n"
+        "  other:\n"
+        "    path: ../other\n"
+        "empty: 1\n";
+    cbm_yaml_node_t *root = cbm_yaml_parse(yaml, (int)strlen(yaml));
+    ASSERT_NOT_NULL(root);
+    const char *keys[2];
+    ASSERT_EQ(cbm_yaml_get_map_keys(root, "dependencies", keys, 2), 3);
+    ASSERT_STR_EQ(keys[0], "shared");
+    ASSERT_STR_EQ(keys[1], "hosted");
+    ASSERT_EQ(cbm_yaml_get_map_keys(root, "empty", keys, 2), 0);
+    ASSERT_EQ(cbm_yaml_get_map_keys(root, "absent", keys, 2), 0);
+    cbm_yaml_free(root);
+    PASS();
+}
+
 TEST(yaml_list_max_out_limit) {
     const char *yaml =
         "items:\n"
@@ -1092,6 +1113,7 @@ SUITE(yaml) {
     RUN_TEST(yaml_empty_path);
     RUN_TEST(yaml_path_trailing_dot);
     RUN_TEST(yaml_duplicate_keys);
+    RUN_TEST(yaml_map_keys_in_file_order);
     RUN_TEST(yaml_indentation_dedent);
     RUN_TEST(yaml_partial_len);
     RUN_TEST(yaml_top_level_list_items);

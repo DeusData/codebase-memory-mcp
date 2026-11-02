@@ -31556,7 +31556,7 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
     ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
     ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreImpl"), "Core/Sources/CoreImpl");
-    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
+    ASSERT_EQ(entries.count, 4); /* the target and its three membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31581,7 +31581,7 @@ TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
-    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
+    ASSERT_EQ(entries.count, 4); /* the target and its three membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31647,7 +31647,7 @@ TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "NestedDecoy"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "StringDecoy"));
-    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
+    ASSERT_EQ(entries.count, 4); /* the target and its three membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31676,7 +31676,7 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "RemoteKit"));
-    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
+    ASSERT_EQ(entries.count, 4); /* the target and its three membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31702,7 +31702,7 @@ TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Utils"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "UtilsPkg"));
-    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
+    ASSERT_EQ(entries.count, 4); /* the target and its three membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }

@@ -1127,6 +1127,12 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         TSNode sig = node;
         if (strcmp(ts_node_type(node), "method_signature") == 0) {
             TSNode fs = cbm_find_child_by_kind(node, "function_signature");
+            if (ts_node_is_null(fs)) {
+                fs = cbm_find_child_by_kind(node, "getter_signature");
+            }
+            if (ts_node_is_null(fs)) {
+                fs = cbm_find_child_by_kind(node, "setter_signature");
+            }
             if (!ts_node_is_null(fs)) {
                 sig = fs;
             }
@@ -1315,6 +1321,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
      * no class scope, so a method body's calls source to the Module and the
      * method itself is mis-extracted as a top-level Function (not a Method). */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
+        name_node = cbm_find_child_by_kind(node, "identifier");
+    }
+    /* Dart: a mixin's name is a plain identifier child; only a class has the field. */
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_DART &&
+        strcmp(ts_node_type(node), "mixin_declaration") == 0) {
         name_node = cbm_find_child_by_kind(node, "identifier");
     }
     /* Rust: impl_item has no `name` field; the implementing type is in the `type`

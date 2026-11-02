@@ -418,6 +418,24 @@ int cbm_yaml_get_str_list(const cbm_yaml_node_t *root, const char *path, const c
     return count;
 }
 
+int cbm_yaml_get_map_keys(const cbm_yaml_node_t *root, const char *path, const char **out,
+                          int max_out) {
+    const cbm_yaml_node_t *node = navigate(root, path);
+    if (!node || node->type != YAML_MAP) {
+        return 0;
+    }
+    int count = 0;
+    for (int i = 0; i < node->child_count; i++) {
+        if (node->children[i]->key) {
+            if (count < max_out) {
+                out[count] = node->children[i]->key;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
 bool cbm_yaml_has(const cbm_yaml_node_t *root, const char *path) {
     return navigate(root, path) != NULL;
 }

@@ -242,8 +242,14 @@ static TSNode terminal_vhdl_identifier(TSNode node, int remaining_depth) {
 // identifiers: a sibling selector/parenthesis group is the grammar contract.
 static bool is_forward_sibling_callee(CBMLanguage language, TSNode node) {
     if (language == CBM_LANG_DART && strcmp(ts_node_type(node), "identifier") == 0) {
+        /* Only an invocation makes it a callee: `Status.ready` reads Status. */
         TSNode next = ts_node_next_named_sibling(node);
-        return !ts_node_is_null(next) && strcmp(ts_node_type(next), "selector") == 0;
+        if (ts_node_is_null(next) || strcmp(ts_node_type(next), "selector") != 0) {
+            return false;
+        }
+        TSNode first = ts_node_named_child(next, 0);
+        return !ts_node_is_null(first) && (strcmp(ts_node_type(first), "argument_part") == 0 ||
+                                           strcmp(ts_node_type(first), "arguments") == 0);
     }
 
     if (language != CBM_LANG_VHDL) {
@@ -2893,7 +2899,11 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
                 cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
             }
         }
-        return;
+        /* Swift: `.slow(reason: r)` and `Mode.slow(reason: r)` may name a case or a closure
+         * property, which are read, not called. Only the semantic pass can tell. */
+        if (ctx->language != CBM_LANG_SWIFT || ts_node_eq(node, state->callee_expr)) {
+            return;
+        }
     }
     if (is_jsx_tag_name(ctx, node, state)) {
         return;

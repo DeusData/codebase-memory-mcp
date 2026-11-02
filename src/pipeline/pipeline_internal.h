@@ -739,12 +739,18 @@ void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
 /* Get the current pipeline's package map (NULL if none). */
 /* Package-map keys under this prefix hold a raw value, not a dotted QN.
  *   dart: a Dart package's name -> its repo-relative lib directory
+ *   dart-pubspec: a directory that holds a pubspec.yaml -> "1"
+ *   dart-dep: such a directory, U+001F, a name its pubspec resolves -> that lib directory
  *   swift-dir: a SwiftPM target's directory -> the target's name
- *   swift-target: a SwiftPM target's name -> its directory */
+ *   swift-target: a SwiftPM target's name -> its directory
+ *   swift-package: a SwiftPM target's directory -> the directory of its manifest */
 #define CBM_PKGMAP_RAW_PREFIX "@cbm:raw:"
 #define CBM_PKGMAP_DART_ROOT_PREFIX "@cbm:raw:dart:"
+#define CBM_PKGMAP_DART_PUBSPEC_PREFIX "@cbm:raw:dart-pubspec:"
+#define CBM_PKGMAP_DART_DEP_PREFIX "@cbm:raw:dart-dep:"
 #define CBM_PKGMAP_SWIFT_DIR_PREFIX "@cbm:raw:swift-dir:"
 #define CBM_PKGMAP_SWIFT_TARGET_PREFIX "@cbm:raw:swift-target:"
+#define CBM_PKGMAP_SWIFT_PACKAGE_PREFIX "@cbm:raw:swift-package:"
 void cbm_pipeline_install_rust_item_macros(const cbm_file_info_t *files, int count);
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);

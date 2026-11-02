@@ -2525,6 +2525,28 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
     ts_tree_cursor_delete(&cursor);
 }
 
+// Swift: `@testable public import class Lib.Session` names a module first in its path.
+static void parse_swift_imports(CBMExtractCtx *ctx) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        more = ts_tree_cursor_goto_next_sibling(&cursor);
+        if (strcmp(ts_node_type(node), "import_declaration") != 0) {
+            continue;
+        }
+        TSNode path = cbm_find_child_by_kind(node, "identifier");
+        char *module = ts_node_is_null(path) || ts_node_named_child_count(path) == 0
+                           ? NULL
+                           : cbm_node_text(ctx->arena, ts_node_named_child(path, 0), ctx->source);
+        if (module && module[0]) {
+            CBMImport imp = {.local_name = module, .module_path = module};
+            push_import_at(ctx, node, imp);
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
 // --- Kotlin imports ---
 // tree-sitter-kotlin nests imports: source_file -> import_list -> import_header*.
 // parse_generic_imports only scans the DIRECT children of root, and "import" is
@@ -2579,10 +2601,10 @@ static bool find_first_descendant_of(TSNode node, const char *type, // NOLINT(mi
     return false;
 }
 
-/* A dependency URI needs the complete direct-import shape. In particular,
- * the first string inside a conditional import or an export is not evidence
- * that this library is the selected dependency. The shared literal helper
- * subsequently audits the complete token, including escapes and interpolation. */
+/* A dependency URI needs the complete direct shape of an import or an export. In
+ * particular, the first string inside a conditional directive is not evidence that this
+ * library is the selected dependency. The shared literal helper subsequently audits the
+ * complete token, including escapes and interpolation. */
 static bool dart_direct_import(TSNode declaration, TSNode uri) {
     enum { DART_IMPORT_MAX_NODES = 256, DART_IMPORT_MAX_DEPTH = 32 };
     if (ts_node_is_null(declaration) || ts_node_has_error(declaration))
@@ -2606,7 +2628,7 @@ static bool dart_direct_import(TSNode declaration, TSNode uri) {
                 break;
             }
         } else if (ts_node_is_named(node)) {
-            if (!strcmp(kind, "library_import"))
+            if (!strcmp(kind, "library_import") || !strcmp(kind, "library_export"))
                 imports++;
             else if (strcmp(kind, "import_or_export") && strcmp(kind, "import_specification") &&
                      strcmp(kind, "configurable_uri") && strcmp(kind, "uri") &&
@@ -2647,6 +2669,21 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
     }
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        /* `part 'x.dart';` brings that file into this library. `part of` points the other way. */
+        if (strcmp(ts_node_type(node), "part_directive") == 0) {
+            TSNode part = node;
+            int previous_count = ctx->result->imports.count;
+            if (!ts_node_has_error(node) &&
+                find_first_descendant_of(node, "string_literal", &part) &&
+                push_literal_relative_import(ctx, part) &&
+                ctx->result->imports.count > previous_count) {
+                CBMImport *import = &ctx->result->imports.items[previous_count];
+                import->site_start_byte = ts_node_start_byte(part);
+                import->site_end_byte = ts_node_end_byte(part);
+                import->source_origin = CBM_SOURCE_ORIGIN_RAW;
+            }
+            continue;
+        }
         if (strcmp(ts_node_type(node), "import_or_export") != 0) {
             continue;
         }
@@ -5155,7 +5192,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "groovy_import");
         break;
     case CBM_LANG_SWIFT:
-        parse_generic_imports(ctx, "import_declaration");
+        parse_swift_imports(ctx);
         break;
     case CBM_LANG_DART:
         parse_dart_imports(ctx);

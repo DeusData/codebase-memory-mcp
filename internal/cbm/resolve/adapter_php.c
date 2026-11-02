@@ -607,7 +607,12 @@ static php_lookup_t php_find_member(const php_ctx_t *ctx, const char *cls, const
     }
     if (trait) {
         /* Adaptation rules can rename or exclude the trait's member. */
-        if (open || (record->flags & CBM_SOURCE_DECL_F_ADAPTED))
+        if (record->flags & CBM_SOURCE_DECL_F_ADAPTED)
+            return PHP_OPEN;
+        /* Two traits inserting one method is a fatal error unless the class resolves it, and
+         * this class resolves nothing, so a trait outside the project cannot declare it too.
+         * An abstract member is the exception: it gives way to the other trait's body. */
+        if (open && (trait->flags & CBM_SOURCE_DECL_F_ABSTRACT))
             return PHP_OPEN;
         *out = trait;
         return PHP_FOUND;
@@ -853,6 +858,61 @@ static void php_declare_params(php_ctx_t *ctx, php_scope_t *scope, TSNode parame
     }
 }
 
+/* The function a call's name selects. A name goes through `use function`, then the current
+ * namespace, then the global namespace; a qualified one has no fallback. */
+static const cbm_source_decl_t *php_function_decl(php_ctx_t *ctx, TSNode function,
+                                                  const char **out_owner,
+                                                  cbm_resolve_rule_t *out_rule) {
+    const char *text = cbm_source_text(ctx->walk, function);
+    const char *lower = text ? cbm_source_lower(ctx->walk, text) : NULL;
+    const char *owner = NULL, *name = NULL, *fallback_name = NULL;
+    *out_rule = CBM_RESOLVE_RULE_SCOPE_BINDING;
+    if (!lower) {
+        *out_owner = NULL;
+        return NULL;
+    }
+    if (lower[0] == '\\') {
+        const char *leaf = strrchr(lower, '\\');
+        owner = leaf == lower
+                    ? ""
+                    : cbm_arena_strndup(ctx->walk->arena, lower + 1, (size_t)(leaf - lower - 1));
+        name = leaf + 1;
+    } else if (strchr(lower, '\\')) {
+        /* Qualified: the first segment goes through class aliases, the rest is
+         * namespace, with no global fallback. */
+        const char *qualified = !strncmp(lower, "namespace\\", 10)
+                                    ? php_join(ctx, ctx->ns, lower + 10)
+                                    : php_class_name(ctx, text);
+        const char *leaf = qualified ? strrchr(qualified, '\\') : NULL;
+        if (leaf) {
+            owner = cbm_arena_strndup(ctx->walk->arena, qualified, (size_t)(leaf - qualified));
+            name = leaf + 1;
+        }
+    } else {
+        const char *imported = php_find_use(ctx, lower, PHP_USE_FUNCTION);
+        if (imported) {
+            const char *leaf = strrchr(imported, '\\');
+            owner = leaf ? cbm_arena_strndup(ctx->walk->arena, imported, (size_t)(leaf - imported))
+                         : "";
+            name = leaf ? leaf + 1 : imported;
+            *out_rule = CBM_RESOLVE_RULE_IMPORT_BINDING;
+        } else {
+            owner = ctx->ns;
+            name = lower;
+            fallback_name = ctx->ns[0] ? lower : NULL;
+        }
+    }
+    const cbm_source_decl_t *decl = name ? cbm_source_lookup(ctx->walk, owner, name) : NULL;
+    /* The manual's fallback: an unqualified function not found in the current
+     * namespace is looked up in the global namespace. */
+    if (!decl && fallback_name) {
+        decl = cbm_source_lookup(ctx->walk, "", fallback_name);
+        owner = "";
+    }
+    *out_owner = owner;
+    return decl;
+}
+
 static const char *php_expr_class(php_ctx_t *ctx, php_scope_t *scope, TSNode node, uint32_t at,
                                   unsigned depth);
 
@@ -1025,6 +1085,17 @@ static const char *php_expr_class(php_ctx_t *ctx, php_scope_t *scope, TSNode nod
             receiver && key ? cbm_source_lookup(ctx->walk, receiver, key) : NULL;
         return value && !value->next ? value->type : NULL;
     }
+    if (!strcmp(kind, "function_call_expression")) {
+        /* A declared return type is enforced at runtime, as it is for a method. */
+        TSNode function = cbm_source_field(node, "function");
+        if (!cbm_source_is(function, "name") && !cbm_source_is(function, "qualified_name"))
+            return NULL;
+        const char *owner = NULL;
+        cbm_resolve_rule_t rule = CBM_RESOLVE_RULE_SCOPE_BINDING;
+        const cbm_source_decl_t *decl = php_function_decl(ctx, function, &owner, &rule);
+        return decl && !decl->next && !(decl->flags & CBM_SOURCE_DECL_F_CONDITIONAL) ? decl->type
+                                                                                     : NULL;
+    }
     bool member_call =
         !strcmp(kind, "member_call_expression") || !strcmp(kind, "nullsafe_member_call_expression");
     bool scoped_call = !strcmp(kind, "scoped_call_expression");
@@ -1175,47 +1246,9 @@ static void php_visit_function_call(php_ctx_t *ctx, TSNode node) {
                              NULL, "php_dynamic_callee");
         return;
     }
-    const char *lower = cbm_source_lower(ctx->walk, text);
-    const char *owner = NULL, *name = NULL, *fallback_name = NULL, *reason = NULL;
+    const char *owner = NULL, *reason = NULL;
     cbm_resolve_rule_t rule = CBM_RESOLVE_RULE_SCOPE_BINDING;
-    if (lower[0] == '\\') {
-        const char *leaf = strrchr(lower, '\\');
-        owner = leaf == lower
-                    ? ""
-                    : cbm_arena_strndup(ctx->walk->arena, lower + 1, (size_t)(leaf - lower - 1));
-        name = leaf + 1;
-    } else if (strchr(lower, '\\')) {
-        /* Qualified: the first segment goes through class aliases, the rest is
-         * namespace, with no global fallback. */
-        const char *qualified = !strncmp(lower, "namespace\\", 10)
-                                    ? php_join(ctx, ctx->ns, lower + 10)
-                                    : php_class_name(ctx, text);
-        const char *leaf = qualified ? strrchr(qualified, '\\') : NULL;
-        if (leaf) {
-            owner = cbm_arena_strndup(ctx->walk->arena, qualified, (size_t)(leaf - qualified));
-            name = leaf + 1;
-        }
-    } else {
-        const char *imported = php_find_use(ctx, lower, PHP_USE_FUNCTION);
-        if (imported) {
-            const char *leaf = strrchr(imported, '\\');
-            owner = leaf ? cbm_arena_strndup(ctx->walk->arena, imported, (size_t)(leaf - imported))
-                         : "";
-            name = leaf ? leaf + 1 : imported;
-            rule = CBM_RESOLVE_RULE_IMPORT_BINDING;
-        } else {
-            owner = ctx->ns;
-            name = lower;
-            fallback_name = ctx->ns[0] ? lower : NULL;
-        }
-    }
-    const cbm_source_decl_t *decl = name ? cbm_source_lookup(ctx->walk, owner, name) : NULL;
-    /* The manual's fallback: an unqualified function not found in the current
-     * namespace is looked up in the global namespace. */
-    if (!decl && fallback_name) {
-        decl = cbm_source_lookup(ctx->walk, "", fallback_name);
-        owner = "";
-    }
+    const cbm_source_decl_t *decl = php_function_decl(ctx, function, &owner, &rule);
     php_note_argument_effects(ctx, ctx->scope, arguments, decl);
     const char *target = cbm_source_unique_qn(decl, &reason);
     if (!decl)

@@ -35,11 +35,14 @@
 
 #define DART_LIBRARY_RECORD "&library"
 #define DART_CLASS_RECORD "&class"
+#define DART_CLASS_PARAMS "&params" /* type: the class's own type parameters, `,T,U,` */
 #define DART_IMPORTS "&imports"
 #define DART_EXPORTS "&exports"
 #define DART_CTOR_PREFIX "ctor:"
 #define DART_CLASS_PREFIX "class:"
 #define DART_DIRECTIVE_SEPARATOR '\x1e'
+#define DART_TYPE_ARGS_SEPARATOR '\x1f' /* base's name, then its type arguments */
+#define DART_CLASS_PARAM '$'            /* a declared type that is a parameter of its class */
 
 typedef struct {
     const char *library; /* project path; NULL when the library is not visible to this table */
@@ -80,11 +83,14 @@ typedef enum { DART_NOTHING, DART_FUNCTION, DART_CLASS, DART_INSTANCE, DART_LIBR
 /* What an expression prefix denotes while walking its selectors. */
 typedef struct {
     dart_kind_t kind;
-    const char *class_key;         /* DART_CLASS, DART_INSTANCE */
-    const cbm_source_decl_t *decl; /* DART_FUNCTION, DART_CLASS */
-    const char *prefix;            /* DART_LIBRARY */
+    const char *class_key;          /* DART_CLASS, DART_INSTANCE */
+    const cbm_source_decl_t *decl;  /* DART_FUNCTION, DART_CLASS */
+    const cbm_source_decl_t *value; /* a value's own declaration, whatever its type */
+    const char *prefix;             /* DART_LIBRARY */
+    const char *receiver;           /* the class a member was selected on */
     bool via_import;
     bool via_receiver;
+    bool from_super; /* `super`: its lookup starts past the class's own members */
     const char *reason;
 } dart_ref_t;
 
@@ -141,8 +147,8 @@ static const char *dart_uri_library(cbm_source_walk_t *walk, const char *base_fi
         const char *slash = strchr(rest, '/');
         if (!slash)
             return NULL;
-        char *key = cbm_arena_sprintf(walk->arena, "@cbm:raw:dart:%.*s", (int)(slash - rest), rest);
-        const char *lib = key ? cbm_source_table_package(walk->table, key) : NULL;
+        char *name = cbm_arena_strndup(walk->arena, rest, (size_t)(slash - rest));
+        const char *lib = name ? cbm_source_table_dart_package(walk->table, base_file, name) : NULL;
         return lib ? dart_path_join(walk, lib, slash + 1) : NULL;
     }
     if (strchr(uri, ':') || uri[0] == '/')
@@ -192,7 +198,12 @@ static const char *dart_list(cbm_source_walk_t *walk, TSNode node, const char *k
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; joined && i < count; i++) {
         TSNode child = ts_node_named_child(node, i);
-        const char *name = cbm_source_is(child, kind) ? cbm_source_text(walk, child) : NULL;
+        if (!cbm_source_is(child, kind))
+            continue;
+        /* `T extends Base` is a type parameter named T. */
+        const char *name = cbm_source_is(child, "type_parameter")
+                               ? cbm_source_text(walk, ts_node_named_child(child, 0))
+                               : cbm_source_text(walk, child);
         if (name)
             joined = cbm_arena_sprintf(walk->arena, "%s%s,", joined, name);
     }
@@ -234,6 +245,16 @@ static const char *dart_type_text(cbm_source_walk_t *walk, TSNode holder, const 
             type = cbm_source_text(walk, child);
     }
     return type && !dart_list_has(type_params, type) ? type : NULL;
+}
+
+/* A member's declared type. A parameter of its class stays a parameter, for a subclass that
+ * fixes it to say what it means; one the member declares itself means nothing outside. */
+static const char *dart_member_type_text(cbm_source_walk_t *walk, TSNode holder,
+                                         const char *class_params, const char *own_params) {
+    const char *type = dart_type_text(walk, holder, own_params);
+    if (type && dart_list_has(class_params, type))
+        return cbm_arena_sprintf(walk->arena, "%c%s", DART_CLASS_PARAM, type);
+    return type;
 }
 
 static void dart_note_directive(cbm_source_walk_t *walk, const char *library, TSNode directive,
@@ -279,16 +300,21 @@ static void dart_declare_function(cbm_source_walk_t *walk, const char *owner, TS
     uint32_t line = ts_node_start_point(name).row + 1;
     cbm_source_decl_t *decl =
         cbm_source_declare(walk, owner, text, cbm_source_def_qn(walk, text, line), 0, line);
-    const char *type =
-        dart_type_text(walk, signature, dart_type_params(walk, signature, type_params));
+    const char *type = dart_member_type_text(walk, signature, type_params,
+                                             dart_type_params(walk, signature, NULL));
     if (decl && type)
         decl->type = cbm_source_table_intern(walk, type);
 }
 
 static void dart_declare_value(cbm_source_walk_t *walk, const char *owner, const char *name,
                                const char *type, uint32_t line) {
+    /* An enum constant or a top-level variable has a node, and an accessor has its Method; a
+     * plain field has none. */
+    const char *qn = name ? cbm_source_def_qn_label(walk, name, line, "Variable") : NULL;
+    if (!qn && name)
+        qn = cbm_source_def_qn_label(walk, name, line, "Method");
     cbm_source_decl_t *decl =
-        name ? cbm_source_declare(walk, owner, name, NULL, CBM_SOURCE_DECL_F_VALUE, line) : NULL;
+        name ? cbm_source_declare(walk, owner, name, qn, CBM_SOURCE_DECL_F_VALUE, line) : NULL;
     if (decl && type)
         decl->type = cbm_source_table_intern(walk, type);
 }
@@ -348,7 +374,7 @@ static bool dart_type_written(TSNode declaration) {
 
 static void dart_collect_declaration(cbm_source_walk_t *walk, const char *owner, TSNode declaration,
                                      const char *type_params) {
-    const char *type = dart_type_text(walk, declaration, type_params);
+    const char *type = dart_member_type_text(walk, declaration, type_params, NULL);
     bool typed = dart_type_written(declaration);
     uint32_t count = ts_node_named_child_count(declaration);
     for (uint32_t i = 0; i < count; i++) {
@@ -361,7 +387,7 @@ static void dart_collect_declaration(cbm_source_walk_t *walk, const char *owner,
         } else if (cbm_source_is(child, "getter_signature") ||
                    cbm_source_is(child, "setter_signature")) {
             dart_declare_value(walk, owner, cbm_source_text(walk, cbm_source_field(child, "name")),
-                               dart_type_text(walk, child, type_params),
+                               dart_member_type_text(walk, child, type_params, NULL),
                                ts_node_start_point(child).row + 1);
         } else if (cbm_source_is(child, "constructor_signature") ||
                    cbm_source_is(child, "constant_constructor_signature") ||
@@ -372,6 +398,31 @@ static void dart_collect_declaration(cbm_source_walk_t *walk, const char *owner,
             dart_collect_declaration(walk, owner, child, type_params);
         }
     }
+}
+
+/* A base's type arguments, in order. An argument with no plain name counts as a place. */
+static const char *dart_base_args(cbm_source_walk_t *walk, TSNode type) {
+    TSNode list = ts_node_next_named_sibling(type);
+    if (!cbm_source_is(list, "type_arguments"))
+        return "";
+    const char *joined = "";
+    uint32_t count = ts_node_named_child_count(list);
+    for (uint32_t i = 0; joined && i < count; i++) {
+        TSNode arg = ts_node_named_child(list, i);
+        /* `A<B>` keeps B's list beside it, and `A?` its mark. */
+        if (cbm_source_is(arg, "type_arguments") || cbm_source_is(arg, "nullable_type"))
+            continue;
+        const char *text = cbm_source_is(arg, "type_identifier") ? cbm_source_text(walk, arg) : "?";
+        joined = cbm_arena_sprintf(walk->arena, "%s%s,", joined, text ? text : "?");
+    }
+    return joined ? joined : "";
+}
+
+static const char *dart_base_entry(cbm_source_walk_t *walk, char tag, TSNode type) {
+    const char *text = cbm_source_text(walk, type);
+    return text ? cbm_arena_sprintf(walk->arena, "%c:%s%c%s", tag, text, DART_TYPE_ARGS_SEPARATOR,
+                                    dart_base_args(walk, type))
+                : NULL;
 }
 
 /* Each base is recorded with its role, since the roles are searched in order. */
@@ -389,9 +440,9 @@ static void dart_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_dec
                                                         : 0;
         /* `mixin M on Base` and `extension E on Base` see Base's members as their own. */
         if (cbm_source_is(child, "type_identifier")) {
-            const char *text = cbm_source_text(walk, child);
-            if (text && used < MAX_BASES)
-                found[used++] = cbm_arena_sprintf(walk->arena, "S:%s", text);
+            const char *entry = dart_base_entry(walk, 'S', child);
+            if (entry && used < MAX_BASES)
+                found[used++] = entry;
             continue;
         }
         if (!tag)
@@ -403,15 +454,15 @@ static void dart_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_dec
             uint32_t names = nested ? ts_node_named_child_count(part) : 1;
             for (uint32_t m = 0; m < names; m++) {
                 TSNode type = nested ? ts_node_named_child(part, m) : part;
-                const char *text =
-                    cbm_source_is(type, "type_identifier") ? cbm_source_text(walk, type) : NULL;
-                if (!text)
+                if (!cbm_source_is(type, "type_identifier"))
+                    continue;
+                const char *entry = dart_base_entry(walk, nested ? 'M' : tag, type);
+                if (!entry)
                     continue;
                 if (used == MAX_BASES)
                     open = true;
                 else
-                    found[used++] =
-                        cbm_arena_sprintf(walk->arena, "%c:%s", nested ? 'M' : tag, text);
+                    found[used++] = entry;
             }
         }
     }
@@ -468,11 +519,17 @@ static void dart_collect_class(cbm_source_walk_t *walk, const char *library, TSN
         in_library->type = cbm_source_table_intern(walk, class_key);
     cbm_source_decl_t *record =
         cbm_source_declare(walk, class_key, DART_CLASS_RECORD, NULL, CBM_SOURCE_DECL_F_TYPE, line);
+    const char *type_params = dart_type_params(walk, node, NULL);
     if (record) {
         record->type = cbm_source_table_intern(walk, library);
         dart_note_bases(walk, node, record);
     }
-    const char *type_params = dart_type_params(walk, node, NULL);
+    if (type_params) {
+        cbm_source_decl_t *params = cbm_source_declare(walk, class_key, DART_CLASS_PARAMS, NULL,
+                                                       CBM_SOURCE_DECL_F_VALUE, line);
+        if (params)
+            params->type = cbm_source_table_intern(walk, type_params);
+    }
     TSNode body = dart_class_body(node);
     uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
@@ -768,6 +825,12 @@ static const char *dart_type_class(dart_ctx_t *ctx, const char *path, const char
 
 typedef enum { DART_FOUND, DART_ABSENT, DART_OPEN, DART_AMBIGUOUS } dart_lookup_t;
 
+static const char *dart_base_name(dart_ctx_t *ctx, const char *base) {
+    const char *mark = strchr(base + 2, DART_TYPE_ARGS_SEPARATOR);
+    return mark ? cbm_arena_strndup(ctx->walk->arena, base + 2, (size_t)(mark - (base + 2)))
+                : base + 2;
+}
+
 static dart_lookup_t dart_find_member(dart_ctx_t *ctx, const char *class_key, const char *name,
                                       cbm_source_chain_t *chain, const cbm_source_decl_t **out);
 
@@ -782,7 +845,7 @@ static dart_lookup_t dart_search_bases(dart_ctx_t *ctx, const cbm_source_decl_t 
         const char *base = bases[reverse ? count - 1 - step : step];
         if (base[0] != role)
             continue;
-        const char *parent = dart_type_class(ctx, record->type, base + 2);
+        const char *parent = dart_type_class(ctx, record->type, dart_base_name(ctx, base));
         if (!parent)
             return DART_OPEN;
         dart_lookup_t found = dart_find_member(ctx, parent, name, chain, out);
@@ -802,6 +865,9 @@ static dart_lookup_t dart_find_member(dart_ctx_t *ctx, const char *class_key, co
     if (!record || record->next || (record->flags & CBM_SOURCE_DECL_F_OPEN))
         return DART_OPEN;
     const cbm_source_decl_t *own = cbm_source_lookup(ctx->walk, class_key, name);
+    /* `_x` of another library is another name, whichever class chain leads to it. */
+    if (own && name[0] == '_' && record->type && strcmp(record->type, ctx->library))
+        own = NULL;
     if (own) {
         if (own->next && !(own->flags & CBM_SOURCE_DECL_F_VALUE))
             return DART_AMBIGUOUS;
@@ -816,24 +882,115 @@ static dart_lookup_t dart_find_member(dart_ctx_t *ctx, const char *class_key, co
     return found;
 }
 
+/* `super.m`: what the class inherits, in the same order, without its own members. */
+static dart_lookup_t dart_find_past_own(dart_ctx_t *ctx, const char *class_key, const char *name,
+                                        cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_first_visit(chain, class_key))
+        return DART_ABSENT;
+    const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, class_key, DART_CLASS_RECORD);
+    if (!record || record->next || (record->flags & CBM_SOURCE_DECL_F_OPEN))
+        return DART_OPEN;
+    dart_lookup_t found = dart_search_bases(ctx, record, 'M', true, name, chain, out);
+    if (found == DART_ABSENT)
+        found = dart_search_bases(ctx, record, 'S', false, name, chain, out);
+    if (found == DART_ABSENT)
+        found = dart_search_bases(ctx, record, 'I', false, name, chain, out);
+    return found;
+}
+
 static const char *dart_decl_library(dart_ctx_t *ctx, const cbm_source_decl_t *decl) {
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, decl->owner, DART_CLASS_RECORD);
     return record && record->type ? record->type : decl->owner;
 }
 
 static const char *dart_declared_class(dart_ctx_t *ctx, const cbm_source_decl_t *decl) {
-    return decl && decl->type ? dart_type_class(ctx, dart_decl_library(ctx, decl), decl->type)
-                              : NULL;
+    return decl && decl->type && decl->type[0] != DART_CLASS_PARAM
+               ? dart_type_class(ctx, dart_decl_library(ctx, decl), decl->type)
+               : NULL;
 }
 
-static dart_ref_t dart_ref_of_decl(dart_ctx_t *ctx, const cbm_source_decl_t *decl) {
-    dart_ref_t ref = {.reason = "dart_name_not_declared_in_project"};
+/* The nth comma-separated entry of `A,B,`, or NULL. */
+static const char *dart_nth(dart_ctx_t *ctx, const char *list, int index) {
+    for (int i = 0; list && *list; i++) {
+        const char *comma = strchr(list, ',');
+        if (!comma)
+            return NULL;
+        if (i == index)
+            return cbm_arena_strndup(ctx->walk->arena, list, (size_t)(comma - list));
+        list = comma + 1;
+    }
+    return NULL;
+}
+
+/* Where a class declares this type parameter, or -1. */
+static int dart_param_index(dart_ctx_t *ctx, const char *cls, const char *name) {
+    const cbm_source_decl_t *params = cbm_source_lookup(ctx->walk, cls, DART_CLASS_PARAMS);
+    /* `,T,U,`: past the leading comma, in the same form dart_nth reads. */
+    const char *list = params && params->type ? params->type + 1 : NULL;
+    for (int i = 0;; i++) {
+        const char *entry = dart_nth(ctx, list, i);
+        if (!entry)
+            return -1;
+        if (!strcmp(entry, name))
+            return i;
+    }
+}
+
+/* What parameter `param` of `owner` means seen from `cls`, walking the extends and with clauses
+ * that fix it. A class key, a parameter of `cls` as "$T", or NULL. The chain bounds the walk: a
+ * class appears once. */
+static const char *dart_type_arg(dart_ctx_t *ctx, const char *cls, const char *owner,
+                                 const char *param, cbm_source_chain_t *chain) {
+    if (!strcmp(cls, owner))
+        return cbm_arena_sprintf(ctx->walk->arena, "%c%s", DART_CLASS_PARAM, param);
+    if (!cbm_source_chain_first_visit(chain, cls))
+        return NULL;
+    const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, cls, DART_CLASS_RECORD);
+    if (!record || record->next)
+        return NULL;
+    for (const char *const *base = record->bases; base && *base; base++) {
+        const char *parent = dart_type_class(ctx, record->type, dart_base_name(ctx, *base));
+        if (!parent)
+            continue;
+        const char *seen = dart_type_arg(ctx, parent, owner, param, chain);
+        if (!seen)
+            continue;
+        if (seen[0] != DART_CLASS_PARAM)
+            return seen;
+        const char *mark = strchr(*base, DART_TYPE_ARGS_SEPARATOR);
+        int index = dart_param_index(ctx, parent, seen + 1);
+        const char *arg = mark && index >= 0 ? dart_nth(ctx, mark + 1, index) : NULL;
+        if (!arg || !strcmp(arg, "?"))
+            return NULL;
+        if (dart_param_index(ctx, cls, arg) >= 0)
+            return cbm_arena_sprintf(ctx->walk->arena, "%c%s", DART_CLASS_PARAM, arg);
+        return dart_type_class(ctx, record->type, arg);
+    }
+    return NULL;
+}
+
+/* A member's declared class, as selected on this receiver. */
+static const char *dart_member_class(dart_ctx_t *ctx, const cbm_source_decl_t *decl,
+                                     const char *receiver) {
+    if (!decl || !decl->type || decl->type[0] != DART_CLASS_PARAM)
+        return dart_declared_class(ctx, decl);
+    if (!receiver)
+        return NULL;
+    cbm_source_chain_t chain = {0};
+    const char *seen = dart_type_arg(ctx, receiver, decl->owner, decl->type + 1, &chain);
+    return seen && seen[0] != DART_CLASS_PARAM ? seen : NULL;
+}
+
+static dart_ref_t dart_ref_on(dart_ctx_t *ctx, const cbm_source_decl_t *decl,
+                              const char *receiver) {
+    dart_ref_t ref = {.reason = "dart_name_not_declared_in_project", .receiver = receiver};
     if (!decl)
         return ref;
     if (decl->flags & CBM_SOURCE_DECL_F_VALUE) {
-        const char *cls = dart_declared_class(ctx, decl);
+        const char *cls = dart_member_class(ctx, decl, receiver);
         ref.kind = cls ? DART_INSTANCE : DART_NOTHING;
         ref.class_key = cls;
+        ref.value = decl;
         ref.reason = cls ? "dart_call_of_a_value" : "dart_value_of_unknown_type";
         return ref;
     }
@@ -845,6 +1002,10 @@ static dart_ref_t dart_ref_of_decl(dart_ctx_t *ctx, const cbm_source_decl_t *dec
     ref.decl = decl;
     ref.reason = "dart_declared_function";
     return ref;
+}
+
+static dart_ref_t dart_ref_of_decl(dart_ctx_t *ctx, const cbm_source_decl_t *decl) {
+    return dart_ref_on(ctx, decl, NULL);
 }
 
 static dart_ref_t dart_ref_of_class(const cbm_source_decl_t *decl) {
@@ -874,7 +1035,7 @@ static dart_ref_t dart_implicit_this(dart_ctx_t *ctx, const char *name) {
             ref.reason = "dart_outside_import_may_provide_name";
             return ref;
         }
-        return dart_ref_of_decl(ctx, inherited);
+        return dart_ref_on(ctx, inherited, ctx->class_key);
     case DART_OPEN:
         ref.reason = "dart_superclass_chain_leaves_project";
         return ref;
@@ -904,7 +1065,7 @@ static dart_ref_t dart_name(dart_ctx_t *ctx, const char *name) {
     if (ctx->class_key) {
         const cbm_source_decl_t *own = cbm_source_lookup(ctx->walk, ctx->class_key, name);
         if (own)
-            return dart_ref_of_decl(ctx, own);
+            return dart_ref_on(ctx, own, ctx->class_key);
     }
     const cbm_source_decl_t *top = cbm_source_lookup(ctx->walk, ctx->library, name);
     if (top)
@@ -991,9 +1152,12 @@ static dart_ref_t dart_member(dart_ctx_t *ctx, const dart_ref_t *receiver, const
     }
     const cbm_source_decl_t *member = NULL;
     cbm_source_chain_t chain = {0};
-    switch (dart_find_member(ctx, receiver->class_key, name, &chain, &member)) {
+    dart_lookup_t lookup = receiver->from_super
+                               ? dart_find_past_own(ctx, receiver->class_key, name, &chain, &member)
+                               : dart_find_member(ctx, receiver->class_key, name, &chain, &member);
+    switch (lookup) {
     case DART_FOUND:
-        ref = dart_ref_of_decl(ctx, member);
+        ref = dart_ref_on(ctx, member, receiver->class_key);
         ref.via_receiver = true;
         return ref;
     case DART_OPEN:
@@ -1007,6 +1171,14 @@ static dart_ref_t dart_member(dart_ctx_t *ctx, const dart_ref_t *receiver, const
     }
     ref.reason = "dart_member_absent_from_chain";
     return ref;
+}
+
+/* A value invoked like a function runs its class's `call` method. */
+static dart_ref_t dart_invoked(dart_ctx_t *ctx, const dart_ref_t *callee) {
+    if (callee->kind != DART_INSTANCE || !callee->class_key)
+        return *callee;
+    dart_ref_t found = dart_member(ctx, callee, "call");
+    return found.kind == DART_FUNCTION ? found : *callee;
 }
 
 /* ── Phase two: the walk ───────────────────────────────────────────── */
@@ -1075,16 +1247,21 @@ static bool dart_selector_is_call(TSNode selector) {
            cbm_source_is(ts_node_named_child(selector, 0), "argument_part");
 }
 
-static const char *dart_selector_member(dart_ctx_t *ctx, TSNode selector) {
-    TSNode first = ts_node_named_child(selector, 0);
+static TSNode dart_selector_member_node(TSNode selector) {
+    TSNode first =
+        cbm_source_is(selector, "selector") ? ts_node_named_child(selector, 0) : selector;
     if (!cbm_source_is(first, "unconditional_assignable_selector") &&
         !cbm_source_is(first, "conditional_assignable_selector"))
-        return NULL;
+        return (TSNode){0};
     uint32_t count = ts_node_named_child_count(first);
     for (uint32_t i = 0; i < count; i++)
         if (cbm_source_is(ts_node_named_child(first, i), "identifier"))
-            return cbm_source_text(ctx->walk, ts_node_named_child(first, i));
-    return NULL;
+            return ts_node_named_child(first, i);
+    return (TSNode){0};
+}
+
+static const char *dart_selector_member(dart_ctx_t *ctx, TSNode selector) {
+    return cbm_source_text(ctx->walk, dart_selector_member_node(selector));
 }
 
 static void dart_emit_call(dart_ctx_t *ctx, uint32_t start, uint32_t end, const dart_ref_t *ref) {
@@ -1124,7 +1301,7 @@ static dart_ref_t dart_result_of(dart_ctx_t *ctx, const dart_ref_t *callee) {
         ref.kind = DART_INSTANCE;
         ref.class_key = callee->class_key;
     } else if (callee->kind == DART_FUNCTION) {
-        const char *cls = dart_declared_class(ctx, callee->decl);
+        const char *cls = dart_member_class(ctx, callee->decl, callee->receiver);
         ref.kind = cls ? DART_INSTANCE : DART_NOTHING;
         ref.class_key = cls;
     }
@@ -1133,14 +1310,17 @@ static dart_ref_t dart_result_of(dart_ctx_t *ctx, const dart_ref_t *callee) {
 
 /* A name read as a value follows the same lookup as a call's. */
 static void dart_emit_reference(dart_ctx_t *ctx, TSNode node, const dart_ref_t *ref) {
-    if ((ref->kind != DART_FUNCTION && ref->kind != DART_CLASS) || !ref->decl)
+    /* A plain field has no node to be the target of a read. */
+    const cbm_source_decl_t *decl = ref->value && ref->value->qn ? ref->value : ref->decl;
+    if (!decl || (decl == ref->decl && ref->kind != DART_FUNCTION && ref->kind != DART_CLASS))
         return;
     const char *identity = NULL;
-    const char *target = cbm_source_unique_qn(ref->decl, &identity);
+    const char *target = cbm_source_unique_qn(decl, &identity);
     cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, target,
-                         ref->via_import ? CBM_RESOLVE_RULE_IMPORT_BINDING
-                                         : CBM_RESOLVE_RULE_SCOPE_BINDING,
-                         ref->decl->owner, target ? ref->reason : identity);
+                         ref->via_receiver ? CBM_RESOLVE_RULE_TYPE_MEMBER
+                         : ref->via_import ? CBM_RESOLVE_RULE_IMPORT_BINDING
+                                           : CBM_RESOLVE_RULE_SCOPE_BINDING,
+                         decl->owner, target ? ref->reason : identity);
 }
 
 static void dart_visit_type_reference(dart_ctx_t *ctx, TSNode node) {
@@ -1170,11 +1350,12 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
         TSNode next = dart_cursor_named(&cursor, &more);
         if (cbm_source_is(child, "selector")) {
             if (dart_selector_is_call(child)) {
+                dart_ref_t invoked = dart_invoked(ctx, &current);
                 if (cbm_source_is(previous, "identifier"))
                     dart_emit_call(ctx, ts_node_start_byte(previous), ts_node_end_byte(child),
-                                   &current);
+                                   &invoked);
                 dart_visit(ctx, child, depth + 1);
-                current = dart_result_of(ctx, &current);
+                current = dart_result_of(ctx, &invoked);
             } else if (ts_node_named_child_count(child) > 0) {
                 const char *member = dart_selector_member(ctx, child);
                 dart_ref_t found = member ? dart_member(ctx, &current, member)
@@ -1186,10 +1367,24 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
                     else
                         dart_emit_extra(ctx, ts_node_start_byte(child), ts_node_end_byte(next),
                                         member, &found);
+                } else if (member) {
+                    dart_emit_reference(ctx, dart_selector_member_node(child), &found);
                 }
                 dart_visit(ctx, child, depth + 1);
                 current = found;
             } /* `x!` leaves x's type. */
+        } else if (cbm_source_is(child, "unconditional_assignable_selector") &&
+                   cbm_source_is(previous, "super")) {
+            /* `super.m` keeps its selector beside the keyword, with no `selector` around it. */
+            const char *member = dart_selector_member(ctx, child);
+            dart_ref_t found = member ? dart_member(ctx, &current, member)
+                                      : (dart_ref_t){.reason = "dart_computed_member"};
+            if (member && dart_selector_is_call(next))
+                dart_emit_extra(ctx, ts_node_start_byte(previous), ts_node_end_byte(next), member,
+                                &found);
+            else if (member)
+                dart_emit_reference(ctx, dart_selector_member_node(child), &found);
+            current = found;
         } else if (cbm_source_is(child, "cascade_section")) {
             /* `x..a()..b()`: each section selects on x, and the value stays x. */
             TSNode selector = dart_find(child, "cascade_selector", 7);
@@ -1217,12 +1412,17 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
                 const char *name = declared ? NULL : cbm_source_text(ctx->walk, child);
                 if (name) {
                     current = dart_name(ctx, name);
-                    if (!cbm_source_is(next, "selector"))
+                    /* The head of `Status.ready` reads Status; `f()` is a call instead. */
+                    if (!dart_selector_is_call(next))
                         dart_emit_reference(ctx, child, &current);
                 }
             } else if (cbm_source_is(child, "this")) {
                 if (ctx->class_key)
                     current = (dart_ref_t){.kind = DART_INSTANCE, .class_key = ctx->class_key};
+            } else if (cbm_source_is(child, "super")) {
+                if (ctx->class_key)
+                    current = (dart_ref_t){
+                        .kind = DART_INSTANCE, .class_key = ctx->class_key, .from_super = true};
             } else if (cbm_source_is(child, "type_identifier")) {
                 dart_visit_type_reference(ctx, child);
             } else {
@@ -1251,6 +1451,54 @@ static void dart_visit_signature_types(dart_ctx_t *ctx, TSNode node, unsigned de
     }
 }
 
+/* `{this.tab = Tab.one, Item? item}`: a default stands beside its parameter, not inside it. It
+ * is read in the scope around the signature, so this runs before the parameters are bound. */
+static void dart_visit_parameter_defaults(dart_ctx_t *ctx, TSNode node, unsigned depth) {
+    if (!cbm_source_step(ctx->walk, depth))
+        return;
+    if (cbm_source_is(node, "optional_formal_parameters")) {
+        (void)dart_visit_sequence(ctx, node, depth, false);
+        return;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (TSNode child = dart_cursor_named(&cursor, &more); !ts_node_is_null(child);
+         child = dart_cursor_named(&cursor, &more))
+        if (dart_parameters_holder(child))
+            dart_visit_parameter_defaults(ctx, child, depth + 1);
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* Everything a class's header names: its bases, its mixins, what a type parameter is
+ * bounded by, and what a mixin or an extension is `on`. */
+static void dart_visit_type_tree(dart_ctx_t *ctx, TSNode node, unsigned depth) {
+    if (!cbm_source_step(ctx->walk, depth))
+        return;
+    if (cbm_source_is(node, "type_identifier")) {
+        dart_visit_type_reference(ctx, node);
+        return;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (TSNode child = dart_cursor_named(&cursor, &more); !ts_node_is_null(child);
+         child = dart_cursor_named(&cursor, &more))
+        dart_visit_type_tree(ctx, child, depth + 1);
+    ts_tree_cursor_delete(&cursor);
+}
+
+static void dart_visit_class_header(dart_ctx_t *ctx, TSNode node, unsigned depth) {
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (TSNode child = dart_cursor_named(&cursor, &more); !ts_node_is_null(child);
+         child = dart_cursor_named(&cursor, &more)) {
+        if (cbm_source_is(child, "superclass") || cbm_source_is(child, "interfaces") ||
+            cbm_source_is(child, "mixins") || cbm_source_is(child, "type_parameters") ||
+            cbm_source_is(child, "type_arguments") || cbm_source_is(child, "type_identifier"))
+            dart_visit_type_tree(ctx, child, depth + 1);
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
 static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode body,
                                      unsigned depth) {
     dart_local_t *saved = ctx->locals;
@@ -1267,6 +1515,7 @@ static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode b
                  : NULL;
     }
     if (!ts_node_is_null(signature)) {
+        dart_visit_parameter_defaults(ctx, signature, depth + 1);
         if (cbm_source_is(signature, "method_signature") && ts_node_named_child_count(signature))
             ctx->type_params =
                 dart_type_params(ctx->walk, ts_node_named_child(signature, 0), ctx->type_params);
@@ -1286,8 +1535,14 @@ static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode b
         }
     }
     /* A signature's types are read in its own type-parameter scope. */
-    if (!ts_node_is_null(signature) && !cbm_source_is(signature, "formal_parameter_list"))
+    if (!ts_node_is_null(signature) && !cbm_source_is(signature, "formal_parameter_list")) {
         dart_visit_signature_types(ctx, signature, depth + 1);
+        /* `C(x) : y = x, super(x) {`: an initializer list runs with the parameters in scope. */
+        uint32_t parts = ts_node_named_child_count(signature);
+        for (uint32_t i = 0; i < parts; i++)
+            if (cbm_source_is(ts_node_named_child(signature, i), "initializers"))
+                dart_visit(ctx, ts_node_named_child(signature, i), depth + 1);
+    }
     if (!ts_node_is_null(body))
         dart_visit(ctx, body, depth + 1);
     ctx->locals = saved;
@@ -1313,6 +1568,7 @@ static void dart_visit_members(dart_ctx_t *ctx, TSNode body, unsigned depth) {
         } else if (declaration) {
             /* A constructor's initializers and body run with its parameters in scope. */
             dart_local_t *saved = ctx->locals;
+            dart_visit_parameter_defaults(ctx, member, depth + 1);
             dart_bind_parameters(ctx, member, depth + 1);
             dart_visit(ctx, member, depth + 1);
             if (has_body)
@@ -1381,6 +1637,7 @@ static void dart_visit(dart_ctx_t *ctx, TSNode node, unsigned depth) {
         ctx->class_key =
             name ? cbm_arena_sprintf(ctx->walk->arena, "%s#%s", ctx->library, name) : NULL;
         ctx->type_params = dart_type_params(ctx->walk, node, NULL);
+        dart_visit_class_header(ctx, node, depth + 1);
         TSNode body = dart_class_body(node);
         if (!ts_node_is_null(body))
             dart_visit_members(ctx, body, depth + 1);
@@ -1416,6 +1673,14 @@ static void dart_visit(dart_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!strcmp(kind, "unconditional_assignable_selector") ||
         !strcmp(kind, "conditional_assignable_selector") || !strcmp(kind, "cascade_selector"))
         return;
+    /* Parameters declare; their defaults are read on the way into their signature. */
+    if (!strcmp(kind, "formal_parameter_list") || !strcmp(kind, "formal_parameter"))
+        return;
+    /* `final Tab x = ...;` at the top of a file keeps its type beside the names. */
+    if (!strcmp(kind, "type_identifier")) {
+        dart_visit_type_reference(ctx, node);
+        return;
+    }
     if (!strcmp(kind, "constructor_signature") || !strcmp(kind, "constant_constructor_signature") ||
         !strcmp(kind, "factory_constructor_signature") ||
         !strcmp(kind, "redirecting_factory_constructor_signature")) {
@@ -1445,7 +1710,48 @@ static void dart_visit(dart_ctx_t *ctx, TSNode node, unsigned depth) {
         }
         return;
     }
-    if (!strcmp(kind, "catch_parameters") || !strcmp(kind, "variable_pattern")) {
+    if (!strcmp(kind, "qualified")) {
+        /* `case Status.ready:` spells the member; it is not a bare name in scope. */
+        const char *reason = NULL;
+        bool via_import = false;
+        TSNode head = ts_node_named_child(node, 0), member = ts_node_named_child(node, 1);
+        const char *name =
+            cbm_source_is(head, "type_identifier") ? cbm_source_text(ctx->walk, head) : NULL;
+        const cbm_source_decl_t *cls =
+            name && !dart_list_has(ctx->type_params, name)
+                ? dart_type_decl(ctx, ctx->library, name, &reason, &via_import)
+                : NULL;
+        if (cls && !cls->next) {
+            dart_ref_t ref = dart_ref_of_class(cls);
+            ref.via_import = via_import;
+            dart_emit_reference(ctx, head, &ref);
+            const char *text =
+                cbm_source_is(member, "identifier") ? cbm_source_text(ctx->walk, member) : NULL;
+            if (text) {
+                dart_ref_t found = dart_member(ctx, &ref, text);
+                dart_emit_reference(ctx, member, &found);
+            }
+        }
+        return;
+    }
+    if (!strcmp(kind, "variable_pattern")) {
+        /* `case Sub s:` is a declared type and a name of it. */
+        TSNode type = ts_node_named_child(node, 0);
+        uint32_t parts = ts_node_named_child_count(node);
+        if (cbm_source_is(type, "type_identifier") && parts == 2 &&
+            cbm_source_is(ts_node_named_child(node, 1), "identifier")) {
+            dart_visit_type_reference(ctx, type);
+            const char *name = cbm_source_text(ctx->walk, type);
+            dart_bind(ctx, cbm_source_text(ctx->walk, ts_node_named_child(node, 1)),
+                      name && !dart_list_has(ctx->type_params, name)
+                          ? dart_type_class(ctx, ctx->library, name)
+                          : NULL);
+            return;
+        }
+        dart_bind_pattern(ctx, node, depth + 1);
+        return;
+    }
+    if (!strcmp(kind, "catch_parameters")) {
         dart_bind_pattern(ctx, node, depth + 1);
         return;
     }
@@ -1484,8 +1790,10 @@ static void dart_resolve(cbm_source_walk_t *walk) {
     cbm_ht_free(ctx.import_memo);
 }
 
+/* The one shared name Dart has is a getter and a setter, which are one node here. */
 const cbm_source_adapter_t cbm_source_adapter_dart = {.language = CBM_LANG_DART,
                                                       .collect = dart_collect,
                                                       .resolve = dart_resolve,
+                                                      .one_name_one_node = true,
                                                       .before_binding_rules = true,
                                                       .decides_references = true};

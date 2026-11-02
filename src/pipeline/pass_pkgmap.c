@@ -21,6 +21,7 @@
 #include "resolve/capabilities.h"
 #include "resolve/policy.h"
 #include "resolve/rust_names.h"
+#include "resolve/source_adapter.h"
 #include "lang_specs.h"
 #include "helpers.h"
 #include "discover/discover.h"
@@ -1054,6 +1055,49 @@ static void parse_composer_json(const char *source, int source_len, const char *
     yyjson_doc_free(doc);
 }
 
+static void pubspec_note_dep(cbm_pkg_entries_t *entries, const char *dir, const char *name,
+                             const char *lib) {
+    char key[PKGMAP_PATH_BUF];
+    int written = snprintf(key, sizeof(key), "%s%s\x1f%s", CBM_PKGMAP_DART_DEP_PREFIX, dir, name);
+    if (written > 0 && (size_t)written < sizeof(key))
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, lib));
+}
+
+/* `dep: {path: x}` is this package's dependency on that directory, whatever else in the
+ * repository shares the name. An entry in dependency_overrides replaces the one it names. */
+static void pubspec_note_path_deps(const cbm_yaml_node_t *root, const char *dir, const char *table,
+                                   cbm_pkg_entries_t *entries) {
+    const char *stack[64];
+    int count = cbm_yaml_get_map_keys(root, table, stack, 64);
+    const char **names = stack;
+    if (count > 64) {
+        names = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)count * sizeof(*names));
+        if (!names) {
+            entries->incomplete = true;
+            return;
+        }
+        (void)cbm_yaml_get_map_keys(root, table, names, count);
+    }
+    for (int i = 0; i < count; i++) {
+        char query[PKGMAP_PATH_BUF], joined[PKGMAP_PATH_BUF], lib[PKGMAP_PATH_BUF];
+        int length = snprintf(query, sizeof(query), "dependency_overrides.%s.path", names[i]);
+        bool replaced = length > 0 && (size_t)length < sizeof(query) &&
+                        strcmp(table, "dependency_overrides") != 0 && cbm_yaml_has(root, query);
+        length = snprintf(query, sizeof(query), "%s.%s.path", table, names[i]);
+        const char *path = !replaced && length > 0 && (size_t)length < sizeof(query)
+                               ? cbm_yaml_get_str(root, query)
+                               : NULL;
+        if (!path || !cbm_repo_rel_join(dir, path, joined, sizeof(joined)))
+            continue;
+        length = snprintf(lib, sizeof(lib), "%s%slib", joined, joined[0] ? "/" : "");
+        if (length > 0 && (size_t)length < sizeof(lib))
+            pubspec_note_dep(entries, dir, names[i], lib);
+    }
+    if (names != stack)
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, names);
+}
+
 /* Dart: pubspec.yaml — name */
 static void parse_pubspec_yaml(const char *source, int source_len, const char *rel_path,
                                cbm_pkg_entries_t *entries) {
@@ -1061,6 +1105,19 @@ static void parse_pubspec_yaml(const char *source, int source_len, const char *r
     if (!root) {
         return;
     }
+    char *pubspec_dir = path_dirname(rel_path);
+    char pubspec_key[PKGMAP_PATH_BUF];
+    int pubspec_written = pubspec_dir ? snprintf(pubspec_key, sizeof(pubspec_key), "%s%s",
+                                                 CBM_PKGMAP_DART_PUBSPEC_PREFIX, pubspec_dir)
+                                      : 0;
+    if (pubspec_written > 0 && (size_t)pubspec_written < sizeof(pubspec_key)) {
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, pubspec_key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "1"));
+        pubspec_note_path_deps(root, pubspec_dir, "dependencies", entries);
+        pubspec_note_path_deps(root, pubspec_dir, "dev_dependencies", entries);
+        pubspec_note_path_deps(root, pubspec_dir, "dependency_overrides", entries);
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, pubspec_dir);
     const char *name = cbm_yaml_get_str(root, "name");
     if (name && name[0] != '\0') {
         char *dir = path_dirname(rel_path);
@@ -1074,6 +1131,8 @@ static void parse_pubspec_yaml(const char *source, int source_len, const char *r
         if (written > 0 && (size_t)written < sizeof(key))
             pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
                              cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+        /* A package always resolves its own name. */
+        pubspec_note_dep(entries, dir, name, entry);
         cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     }
     cbm_yaml_free(root);
@@ -1424,9 +1483,16 @@ static char *swift_extract_after(const char *start, const char *end, const char 
  * `Sources/<target_name>` (fixed-convention, same approach parse_cargo_toml
  * takes for `src/lib`). `literal_path` is borrowed; caller retains
  * ownership. */
-static void swift_register_membership(const char *target_name, const char *directory,
-                                      cbm_pkg_entries_t *entries) {
+static void swift_register_membership(const char *manifest, const char *target_name,
+                                      const char *directory, cbm_pkg_entries_t *entries) {
     char key[PKGMAP_PATH_BUF];
+    char *package = path_dirname(manifest);
+    int package_key =
+        snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_SWIFT_PACKAGE_PREFIX, directory);
+    if (package && package_key > 0 && (size_t)package_key < sizeof(key))
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, package[0] ? package : "."));
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, package);
     int written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_SWIFT_DIR_PREFIX, directory);
     if (written > 0 && (size_t)written < sizeof(key))
         pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
@@ -1452,7 +1518,7 @@ static void swift_register_target(const char *rel_path, const char *target_name,
     }
     char *entry = build_entry_path(rel_path, suffix);
     if (entry) {
-        swift_register_membership(target_name, entry, entries);
+        swift_register_membership(rel_path, target_name, entry, entries);
         pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, target_name), entry);
     }
 }
@@ -1473,7 +1539,7 @@ static void swift_register_membership_only(const char *rel_path, const char *tar
     }
     char *entry = build_entry_path(rel_path, suffix);
     if (entry) {
-        swift_register_membership(target_name, entry, entries);
+        swift_register_membership(rel_path, target_name, entry, entries);
         cbm_free(CBM_MEM_CLASS_SEMANTIC, entry);
     }
 }
@@ -5639,6 +5705,31 @@ static bool resolve_source_language_import(const cbm_pipeline_ctx_t *ctx, const 
     }
 }
 
+static const char *swift_pkgmap_value(CBMHashTable *packages, const char *prefix,
+                                      const char *name) {
+    char key[PKGMAP_PATH_BUF];
+    int length = snprintf(key, sizeof(key), "%s%s", prefix, name);
+    const char *value =
+        packages && length > 0 && (size_t)length < sizeof(key) ? cbm_ht_get(packages, key) : NULL;
+    return value && strncmp(value, "@cbm:", strlen("@cbm:")) ? value : NULL;
+}
+
+/* The manifest directory of the target whose directory holds a file. */
+static const char *swift_package_of_file(CBMHashTable *packages, const char *file) {
+    char directory[PKGMAP_PATH_BUF];
+    int length = snprintf(directory, sizeof(directory), "%s", file);
+    if (length <= 0 || (size_t)length >= sizeof(directory))
+        return NULL;
+    for (char *slash = strrchr(directory, '/'); slash; slash = strrchr(directory, '/')) {
+        *slash = '\0';
+        const char *package =
+            swift_pkgmap_value(packages, CBM_PKGMAP_SWIFT_PACKAGE_PREFIX, directory);
+        if (package)
+            return package;
+    }
+    return NULL;
+}
+
 static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ctx,
                                                     const char *source_rel,
                                                     const char *source_file_qn,
@@ -5685,6 +5776,24 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
             return NULL;
         }
     }
+    if (lang == CBM_LANG_SWIFT) {
+        /* `import Lib` from a target of the manifest that declares Lib: a package graph has one
+         * module of a name. From anywhere else it takes the dependency chain to say which. */
+        CBMHashTable *packages = cbm_pipeline_get_pkgmap();
+        const char *directory =
+            swift_pkgmap_value(packages, CBM_PKGMAP_SWIFT_TARGET_PREFIX, imp->module_path);
+        *reason = "swift_module_not_in_project";
+        if (!directory)
+            return NULL;
+        const char *own = swift_package_of_file(packages, source_rel);
+        const char *declared =
+            swift_pkgmap_value(packages, CBM_PKGMAP_SWIFT_PACKAGE_PREFIX, directory);
+        *reason = "swift_target_of_another_package";
+        if (!own || !declared || strcmp(own, declared))
+            return NULL;
+        *reason = "swift_target_directory";
+        return kustomize_folder(ctx, directory);
+    }
     if (lang == CBM_LANG_DART) {
         *reason = "dart_import_uri_unproven";
         if (imp->kind == CBM_IMPORT_KIND_DART_PACKAGE_URI) {
@@ -5693,12 +5802,11 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
             const char *slash = strchr(rest, '/');
             CBMHashTable *packages = cbm_pipeline_get_pkgmap();
             char name[PKGMAP_PATH_BUF], path[PKGMAP_PATH_BUF];
-            int length = slash ? snprintf(name, sizeof(name), "%s%.*s", CBM_PKGMAP_DART_ROOT_PREFIX,
-                                          (int)(slash - rest), rest)
-                               : 0;
+            int length =
+                slash ? snprintf(name, sizeof(name), "%.*s", (int)(slash - rest), rest) : 0;
             if (!packages || length <= 0 || (size_t)length >= sizeof(name))
                 return NULL;
-            const char *lib = cbm_ht_get(packages, name);
+            const char *lib = cbm_source_dart_package_lib(packages, source_rel, name);
             *reason = "dart_package_not_in_project";
             if (!lib || !cbm_repo_rel_join(lib, slash + 1, path, sizeof(path)))
                 return NULL;

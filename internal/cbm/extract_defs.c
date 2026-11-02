@@ -223,7 +223,8 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
 static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                     const CBMLangSpec *spec, int fields_from);
-static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from);
+static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from,
+                                            const char *label);
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec);
@@ -231,12 +232,23 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                                  const CBMLangSpec *spec);
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
+static void extract_swift_enum_cases(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
 
 // Get "name" field from a node
+/* Swift: `init`, `deinit` and `subscript` are declarations whose name is their keyword. All
+ * of a type's initializers share one node, as a type's overloads of one name do. */
+static TSNode swift_keyword_member_name(TSNode node, const char *kind) {
+    const char *keyword = !strcmp(kind, "init_declaration")        ? "init"
+                          : !strcmp(kind, "deinit_declaration")    ? "deinit"
+                          : !strcmp(kind, "subscript_declaration") ? "subscript"
+                                                                   : NULL;
+    return keyword ? cbm_find_child_by_kind(node, keyword) : (TSNode){0};
+}
+
 static TSNode func_name_node(TSNode node) {
     TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name)) {
@@ -896,6 +908,11 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
     for (int tmpl_depth = 0; tmpl_depth < MAX_TEMPLATE_DEPTH; tmpl_depth++) {
         const char *kind = ts_node_type(node);
 
+        /* Swift: the grammar's `name` field of a subscript is its return type. */
+        if (lang == CBM_LANG_SWIFT && strcmp(kind, "subscript_declaration") == 0) {
+            return swift_keyword_member_name(node, kind);
+        }
+
         // C#: an overloaded operator has no name field, its token names it.
         if (lang == CBM_LANG_CSHARP && strcmp(kind, "operator_declaration") == 0) {
             return ts_node_child_by_field_name(node, TS_FIELD("operator"));
@@ -956,6 +973,12 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             TSNode si = cbm_find_child_by_kind(node, "simple_identifier");
             if (!ts_node_is_null(si)) {
                 return si;
+            }
+        }
+        if (lang == CBM_LANG_SWIFT) {
+            TSNode keyword = swift_keyword_member_name(node, kind);
+            if (!ts_node_is_null(keyword)) {
+                return keyword;
             }
         }
 
@@ -9094,6 +9117,11 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
         name_node = cbm_find_child_by_kind(node, "identifier");
     }
+    // Dart: a mixin's name is a plain identifier child; only a class has the field.
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_DART &&
+        strcmp(kind, "mixin_declaration") == 0) {
+        name_node = cbm_find_child_by_kind(node, "identifier");
+    }
     // ObjectScript UDL: class name is a `class_name` child (no "name" field).
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         name_node = cbm_find_child_by_kind(node, "class_name");
@@ -9484,6 +9512,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (strcmp(label, "Enum") == 0) {
         extract_enum_members(ctx, node, class_qn);
     }
+    if (ctx->language == CBM_LANG_SWIFT) {
+        extract_swift_enum_cases(ctx, node, class_qn);
+    }
 
     if (ctx->language == CBM_LANG_JAVA && strcmp(kind, "record_declaration") == 0) {
         extract_record_accessors(ctx, node, class_qn);
@@ -9496,10 +9527,15 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     // Extract typed struct/class fields (for cross-file LSP type resolution)
     int fields_from = ctx->result->defs.count;
     extract_class_fields(ctx, node, class_qn, spec);
-    fence_fields_named_like_methods(ctx, methods_from, fields_from);
+    fence_fields_named_like_methods(ctx, methods_from, fields_from, "Field");
 
     // Extract class-level variables (field declarations not already Fields)
+    int variables_from = ctx->result->defs.count;
     extract_class_variables(ctx, node, class_qn, spec, fields_from);
+    /* Swift: `var x` and `func x(y: Int)` can share a type, and now a qualified name. */
+    if (ctx->language == CBM_LANG_SWIFT) {
+        fence_fields_named_like_methods(ctx, methods_from, variables_from, "Variable");
+    }
 
     if (ctx->language == CBM_LANG_PYTHON) {
         extract_py_field_types(ctx, node, class_qn);
@@ -9821,6 +9857,14 @@ static TSNode resolve_dart_method_name(TSNode child, const char *ck) {
             }
             return cbm_find_child_by_kind(func_sig, "identifier");
         }
+        /* `int get x => 1;` and `set x(int v) {}`: both accessors of x, one node. */
+        TSNode accessor = cbm_find_child_by_kind(child, "getter_signature");
+        if (ts_node_is_null(accessor)) {
+            accessor = cbm_find_child_by_kind(child, "setter_signature");
+        }
+        if (!ts_node_is_null(accessor)) {
+            return cbm_find_child_by_kind(accessor, "identifier");
+        }
     }
     if (strcmp(ck, "function_signature") == 0) {
         return cbm_find_child_by_kind(child, "identifier");
@@ -9853,6 +9897,9 @@ static TSNode resolve_arrow_func_name(TSNode child) {
 
 // Try to extract method name from a node, with language-specific fallbacks.
 static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
+    if (lang == CBM_LANG_SWIFT && strcmp(ts_node_type(child), "subscript_declaration") == 0) {
+        return swift_keyword_member_name(child, "subscript_declaration");
+    }
     TSNode name_node = func_name_node(child);
     if (!ts_node_is_null(name_node)) {
         return name_node;
@@ -9896,6 +9943,12 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
         (strcmp(ck, "function_declaration") == 0 ||
          strcmp(ck, "protocol_function_declaration") == 0)) {
         return cbm_find_child_by_kind(child, "simple_identifier");
+    }
+    if (lang == CBM_LANG_SWIFT) {
+        TSNode keyword = swift_keyword_member_name(child, ck);
+        if (!ts_node_is_null(keyword)) {
+            return keyword;
+        }
     }
 
     // Squirrel: function_declaration's name is a plain `identifier` child.
@@ -10246,6 +10299,15 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
                     push_method_def(ctx, member, class_node, class_qn, spec, member_name);
             }
             continue;
+        }
+
+        // Dart keeps a member with no body in a `declaration`, a body's sibling
+        // being what marks the other kind. `T read(K key);` is a member all the same.
+        if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(child), "declaration") == 0) {
+            TSNode signature = cbm_find_child_by_kind(child, "function_signature");
+            if (!ts_node_is_null(signature)) {
+                child = signature;
+            }
         }
 
         // Squirrel wraps each class member in a member_declaration node; the
@@ -10943,7 +11005,8 @@ static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
     def.qualified_name =
-        (ctx->language == CBM_LANG_KOTLIN || ctx->language == CBM_LANG_SCALA) &&
+        (ctx->language == CBM_LANG_KOTLIN || ctx->language == CBM_LANG_SCALA ||
+         ctx->language == CBM_LANG_SWIFT) &&
                 ctx->var_parent_class
             ? cbm_arena_sprintf(a, "%s.%s", ctx->var_parent_class, qn_name ? qn_name : name)
             : cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name ? qn_name : name,
@@ -11200,6 +11263,42 @@ static void extract_c_enum_members(CBMExtractCtx *ctx, TSNode body,
 }
 
 /* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
+/* Swift: `case a, b(Int)` declares a and b; the grammar spells any enum a class_declaration. */
+static void extract_swift_enum_cases(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
+    TSNode body = find_class_body(node, ctx->language);
+    if (ts_node_is_null(body) || strcmp(ts_node_type(body), "enum_class_body") != 0) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode entry = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(entry), "enum_entry") != 0) {
+            continue;
+        }
+        uint32_t parts = ts_node_named_child_count(entry);
+        for (uint32_t p = 0; p < parts; p++) {
+            const char *field = ts_node_field_name_for_named_child(entry, p);
+            TSNode part = ts_node_named_child(entry, p);
+            char *name = field && strcmp(field, "name") == 0
+                             ? cbm_node_text(ctx->arena, part, ctx->source)
+                             : NULL;
+            if (!name || !name[0]) {
+                continue;
+            }
+            CBMDefinition def;
+            memset(&def, 0, sizeof(def));
+            def.name = name;
+            def.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
+            def.parent_class = class_qn;
+            def.label = "Variable";
+            def.file_path = ctx->rel_path;
+            def.start_line = ts_node_start_point(part).row + TS_LINE_OFFSET;
+            def.end_line = ts_node_end_point(part).row + TS_LINE_OFFSET;
+            cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+        }
+    }
+}
+
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
     TSNode body = find_class_body(node, ctx->language);
     if (ts_node_is_null(body)) {
@@ -13412,7 +13511,8 @@ static int cmp_cstr_ptr(const void *pa, const void *pb) {
 // renames, so every other field keeps its name. The body's methods are the
 // defs [methods_from, fields_from), its fields [fields_from, count); a sorted
 // copy of the method names keeps a large class linear-logarithmic.
-static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from) {
+static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from,
+                                            const char *label) {
     CBMDefinition *defs = ctx->result->defs.items;
     int fields_to = ctx->result->defs.count;
     if (fields_from >= fields_to || methods_from >= fields_from) {
@@ -13435,7 +13535,7 @@ static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from
     qsort(qns, n, sizeof(qns[0]), cmp_cstr_ptr);
     for (int i = fields_from; i < fields_to; i++) {
         const char *qn = defs[i].qualified_name;
-        if (qn && strcmp(defs[i].label, "Field") == 0 &&
+        if (qn && strcmp(defs[i].label, label) == 0 &&
             bsearch(&qn, qns, n, sizeof(qns[0]), cmp_cstr_ptr)) {
             char *fenced = cbm_arena_sprintf(ctx->arena, "%s#field", qn);
             if (fenced) {

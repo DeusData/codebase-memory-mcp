@@ -173,6 +173,8 @@ const cbm_source_decl_t *cbm_source_lookup(const cbm_source_walk_t *walk, const 
 const cbm_source_decl_t *cbm_source_lookup_in(const cbm_source_walk_t *walk, CBMLanguage language,
                                               const char *owner, const char *name);
 const char *cbm_source_table_package(const cbm_source_table_t *table, const char *name);
+const char *cbm_source_table_dart_package(const cbm_source_table_t *table, const char *file,
+                                          const char *name);
 
 /* Phase two. Later rows for the same exact site replace earlier ones. */
 void cbm_source_emit(cbm_source_walk_t *walk, uint32_t start, uint32_t end,

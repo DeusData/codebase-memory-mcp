@@ -2210,6 +2210,289 @@ static char *kotlin_parse_view(const char *source, uint32_t length) {
     return view;
 }
 
+static bool swift_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_' || c == '$';
+}
+
+static uint32_t swift_skip_blanks(const char *text, uint32_t at, uint32_t length) {
+    while (at < length && (text[at] == ' ' || text[at] == '\t'))
+        at++;
+    return at;
+}
+
+static bool swift_word(const char *text, uint32_t at, uint32_t length, const char *word) {
+    size_t size = strlen(word);
+    return (size_t)length - at >= size && !strncmp(text + at, word, size) &&
+           (at + size == length || !swift_ident_char(text[at + size]));
+}
+
+/* A contextual prefix stands before an operand on its line. `func f(copy x: Int)` has it
+ * as a parameter's label instead, and `copy = 1`, `copy.x` or `copy (x)` are plain names.
+ * Only a type can open with a bracket after such a word. */
+static bool swift_prefix_of_operand(const char *text, uint32_t at, uint32_t length, size_t size,
+                                    bool type_position) {
+    uint32_t next = swift_skip_blanks(text, at + (uint32_t)size, length);
+    if (next == at + size || next >= length)
+        return false;
+    if (type_position && (text[next] == '(' || text[next] == '['))
+        return true;
+    if (!swift_ident_char(text[next]))
+        return false;
+    while (next < length && swift_ident_char(text[next]))
+        next++;
+    next = swift_skip_blanks(text, next, length);
+    return next >= length || text[next] != ':';
+}
+
+/* The end of a `(...)` group opening at `open`, or 0. A parenthesis in a string does not count. */
+static uint32_t swift_group_end(const char *text, uint32_t open, uint32_t length) {
+    int depth = 0;
+    bool quoted = false;
+    for (uint32_t at = open; at < length; at++) {
+        char c = text[at];
+        if (quoted) {
+            at += c == '\\';
+            quoted = c != '"' && c != '\n';
+            continue;
+        }
+        quoted = c == '"';
+        depth += c == '(';
+        depth -= c == ')';
+        if (depth == 0)
+            return at + 1;
+    }
+    return 0;
+}
+
+static void swift_blank(char *view, uint32_t start, uint32_t end) {
+    for (uint32_t i = start; i < end; i++)
+        if (view[i] != '\n' && view[i] != '\r')
+            view[i] = ' ';
+}
+
+/* Conditional-compilation lines: every branch must parse on its own, which the language
+ * requires, so the branches stay and only the lines that delimit them go. A compile-time
+ * message says nothing about a name, and it can span lines. */
+static void swift_blank_directives(char *view, uint32_t length) {
+    static const char *const directives[] = {"#if", "#elseif", "#else", "#endif"};
+    static const char *const messages[] = {"#error", "#warning", "#sourceLocation"};
+    bool continues = false;
+    for (uint32_t at = 0; at < length;) {
+        const char *newline = memchr(view + at, '\n', length - at);
+        uint32_t end = newline ? (uint32_t)(newline - view) : length;
+        uint32_t word = swift_skip_blanks(view, at, end);
+        bool directive = continues && word + 1 < end &&
+                         (!strncmp(view + word, "&&", 2) || !strncmp(view + word, "||", 2));
+        for (size_t i = 0; !directive && i < sizeof(directives) / sizeof(directives[0]); i++)
+            directive = swift_word(view, word, end, directives[i]);
+        bool message = false;
+        for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); i++)
+            message |= swift_word(view, word, end, messages[i]);
+        if (message) {
+            uint32_t open = word;
+            while (open < end && view[open] != '(')
+                open++;
+            uint32_t close = open < end ? swift_group_end(view, open, length) : 0;
+            if (close) {
+                swift_blank(view, word, close);
+                const char *rest = memchr(view + close, '\n', length - close);
+                at = rest ? (uint32_t)(rest - view) + 1 : length;
+                continues = false;
+                continue;
+            }
+        }
+        continues = directive;
+        if (directive) {
+            /* `#if a ||` carries on below. */
+            uint32_t tail = end;
+            while (tail > word &&
+                   (view[tail - 1] == ' ' || view[tail - 1] == '\t' || view[tail - 1] == '\r'))
+                tail--;
+            bool open_ended = tail >= word + 2 && (!strncmp(view + tail - 2, "&&", 2) ||
+                                                   !strncmp(view + tail - 2, "||", 2));
+            swift_blank(view, at, end);
+            if (open_ended && end < length) {
+                uint32_t next = end + 1;
+                const char *after = memchr(view + next, '\n', length - next);
+                uint32_t stop = after ? (uint32_t)(after - view) : length;
+                swift_blank(view, next, stop);
+                end = stop;
+            }
+        }
+        at = end + 1;
+    }
+}
+
+/* Right after `try`, `try?` or `try!` on its line. */
+static bool swift_follows_try(const char *text, uint32_t at) {
+    uint32_t before = at;
+    while (before > 0 && (text[before - 1] == ' ' || text[before - 1] == '\t'))
+        before--;
+    if (before > 0 && (text[before - 1] == '?' || text[before - 1] == '!'))
+        before--;
+    return before >= 3 && !strncmp(text + before - 3, "try", 3) &&
+           (before == 3 || !swift_ident_char(text[before - 4]));
+}
+
+/* Forms newer than the grammar. Each only qualifies what stands beside it, so no name
+ * that lookup needs goes with it. A blank inside a comment or a string changes nothing. */
+static void swift_blank_new_forms(char *view, uint32_t length) {
+    for (uint32_t at = 0; at < length; at++) {
+        char first = view[at];
+        if (first != 'n' && first != 't' && first != 's' && first != 'i' && first != 'c' &&
+            first != 'd' && first != 'u' && first != 'a' && first != '#' && first != '@')
+            continue;
+        if (at > 0 && (swift_ident_char(view[at - 1]) || view[at - 1] == '.' ||
+                       view[at - 1] == '@' || view[at - 1] == '#'))
+            continue;
+        if (swift_word(view, at, length, "nonisolated") && view[at + 11] == '(') {
+            uint32_t end = swift_group_end(view, at + 11, length);
+            if (end)
+                swift_blank(view, at, end);
+        } else if (swift_word(view, at, length, "throws") && at + 6 < length &&
+                   view[at + 6] == '(') {
+            /* `do throws(E) {` has no bare form in the grammar either. */
+            uint32_t end = swift_group_end(view, at + 6, length);
+            uint32_t before = at;
+            while (before > 0 && (view[before - 1] == ' ' || view[before - 1] == '\t'))
+                before--;
+            bool after_do = before >= 2 && !strncmp(view + before - 2, "do", 2) &&
+                            (before == 2 || !swift_ident_char(view[before - 3]));
+            if (end)
+                swift_blank(view, after_do ? at : at + 6, end);
+        } else if ((swift_word(view, at, length, "sending") ||
+                    swift_word(view, at, length, "isolated")) &&
+                   swift_prefix_of_operand(view, at, length, view[at] == 's' ? 7 : 8, true)) {
+            memset(view + at, ' ', view[at] == 's' ? 7 : 8);
+        } else if (swift_word(view, at, length, "unsafe") &&
+                   swift_prefix_of_operand(view, at, length, 6, false)) {
+            memset(view + at, ' ', 6);
+        } else if (swift_word(view, at, length, "@_lifetime") && view[at + 10] == '(') {
+            uint32_t end = swift_group_end(view, at + 10, length);
+            if (end)
+                swift_blank(view, at, end);
+        } else if (swift_word(view, at, length, "consume") &&
+                   swift_prefix_of_operand(view, at, length, 7, false)) {
+            memset(view + at, ' ', 7);
+        } else if (swift_word(view, at, length, "copy") &&
+                   swift_prefix_of_operand(view, at, length, 4, false)) {
+            memset(view + at, ' ', 4);
+        } else if (swift_word(view, at, length, "await") &&
+                   swift_prefix_of_operand(view, at, length, 5, false) &&
+                   swift_follows_try(view, at)) {
+            /* `if let x = try await f() {` reads the brace as f's closure; `try f()` does not. */
+            memset(view + at, ' ', 5);
+        } else if (swift_word(view, at, length, "discard") &&
+                   swift_word(view, swift_skip_blanks(view, at + 7, length), length, "self")) {
+            memset(view + at, ' ', 7);
+        } else if (swift_word(view, at, length, "#isolation")) {
+            memcpy(view + at, "nil       ", 10);
+        } else if (swift_word(view, at, length, "#_sourceLocation")) {
+            memcpy(view + at, "nil             ", 16);
+        }
+    }
+}
+
+/* `()` as a value: the grammar wants a `!` in it and adds a zero-width one. The literal
+ * in its place is one expression too, and nothing reads the view's text. Returns whether
+ * the walk changed the view. */
+static bool swift_hide_unit_values(TSTree *tree, char *view) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+    bool changed = false;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_has_error(node) && strcmp(ts_node_type(node), "tuple_expression") == 0 &&
+            ts_node_named_child_count(node) == 1) {
+            TSNode only = ts_node_named_child(node, 0);
+            uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+            if (ts_node_start_byte(only) == ts_node_end_byte(only) && end >= start + 2 &&
+                view[start] == '(' && view[end - 1] == ')') {
+                view[start] = '0';
+                view[end - 1] = ' ';
+                changed = true;
+            }
+        }
+        if (ts_node_has_error(node) && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool done = false;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+        if (done)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return changed;
+}
+
+/* The bytes the grammar could not read, and each token it had to invent. */
+static uint64_t swift_parse_damage(TSTree *tree) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+    uint64_t damage = 0;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool broken = ts_node_is_error(node);
+        if (broken)
+            damage += ts_node_end_byte(node) - ts_node_start_byte(node) + 1;
+        else if (ts_node_is_missing(node))
+            damage++;
+        if (!broken && ts_node_has_error(node) && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool done = false;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+        if (done)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return damage;
+}
+
+/* Swift: the grammar reads `#if` only among statements and at file level, so one in a type
+ * body or a switch breaks the type open and every member of it is lost; and it wants a `!`
+ * inside a `()` value. Both are ordinary Swift. This view has the same length and the same
+ * lines, and only a file the grammar could not otherwise read uses it. A `()` shows up only
+ * once the bodies around it read, so that step runs on the view's own parse too. The second
+ * parse is the last: every `()` of a body that reads is in it. */
+static TSTree *swift_parse_repaired(TSParser *parser, const char *source, uint32_t source_len,
+                                    TSParseOptions opts, TSTree *tree) {
+    char *view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)source_len + 1);
+    if (!view)
+        return tree;
+    memcpy(view, source, source_len);
+    view[source_len] = '\0';
+    swift_blank_directives(view, source_len);
+    swift_blank_new_forms(view, source_len);
+    (void)swift_hide_unit_values(tree, view);
+    ts_parser_reset(parser);
+    TSTree *repaired = cbm_parse_source(parser, view, source_len, opts);
+    if (repaired && ts_node_has_error(ts_tree_root_node(repaired)) &&
+        swift_hide_unit_values(repaired, view)) {
+        ts_parser_reset(parser);
+        TSTree *again = cbm_parse_source(parser, view, source_len, opts);
+        if (again) {
+            ts_tree_delete(repaired);
+            repaired = again;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, view);
+    if (!repaired)
+        return tree;
+    if (swift_parse_damage(repaired) < swift_parse_damage(tree)) {
+        ts_tree_delete(tree);
+        return repaired;
+    }
+    ts_tree_delete(repaired);
+    return tree;
+}
+
 TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, const char *source,
                                       uint32_t source_len, TSParseOptions opts,
                                       TSTree **unrepaired) {
@@ -2229,9 +2512,12 @@ TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, co
             ts_tree_delete(declared);
         return tree;
     }
+    if (!tree || !ts_node_has_error(ts_tree_root_node(tree)))
+        return tree;
+    if (language == CBM_LANG_SWIFT)
+        return swift_parse_repaired(parser, source, source_len, opts, tree);
     bool rust = language == CBM_LANG_RUST, go = language == CBM_LANG_GO;
-    if (!tree || (language != CBM_LANG_CSHARP && !rust && !go) ||
-        !ts_node_has_error(ts_tree_root_node(tree)))
+    if (language != CBM_LANG_CSHARP && !rust && !go)
         return tree;
     bool hid_branch = false;
     char *view = rust ? rust_parse_view(source, source_len)

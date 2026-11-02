@@ -439,6 +439,24 @@ static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, 
         if (strcmp(ck, "simple_identifier") == 0 || strcmp(ck, "navigation_expression") == 0) {
             return cbm_node_text(a, callee, source);
         }
+        // `Box<Int>()` is the one form of a call whose callee is a written type.
+        if (strcmp(nk, "constructor_expression") == 0 && strcmp(ck, "user_type") == 0) {
+            char *written = cbm_node_text(a, callee, source);
+            char *arguments = written ? strchr(written, '<') : NULL;
+            if (arguments) {
+                *arguments = '\0';
+            }
+            return written;
+        }
+        // `.make()` names a member of the type its context states.
+        if (strcmp(ck, "prefix_expression") == 0 && ts_node_child_count(callee) > 0 &&
+            strcmp(ts_node_type(ts_node_child(callee, 0)), ".") == 0) {
+            TSNode member = ts_node_child_by_field_name(callee, TS_FIELD("target"));
+            if (!ts_node_is_null(member) &&
+                strcmp(ts_node_type(member), "simple_identifier") == 0) {
+                return cbm_node_text(a, member, source);
+            }
+        }
     }
     return NULL;
 }

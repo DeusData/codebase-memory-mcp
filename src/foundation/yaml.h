@@ -40,6 +40,11 @@ bool cbm_yaml_get_bool(const cbm_yaml_node_t *root, const char *path, bool defau
 int cbm_yaml_get_str_list(const cbm_yaml_node_t *root, const char *path, const char **out,
                           int max_out);
 
+/* The keys of the map at a path, in file order. Writes up to max_out pointers owned by the
+ * YAML tree and returns how many keys the map has, which can exceed max_out. */
+int cbm_yaml_get_map_keys(const cbm_yaml_node_t *root, const char *path, const char **out,
+                          int max_out);
+
 /* Check if a node at the given path exists. */
 bool cbm_yaml_has(const cbm_yaml_node_t *root, const char *path);
 

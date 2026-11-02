@@ -96,12 +96,16 @@ static const edge_row_t edge_rows[] = {
      "Cargo crates, workspace [patch.crates-io] directories, module trees, use trees, re-exports "
      "and globs; items a macro's definition passes through count as items. Other macro-generated "
      "items and unmodeled receiver types abstain."},
-    {CBM_LANG_SWIFT, EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
-     "Modules from SwiftPM targets; lexical scope, extensions, inheritance and argument labels; "
-     "declared and constructed receiver types. Xcode module membership abstains."},
+    {CBM_LANG_SWIFT, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
+     "Modules from SwiftPM targets, and an import of one within its package reaches its directory; "
+     "lexical scope, "
+     "extensions, inheritance, argument labels and "
+     "the parameter types that tell overloads apart; declared, constructed and closure-signature "
+     "receiver types; `.foo` in a stated context. Xcode module membership abstains."},
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
-     "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the pubspec "
-     "name; declared and constructed receiver types along class, mixin and superclass chains. "
+     "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the governing "
+     "pubspec's own name and path dependencies; declared and constructed receiver types, and "
+     "class type arguments fixed in extends clauses, along class, mixin and superclass chains. "
      "Collection element types, conditional imports and part-of by library name abstain."},
     {CBM_LANG_LUA, EDGE(CALLS), NULL},
     {CBM_LANG_CSS, EDGE(IMPORTS),
@@ -336,8 +340,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_TYPE_FLOW;
         out->limitation =
             "Namespace, use and global-fallback name resolution; class chains through declared "
-            "parameter, property and return types and consistent local assignment. A chain "
-            "leaving the project, magic members, PHPDoc types and reference effects abstain.";
+            "parameter, property and function or method return types and consistent local "
+            "assignment. A chain leaving the project, magic members, PHPDoc types and reference "
+            "effects abstain.";
         break;
     case CBM_LANG_ELIXIR:
         out->adapter = "elixir_source";
@@ -463,9 +468,10 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->adapter = "dart_source";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
-        out->limitation = "Lexical scope, parts, exports and prefixes; declared and constructed "
-                          "receiver types; collection element types and conditional imports "
-                          "abstain.";
+        out->limitation =
+            "Lexical scope, parts, exports and prefixes; declared and constructed "
+            "receiver types with class type arguments fixed by subclasses; collection "
+            "element types and conditional imports abstain.";
         break;
     case CBM_LANG_LUA:
         out->adapter = "lua_source";
@@ -493,8 +499,8 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
         out->limitation = "Modules from SwiftPM targets; outside those, a file decides only for "
-                          "itself. Implicit member expressions and collection element types "
-                          "abstain.";
+                          "itself. Implicit members with no stated context and collection element "
+                          "types abstain.";
         break;
     default:
         break;

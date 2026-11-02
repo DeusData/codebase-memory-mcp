@@ -2293,30 +2293,23 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
         ASSERT(!file->has_error && !file->parse_incomplete && !file->parse_unusable);
         ASSERT_EQ(file->imports.count, 1);
         ASSERT_STR_EQ(file->imports.items[0].module_path, raw_paths[i]);
-        if (i)
+        /* A direct import and a direct export name their file; a conditional URI and an escape
+         * do not say which file. */
+        if (i == 1 || i == 3)
             ASSERT_EQ(file->imports.items[0].kind, CBM_IMPORT_KIND_DEFAULT);
         cbm_free_result(file);
     }
     static const RQ_Expected expected[] = {
-        {.case_id = "dart-export-dependency-remains-a-counted-gap",
+        {.case_id = "dart-export-names-its-file",
          .site = {.file = "exported.dart",
                   .caller = "exported.dart.__file__",
-                  .needle = "export './stub.dart';"},
+                  .needle = "'./stub.dart'"},
          .relation = "IMPORTS",
          .target = {.file = "stub.dart",
                     .suffix = "stub.dart.__file__",
                     .label = "File",
                     .declaration_line = 1,
-                    .declaration_text = "int value = 1;"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "dart-export-dependency-proof-missing",
-         .why = "The exported library is a genuine dependency, but the audited "
-                "adapter covers "
-                "direct imports only; export namespace and occurrence proofs "
-                "remain absent.",
-         .tried = "Preserved the export carrier and exact physical file. A "
-                  "descendant string "
-                  "must not borrow the direct-import proof."},
+                    .declaration_text = "int value = 1;"}},
         {.case_id = "dart-escaped-uri-dependency-remains-a-counted-gap",
          .site = {.file = "escaped.dart",
                   .caller = "escaped.dart.__file__",
@@ -2386,7 +2379,7 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
              rq_check(store, "dart-uri", "dart-import-uri-proof", sources,
                       sizeof(sources) / sizeof(sources[0]), expected,
                       sizeof(expected) / sizeof(expected[0]), &forbidden, 1, &report, stderr) &&
-             report.genuine == 3 && report.found == 1 && report.missing == 2 &&
+             report.genuine == 3 && report.found == 2 && report.missing == 1 &&
              !report.required_missing && !report.wrong && ok;
         if (store) {
             /* The required direct IMPORTS control now carries the URI literal's exact
@@ -2410,12 +2403,12 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
                                       "project='dart-uri' "
                                       "AND relation='IMPORTS' AND emitted=0 AND target='' "
                                       "AND file_path IN "
-                                      "('conditional.dart','exported.dart','escaped.dart')") == 3 &&
+                                      "('conditional.dart','escaped.dart')") == 2 &&
                  ok;
             ok = generic_count(store,
                                "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
                                "WHERE e.type='IMPORTS' AND s.file_path IN "
-                               "('conditional.dart','exported.dart','escaped.dart')") == 0 &&
+                               "('conditional.dart','escaped.dart')") == 0 &&
                  ok;
             cbm_store_close(store);
         }

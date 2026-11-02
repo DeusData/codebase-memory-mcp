@@ -81,6 +81,43 @@ const char *cbm_source_table_package(const cbm_source_table_t *table, const char
     return table && table->packages && name ? cbm_ht_get(table->packages, name) : NULL;
 }
 
+const char *cbm_source_dart_package_lib(const CBMHashTable *packages, const char *file,
+                                        const char *name) {
+    enum { DART_KEY_MAX = 4096 };
+    if (!packages || !name)
+        return NULL;
+    char key[DART_KEY_MAX], dir[DART_KEY_MAX];
+    const char *slash = file ? strrchr(file, '/') : NULL;
+    size_t length = slash ? (size_t)(slash - file) : 0;
+    /* One hash lookup per directory above the file: bounded by the path's depth. */
+    while (file && length < sizeof(dir)) {
+        memcpy(dir, file, length);
+        dir[length] = '\0';
+        int written = snprintf(key, sizeof(key), "@cbm:raw:dart-pubspec:%s", dir);
+        if (written > 0 && (size_t)written < sizeof(key) && cbm_ht_get(packages, key)) {
+            written = snprintf(key, sizeof(key), "@cbm:raw:dart-dep:%s\x1f%s", dir, name);
+            const char *own =
+                written > 0 && (size_t)written < sizeof(key) ? cbm_ht_get(packages, key) : NULL;
+            if (own)
+                return own;
+            break;
+        }
+        if (!length)
+            break;
+        const char *up = strrchr(dir, '/');
+        length = up ? (size_t)(up - dir) : 0;
+    }
+    int written = snprintf(key, sizeof(key), "@cbm:raw:dart:%s", name);
+    const char *any =
+        written > 0 && (size_t)written < sizeof(key) ? cbm_ht_get(packages, key) : NULL;
+    return any && strncmp(any, "@cbm:", 5) ? any : NULL;
+}
+
+const char *cbm_source_table_dart_package(const cbm_source_table_t *table, const char *file,
+                                          const char *name) {
+    return table ? cbm_source_dart_package_lib(table->packages, file, name) : NULL;
+}
+
 cbm_source_table_t *cbm_source_table_new(void) {
     cbm_source_table_t *table = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*table));
     if (!table)
@@ -422,8 +459,10 @@ static TSTree *parse_source(const CBMFileResult *result, CBMLanguage language, c
     if (!parser)
         return NULL;
     TSTree *tree = NULL;
+    /* The extraction's own parse, so a parked result reads the tree a retained one had. */
     if (ts_parser_set_language(parser, cbm_ts_language(language)))
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source_repairing(parser, language, source, (uint32_t)source_len,
+                                          (TSParseOptions){0});
     ts_parser_delete(parser);
     *owned = tree;
     return tree;

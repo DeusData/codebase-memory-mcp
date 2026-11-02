@@ -55,6 +55,12 @@ bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
                         CBMLanguage language, const char *file, const char *source,
                         size_t source_len);
 bool cbm_source_table_incomplete(const cbm_source_table_t *table, CBMLanguage language);
+/* The lib directory `package:name/` means in this repository-relative file. The nearest
+ * pubspec above the file decides first: its own name and its `path:` dependencies. Any
+ * other name goes to the one package in the repository that has it. NULL: no such package,
+ * or several and nothing that tells them apart. */
+const char *cbm_source_dart_package_lib(const CBMHashTable *packages, const char *file,
+                                        const char *name);
 
 /* The QN of a declared type's base class by this language's rules, for the graph's
  * inheritance edges. offset counts the bases this language's rules can name; NULL means
