@@ -26,6 +26,7 @@
 #include <foundation/platform.h>
 #include <foundation/private_file_lock.h>
 #include <foundation/sha256.h>
+#include <foundation/str_util.h>
 #include <mcp/mcp.h>
 #include <mcp/index_supervisor.h>
 #include <pipeline/pipeline.h>
@@ -10944,6 +10945,96 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
         FAIL("the indexed main checkout must still resolve in the same matrix");
     PASS();
 }
+
+/* With ignore_worktrees unset, the lifecycle hook must do what it did before
+ * the key existed. It may read the key, but it must not create a runtime
+ * config store just to find the key unset, and it must not canonicalize the
+ * cwd or probe for a linked worktree. Turning the key on is the positive
+ * control: the same call then reaches the worktree gate exactly once. */
+TEST(cli_hook_ignore_worktrees_default_off_does_no_worktree_work) {
+    char tmpdir[256];
+    char *raw = th_mktempdir("cbm_hook_wt_off");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
+    snprintf(tmpdir, sizeof(tmpdir), "%s", raw);
+    char cache[512];
+    char maindir[512];
+    char wtdir[512];
+    char store_path[600];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(maindir, sizeof(maindir), "%s/checkout-main", tmpdir);
+    snprintf(wtdir, sizeof(wtdir), "%s/checkout-side", tmpdir);
+    snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache);
+    test_mkdirp(cache);
+    test_mkdirp(maindir);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "cd \"%s\" && git init -q && git config user.email t@t && git config user.name t && "
+             ": > f.txt && git add f.txt && git commit -qm init && "
+             "git worktree add -q \"%s\" -b wtoff",
+             maindir, wtdir);
+    if (system(cmd) != 0) {
+        th_rmtree(tmpdir);
+        SKIP_PLATFORM("git worktree add unavailable");
+    }
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
+    struct stat st;
+    int gate_calls = 0;
+    cbm_hook_set_worktree_gate_counter_for_testing(&gate_calls);
+    bool store_absent_before = stat(store_path, &st) != 0;
+    char *off_out = cbm_hook_augment_lifecycle_json(input);
+    bool off_note = off_out && strstr(off_out, "Run index_repository") &&
+                    !strstr(off_out, "ignore_worktrees is enabled");
+    free(off_out);
+    bool store_absent_after = stat(store_path, &st) != 0;
+    int off_gate_calls = gate_calls;
+
+    /* A store that leaves the key unset may be read for the key, nothing more. */
+    cbm_config_t *cfg = cbm_config_open(cache);
+    bool other_key_set = cfg && cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "true") == 0;
+    cbm_config_close(cfg);
+    gate_calls = 0;
+    char *unset_out = other_key_set ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool unset_note = unset_out && strstr(unset_out, "Run index_repository") &&
+                      !strstr(unset_out, "ignore_worktrees is enabled");
+    free(unset_out);
+    int unset_gate_calls = gate_calls;
+
+    cfg = cbm_config_open(cache);
+    bool enabled = cfg && cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(cfg);
+    gate_calls = 0;
+    char *on_out = enabled ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool on_note = on_out && strstr(on_out, "ignore_worktrees is enabled");
+    free(on_out);
+    int on_gate_calls = gate_calls;
+    cbm_hook_set_worktree_gate_counter_for_testing(NULL);
+
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
+             maindir, wtdir);
+    (void)system(cmd);
+    th_rmtree(tmpdir);
+
+    ASSERT_TRUE(store_absent_before);
+    ASSERT_TRUE(off_note);
+    if (!store_absent_after)
+        FAIL("a default-off lifecycle event must not create the runtime config store");
+    ASSERT_EQ(off_gate_calls, 0);
+    ASSERT_TRUE(other_key_set);
+    ASSERT_TRUE(unset_note);
+    ASSERT_EQ(unset_gate_calls, 0);
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(on_note);
+    ASSERT_EQ(on_gate_calls, 1);
+    PASS();
+}
 #endif
 
 TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
@@ -16975,6 +17066,7 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(cli_hook_worktree_cwd_resolves_own_indexed_project);
     RUN_TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent);
+    RUN_TEST(cli_hook_ignore_worktrees_default_off_does_no_worktree_work);
 #endif
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);

@@ -17,6 +17,7 @@
  */
 
 #include "cli/cli.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/mem.h"
@@ -1002,6 +1003,10 @@ static char *ha_resolve_indexed_project_with_root(cbm_mcp_server_t *srv, const c
     return ha_registry_project_for_path(srv, cwd, root_out, root_out_size);
 }
 
+static char *ha_resolve_indexed_project(cbm_mcp_server_t *srv, const char *cwd) {
+    return ha_resolve_indexed_project_with_root(srv, cwd, NULL, 0U);
+}
+
 static const char *ha_hook_event_name(yyjson_val *root) {
     const char *event = ha_obj_str(root, "hook_event_name");
     return event ? event : ha_obj_str(root, "hookEventName");
@@ -1459,6 +1464,41 @@ static bool ha_invocation_supported(ha_lifecycle_dialect_t dialect, const char *
     return !forced_event || ha_dialect_event_supported(dialect, forced_event);
 }
 
+#ifdef CBM_CLI_ENABLE_TEST_API
+static CBM_TLS int *g_ha_worktree_gate_counter = NULL;
+#endif
+
+/* Project resolution once ignore_worktrees is on; the caller runs this only
+ * after reading the key, so the default path does none of it. A symlink alias
+ * has no .git of its own, and walking its lexical parents leaves the linked
+ * worktree. index_repository canonicalizes before the same gate, so the hook
+ * must too or it tells the agent to index a path the setting will refuse. The
+ * setting refuses a linked worktree even when it sits inside an indexed
+ * checkout or inside another linked worktree, so a match is kept only when its
+ * root belongs to this cwd's own linked worktree, not a parent graph. */
+static char *ha_resolve_project_ignoring_worktrees(cbm_mcp_server_t *srv, const char *cwd,
+                                                   bool *drop_ancestor, bool *worktree_ignored) {
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_ha_worktree_gate_counter) {
+        (*g_ha_worktree_gate_counter)++;
+    }
+#endif
+    char canonical_cwd[4096];
+    if (ha_canonical_path(cwd, canonical_cwd, sizeof(canonical_cwd))) {
+        cwd = canonical_cwd;
+    }
+    char project_root[4096];
+    project_root[0] = '\0';
+    char *project =
+        ha_resolve_indexed_project_with_root(srv, cwd, project_root, sizeof(project_root));
+    bool linked = cbm_git_is_linked_worktree(cwd);
+    /* Drop a parent graph without a second free(): this file's raw free count
+     * is ratcheted, and the caller's single free(project) still releases it. */
+    *drop_ancestor = linked && project && !cbm_git_same_linked_worktree(cwd, project_root);
+    *worktree_ignored = linked && (!project || *drop_ancestor);
+    return project;
+}
+
 static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root,
                                          const char *forced_event, ha_lifecycle_dialect_t dialect) {
     if (!root || !yyjson_is_obj(root)) {
@@ -1471,47 +1511,24 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
 
     char cwd_buffer[4096];
     cbm_mcp_server_t *owned_server = NULL;
-    cbm_config_t *owned_config = NULL;
     if (!srv) {
         owned_server = cbm_mcp_server_new(NULL);
         srv = owned_server;
     }
-    /* cbm_mcp_server_new(NULL) does not attach the runtime store. The production
-     * hook uses that constructor, so ignore_worktrees would stay at its default
-     * (off) and the "not indexed" note would still tell the agent to run
-     * index_repository in a linked worktree the setting refuses. Load the store
-     * only when the caller has not already set one, then drop it before return
-     * so a caller-owned server is not left pointing at a closed config. */
-    if (srv) {
-        owned_config = cbm_mcp_server_attach_runtime_config(srv);
-    }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
-    /* A symlink alias has no .git of its own, and walking its lexical parents
-     * leaves the linked worktree. index_repository canonicalizes before the
-     * same gate, so the hook must too or it tells the agent to index a path
-     * the setting will refuse. */
-    char canonical_cwd[4096];
-    if (cwd && ha_canonical_path(cwd, canonical_cwd, sizeof(canonical_cwd))) {
-        cwd = canonical_cwd;
-    }
-    char project_root[4096];
-    project_root[0] = '\0';
-    char *project = srv && cwd ? ha_resolve_indexed_project_with_root(srv, cwd, project_root,
-                                                                      sizeof(project_root))
-                               : NULL;
-    /* ignore_worktrees refuses a linked worktree, including one nested inside an
-     * indexed checkout or inside another linked worktree. Keep a match only when
-     * its root belongs to this cwd's own linked worktree, not a parent graph. */
-    bool ignore_linked =
-        srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) && cbm_git_is_linked_worktree(cwd);
-    /* Drop a parent graph without a second free(): this file's raw free count
-     * is ratcheted, and the single free(project) below still releases it. */
-    bool drop_ancestor =
-        ignore_linked && project && !cbm_git_same_linked_worktree(cwd, project_root);
-    bool worktree_ignored = ignore_linked && (!project || drop_ancestor);
-    if (owned_config) {
-        cbm_mcp_server_set_config(srv, NULL);
-        cbm_config_close(owned_config);
+    /* Read ignore_worktrees first and do nothing else for it while it is off.
+     * cbm_mcp_server_new(NULL) has no store, and srv may be the daemon's
+     * session server, so the read leaves srv untouched (see
+     * cbm_mcp_ignore_worktrees_runtime_enabled). Off, this is the resolution
+     * the hook did before the key existed. */
+    bool drop_ancestor = false;
+    bool worktree_ignored = false;
+    char *project = NULL;
+    if (srv && cwd && cbm_mcp_ignore_worktrees_runtime_enabled(srv)) {
+        project =
+            ha_resolve_project_ignoring_worktrees(srv, cwd, &drop_ancestor, &worktree_ignored);
+    } else {
+        project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
     }
     cbm_mcp_server_free(owned_server);
 
@@ -1668,6 +1685,10 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event,
                                                            bool worktree_ignored) {
     return ha_no_project_index_guidance(event, worktree_ignored);
+}
+
+void cbm_hook_set_worktree_gate_counter_for_testing(int *counter) {
+    g_ha_worktree_gate_counter = counter;
 }
 
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz) {

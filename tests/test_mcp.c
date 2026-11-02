@@ -10,6 +10,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
 #include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
+#include "../src/foundation/str_util.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
 #include "../src/mcp/compact_out.h"
@@ -1202,37 +1203,53 @@ TEST(mcp_initialize_response) {
     PASS();
 }
 
-TEST(mcp_attach_runtime_config_respects_caller_ownership) {
-    char *cache = th_mktempdir("cbm_mcp_runtime_config");
-    ASSERT_NOT_NULL(cache);
+/* The lifecycle hook reads ignore_worktrees through this reader. It must never
+ * attach a store to the server (the daemon lends its session server) and never
+ * create the runtime store; a server with its own store answers from it. */
+TEST(mcp_ignore_worktrees_runtime_read_leaves_server_and_store_alone) {
+    char *raw = th_mktempdir("cbm_mcp_runtime_config");
+    ASSERT_NOT_NULL(raw);
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", raw);
+    char own_dir[320];
+    snprintf(own_dir, sizeof(own_dir), "%s/own", cache);
+    char store_path[400];
+    snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache);
     const char *saved = getenv("CBM_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
-    cbm_config_t *config = cbm_config_open(cache);
     cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
-    bool stored = config && cbm_config_set(config, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
-    bool default_off = server && !cbm_mcp_ignore_worktrees_enabled(server);
-    cbm_config_t *attached = server ? cbm_mcp_server_attach_runtime_config(server) : NULL;
-    bool enabled = attached && cbm_mcp_ignore_worktrees_enabled(server);
-    bool not_replaced = server && cbm_mcp_server_attach_runtime_config(server) == NULL;
-    if (server) {
-        cbm_mcp_server_set_config(server, config);
+    struct stat st;
+    bool absent_off = server && !cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    bool still_absent = stat(store_path, &st) != 0;
+
+    cbm_config_t *runtime = cbm_config_open(cache);
+    bool stored = runtime && cbm_config_set(runtime, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(runtime);
+    bool runtime_on = server && cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    bool server_untouched = server && !cbm_mcp_ignore_worktrees_enabled(server);
+
+    cbm_config_t *own = cbm_config_open(own_dir);
+    if (server && own) {
+        cbm_mcp_server_set_config(server, own);
     }
-    cbm_config_close(attached);
-    bool caller_config_kept = server && cbm_mcp_server_attach_runtime_config(server) == NULL &&
-                              cbm_mcp_ignore_worktrees_enabled(server);
+    bool own_store_wins = server && own && !cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    if (server) {
+        cbm_mcp_server_set_config(server, NULL);
+    }
     cbm_mcp_server_free(server);
-    cbm_config_close(config);
+    cbm_config_close(own);
     restore_cache_dir(saved_copy);
     free(saved_copy);
     int removed = th_rmtree(cache);
 
+    ASSERT(absent_off);
+    ASSERT(still_absent);
     ASSERT(stored);
-    ASSERT(default_off);
-    ASSERT(enabled);
-    ASSERT(not_replaced);
-    ASSERT(caller_config_kept);
+    ASSERT(runtime_on);
+    ASSERT(server_untouched);
+    ASSERT(own_store_wins);
     ASSERT_EQ(removed, 0);
     PASS();
 }
@@ -21182,7 +21199,7 @@ SUITE(mcp) {
 
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
-    RUN_TEST(mcp_attach_runtime_config_respects_caller_ownership);
+    RUN_TEST(mcp_ignore_worktrees_runtime_read_leaves_server_and_store_alone);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_help_list_matches_registry);
     RUN_TEST(mcp_tools_list_latest_metadata);

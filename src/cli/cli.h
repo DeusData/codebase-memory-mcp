@@ -264,6 +264,9 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event,
                                                            bool worktree_ignored);
+/* Counts lifecycle calls that reached the ignore_worktrees resolution (cwd
+ * canonicalization and the linked-worktree probe). NULL stops counting. */
+void cbm_hook_set_worktree_gate_counter_for_testing(int *counter);
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);

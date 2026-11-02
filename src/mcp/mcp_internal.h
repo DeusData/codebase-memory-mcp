@@ -68,6 +68,11 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
  * automatic index of a linked worktree should be skipped. */
 bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv);
 
+/* The same key when srv may have no store (the lifecycle hook). Never attaches
+ * a store to srv and never creates the runtime store; reads it only when it
+ * already exists. */
+bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv);
+
 /* detect_changes seed scoping (#1363): does `node`'s line range overlap any
  * recorded hunk for `file`? Exposed for direct unit testing of the overlap
  * logic, independent of the git/subprocess/index plumbing around it. */

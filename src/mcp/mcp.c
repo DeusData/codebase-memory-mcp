@@ -1849,17 +1849,6 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
-struct cbm_config *cbm_mcp_server_attach_runtime_config(cbm_mcp_server_t *srv) {
-    if (!srv || srv->config) {
-        return NULL;
-    }
-    cbm_config_t *config = cbm_config_open(cbm_resolve_cache_dir());
-    if (config) {
-        cbm_mcp_server_set_config(srv, config);
-    }
-    return config;
-}
-
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
                                                    cbm_mcp_auto_index_count_test_hook_fn hook,
@@ -17926,6 +17915,33 @@ bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv) {
         return false; /* default off */
     }
     return cbm_config_get_bool(srv->config, CBM_CONFIG_IGNORE_WORKTREES, false);
+}
+
+/* The same key for a caller whose server may have no store: the stand-alone
+ * lifecycle hook builds one with cbm_mcp_server_new(NULL), and the daemon lends
+ * its session server, which this must not modify. A server with a store answers
+ * from it. Otherwise the runtime store is opened only to read this key, and only
+ * when it exists: a missing store leaves every key at its default, so this read
+ * never creates one. */
+bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv) {
+    if (srv && srv->config) {
+        return cbm_mcp_ignore_worktrees_enabled(srv);
+    }
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return false;
+    }
+    char store_path[CBM_SZ_4K];
+    int written = snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
+    cbm_path_info_t info;
+    if (written < 0 || (size_t)written >= sizeof(store_path) ||
+        cbm_path_info_utf8(store_path, &info) != CBM_PATH_INFO_OK || !info.is_regular) {
+        return false;
+    }
+    cbm_config_t *config = cbm_config_open(cache_dir);
+    bool enabled = config && cbm_config_get_bool(config, CBM_CONFIG_IGNORE_WORKTREES, false);
+    cbm_config_close(config);
+    return enabled;
 }
 
 /* Register the session project with the background watcher for ongoing
