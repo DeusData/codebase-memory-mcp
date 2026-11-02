@@ -91,6 +91,9 @@ bool cbm_resolve_types_declare(CBMResolveTypeMap *map, CBMScope *scope, const ch
 bool cbm_resolve_types_assign(CBMResolveTypeMap *map, CBMScope *scope, const char *name,
                               uint32_t at, const CBMType *type, cbm_resolve_type_origin_t origin,
                               const cbm_resolve_result_t *evidence);
+/* Where the current fact of this exact binding in this exact scope starts, 0 with none. */
+uint32_t cbm_resolve_types_valid_from(CBMResolveTypeMap *map, const CBMScope *scope,
+                                      const char *name);
 cbm_resolve_type_fact_t cbm_resolve_types_lookup(CBMResolveTypeMap *map, const CBMScope *scope,
                                                  const char *name, uint32_t at);
 

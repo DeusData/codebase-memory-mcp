@@ -297,8 +297,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
         out->limitation = "Exact visibility and owner proofs; overloads of one parameter count "
-                          "with separate nodes, templates, ADL with a second visible function "
-                          "and callable-field selection abstain.";
+                          "with separate nodes, a template's dependent names, specialized class "
+                          "templates, ADL with a second visible function, callable-field "
+                          "selection and what only some definitions of a macro name abstain.";
         break;
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:

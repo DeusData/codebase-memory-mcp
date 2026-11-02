@@ -455,6 +455,13 @@ bool cbm_resolve_types_assign(CBMResolveTypeMap *map, CBMScope *scope, const cha
     return owner && cbm_resolve_types_declare(map, owner, name, at, type, origin, evidence);
 }
 
+uint32_t cbm_resolve_types_valid_from(CBMResolveTypeMap *map, const CBMScope *scope,
+                                      const char *name) {
+    const CBMVarBinding *binding = scope && name ? cbm_scope_lookup_local(scope, name) : NULL;
+    cbm_resolve_type_slot_t *slot = binding ? find_slot(map, binding) : NULL;
+    return slot && slot->fact.binding ? slot->fact.valid_from : 0;
+}
+
 cbm_resolve_type_fact_t cbm_resolve_types_lookup(CBMResolveTypeMap *map, const CBMScope *scope,
                                                  const char *name, uint32_t at) {
     if (!type_step(map)) {

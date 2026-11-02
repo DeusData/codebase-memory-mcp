@@ -106,6 +106,9 @@ typedef struct {
      * node for them, with each branch's span as a variant, so an edge to or from
      * that node is true of the configurations it was found in. */
     bool c_variants;
+    /* `typedef struct X X;` in x.h and `struct X {...}` in x.c share a module and so a QN, and
+     * denote one type wherever each is written. The graph's node for them is that type. */
+    bool c_one_type, c_self_alias;
     bool one_name;
 } target_proof_t;
 
@@ -444,6 +447,29 @@ static bool python_accessor_definition(const CBMDefinition *definition) {
     return false;
 }
 
+static bool c_family_language(CBMLanguage language) {
+    return language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
+}
+
+/* `typedef struct X X;`: the name means the tag of that name and nothing else. */
+static bool c_self_alias_definition(const CBMDefinition *definition) {
+    return definition->alias_target && definition->name &&
+           !strcmp(definition->alias_target, definition->name);
+}
+
+static bool add_target_file(cbm_shared_resolver_t *resolver, target_proof_t *target,
+                            const char *file) {
+    if (target_declared_in(target, file))
+        return true;
+    target_file_t *other = cbm_arena_calloc(&resolver->arena, sizeof(*other));
+    const char *copy = cbm_arena_strdup(&resolver->arena, file);
+    if (!other || !copy)
+        return false;
+    *other = (target_file_t){.file = copy, .next = target->other_files};
+    target->other_files = other;
+    return true;
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
                        const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
@@ -479,9 +505,23 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
             return true;
         }
         prior->cross_file |= !same_file;
-        if (same_owner &&
-            (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA)) {
+        if (same_owner && c_family_language(language)) {
             prior->c_variants = true;
+            return true;
+        }
+        if (c_family_language(language) && !prior->ambiguous &&
+            cbm_label_is_type_like(prior->label) && cbm_label_is_type_like(definition->label) &&
+            (prior->c_self_alias || c_self_alias_definition(definition))) {
+            prior->c_one_type = true;
+            return add_target_file(resolver, prior, file);
+        }
+        /* `static struct config {...} config;` and `struct asmManager *asmManager;` beside its
+         * tag declare a tag and an object of one spelling. C keeps those apart, this graph holds
+         * one node, and either name in that file selects it. */
+        if (c_family_language(language) && same_file && !prior->ambiguous &&
+            ((cbm_label_is_type_like(prior->label) && !strcmp(definition->label, "Variable")) ||
+             (cbm_label_is_type_like(definition->label) && !strcmp(prior->label, "Variable")))) {
+            prior->one_name = true;
             return true;
         }
         /* Clauses of one function are one declaration wherever the QN carries
@@ -500,14 +540,8 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         prior->one_name |= one_name;
         prior->mixed_kinds |= strcmp(prior->label, definition->label) != 0;
         prior->rebound |= !declarations_coexist(language);
-        if (!target_declared_in(prior, file)) {
-            target_file_t *other = cbm_arena_calloc(&resolver->arena, sizeof(*other));
-            const char *copy = cbm_arena_strdup(&resolver->arena, file);
-            if (!other || !copy)
-                return false;
-            *other = (target_file_t){.file = copy, .next = prior->other_files};
-            prior->other_files = other;
-        }
+        if (!add_target_file(resolver, prior, file))
+            return false;
         if (prior->declarations == 1 && same_owner) {
             prior->second_start_line = definition->start_line;
             prior->second_end_line = definition->end_line;
@@ -528,6 +562,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     entry->signature_only = definition->is_abstract;
     entry->rebound = !declarations_coexist(language);
     entry->rust = language == CBM_LANG_RUST;
+    entry->c_self_alias = c_family_language(language) && c_self_alias_definition(definition);
     if (!entry->file || !entry->label)
         return false;
     cbm_ht_set(resolver->targets, key, entry);
@@ -698,6 +733,8 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         return false;
     if (proof->rust)
         return !proof->ambiguous && !strcmp(proof->file, node->file_path);
+    if (proof->c_one_type && !proof->ambiguous)
+        return target_declared_in(proof, node->file_path);
     /* Several declarations of one kind sharing a QN are one identity in this graph: one
      * node whose `variants` keep every span and whose edges are the union of every body
      * (graph_buffer.c, "Definition variants"). Rust `impl From<A> for E` beside
@@ -3297,6 +3334,18 @@ static bool same_target(const CBMResolvedCall *a, const CBMResolvedCall *b) {
            strcmp(a->callee_sig ? a->callee_sig : "", b->callee_sig ? b->callee_sig : "") == 0;
 }
 
+/* Legacy strategy/confidence rows are not semantic authority. A
+ * supported generic adapter may independently prove the occurrence. */
+static bool semantic_row_admissible(const CBMResolvedCall *row) {
+    uint32_t required = cbm_resolve_rule_required_facts(row->evidence.rule);
+    return row->site_end_byte > row->site_start_byte &&
+           row->source_origin <= CBM_SOURCE_ORIGIN_PREPROCESSED && row->callee_qn &&
+           row->callee_qn[0] && required && row->evidence.proof &&
+           row->evidence.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE &&
+           (row->evidence.facts & (required | CBM_RESOLVE_FACT_OCCURRENCE_EXACT)) ==
+               (required | CBM_RESOLVE_FACT_OCCURRENCE_EXACT);
+}
+
 static bool index_semantics(file_resolver_t *resolver) {
     const CBMResolvedCallArray *rows = &resolver->file->result->resolved_calls;
     if (rows->count <= 0)
@@ -3309,15 +3358,7 @@ static bool index_semantics(file_resolver_t *resolver) {
         return false;
     for (int r = 0; r < rows->count; r++) {
         const CBMResolvedCall *row = &rows->items[r];
-        /* Legacy strategy/confidence rows are not semantic authority. A
-         * supported generic adapter may independently prove the occurrence. */
-        uint32_t required = cbm_resolve_rule_required_facts(row->evidence.rule);
-        if (row->site_end_byte <= row->site_start_byte ||
-            row->source_origin > CBM_SOURCE_ORIGIN_PREPROCESSED || !row->callee_qn ||
-            !row->callee_qn[0] || !required || !row->evidence.proof ||
-            row->evidence.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
-            (row->evidence.facts & (required | CBM_RESOLVE_FACT_OCCURRENCE_EXACT)) !=
-                (required | CBM_RESOLVE_FACT_OCCURRENCE_EXACT))
+        if (!semantic_row_admissible(row))
             continue;
         resolver->sites[resolver->site_count++] = (semantic_site_t){.start = row->site_start_byte,
                                                                     .end = row->site_end_byte,
@@ -4674,6 +4715,26 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
     return true;
 }
 
+/* What a macro's replacement calls or reads, proven at the macro's use. No extraction carrier
+ * holds these names, since the raw source does not spell them there, so the proof rows themselves
+ * are the occurrences. */
+static bool resolve_macro_bodies(file_resolver_t *resolver, CBMArena *arena) {
+    const CBMResolvedCallArray *rows = &resolver->file->result->resolved_calls;
+    for (int r = 0; r < rows->count; r++) {
+        const CBMResolvedCall *row = &rows->items[r];
+        if ((row->kind != CBM_RESOLVED_MACRO_INVOCATION && row->kind != CBM_RESOLVED_MACRO_VALUE) ||
+            !semantic_row_admissible(row))
+            continue;
+        semantic_site_t site = {.row = row};
+        if (!record_result(resolver, row->caller_qn, row->reason,
+                           row->kind == CBM_RESOLVED_MACRO_INVOCATION ? "CALLS" : "USAGE",
+                           row->site_start_byte, row->site_end_byte, row->source_origin,
+                           semantic_result(resolver, &site, arena), NULL))
+            return false;
+    }
+    return true;
+}
+
 static bool resolve_writes(file_resolver_t *resolver, CBMArena *arena) {
     const CBMFileResult *result = resolver->file->result;
     for (int r = 0; r < result->rw.count; r++) {
@@ -4833,7 +4894,8 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
                                                 file->rel_path)) &&
               prepare_source_imports(&resolver) && index_semantics(&resolver) &&
               resolve_calls(&resolver, &arena) && resolve_usages(&resolver, &arena) &&
-              resolve_writes(&resolver, &arena) && resolve_types(&resolver);
+              resolve_macro_bodies(&resolver, &arena) && resolve_writes(&resolver, &arena) &&
+              resolve_types(&resolver);
     if (begun)
         cbm_gbuf_resolution_end(file->output);
     cbm_ht_free(resolver.import_names);

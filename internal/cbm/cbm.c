@@ -782,6 +782,62 @@ static void cbm_attr_check_declaration(TSNode node, const char *source, CBMAttrW
     const char *declarator_kind = ts_node_type(declarator);
     bool definition = !strcmp(ts_node_type(node), "function_definition");
     bool bare_declarator = !strcmp(declarator_kind, "identifier");
+    /* `DISABLE_WARNINGS namespace llvm {`: a word with no `;` of its own, and the grammar reads a
+     * function named namespace whose body is the rest of the file. No declaration has that name. */
+    if (definition && bare_declarator && !ts_node_is_null(type) && ts_node_has_error(node) &&
+        !strcmp(ts_node_type(type), "type_identifier") &&
+        ts_node_end_byte(declarator) - ts_node_start_byte(declarator) == strlen("namespace") &&
+        !memcmp(source + ts_node_start_byte(declarator), "namespace", strlen("namespace"))) {
+        cbm_attr_word_add(words, type);
+        return;
+    }
+    /* `API T f(int x);` with a macro in front: `T f` is no name, and the grammar invents a `::` to
+     * make it one. */
+    if (!ts_node_is_null(type) && !strcmp(declarator_kind, "function_declarator") &&
+        !strcmp(ts_node_type(type), "type_identifier") && cbm_attr_all_caps(source, type)) {
+        TSNode inner = ts_node_child_by_field_name(declarator, "declarator", 10);
+        if (!ts_node_is_null(inner) && ts_node_has_error(inner) &&
+            !strcmp(ts_node_type(inner), "qualified_identifier")) {
+            cbm_attr_word_add(words, type);
+            return;
+        }
+    }
+    /* `API T f(int x) ATTR PURE;`: the whole function lands in an error between two macro words. */
+    if (!definition && bare_declarator && !ts_node_is_null(type) &&
+        !strcmp(ts_node_type(type), "type_identifier") && cbm_attr_all_caps(source, type) &&
+        cbm_attr_all_caps(source, declarator)) {
+        TSTreeCursor parts = ts_tree_cursor_new(node);
+        bool found = false;
+        if (ts_tree_cursor_goto_first_child(&parts)) {
+            do {
+                TSNode error = ts_tree_cursor_current_node(&parts);
+                if (!ts_node_is_error(error) || !ts_tree_cursor_goto_first_child(&parts))
+                    continue;
+                /* Over the error's children, for the function and then for the words. */
+                TSTreeCursor inner = ts_tree_cursor_copy(&parts);
+                do {
+                    found = !strcmp(ts_node_type(ts_tree_cursor_current_node(&inner)),
+                                    "function_declarator");
+                } while (!found && ts_tree_cursor_goto_next_sibling(&inner));
+                ts_tree_cursor_delete(&inner);
+                if (found) {
+                    do {
+                        TSNode word = ts_tree_cursor_current_node(&parts);
+                        if (!strcmp(ts_node_type(word), "identifier") &&
+                            cbm_attr_all_caps(source, word))
+                            cbm_attr_word_add(words, word);
+                    } while (ts_tree_cursor_goto_next_sibling(&parts));
+                }
+                ts_tree_cursor_goto_parent(&parts);
+            } while (!found && ts_tree_cursor_goto_next_sibling(&parts));
+        }
+        ts_tree_cursor_delete(&parts);
+        if (found) {
+            cbm_attr_word_add(words, type);
+            cbm_attr_word_add(words, declarator);
+            return;
+        }
+    }
     if (definition && bare_declarator && !ts_node_is_null(type)) {
         /* A function definition needs a function declarator, so `class ATTR Name {` is the
          * only reading: the specifier's name is the macro. */
@@ -887,22 +943,54 @@ static void cbm_attr_collect(TSNode node, const char *source, CBMAttrWords *word
     if (depth > CBM_ATTR_MAX_DEPTH || words->failed) {
         return;
     }
-    uint32_t count = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(node, i);
-        const char *kind = ts_node_type(child);
-        bool declaration = !strcmp(kind, "function_definition") || !strcmp(kind, "declaration") ||
-                           !strcmp(kind, "field_declaration");
-        if (declaration) {
-            cbm_attr_check_declaration(child, source, words);
-        }
-        if (!strcmp(kind, "declaration") && ts_node_has_error(child)) {
-            cbm_attr_initializer_macro(child, source, words);
-        }
-        if (ts_node_has_error(child) || cbm_attr_is_container(kind)) {
-            cbm_attr_collect(child, source, words, depth + 1);
-        }
+    bool container = cbm_attr_is_container(ts_node_type(node));
+    bool unterminated = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child)) {
+                continue;
+            }
+            const char *kind = ts_node_type(child);
+            /* `int (*f)(int x) API_ATTR;`: the grammar ends the declaration with a `;` of its own
+             * and leaves the word as a statement, which a declaration list cannot hold. */
+            if (container && unterminated && !strcmp(kind, "expression_statement") &&
+                ts_node_named_child_count(child) == 1) {
+                TSNode word = ts_node_named_child(child, 0);
+                if (!strcmp(ts_node_type(word), "identifier") && cbm_attr_all_caps(source, word)) {
+                    cbm_attr_word_add(words, word);
+                }
+            }
+            /* And `int (*f)(int x) API_ATTR API_PURE;` leaves two, which read as a declaration. */
+            if (container && unterminated && !strcmp(kind, "declaration")) {
+                TSNode first = ts_node_child_by_field_name(child, "type", 4);
+                TSNode second = ts_node_child_by_field_name(child, "declarator", 10);
+                if (!ts_node_is_null(first) && !ts_node_is_null(second) &&
+                    !strcmp(ts_node_type(first), "type_identifier") &&
+                    !strcmp(ts_node_type(second), "identifier") &&
+                    cbm_attr_all_caps(source, first) && cbm_attr_all_caps(source, second)) {
+                    cbm_attr_word_add(words, first);
+                    cbm_attr_word_add(words, second);
+                }
+            }
+            bool declaration = !strcmp(kind, "function_definition") ||
+                               !strcmp(kind, "declaration") || !strcmp(kind, "field_declaration");
+            if (declaration) {
+                cbm_attr_check_declaration(child, source, words);
+            }
+            if (!strcmp(kind, "declaration") && ts_node_has_error(child)) {
+                cbm_attr_initializer_macro(child, source, words);
+            }
+            uint32_t tokens = ts_node_child_count(child);
+            unterminated = !strcmp(kind, "declaration") && tokens > 0 &&
+                           ts_node_is_missing(ts_node_child(child, tokens - 1));
+            if (ts_node_has_error(child) || cbm_attr_is_container(kind)) {
+                cbm_attr_collect(child, source, words, depth + 1);
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static int cbm_attr_range_cmp(const void *a, const void *b) {
@@ -945,14 +1033,337 @@ static bool cbm_attr_exclude_words(TSParser *parser, CBMAttrWords *words) {
     return set;
 }
 
+/* `Length(Str ?\n#if A\n f(Str)\n#else\n g(Str)\n#endif\n : 0)` offers alternatives for one
+ * expression, and no grammar can parse both at once: LLVM's StringRef loses its class to this one
+ * constructor. Inside parentheses the first alternative is read and the directives and the rest
+ * are left out, as a preprocessor taking that branch would. A single pass over the text. */
+#define CBM_ATTR_MAX_CONDITIONALS 64
+
+typedef struct {
+    bool in_expression, skipping;
+    int depth_at_open;
+    uint32_t skip_start;
+    TSPoint skip_point;
+    /* The `#if` line, left out as well once its branch turns out not to be complete. */
+    TSRange directive;
+} CBMAttrConditional;
+
+static void cbm_attr_expression_branches(const char *source, uint32_t length, CBMAttrWords *words) {
+    CBMAttrConditional stack[CBM_ATTR_MAX_CONDITIONALS];
+    int top = 0, skipping = 0, depth = 0, overflow = 0;
+    uint32_t at = 0, line_start = 0, row = 0;
+    bool line_begun = false;
+    /* Braces opened by `= {`. An initializer holds no `;`, so one closes the count whatever two
+     * branches of a conditional did to it. */
+    uint32_t initializer = 0;
+    bool after_assign = false;
+    while (at < length) {
+        char ch = source[at];
+        if (ch == '\n') {
+            at++;
+            row++;
+            line_start = at;
+            line_begun = false;
+            continue;
+        }
+        if (ch == '/' && at + 1 < length && source[at + 1] == '/') {
+            while (at < length && source[at] != '\n')
+                at++;
+            continue;
+        }
+        if (ch == '/' && at + 1 < length && source[at + 1] == '*') {
+            for (at += 2; at + 1 < length && !(source[at] == '*' && source[at + 1] == '/'); at++) {
+                if (source[at] == '\n') {
+                    row++;
+                    line_start = at + 1;
+                }
+            }
+            at = at + 2 <= length ? at + 2 : length;
+            continue;
+        }
+        if (ch == ' ' || ch == '\t' || ch == '\r') {
+            at++;
+            continue;
+        }
+        if (ch == '#' && !line_begun) {
+            uint32_t word = at + 1;
+            while (word < length && (source[word] == ' ' || source[word] == '\t'))
+                word++;
+            uint32_t word_end = word;
+            while (word_end < length && source[word_end] >= 'a' && source[word_end] <= 'z')
+                word_end++;
+            size_t size = word_end - word;
+            const char *text = source + word;
+            /* A directive runs to the end of its line, continuations included. */
+            uint32_t end = word_end, end_row = row;
+            bool defines = size == 6 && !memcmp(text, "define", 6);
+            /* `T table[] = { / #define OP(x) {x}, / LIST / #undef OP / };`: no grammar has a
+             * directive inside an initializer, and error recovery read a function named OP that
+             * swallowed the next 1,400 lines of jemalloc's ctl.c. The preprocessor takes these
+             * lines out before any of it is C, and so does this. */
+            bool in_table = initializer > 0 && !skipping &&
+                            (defines || (size == 5 && !memcmp(text, "undef", 5)) ||
+                             (size == 7 && !memcmp(text, "include", 7)));
+            while (end < length && source[end] != '\n') {
+                /* `#define M() do { \ / * why * / \`: the grammar ends the replacement at a comment
+                 * and reads the rest of the macro as code of the function around it. */
+                if (defines && !in_table && source[end] == '/' && end + 1 < length &&
+                    source[end + 1] == '*') {
+                    TSPoint comment_point = {end_row, end - line_start};
+                    uint32_t comment = end;
+                    for (end += 2;
+                         end + 1 < length && !(source[end] == '*' && source[end + 1] == '/');
+                         end++) {
+                        if (source[end] == '\n') {
+                            end_row++;
+                            line_start = end + 1;
+                        }
+                    }
+                    end = end + 2 <= length ? end + 2 : length;
+                    cbm_attr_range_add(
+                        words, (TSRange){comment_point, {end_row, end - line_start}, comment, end});
+                    continue;
+                }
+                if (source[end] == '\\' && end + 1 < length && source[end + 1] == '\n') {
+                    end++;
+                    end_row++;
+                    line_start = end + 1;
+                }
+                end++;
+            }
+            TSPoint begin_point = {row, at >= line_start ? at - line_start : 0};
+            TSPoint end_point = {end_row, end >= line_start ? end - line_start : 0};
+            if (in_table) {
+                cbm_attr_range_add(words, (TSRange){begin_point, end_point, at, end});
+            }
+            bool opens = (size == 2 && !memcmp(text, "if", 2)) ||
+                         (size == 5 && !memcmp(text, "ifdef", 5)) ||
+                         (size == 6 && !memcmp(text, "ifndef", 6));
+            bool alternative =
+                (size == 4 && (!memcmp(text, "else", 4) || !memcmp(text, "elif", 4))) ||
+                (size == 7 && (!memcmp(text, "elifdef", 7)));
+            bool closes = size == 5 && !memcmp(text, "endif", 5);
+            if (opens) {
+                if (top == CBM_ATTR_MAX_CONDITIONALS) {
+                    overflow++;
+                } else {
+                    bool in_expression = depth > 0 && !skipping;
+                    stack[top++] =
+                        (CBMAttrConditional){.in_expression = in_expression,
+                                             .depth_at_open = depth,
+                                             .directive = {begin_point, end_point, at, end}};
+                    if (in_expression)
+                        cbm_attr_range_add(words, (TSRange){begin_point, end_point, at, end});
+                }
+            } else if (alternative && top && !overflow) {
+                CBMAttrConditional *frame = &stack[top - 1];
+                if (frame->in_expression && !frame->skipping) {
+                    frame->skipping = true;
+                    frame->skip_start = at;
+                    frame->skip_point = begin_point;
+                    skipping++;
+                } else if (!frame->in_expression && !skipping) {
+                    /* `#if A / f(x, / #else / g(x, / #endif`: the branch leaves a parenthesis open
+                     * that the code after the conditional closes, so each branch is half of a
+                     * statement and only one of them can be read with it. A brace left open is the
+                     * other case: both heads of `#if / int f(void) { / #else / int g(void) { /
+                     * #endif` are definitions, and the region stays reported as partial. */
+                    if (depth != frame->depth_at_open) {
+                        frame->in_expression = true;
+                        frame->skipping = true;
+                        frame->skip_start = at;
+                        frame->skip_point = begin_point;
+                        skipping++;
+                        cbm_attr_range_add(words, frame->directive);
+                    }
+                }
+            } else if (closes) {
+                if (overflow) {
+                    overflow--;
+                } else if (top) {
+                    CBMAttrConditional *frame = &stack[--top];
+                    if (frame->skipping) {
+                        skipping--;
+                        cbm_attr_range_add(
+                            words, (TSRange){frame->skip_point, end_point, frame->skip_start, end});
+                    } else if (frame->in_expression) {
+                        cbm_attr_range_add(words, (TSRange){begin_point, end_point, at, end});
+                    }
+                }
+            }
+            row = end_row;
+            at = end;
+            line_begun = true;
+            continue;
+        }
+        line_begun = true;
+        if (ch == '"' || ch == '\'') {
+            char quote = ch;
+            for (at++; at < length && source[at] != quote && source[at] != '\n'; at++) {
+                if (source[at] == '\\')
+                    at++;
+            }
+            if (at < length && source[at] == quote)
+                at++;
+            continue;
+        }
+        if (!skipping) {
+            if (ch == '(') {
+                depth++;
+            } else if (ch == ')' && depth > 0) {
+                depth--;
+            } else if (ch == '{' && (initializer || after_assign)) {
+                initializer++;
+            } else if (ch == '}' && initializer) {
+                initializer--;
+            } else if (ch == ';') {
+                initializer = 0;
+            }
+        }
+        after_assign = ch == '=';
+        at++;
+    }
+}
+
+/* A name is a macro throughout a file. Each round finds the forms it can see, and the first
+ * `LLVM_NODISCARD` it leaves out says what the word is at every other place, including the ones
+ * whose broken parse shows no such form: LLVM's StringRef closes its class early at one of those.
+ * Capitals only, since a word in any other case may be a type elsewhere. One pass over the text;
+ * a directive's line is not code and an invocation with arguments is not this bare form. */
+#define CBM_ATTR_MAX_PROPAGATED 64
+
+static bool cbm_attr_range_is_caps_word(const char *source, const TSRange *range) {
+    uint32_t length = range->end_byte - range->start_byte;
+    if (length < CBM_ATTR_MIN_CAPS)
+        return false;
+    for (uint32_t i = 0; i < length; i++) {
+        char ch = source[range->start_byte + i];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'))
+            return false;
+    }
+    return true;
+}
+
+static void cbm_attr_propagate_words(CBMAttrWords *words, uint32_t from) {
+    const char *source = words->source;
+    const TSRange *found[CBM_ATTR_MAX_PROPAGATED];
+    uint32_t found_count = 0, lengths = 0;
+    for (uint32_t i = from; i < words->count && found_count < CBM_ATTR_MAX_PROPAGATED; i++) {
+        const TSRange *range = &words->items[i];
+        if (!cbm_attr_range_is_caps_word(source, range))
+            continue;
+        uint32_t length = range->end_byte - range->start_byte;
+        bool known = false;
+        for (uint32_t k = 0; k < found_count && !known; k++)
+            known = found[k]->end_byte - found[k]->start_byte == length &&
+                    !memcmp(source + found[k]->start_byte, source + range->start_byte, length);
+        if (!known) {
+            found[found_count++] = range;
+            lengths |= 1u << (length & 31);
+        }
+    }
+    if (!found_count)
+        return;
+    /* `found` points into the array the additions may move, so copy what the scan compares. */
+    uint32_t starts[CBM_ATTR_MAX_PROPAGATED], sizes[CBM_ATTR_MAX_PROPAGATED];
+    for (uint32_t k = 0; k < found_count; k++) {
+        starts[k] = found[k]->start_byte;
+        sizes[k] = found[k]->end_byte - found[k]->start_byte;
+    }
+    uint32_t at = 0, row = 0, line_start = 0, length = words->source_len;
+    bool line_begun = false;
+    while (at < length) {
+        char ch = source[at];
+        if (ch == '\n') {
+            at++;
+            row++;
+            line_start = at;
+            line_begun = false;
+        } else if (ch == ' ' || ch == '\t' || ch == '\r') {
+            at++;
+        } else if (ch == '/' && at + 1 < length && source[at + 1] == '/') {
+            while (at < length && source[at] != '\n')
+                at++;
+        } else if (ch == '/' && at + 1 < length && source[at + 1] == '*') {
+            for (at += 2; at + 1 < length && !(source[at] == '*' && source[at + 1] == '/'); at++) {
+                if (source[at] == '\n') {
+                    row++;
+                    line_start = at + 1;
+                }
+            }
+            at = at + 2 <= length ? at + 2 : length;
+        } else if (ch == '#' && !line_begun) {
+            while (at < length && source[at] != '\n') {
+                if (source[at] == '\\' && at + 1 < length && source[at + 1] == '\n') {
+                    at++;
+                    row++;
+                    line_start = at + 1;
+                }
+                at++;
+            }
+        } else if (ch == '"' || ch == '\'') {
+            line_begun = true;
+            char quote = ch;
+            for (at++; at < length && source[at] != quote && source[at] != '\n'; at++) {
+                if (source[at] == '\\')
+                    at++;
+            }
+            if (at < length && source[at] == quote)
+                at++;
+        } else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_') {
+            line_begun = true;
+            uint32_t start = at;
+            while (at < length && ((source[at] >= 'a' && source[at] <= 'z') ||
+                                   (source[at] >= 'A' && source[at] <= 'Z') ||
+                                   (source[at] >= '0' && source[at] <= '9') || source[at] == '_'))
+                at++;
+            uint32_t size = at - start;
+            if (!(lengths & (1u << (size & 31))))
+                continue;
+            bool match = false;
+            for (uint32_t k = 0; k < found_count && !match; k++)
+                match = sizes[k] == size && !memcmp(source + starts[k], source + start, size);
+            if (!match)
+                continue;
+            uint32_t next = at;
+            while (next < length && (source[next] == ' ' || source[next] == '\t'))
+                next++;
+            if (next < length && source[next] == '(')
+                continue;
+            cbm_attr_range_add(
+                words, (TSRange){{row, start - line_start}, {row, at - line_start}, start, at});
+        } else {
+            line_begun = true;
+            at++;
+        }
+    }
+}
+
 static TSTree *cbm_parse_c_source_defined(TSParser *parser, const char *source, uint32_t source_len,
                                           TSParseOptions opts, const char **defined) {
     TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
     CBMAttrWords words = {.source_len = source_len, .source = source, .defined = defined};
+    if (tree && ts_node_has_error(ts_tree_root_node(tree))) {
+        cbm_attr_expression_branches(source, source_len, &words);
+        if (!words.failed && words.count && cbm_attr_exclude_words(parser, &words)) {
+            TSTree *next = cbm_parse_source(parser, source, source_len, opts);
+            (void)ts_parser_set_included_ranges(parser, NULL, 0);
+            if (next) {
+                ts_tree_delete(tree);
+                tree = next;
+            } else {
+                ts_parser_reset(parser);
+            }
+        }
+    }
     for (int round = 0; tree && round < CBM_ATTR_MAX_ROUNDS; round++) {
         uint32_t before = words.count;
         cbm_attr_collect(ts_tree_root_node(tree), source, &words, 0);
-        if (words.failed || words.count == before || !cbm_attr_exclude_words(parser, &words)) {
+        if (words.failed || words.count == before) {
+            break;
+        }
+        cbm_attr_propagate_words(&words, before);
+        if (words.failed || !cbm_attr_exclude_words(parser, &words)) {
             break;
         }
         TSTree *next = cbm_parse_source(parser, source, source_len, opts);

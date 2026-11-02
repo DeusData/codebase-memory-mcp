@@ -28,6 +28,7 @@ typedef struct {
      * too, with the point in this file where it became visible. */
     struct CTUModule *tu_modules;
     uint32_t tu_cap, tu_count;
+    bool tu_adding_includer_context;
     const struct CBMCDeclIndex *c_decls;
     const char *own_file_qn; /* NULL when only the module identifies this file */
     /* C++: the class whose member function this is, inline or out of line. Its members
@@ -35,6 +36,17 @@ typedef struct {
     const CBMRegisteredType *proof_method_class;
     bool proof_class_scope_checked; /* the current name was looked for in that class */
     bool plain_header;              /* this TU is a .h, so its own language is its includer's */
+    /* The argument list last asked about: is its callee a visible macro, and which of its bare
+     * names reach the expansion as themselves. Start bytes, ascending. */
+    const char **outer_template_params; /* every enclosing template's parameter names */
+    int outer_template_param_count;
+    const void *macro_args_list;
+    const uint32_t *macro_plain_args;
+    int macro_plain_count;
+    bool macro_args_of_macro;
+    /* Name to CMacroDefs: the definitions in this translation unit, each name scanned once. */
+    struct CBMHashTable *macro_defs;
+    bool macro_defs_ready;
     const cbm_resolve_import_snapshot_t *import_facts;
     bool require_import_proofs;
     struct CProofBuiltinBinding *proof_builtins;

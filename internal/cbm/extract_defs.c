@@ -574,6 +574,19 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
 // this, an out-of-line definition — whose class body lives declaration-only in a
 // header — would be recorded as a free Function with no link to its class.
 char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
+    // `template <class T> void Box<T>::run() {}` arrives as its template_declaration.
+    for (int depth = 0;
+         depth < DECLARATOR_DEPTH_LIMIT && strcmp(ts_node_type(node), "template_declaration") == 0;
+         depth++) {
+        TSNode inner = cbm_find_child_by_kind(node, "function_definition");
+        if (ts_node_is_null(inner)) {
+            inner = cbm_find_child_by_kind(node, "template_declaration");
+        }
+        if (ts_node_is_null(inner)) {
+            return NULL;
+        }
+        node = inner;
+    }
     // Descend the declarator chain to its qualified_identifier, if any.
     TSNode qid = {0};
     TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
@@ -602,6 +615,15 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
     if (ts_node_is_null(qid)) {
         return NULL;
     }
+    // `ns::Foo::bar` nests on the name side: the class is the scope beside the name.
+    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT; depth++) {
+        TSNode name = ts_node_child_by_field_name(qid, TS_FIELD("name"));
+        if (ts_node_is_null(name) || (strcmp(ts_node_type(name), "qualified_identifier") != 0 &&
+                                      strcmp(ts_node_type(name), "scoped_identifier") != 0)) {
+            break;
+        }
+        qid = name;
+    }
     // The qualified_identifier's `scope` is the parent. For a nested scope
     // (`ns::Foo`) descend through its `name` field to the innermost segment so
     // the direct parent ("Foo") is returned, not the outer namespace.
@@ -619,6 +641,13 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
             break;
         }
         scope = name;
+    }
+    // `Box<T>::run`: the class is Box, whatever its arguments.
+    if (strcmp(ts_node_type(scope), "template_type") == 0) {
+        TSNode name = ts_node_child_by_field_name(scope, TS_FIELD("name"));
+        if (!ts_node_is_null(name)) {
+            scope = name;
+        }
     }
     char *text = cbm_node_text(a, scope, source);
     return (text && text[0]) ? text : NULL;
@@ -7216,7 +7245,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // is scoped to its class and whose parent_class links it back (matching the
     // class node QN computed the same way) so DEFINES_METHOD edges resolve.
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        strcmp(ts_node_type(node), "function_definition") == 0) {
+        (strcmp(ts_node_type(node), "function_definition") == 0 ||
+         strcmp(ts_node_type(node), "template_declaration") == 0)) {
         char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, scope_name);
@@ -9587,6 +9617,13 @@ static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             continue;
         }
         TSNode decl = ts_tree_cursor_current_node(&cursor);
+        /* `typedef kvec_t(Object) Array;` reads as a parenthesized declarator with the rest in an
+         * error: Object is the macro's argument, and a Type of that name would compete with the
+         * real one in every file that includes this one. */
+        if (ts_node_has_error(node) &&
+            strcmp(ts_node_type(decl), "parenthesized_declarator") == 0) {
+            continue;
+        }
         TSNode alias_node = c_typedef_alias_node(decl);
         char *name = ts_node_is_null(alias_node) ? NULL : cbm_node_text(a, alias_node, ctx->source);
         if (!name || !name[0] || (tag && strcmp(tag, name) == 0)) {
@@ -10259,6 +10296,17 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             }
             TSNode inner = ts_node_named_child(child, 0);
             if (!cbm_kind_in_set(inner, spec->function_node_types)) {
+                continue;
+            }
+            method_node = inner;
+        }
+
+        /* `template <class U> int get(U u) { ... }` written in the class is a method of it. With
+         * no node, its body belonged to the file and nothing could call it. */
+        if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
+            strcmp(ts_node_type(child), "template_declaration") == 0) {
+            TSNode inner = find_cpp_template_inner_node(child, ctx->language);
+            if (ts_node_is_null(inner) || strcmp(ts_node_type(inner), "function_definition") != 0) {
                 continue;
             }
             method_node = inner;
@@ -11288,6 +11336,27 @@ static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char
     }
 }
 
+/* `REDIS_STATIC quicklistNode *merge(quicklist *q);` with REDIS_STATIC an unknown word reads as
+ * `REDIS_STATIC quicklistNode` with its `;` missing, then the expression `*merge(q)`. That names
+ * the return type, not an object, and the Variable would take the type's QN. */
+static bool c_macro_prefixed_pointer_prototype(TSNode declaration) {
+    uint32_t count = ts_node_child_count(declaration);
+    if (!count || !ts_node_is_missing(ts_node_child(declaration, count - 1))) {
+        return false;
+    }
+    TSNode next = ts_node_next_named_sibling(declaration);
+    if (ts_node_is_null(next) || strcmp(ts_node_type(next), "expression_statement") != 0 ||
+        ts_node_named_child_count(next) == 0) {
+        return false;
+    }
+    TSNode expression = ts_node_named_child(next, 0);
+    if (strcmp(ts_node_type(expression), "pointer_expression") != 0) {
+        return false;
+    }
+    TSNode operand = ts_node_child_by_field_name(expression, TS_FIELD("argument"));
+    return !ts_node_is_null(operand) && strcmp(ts_node_type(operand), "call_expression") == 0;
+}
+
 /* Resolve the identifier node from a destructure pattern child.
  * pair_pattern → value field; shorthand/identifier → itself; others → first named child. */
 static TSNode destructure_ident(TSNode pat_child) {
@@ -11580,7 +11649,7 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     case CBM_LANG_C:
     case CBM_LANG_OBJC: {
         const char *vname = extract_c_declarator_name(a, node, ctx->source);
-        if (vname) {
+        if (vname && !c_macro_prefixed_pointer_prototype(node)) {
             push_var_def(ctx, vname, node);
         }
         break;
@@ -12722,6 +12791,26 @@ static bool is_c_member_declaration(CBMExtractCtx *ctx, TSNode field) {
            !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("declarator")));
 }
 
+/* `kvec_t(uint64_t) update_channels;`: the grammar ends the member at a `;` it invented and leaves
+ * the name as the next member, one with a type and nothing else. */
+static TSNode c_member_name_after_invented_semicolon(TSNode member) {
+    TSNode null_node = {0};
+    uint32_t tokens = ts_node_child_count(member);
+    if (tokens == 0 || !ts_node_is_missing(ts_node_child(member, tokens - SKIP_ONE))) {
+        return null_node;
+    }
+    TSNode next = ts_node_next_named_sibling(member);
+    if (ts_node_is_null(next) || strcmp(ts_node_type(next), "field_declaration") != 0 ||
+        ts_node_named_child_count(next) != SKIP_ONE ||
+        !ts_node_is_null(ts_node_child_by_field_name(next, TS_FIELD("declarator")))) {
+        return null_node;
+    }
+    TSNode alone = ts_node_child_by_field_name(next, TS_FIELD("type"));
+    return !ts_node_is_null(alone) && strcmp(ts_node_type(alone), "type_identifier") == 0
+               ? alone
+               : null_node;
+}
+
 /* A member whose type is a macro invocation (`ql_head(tcache_slow_t)
  * tcache_ql;`). The C grammar reads the type as a macro_type_specifier; the
  * C++ grammar, which every header gets, reads `(tcache_slow_t)` as a
@@ -12731,6 +12820,10 @@ static TSNode c_macro_typed_member_name(TSNode decl) {
     TSNode null_node = {0};
     if (strcmp(ts_node_type(decl), "parenthesized_declarator") != 0) {
         return null_node;
+    }
+    TSNode invented = c_member_name_after_invented_semicolon(ts_node_parent(decl));
+    if (!ts_node_is_null(invented)) {
+        return invented;
     }
     TSNode err = ts_node_next_sibling(decl);
     if (ts_node_is_null(err) || strcmp(ts_node_type(err), "ERROR") != 0 ||
@@ -12743,6 +12836,81 @@ static TSNode c_macro_typed_member_name(TSNode decl) {
         return null_node;
     }
     return name;
+}
+
+/* `kvec_t(WinInfo *) b_wininfo;` and `Map(int, int) ns[1];`: the grammar reads the macro as a
+ * function declarator and leaves the member's name in an error beside it. */
+static void extract_c_macro_declared_member(CBMExtractCtx *ctx, TSNode declaration,
+                                            const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    TSNode macro = ts_node_child_by_field_name(declaration, TS_FIELD("declarator"));
+    if (ts_node_is_null(macro) || strcmp(ts_node_type(macro), "function_declarator") != 0 ||
+        !ts_node_is_null(ts_node_child_by_field_name(declaration, TS_FIELD("type")))) {
+        return;
+    }
+    TSNode name_node = c_member_name_after_invented_semicolon(declaration);
+    if (ts_node_is_null(name_node)) {
+        TSNode err = ts_node_next_sibling(macro);
+        if (ts_node_is_null(err) || strcmp(ts_node_type(err), "ERROR") != 0 ||
+            ts_node_named_child_count(err) == 0) {
+            return;
+        }
+        name_node = ts_node_named_child(err, 0);
+        const char *kind = ts_node_type(name_node);
+        if (strcmp(kind, "identifier") != 0 && strcmp(kind, "field_identifier") != 0) {
+            return;
+        }
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    char *type_text = cbm_node_text(a, macro, ctx->source);
+    if (!name || !name[0] || !type_text || !type_text[0]) {
+        return;
+    }
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    def.label = "Field";
+    def.file_path = ctx->rel_path;
+    def.parent_class = class_qn;
+    def.return_type = type_text;
+    def.start_line = ts_node_start_point(declaration).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(declaration).row + TS_LINE_OFFSET;
+    def.is_exported = cbm_is_exported(name, ctx->language);
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* A struct or union written where it is used, with no tag to name it by. */
+static bool c_aggregate_is_unnamed(TSNode type) {
+    if (ts_node_is_null(type)) {
+        return false;
+    }
+    const char *kind = ts_node_type(type);
+    return (strcmp(kind, "struct_specifier") == 0 || strcmp(kind, "union_specifier") == 0 ||
+            strcmp(kind, "class_specifier") == 0) &&
+           ts_node_is_null(ts_node_child_by_field_name(type, TS_FIELD("name"))) &&
+           !ts_node_is_null(ts_node_child_by_field_name(type, TS_FIELD("body")));
+}
+
+/* `union { ... } data;`: what the union holds is read through data, so it is a class of its own,
+ * named for its owner and the member. The member's node holds the plain dotted name already, so
+ * the class beside it writes `Object$data`. Returns the member's type: that name, then whatever
+ * the declarator adds to it (`*`, `[2]`). */
+static char *c_unnamed_member_class(CBMExtractCtx *ctx, TSNode type, const char *class_qn,
+                                    const char *member, const char *rendered,
+                                    const CBMLangSpec *spec) {
+    CBMArena *a = ctx->arena;
+    const char *dot = strrchr(class_qn, '.');
+    const char *close = strrchr(rendered, '}');
+    char *name = cbm_arena_sprintf(a, "%s$%s", dot ? dot + SKIP_ONE : class_qn, member);
+    if (!name || !close) {
+        return NULL;
+    }
+    const char *enclosing = ctx->enclosing_class_qn;
+    ctx->enclosing_class_qn = dot ? cbm_arena_strndup(a, class_qn, (size_t)(dot - class_qn)) : NULL;
+    emit_class_def(ctx, type, spec, ts_node_type(type), name);
+    ctx->enclosing_class_qn = enclosing;
+    return cbm_arena_sprintf(a, "%s%s", name, close + SKIP_ONE);
 }
 
 /* One Field per data-member declarator of a C-family member declaration. */
@@ -12774,6 +12942,9 @@ static void extract_c_member_fields(CBMExtractCtx *ctx, TSNode field, const char
             }
             name = cbm_node_text(a, name_node, ctx->source);
             type_text = c_member_type_text(ctx, field, type_node, decl, name_node);
+            if (name && name[0] && type_text && c_aggregate_is_unnamed(type_node)) {
+                type_text = c_unnamed_member_class(ctx, type_node, class_qn, name, type_text, spec);
+            }
         }
         if (!name || !name[0] || !type_text || !type_text[0]) {
             continue;
@@ -12903,12 +13074,29 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             child = ts_node_named_child(child, 0);
         }
 
+        if (is_c_declarator_lang(ctx->language) &&
+            strcmp(ts_node_type(child), "declaration") == 0) {
+            extract_c_macro_declared_member(ctx, child, class_qn);
+            continue;
+        }
+
         if (!cbm_kind_in_set(child, spec->field_node_types)) {
             continue;
         }
 
         if (is_c_member_declaration(ctx, child)) {
             extract_c_member_fields(ctx, child, class_qn, spec);
+            continue;
+        }
+
+        /* `union { int a; int b; };` has no member to read it through: a and b are members of
+         * the class around it. */
+        if (is_c_declarator_lang(ctx->language) &&
+            strcmp(ts_node_type(child), "field_declaration") == 0 &&
+            c_aggregate_is_unnamed(ts_node_child_by_field_name(child, TS_FIELD("type"))) &&
+            ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("declarator")))) {
+            extract_class_fields(ctx, ts_node_child_by_field_name(child, TS_FIELD("type")),
+                                 class_qn, spec);
             continue;
         }
 

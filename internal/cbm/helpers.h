@@ -63,6 +63,7 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 
 // Get the QN of an enclosing function, or module_qn if none.
+bool cbm_c_function_is_macro_block(CBMLanguage lang, TSNode function);
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path, const char *module_qn);
 

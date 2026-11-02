@@ -13,12 +13,17 @@ bool cbm_c_collect_source_facts(CBMArena *arena, const char *source, int length,
  * node, yet a file's declarations decide what a name means in every includer.
  * These are source facts: nothing here selects an edge target. */
 typedef enum {
-    CBM_C_DECL_PROTOTYPE = 0, /* a function declared without a body */
-    CBM_C_DECL_MACRO,         /* a #define of this name, in any branch */
-    CBM_C_DECL_EXTERN_VALUE,  /* an extern object declaration */
-    CBM_C_DECL_VALUE,         /* a graph Variable: object definition or enumerator */
-    CBM_C_DECL_METHOD,        /* an out-of-line or inline member definition */
-    CBM_C_DECL_MEMBER_NAME,   /* any name a class body declares; type_name is the class */
+    CBM_C_DECL_PROTOTYPE = 0,  /* a function declared without a body */
+    CBM_C_DECL_MACRO,          /* a #define of this name, in any branch */
+    CBM_C_DECL_EXTERN_VALUE,   /* an extern object declaration */
+    CBM_C_DECL_VALUE,          /* a graph Variable: object definition or enumerator */
+    CBM_C_DECL_METHOD,         /* an out-of-line or inline member definition */
+    CBM_C_DECL_MEMBER_NAME,    /* any name a class body declares; type_name is the class */
+    CBM_C_DECL_SPECIALIZATION, /* `template <> class Name<int>`: name is the template's */
+    CBM_C_DECL_CLASS_TEMPLATE, /* `template <class T> class Name`: a base of this name can depend */
+    CBM_C_DECL_TEMPLATE_PARAMETER, /* `template <class Value> class Pair`: name is Value, type_name
+                                    * is Pair. What it means comes with each instantiation. */
+    CBM_C_DECL_DEFINED_IN_BRANCH,  /* a function defined inside a conditional */
 } CBMCDeclKind;
 
 enum {
@@ -29,14 +34,84 @@ enum {
     CBM_C_DECL_PROTECTED = 1u << 4,   /* with NOT_PUBLIC: reachable from a derived class */
 };
 
+/* One place a macro hands a parameter on: `callee(..., param, ...)` in its replacement list.
+ * Whether callee is itself a macro depends on the translation unit using this one. */
+typedef struct CBMCMacroHandoff {
+    const char *callee;
+    uint8_t param, position;
+} CBMCMacroHandoff;
+
+/* `RM_ ## name` in a replacement: with a bare name as the argument, the expansion's identifier. */
+typedef struct CBMCMacroPaste {
+    const char *prefix, *suffix;
+    uint8_t param;
+} CBMCMacroPaste;
+
+/* `list_for_each_entry(obj, &patch->obj_list, node)` in a replacement: a bare word handed to a
+ * callee. What it names depends on that callee, which may read it as a member. */
+typedef struct CBMCMacroNameArgument {
+    const char *name, *callee;
+    uint8_t position;
+} CBMCMacroNameArgument;
+
+/* `(l)->len` and `L->ci->top` in a replacement: what it reads through a parameter, dotted. */
+typedef struct CBMCMacroMember {
+    const char *path;
+    uint8_t param;
+} CBMCMacroMember;
+
+/* What a function-like macro's replacement list does with each parameter, by the C rules for
+ * substitution. A parameter next to `#` or `##` is tokens, a parameter after `.` or `->` names a
+ * member, and one after a type is what the macro declares. Anything else is the argument, so a
+ * name written there means what that name means at the use. */
+typedef struct CBMCMacroShape {
+    uint32_t plain;    /* bit i: parameter i only ever appears as the argument itself */
+    uint32_t declared; /* bit i: the replacement declares parameter i as a variable */
+    uint8_t param_count;
+    bool variadic;    /* the last parameter takes every further argument */
+    bool object_like; /* `#define NAME replacement`: no parameter list, used without parentheses */
+    const CBMCMacroHandoff *handoffs;
+    int handoff_count;
+    /* Names the replacement declares itself, which would capture an argument of that name. */
+    const char **locals;
+    int local_count;
+    /* For each bit of declared, in bit order: the base type written, and how many `*` follow. */
+    const char **declared_types;
+    const uint8_t *declared_pointers;
+    /* Names the replacement itself writes: called, or read as values. */
+    const char **calls;
+    int call_count;
+    const char **values;
+    int value_count;
+    const CBMCMacroPaste *pastes;
+    int paste_count;
+    const CBMCMacroMember *members;
+    int member_count;
+    const CBMCMacroNameArgument *name_arguments;
+    int name_argument_count;
+    /* Words a member is read from, which are objects whatever types share their spelling. */
+    const char **objects;
+    int object_count;
+    /* `#define w_p_list w_onebuf_opt.wo_list`: an object-like replacement that is nothing but
+     * dotted names, which can stand after `->` and name members there. */
+    const char *field_path;
+} CBMCMacroShape;
+
 typedef struct CBMCDecl {
     const char *file;         /* the declaring file's identity (see CBMCFileFacts) */
     const char *name;         /* namespace-relative name, dotted */
-    const char *target;       /* VALUE: exact graph QN. Otherwise NULL. */
+    const char *target;       /* VALUE, or MEMBER_NAME of an enumerator: exact graph QN. */
     const char *type_name;    /* VALUE, EXTERN_VALUE: written base type. METHOD: owner's name */
     const CBMType *signature; /* PROTOTYPE: builtin-only audited signature, else NULL */
+    const CBMCMacroShape *macro; /* MACRO: what its replacement names, or NULL when nothing */
     int arity;                /* PROTOTYPE: fixed parameter count, -1 when not fixed */
     uint32_t flags;
+    /* The innermost `#if` around this declaration and which of its branches holds it. Non-zero
+     * only inside a conditional; two declarations of one group and different branches exclude
+     * each other. */
+    uint32_t branch_group, branch;
+    /* MACRO in the first branch of `#ifdef X` or `#if defined(X)`: X. */
+    const char *needs_macro;
     CBMCDeclKind kind;
 } CBMCDecl;
 
@@ -53,6 +128,7 @@ typedef struct CBMCFileFacts {
     const char *guard; /* whole-file include guard macro, or NULL */
     bool plain_header; /* a .h: included by C and C++ alike, so linkage is the includer's */
     bool cpp_syntax;   /* a namespace, class or template: this .h is C++ whatever its name */
+    bool source_file;  /* .c, .cc, .cpp or .cxx: a build may compile it on its own */
     CBMCDecl *decls;
     int decl_count, decl_cap;
     const char **includes; /* proven direct includes, as file identities */
@@ -80,5 +156,10 @@ const CBMCDeclIndex *cbm_c_decl_index_build(CBMArena *arena, const CBMLSPDef *de
 /* The bucket holding this name, which may also hold others: compare ->decl->name. */
 const CBMCDeclLink *cbm_c_decl_lookup(const CBMCDeclIndex *index, const char *name);
 const CBMCFileFacts *cbm_c_file_facts(const CBMCDeclIndex *index, const char *file);
+/* Does this text hold a `#define` directive? Most function bodies do not. */
+bool cbm_c_text_defines_macro(const char *text, uint32_t length);
+/* The one project file that includes this one, when exactly one does, else NULL. A fragment with
+ * one includer reaches a compiler only through it. */
+const CBMCFileFacts *cbm_c_sole_includer(const CBMCDeclIndex *index, const char *file);
 
 #endif

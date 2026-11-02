@@ -391,13 +391,15 @@ TEST(resolver_c_quoted_header_fields_require_exact_source_owner) {
      * or a header suppressed by the caller defining its guard first. */
     for (int i = 0; i < 7; i++)
         ASSERT_EQ(wrong[i], 0);
-    for (int i = 2; i < 7; i++)
+    for (int i = 2; i < 6; i++)
         ASSERT_EQ(exact[i], 0);
     ASSERT_EQ(exact[1], 3);
+    ASSERT_EQ(exact[6], 3);
     /* Every real C header is guarded, and every one of these three references
      * targets Alpha's fields. The guard's one way to hide them, the caller defining
      * it first, is case 5 above. An ordinary feature #ifdef around the struct, case
-     * 6, stays unknown. */
+     * 6, is the only definition the code can be reading; the file that defines one
+     * twice stays unknown, in resolver_c_struct_shapes_real_headers_use. */
     ASSERT_EQ(exact[0], 3);
     PASS();
 }
@@ -925,20 +927,26 @@ TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships) {
                     .suffix = "raw.raw_target",
                     .label = "Function",
                     .declaration_line = 1,
-                    .declaration_text = "void raw_target(void) {}"}}};
+                    .declaration_text = "void raw_target(void) {}"}},
+        /* No preprocessed text speaks here. The raw #define does, the way a direct call of this
+         * function in this file would bind in spite of the same missing header. */
+        {.case_id = "raw-define-beside-a-missing-header",
+         .site = {.file = "missing.c",
+                  .caller = "missing.missing_run",
+                  .needle = "CALL()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "missing.c",
+                    .suffix = "missing.missing_target",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "void missing_target(void) {}"}}};
     const RQ_Forbidden forbidden[] = {
         {.case_id = "guessed-config-negative",
          .site = {.file = "guessed.c",
                   .caller = "guessed.guessed_run",
                   .needle = "CALL()",
                   .occurrence_index = 2},
-         .relation = "CALLS",
-         .any_target = true},
-        {.case_id = "missing-header-negative",
-         .site = {.file = "missing.c",
-                  .caller = "missing.missing_run",
-                  .needle = "CALL()",
-                  .occurrence_index = 1},
          .relation = "CALLS",
          .any_target = true},
     };
@@ -983,8 +991,8 @@ TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships) {
             cbm_store_close(store);
         th_cleanup(root);
         ASSERT(ok);
-        ASSERT_EQ(report.genuine, 1);
-        ASSERT_EQ(report.found, 1);
+        ASSERT_EQ(report.genuine, 2);
+        ASSERT_EQ(report.found, 2);
         ASSERT_EQ(report.missing + report.wrong + report.metadata_errors, 0);
     }
     PASS();
@@ -1964,6 +1972,7 @@ static const RQ_Source C_TU_GAPS[] = {{.path = "gaps.h", .text = C_TU_GAPS_HEADE
 TEST(resolver_c_known_gaps_stay_honest) {
     const char *use = C_TU_GAPS_USE;
     const RQ_Expected expected[] = {
+        /* Was a known gap until the macro's replacement list was read: it writes the type. */
         {.case_id = "macro-declared-loop-variable",
          .site = C_TU_WORD("use_gaps.c", use, "use_gaps.use_loop", "n += tp->", "tp_next"),
          .relation = "USAGE",
@@ -1971,13 +1980,7 @@ TEST(resolver_c_known_gaps_stay_honest) {
                     .suffix = "gaps.tabpage_S.tp_next",
                     .label = "Field",
                     .declaration_line = 4,
-                    .declaration_text = "  struct tabpage_S *tp_next;"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "c-macro-declared-variable",
-         .why = "`FOR_ALL_TABS(tp)` declares tp inside a macro body. The resolver does not "
-                "expand macros, so tp has no declared type and its members stay unknown.",
-         .tried = "Read neovim's FOR_ALL_* loops. Guessing the type from the macro text needs "
-                  "expansion rules this resolver does not have."},
+                    .declaration_text = "  struct tabpage_S *tp_next;"}},
         {.case_id = "anonymous-aggregate-member",
          .site = C_TU_WORD("use_gaps.c", use, "use_gaps.use_union", "o->value", "value"),
          .relation = "USAGE",
@@ -1985,35 +1988,23 @@ TEST(resolver_c_known_gaps_stay_honest) {
                     .suffix = "gaps.item.value",
                     .label = "Field",
                     .declaration_line = 12,
-                    .declaration_text = "    int value;"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "c-anonymous-aggregate-member",
-         .why = "Members of an anonymous struct or union get no Field node, so there is nothing to "
-                "bind. Neovim's `data` union in Object and redis's `u` unions have this form.",
-         .tried = "A nested aggregate with a tag binds through the tag. Without one, extraction "
-                  "must first attach the members to the enclosing struct."},
+                    .declaration_text = "    int value;"}},
+        /* Was a known gap until the replacement list was read: the function it reaches is what
+         * compiles here, so the edge goes there and not to the Macro node. */
         {.case_id = "function-like-macro",
          .site = {.file = "use_gaps.c", .caller = "use_gaps.use_macro", .needle = "LOG_LINE(\"x\")"},
          .relation = "CALLS",
-         .target = {.file = "gaps.h",
-                    .suffix = "gaps.LOG_LINE#macro",
-                    .label = "Macro",
-                    .declaration_line = 8,
-                    .declaration_text = "#define LOG_LINE(s) log_line(s)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "c-function-like-macro",
-         .why = "A function-like macro use reads as a call, and the function it reaches is only "
-                "known after expansion. `serverLog`, `assert` and `kv_size` have this form.",
-         .tried = "A macro of the name abstains wherever it is visible, so a same-named function "
-                  "never takes the edge. Binding the Macro node as a call needs a decision on "
-                  "what CALLS means for a macro."},
+         .target = {.file = "gaps.c",
+                    .suffix = "gaps.log_line",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "void log_line(const char *s) { (void)s; }"}},
     };
     const CTUCase fixture = {.suite = "c-tu-gaps",
                              .sources = C_TU_GAPS,
                              .source_count = sizeof(C_TU_GAPS) / sizeof(C_TU_GAPS[0]),
                              .expected = expected,
-                             .expected_count = sizeof(expected) / sizeof(expected[0]),
-                             .known_gaps = sizeof(expected) / sizeof(expected[0])};
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
     for (int driver = 0; driver < 2; driver++)
         ASSERT(c_tu_run(&fixture, driver));
     PASS();
@@ -2504,7 +2495,9 @@ TEST(resolver_c_large_file_keeps_its_last_call) {
     PASS();
 }
 
-/* What the C++ rules leave unbound on LLVM. Each is a genuine call the resolver abstains on. */
+/* Forms that used to abstain on LLVM. A class template's primary is the receiver's class when no
+ * specialization exists, an `auto` has its initializer's written type, and every overload of one
+ * name in one file is one node. */
 #define C_TU_CXX_GAPS_HEADER                                                                    \
     "#ifndef CXX_GAPS_H\n"                                                                      \
     "#define CXX_GAPS_H\n"                                                                      \
@@ -2528,6 +2521,7 @@ TEST(resolver_c_large_file_keeps_its_last_call) {
     "namespace llvm {\n"                                                                        \
     "int *Value::parts() { return 0; }\n"                                                       \
     "const int *Value::parts() const { return 0; }\n"                                           \
+    "Value makeValue() { return Value(); }\n"                                                   \
     "}\n"
 #define C_TU_CXX_GAPS_USE                                                                       \
     "#include \"cxx_gaps.h\"\n"                                                                 \
@@ -2551,13 +2545,15 @@ TEST(resolver_cpp_known_gaps_stay_honest) {
                     .suffix = "llvm.ArrayRef.size",
                     .label = "Method",
                     .declaration_line = 6,
-                    .declaration_text = "  int size() const { return 1; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "cpp-class-template-member",
-         .why = "A specialization can replace the member, and the graph has one node per template "
-                "name, so a class template is not taken as a receiver's class.",
-         .tried = "Read SmallVector, ArrayRef and Optional in LLVM. SmallVectorTemplateBase has two "
-                  "specializations; a rule for templates needs specialization facts first."},
+                    .declaration_text = "  int size() const { return 1; }"}},
+        {.case_id = "initializer-of-the-auto-receiver",
+         .site = {.file = "cxx_gaps_use.cpp", .caller = "llvm.useAuto", .needle = "makeValue()"},
+         .relation = "CALLS",
+         .target = {.file = "cxx_gaps.cpp",
+                    .suffix = "llvm.makeValue",
+                    .label = "Function",
+                    .declaration_line = 5,
+                    .declaration_text = "Value makeValue() { return Value(); }"}},
         {.case_id = "receiver-declared-auto",
          .site = {.file = "cxx_gaps_use.cpp", .caller = "llvm.useAuto", .needle = "V.length()"},
          .relation = "CALLS",
@@ -2565,13 +2561,7 @@ TEST(resolver_cpp_known_gaps_stay_honest) {
                     .suffix = "llvm.Value.length",
                     .label = "Method",
                     .declaration_line = 12,
-                    .declaration_text = "  int length() const { return 1; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "cpp-auto-receiver",
-         .why = "An `auto` variable's type is inferred from its initializer. Only written "
-                "declarations give a receiver its type here.",
-         .tried = "Written declaration types are followed through typedefs, fields and declared "
-                  "return types. Initializer flow is left out on purpose: it can go stale."},
+                    .declaration_text = "  int length() const { return 1; }"}},
         /* Not a gap: the two definitions are one graph node, so which overload the call
          * selects does not change the edge. */
         {.case_id = "overloads-sharing-one-node",
@@ -2592,20 +2582,13 @@ TEST(resolver_cpp_known_gaps_stay_honest) {
                     .label = "Function",
                     .declaration_line = 14,
                     .declaration_text =
-                        "template <typename T> bool usesLayout(int x) { return x > 0; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "cpp-function-template",
-         .why = "Function templates take part in overload resolution by deduction, which is not "
-                "modelled.",
-         .tried = "Plain functions and members bind. A template function is skipped as a candidate "
-                  "so it never wins by being the only name visible."},
+                        "template <typename T> bool usesLayout(int x) { return x > 0; }"}},
     };
     const CTUCase fixture = {.suite = "c-tu-cxx-gaps",
                              .sources = C_TU_CXX_GAPS,
                              .source_count = sizeof(C_TU_CXX_GAPS) / sizeof(C_TU_CXX_GAPS[0]),
                              .expected = expected,
-                             .expected_count = sizeof(expected) / sizeof(expected[0]),
-                             .known_gaps = sizeof(expected) / sizeof(expected[0]) - 1};
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
     for (int driver = 0; driver < 2; driver++)
         ASSERT(c_tu_run(&fixture, driver));
     PASS();
@@ -2673,6 +2656,2690 @@ TEST(resolver_c_bare_macro_arguments_prove_nothing) {
                              .expected_count = sizeof(expected) / sizeof(expected[0]),
                              .forbidden = forbidden,
                              .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* The replacement list says what happens to an argument. redis's `atomicIncr(counter, 1)` reads
+ * the object; the same bare name pasted, stringified or read as a member names nothing. */
+#define C_TU_MACRO_READ_HEADER                                                                  \
+    "#ifndef ATOMICS_H\n"                                                                       \
+    "#define ATOMICS_H\n"                                                                       \
+    "#define atomicIncr(var,count) fetch_add(&var,(count),relaxed)\n"                           \
+    "#define PASTED(name) global_##name\n"                                                      \
+    "#define MEMBER(s, field) ((s)->field)\n"                                                   \
+    "#define NAMED(x) #x\n"                                                                     \
+    "#define THROUGH_PASTE(x) PASTED(x)\n"                                                      \
+    "#define THROUGH_READ(x) atomicIncr(x, 1)\n"                                                \
+    "#define CAPTURING(x) do { int tmp = (x); use_int(tmp); } while (0)\n"                      \
+    "#define SWAPPED(x) ((void)(x))\n"                                                          \
+    "void use_int(int v);\n"                                                                    \
+    "#endif\n"
+#define C_TU_MACRO_READ_ONE                                                                     \
+    "#ifndef SWAP_A_H\n"                                                                        \
+    "#define SWAP_A_H\n"                                                                        \
+    "#ifdef LOUD\n"                                                                             \
+    "#define SWAPPED_TWICE(x) log_it(#x)\n"                                                     \
+    "#else\n"                                                                                   \
+    "#define SWAPPED_TWICE(x) ((void)(x))\n"                                                    \
+    "#endif\n"                                                                                  \
+    "#endif\n"
+#define C_TU_MACRO_READ_USE                                                                     \
+    "#include \"atomics.h\"\n"                                                                  \
+    "#include \"swap_a.h\"\n"                                                                   \
+    "static int counter;\n"                                                                     \
+    "static int tmp;\n"                                                                         \
+    "static int global_counter;\n"                                                              \
+    "static void reads(void) { atomicIncr(counter, 1); }\n"                                     \
+    "static void nested(void) { THROUGH_READ(counter); }\n"                                     \
+    "static void captured_other(void) { CAPTURING(counter); }\n"                                \
+    "static void one_branch(void) { SWAPPED(counter); }\n"                                      \
+    "static void pasted(void) { PASTED(counter); }\n"                                           \
+    "static void member(int *p) { MEMBER(p, counter); }\n"                                      \
+    "static void named(void) { NAMED(counter); }\n"                                             \
+    "static void through(void) { THROUGH_PASTE(counter); }\n"                                   \
+    "static void captured(void) { CAPTURING(tmp); }\n"                                          \
+    "static void swapped_twice(void) { SWAPPED_TWICE(counter); }\n"
+static const RQ_Source C_TU_MACRO_READ[] = {{.path = "atomics.h", .text = C_TU_MACRO_READ_HEADER},
+                                            {.path = "swap_a.h", .text = C_TU_MACRO_READ_ONE},
+                                            {.path = "use_read.c", .text = C_TU_MACRO_READ_USE}};
+
+TEST(resolver_c_macro_argument_binds_when_the_replacement_substitutes_it) {
+    const char *use = C_TU_MACRO_READ_USE;
+    const RQ_Target counter = {.file = "use_read.c",
+                               .suffix = "use_read.counter",
+                               .label = "Variable",
+                               .declaration_line = 3,
+                               .declaration_text = "static int counter;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "read-through-the-macro",
+         .site = C_TU_WORD("use_read.c", use, "use_read.reads", "atomicIncr(", "counter"),
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "read-through-a-macro-handing-it-on",
+         .site = C_TU_WORD("use_read.c", use, "use_read.nested", "THROUGH_READ(", "counter"),
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "other-name-than-what-the-macro-captures",
+         .site = C_TU_WORD("use_read.c", use, "use_read.captured_other", "CAPTURING(", "counter"),
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "plain-in-the-only-definition",
+         .site = C_TU_WORD("use_read.c", use, "use_read.one_branch", "SWAPPED(", "counter"),
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "the-name-the-paste-makes",
+         .site = {.file = "use_read.c", .caller = "use_read.pasted", .needle = "PASTED(counter)"},
+         .relation = "USAGE",
+         .target = {.file = "use_read.c",
+                    .suffix = "use_read.global_counter",
+                    .label = "Variable",
+                    .declaration_line = 5,
+                    .declaration_text = "static int global_counter;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "pasted-argument-is-no-read-of-its-own-name",
+         .site = C_TU_WORD("use_read.c", use, "use_read.pasted", "PASTED(", "counter"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "member-name",
+         .site = C_TU_WORD("use_read.c", use, "use_read.member", "MEMBER(p, ", "counter"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "stringified",
+         .site = C_TU_WORD("use_read.c", use, "use_read.named", "NAMED(", "counter"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "pasted-by-a-macro-it-is-handed-to",
+         .site = C_TU_WORD("use_read.c", use, "use_read.through", "THROUGH_PASTE(", "counter"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "captured-by-the-local-of-that-name",
+         .site = C_TU_WORD("use_read.c", use, "use_read.captured", "CAPTURING(", "tmp"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "one-definition-of-two-stringifies",
+         .site = C_TU_WORD("use_read.c", use, "use_read.swapped_twice", "SWAPPED_TWICE(", "counter"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-read",
+                             .sources = C_TU_MACRO_READ,
+                             .source_count = sizeof(C_TU_MACRO_READ) / sizeof(C_TU_MACRO_READ[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* neovim's three loop macro forms: a name in parentheses, a second argument, and a macro that
+ * hands its arguments to the macros that declare them. The name is a variable of the written
+ * type only inside what the macro says. */
+#define C_TU_LOOPS_HEADER                                                                       \
+    "#ifndef LOOPS_H\n"                                                                         \
+    "#define LOOPS_H\n"                                                                         \
+    "typedef struct tab_S { struct tab_S *tp_next; int tp_flag; } tab_T;\n"                     \
+    "typedef struct win_S { struct win_S *w_next; int w_buffer; } win_T;\n"                     \
+    "extern tab_T *first_tab;\n"                                                                \
+    "extern win_T *first_win;\n"                                                                \
+    "extern int wp;\n"                                                                          \
+    "#define FOR_TABS(tp) for (tab_T *(tp) = first_tab; (tp); (tp) = (tp)->tp_next)\n"          \
+    "#define FOR_WINS(wp, tp) for (win_T *wp = (tp) ? first_win : 0; wp; wp = wp->w_next)\n"    \
+    "#define FOR_TAB_WINS(tp, wp) FOR_TABS(tp) FOR_WINS(wp, tp)\n"                              \
+    "#endif\n"
+#define C_TU_LOOPS_USE                                                                          \
+    "#include \"loops.h\"\n"                                                                    \
+    "int use_tabs(void) {\n"                                                                    \
+    "  int n = 0;\n"                                                                            \
+    "  FOR_TABS(tp) {\n"                                                                        \
+    "    n += tp->tp_flag;\n"                                                                   \
+    "  }\n"                                                                                     \
+    "  return n;\n"                                                                             \
+    "}\n"                                                                                       \
+    "int use_wins(tab_T *t) {\n"                                                                \
+    "  int n = 0;\n"                                                                            \
+    "  FOR_WINS(wp, t) {\n"                                                                     \
+    "    n += wp->w_buffer;\n"                                                                  \
+    "  }\n"                                                                                     \
+    "  return n;\n"                                                                             \
+    "}\n"                                                                                       \
+    "int use_both(void) {\n"                                                                    \
+    "  int n = 0;\n"                                                                            \
+    "  FOR_TAB_WINS(tp, wp) {\n"                                                                \
+    "    n += wp->w_buffer;\n"                                                                  \
+    "  }\n"                                                                                     \
+    "  return n;\n"                                                                             \
+    "}\n"
+static const RQ_Source C_TU_LOOPS[] = {{.path = "loops.h", .text = C_TU_LOOPS_HEADER},
+                                       {.path = "use_loops.c", .text = C_TU_LOOPS_USE},
+                                       {.path = "use_loops_cpp.cpp", .text = C_TU_LOOPS_USE}};
+
+TEST(resolver_c_loop_macro_declares_its_variable) {
+    const char *use = C_TU_LOOPS_USE;
+    const RQ_Target tab_type = {.file = "loops.h",
+                                .suffix = "loops.tab_T",
+                                .label = "Type",
+                                .declaration_line = 3,
+                                .declaration_text =
+                                    "typedef struct tab_S { struct tab_S *tp_next; int tp_flag; } "
+                                    "tab_T;"};
+    const RQ_Target win_type = {.file = "loops.h",
+                                .suffix = "loops.win_T",
+                                .label = "Type",
+                                .declaration_line = 4,
+                                .declaration_text =
+                                    "typedef struct win_S { struct win_S *w_next; int w_buffer; } "
+                                    "win_T;"};
+    const RQ_Target w_buffer = {.file = "loops.h",
+                                .suffix = "loops.win_S.w_buffer",
+                                .label = "Field",
+                                .declaration_line = 4,
+                                .declaration_text =
+                                    "typedef struct win_S { struct win_S *w_next; int w_buffer; } "
+                                    "win_T;"};
+    const RQ_Target tp_flag = {.file = "loops.h",
+                               .suffix = "loops.tab_S.tp_flag",
+                               .label = "Field",
+                               .declaration_line = 3,
+                               .declaration_text =
+                                   "typedef struct tab_S { struct tab_S *tp_next; int tp_flag; } "
+                                   "tab_T;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "parenthesized-macro-variable",
+         .site = C_TU_WORD("use_loops.c", use, "use_loops.use_tabs", "n += tp->", "tp_flag"),
+         .relation = "USAGE",
+         .target = tp_flag},
+        {.case_id = "second-argument-loop",
+         .site = C_TU_WORD("use_loops.c", use, "use_loops.use_wins", "n += wp->", "w_buffer"),
+         .relation = "USAGE",
+         .target = w_buffer},
+        {.case_id = "macro-handing-on-to-declaring-macros",
+         .site = C_TU_WORD("use_loops.c", use, "use_loops.use_both", "use_both(", "w_buffer"),
+         .relation = "USAGE",
+         .target = w_buffer},
+        {.case_id = "parameter-type-of-the-second-argument-loop",
+         .site = C_TU_WORD("use_loops.c", use, "use_loops.use_wins", "(tab_T *t", "tab_T"),
+         .relation = "USAGE",
+         .target = tab_type},
+        {.case_id = "type-the-loop-macro-writes",
+         .site = {.file = "use_loops.c", .caller = "use_loops.use_wins", .needle = "FOR_WINS(wp, t)"},
+         .relation = "USAGE",
+         .target = win_type,
+         .dispatch_group = "wins"},
+        {.case_id = "member-the-loop-macro-reads-through-its-own-variable",
+         .site = {.file = "use_loops.c", .caller = "use_loops.use_wins", .needle = "FOR_WINS(wp, t)"},
+         .relation = "USAGE",
+         .target = {.file = "loops.h",
+                    .suffix = "loops.win_S.w_next",
+                    .label = "Field",
+                    .declaration_line = 4,
+                    .declaration_text =
+                        "typedef struct win_S { struct win_S *w_next; int w_buffer; } win_T;"},
+         .dispatch_group = "wins"},
+        {.case_id = "type-of-the-macro-handed-on-first",
+         .site = {.file = "use_loops.c",
+                  .caller = "use_loops.use_both",
+                  .needle = "FOR_TAB_WINS(tp, wp)"},
+         .relation = "USAGE",
+         .target = tab_type,
+         .dispatch_group = "both"},
+        {.case_id = "type-of-the-macro-handed-on-second",
+         .site = {.file = "use_loops.c",
+                  .caller = "use_loops.use_both",
+                  .needle = "FOR_TAB_WINS(tp, wp)"},
+         .relation = "USAGE",
+         .target = win_type,
+         .dispatch_group = "both"},
+        {.case_id = "cpp-grammar-parenthesized-macro-variable",
+         .site = C_TU_WORD("use_loops_cpp.cpp", use, "use_loops_cpp.use_tabs", "n += tp->",
+                           "tp_flag"),
+         .relation = "USAGE",
+         .target = tp_flag},
+    };
+    const RQ_Forbidden forbidden[] = {
+        /* `extern int wp;` is in the header, and the macro's own variable hides it. */
+        {.case_id = "global-of-the-declared-name",
+         .site = C_TU_WORD("use_loops.c", use, "use_loops.use_wins", "n += ", "wp"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-loops",
+                             .sources = C_TU_LOOPS,
+                             .source_count = sizeof(C_TU_LOOPS) / sizeof(C_TU_LOOPS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* A function's name as a value, and the file-scope table it often sits in, past a syntax error
+ * elsewhere in the file. A directive's names are not uses of anything. */
+#define C_TU_FNVALUES_USE                                                                         \
+    "#include \"values_dep.h\"\n"                                                               \
+    "typedef struct ops { int (*cb)(int); } ops;\n"                                             \
+    "enum colour { RED, GREEN };\n"                                                             \
+    "static int handler(int x) { return x; }\n"                                                 \
+    "static int (*hook)(int);\n"                                                                \
+    "static int broken(void) { return ( ; }\n"                                                  \
+    "static ops table = { .cb = handler };\n"                                                   \
+    "static int colours[] = { GREEN };\n"                                                       \
+    "void install(void) { hook = handler; }\n"                                                  \
+    "void address(void) { hook = &handler; }\n"                                                 \
+    "int shadowed(int handler) { return handler; }\n"                                           \
+    "#define handler_alias handler\n"                                                           \
+    "#if GREEN\n"                                                                               \
+    "int conditioned;\n"                                                                        \
+    "#endif\n"
+static const RQ_Source C_TU_FNVALUES[] = {{.path = "values_dep.h", .text = "/* empty */\n"},
+                                          {.path = "values.c", .text = C_TU_FNVALUES_USE}};
+
+TEST(resolver_c_function_names_are_values_at_any_scope) {
+    const char *use = C_TU_FNVALUES_USE;
+    const RQ_Target handler = {.file = "values.c",
+                               .suffix = "values.handler",
+                               .label = "Function",
+                               .declaration_line = 4,
+                               .declaration_text = "static int handler(int x) { return x; }"};
+    const RQ_Expected expected[] = {
+        {.case_id = "assigned-to-a-pointer",
+         .site = C_TU_WORD("values.c", use, "values.install", "hook = ", "handler"),
+         .relation = "USAGE",
+         .target = handler},
+        {.case_id = "address-taken",
+         .site = C_TU_WORD("values.c", use, "values.address", "hook = &", "handler"),
+         .relation = "USAGE",
+         .target = handler},
+        {.case_id = "file-scope-table-past-an-error-elsewhere",
+         .site = C_TU_WORD("values.c", use, "values", ".cb = ", "handler"),
+         .relation = "USAGE",
+         .target = handler},
+        {.case_id = "designator-in-a-file-scope-table",
+         .site = C_TU_WORD("values.c", use, "values", ".cb = ", "cb"),
+         .relation = "USAGE",
+         .target = {.file = "values.c",
+                    .suffix = "values.ops.cb",
+                    .label = "Field",
+                    .declaration_line = 2,
+                    .declaration_text = "typedef struct ops { int (*cb)(int); } ops;"}},
+        {.case_id = "enumerator-in-a-file-scope-table",
+         .site = C_TU_WORD("values.c", use, "values", "colours[] = { ", "GREEN"),
+         .relation = "USAGE",
+         .target = {.file = "values.c",
+                    .suffix = "values.GREEN",
+                    .label = "Variable",
+                    .declaration_line = 3,
+                    .declaration_text = "enum colour { RED, GREEN };"}},
+        {.case_id = "type-of-a-file-scope-table",
+         .site = C_TU_WORD("values.c", use, "values", "static ops table", "ops"),
+         .relation = "USAGE",
+         .target = {.file = "values.c",
+                    .suffix = "values.ops",
+                    .label = "Class",
+                    .declaration_line = 2,
+                    .declaration_text = "typedef struct ops { int (*cb)(int); } ops;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "parameter-of-that-name",
+         .site = C_TU_WORD("values.c", use, "values.shadowed", "return ", "handler"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "condition-of-a-directive",
+         .site = C_TU_WORD("values.c", use, "values", "#if ", "GREEN"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-values",
+                             .sources = C_TU_FNVALUES,
+                             .source_count = sizeof(C_TU_FNVALUES) / sizeof(C_TU_FNVALUES[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* redis, hiredis and Lua write these. A header's `typedef struct X X;` beside `struct X {...}` in
+ * the same-stem source is one type under one QN. A struct in an `#ifdef __cplusplus extern "C" {`
+ * or below an include ahead of the guard is in a branch only by accident of how it parses.
+ * Swapped layouts in two branches stay unknown. */
+#define C_TU_SHAPES_LIST_H                                                                      \
+    "#include <stdint.h>\n"                                                                     \
+    "#ifndef LIST_H\n"                                                                          \
+    "#define LIST_H\n"                                                                          \
+    "typedef struct listNode {\n"                                                               \
+    "    struct listNode *prev;\n"                                                              \
+    "    int sz;\n"                                                                             \
+    "} listNode;\n"                                                                             \
+    "typedef struct opaque opaque;\n"                                                           \
+    "#endif\n"
+#define C_TU_SHAPES_LIST_C                                                                      \
+    "#include \"list.h\"\n"                                                                     \
+    "#define LIST_STATIC static\n"                                                              \
+    "LIST_STATIC listNode *make_node(int sz);\n"                                                \
+    "struct opaque { int secret; };\n"                                                          \
+    "int read_opaque(opaque *o) { return o->secret; }\n"                                        \
+    "int read_tag(struct opaque *o) { return o->secret; }\n"                                    \
+    "int read_node(listNode *n) { return n->sz; }\n"
+#define C_TU_SHAPES_REPLY_H                                                                     \
+    "#ifndef REPLY_H\n"                                                                         \
+    "#define REPLY_H\n"                                                                         \
+    "#ifdef __cplusplus\n"                                                                      \
+    "extern \"C\" {\n"                                                                          \
+    "#endif\n"                                                                                  \
+    "typedef struct reply { int type; } reply;\n"                                               \
+    "#ifdef __cplusplus\n"                                                                      \
+    "}\n"                                                                                       \
+    "#endif\n"                                                                                  \
+    "#endif\n"
+#define C_TU_SHAPES_SWAP_H                                                                      \
+    "#ifndef SWAP_H\n"                                                                          \
+    "#define SWAP_H\n"                                                                          \
+    "#ifdef WIDE\n"                                                                             \
+    "struct swapped { long size; };\n"                                                          \
+    "#else\n"                                                                                   \
+    "struct swapped { int size; };\n"                                                           \
+    "#endif\n"                                                                                  \
+    "#endif\n"
+#define C_TU_SHAPES_USE                                                                         \
+    "#include \"list.h\"\n"                                                                     \
+    "#include \"reply.h\"\n"                                                                    \
+    "#include \"swap.h\"\n"                                                                     \
+    "typedef struct sock { int fd; } sock;\n"                                                   \
+    "static sock CT_Socket;\n"                                                                  \
+    "int use_reply(reply *r) { return r->type; }\n"                                             \
+    "int use_node(listNode *n) { return n->sz; }\n"                                             \
+    "int use_swapped(struct swapped *s) { return s->size; }\n"                                  \
+    "int use_opaque(opaque *o) { return o->secret; }\n"                                         \
+    "int use_socket(sock *c) { return c->fd; }\n"                                               \
+    "static sock CT_Socket = { 1 };\n"                                                          \
+    "int use_after(sock *c) { return c->fd; }\n"
+static const RQ_Source C_TU_SHAPES[] = {{.path = "list.h", .text = C_TU_SHAPES_LIST_H},
+                                        {.path = "list.c", .text = C_TU_SHAPES_LIST_C},
+                                        {.path = "reply.h", .text = C_TU_SHAPES_REPLY_H},
+                                        {.path = "swap.h", .text = C_TU_SHAPES_SWAP_H},
+                                        {.path = "use_shapes.c", .text = C_TU_SHAPES_USE}};
+
+TEST(resolver_c_struct_shapes_real_headers_use) {
+    const char *use = C_TU_SHAPES_USE;
+    const char *impl = C_TU_SHAPES_LIST_C;
+    const RQ_Target sz = {.file = "list.h",
+                          .suffix = "list.listNode.sz",
+                          .label = "Field",
+                          .declaration_line = 6,
+                          .declaration_text = "    int sz;"};
+    const RQ_Target secret = {.file = "list.c",
+                              .suffix = "list.opaque.secret",
+                              .label = "Field",
+                              .declaration_line = 4,
+                              .declaration_text = "struct opaque { int secret; };"};
+    const RQ_Target opaque_class = {.file = "list.c",
+                                    .suffix = "list.opaque",
+                                    .label = "Class",
+                                    .declaration_line = 4,
+                                    .declaration_text = "struct opaque { int secret; };"};
+    const RQ_Target sock_class = {.file = "use_shapes.c",
+                                  .suffix = "use_shapes.sock",
+                                  .label = "Class",
+                                  .declaration_line = 4,
+                                  .declaration_text = "typedef struct sock { int fd; } sock;"};
+    const RQ_Target fd = {.file = "use_shapes.c",
+                          .suffix = "use_shapes.sock.fd",
+                          .label = "Field",
+                          .declaration_line = 4,
+                          .declaration_text = "typedef struct sock { int fd; } sock;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "struct-below-an-include-ahead-of-the-guard",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_node", "n->", "sz"),
+         .relation = "USAGE",
+         .target = sz},
+        {.case_id = "struct-inside-a-cplusplus-branch",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_reply", "r->", "type"),
+         .relation = "USAGE",
+         .target = {.file = "reply.h",
+                    .suffix = "reply.reply.type",
+                    .label = "Field",
+                    .declaration_line = 6,
+                    .declaration_text = "typedef struct reply { int type; } reply;"}},
+        {.case_id = "typedef-name-with-tag-in-the-same-stem-source",
+         .site = C_TU_WORD("list.c", impl, "list.read_opaque", "o->", "secret"),
+         .relation = "USAGE",
+         .target = secret},
+        {.case_id = "written-tag-beside-a-header-typedef",
+         .site = C_TU_WORD("list.c", impl, "list.read_tag", "read_tag(", "secret"),
+         .relation = "USAGE",
+         .target = secret},
+        {.case_id = "class-keeps-its-node-despite-a-macro-prefixed-prototype",
+         .site = C_TU_WORD("list.c", impl, "list.read_node", "read_node(", "listNode"),
+         .relation = "USAGE",
+         .target = {.file = "list.h",
+                    .suffix = "list.listNode",
+                    .label = "Class",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct listNode {"}},
+        {.case_id = "typedef-name-of-a-tag-defined-in-the-source",
+         .site = C_TU_WORD("list.c", impl, "list.read_opaque", "(opaque *o", "opaque"),
+         .relation = "USAGE",
+         .target = opaque_class},
+        {.case_id = "member-through-the-typedef-name-in-its-own-file",
+         .site = C_TU_WORD("list.c", impl, "list.read_node", "n->", "sz"),
+         .relation = "USAGE",
+         .target = sz},
+        {.case_id = "type-inside-a-cplusplus-branch",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_reply", "(reply *r", "reply"),
+         .relation = "USAGE",
+         .target = {.file = "reply.h",
+                    .suffix = "reply.reply",
+                    .label = "Class",
+                    .declaration_line = 6,
+                    .declaration_text = "typedef struct reply { int type; } reply;"}},
+        {.case_id = "type-below-an-include-ahead-of-the-guard",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_node", "(listNode *n", "listNode"),
+         .relation = "USAGE",
+         .target = {.file = "list.h",
+                    .suffix = "list.listNode",
+                    .label = "Class",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct listNode {"}},
+        {.case_id = "typedef-name-from-an-includer-of-the-header",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_opaque", "(opaque *o", "opaque"),
+         .relation = "USAGE",
+         .target = opaque_class},
+        {.case_id = "type-before-a-second-file-scope-declaration",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_socket", "(sock *c", "sock"),
+         .relation = "USAGE",
+         .target = sock_class},
+        {.case_id = "type-after-a-second-file-scope-declaration",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_after", "use_after(sock", "sock"),
+         .relation = "USAGE",
+         .target = sock_class},
+        {.case_id = "member-before-a-second-file-scope-declaration",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_socket", "c->", "fd"),
+         .relation = "USAGE",
+         .target = fd},
+        {.case_id = "member-after-a-second-file-scope-declaration",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_after", "use_after(", "fd"),
+         .relation = "USAGE",
+         .target = fd},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "swapped-layouts-stay-unknown",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_swapped", "s->", "size"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "struct-body-the-unit-does-not-see",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_opaque", "o->", "secret"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-shapes",
+                             .sources = C_TU_SHAPES,
+                             .source_count = sizeof(C_TU_SHAPES) / sizeof(C_TU_SHAPES[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Macros no grammar can place: in a parameter list, in front of a parenthesized name, and between
+ * the attribute and the return type. Each declaration still names what it names. Enum typedefs
+ * are types too, and a macro's own #define line uses nothing. */
+#define C_TU_PROTO_HEADER                                                                       \
+    "#ifndef PROTO_H\n"                                                                         \
+    "#define PROTO_H\n"                                                                         \
+    "typedef struct dict { int n; } dict;\n"                                                    \
+    "typedef enum { kOff, kOn } TriState;\n"                                                    \
+    "int dictAdd(dict *d, void *key __stored_key, void *val);\n"                                \
+    "LUA_API int   (lua_gettop) (dict *L);\n"                                                   \
+    "ALWAYS_INLINE int\n"                                                                       \
+    "inline_size(dict *d) {\n"                                                                  \
+    "    return d->n;\n"                                                                        \
+    "}\n"                                                                                       \
+    "ALWAYS_INLINE dict *\n"                                                                    \
+    "inline_self(dict *d) {\n"                                                                  \
+    "    return d;\n"                                                                           \
+    "}\n"                                                                                       \
+    "ALWAYS_INLINE int\n"                                                                       \
+    "inline_caller(dict *d) {\n"                                                                \
+    "    return inline_size(inline_self(d));\n"                                                 \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_PROTO_IMPL                                                                         \
+    "#include \"proto.h\"\n"                                                                    \
+    "int dictAdd(dict *d, void *key, void *val) { return d->n; }\n"                             \
+    "int lua_gettop(dict *L) { return L->n; }\n"
+#define C_TU_PROTO_USE                                                                          \
+    "#include \"proto.h\"\n"                                                                    \
+    "#define renamed dictAdd\n"                                                                 \
+    "int call_add(dict *d) { return dictAdd(d, 0, 0); }\n"                                      \
+    "int call_lua(dict *d) { return lua_gettop(d); }\n"                                         \
+    "int call_inline(dict *d) { return inline_size(d); }\n"                                     \
+    "TriState enum_type(TriState t) { return t; }\n"
+static const RQ_Source C_TU_PROTO[] = {{.path = "proto.h", .text = C_TU_PROTO_HEADER},
+                                       {.path = "proto.c", .text = C_TU_PROTO_IMPL},
+                                       {.path = "use_proto.c", .text = C_TU_PROTO_USE}};
+
+TEST(resolver_c_macros_in_declarations_do_not_hide_their_names) {
+    const char *use = C_TU_PROTO_USE;
+    const char *header = C_TU_PROTO_HEADER;
+    const RQ_Target inline_size = {.file = "proto.h",
+                                   .suffix = "proto.inline_size",
+                                   .label = "Function",
+                                   .declaration_line = 8,
+                                   .declaration_text = "inline_size(dict *d) {"};
+    const RQ_Expected expected[] = {
+        {.case_id = "macro-among-the-parameters",
+         .site = {.file = "use_proto.c", .caller = "use_proto.call_add", .needle = "dictAdd(d, 0, 0)"},
+         .relation = "CALLS",
+         .target = {.file = "proto.c",
+                    .suffix = "proto.dictAdd",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "int dictAdd(dict *d, void *key, void *val) { return d->n; }"}},
+        {.case_id = "macro-before-a-parenthesized-name",
+         .site = {.file = "use_proto.c", .caller = "use_proto.call_lua", .needle = "lua_gettop(d)"},
+         .relation = "CALLS",
+         .target = {.file = "proto.c",
+                    .suffix = "proto.lua_gettop",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "int lua_gettop(dict *L) { return L->n; }"}},
+        {.case_id = "macro-prefixed-definition-from-its-includer",
+         .site = {.file = "use_proto.c", .caller = "use_proto.call_inline", .needle = "inline_size(d)"},
+         .relation = "CALLS",
+         .target = inline_size},
+        {.case_id = "macro-prefixed-definition-from-its-own-file",
+         .site = {.file = "proto.h",
+                  .caller = "proto.inline_caller",
+                  .needle = "inline_size(inline_self(d))"},
+         .relation = "CALLS",
+         .target = inline_size},
+        {.case_id = "macro-prefixed-pointer-definition-from-its-own-file",
+         .site = {.file = "proto.h",
+                  .caller = "proto.inline_caller",
+                  .needle = "inline_self(d)"},
+         .relation = "CALLS",
+         .target = {.file = "proto.h",
+                    .suffix = "proto.inline_self",
+                    .label = "Function",
+                    .declaration_line = 12,
+                    .declaration_text = "inline_self(dict *d) {"}},
+        {.case_id = "enum-typedef-is-a-type",
+         .site = C_TU_WORD("use_proto.c", use, "use_proto.enum_type", "enum_type(", "TriState"),
+         .relation = "USAGE",
+         .target = {.file = "proto.h",
+                    .suffix = "proto.TriState",
+                    .label = "Enum",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef enum { kOff, kOn } TriState;"}},
+        {.case_id = "enum-typedef-as-the-return-type",
+         .site = C_TU_WORD("use_proto.c", use, "use_proto.enum_type", "TriState enum_type(",
+                           "TriState"),
+         .relation = "USAGE",
+         .target = {.file = "proto.h",
+                    .suffix = "proto.TriState",
+                    .label = "Enum",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef enum { kOff, kOn } TriState;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "macro-definition-line-uses-nothing",
+         .site = C_TU_WORD("use_proto.c", use, "use_proto", "#define renamed ", "dictAdd"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    (void)header;
+    const CTUCase fixture = {.suite = "c-tu-proto",
+                             .sources = C_TU_PROTO,
+                             .source_count = sizeof(C_TU_PROTO) / sizeof(C_TU_PROTO[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Two-phase lookup on the forms LLVM's headers use. What a template's own body names binds where
+ * it is written, except its parameters and what an instantiation adds. */
+#define C_TU_TMPL_HEADER                                                                        \
+    "#ifndef TMPL_H\n"                                                                          \
+    "#define TMPL_H\n"                                                                          \
+    "namespace llvm {\n"                                                                        \
+    "class T { public: int decoy() const { return 0; } };\n"                                    \
+    "class Helper { public: int help() const { return 1; } };\n"                                \
+    "int free_fn(int V);\n"                                                                     \
+    "void swap(int &A, int &B);\n"                                                              \
+    "template <typename U> int free_tpl(U V) { return free_fn(V); }\n"                          \
+    "template <typename U> int fixed_tpl() { return free_fn(1); }\n"                            \
+    "template <typename T> class Box {\n"                                                       \
+    "public:\n"                                                                                 \
+    "  enum Kind { Small, Large };\n"                                                           \
+    "  int size() const { return count(); }\n"                                                  \
+    "  int count() const { return Held; }\n"                                                    \
+    "  Kind kind() const { return Small; }\n"                                                   \
+    "  T *param(T *V) { return V; }\n"                                                          \
+    "private:\n"                                                                                \
+    "  int Held;\n"                                                                             \
+    "};\n"                                                                                      \
+    "template <typename T> class Derived : public Box<T> {\n"                                   \
+    "public:\n"                                                                                 \
+    "  int viaBase() { return size(); }\n"                                                      \
+    "};\n"                                                                                      \
+    "template <typename U> struct Traits { int width() const { return 1; } };\n"                \
+    "template <> struct Traits<int> { int width() const { return 2; } };\n"                     \
+    "class Triple {\n"                                                                          \
+    "public:\n"                                                                                 \
+    "  enum OSType { UnknownOS, Linux };\n"                                                     \
+    "  enum class Scoped { Inner };\n"                                                          \
+    "  OSType os() const { return Linux; }\n"                                                   \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_TMPL_USE                                                                           \
+    "#include <utility>\n"                                                                      \
+    "#include \"tmpl.h\"\n"                                                                     \
+    "using namespace llvm;\n"                                                                   \
+    "int useBox(Box<int> B) { return B.size(); }\n"                                             \
+    "int useTraits(Traits<int> S) { return S.width(); }\n"                                      \
+    "int useCast(void *Q) { auto *P = static_cast<Helper *>(Q); return P->help(); }\n"          \
+    "int useScoped() { return Triple::UnknownOS; }\n"                                           \
+    "void useStdSwap(int A, int B) { using std::swap; swap(A, B); }\n"
+static const RQ_Source C_TU_TMPL[] = {{.path = "tmpl.h", .text = C_TU_TMPL_HEADER},
+                                      {.path = "tmpl_use.cpp", .text = C_TU_TMPL_USE}};
+
+TEST(resolver_cpp_templates_bind_what_is_not_dependent) {
+    const char *header = C_TU_TMPL_HEADER;
+    const char *use = C_TU_TMPL_USE;
+    const RQ_Target box_size = {.file = "tmpl.h",
+                                .suffix = "llvm.Box.size",
+                                .label = "Method",
+                                .declaration_line = 13,
+                                .declaration_text = "  int size() const { return count(); }"};
+    const RQ_Target free_fn_target = {.file = "tmpl.h",
+                                      .suffix = "llvm.free_fn",
+                                      .label = NULL,
+                                      .declaration_line = 6,
+                                      .declaration_text = "int free_fn(int V);"};
+    (void)free_fn_target;
+    const RQ_Expected expected[] = {
+        {.case_id = "own-member-of-the-current-instantiation",
+         .site = {.file = "tmpl.h", .caller = "llvm.Box.size", .needle = "count()"},
+         .relation = "CALLS",
+         .target = {.file = "tmpl.h",
+                    .suffix = "llvm.Box.count",
+                    .label = "Method",
+                    .declaration_line = 14,
+                    .declaration_text = "  int count() const { return Held; }"}},
+        {.case_id = "own-field-of-the-current-instantiation",
+         .site = C_TU_WORD("tmpl.h", header, "llvm.Box.count", "return ", "Held"),
+         .relation = "USAGE",
+         .target = {.file = "tmpl.h",
+                    .suffix = "llvm.Box.Held",
+                    .label = "Field",
+                    .declaration_line = 18,
+                    .declaration_text = "  int Held;"}},
+        {.case_id = "own-enum-as-a-return-type",
+         .site = C_TU_WORD("tmpl.h", header, "llvm.Box.kind", "Kind kind()", "Kind"),
+         .relation = "USAGE",
+         .target = {.file = "tmpl.h",
+                    .suffix = "llvm.Box.Kind",
+                    .label = "Enum",
+                    .declaration_line = 12,
+                    .declaration_text = "  enum Kind { Small, Large };"}},
+        {.case_id = "own-enumerator-of-the-current-instantiation",
+         .site = C_TU_WORD("tmpl.h", header, "llvm.Box.kind", "return Small", "Small"),
+         .relation = "USAGE",
+         .target = {.file = "tmpl.h",
+                    .suffix = "llvm.Box.Small",
+                    .label = "Variable",
+                    .declaration_line = 12,
+                    .declaration_text = "  enum Kind { Small, Large };"}},
+        {.case_id = "receiver-of-a-class-template-with-no-specialization",
+         .site = {.file = "tmpl_use.cpp", .caller = "useBox", .needle = "B.size()"},
+         .relation = "CALLS",
+         .target = box_size},
+        {.case_id = "receiver-of-a-written-cast-through-auto",
+         .site = {.file = "tmpl_use.cpp", .caller = "useCast", .needle = "P->help()"},
+         .relation = "CALLS",
+         .target = {.file = "tmpl.h",
+                    .suffix = "llvm.Helper.help",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text = "class Helper { public: int help() const { return 1; } };"}},
+        {.case_id = "enumerator-through-its-class",
+         .site = C_TU_WORD("tmpl_use.cpp", use, "useScoped", "useScoped(", "UnknownOS"),
+         .relation = "USAGE",
+         .target = {.file = "tmpl.h",
+                    .suffix = "llvm.Triple.UnknownOS",
+                    .label = "Variable",
+                    .declaration_line = 28,
+                    .declaration_text = "  enum OSType { UnknownOS, Linux };"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "template-parameter-hides-a-class-of-its-name",
+         .site = C_TU_WORD("tmpl.h", header, "llvm.Box.param", "T *param(T", "T"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "unqualified-name-does-not-search-a-dependent-base",
+         .site = {.file = "tmpl.h", .caller = "llvm.Derived.viaBase", .needle = "size()"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "dependent-argument-may-add-candidates",
+         .site = {.file = "tmpl.h", .caller = "llvm.free_tpl", .needle = "free_fn(V)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "a-specialization-may-replace-the-member",
+         .site = {.file = "tmpl_use.cpp", .caller = "useTraits", .needle = "S.width()"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "using-of-a-declaration-this-index-has-not",
+         .site = {.file = "tmpl_use.cpp", .caller = "useStdSwap", .needle = "swap(A, B)"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-tmpl",
+                             .sources = C_TU_TMPL,
+                             .source_count = sizeof(C_TU_TMPL) / sizeof(C_TU_TMPL[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* redis's ae.c includes ae_epoll.c, which includes nothing it needs. A fragment with one includer
+ * is compiled only there, seeing what stood before its `#include`. */
+#define C_TU_FRAG_FRAGMENT                                                                      \
+    "static int fragment_free(aeLoop *l) { return l->apidata != 0; }\n"                         \
+    "static int fragment_late(lateLoop *l) { return l->later != 0; }\n"
+#define C_TU_FRAG_SHARED                                                                        \
+    "static int shared_free(thing *t) { return t->size; }\n"
+static const RQ_Source C_TU_FRAG[] = {
+    {.path = "ae.h", .text = "typedef struct aeLoop { void *apidata; } aeLoop;\n"},
+    {.path = "late.h", .text = "typedef struct lateLoop { void *later; } lateLoop;\n"},
+    {.path = "ae.c", .text = "#include \"ae.h\"\n#include \"ae_epoll.c\"\n#include \"late.h\"\n"},
+    {.path = "ae_epoll.c", .text = C_TU_FRAG_FRAGMENT},
+    {.path = "one.h", .text = "typedef struct thing { int size; } thing;\n"},
+    {.path = "two.h", .text = "typedef struct thing { long size; } thing;\n"},
+    {.path = "one.c", .text = "#include \"one.h\"\n#include \"shared.c\"\n"},
+    {.path = "two.c", .text = "#include \"two.h\"\n#include \"shared.c\"\n"},
+    {.path = "shared.c", .text = C_TU_FRAG_SHARED}};
+
+TEST(resolver_c_fragment_sees_what_its_one_includer_saw) {
+    const char *fragment = C_TU_FRAG_FRAGMENT;
+    const char *shared = C_TU_FRAG_SHARED;
+    const RQ_Expected expected[] = {
+        {.case_id = "field-from-an-earlier-include-of-the-includer",
+         .site = C_TU_WORD("ae_epoll.c", fragment, "ae_epoll.fragment_free", "l->", "apidata"),
+         .relation = "USAGE",
+         .target = {.file = "ae.h",
+                    .suffix = "ae.aeLoop.apidata",
+                    .label = "Field",
+                    .declaration_line = 1,
+                    .declaration_text = "typedef struct aeLoop { void *apidata; } aeLoop;"}},
+        {.case_id = "type-from-an-earlier-include-of-the-includer",
+         .site = C_TU_WORD("ae_epoll.c", fragment, "ae_epoll.fragment_free", "fragment_free(",
+                           "aeLoop"),
+         .relation = "USAGE",
+         .target = {.file = "ae.h",
+                    .suffix = "ae.aeLoop",
+                    .label = "Class",
+                    .declaration_line = 1,
+                    .declaration_text = "typedef struct aeLoop { void *apidata; } aeLoop;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "include-standing-after-the-fragment",
+         .site = C_TU_WORD("ae_epoll.c", fragment, "ae_epoll.fragment_late", "l->", "later"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "fragment-of-two-includers",
+         .site = C_TU_WORD("shared.c", shared, "shared.shared_free", "t->", "size"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-fragment",
+                             .sources = C_TU_FRAG,
+                             .source_count = sizeof(C_TU_FRAG) / sizeof(C_TU_FRAG[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* What a macro's replacement names compiles where the macro is used. Redis registers its module API
+ * with REGISTER_API(name) and asserts through a macro around _serverAssert, neovim allocates through
+ * kv_push and reads firstwin through FOR_ALL_WINDOWS. A local at the use takes the name, a local of
+ * the macro's own has it, a member is no lookup, and a function nobody declared here stays unbound. */
+#define C_TU_BODY_API_H                                                                         \
+    "#ifndef BODY_API_H\n"                                                                      \
+    "#define BODY_API_H\n"                                                                      \
+    "void report_failure(const char *what);\n"                                                  \
+    "extern int counter;\n"                                                                     \
+    "int RM_Open(int v);\n"                                                                     \
+    "int register_it(int (*f)(int));\n"                                                         \
+    "int hi_new(int v);\n"                                                                      \
+    "int helper(int v);\n"                                                                      \
+    "typedef struct list_S { int len; struct list_S *next; } list_T;\n"                         \
+    "#define LIST_LEN(l) ((l)->len)\n"                                                          \
+    "#define NEXT_LEN(l) l->next->len\n"                                                        \
+    "typedef struct other_S { int len; } other_T;\n"                                            \
+    "#define THROUGH_CALL(o) (&to_list(o)->len)\n"                                              \
+    "#define CHECK(x) do { if (!(x)) report_failure(\"x\"); } while (0)\n"                      \
+    "#define READ_COUNTER() (counter)\n"                                                        \
+    "#define REGISTER(name) register_it(RM_##name)\n"                                           \
+    "#define CURRENT counter\n"                                                                 \
+    "#define sd_new hi_new\n"                                                                   \
+    "#define list_alias list_T\n"                                                               \
+    "#define TWICE(x) CHECK(x); CHECK(x)\n"                                                     \
+    "#define HELPER_LOCAL(a) do { int helper = (a); (void)helper; } while (0)\n"                \
+    "#define MEMBER_OF(p) ((p)->report_failure)\n"                                              \
+    "#define TAKE_MEMBER(p, m) ((p)->m)\n"                                                      \
+    "#define PROTOTYPE_PARAMETER(a) { extern int proto_fn(void *counter); (void)(a); }\n"       \
+    "struct object_like { int size; };\n"                                                       \
+    "#define READ_OBJECT() (object_like.size)\n"                                                \
+    "#define SELECT_BY_TYPE(x) _Generic((x), long: &counter, default: 0)\n"                     \
+    "#define HAND_ON_MEMBER(p) TAKE_MEMBER(p, counter)\n"                                       \
+    "#define HAND_TO_FUNCTION(v) register_value(v, counter)\n"                                  \
+    "#define HAND_TO_UNKNOWN(v) not_declared_here(v, counter)\n"                                \
+    "#define HAND_THROUGH_OFFSET(T) offsetof(T, counter)\n"                                     \
+    "int register_value(int v, int w);\n"                                                       \
+    "#ifdef FEATURE\n"                                                                          \
+    "#define ONE_BRANCH(x) report_failure(\"x\")\n"                                             \
+    "#define BOTH_BRANCHES(x) report_failure(\"a\")\n"                                           \
+    "#else\n"                                                                                   \
+    "#define ONE_BRANCH(x)\n"                                                                   \
+    "#define BOTH_BRANCHES(x) report_failure(\"b\")\n"                                           \
+    "#endif\n"                                                                                  \
+    "#endif\n"
+#define C_TU_BODY_API_C                                                                         \
+    "void report_failure(const char *what) { (void)what; }\n"                                   \
+    "int counter;\n"                                                                            \
+    "int RM_Open(int v) { return v; }\n"                                                        \
+    "int register_it(int (*f)(int)) { return f(0); }\n"                                         \
+    "int hi_new(int v) { return v; }\n"                                                         \
+    "int helper(int v) { return v; }\n"                                                         \
+    "int register_value(int v, int w) { return v + w; }\n"
+#define C_TU_BODY_USE                                                                           \
+    "#include \"body_api.h\"\n"                                                                 \
+    "void checked(int v) { CHECK(v); }\n"                                                       \
+    "int reads(void) { return READ_COUNTER(); }\n"                                              \
+    "void registers(void) { REGISTER(Open); }\n"                                                \
+    "int reads_object(void) { return CURRENT; }\n"                                              \
+    "int renamed(int v) { return sd_new(v); }\n"                                                \
+    "void nested(int v) { TWICE(v); }\n"                                                        \
+    "void in_body(int v) {\n"                                                                   \
+    "#define BODY_CHECK(x) report_failure(\"x\")\n"                                             \
+    "  BODY_CHECK(v);\n"                                                                        \
+    "}\n"                                                                                       \
+    "int shadowed(void) { int counter = 1; return READ_COUNTER() + counter; }\n"                \
+    "void own_local(int v) { HELPER_LOCAL(v); }\n"                                              \
+    "struct holder { int report_failure; };\n"                                                  \
+    "int member(struct holder *h) { return MEMBER_OF(h); }\n"                                   \
+    "void one_branch(int v) { ONE_BRANCH(v); }\n"                                               \
+    "void both_branches(int v) { BOTH_BRANCHES(v); }\n"                                         \
+    "int read_len(list_T *l) { return LIST_LEN(l); }\n"                                         \
+    "int read_next(list_T *l) { return NEXT_LEN(l); }\n"                                        \
+    "int no_receiver(void *p) { return LIST_LEN(p); }\n"                                        \
+    "void through_call(other_T *o) { (void)THROUGH_CALL(o); }\n"                                \
+    "int through_alias(list_alias *l) { return l != 0; }\n"                                     \
+    "int handed_member(void *p) { return HAND_ON_MEMBER(p); }\n"                                \
+    "int selected(int v) { return SELECT_BY_TYPE(v); }\n"                                       \
+    "void prototype_parameter(int v) { PROTOTYPE_PARAMETER(v); }\n"                             \
+    "int read_object(void) { return READ_OBJECT(); }\n"                                         \
+    "int handed_function(int v) { return HAND_TO_FUNCTION(v); }\n"                              \
+    "int handed_unknown(int v) { return HAND_TO_UNKNOWN(v); }\n"                                \
+    "unsigned long handed_offset(void) { return HAND_THROUGH_OFFSET(list_T); }\n"               \
+    "#undef CHECK\n"                                                                            \
+    "void after_undef(int v) { CHECK(v); }\n"
+#define C_TU_BODY_HIDDEN_C "int hidden_target(int v) { return v; }\n"
+#define C_TU_BODY_HIDDEN_USE                                                                    \
+    "#define CALL_HIDDEN(x) hidden_target(x)\n"                                                 \
+    "int undeclared(int v) { return CALL_HIDDEN(v); }\n"
+#define C_TU_BODY_QUALIFIED                                                                     \
+    "#include \"body_api.h\"\n"                                                                 \
+    "int qualified_helper(int v) { return v; }\n"                                               \
+    "namespace other {\n"                                                                       \
+    "int qualified_helper(int v) { return v + 1; }\n"                                           \
+    "}\n"                                                                                       \
+    "template <class T> struct Holder { static int qualified_helper(int v) { return v; } };\n"  \
+    "#define QCALL(x) other::qualified_helper(x)\n"                                             \
+    "#define TCALL(x) Holder<int>::qualified_helper(x)\n"                                       \
+    "int qualified(int v) { return QCALL(v); }\n"                                               \
+    "int through_template(int v) { return TCALL(v); }\n"                                        \
+    "struct Own {\n"                                                                            \
+    "  int qualified_helper(int v) { return v; }\n"                                             \
+    "  int plain(int v);\n"                                                                     \
+    "};\n"                                                                                      \
+    "#define PLAIN(x) qualified_helper(x)\n"                                                    \
+    "int Own::plain(int v) { return PLAIN(v); }\n"                                              \
+    "#define GLOBAL(x) ::other::qualified_helper(x)\n"                                          \
+    "struct Reaches {\n"                                                                        \
+    "  int qualified_helper(int v) { return v; }\n"                                             \
+    "  int global(int v) { return GLOBAL(v); }\n"                                               \
+    "};\n"
+static const RQ_Source C_TU_BODY[] = {{.path = "body_api.h", .text = C_TU_BODY_API_H},
+                                      {.path = "body_api.c", .text = C_TU_BODY_API_C},
+                                      {.path = "body_use.c", .text = C_TU_BODY_USE},
+                                      {.path = "hidden_def.c", .text = C_TU_BODY_HIDDEN_C},
+                                      {.path = "hidden_use.c", .text = C_TU_BODY_HIDDEN_USE},
+                                      {.path = "qualified.cpp", .text = C_TU_BODY_QUALIFIED}};
+
+TEST(resolver_c_macro_replacement_compiles_at_its_use) {
+    const char *body_use = C_TU_BODY_USE;
+    const RQ_Target list_type = {.file = "body_api.h",
+                                 .suffix = "body_api.list_T",
+                                 .label = "Type",
+                                 .declaration_line = 9,
+                                 .declaration_text =
+                                     "typedef struct list_S { int len; struct list_S *next; } list_T;"};
+    const RQ_Target list_len = {.file = "body_api.h",
+                                .suffix = "body_api.list_S.len",
+                                .label = "Field",
+                                .declaration_line = 9,
+                                .declaration_text =
+                                    "typedef struct list_S { int len; struct list_S *next; } list_T;"};
+    const RQ_Target failure = {.file = "body_api.c",
+                               .suffix = "body_api.report_failure",
+                               .label = "Function",
+                               .declaration_line = 1,
+                               .declaration_text =
+                                   "void report_failure(const char *what) { (void)what; }"};
+    const RQ_Target counter = {.file = "body_api.c",
+                               .suffix = "body_api.counter",
+                               .label = "Variable",
+                               .declaration_line = 2,
+                               .declaration_text = "int counter;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "call-in-a-replacement",
+         .site = {.file = "body_use.c", .caller = "body_use.checked", .needle = "CHECK(v)"},
+         .relation = "CALLS",
+         .target = failure},
+        {.case_id = "read-in-a-replacement-without-parameters",
+         .site = {.file = "body_use.c", .caller = "body_use.reads", .needle = "READ_COUNTER()"},
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "pasted-name",
+         .site = {.file = "body_use.c", .caller = "body_use.registers", .needle = "REGISTER(Open)"},
+         .relation = "USAGE",
+         .target = {.file = "body_api.c",
+                    .suffix = "body_api.RM_Open",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "int RM_Open(int v) { return v; }"}},
+        {.case_id = "call-beside-the-pasted-name",
+         .site = {.file = "body_use.c", .caller = "body_use.registers", .needle = "REGISTER(Open)"},
+         .relation = "CALLS",
+         .target = {.file = "body_api.c",
+                    .suffix = "body_api.register_it",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "int register_it(int (*f)(int)) { return f(0); }"}},
+        {.case_id = "object-like-macro-at-a-value",
+         .site = {.file = "body_use.c", .caller = "body_use.reads_object", .needle = "CURRENT"},
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "object-like-rename-at-a-call",
+         .site = {.file = "body_use.c", .caller = "body_use.renamed", .needle = "sd_new(v)"},
+         .relation = "CALLS",
+         .target = {.file = "body_api.c",
+                    .suffix = "body_api.hi_new",
+                    .label = "Function",
+                    .declaration_line = 5,
+                    .declaration_text = "int hi_new(int v) { return v; }"}},
+        {.case_id = "member-is-the-field-and-not-the-function-of-that-name",
+         .site = {.file = "body_use.c", .caller = "body_use.member", .needle = "MEMBER_OF(h)"},
+         .relation = "USAGE",
+         .target = {.file = "body_use.c",
+                    .suffix = "body_use.holder.report_failure",
+                    .label = "Field",
+                    .declaration_line = 14,
+                    .declaration_text = "struct holder { int report_failure; };"}},
+        {.case_id = "type-a-template-scope-names",
+         .site = {.file = "qualified.cpp", .caller = "qualified.through_template", .needle = "TCALL(v)"},
+         .relation = "USAGE",
+         .target = {.file = "qualified.cpp",
+                    .suffix = "qualified.Holder",
+                    .label = "Class",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "template <class T> struct Holder { static int qualified_helper(int v) { return v; } };"}},
+        {.case_id = "word-handed-to-a-function-this-unit-sees",
+         .site = {.file = "body_use.c",
+                  .caller = "body_use.handed_function",
+                  .needle = "HAND_TO_FUNCTION(v)"},
+         .relation = "USAGE",
+         .target = counter},
+        {.case_id = "the-function-it-is-handed-to",
+         .site = {.file = "body_use.c",
+                  .caller = "body_use.handed_function",
+                  .needle = "HAND_TO_FUNCTION(v)"},
+         .relation = "CALLS",
+         .target = {.file = "body_api.c",
+                    .suffix = "body_api.register_value",
+                    .label = "Function",
+                    .declaration_line = 7,
+                    .declaration_text = "int register_value(int v, int w) { return v + w; }"}},
+        {.case_id = "type-a-macro-renames",
+         .site = C_TU_WORD("body_use.c", body_use, "body_use.through_alias", "(list_alias", "list_alias"),
+         .relation = "USAGE",
+         .target = list_type},
+        {.case_id = "parameter-type-of-the-member-read",
+         .site = C_TU_WORD("body_use.c", body_use, "body_use.read_len", "read_len(", "list_T"),
+         .relation = "USAGE",
+         .target = list_type},
+        {.case_id = "member-read-through-a-parameter",
+         .site = {.file = "body_use.c", .caller = "body_use.read_len", .needle = "LIST_LEN(l)"},
+         .relation = "USAGE",
+         .target = list_len},
+        {.case_id = "parameter-type-of-the-member-chain",
+         .site = C_TU_WORD("body_use.c", body_use, "body_use.read_next", "read_next(", "list_T"),
+         .relation = "USAGE",
+         .target = list_type},
+        {.case_id = "first-member-of-a-chain",
+         .site = {.file = "body_use.c", .caller = "body_use.read_next", .needle = "NEXT_LEN(l)"},
+         .relation = "USAGE",
+         .target = {.file = "body_api.h",
+                    .suffix = "body_api.list_S.next",
+                    .label = "Field",
+                    .declaration_line = 9,
+                    .declaration_text = "typedef struct list_S { int len; struct list_S *next; } list_T;"},
+         .dispatch_group = "chain"},
+        {.case_id = "second-member-of-a-chain",
+         .site = {.file = "body_use.c", .caller = "body_use.read_next", .needle = "NEXT_LEN(l)"},
+         .relation = "USAGE",
+         .target = list_len,
+         .dispatch_group = "chain"},
+        {.case_id = "parameter-type-of-the-call-decoy",
+         .site = C_TU_WORD("body_use.c", body_use, "body_use.through_call", "(other_T", "other_T"),
+         .relation = "USAGE",
+         .target = {.file = "body_api.h",
+                    .suffix = "body_api.other_T",
+                    .label = "Type",
+                    .declaration_line = 12,
+                    .declaration_text = "typedef struct other_S { int len; } other_T;"}},
+        {.case_id = "every-definition-names-it",
+         .site = {.file = "body_use.c", .caller = "body_use.both_branches", .needle = "BOTH_BRANCHES(v)"},
+         .relation = "CALLS",
+         .target = failure},
+        {.case_id = "macro-defined-in-the-function-body",
+         .site = {.file = "body_use.c", .caller = "body_use.in_body", .needle = "BODY_CHECK(v)"},
+         .relation = "CALLS",
+         .target = failure},
+        {.case_id = "macro-handed-on-by-a-macro",
+         .site = {.file = "body_use.c", .caller = "body_use.nested", .needle = "TWICE(v)"},
+         .relation = "CALLS",
+         .target = failure},
+        {.case_id = "qualified-name-in-its-namespace",
+         .site = {.file = "qualified.cpp", .caller = "qualified.qualified", .needle = "QCALL(v)"},
+         .relation = "CALLS",
+         .target = {.file = "qualified.cpp",
+                    .suffix = "qualified.other.qualified_helper",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "int qualified_helper(int v) { return v + 1; }"}},
+        {.case_id = "global-name-from-a-member-function",
+         .site = {.file = "qualified.cpp", .caller = "qualified.Reaches.global", .needle = "GLOBAL(v)"},
+         .relation = "CALLS",
+         .target = {.file = "qualified.cpp",
+                    .suffix = "qualified.other.qualified_helper",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "int qualified_helper(int v) { return v + 1; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "the-member-of-what-a-call-returns",
+         .site = {.file = "body_use.c", .caller = "body_use.through_call", .needle = "THROUGH_CALL(o)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "receiver-of-no-known-type",
+         .site = {.file = "body_use.c", .caller = "body_use.no_receiver", .needle = "LIST_LEN(p)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "parameter-of-a-prototype-in-a-replacement",
+         .site = {.file = "body_use.c",
+                  .caller = "body_use.prototype_parameter",
+                  .needle = "PROTOTYPE_PARAMETER(v)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "object-whose-tag-has-its-spelling",
+         .site = {.file = "body_use.c", .caller = "body_use.read_object", .needle = "READ_OBJECT()"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "branch-of-a-generic-selection",
+         .site = {.file = "body_use.c", .caller = "body_use.selected", .needle = "SELECT_BY_TYPE(v)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "word-a-macro-reads-as-a-member",
+         .site = {.file = "body_use.c", .caller = "body_use.handed_member", .needle = "HAND_ON_MEMBER(p)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "word-handed-to-a-callee-nothing-declares",
+         .site = {.file = "body_use.c", .caller = "body_use.handed_unknown", .needle = "HAND_TO_UNKNOWN(v)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "word-offsetof-reads-as-a-member",
+         .site = {.file = "body_use.c",
+                  .caller = "body_use.handed_offset",
+                  .needle = "HAND_THROUGH_OFFSET(list_T)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "this-file-undefined-the-macro",
+         .site = {.file = "body_use.c",
+                  .caller = "body_use.after_undef",
+                  .needle = "CHECK(v)",
+                  .occurrence_index = 2},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "only-one-definition-names-it",
+         .site = {.file = "body_use.c", .caller = "body_use.one_branch", .needle = "ONE_BRANCH(v)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "local-at-the-use-takes-the-name",
+         .site = {.file = "body_use.c", .caller = "body_use.shadowed", .needle = "READ_COUNTER()"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "the-macros-own-local-takes-the-name",
+         .site = {.file = "body_use.c", .caller = "body_use.own_local", .needle = "HELPER_LOCAL(v)"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "nothing-declares-the-function-here",
+         .site = {.file = "hidden_use.c", .caller = "hidden_use.undeclared", .needle = "CALL_HIDDEN(v)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "a-template-scope-is-not-read",
+         .site = {.file = "qualified.cpp",
+                  .caller = "qualified.through_template",
+                  .needle = "TCALL(v)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "the-class-comes-first-in-a-member-function",
+         .site = {.file = "qualified.cpp", .caller = "qualified.Own.plain", .needle = "PLAIN(v)"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-body",
+                             .sources = C_TU_BODY,
+                             .source_count = sizeof(C_TU_BODY) / sizeof(C_TU_BODY[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Lua's lauxlib.h writes `#if COMPAT / #define luaL_getn(L,i) ... / #else / int (luaL_getn)(...); /
+ * #endif`, and xxhash defines XXH_swap64 beside a builtin the same way: the function is one branch
+ * of a conditional that is read in full. A macro with no such partner still decides the name. */
+#define C_TU_ALT_H                                                                              \
+    "#ifndef ALT_H\n"                                                                           \
+    "#define ALT_H\n"                                                                           \
+    "#if defined(USE_COMPAT)\n"                                                                 \
+    "#define get_len(x) (x)\n"                                                                  \
+    "#else\n"                                                                                   \
+    "int (get_len)(int x);\n"                                                                   \
+    "#endif\n"                                                                                  \
+    "#if defined(USE_BUILTIN)\n"                                                                \
+    "#define swap_bytes __builtin_bswap32\n"                                                    \
+    "#else\n"                                                                                   \
+    "static int swap_bytes(int v) { return v; }\n"                                              \
+    "#endif\n"                                                                                  \
+    "int always(int x);\n"                                                                      \
+    "#define always(x) (x)\n"                                                                   \
+    "#if defined(ONLY_MACRO)\n"                                                                 \
+    "#define sometimes(x) (x)\n"                                                                \
+    "#endif\n"                                                                                  \
+    "int sometimes(int x);\n"                                                                   \
+    "#endif\n"
+#define C_TU_ALT_C                                                                              \
+    "int (get_len)(int x) { return x; }\n"                                                      \
+    "int (always)(int x) { return x; }\n"                                                       \
+    "int (sometimes)(int x) { return x; }\n"
+#define C_TU_ALT_USE                                                                            \
+    "#include \"alt.h\"\n"                                                                      \
+    "int use_len(int v) { return get_len(v); }\n"                                               \
+    "int use_swap(int v) { return swap_bytes(v); }\n"                                           \
+    "int use_always(int v) { return always(v); }\n"                                             \
+    "int use_sometimes(int v) { return sometimes(v); }\n"
+static const RQ_Source C_TU_ALT[] = {{.path = "alt.h", .text = C_TU_ALT_H},
+                                     {.path = "alt.c", .text = C_TU_ALT_C},
+                                     {.path = "alt_use.c", .text = C_TU_ALT_USE}};
+
+TEST(resolver_c_macro_in_one_branch_leaves_the_function_in_another) {
+    const RQ_Expected expected[] = {
+        {.case_id = "prototype-in-the-other-branch",
+         .site = {.file = "alt_use.c", .caller = "alt_use.use_len", .needle = "get_len(v)"},
+         .relation = "CALLS",
+         .target = {.file = "alt.c",
+                    .suffix = "alt.get_len",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "int (get_len)(int x) { return x; }"}},
+        {.case_id = "definition-in-the-other-branch",
+         .site = {.file = "alt_use.c", .caller = "alt_use.use_swap", .needle = "swap_bytes(v)"},
+         .relation = "CALLS",
+         .target = {.file = "alt.h",
+                    .suffix = "alt.swap_bytes",
+                    .label = "Function",
+                    .declaration_line = 11,
+                    .declaration_text = "static int swap_bytes(int v) { return v; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "macro-outside-any-conditional",
+         .site = {.file = "alt_use.c", .caller = "alt_use.use_always", .needle = "always(v)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "macro-in-a-conditional-with-no-other-branch",
+         .site = {.file = "alt_use.c", .caller = "alt_use.use_sometimes", .needle = "sometimes(v)"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-branch",
+                             .sources = C_TU_ALT,
+                             .source_count = sizeof(C_TU_ALT) / sizeof(C_TU_ALT[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* A macro after the parameters leaves the word as a statement of its own: redismodule.h lost its
+ * RedisModule_Init that way, to 500 lines of `(*RedisModule_X)(...) REDISMODULE_ATTR;`. */
+#define C_TU_TRAIL_H                                                                            \
+    "#ifndef TRAIL_H\n"                                                                         \
+    "#define TRAIL_H\n"                                                                         \
+    "#define API\n"                                                                             \
+    "#define API_ATTR __attribute__((common))\n"                                                \
+    "#define API_UNUSED __attribute__((unused))\n"                                              \
+    "API int (*Api_Open)(int v) API_ATTR;\n"                                                    \
+    "API int (*Api_Close)(int v) API_ATTR;\n"                                                   \
+    "API int (*Api_Read)(int v) API_ATTR;\n"                                                    \
+    "API int Api_Twice(int v) API_ATTR API_UNUSED;\n"                                           \
+    "API int Api_Other(int v) API_ATTR API_UNUSED;\n"                                           \
+    "#define Api_IsReady(id) ((id) == 0)\n"                                                     \
+    "static int Api_Init(int v) API_UNUSED;\n"                                                  \
+    "static int Api_Init(int v) {\n"                                                            \
+    "    return v;\n"                                                                           \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_TRAIL_C "#include \"trail.h\"\nint Api_Twice(int v) { return v; }\n"
+#define C_TU_TRAIL_USE                                                                          \
+    "#include \"trail.h\"\n"                                                                    \
+    "int on_load(int v) { return Api_Init(v); }\n"                                              \
+    "int on_twice(int v) { return Api_Twice(v); }\n"
+static const RQ_Source C_TU_TRAIL[] = {{.path = "trail.h", .text = C_TU_TRAIL_H},
+                                       {.path = "trail.c", .text = C_TU_TRAIL_C},
+                                       {.path = "trail_use.c", .text = C_TU_TRAIL_USE}};
+
+TEST(resolver_c_macro_after_the_parameters_keeps_what_follows) {
+    const RQ_Expected expected[] = {
+        {.case_id = "definition-after-attribute-macro-prototypes",
+         .site = {.file = "trail_use.c", .caller = "trail_use.on_load", .needle = "Api_Init(v)"},
+         .relation = "CALLS",
+         .target = {.file = "trail.h",
+                    .suffix = "trail.Api_Init",
+                    .label = "Function",
+                    .declaration_line = 13,
+                    .declaration_text = "static int Api_Init(int v) {"}},
+        {.case_id = "prototype-between-two-attribute-macros",
+         .site = {.file = "trail_use.c", .caller = "trail_use.on_twice", .needle = "Api_Twice(v)"},
+         .relation = "CALLS",
+         .target = {.file = "trail.c",
+                    .suffix = "trail.Api_Twice",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "int Api_Twice(int v) { return v; }"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-trailing-macro",
+                             .sources = C_TU_TRAIL,
+                             .source_count = sizeof(C_TU_TRAIL) / sizeof(C_TU_TRAIL[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* redismodule.h: `#if defined(REDISMODULE_CORE) / #define RedisModuleString robj / #endif`, and only
+ * server.h defines the switch before including it. A module's unit leaves the switch off, so the
+ * name is the type. A switch nothing in the project defines may come from the build. */
+#define C_TU_SWITCH_API                                                                         \
+    "#ifndef API_H\n"                                                                           \
+    "#define API_H\n"                                                                           \
+    "#if defined(API_CORE)\n"                                                                   \
+    "#define Thing core_thing\n"                                                                \
+    "#endif\n"                                                                                  \
+    "#ifndef API_CORE\n"                                                                        \
+    "typedef struct Thing Thing;\n"                                                             \
+    "#endif\n"                                                                                  \
+    "typedef struct Other Other;\n"                                                             \
+    "#ifdef FROM_THE_BUILD\n"                                                                   \
+    "#define Other build_other\n"                                                               \
+    "#endif\n"                                                                                  \
+    "#endif\n"
+#define C_TU_SWITCH_CORE "#define API_CORE 1\n#include \"api.h\"\ntypedef int core_thing;\n"
+#define C_TU_SWITCH_MODULE                                                                      \
+    "#include \"api.h\"\n"                                                                      \
+    "int module_use(Thing *t) { return t != 0; }\n"                                             \
+    "int module_other(Other *t) { return t != 0; }\n"
+#define C_TU_SWITCH_INSIDE                                                                      \
+    "#include \"core.h\"\n"                                                                     \
+    "int inside_use(Thing *t) { return t != 0; }\n"
+static const RQ_Source C_TU_SWITCH[] = {{.path = "api.h", .text = C_TU_SWITCH_API},
+                                        {.path = "core.h", .text = C_TU_SWITCH_CORE},
+                                        {.path = "module_use.c", .text = C_TU_SWITCH_MODULE},
+                                        {.path = "inside_use.c", .text = C_TU_SWITCH_INSIDE}};
+
+TEST(resolver_c_macro_behind_a_switch_this_unit_leaves_off) {
+    const char *module = C_TU_SWITCH_MODULE;
+    const char *inside = C_TU_SWITCH_INSIDE;
+    const RQ_Expected expected[] = {
+        {.case_id = "type-where-the-switch-is-off",
+         .site = C_TU_WORD("module_use.c", module, "module_use.module_use", "(Thing", "Thing"),
+         .relation = "USAGE",
+         .target = {.file = "api.h",
+                    .suffix = "api.Thing",
+                    .label = "Type",
+                    .declaration_line = 7,
+                    .declaration_text = "typedef struct Thing Thing;"}},
+        {.case_id = "what-the-macro-names-where-the-switch-is-on",
+         .site = C_TU_WORD("inside_use.c", inside, "inside_use.inside_use", "(Thing", "Thing"),
+         .relation = "USAGE",
+         .target = {.file = "core.h",
+                    .suffix = "core.core_thing",
+                    .label = "Type",
+                    .declaration_line = 3,
+                    .declaration_text = "typedef int core_thing;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-switch-only-the-build-can-set",
+         .site = C_TU_WORD("module_use.c", module, "module_use.module_other", "(Other", "Other"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-switch",
+                             .sources = C_TU_SWITCH,
+                             .source_count = sizeof(C_TU_SWITCH) / sizeof(C_TU_SWITCH[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `typval_T argv[3];` with no initializer bound no type, where `typval_T argv[] = {...}` did. neovim's
+ * tv_dict_watcher_notify, parse_csi and suggest_trie_walk read members through such arrays. */
+#define C_TU_ARR_H                                                                              \
+    "#ifndef ARR_H\n"                                                                           \
+    "#define ARR_H\n"                                                                           \
+    "typedef struct item_S { int val; } item_T;\n"                                              \
+    "typedef struct other_S { int more; } other_T;\n"                                           \
+    "#endif\n"
+#define C_TU_ARR_USE                                                                            \
+    "#include \"arr.h\"\n"                                                                      \
+    "int local_array(int i) { item_T argv[3]; return argv[i].val; }\n"                          \
+    "int local_pointers(int i) { item_T *ptrs[3]; return ptrs[i]->val; }\n"                     \
+    "int two_dimensions(int i) { item_T grid[2][2]; return grid[i][i].val; }\n"                 \
+    "int no_such_member(int i) { other_T o[2]; return o[i].val; }\n"
+static const RQ_Source C_TU_ARR[] = {{.path = "arr.h", .text = C_TU_ARR_H},
+                                     {.path = "arr_use.c", .text = C_TU_ARR_USE}};
+
+TEST(resolver_c_local_array_types_its_elements) {
+    const char *use = C_TU_ARR_USE;
+    const RQ_Target val = {.file = "arr.h",
+                           .suffix = "arr.item_S.val",
+                           .label = "Field",
+                           .declaration_line = 3,
+                           .declaration_text = "typedef struct item_S { int val; } item_T;"};
+    const RQ_Target item = {.file = "arr.h",
+                            .suffix = "arr.item_T",
+                            .label = "Type",
+                            .declaration_line = 3,
+                            .declaration_text = "typedef struct item_S { int val; } item_T;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "type-of-a-local-array",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.local_array", "item_T argv", "item_T"),
+         .relation = "USAGE",
+         .target = item},
+        {.case_id = "member-of-an-element",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.local_array", "argv[i].val", "val"),
+         .relation = "USAGE",
+         .target = val},
+        {.case_id = "type-of-an-array-of-pointers",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.local_pointers", "item_T *ptrs", "item_T"),
+         .relation = "USAGE",
+         .target = item},
+        {.case_id = "member-through-an-element-pointer",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.local_pointers", "ptrs[i]->val", "val"),
+         .relation = "USAGE",
+         .target = val},
+        {.case_id = "type-of-two-dimensions",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.two_dimensions", "item_T grid", "item_T"),
+         .relation = "USAGE",
+         .target = item},
+        {.case_id = "member-of-an-element-of-an-element",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.two_dimensions", "grid[i][i].val", "val"),
+         .relation = "USAGE",
+         .target = val},
+        {.case_id = "type-of-the-decoy-array",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.no_such_member", "other_T o", "other_T"),
+         .relation = "USAGE",
+         .target = {.file = "arr.h",
+                    .suffix = "arr.other_T",
+                    .label = "Type",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct other_S { int more; } other_T;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-member-the-element-type-lacks",
+         .site = C_TU_WORD("arr_use.c", use, "arr_use.no_such_member", "o[i].val", "val"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-local-arrays",
+                             .sources = C_TU_ARR,
+                             .source_count = sizeof(C_TU_ARR) / sizeof(C_TU_ARR[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `union { ... } data;` has no tag, so its members had no node and the chain through it stopped:
+ * neovim's Object.data, redis's RedisModuleKey.u, llvm's APInt.U. It is a class named for its owner
+ * and the member. With no declarator its members are members of the class around it. */
+#define C_TU_AGG_H                                                                              \
+    "#ifndef AGG_H\n"                                                                           \
+    "#define AGG_H\n"                                                                           \
+    "typedef struct { int len; } Text;\n"                                                       \
+    "typedef struct {\n"                                                                        \
+    "  int kind;\n"                                                                             \
+    "  union { int number; Text text; } data;\n"                                                \
+    "  struct { int depth; struct { int leaf; } inner; } levels[2];\n"                          \
+    "  union { int first; int second; };\n"                                                     \
+    "} Value;\n"                                                                                \
+    "typedef struct {\n"                                                                        \
+    "  union { int number; } data;\n"                                                           \
+    "} Other;\n"                                                                                \
+    "#endif\n"
+#define C_TU_AGG_USE                                                                            \
+    "#include \"agg.h\"\n"                                                                      \
+    "void write_number(Value *v) { v->data.number = 1; }\n"                                     \
+    "int read_text(Value v) { return v.data.text.len; }\n"                                      \
+    "int read_leaf(Value *v) { return v->levels[1].inner.leaf; }\n"                             \
+    "int read_flat(Value *v) { return v->first; }\n"                                            \
+    "int read_other(Other *o) { return o->data.number; }\n"                                     \
+    "int read_absent(Value *v) { return v->data.absent; }\n"
+#define C_TU_AGG_SAME                                                                           \
+    "typedef struct { union { int here; } local; } Own;\n"                                      \
+    "int same_file(Own *p) { return p->local.here; }\n"
+static const RQ_Source C_TU_AGG[] = {{.path = "agg.h", .text = C_TU_AGG_H},
+                                     {.path = "agg_use.c", .text = C_TU_AGG_USE},
+                                     {.path = "agg_same.c", .text = C_TU_AGG_SAME}};
+
+TEST(resolver_c_unnamed_aggregate_is_a_class_of_its_own) {
+    const char *use = C_TU_AGG_USE;
+    const char *same = C_TU_AGG_SAME;
+    static const char data_line[] = "  union { int number; Text text; } data;";
+    static const char levels_line[] = "  struct { int depth; struct { int leaf; } inner; } levels[2];";
+    static const char flat_line[] = "  union { int first; int second; };";
+    static const char other_data_line[] = "  union { int number; } data;";
+#define AGG_FIELD(suffix_, line_, text_)                                                        \
+    {.file = "agg.h", .suffix = suffix_, .label = "Field", .declaration_line = line_,            \
+     .declaration_text = text_}
+#define AGG_USAGE(id, caller, context, word, target_)                                           \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("agg_use.c", use, "agg_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+    const RQ_Target value = {.file = "agg.h",
+                             .suffix = "agg.Value",
+                             .label = "Class",
+                             .declaration_line = 4,
+                             .declaration_text = "typedef struct {"};
+    const RQ_Target data = AGG_FIELD("agg.Value.data", 6, data_line);
+    const RQ_Expected expected[] = {
+        AGG_USAGE("type-of-the-writer", "write_number", "Value *v) { v->data.number", "Value", value),
+        {.case_id = "write-into-the-union",
+         .site = C_TU_WORD("agg_use.c", use, "agg_use.write_number", "number = 1", "number"),
+         .relation = "WRITES",
+         .target = AGG_FIELD("agg.Value$data.number", 6, data_line)},
+        AGG_USAGE("type-of-the-reader", "read_text", "Value v) {", "Value", value),
+        AGG_USAGE("the-member-holding-the-union", "read_text", "data.text.len", "data", data),
+        AGG_USAGE("a-member-of-the-union", "read_text", "text.len", "text",
+                  AGG_FIELD("agg.Value$data.text", 6, data_line)),
+        AGG_USAGE("the-chain-goes-on-through-its-type", "read_text", "len; }", "len",
+                  AGG_FIELD("agg.Text.len", 3, "typedef struct { int len; } Text;")),
+        AGG_USAGE("type-of-the-deep-reader", "read_leaf", "Value *v) { return v->levels", "Value",
+                  value),
+        AGG_USAGE("an-array-of-an-unnamed-struct", "read_leaf", "levels[1]", "levels",
+                  AGG_FIELD("agg.Value.levels", 7, levels_line)),
+        AGG_USAGE("an-unnamed-struct-inside-one", "read_leaf", "inner.leaf", "inner",
+                  AGG_FIELD("agg.Value$levels.inner", 7, levels_line)),
+        AGG_USAGE("a-member-two-levels-in", "read_leaf", "leaf; }", "leaf",
+                  AGG_FIELD("agg.Value$levels$inner.leaf", 7, levels_line)),
+        AGG_USAGE("type-of-the-flat-reader", "read_flat", "Value *v) { return v->first", "Value",
+                  value),
+        AGG_USAGE("no-declarator-belongs-to-the-class-around-it", "read_flat", "first; }", "first",
+                  AGG_FIELD("agg.Value.first", 8, flat_line)),
+        AGG_USAGE("type-of-the-other-struct", "read_other", "Other *o", "Other",
+                  ((RQ_Target){.file = "agg.h",
+                               .suffix = "agg.Other",
+                               .label = "Class",
+                               .declaration_line = 10,
+                               .declaration_text = "typedef struct {"})),
+        AGG_USAGE("its-own-member-of-that-name", "read_other", "data.number; }", "data",
+                  AGG_FIELD("agg.Other.data", 11, other_data_line)),
+        AGG_USAGE("its-own-union-not-the-namesake", "read_other", "number; }", "number",
+                  AGG_FIELD("agg.Other$data.number", 11, other_data_line)),
+        AGG_USAGE("type-of-the-absent-reader", "read_absent", "Value *v) { return v->data.absent",
+                  "Value", value),
+        AGG_USAGE("the-member-before-the-absent-one", "read_absent", "data.absent", "data", data),
+        {.case_id = "type-in-the-same-file",
+         .site = C_TU_WORD("agg_same.c", same, "agg_same.same_file", "Own *p", "Own"),
+         .relation = "USAGE",
+         .target = {.file = "agg_same.c",
+                    .suffix = "agg_same.Own",
+                    .label = "Class",
+                    .declaration_line = 1,
+                    .declaration_text = "typedef struct { union { int here; } local; } Own;"}},
+        {.case_id = "member-in-the-same-file",
+         .site = C_TU_WORD("agg_same.c", same, "agg_same.same_file", "local.here", "local"),
+         .relation = "USAGE",
+         .target = {.file = "agg_same.c",
+                    .suffix = "agg_same.Own.local",
+                    .label = "Field",
+                    .declaration_line = 1,
+                    .declaration_text = "typedef struct { union { int here; } local; } Own;"}},
+        {.case_id = "through-a-union-in-the-same-file",
+         .site = C_TU_WORD("agg_same.c", same, "agg_same.same_file", "here; }\n", "here"),
+         .relation = "USAGE",
+         .target = {.file = "agg_same.c",
+                    .suffix = "agg_same.Own$local.here",
+                    .label = "Field",
+                    .declaration_line = 1,
+                    .declaration_text = "typedef struct { union { int here; } local; } Own;"}},
+    };
+#undef AGG_USAGE
+#undef AGG_FIELD
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-member-the-union-lacks",
+         .site = C_TU_WORD("agg_use.c", use, "agg_use.read_absent", "absent; }", "absent"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-unnamed-aggregates",
+                             .sources = C_TU_AGG,
+                             .source_count = sizeof(C_TU_AGG) / sizeof(C_TU_AGG[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `ns::Name` written outside ns stayed unbound, so nothing read through it bound either: every
+ * `llvm::StringRef` in clang and `cl::opt` under `using namespace llvm`. The qualifier is matched
+ * whole against the declaration's name, from a place the lookup of its first segment reaches. */
+#define C_TU_Q_H                                                                                \
+    "#ifndef Q_HPP\n"                                                                           \
+    "#define Q_HPP\n"                                                                           \
+    "namespace ns {\n"                                                                          \
+    "struct Name { int in_ns; };\n"                                                             \
+    "template <typename T> struct Box { T box_field; };\n"                                      \
+    "}\n"                                                                                       \
+    "namespace other {\n"                                                                       \
+    "struct Name { int in_other; };\n"                                                          \
+    "}\n"                                                                                       \
+    "namespace outer {\n"                                                                       \
+    "namespace in2 {\n"                                                                         \
+    "struct Deep { int deep_field; };\n"                                                        \
+    "}\n"                                                                                       \
+    "}\n"                                                                                       \
+    "namespace elsewhere {\n"                                                                   \
+    "namespace hidden {\n"                                                                      \
+    "struct Secret { int secret_field; };\n"                                                    \
+    "}\n"                                                                                       \
+    "}\n"                                                                                       \
+    "namespace mid {\n"                                                                         \
+    "namespace sub {\n"                                                                         \
+    "struct Sub { int sub_field; };\n"                                                          \
+    "}\n"                                                                                       \
+    "namespace twice {\n"                                                                       \
+    "struct Twice { int twice_field; };\n"                                                      \
+    "}\n"                                                                                       \
+    "}\n"                                                                                       \
+    "namespace twice {\n"                                                                       \
+    "struct Twice { int twice_field; };\n"                                                      \
+    "}\n"                                                                                       \
+    "template <typename T> struct Plain { T plain_field; };\n"                                  \
+    "struct Holder { struct Inner { int inner_field; }; };\n"                                   \
+    "#endif\n"
+#define C_TU_Q_USE                                                                              \
+    "#include \"q.hpp\"\n"                                                                      \
+    "int two_namespaces(ns::Name *a, other::Name *b) { return a->in_ns + b->in_other; }\n"      \
+    "using namespace outer;\n"                                                                  \
+    "int through_using(in2::Deep *d) { return d->deep_field; }\n"                               \
+    "int not_reachable(hidden::Secret *s) { return s->secret_field; }\n"                        \
+    "namespace mid {\n"                                                                         \
+    "int enclosing(sub::Sub *q) { return q->sub_field; }\n"                                     \
+    "int two_candidates(twice::Twice *t) { return t->twice_field; }\n"                          \
+    "}\n"                                                                                       \
+    "int templates(ns::Box<int> *b, Plain<int> p) { return b->box_field + p.plain_field; }\n"   \
+    "int rooted(::ns::Name *a) { return a->in_ns; }\n"                                          \
+    "int nested(Holder::Inner *i) { return i->inner_field; }\n"                                 \
+    "template <template <typename> class T> int parameter(T<int> *t) { return 0; }\n"
+static const RQ_Source C_TU_Q[] = {{.path = "q.hpp", .text = C_TU_Q_H},
+                                   {.path = "q_use.cpp", .text = C_TU_Q_USE}};
+
+TEST(resolver_cpp_qualified_type_binds_from_where_its_lookup_starts) {
+    const char *use = C_TU_Q_USE;
+#define Q_TARGET(suffix_, label_, line_, text_)                                                 \
+    ((RQ_Target){.file = "q.hpp",                                                                \
+                 .suffix = suffix_,                                                              \
+                 .label = label_,                                                                \
+                 .declaration_line = line_,                                                      \
+                 .declaration_text = text_})
+#define Q_USAGE(id, caller, context, word, target_)                                             \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("q_use.cpp", use, "q_use." caller, context, word),                        \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+    static const char name_line[] = "struct Name { int in_ns; };";
+    static const char other_line[] = "struct Name { int in_other; };";
+    static const char box_line[] = "template <typename T> struct Box { T box_field; };";
+    static const char plain_line[] = "template <typename T> struct Plain { T plain_field; };";
+    static const char holder_line[] = "struct Holder { struct Inner { int inner_field; }; };";
+    static const char deep_line[] = "struct Deep { int deep_field; };";
+    static const char sub_line[] = "struct Sub { int sub_field; };";
+    const RQ_Expected expected[] = {
+        Q_USAGE("the-namespace-it-names", "two_namespaces", "ns::Name *a", "Name",
+                Q_TARGET("q.ns.Name", "Class", 4, name_line)),
+        Q_USAGE("the-other-namesake", "two_namespaces", "other::Name *b", "Name",
+                Q_TARGET("q.other.Name", "Class", 8, other_line)),
+        Q_USAGE("a-member-through-the-first", "two_namespaces", "in_ns +", "in_ns",
+                Q_TARGET("q.ns.Name.in_ns", "Field", 4, name_line)),
+        Q_USAGE("a-member-through-the-second", "two_namespaces", "in_other; }", "in_other",
+                Q_TARGET("q.other.Name.in_other", "Field", 8, other_line)),
+        Q_USAGE("from-a-using-directive", "through_using", "in2::Deep", "Deep",
+                Q_TARGET("q.outer.in2.Deep", "Class", 12, deep_line)),
+        Q_USAGE("a-member-from-a-using-directive", "through_using", "deep_field; }", "deep_field",
+                Q_TARGET("q.outer.in2.Deep.deep_field", "Field", 12, deep_line)),
+        Q_USAGE("from-the-namespace-around-it", "mid.enclosing", "sub::Sub", "Sub",
+                Q_TARGET("q.mid.sub.Sub", "Class", 22, sub_line)),
+        Q_USAGE("a-member-from-the-namespace-around-it", "mid.enclosing", "sub_field; }", "sub_field",
+                Q_TARGET("q.mid.sub.Sub.sub_field", "Field", 22, sub_line)),
+        Q_USAGE("a-qualified-template", "templates", "ns::Box<int>", "Box",
+                Q_TARGET("q.ns.Box", "Class", 5, box_line)),
+        Q_USAGE("a-template-with-no-qualifier", "templates", "Plain<int>", "Plain",
+                Q_TARGET("q.Plain", "Class", 31, plain_line)),
+        Q_USAGE("a-member-through-a-qualified-template", "templates", "box_field +", "box_field",
+                Q_TARGET("q.ns.Box.box_field", "Field", 5, box_line)),
+        Q_USAGE("a-member-through-a-template", "templates", "plain_field; }", "plain_field",
+                Q_TARGET("q.Plain.plain_field", "Field", 31, plain_line)),
+        Q_USAGE("from-the-global-scope", "rooted", "::ns::Name", "Name",
+                Q_TARGET("q.ns.Name", "Class", 4, name_line)),
+        Q_USAGE("a-member-from-the-global-scope", "rooted", "in_ns; }", "in_ns",
+                Q_TARGET("q.ns.Name.in_ns", "Field", 4, name_line)),
+        Q_USAGE("a-class-as-the-qualifier", "nested", "Holder::Inner", "Inner",
+                Q_TARGET("q.Holder.Inner", "Class", 32, holder_line)),
+        Q_USAGE("a-member-through-a-nested-class", "nested", "inner_field; }", "inner_field",
+                Q_TARGET("q.Holder.Inner.inner_field", "Field", 32, holder_line)),
+    };
+#undef Q_USAGE
+#undef Q_TARGET
+#define Q_NEVER(id, caller, context, word)                                                      \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("q_use.cpp", use, "q_use." caller, context, word),                        \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Forbidden forbidden[] = {
+        Q_NEVER("a-namespace-this-code-cannot-reach", "not_reachable", "hidden::Secret", "Secret"),
+        Q_NEVER("nothing-through-what-it-cannot-reach", "not_reachable", "secret_field; }",
+                "secret_field"),
+        Q_NEVER("two-places-the-name-could-start", "mid.two_candidates", "twice::Twice", "Twice"),
+        Q_NEVER("nothing-through-the-undecided-name", "mid.two_candidates", "twice_field; }",
+                "twice_field"),
+        Q_NEVER("a-template-template-parameter", "parameter", "T<int>", "T"),
+    };
+#undef Q_NEVER
+    const CTUCase fixture = {.suite = "c-tu-qualified-types",
+                             .sources = C_TU_Q,
+                             .source_count = sizeof(C_TU_Q) / sizeof(C_TU_Q[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `template <class T> void Box<T>::run() {}` was a free Function named run, and its body belonged to
+ * no node at all: `Box<T>` went into the name of the scope, and `ns::Box<T>::run` got no node. Most
+ * of llvm's Impl headers are written this way. It is a Method of Box, like `Plain::run`. */
+#define C_TU_OOL_H                                                                              \
+    "#ifndef TREE_HPP\n"                                                                        \
+    "#define TREE_HPP\n"                                                                        \
+    "namespace lib {\n"                                                                         \
+    "template <class T> class Tree {\n"                                                         \
+    "public:\n"                                                                                 \
+    "  void walk();\n"                                                                          \
+    "  void step();\n"                                                                          \
+    "  int depth;\n"                                                                            \
+    "};\n"                                                                                      \
+    "class Solid {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  void go();\n"                                                                            \
+    "  void back();\n"                                                                          \
+    "  int count;\n"                                                                            \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_OOL_USE                                                                            \
+    "#include \"tree.hpp\"\n"                                                                   \
+    "static void step() {}\n"                                                                   \
+    "namespace lib {\n"                                                                         \
+    "template <class T> void Tree<T>::step() {}\n"                                              \
+    "template <class T> void Tree<T>::walk() { step(); depth = 1; }\n"                          \
+    "void Solid::back() {}\n"                                                                   \
+    "}\n"                                                                                       \
+    "void lib::Solid::go() { back(); count = 1; }\n"
+static const RQ_Source C_TU_OOL[] = {{.path = "tree.hpp", .text = C_TU_OOL_H},
+                                     {.path = "tree_impl.cpp", .text = C_TU_OOL_USE}};
+
+TEST(resolver_cpp_out_of_line_template_member_is_a_method_of_its_class) {
+    const char *use = C_TU_OOL_USE;
+    const RQ_Expected expected[] = {
+        {.case_id = "the-class-before-the-free-namesake",
+         .site = {.file = "tree_impl.cpp",
+                  .caller = "tree_impl.Tree.walk",
+                  .needle = "step()",
+                  .occurrence_index = 2},
+         .relation = "CALLS",
+         .target = {.file = "tree_impl.cpp",
+                    .suffix = "tree_impl.Tree.step",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "template <class T> void Tree<T>::step() {}"}},
+        {.case_id = "a-field-of-the-template-from-its-body",
+         .site = C_TU_WORD("tree_impl.cpp", use, "tree_impl.Tree.walk", "depth = 1", "depth"),
+         .relation = "WRITES",
+         .target = {.file = "tree.hpp",
+                    .suffix = "tree.lib.Tree.depth",
+                    .label = "Field",
+                    .declaration_line = 8,
+                    .declaration_text = "  int depth;"}},
+        {.case_id = "a-sibling-through-the-qualified-name",
+         .site = {.file = "tree_impl.cpp",
+                  .caller = "tree_impl.Solid.go",
+                  .needle = "back()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "tree_impl.cpp",
+                    .suffix = "tree_impl.Solid.back",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text = "void Solid::back() {}"}},
+        {.case_id = "a-field-through-the-qualified-name",
+         .site = C_TU_WORD("tree_impl.cpp", use, "tree_impl.Solid.go", "count = 1", "count"),
+         .relation = "WRITES",
+         .target = {.file = "tree.hpp",
+                    .suffix = "tree.lib.Solid.count",
+                    .label = "Field",
+                    .declaration_line = 14,
+                    .declaration_text = "  int count;"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-out-of-line-template-members",
+                             .sources = C_TU_OOL,
+                             .source_count = sizeof(C_TU_OOL) / sizeof(C_TU_OOL[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `template <class U> int get(U u) { ... }` written in its class had no node: its body belonged to the
+ * file and nothing could call it. llvm's DenseMap, PatternMatch and ItaniumDemangle are full of them. */
+#define C_TU_MT_H                                                                               \
+    "struct Host {\n"                                                                           \
+    "  int count;\n"                                                                            \
+    "  int helper() { return 1; }\n"                                                            \
+    "  template <class U> int get(U u) { helper(); return count; }\n"                           \
+    "};\n"                                                                                      \
+    "template <class T> struct Tpl {\n"                                                         \
+    "  template <class U> int inner(U u) { return 2; }\n"                                       \
+    "};\n"
+#define C_TU_MT_USE                                                                             \
+    "#include \"mt.hpp\"\n"                                                                     \
+    "int use(Host &h, Tpl<int> &t) { return h.get(1) + t.inner(2); }\n"
+static const RQ_Source C_TU_MT[] = {{.path = "mt.hpp", .text = C_TU_MT_H},
+                                    {.path = "mt_use.cpp", .text = C_TU_MT_USE}};
+
+TEST(resolver_cpp_member_template_is_a_method_of_its_class) {
+    const char *header = C_TU_MT_H;
+    const char *use = C_TU_MT_USE;
+    static const char get_line[] = "  template <class U> int get(U u) { helper(); return count; }";
+    static const char inner_line[] = "  template <class U> int inner(U u) { return 2; }";
+    const RQ_Expected expected[] = {
+        {.case_id = "a-sibling-from-the-template-body",
+         .site = {.file = "mt.hpp", .caller = "mt.Host.get", .needle = "helper()", .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "mt.hpp",
+                    .suffix = "mt.Host.helper",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text = "  int helper() { return 1; }"}},
+        {.case_id = "a-field-from-the-template-body",
+         .site = C_TU_WORD("mt.hpp", header, "mt.Host.get", "count; }", "count"),
+         .relation = "USAGE",
+         .target = {.file = "mt.hpp",
+                    .suffix = "mt.Host.count",
+                    .label = "Field",
+                    .declaration_line = 2,
+                    .declaration_text = "  int count;"}},
+        {.case_id = "a-call-of-the-member-template",
+         .site = {.file = "mt_use.cpp", .caller = "mt_use.use", .needle = "h.get(1)"},
+         .relation = "CALLS",
+         .target = {.file = "mt.hpp",
+                    .suffix = "mt.Host.get",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = get_line}},
+        {.case_id = "a-call-of-a-member-template-of-a-template",
+         .site = {.file = "mt_use.cpp", .caller = "mt_use.use", .needle = "t.inner(2)"},
+         .relation = "CALLS",
+         .target = {.file = "mt.hpp",
+                    .suffix = "mt.Tpl.inner",
+                    .label = "Method",
+                    .declaration_line = 7,
+                    .declaration_text = inner_line}},
+        {.case_id = "the-class-in-the-signature",
+         .site = C_TU_WORD("mt_use.cpp", use, "mt_use.use", "Host &h", "Host"),
+         .relation = "USAGE",
+         .target = {.file = "mt.hpp",
+                    .suffix = "mt.Host",
+                    .label = "Class",
+                    .declaration_line = 1,
+                    .declaration_text = "struct Host {"}},
+        {.case_id = "the-template-in-the-signature",
+         .site = C_TU_WORD("mt_use.cpp", use, "mt_use.use", "Tpl<int>", "Tpl"),
+         .relation = "USAGE",
+         .target = {.file = "mt.hpp",
+                    .suffix = "mt.Tpl",
+                    .label = "Class",
+                    .declaration_line = 6,
+                    .declaration_text = "template <class T> struct Tpl {"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-member-templates",
+                             .sources = C_TU_MT,
+                             .source_count = sizeof(C_TU_MT) / sizeof(C_TU_MT[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Two forms the grammar reads as a function that swallows what follows. `#define` inside an initializer
+ * made a function OP of 1,400 lines of jemalloc's ctl.c, and a macro word before `namespace` made a
+ * function `namespace` of all of llvm's ConvertUTF.cpp. The functions inside are the ones to keep. */
+#define C_TU_SW_H                                                                               \
+    "#ifndef SW_H\n"                                                                            \
+    "#define SW_H\n"                                                                            \
+    "#define LIST OP(1) OP(2)\n"                                                                \
+    "#define Quiet_Warnings\n"                                                                  \
+    "#endif\n"
+#define C_TU_SW_TABLE                                                                           \
+    "#include \"sw.h\"\n"                                                                       \
+    "static const int table[] = {\n"                                                            \
+    "#define OP(n) n,\n"                                                                        \
+    "LIST\n"                                                                                    \
+    "#undef OP\n"                                                                               \
+    "  0\n"                                                                                     \
+    "};\n"                                                                                      \
+    "static int after_table(int v) { return v; }\n"                                             \
+    "int call_after(int v) { return after_table(v); }\n"
+#define C_TU_SW_NS                                                                              \
+    "#include \"sw.h\"\n"                                                                       \
+    "Quiet_Warnings\n"                                                                          \
+    "namespace lib {\n"                                                                         \
+    "static int inside(int v) { return v; }\n"                                                  \
+    "int call_inside(int v) { return inside(v); }\n"                                            \
+    "}\n"
+static const RQ_Source C_TU_SW[] = {{.path = "sw.h", .text = C_TU_SW_H},
+                                    {.path = "sw_table.c", .text = C_TU_SW_TABLE},
+                                    {.path = "sw_ns.cpp", .text = C_TU_SW_NS}};
+
+TEST(resolver_c_a_broken_head_does_not_swallow_the_functions_after_it) {
+    const RQ_Expected expected[] = {
+        {.case_id = "a-function-after-a-define-in-a-table",
+         .site = {.file = "sw_table.c", .caller = "sw_table.call_after", .needle = "after_table(v)"},
+         .relation = "CALLS",
+         .target = {.file = "sw_table.c",
+                    .suffix = "sw_table.after_table",
+                    .label = "Function",
+                    .declaration_line = 8,
+                    .declaration_text = "static int after_table(int v) { return v; }"}},
+        {.case_id = "a-function-after-a-word-before-namespace",
+         .site = {.file = "sw_ns.cpp", .caller = "sw_ns.lib.call_inside", .needle = "inside(v)"},
+         .relation = "CALLS",
+         .target = {.file = "sw_ns.cpp",
+                    .suffix = "sw_ns.lib.inside",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "static int inside(int v) { return v; }"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-swallowing-heads",
+                             .sources = C_TU_SW,
+                             .source_count = sizeof(C_TU_SW) / sizeof(C_TU_SW[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `wp->w_p_list` with `#define w_p_list w_onebuf_opt.wo_list`: no field of that name exists, and the
+ * compiler reads the replacement after the arrow. neovim has a thousand of these, with the macro written
+ * inside the struct beside the member, and the kernel's `sk->sk_family` has the same shape. */
+#define C_TU_MP_H                                                                               \
+    "#ifndef MP_H\n"                                                                            \
+    "#define MP_H\n"                                                                            \
+    "typedef struct {\n"                                                                        \
+    "  int wo_list;\n"                                                                          \
+    "#define w_p_list w_onebuf_opt.wo_list   // 'list'\n"                                       \
+    "} winopt_T;\n"                                                                             \
+    "typedef struct {\n"                                                                        \
+    "  winopt_T w_onebuf_opt;\n"                                                                \
+    "  int handle;\n"                                                                           \
+    "  int both_a;\n"                                                                           \
+    "  int both_b;\n"                                                                           \
+    "} win_T;\n"                                                                                \
+    "#define b_fnum handle\n"                                                                   \
+    "#ifdef SOME_CONFIG\n"                                                                      \
+    "#define alt_name both_a\n"                                                                 \
+    "#else\n"                                                                                   \
+    "#define alt_name both_b\n"                                                                 \
+    "#endif\n"                                                                                  \
+    "#define nowhere no_such_member.at_all\n"                                                   \
+    "#endif\n"
+#define C_TU_MP_USE                                                                             \
+    "#include \"mp.h\"\n"                                                                       \
+    "int through_a_path(win_T *wp) { return wp->w_p_list; }\n"                                  \
+    "int one_word(win_T *wp) { return wp->b_fnum; }\n"                                          \
+    "int two_definitions(win_T *wp) { return wp->alt_name; }\n"                                 \
+    "int missing_step(win_T *wp) { return wp->nowhere; }\n"
+static const RQ_Source C_TU_MP[] = {{.path = "mp.h", .text = C_TU_MP_H},
+                                    {.path = "mp_use.c", .text = C_TU_MP_USE}};
+
+TEST(resolver_c_macro_after_an_arrow_reads_the_members_it_names) {
+    const char *use = C_TU_MP_USE;
+    const RQ_Target win = {.file = "mp.h",
+                           .suffix = "mp.win_T",
+                           .label = "Class",
+                           .declaration_line = 7,
+                           .declaration_text = "typedef struct {"};
+    const RQ_Expected expected[] = {
+        {.case_id = "type-of-the-path-reader",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.through_a_path",
+                           "win_T *wp) { return wp->w_p_list", "win_T"),
+         .relation = "USAGE",
+         .target = win},
+        {.case_id = "first-step-of-the-path",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.through_a_path", "w_p_list; }", "w_p_list"),
+         .relation = "USAGE",
+         .dispatch_group = "the-whole-path",
+         .target = {.file = "mp.h",
+                    .suffix = "mp.win_T.w_onebuf_opt",
+                    .label = "Field",
+                    .declaration_line = 8,
+                    .declaration_text = "  winopt_T w_onebuf_opt;"}},
+        {.case_id = "last-step-of-the-path",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.through_a_path", "w_p_list; }", "w_p_list"),
+         .relation = "USAGE",
+         .dispatch_group = "the-whole-path",
+         .target = {.file = "mp.h",
+                    .suffix = "mp.winopt_T.wo_list",
+                    .label = "Field",
+                    .declaration_line = 4,
+                    .declaration_text = "  int wo_list;"}},
+        {.case_id = "type-of-the-word-reader",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.one_word", "win_T *wp) { return wp->b_fnum",
+                           "win_T"),
+         .relation = "USAGE",
+         .target = win},
+        {.case_id = "a-macro-for-one-member",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.one_word", "b_fnum; }", "b_fnum"),
+         .relation = "USAGE",
+         .target = {.file = "mp.h",
+                    .suffix = "mp.win_T.handle",
+                    .label = "Field",
+                    .declaration_line = 9,
+                    .declaration_text = "  int handle;"}},
+        {.case_id = "type-beside-two-definitions",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.two_definitions",
+                           "win_T *wp) { return wp->alt_name", "win_T"),
+         .relation = "USAGE",
+         .target = win},
+        {.case_id = "type-beside-a-missing-step",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.missing_step",
+                           "win_T *wp) { return wp->nowhere", "win_T"),
+         .relation = "USAGE",
+         .target = win},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "definitions-that-disagree",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.two_definitions", "alt_name; }", "alt_name"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "a-step-the-class-does-not-have",
+         .site = C_TU_WORD("mp_use.c", use, "mp_use.missing_step", "nowhere; }", "nowhere"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-member-paths",
+                             .sources = C_TU_MP,
+                             .source_count = sizeof(C_TU_MP) / sizeof(C_TU_MP[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `kvec_t(uint64_t) update_channels;` made a Field named uint64_t and none for the member, since the
+ * grammar ends the member at a `;` it invents and leaves the name as a member of its own. */
+#define C_TU_KV_H                                                                               \
+    "#ifndef KV_H\n"                                                                            \
+    "#define KV_H\n"                                                                            \
+    "#define kvec_t(type) struct { unsigned size; type *items; }\n"                             \
+    "typedef struct { int cb; } Callback;\n"                                                    \
+    "struct buffer {\n"                                                                         \
+    "  int first;\n"                                                                            \
+    "  // channels\n"                                                                           \
+    "  kvec_t(uint64_t) update_channels;\n"                                                     \
+    "  // callbacks\n"                                                                          \
+    "  kvec_t(Callback) update_callbacks;\n"                                                    \
+    "\n"                                                                                        \
+    "  // windows\n"                                                                            \
+    "  int between;\n"                                                                          \
+    "  kvec_t(Callback *) pointer_vec;\n"                                                       \
+    "  int last;\n"                                                                             \
+    "};\n"                                                                                      \
+    "#endif\n"
+#define C_TU_KV_USE                                                                             \
+    "#include \"kv.h\"\n"                                                                       \
+    "void *read_channels(struct buffer *b) { return &b->update_channels; }\n"                   \
+    "void *read_callbacks(struct buffer *b) { return &b->update_callbacks; }\n"                 \
+    "void *read_pointers(struct buffer *b) { return &b->pointer_vec; }\n"
+static const RQ_Source C_TU_KV[] = {{.path = "kv.h", .text = C_TU_KV_H},
+                                    {.path = "kv_use.c", .text = C_TU_KV_USE}};
+
+TEST(resolver_c_macro_typed_member_keeps_its_own_name) {
+    const char *use = C_TU_KV_USE;
+    const RQ_Expected expected[] = {
+        {.case_id = "a-member-whose-name-the-grammar-split-off",
+         .site = C_TU_WORD("kv_use.c", use, "kv_use.read_channels", "update_channels; }",
+                           "update_channels"),
+         .relation = "USAGE",
+         .target = {.file = "kv.h",
+                    .suffix = "kv.buffer.update_channels",
+                    .label = "Field",
+                    .declaration_line = 8,
+                    .declaration_text = "  kvec_t(uint64_t) update_channels;"}},
+        {.case_id = "a-member-the-grammar-reads-whole",
+         .site = C_TU_WORD("kv_use.c", use, "kv_use.read_callbacks", "update_callbacks; }",
+                           "update_callbacks"),
+         .relation = "USAGE",
+         .target = {.file = "kv.h",
+                    .suffix = "kv.buffer.update_callbacks",
+                    .label = "Field",
+                    .declaration_line = 10,
+                    .declaration_text = "  kvec_t(Callback) update_callbacks;"}},
+        {.case_id = "a-member-the-grammar-reads-as-a-prototype",
+         .site = C_TU_WORD("kv_use.c", use, "kv_use.read_pointers", "pointer_vec; }", "pointer_vec"),
+         .relation = "USAGE",
+         .target = {.file = "kv.h",
+                    .suffix = "kv.buffer.pointer_vec",
+                    .label = "Field",
+                    .declaration_line = 14,
+                    .declaration_text = "  kvec_t(Callback *) pointer_vec;"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-typed-members",
+                             .sources = C_TU_KV,
+                             .source_count = sizeof(C_TU_KV) / sizeof(C_TU_KV[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `Optional<int> Entries;` read in a member function lost its owner, since a template field had no type
+ * name. And `template <class Value> class Pair { Value first; };` beside a project class Value read
+ * `p.first.v_field` as that class's field: first has whatever type the instantiation supplies. */
+#define C_TU_TF_H                                                                               \
+    "#ifndef TF_HPP\n"                                                                          \
+    "#define TF_HPP\n"                                                                          \
+    "namespace lib {\n"                                                                         \
+    "struct Value { int v_field; int getName() { return 1; } };\n"                              \
+    "struct Key { int k_field; };\n"                                                            \
+    "struct Real { int r_field; };\n"                                                           \
+    "template <class Value, class Key> class Pair {\n"                                          \
+    "public:\n"                                                                                 \
+    "  bool ok() const { return true; }\n"                                                      \
+    "  Value get();\n"                                                                          \
+    "  Value first;\n"                                                                          \
+    "  Key *second;\n"                                                                          \
+    "  Real plain;\n"                                                                           \
+    "};\n"                                                                                      \
+    "template <class T> class Special { public: bool general() const { return true; } };\n"     \
+    "template <> class Special<char> { public: bool only_char() const { return true; } };\n"    \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_TF_USE                                                                             \
+    "#include \"tf.hpp\"\n"                                                                     \
+    "using namespace lib;\n"                                                                    \
+    "struct Holder {\n"                                                                         \
+    "  Pair<Real, Real> field;\n"                                                               \
+    "  Special<int> special;\n"                                                                 \
+    "  bool through_a_field() { return field.ok(); }\n"                                         \
+    "  int a_real_member() { return field.plain.r_field; }\n"                                   \
+    "  int a_parameter_type() { return field.first.v_field; }\n"                                \
+    "  bool a_specialized_template() { return special.general(); }\n"                           \
+    "};\n"                                                                                      \
+    "int param_route(Pair<Real, Real> &p) {\n"                                                  \
+    "  return p.first.v_field + p.first.getName() + p.second->k_field + p.get().v_field;\n"     \
+    "}\n"
+static const RQ_Source C_TU_TF[] = {{.path = "tf.hpp", .text = C_TU_TF_H},
+                                    {.path = "tf_use.cpp", .text = C_TU_TF_USE}};
+
+TEST(resolver_cpp_template_field_reads_the_template_and_not_its_parameter_spelling) {
+    const char *use = C_TU_TF_USE;
+#define TF_TARGET(file_, suffix_, label_, line_, text_)                                         \
+    {.file = file_, .suffix = suffix_, .label = label_, .declaration_line = line_,               \
+     .declaration_text = text_}
+#define TF_USAGE(id, caller, context, word, target_)                                            \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("tf_use.cpp", use, "tf_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+    const RQ_Target field = TF_TARGET("tf_use.cpp", "tf_use.Holder.field", "Field", 4,
+                                      "  Pair<Real, Real> field;");
+    const RQ_Target first = TF_TARGET("tf.hpp", "tf.lib.Pair.first", "Field", 11, "  Value first;");
+    const RQ_Target real = TF_TARGET("tf.hpp", "tf.lib.Real", "Class", 6,
+                                     "struct Real { int r_field; };");
+    const RQ_Expected expected[] = {
+        {.case_id = "a-method-through-a-template-field",
+         .site = {.file = "tf_use.cpp", .caller = "tf_use.Holder.through_a_field", .needle = "field.ok()"},
+         .relation = "CALLS",
+         .target = TF_TARGET("tf.hpp", "tf.lib.Pair.ok", "Method", 9,
+                             "  bool ok() const { return true; }")},
+        TF_USAGE("the-field-before-a-method", "Holder.through_a_field", "field.ok()", "field", field),
+        TF_USAGE("the-field-before-a-member", "Holder.a_real_member", "field.plain", "field", field),
+        TF_USAGE("a-member-the-template-writes-out", "Holder.a_real_member", "plain.r_field", "plain",
+                 TF_TARGET("tf.hpp", "tf.lib.Pair.plain", "Field", 13, "  Real plain;")),
+        TF_USAGE("a-written-class-through-a-template-field", "Holder.a_real_member", "r_field; }",
+                 "r_field",
+                 TF_TARGET("tf.hpp", "tf.lib.Real.r_field", "Field", 6,
+                           "struct Real { int r_field; };")),
+        TF_USAGE("the-field-before-a-parameter-type", "Holder.a_parameter_type", "field.first", "field",
+                 field),
+        TF_USAGE("a-field-of-a-parameter-type-is-a-field", "Holder.a_parameter_type", "first.v_field; }",
+                 "first", first),
+        TF_USAGE("the-field-of-a-specialized-template", "Holder.a_specialized_template",
+                 "special.general()", "special",
+                 TF_TARGET("tf_use.cpp", "tf_use.Holder.special", "Field", 5,
+                           "  Special<int> special;")),
+        TF_USAGE("the-template-of-the-parameter", "param_route", "Pair<Real, Real> &p", "Pair",
+                 TF_TARGET("tf.hpp", "tf.lib.Pair", "Class", 7,
+                           "template <class Value, class Key> class Pair {")),
+        TF_USAGE("the-first-argument", "param_route", "Real, Real> &p", "Real", real),
+        TF_USAGE("the-second-argument", "param_route", "Real> &p", "Real", real),
+        TF_USAGE("the-field-through-a-reference", "param_route", "first.v_field +", "first", first),
+        TF_USAGE("the-field-before-a-method-call", "param_route", "first.getName()", "first", first),
+        TF_USAGE("the-pointer-field", "param_route", "second->k_field", "second",
+                 TF_TARGET("tf.hpp", "tf.lib.Pair.second", "Field", 12, "  Key *second;")),
+    };
+#undef TF_USAGE
+#undef TF_TARGET
+#define TF_NEVER(id, caller, context, word)                                                     \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("tf_use.cpp", use, "tf_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Forbidden forbidden[] = {
+        TF_NEVER("a-parameter-spelled-like-a-class-from-a-field", "Holder.a_parameter_type", "v_field; }",
+                 "v_field"),
+        TF_NEVER("a-parameter-spelled-like-a-class-from-a-reference", "param_route", "v_field + p.first",
+                 "v_field"),
+        TF_NEVER("a-pointer-to-a-parameter", "param_route", "k_field + p.get", "k_field"),
+        TF_NEVER("what-a-method-returning-a-parameter-gives", "param_route", "v_field;\n}", "v_field"),
+        {.case_id = "a-method-of-what-a-parameter-holds",
+         .site = {.file = "tf_use.cpp", .caller = "tf_use.param_route", .needle = "p.first.getName()"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "a-template-with-a-specialization",
+         .site = {.file = "tf_use.cpp",
+                  .caller = "tf_use.Holder.a_specialized_template",
+                  .needle = "special.general()"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+#undef TF_NEVER
+    const CTUCase fixture = {.suite = "c-tu-template-fields",
+                             .sources = C_TU_TF,
+                             .source_count = sizeof(C_TU_TF) / sizeof(C_TU_TF[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* A class in an anonymous namespace is declared in the file around it. Each .cpp has its own, and
+ * another file's class of the same name stays out of it. */
+#define C_TU_ANON_ONE                                                                           \
+    "namespace {\n"                                                                             \
+    "int freeHelper(int v) { return v; }\n"                                                     \
+    "class Local {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  int helper() { return 1; }\n"                                                            \
+    "  int run(int v) { return freeHelper(v) + helper(); }\n"                                   \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "int useLocal() { Local l; return l.run(1); }\n"
+#define C_TU_ANON_TWO                                                                           \
+    "namespace {\n"                                                                             \
+    "class Local {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  int run(int v) { return v; }\n"                                                          \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "int useOther() { Local l; return l.run(2); }\n"
+static const RQ_Source C_TU_ANON[] = {{.path = "anon_one.cpp", .text = C_TU_ANON_ONE},
+                                      {.path = "anon_two.cpp", .text = C_TU_ANON_TWO}};
+
+TEST(resolver_cpp_anonymous_namespace_declares_in_its_file) {
+    const char *one = C_TU_ANON_ONE;
+    const char *two = C_TU_ANON_TWO;
+    const RQ_Expected expected[] = {
+        {.case_id = "free-function-from-a-method",
+         .site = {.file = "anon_one.cpp", .caller = "anon_one.Local.run", .needle = "freeHelper(v)"},
+         .relation = "CALLS",
+         .target = {.file = "anon_one.cpp",
+                    .suffix = "anon_one.freeHelper",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "int freeHelper(int v) { return v; }"}},
+        {.case_id = "sibling-method",
+         .site = {.file = "anon_one.cpp",
+                  .caller = "anon_one.Local.run",
+                  .needle = "helper()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "anon_one.cpp",
+                    .suffix = "anon_one.Local.helper",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text = "  int helper() { return 1; }"}},
+        {.case_id = "receiver-of-the-files-own-class",
+         .site = {.file = "anon_one.cpp", .caller = "anon_one.useLocal", .needle = "l.run(1)"},
+         .relation = "CALLS",
+         .target = {.file = "anon_one.cpp",
+                    .suffix = "anon_one.Local.run",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text = "  int run(int v) { return freeHelper(v) + helper(); }"}},
+        {.case_id = "same-name-in-another-file",
+         .site = {.file = "anon_two.cpp", .caller = "anon_two.useOther", .needle = "l.run(2)"},
+         .relation = "CALLS",
+         .target = {.file = "anon_two.cpp",
+                    .suffix = "anon_two.Local.run",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "  int run(int v) { return v; }"}},
+        {.case_id = "type-of-the-files-own-class",
+         .site = C_TU_WORD("anon_one.cpp", one, "anon_one.useLocal", "{ Local l", "Local"),
+         .relation = "USAGE",
+         .target = {.file = "anon_one.cpp",
+                    .suffix = "anon_one.Local",
+                    .label = "Class",
+                    .declaration_line = 3,
+                    .declaration_text = "class Local {"}},
+        {.case_id = "type-of-the-other-files-own-class",
+         .site = C_TU_WORD("anon_two.cpp", two, "anon_two.useOther", "useOther() { ", "Local"),
+         .relation = "USAGE",
+         .target = {.file = "anon_two.cpp",
+                    .suffix = "anon_two.Local",
+                    .label = "Class",
+                    .declaration_line = 2,
+                    .declaration_text = "class Local {"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-anon",
+                             .sources = C_TU_ANON,
+                             .source_count = sizeof(C_TU_ANON) / sizeof(C_TU_ANON[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `.free = my_free` names a member with no object in front of it, and the type being initialized
+ * is its receiver: 1,228 such sites in redis and 1,586 in neovim. A type this file cannot see
+ * proves nothing. */
+#define C_TU_DESIG_H                                                                            \
+    "#ifndef DESIG_H\n"                                                                         \
+    "#define DESIG_H\n"                                                                         \
+    "typedef struct inner_S { int depth; } inner_T;\n"                                          \
+    "typedef struct outer_S {\n"                                                                \
+    "  int size;\n"                                                                             \
+    "  inner_T in;\n"                                                                           \
+    "} outer_T;\n"                                                                              \
+    "#endif\n"
+#define C_TU_DESIG_USE                                                                          \
+    "#include \"desig.h\"\n"                                                                    \
+    "void declared(void) {\n"                                                                   \
+    "  outer_T o = {.size = 1};\n"                                                              \
+    "  (void)o;\n"                                                                              \
+    "}\n"                                                                                       \
+    "void literal(void) { (void)(inner_T){.depth = 2}; }\n"                                     \
+    "void nested(void) {\n"                                                                     \
+    "  outer_T o = {.in = {.depth = 3}};\n"                                                     \
+    "  (void)o;\n"                                                                              \
+    "}\n"                                                                                       \
+    "unsigned long size_of(void) { return sizeof(inner_T); }\n"                                 \
+    "unsigned long size_of_local(int inner_T) { unsigned long n = sizeof(inner_T); return n; }\n"
+#define C_TU_DESIG_OTHER "typedef struct hidden_S { int count; } hidden_T;\n"
+#define C_TU_DESIG_DECOY                                                                        \
+    "#include \"desig.h\"\n"                                                                    \
+    "void not_included(void) {\n"                                                               \
+    "  hidden_T b = {.count = 1};\n"                                                            \
+    "  (void)b;\n"                                                                              \
+    "}\n"
+static const RQ_Source C_TU_DESIG[] = {{.path = "desig.h", .text = C_TU_DESIG_H},
+                                       {.path = "desig_use.c", .text = C_TU_DESIG_USE},
+                                       {.path = "hidden.h", .text = C_TU_DESIG_OTHER},
+                                       {.path = "desig_decoy.c", .text = C_TU_DESIG_DECOY}};
+
+TEST(resolver_c_designated_member_binds_through_the_type_being_initialized) {
+    const char *use = C_TU_DESIG_USE;
+    const char *decoy = C_TU_DESIG_DECOY;
+    const RQ_Target size = {.file = "desig.h",
+                            .suffix = "desig.outer_S.size",
+                            .label = "Field",
+                            .declaration_line = 5,
+                            .declaration_text = "  int size;"};
+    const RQ_Target depth = {.file = "desig.h",
+                             .suffix = "desig.inner_S.depth",
+                             .label = "Field",
+                             .declaration_line = 3,
+                             .declaration_text = "typedef struct inner_S { int depth; } inner_T;"};
+    const RQ_Target outer = {.file = "desig.h",
+                             .suffix = "desig.outer_T",
+                             .label = "Type",
+                             .declaration_line = 7,
+                             .declaration_text = "} outer_T;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "type-of-a-declared-variable",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.declared", "outer_T o = {.size", "outer_T"),
+         .relation = "USAGE",
+         .target = outer},
+        {.case_id = "member-of-a-declared-variable",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.declared", "{.size", "size"),
+         .relation = "USAGE",
+         .target = size},
+        {.case_id = "type-of-a-compound-literal",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.literal", "(inner_T){", "inner_T"),
+         .relation = "USAGE",
+         .target = {.file = "desig.h",
+                    .suffix = "desig.inner_T",
+                    .label = "Type",
+                    .declaration_line = 3,
+                    .declaration_text = "typedef struct inner_S { int depth; } inner_T;"}},
+        {.case_id = "member-of-a-compound-literal",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.literal", "{.depth", "depth"),
+         .relation = "USAGE",
+         .target = depth},
+        {.case_id = "type-of-the-outer-variable",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.nested", "outer_T o = {.in", "outer_T"),
+         .relation = "USAGE",
+         .target = outer},
+        {.case_id = "member-holding-a-list",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.nested", "{.in", "in"),
+         .relation = "USAGE",
+         .target = {.file = "desig.h",
+                    .suffix = "desig.outer_S.in",
+                    .label = "Field",
+                    .declaration_line = 6,
+                    .declaration_text = "  inner_T in;"}},
+        {.case_id = "member-of-a-member",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.nested", "{.in = {.depth", "depth"),
+         .relation = "USAGE",
+         .target = depth},
+        {.case_id = "type-inside-sizeof",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.size_of", "sizeof(inner_T", "inner_T"),
+         .relation = "USAGE",
+         .target = {.file = "desig.h",
+                    .suffix = "desig.inner_T",
+                    .label = "Type",
+                    .declaration_line = 3,
+                    .declaration_text = "typedef struct inner_S { int depth; } inner_T;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-local-inside-sizeof",
+         .site = C_TU_WORD("desig_use.c", use, "desig_use.size_of_local", "n = sizeof(", "inner_T"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "a-type-this-file-does-not-see",
+         .site = C_TU_WORD("desig_decoy.c", decoy, "desig_decoy.not_included", "{.count", "count"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-designators",
+                             .sources = C_TU_DESIG,
+                             .source_count = sizeof(C_TU_DESIG) / sizeof(C_TU_DESIG[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* LLVM's StringRef lost its class to a macro word the attribute rules saw at only some of its uses:
+ * a name is a macro throughout a file. A conditional inside parentheses has one reading per branch
+ * and neovim's kvec_t(Object) names no type Object. */
+#define C_TU_REPAIR_STR_H                                                                       \
+    "#ifndef STR_H\n"                                                                           \
+    "#define STR_H\n"                                                                           \
+    "namespace llvm {\n"                                                                        \
+    "int convert(int V);\n"                                                                     \
+    "class MY_POINTER Str {\n"                                                                  \
+    "public:\n"                                                                                 \
+    "  MY_NODISCARD int size() const { return Len; }\n"                                         \
+    "  MY_NODISCARD\n"                                                                          \
+    "  bool empty() const { return Len == 0; }\n"                                               \
+    "  MY_NODISCARD\n"                                                                          \
+    "  char operator[](int I) const { return 'x'; }\n"                                          \
+    "  MY_NODISCARD\n"                                                                          \
+    "  int back() const { return Len; }\n"                                                      \
+    "  int Len;\n"                                                                              \
+    "};\n"                                                                                      \
+    "class Sized {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  Sized(int S) : Size(convert(S)) {}\n"                                                    \
+    "  int Size;\n"                                                                             \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_REPAIR_STR_USE                                                                     \
+    "#include \"str.h\"\n"                                                                      \
+    "using namespace llvm;\n"                                                                   \
+    "int useBack(Str S) { return S.back(); }\n"
+#define C_TU_REPAIR_ARGS                                                                        \
+    "#include \"defs.h\"\n"                                                                     \
+    "static int left_side(int v) { return v; }\n"                                               \
+    "static int right_side(int v) { return v; }\n"                                              \
+    "static int pick(int a, int b) { return a + b; }\n"                                         \
+    "int both(int v) {\n"                                                                       \
+    "  return pick(v,\n"                                                                        \
+    "#ifdef LEFT\n"                                                                             \
+    "    left_side(v)\n"                                                                        \
+    "#else\n"                                                                                   \
+    "    right_side(v)\n"                                                                       \
+    "#endif\n"                                                                                  \
+    "  );\n"                                                                                    \
+    "}\n"
+#define C_TU_REPAIR_DEFS_H                                                                      \
+    "#ifndef DEFS_H\n#define DEFS_H\ntypedef struct object Object;\n#endif\n"
+#define C_TU_REPAIR_VEC_H                                                                       \
+    "#ifndef VEC_H\n#define VEC_H\n#include \"defs.h\"\ntypedef kvec_t(Object) Array;\n#endif\n"
+#define C_TU_REPAIR_VEC_USE                                                                     \
+    "#include \"vec.h\"\n"                                                                      \
+    "void useObject(Object *o) { (void)o; }\n"
+/* lua_cmsgpack.c: `#if / lua_pushnumber(L, / #else / lua_pushinteger(L, / #endif`, each branch half
+ * of a statement, cost every function after it. neovim's do_sub: a comment in a multi-line #define
+ * ended the replacement for the grammar, and the rest of the macro closed the function. */
+#define C_TU_REPAIR_SPLIT                                                                       \
+    "#include \"defs.h\"\n"                                                                     \
+    "static int pa(int a, int b) { return a + b; }\n"                                           \
+    "int half(int v) {\n"                                                                       \
+    "#ifdef OLD\n"                                                                              \
+    "  int r = pa(v,\n"                                                                         \
+    "#else\n"                                                                                   \
+    "  int r = pa(v + 1,\n"                                                                     \
+    "#endif\n"                                                                                  \
+    "    v);\n"                                                                                 \
+    "  return r;\n"                                                                             \
+    "}\n"                                                                                       \
+    "int after_half(int v) { return pa(v, 7); }\n"                                              \
+    "int with_comment(int v) {\n"                                                               \
+    "#define STEP() \\\n"                                                                       \
+    "  do { \\\n"                                                                               \
+    "    /* a comment in the replacement */ \\\n"                                               \
+    "    if (v) { \\\n"                                                                         \
+    "      v = 0; \\\n"                                                                         \
+    "    } \\\n"                                                                                \
+    "  } while (0)\n"                                                                           \
+    "\n"                                                                                        \
+    "  int i = pa(v, 9);\n"                                                                     \
+    "  return i;\n"                                                                             \
+    "}\n"
+static const RQ_Source C_TU_REPAIR[] = {{.path = "str.h", .text = C_TU_REPAIR_STR_H},
+                                        {.path = "split.c", .text = C_TU_REPAIR_SPLIT},
+                                        {.path = "str_use.cpp", .text = C_TU_REPAIR_STR_USE},
+                                        {.path = "args.c", .text = C_TU_REPAIR_ARGS},
+                                        {.path = "defs.h", .text = C_TU_REPAIR_DEFS_H},
+                                        {.path = "vec.h", .text = C_TU_REPAIR_VEC_H},
+                                        {.path = "vec_use.c", .text = C_TU_REPAIR_VEC_USE}};
+
+TEST(resolver_c_parse_repairs_keep_declarations) {
+    const char *vec_use = C_TU_REPAIR_VEC_USE;
+    const RQ_Target split_pa = {.file = "split.c",
+                                .suffix = "split.pa",
+                                .label = "Function",
+                                .declaration_line = 2,
+                                .declaration_text = "static int pa(int a, int b) { return a + b; }"};
+    const RQ_Expected expected[] = {
+        {.case_id = "class-past-a-macro-word-the-rules-saw-elsewhere",
+         .site = {.file = "str_use.cpp", .caller = "useBack", .needle = "S.back()"},
+         .relation = "CALLS",
+         .target = {.file = "str.h",
+                    .suffix = "llvm.Str.back",
+                    .label = "Method",
+                    .declaration_line = 13,
+                    .declaration_text = "  int back() const { return Len; }"}},
+        {.case_id = "constructor-initializer-runs-in-the-constructor",
+         .site = {.file = "str.h", .caller = "llvm.Sized.Sized", .needle = "convert(S)"},
+         .relation = "CALLS",
+         .target = {.file = "str.h",
+                    .suffix = "llvm.convert",
+                    .label = NULL,
+                    .declaration_line = 4,
+                    .declaration_text = "int convert(int V);"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "c-declaration-without-a-definition",
+         .why = "convert is declared and never defined in this fixture, so it has no node.",
+         .tried = "A prototype alone has no graph node to point at."},
+        {.case_id = "first-branch-of-a-conditional-inside-parentheses",
+         .site = {.file = "args.c", .caller = "args.both", .needle = "left_side(v)"},
+         .relation = "CALLS",
+         .target = {.file = "args.c",
+                    .suffix = "args.left_side",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "static int left_side(int v) { return v; }"}},
+        {.case_id = "call-the-conditional-sits-in",
+         .site = {.file = "args.c",
+                  .caller = "args.both",
+                  .needle = "pick(v,\n#ifdef LEFT\n    left_side(v)\n#else\n    right_side(v)\n#endif\n  )"},
+         .relation = "CALLS",
+         .target = {.file = "args.c",
+                    .suffix = "args.pick",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "static int pick(int a, int b) { return a + b; }"}},
+        {.case_id = "function-after-a-branch-that-is-half-a-statement",
+         .site = {.file = "split.c", .caller = "split.after_half", .needle = "pa(v, 7)"},
+         .relation = "CALLS",
+         .target = split_pa},
+        {.case_id = "call-below-a-comment-in-a-multi-line-define",
+         .site = {.file = "split.c", .caller = "split.with_comment", .needle = "pa(v, 9)"},
+         .relation = "CALLS",
+         .target = split_pa},
+        {.case_id = "macro-argument-in-a-typedef-names-no-type",
+         .site = C_TU_WORD("vec_use.c", vec_use, "vec_use.useObject", "(Object *o", "Object"),
+         .relation = "USAGE",
+         .target = {.file = "defs.h",
+                    .suffix = "defs.Object",
+                    .label = "Type",
+                    .declaration_line = 3,
+                    .declaration_text = "typedef struct object Object;"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-repair",
+                             .sources = C_TU_REPAIR,
+                             .source_count = sizeof(C_TU_REPAIR) / sizeof(C_TU_REPAIR[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .known_gaps = 1};
     for (int driver = 0; driver < 2; driver++)
         ASSERT(c_tu_run(&fixture, driver));
     PASS();
@@ -2982,6 +5649,29 @@ SUITE(resolver_c) {
     RUN_TEST(resolver_c_unknown_shadow_and_include_conflicts_abstain);
     RUN_TEST(resolver_cpp_namespaces_and_using_require_unique_declarations);
     RUN_TEST(resolver_cpp_overloads_and_unmodelled_adl_abstain);
+    RUN_TEST(resolver_c_macro_argument_binds_when_the_replacement_substitutes_it);
+    RUN_TEST(resolver_c_loop_macro_declares_its_variable);
+    RUN_TEST(resolver_c_function_names_are_values_at_any_scope);
+    RUN_TEST(resolver_c_struct_shapes_real_headers_use);
+    RUN_TEST(resolver_c_parse_repairs_keep_declarations);
+    RUN_TEST(resolver_c_macro_replacement_compiles_at_its_use);
+    RUN_TEST(resolver_c_macro_in_one_branch_leaves_the_function_in_another);
+    RUN_TEST(resolver_c_macro_after_the_parameters_keeps_what_follows);
+    RUN_TEST(resolver_c_designated_member_binds_through_the_type_being_initialized);
+    RUN_TEST(resolver_cpp_anonymous_namespace_declares_in_its_file);
+    RUN_TEST(resolver_c_local_array_types_its_elements);
+    RUN_TEST(resolver_c_unnamed_aggregate_is_a_class_of_its_own);
+    RUN_TEST(resolver_cpp_qualified_type_binds_from_where_its_lookup_starts);
+    RUN_TEST(resolver_cpp_out_of_line_template_member_is_a_method_of_its_class);
+    RUN_TEST(resolver_cpp_member_template_is_a_method_of_its_class);
+    RUN_TEST(resolver_c_a_broken_head_does_not_swallow_the_functions_after_it);
+    RUN_TEST(resolver_c_macro_after_an_arrow_reads_the_members_it_names);
+    RUN_TEST(resolver_c_macro_typed_member_keeps_its_own_name);
+    RUN_TEST(resolver_cpp_template_field_reads_the_template_and_not_its_parameter_spelling);
+    RUN_TEST(resolver_c_macro_behind_a_switch_this_unit_leaves_off);
+    RUN_TEST(resolver_cpp_templates_bind_what_is_not_dependent);
+    RUN_TEST(resolver_c_fragment_sees_what_its_one_includer_saw);
+    RUN_TEST(resolver_c_macros_in_declarations_do_not_hide_their_names);
     RUN_TEST(resolver_c_callable_mutations_and_escapes_clear_identity);
     RUN_TEST(resolver_c_proof_view_includes_late_registration_and_excludes_inference_tail);
     RUN_TEST(resolver_c_field_identity_is_not_a_callable_target);

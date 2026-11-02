@@ -1035,6 +1035,9 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         state->enclosing_func_qn != ctx->module_qn) {
         return state->enclosing_func_qn;
     }
+    if (cbm_c_function_is_macro_block(ctx->language, node)) {
+        return state->enclosing_func_qn;
+    }
 
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
@@ -1201,7 +1204,8 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * file scope, so enclosing_class_qn is NULL — derive the class from the
      * qualified declarator instead. */
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        strcmp(ts_node_type(node), "function_definition") == 0) {
+        (strcmp(ts_node_type(node), "function_definition") == 0 ||
+         strcmp(ts_node_type(node), "template_declaration") == 0)) {
         char *scope_name = cbm_cpp_out_of_line_parent_class(ctx->arena, node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn =

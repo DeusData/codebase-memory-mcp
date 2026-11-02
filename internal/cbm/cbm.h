@@ -666,6 +666,10 @@ typedef enum {
     /* Exact source value binding, with no assertion of callable identity.
      * A Function/Method graph label does not upgrade this proof to a call. */
     CBM_RESOLVED_VALUE_REFERENCE,
+    /* What a function-like macro's replacement list calls or reads, proven at the macro's use:
+     * the expansion is what compiles there. reason holds the name, and the site is the use. */
+    CBM_RESOLVED_MACRO_INVOCATION,
+    CBM_RESOLVED_MACRO_VALUE,
 } CBMResolvedKind;
 
 // LSP-resolved invocation/reference: high-confidence type-aware resolution.

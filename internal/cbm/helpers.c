@@ -1082,6 +1082,42 @@ static const char **func_kinds_for_lang(CBMLanguage lang) {
     }
 }
 
+/* `FOR_ALL_TABS(tp) { ... }` inside a function body reads as a nested function whose type is the
+ * macro and whose declarator is `(tp)`. It is a statement of the function around it. */
+bool cbm_c_function_is_macro_block(CBMLanguage lang, TSNode function) {
+    if (lang != CBM_LANG_C && lang != CBM_LANG_CPP) {
+        return false;
+    }
+    if (strcmp(ts_node_type(function), "function_definition") != 0) {
+        return false;
+    }
+    TSNode declarator = ts_node_child_by_field_name(function, "declarator", 10);
+    if (ts_node_is_null(declarator)) {
+        return false;
+    }
+    /* C++ reads it with no type at all, the macro being the function's name. */
+    const char *reading = ts_node_type(declarator);
+    if (strcmp(reading, "parenthesized_declarator") != 0 &&
+        (strcmp(reading, "function_declarator") != 0 ||
+         !ts_node_is_null(ts_node_child_by_field_name(function, "type", 4)))) {
+        return false;
+    }
+    TSNode parent = ts_node_parent(function);
+    if (ts_node_is_null(parent)) {
+        return false;
+    }
+    static const char *const statements[] = {
+        "compound_statement", "case_statement",  "if_statement", "else_clause",
+        "for_statement",      "while_statement", "do_statement", "labeled_statement"};
+    const char *kind = ts_node_type(parent);
+    for (size_t i = 0; i < sizeof(statements) / sizeof(statements[0]); i++) {
+        if (strcmp(kind, statements[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
     const char **kinds = func_kinds_for_lang(lang);
     TSNode cur = node;
@@ -1092,7 +1128,7 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
         }
         const char *pk = ts_node_type(parent);
         for (const char **k = kinds; *k; k++) {
-            if (strcmp(pk, *k) == 0) {
+            if (strcmp(pk, *k) == 0 && !cbm_c_function_is_macro_block(lang, parent)) {
                 return parent;
             }
         }
@@ -1117,6 +1153,21 @@ static TSNode resolve_qualified_name(TSNode decl) {
         TSNode found = cbm_find_child_by_kind(decl, *k);
         if (!ts_node_is_null(found)) {
             return found;
+        }
+    }
+    /* `ns::Foo::bar` nests on the name side, so the name is one level further in. */
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT; depth++) {
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+        if (ts_node_is_null(inner) || (strcmp(ts_node_type(inner), "qualified_identifier") != 0 &&
+                                       strcmp(ts_node_type(inner), "scoped_identifier") != 0)) {
+            break;
+        }
+        decl = inner;
+        for (const char **k = name_kinds; *k; k++) {
+            TSNode found = cbm_find_child_by_kind(decl, *k);
+            if (!ts_node_is_null(found)) {
+                return found;
+            }
         }
     }
     TSNode null_node = {0};

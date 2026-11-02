@@ -1160,6 +1160,10 @@ static void pxc_collect_c_file(const cbm_pipeline_ctx_t *ctx, CBMArena *arena, c
     if (facts) {
         size_t path_len = strlen(file->rel_path);
         facts->plain_header = path_len > 2 && !strcmp(file->rel_path + path_len - 2, ".h");
+        const char *extension = strrchr(file->rel_path, '.');
+        facts->source_file =
+            extension && (!strcmp(extension, ".c") || !strcmp(extension, ".cc") ||
+                          !strcmp(extension, ".cpp") || !strcmp(extension, ".cxx"));
         facts->module_qn = module;
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, file->rel_path, "__file__");
         facts->file_qn = file_qn ? cbm_arena_strdup(arena, file_qn) : NULL;
