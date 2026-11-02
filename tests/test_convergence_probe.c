@@ -275,7 +275,8 @@ static int cp_callables(cbm_store_t *store, const char *project) {
 }
 
 /* Diagnostic edge histogram (stderr only, so test output stays clean). */
-static const char *CP_ALL_EDGE_TYPES[] = {"CALLS",
+static const char *CP_ALL_EDGE_TYPES[] = {"BINDS",
+                                          "CALLS",
                                           "CALL_REFERENCE",
                                           "CONFIGURES",
                                           "CONTAINS_FILE",
