@@ -1941,6 +1941,12 @@ static const char PL2_THING[] =
     "sub takes_ref { my $r = \\&own; $r }\n"
     "sub takes_qualified_ref { keep(\\&My::Root::root_m) }\n"
     "sub no_absent_ref { my $r = \\&absent; $r }\n"
+    "sub also { return 5; }\n"
+    "sub picks_one { my $f = shift; keep($f ? \\&own : \\&also) }\n"
+    "sub falls_back { my $f = shift; my $r = $f || \\&also; $r }\n"
+    "sub low_or { my $f = shift; my $r = ($f or \\&also); $r }\n"
+    "sub in_parens { my $f = shift; my $r = $f ? (\\&own) : 0; $r }\n"
+    "sub table_entry { my %t = (a => \\&own); $t{a} }\n"
     "1;\n";
 
 static const char PL3_THING[] =
@@ -2011,6 +2017,18 @@ TEST(resolver_source_perl_invocant_reexports_and_code_references) {
                    "sub own { return 4; }"),
         SL_REF_AT("code-reference-with-its-package", "lib/My/Thing.pm", "Thing.takes_qualified_ref", "\\&My::Root::root_m", 0, "lib/My/Root.pm", "Root.root_m", "Function", 2,
                    "sub root_m { return 3; }"),
+        SL_USE_AT("conditional-branch-mentions-its-sub", "lib/My/Thing.pm", "Thing.picks_one", "\\&own", 1, "lib/My/Thing.pm", "Thing.own", "Function", 5,
+                  "sub own { return 4; }"),
+        SL_USE_AT("other-conditional-branch-mentions-its-sub", "lib/My/Thing.pm", "Thing.picks_one", "\\&also", 0, "lib/My/Thing.pm", "Thing.also", "Function", 19,
+                  "sub also { return 5; }"),
+        SL_USE_AT("logical-operand-mentions-its-sub", "lib/My/Thing.pm", "Thing.falls_back", "\\&also", 1, "lib/My/Thing.pm", "Thing.also", "Function", 19,
+                  "sub also { return 5; }"),
+        SL_USE_AT("low-precedence-operand-mentions-its-sub", "lib/My/Thing.pm", "Thing.low_or", "\\&also", 2, "lib/My/Thing.pm", "Thing.also", "Function", 19,
+                  "sub also { return 5; }"),
+        SL_USE_AT("parentheses-change-nothing", "lib/My/Thing.pm", "Thing.in_parens", "\\&own", 2, "lib/My/Thing.pm", "Thing.own", "Function", 5,
+                  "sub own { return 4; }"),
+        SL_REF_AT("table-entry-names-one-sub", "lib/My/Thing.pm", "Thing.table_entry", "\\&own", 3, "lib/My/Thing.pm", "Thing.own", "Function", 5,
+                  "sub own { return 4; }"),
     };
     static const RQ_Forbidden forbidden[] = {
         SL_DENY_AT("plain-function-takes-whatever-it-is-given", "lib/My/Thing.pm", "Thing._select", "$_[0]->own", 0),
@@ -2018,6 +2036,11 @@ TEST(resolver_source_perl_invocant_reexports_and_code_references) {
         SL_DENY_AT("second-shift-is-the-second-argument", "lib/My/Thing.pm", "Thing.second_shift", "shift->own", 1),
         SL_DENY_AT("anonymous-sub-has-its-own-arguments", "lib/My/Thing.pm", "Thing.anon_has_its_own_args", "shift->own", 2),
         SL_NO_REF_AT("code-reference-to-nothing", "lib/My/Thing.pm", "Thing.no_absent_ref", "\\&absent", 0),
+        SL_NO_REF_AT("conditional-branch-is-no-reference", "lib/My/Thing.pm", "Thing.picks_one", "\\&own", 1),
+        SL_NO_REF_AT("other-conditional-branch-is-no-reference", "lib/My/Thing.pm", "Thing.picks_one", "\\&also", 0),
+        SL_NO_REF_AT("logical-operand-is-no-reference", "lib/My/Thing.pm", "Thing.falls_back", "\\&also", 1),
+        SL_NO_REF_AT("low-precedence-operand-is-no-reference", "lib/My/Thing.pm", "Thing.low_or", "\\&also", 2),
+        SL_NO_REF_AT("parentheses-are-no-reference", "lib/My/Thing.pm", "Thing.in_parens", "\\&own", 2),
     };
     ASSERT(sl_check("perl-invocant", ".pm", "package Filler;\nsub f { return 1; }\n1;\n", sources,
                     sizeof(sources) / sizeof(sources[0]), expected,

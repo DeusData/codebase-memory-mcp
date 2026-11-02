@@ -4305,12 +4305,7 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "sub perlReferenceTarget {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "callback-perl-coderef",
-         .why = "Package/subroutine declaration identity and typeglob/redefinition barriers lack a "
-                "proof adapter.",
-         .tried = "Focused pipeline probe: direct coderef has a legacy carrier only; no legacy "
-                  "confidence is admitted."},
+         .mode = RQ_REQUIRED},
         {.case_id = "javascript-script-shadow-control",
          .site = {.file = "shadow.js",
                   .caller = "shadow.javascriptShadowSite",
@@ -4691,9 +4686,9 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     parallel_reference[i]);
     }
     for (int i = 0; i < pair_count; i++) {
-        /* These six independent expectations are counted above as source-audited
+        /* These five independent expectations are counted above as source-audited
          * quality gaps; recovery must promote them to required in the oracle. */
-        if (i != 4 && i != 5 && i != 7 && i != 10 && i != 12 && i != 13)
+        if (i != 4 && i != 5 && i != 7 && i != 10 && i != 12)
             ASSERT_GT(sequential_reference[i], 0);
         ASSERT_EQ(parallel_reference[i], sequential_reference[i]);
         ASSERT_EQ(sequential_usage[i], 0);
@@ -15477,26 +15472,44 @@ static bool rust_std_receiver_quality(cbm_store_t *store, const char *project, c
          .site = {.file = "src/lib.rs", .caller = "lib.real_caller", .needle = "EvidenceTier(1)"},
          .relation = "CALLS",
          .target = {.file = "src/lib.rs",
+                    .suffix = "lib.EvidenceTier",
+                    .label = "Struct",
                     .declaration_line = 4,
                     .declaration_text = "pub struct EvidenceTier(pub u8);"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "RUST-TUPLE-STRUCT-CONSTRUCTOR-IDENTITY",
-         .why = "The tuple-struct constructor is genuine but has no independent callable "
-                "declaration identity in the current graph.",
-         .tried = "Retained the exact source invocation and struct anchor; no synthesized method "
-                  "or legacy confidence substitutes for a constructor proof."},
+         .mode = RQ_REQUIRED},
         {.case_id = "rust.tuple-constructor.argument",
          .site = {.file = "src/lib.rs", .caller = "lib.real_caller", .needle = "EvidenceTier(2)"},
          .relation = "CALLS",
          .target = {.file = "src/lib.rs",
+                    .suffix = "lib.EvidenceTier",
+                    .label = "Struct",
                     .declaration_line = 4,
                     .declaration_text = "pub struct EvidenceTier(pub u8);"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "RUST-TUPLE-STRUCT-CONSTRUCTOR-IDENTITY",
-         .why = "The argument independently invokes the tuple-struct constructor; its callable "
-                "identity is not represented.",
-         .tried = "Kept the second raw call site in the denominator rather than merging it with "
-                  "the receiver constructor."},
+         .mode = RQ_REQUIRED},
+        {.case_id = "rust.return-type.usage",
+         .site = {.file = "src/lib.rs",
+                  .caller = "lib.real_caller",
+                  .needle = "EvidenceTier",
+                  .occurrence_index = 5},
+         .relation = "USAGE",
+         .target = {.file = "src/lib.rs",
+                    .suffix = "lib.EvidenceTier",
+                    .label = "Struct",
+                    .declaration_line = 4,
+                    .declaration_text = "pub struct EvidenceTier(pub u8);"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "rust.return-type.uses-type",
+         .site = {.file = "src/lib.rs",
+                  .caller = "lib.real_caller",
+                  .needle = "EvidenceTier",
+                  .occurrence_index = 5},
+         .relation = "USES_TYPE",
+         .target = {.file = "src/lib.rs",
+                    .suffix = "lib.EvidenceTier",
+                    .label = "Struct",
+                    .declaration_line = 4,
+                    .declaration_text = "pub struct EvidenceTier(pub u8);"},
+         .mode = RQ_REQUIRED},
         {.case_id = "rust.iterator-closure.receiver",
          .site = {.file = "src/lib.rs",
                   .caller = "lib.untyped_receiver",

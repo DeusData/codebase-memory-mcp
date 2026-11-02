@@ -29,7 +29,9 @@
  * has no sub import of its own, and lists the name in @EXPORT or @EXPORT_OK. What it
  * lists can be a name it imported itself, which is then that module's export.
  *
- * `\&name` takes a reference to the sub the same lookup selects, without calling it.
+ * `\&name` takes a reference to the sub the same lookup selects, without calling it. Under a
+ * conditional or an operator the value is one of several, so the site only mentions the sub:
+ * the carrier from extraction says which.
  *
  * Literal glob assignment and lexical `my sub` replace a name, so that name
  * abstains. A glob assigned from a computed name can touch any package anywhere

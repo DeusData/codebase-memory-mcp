@@ -315,27 +315,17 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 1,
                  .declaration_text = "sub handler {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "perl_exact_coderef_is_call_reference-1",
-      .why = "Delegate or coderef argument values and callable-parameter applicability require an "
-             "audited proof bridge.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_perl_exact_coderef_is_call_reference",
      {.case_id = "perl_exact_coderef_is_call_reference-2",
       .site = {.file = "refs.pl", .caller = "argument", .start_byte = 66, .end_byte = 83},
       .relation = "CALLS",
       .target = {.file = "refs.pl",
-                 .suffix = "refs.accept",
+                 .suffix = "refs.submit",
                  .label = "Function",
                  .declaration_line = 2,
-                 .declaration_text = "sub accept { my ($callback) = @_; }"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "perl_exact_coderef_is_call_reference-2",
-      .why = "Delegate or coderef argument values and callable-parameter applicability require an "
-             "audited proof bridge.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+                 .declaration_text = "sub submit { my ($callback) = @_; }"},
+      .mode = RQ_REQUIRED}},
     {"repro_rust_direct_scoped_function_value_is_exact_reference",
      {.case_id = "rust_direct_scoped_function_value_is_exact_reference-1",
       .site = {.file = "main.rs", .caller = "scoped_argument", .start_byte = 83, .end_byte = 98},
@@ -890,49 +880,31 @@ static const RP_QualityGolden rp_quality_goldens[] = {
       .site = {.file = "complex.pl", .caller = "complex", .start_byte = 99, .end_byte = 138},
       .relation = "CALLS",
       .target = {.file = "complex.pl",
-                 .suffix = "complex.accept",
+                 .suffix = "complex.submit",
                  .label = "Function",
                  .declaration_line = 3,
-                 .declaration_text = "sub accept { my ($callback) = @_; }"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "perl_conditional_coderefs_stay_usage-1",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+                 .declaration_text = "sub submit { my ($callback) = @_; }"},
+      .mode = RQ_REQUIRED}},
     {"repro_perl_conditional_coderefs_stay_usage",
      {.case_id = "perl_conditional_coderefs_stay_usage-2",
-      .site = {.file = "complex.pl", .caller = "complex", .start_byte = 116, .end_byte = 123},
+      .site = {.file = "complex.pl", .caller = "complex", .start_byte = 114, .end_byte = 123},
       .relation = "USAGE",
       .target = {.file = "complex.pl",
                  .suffix = "complex.handler",
                  .label = "Function",
                  .declaration_line = 1,
                  .declaration_text = "sub handler {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "perl_conditional_coderefs_stay_usage-2",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_perl_conditional_coderefs_stay_usage",
      {.case_id = "perl_conditional_coderefs_stay_usage-3",
-      .site = {.file = "complex.pl", .caller = "complex", .start_byte = 128, .end_byte = 137},
+      .site = {.file = "complex.pl", .caller = "complex", .start_byte = 126, .end_byte = 137},
       .relation = "USAGE",
       .target = {.file = "complex.pl",
                  .suffix = "complex.alternate",
                  .label = "Function",
                  .declaration_line = 2,
                  .declaration_text = "sub alternate {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "perl_conditional_coderefs_stay_usage-3",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_python_local_function_shadows_imported_callable",
      {.case_id = "repro_python_local_function_shadows_imported_callable-reference",
       .site = {.file = "use.py", .caller = "crossArgument", .start_byte = 121, .end_byte = 129},
@@ -2302,10 +2274,12 @@ TEST(repro_tsx_exact_bound_method_is_call_reference) {
     PASS();
 }
 
+/* The registrar is not called `accept`: that is a Perl builtin, only an import overrides it
+ * (perlsub), and `perl -c` rejects `accept(\&handler)` as too few arguments to the builtin. */
 TEST(repro_perl_exact_coderef_is_call_reference) {
     static const char source[] = "sub handler {}\n"
-                                 "sub accept { my ($callback) = @_; }\n"
-                                 "sub argument { accept(\\&handler); }\n";
+                                 "sub submit { my ($callback) = @_; }\n"
+                                 "sub argument { submit(\\&handler); }\n";
     int rc = rp_assert_exact_function_value_reference_quality(
         "refs.pl", source, CBM_LANG_PERL, "Function", "repro_perl_exact_coderef_is_call_reference");
     if (rc != 0)
@@ -3564,12 +3538,13 @@ TEST(repro_php_complex_first_class_callable_stays_usage) {
     PASS();
 }
 
+/* The registrar is not called `accept`: see repro_perl_exact_coderef_is_call_reference. */
 TEST(repro_perl_conditional_coderefs_stay_usage) {
     static const char source[] = "sub handler {}\n"
                                  "sub alternate {}\n"
-                                 "sub accept { my ($callback) = @_; }\n"
+                                 "sub submit { my ($callback) = @_; }\n"
                                  "sub complex { my ($flag) = @_; "
-                                 "accept($flag ? \\&handler : \\&alternate); }\n";
+                                 "submit($flag ? \\&handler : \\&alternate); }\n";
     int rc = rp_assert_complex_function_values_stay_usage_quality(
         "complex.pl", source, CBM_LANG_PERL, "Function",
         "repro_perl_conditional_coderefs_stay_usage");

@@ -4811,6 +4811,7 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
     cbm_pxc_set_rust_manifest(NULL);
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
+    cbm_kind_in_set_free_cache(); /* a damaged source file's scan fills it here too */
     cbm_service_pattern_cache_end();
     cbm_pxc_thread_scratch_end();
     file_node_cache_clear();
