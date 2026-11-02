@@ -289,20 +289,20 @@ jobs:
     with:
       mode: pr
 
-  # ── glibc floor, REPORT-ONLY: builds the production binary in the SAME
-  #    pinned ubuntu:22.04 container the standard Linux release binaries build
-  #    in (_build.yml build-linux) and runs the composition gate with the same
-  #    declared floor, so a change that needs a newer glibc or libstdc++ symbol
-  #    version -- or stops compiling with that GCC 11 toolchain -- shows up at
-  #    PR time instead of in a release run. Light on purpose: a headless build
-  #    (the shipped composition only swaps src/ui/embedded_stub.c for the
-  #    generated asset data) and no smoke. Deliberately NOT in ci-ok's needs
-  #    and no lane of its own: it never blocks or passes a merge. It runs
-  #    whenever the selection holds smoke-ubuntu, i.e. whenever the production
-  #    binary can change. ──
+  # ── glibc floor (lane glibc-floor, GATING): builds the production binary in
+  #    the SAME pinned ubuntu:22.04 container the standard Linux release
+  #    binaries build in (_build.yml build-linux) and runs the composition gate
+  #    with the same declared floor, so a change that needs a newer glibc or
+  #    libstdc++ symbol version -- or stops compiling with that GCC 11
+  #    toolchain -- fails the PR instead of a release run. Light on purpose: a
+  #    headless build (the shipped composition only swaps
+  #    src/ui/embedded_stub.c for the generated asset data) and no smoke. The
+  #    selector picks the lane whenever it picks smoke-ubuntu, i.e. whenever
+  #    the production binary can change; ci-ok needs it, and a selected
+  #    glibc-floor that fails, skips or never runs fails ci-ok. ──
   glibc-floor:
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-ubuntu') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'glibc-floor') }}
     runs-on: ubuntu-latest
     container:
       image: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
@@ -429,7 +429,7 @@ jobs:
     # every lane the selector chose ran green: `skipped` is OK only for a lane
     # nobody selected (a selected lane that skipped is a silent gate loss).
     # memwaste and the test-impact shadow are report-only and not needed here.
-    needs: [changes, security, lint, test, pr-smoke, contracts, codeql]
+    needs: [changes, security, lint, test, pr-smoke, contracts, codeql, glibc-floor]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

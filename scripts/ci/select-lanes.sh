@@ -320,7 +320,7 @@ def tier_of(cats):
 # lane, by any full run: an undeterminable diff scans every language.
 CODEQL_LANES = {"c-cpp": "codeql-cpp", "javascript-typescript": "codeql-js",
                 "python": "codeql-py", "actions": "codeql-actions"}
-FULL = {"diag", "license-gate", "lint", "lint-mem", "lsan-macos",
+FULL = {"diag", "glibc-floor", "license-gate", "lint", "lint-mem", "lsan-macos",
         "memwaste", "msan", "pkg-wrappers", "security-static", "shard-completeness",
         "smoke-mac", "smoke-ubuntu", "smoke-win", "tsan-arm", "tsan-mac", "tsan-x86",
         "unix-arm64", "unix-macos-intel", "unix-macos14", "unix-x86", "windows",
@@ -330,6 +330,11 @@ LINT = {"lint", "lint-mem"}
 CORE_LEGS = {"unix-x86", "unix-macos14", "windows", "shard-completeness"}
 TEST_LEGS = {"unix-x86", "unix-arm64", "unix-macos14", "unix-macos-intel", "windows"}
 ALWAYS = {"security-static"}
+# Lanes that ride with another lane, whatever selected it: glibc-floor (pr.yml:
+# the production binary built in the pinned ubuntu:22.04 release container and
+# held to the release glibc floor) runs whenever smoke-ubuntu does, i.e.
+# whenever the production Linux binary can change.
+FOLLOWS = {"smoke-ubuntu": "glibc-floor"}
 R1 = {
     "T0a-docs": {"contracts"},
     # The contract steps police test-infrastructure/ and lint config too.
@@ -474,6 +479,9 @@ def select(paths, expect=None):
             lanes = lanes | extra
     if lanes & TEST_LEGS:
         lanes = lanes | {"shard-completeness"}
+    for leader, follower in sorted(FOLLOWS.items()):
+        if leader in lanes:
+            lanes = lanes | {follower}
     for language, lane in sorted(CODEQL_LANES.items()):
         hits = [p for p in paths if codeql_scope(language, p)]
         if hits and lane not in lanes:
