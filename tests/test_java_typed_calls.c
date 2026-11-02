@@ -16,7 +16,9 @@
  *     fallback;
  *   - a project type in the caller's own package that shares its simple
  *     name with a java.lang type (Process), or such a type declared in the
- *     caller's own file (Record): the own package wins.
+ *     caller's own file (Record): the own package wins;
+ *   - the same rule on a project class named Enum (com.acme.protogen):
+ *     `new Enum(..)` there binds that class node, not java.lang.Enum.
  * The same fixture runs on the sequential path and, padded past
  * MIN_FILES_FOR_PARALLEL, on the parallel one: both must agree on every edge
  * found by type. A name guess is left out of that comparison: on Windows the
@@ -105,11 +107,30 @@ static const char *const JT_SERVICE =
     "    }\n"
     "}\n";
 
+/* JLS 6.4.1: java.lang is an on-demand import, and an on-demand import never
+ * shadows a type of the compilation unit's own package. So `Enum` in
+ * Message means com.acme.protogen.Enum (the shape of Netflix conductor's
+ * protogen.Enum). Read as java.lang.Enum, the call counts as external and
+ * loses its edge. */
+static const char *const JT_PROTO_ENUM = "package com.acme.protogen;\n\n"
+                                         "public class Enum {\n"
+                                         "    public Enum(Class<?> cls, String parent) {}\n"
+                                         "}\n";
+
+static const char *const JT_PROTO_MESSAGE = "package com.acme.protogen;\n\n"
+                                            "public class Message {\n"
+                                            "    public void addNestedEnum(Class<?> cls) {\n"
+                                            "        Enum e = new Enum(cls, \"parent\");\n"
+                                            "    }\n"
+                                            "}\n";
+
 static void jt_write_fixture(const char *tmp, int filler) {
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/model/Customer.java"), JT_CUSTOMER);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/other/Filters.java"), JT_FILTERS);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/svc/InvoiceService.java"), JT_SERVICE);
     th_write_file(TH_PATH(tmp, "src/main/java/com/acme/svc/Process.java"), JT_PROCESS);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/protogen/Enum.java"), JT_PROTO_ENUM);
+    th_write_file(TH_PATH(tmp, "src/main/java/com/acme/protogen/Message.java"), JT_PROTO_MESSAGE);
     for (int i = 0; i < filler; i++) {
         char rel[128];
         char body[256];
@@ -310,16 +331,71 @@ static int jt_check_external(jt_index_t *ix, int sequential) {
     return ok;
 }
 
-static int jt_run_all(int filler) {
+/* The one CALLS edge for (caller, leaf) reaches a node labelled `label`. */
+static int jt_expect_target_label(jt_index_t *ix, const char *caller, const char *leaf,
+                                  const char *label) {
+    const char *sql = "SELECT t.label, json_extract(e.properties,'$.callee') FROM edges e "
+                      "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                      "WHERE e.type = 'CALLS' AND s.name = ?1";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(ix->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(st, 1, caller, -1, SQLITE_STATIC);
+    int hits = 0;
+    int others = 0;
+    size_t llen = strlen(leaf);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *have = (const char *)sqlite3_column_text(st, 0);
+        const char *callee = (const char *)sqlite3_column_text(st, 1);
+        if (!have || !callee) {
+            continue;
+        }
+        size_t clen = strlen(callee);
+        bool leaf_match = (clen == llen && strcmp(callee, leaf) == 0) ||
+                          (clen > llen && callee[clen - llen - 1] == '.' &&
+                           strcmp(callee + clen - llen, leaf) == 0);
+        if (!leaf_match) {
+            continue;
+        }
+        if (strcmp(have, label) == 0) {
+            hits++;
+        } else {
+            others++;
+        }
+    }
+    sqlite3_finalize(st);
+    if (hits == 1 && others == 0) {
+        return 1;
+    }
+    printf("\n  %s -> %s: want one edge to a %s node, have %d to one and %d to others\n", caller,
+           leaf, label, hits, others);
+    return 0;
+}
+
+/* `new Enum(..)` in com.acme.protogen binds the project class Enum (its
+ * class node, as `new` does for every project type), not java.lang.Enum. */
+static int jt_check_own_package_enum(jt_index_t *ix) {
+    int ok = 1;
+    ok &= jt_expect(ix, "addNestedEnum", "Enum", "com.acme.protogen.Enum");
+    ok &= jt_expect_target_label(ix, "addNestedEnum", "Enum", "Class");
+    return ok;
+}
+
+static int jt_run_check(int filler, int enum_only) {
     jt_index_t ix;
     if (jt_index(&ix, filler) != 0) {
         printf("\n  indexing the fixture failed\n");
         jt_close(&ix);
         return 0;
     }
-    int ok = jt_check_external(&ix, filler == 0);
+    int ok = enum_only ? jt_check_own_package_enum(&ix) : jt_check_external(&ix, filler == 0);
     jt_close(&ix);
     return ok;
+}
+
+static int jt_run_all(int filler) {
+    return jt_run_check(filler, 0);
 }
 
 TEST(java_typed_calls_sequential) {
@@ -329,6 +405,16 @@ TEST(java_typed_calls_sequential) {
 
 TEST(java_typed_calls_parallel) {
     ASSERT_TRUE(jt_run_all(60));
+    PASS();
+}
+
+TEST(java_typed_calls_own_package_enum_sequential) {
+    ASSERT_TRUE(jt_run_check(0, 1));
+    PASS();
+}
+
+TEST(java_typed_calls_own_package_enum_parallel) {
+    ASSERT_TRUE(jt_run_check(60, 1));
     PASS();
 }
 
@@ -355,5 +441,7 @@ TEST(java_typed_calls_paths_agree) {
 SUITE(java_typed_calls) {
     RUN_TEST(java_typed_calls_sequential);
     RUN_TEST(java_typed_calls_parallel);
+    RUN_TEST(java_typed_calls_own_package_enum_sequential);
+    RUN_TEST(java_typed_calls_own_package_enum_parallel);
     RUN_TEST(java_typed_calls_paths_agree);
 }
