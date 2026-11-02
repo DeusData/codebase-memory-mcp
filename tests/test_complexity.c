@@ -40,6 +40,7 @@
  * suite hunts cannot arise from them; the shared passes they feed (registry,
  * similarity, semantic) are exercised by the template corpus.
  */
+#include "lsp/type_registry.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 
@@ -51,13 +52,25 @@
 #include "cbm.h"
 #include "discover/discover.h"
 #include "lang_specs.h"
+#include "lsp/c_lsp.h"
+#include "lsp/kotlin_lsp.h"
 #include "lsp/py_lsp.h"
+#include "lsp/rust_proof.h"
 #include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "resolve/stats.h"
+#include "foundation/sha256.h"
+#include <sqlite3.h>
+#include "graph_buffer/graph_buffer.h"
+#include "resolve/binding.h"
+#include "resolve/rust_names.h"
+#include "lsp/lsp_work.h"
+#include "lsp/lsp_name_rows.h"
+#define CBM_SYNTAX_INDEX_IMPLEMENTATION /* the seam only: this file asks tree-sitter directly */
+#include "resolve/syntax_index.h"
 #include "yyjson/yyjson.h"
 
 #include <stdatomic.h>
@@ -913,7 +926,7 @@ static bool cx_resolver_linear(const CxMetrics *a, const CxMetrics *b) {
     for (unsigned i = 0; i < CBM_RESOLVE_STAT_COUNT; i++) {
         /* Only languages with root-level semantic facts walk syntax here; the
          * flat-file test below gates this counter with a corpus that does. */
-        if (i == CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS)
+        if (i == CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS || i == CBM_RESOLVE_STAT_SYNTAX_INDEX_NODES)
             continue;
         uint64_t first = a->resolver.values[i], second = b->resolver.values[i];
         double ratio = cx_ratio((double)second, (double)first);
@@ -1530,6 +1543,66 @@ static int cx_build_flat_ts(const char *root, int k) {
     return fclose(f) == 0 && written ? 0 : -1;
 }
 
+/* Java, Kotlin and C# bodies: each identifier asks whether it is a local. */
+static int cx_build_long_java_body(const char *root, int k) {
+    char path[1200];
+    int pn = snprintf(path, sizeof(path), "%s/Body.java", root);
+    if (pn < 0 || (size_t)pn >= sizeof(path))
+        return -1;
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    bool written = fprintf(f, "class Body { int f(int a) { return a; } void big() {\n") >= 0;
+    for (int i = 0; written && i < k * CX_FLAT_CLASSES_PER_K; i++)
+        written = fprintf(f, "  int v%d = f(1);\n", i) >= 0;
+    written = written && fprintf(f, "} }\n") >= 0;
+    return fclose(f) == 0 && written ? 0 : -1;
+}
+TEST(complexity_oo_local_lookup_is_linear) {
+    CxMetrics a = {0}, b = {0};
+    ASSERT_EQ(cx_measure(cx_build_long_java_body, "cbm_cxbody_a", "cbm_cxbody_b", &a, &b), 0);
+    uint64_t first = a.resolver.values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+    uint64_t second = b.resolver.values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    oo locals lookup_probes %llu -> %llu (ratio %.2f, linear ~2, quadratic ~4)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)(CX_K_BASE * CX_FLAT_CLASSES_PER_K));
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* The same bodies asking which import a name means. */
+static int cx_build_long_java_imports(const char *root, int k) {
+    char path[1200];
+    int pn = snprintf(path, sizeof(path), "%s/Imports.java", root);
+    if (pn < 0 || (size_t)pn >= sizeof(path))
+        return -1;
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    int lines = k * CX_FLAT_CLASSES_PER_K;
+    bool written = true;
+    for (int i = 0; written && i < lines; i++)
+        written = fprintf(f, "import q.r%d.S%d;\n", i, i) >= 0;
+    written = written && fprintf(f, "class Imports { void big() {\n") >= 0;
+    for (int i = 0; written && i < lines; i++)
+        written = fprintf(f, "  S%d.call();\n", i) >= 0;
+    written = written && fprintf(f, "} }\n") >= 0;
+    return fclose(f) == 0 && written ? 0 : -1;
+}
+TEST(complexity_oo_explicit_imports_are_linear) {
+    CxMetrics a = {0}, b = {0};
+    ASSERT_EQ(cx_measure(cx_build_long_java_imports, "cbm_cximp_a", "cbm_cximp_b", &a, &b), 0);
+    uint64_t first = a.resolver.values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+    uint64_t second = b.resolver.values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    oo imports lookup_probes %llu -> %llu (ratio %.2f, linear ~2, quadratic ~4)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)(CX_K_BASE * CX_FLAT_CLASSES_PER_K));
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 TEST(complexity_flat_file_syntax_walk_is_linear) {
     CxMetrics a = {0}, b = {0};
     ASSERT_EQ(cx_measure(cx_build_flat_ts, "cbm_cxflat_a", "cbm_cxflat_b", &a, &b), 0);
@@ -1546,8 +1619,1588 @@ TEST(complexity_flat_file_syntax_walk_is_linear) {
     PASS();
 }
 
+/* ── One file's source analysis ─────────────────────────────────────
+ * These run the binding index alone, in-process, so a shape can be doubled cheaply and
+ * each counter speaks for the analysis and nothing else. The plain mode asks tree-sitter
+ * the way this code used to and charges the sibling steps that really takes: a fixture
+ * that does not show about 4 there could not show a quadratic here either. */
+enum { CX_BINDING_LINES = 1500, CX_BINDING_LINE_ROOM = 128, TARGET_FILES_SHORT = 12 };
+
+typedef const char *(*CxLineFn)(char *out, size_t cap, int i);
+
+/* The steps to reach a child: walking its siblings, or listing them once in an index. */
+static uint64_t cx_stat_work(const cbm_resolve_stats_t *stats, cbm_resolve_stat_t stat) {
+    cbm_resolve_stats_snapshot_t seen = cbm_resolve_stats_snapshot(stats);
+    return seen.values[stat] + (stat == CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS
+                                    ? seen.values[CBM_RESOLVE_STAT_SYNTAX_INDEX_NODES]
+                                    : 0);
+}
+static uint64_t cx_binding_work(CBMLanguage language, const char *path, const char *head,
+                                CxLineFn line, const char *tail, int lines, bool plain,
+                                cbm_resolve_stat_t stat) {
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    length += (size_t)snprintf(source + length, room - length, "%s", tail);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, language, "test", path, 0, NULL, NULL);
+    uint64_t work = 0;
+    if (result) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        cbm_syntax_index_test_set_plain(plain);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, result, language, source, length);
+        cbm_syntax_index_test_set_plain(false);
+        cbm_resolve_stats_bind(previous);
+        if (index &&
+            !strcmp(cbm_resolve_binding_status(index), "binding_complete_supported_subset"))
+            work = cx_stat_work(&stats, stat);
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
+    free(source);
+    return work;
+}
+
+static double cx_binding_ratio(CBMLanguage language, const char *path, const char *head,
+                               CxLineFn line, const char *tail, bool plain, cbm_resolve_stat_t stat,
+                               uint64_t *base) {
+    uint64_t first =
+        cx_binding_work(language, path, head, line, tail, CX_BINDING_LINES, plain, stat);
+    uint64_t second =
+        cx_binding_work(language, path, head, line, tail, CX_BINDING_LINES * 2, plain, stat);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s%s %s %llu -> %llu (ratio %.2f)\n", path, plain ? " plain" : "",
+           cbm_resolve_stat_name(stat), (unsigned long long)first, (unsigned long long)second,
+           ratio);
+    *base = first;
+    return ratio;
+}
+
+/* Quadratic when asked plainly, linear through the syntax index. */
+static bool cx_syntax_shape_binds(CBMLanguage language, const char *path, const char *head,
+                                  CxLineFn line, const char *tail) {
+    uint64_t base = 0;
+    double plain = cx_binding_ratio(language, path, head, line, tail, true,
+                                    CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    if (base < CX_BINDING_LINES || plain < 3.2)
+        return false;
+    double indexed = cx_binding_ratio(language, path, head, line, tail, false,
+                                      CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    return base >= CX_BINDING_LINES && indexed >= CX_RATIO_LO && indexed <= CX_RATIO_HI;
+}
+
+static const char *cx_line_py_statement(char *out, size_t cap, int i) {
+    snprintf(out, cap, "value_%d = make_%d(input_%d)\n", i, i, i);
+    return out;
+}
+static const char *cx_line_ts_statement(char *out, size_t cap, int i) {
+    snprintf(out, cap, "export const value_%d = make_%d(input_%d);\n", i, i, i);
+    return out;
+}
+static const char *cx_line_ts_member(char *out, size_t cap, int i) {
+    snprintf(out, cap, "  member_%d: helper_%d,\n", i, i);
+    return out;
+}
+static const char *cx_line_py_member(char *out, size_t cap, int i) {
+    snprintf(out, cap, "    value_%d = make_%d(input_%d)\n", i, i, i);
+    return out;
+}
+
+/* A module's width: every occurrence asks for its parent. */
+TEST(complexity_binding_wide_module_questions_are_linear) {
+    ASSERT_TRUE(cx_syntax_shape_binds(CBM_LANG_PYTHON, "flat.py", "", cx_line_py_statement, ""));
+    ASSERT_TRUE(
+        cx_syntax_shape_binds(CBM_LANG_TYPESCRIPT, "flat.ts", "", cx_line_ts_statement, ""));
+    PASS();
+}
+
+/* A wide node that is not the root: an object literal's members and a function's body. */
+TEST(complexity_binding_wide_inner_nodes_are_linear) {
+    ASSERT_TRUE(cx_syntax_shape_binds(CBM_LANG_TYPESCRIPT, "object.ts", "export const table = {\n",
+                                      cx_line_ts_member, "};\n"));
+    ASSERT_TRUE(
+        cx_syntax_shape_binds(CBM_LANG_PYTHON, "body.py", "def body():\n", cx_line_py_member, ""));
+    PASS();
+}
+
+/* An answer is exactly what tree-sitter says, including at the edges of the tree. */
+TEST(complexity_syntax_index_answers_as_tree_sitter_does) {
+    static const char source[] =
+        "def f(a, b=1):\n    return [a, (b), {'k': a}]\n\nclass C:\n    x = 1\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_PYTHON)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    ts_parser_delete(parser);
+    ASSERT_NOT_NULL(tree);
+    cbm_syntax_index_t index;
+    cbm_syntax_index_begin(&index, tree);
+    TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+    size_t visited = 0;
+    bool same = true;
+    for (bool more = true; more;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        visited++;
+        same = same && ts_node_eq(cbm_syntax_parent(node), ts_node_parent(node));
+        uint32_t count = ts_node_child_count(node);
+        for (uint32_t i = 0; i <= count; i++)
+            same = same && ts_node_eq(cbm_syntax_child(node, i), ts_node_child(node, i));
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode before = i ? ts_node_child(node, i - 1) : (TSNode){0};
+            TSNode child = ts_node_child(node, i);
+            same = same && ts_node_eq(cbm_syntax_previous_child(child), before);
+            cbm_syntax_index_test_set_plain(true);
+            same = same && ts_node_eq(cbm_syntax_previous_child(child), before);
+            cbm_syntax_index_test_set_plain(false);
+        }
+        uint32_t named = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i <= named; i++)
+            same =
+                same && ts_node_eq(cbm_syntax_named_child(node, i), ts_node_named_child(node, i));
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    cbm_syntax_index_end(&index);
+    ts_tree_delete(tree);
+    ASSERT_TRUE(same);
+    ASSERT_GTE(visited, (size_t)20);
+    PASS();
+}
+
+/* Past the width where children are listed: every position, and one past the end. */
+TEST(complexity_syntax_index_wide_lists_match_tree_sitter) {
+    enum { MEMBERS = 200 };
+    char *source = malloc((size_t)MEMBERS * 32 + 64);
+    ASSERT_NOT_NULL(source);
+    size_t length = (size_t)snprintf(source, 64, "values = [\n");
+    for (int i = 0; i < MEMBERS; i++)
+        length += (size_t)snprintf(source + length, 32, "  item_%d,  # note\n", i);
+    length += (size_t)snprintf(source + length, 8, "]\n");
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_PYTHON)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    ts_parser_delete(parser);
+    ASSERT_NOT_NULL(tree);
+    TSNode list = ts_node_named_descendant_for_byte_range(ts_tree_root_node(tree), 9, 10);
+    ASSERT_TRUE(!strcmp(ts_node_type(list), "list"));
+    ASSERT_GT(ts_node_child_count(list), (uint32_t)MEMBERS);
+    cbm_syntax_index_t index;
+    cbm_syntax_index_begin(&index, tree);
+    bool same = true;
+    for (uint32_t i = 0; i <= ts_node_child_count(list); i++)
+        same = same && ts_node_eq(cbm_syntax_child(list, i), ts_node_child(list, i));
+    for (uint32_t i = 0; i <= ts_node_named_child_count(list); i++)
+        same = same && ts_node_eq(cbm_syntax_named_child(list, i), ts_node_named_child(list, i));
+    cbm_syntax_index_end(&index);
+    ts_tree_delete(tree);
+    free(source);
+    ASSERT_TRUE(same);
+    PASS();
+}
+
+/* Each helper is a declaration and a definition spelled alike, so a join on the name
+ * alone visits every pair. Generated files repeat names exactly like this. */
+static const char *cx_line_js_same_named(char *out, size_t cap, int i) {
+    snprintf(out, cap, "export function outer_%d() { function helper() { return %d; } }\n", i, i);
+    return out;
+}
+TEST(complexity_js_value_join_is_linear_in_a_repeated_name) {
+    uint64_t base = 0;
+    double ratio = cx_binding_ratio(CBM_LANG_TYPESCRIPT, "same.ts", "", cx_line_js_same_named, "",
+                                    false, CBM_RESOLVE_STAT_CANDIDATE_VISITS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each dotted import asks whether its package is bound yet. */
+static const char *cx_line_py_dotted_import(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import package_%d.part\n", i);
+    return out;
+}
+TEST(complexity_python_dotted_imports_are_linear) {
+    uint64_t base = 0;
+    double ratio = cx_binding_ratio(CBM_LANG_PYTHON, "imports.py", "", cx_line_py_dotted_import, "",
+                                    false, CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each decorator's root is joined to the file's imports. */
+static const char *cx_line_py_decorated(char *out, size_t cap, int i) {
+    snprintf(out, cap, "from package_%d import deco_%d\n@deco_%d\ndef run_%d():\n    return 1\n", i,
+             i, i, i);
+    return out;
+}
+TEST(complexity_python_import_join_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_binding_ratio(CBM_LANG_PYTHON, "decorated.py", "", cx_line_py_decorated, "",
+                                    false, CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Extraction runs a language's own pass over the file, so these shapes count that. */
+static uint64_t cx_extract_work(CBMLanguage language, const char *path, const char *head,
+                                CxLineFn line, const char *tail, int lines, bool plain,
+                                cbm_resolve_stat_t stat) {
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    length += (size_t)snprintf(source + length, room - length, "%s", tail);
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    cbm_syntax_index_test_set_plain(plain);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, language, "test", path, 0, NULL, NULL);
+    cbm_syntax_index_test_set_plain(false);
+    cbm_resolve_stats_bind(previous);
+    uint64_t work = result ? cx_stat_work(&stats, stat) : 0;
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+static double cx_extract_ratio(CBMLanguage language, const char *path, const char *head,
+                               CxLineFn line, const char *tail, bool plain, cbm_resolve_stat_t stat,
+                               uint64_t *base) {
+    uint64_t first =
+        cx_extract_work(language, path, head, line, tail, CX_BINDING_LINES, plain, stat);
+    uint64_t second =
+        cx_extract_work(language, path, head, line, tail, CX_BINDING_LINES * 2, plain, stat);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s%s %s %llu -> %llu (ratio %.2f)\n", path, plain ? " plain" : "",
+           cbm_resolve_stat_name(stat), (unsigned long long)first, (unsigned long long)second,
+           ratio);
+    *base = first;
+    return ratio;
+}
+
+/* What the language's own pass compared while searching its registry and scopes. */
+static uint64_t cx_extract_lsp_steps(CBMLanguage language, const char *path, const char *head,
+                                     CxLineFn line, const char *tail, int lines) {
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    length += (size_t)snprintf(source + length, room - length, "%s", tail);
+    (void)cbm_lsp_work_take();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, language, "test", path, 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+/* Before a JavaScript file's registry was indexed, its own pass searched it from the top
+ * for every function and every identifier in the body it inferred a return type from. */
+static const char *cx_line_js_function_pair(char *out, size_t cap, int i) {
+    snprintf(out, cap, "function f_%d(a) { return g_%d(a); }\nfunction g_%d(b) { return b; }\n", i,
+             i, i);
+    return out;
+}
+static const char *cx_line_kotlin_function_pair(char *out, size_t cap, int i) {
+    snprintf(out, cap, "fun f_%d(a: Int): Int = g_%d(a)\nfun g_%d(b: Int): Int = b\n", i, i, i);
+    return out;
+}
+/* The same with Rust's registration passes, one patch per function and per method. */
+static const char *cx_line_rust_function_pair(char *out, size_t cap, int i) {
+    snprintf(out, cap, "pub fn f_%d(a: i32) -> i32 { g_%d(a) }\nfn g_%d(b: i32) -> i32 { b }\n", i,
+             i, i);
+    return out;
+}
+static bool cx_pass_steps_are_linear(CBMLanguage language, const char *path, const char *head,
+                                     CxLineFn line) {
+    uint64_t first = cx_extract_lsp_steps(language, path, head, line, "", CX_BINDING_LINES);
+    uint64_t second = cx_extract_lsp_steps(language, path, head, line, "", CX_BINDING_LINES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s lsp steps %llu -> %llu (ratio %.2f)\n", path, (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    return first >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_js_pass_registry_lookups_are_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_JAVASCRIPT, "pairs.js", "export {};\n",
+                                         cx_line_js_function_pair));
+    PASS();
+}
+TEST(complexity_rust_pass_registration_is_linear) {
+    ASSERT_TRUE(
+        cx_pass_steps_are_linear(CBM_LANG_RUST, "pairs.rs", "", cx_line_rust_function_pair));
+    PASS();
+}
+static const char *cx_line_go_type_and_method(char *out, size_t cap, int i) {
+    snprintf(out, cap, "type T%d struct{ A int }\nfunc (t T%d) M() int { return t.A }\n", i, i);
+    return out;
+}
+TEST(complexity_go_pass_registration_is_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_GO, "types.go", "package p\n",
+                                         cx_line_go_type_and_method));
+    PASS();
+}
+/* A type name no import explains looked through every registered type. */
+static const char *cx_line_java_unknown_type(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class A%d { Unknown%d field; Unknown%d get() { return field; } }\n", i, i,
+             i);
+    return out;
+}
+TEST(complexity_java_short_name_fallback_is_linear) {
+    ASSERT_TRUE(
+        cx_pass_steps_are_linear(CBM_LANG_JAVA, "Types.java", "", cx_line_java_unknown_type));
+    PASS();
+}
+/* Each C# method and class patched the first registration of its name after a scan. */
+static const char *cx_line_csharp_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class C%d { public int X; int F(int a) { return a; } }\n", i);
+    return out;
+}
+static const char *cx_line_csharp_methods(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "class C%d { public int X; int F(int a) { return a; } int G() { return 1; } "
+             "int H() { return 1; } }\n",
+             i);
+    return out;
+}
+/* Every definition does linear work too, so it takes this many before the scans show. */
+TEST(complexity_csharp_pass_registration_is_linear) {
+    enum { LINES = 3000 };
+    uint64_t first =
+        cx_extract_lsp_steps(CBM_LANG_CSHARP, "methods.cs", "", cx_line_csharp_methods, "", LINES);
+    uint64_t second = cx_extract_lsp_steps(CBM_LANG_CSHARP, "methods.cs", "",
+                                           cx_line_csharp_methods, "", LINES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    methods.cs lsp steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)LINES);
+    ASSERT_TRUE(ratio <= CX_RATIO_HI);
+    PASS();
+}
+/* A file of classes: each one's registration looked at all that were registered before. */
+static const char *cx_line_kotlin_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class C%d { val x: Int = 1\n fun f(a: Int): Int = a }\n", i);
+    return out;
+}
+TEST(complexity_kotlin_class_registration_is_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_KOTLIN, "classes.kt", "package p\n",
+                                         cx_line_kotlin_class));
+    PASS();
+}
+static const char *cx_line_java_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class C%d extends B { int f; void m(int a) { } }\n", i);
+    return out;
+}
+TEST(complexity_java_class_registration_is_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_JAVA, "Classes.java", "", cx_line_java_class));
+    PASS();
+}
+static const char *cx_line_ts_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "export class C%d { x: number = 1; m(a: number): number { return a; } }\n",
+             i);
+    return out;
+}
+/* TypeScript's checker.ts names thousands of imports and makes a hundred thousand calls: the proof
+ * looked through the imports for each callee and each annotation, and through all the narrowings of
+ * a path for each receiver on it. */
+static const char *cx_line_ts_imported_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import { f%d } from './m';\nf%d().m();\n", i, i);
+    return out;
+}
+static const char *cx_line_ts_imported_annotation(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import { t%d } from './m';\nlet a%d: C[] = [];\na%d[0].m();\n", i, i, i);
+    return out;
+}
+static const char *cx_line_ts_narrowing(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "if (x instanceof C) { x.m(); }\n");
+    return out;
+}
+TEST(complexity_ts_proof_callee_imports_are_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_TYPESCRIPT, "calls.ts", "class C { m() {} }\n",
+                                         cx_line_ts_imported_call));
+    PASS();
+}
+TEST(complexity_ts_proof_annotation_imports_are_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_TYPESCRIPT, "typed.ts", "class C { m() {} }\n",
+                                         cx_line_ts_imported_annotation));
+    PASS();
+}
+/* ── A file that never parses ───────────────────────────────────────
+ * Declarations left open end up side by side under one error node, so every question
+ * about a child is a question about a very wide parent. A 990 KB Kotlin file of these
+ * lines held an index run for 50 minutes. Extraction has its index; a language's cross
+ * pass parses again and needs its own. No index open means no work counted at all, so
+ * the floor on the first count fails then too. */
+static const char *cx_line_kotlin_unclosed(char *out, size_t cap, int i) {
+    (void)out, (void)cap, (void)i;
+    return "object A {\n";
+}
+static const char *cx_line_c_unclosed(char *out, size_t cap, int i) {
+    (void)out, (void)cap, (void)i;
+    return "struct A {\n";
+}
+static const char *cx_line_cpp_unclosed(char *out, size_t cap, int i) {
+    (void)out, (void)cap, (void)i;
+    return "namespace a {\n";
+}
+static const char *cx_line_js_unclosed(char *out, size_t cap, int i) {
+    (void)out, (void)cap, (void)i;
+    return "function a() {\n";
+}
+static const char *cx_line_dart_unclosed(char *out, size_t cap, int i) {
+    (void)out, (void)cap, (void)i;
+    return "class A {\n";
+}
+typedef void (*CxCrossFn)(CBMArena *arena, const char *source, int length,
+                          CBMResolvedCallArray *out);
+static void cx_cross_kotlin(CBMArena *arena, const char *source, int length,
+                            CBMResolvedCallArray *out) {
+    cbm_run_kotlin_lsp_cross(arena, source, length, "test.m", NULL, 0, NULL, NULL, 0, NULL, out);
+}
+static void cx_cross_c(CBMArena *arena, const char *source, int length, CBMResolvedCallArray *out) {
+    (void)cbm_run_c_lsp_cross(arena, source, length, "test.m", false, NULL, 0, NULL, NULL, 0, NULL,
+                              out);
+}
+static void cx_cross_cpp(CBMArena *arena, const char *source, int length,
+                         CBMResolvedCallArray *out) {
+    (void)cbm_run_c_lsp_cross(arena, source, length, "test.m", true, NULL, 0, NULL, NULL, 0, NULL,
+                              out);
+}
+static void cx_cross_c_shared(CBMArena *arena, const char *source, int length,
+                              CBMResolvedCallArray *out) {
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, arena);
+    cbm_registry_finalize(&registry);
+    (void)cbm_run_c_lsp_cross_with_registry_status(arena, source, length, "test.m", false,
+                                                   &registry, NULL, NULL, 0, NULL, out);
+}
+static uint64_t cx_cross_work(CxCrossFn run, CxLineFn line, int lines) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    run(&arena, source, (int)length, &out);
+    cbm_resolve_stats_bind(previous);
+    uint64_t work = cx_stat_work(&stats, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS);
+    cbm_arena_destroy(&arena);
+    free(source);
+    return work;
+}
+static bool cx_cross_is_linear(CxCrossFn run, CxLineFn line, const char *name) {
+    uint64_t first = cx_cross_work(run, line, CX_BINDING_LINES);
+    uint64_t second = cx_cross_work(run, line, CX_BINDING_LINES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s cross steps %llu -> %llu (ratio %.2f)\n", name, (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    return first >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+static const char *cx_line_rust_unclosed(char *out, size_t cap, int i) {
+    (void)out, (void)cap, (void)i;
+    return "mod a {\n";
+}
+static void cx_cross_rust_facts(CBMArena *arena, const char *source, int length,
+                                CBMResolvedCallArray *out) {
+    (void)out;
+    (void)cbm_rust_collect_source_facts(arena, source, length, "test.m", NULL, 0);
+}
+TEST(complexity_rust_source_facts_on_unclosed_nesting_are_linear) {
+    ASSERT_TRUE(cx_cross_is_linear(cx_cross_rust_facts, cx_line_rust_unclosed, "unclosed.rs"));
+    PASS();
+}
+TEST(complexity_kotlin_cross_on_unclosed_nesting_is_linear) {
+    ASSERT_TRUE(cx_cross_is_linear(cx_cross_kotlin, cx_line_kotlin_unclosed, "unclosed.kt"));
+    PASS();
+}
+TEST(complexity_c_cross_on_unclosed_nesting_is_linear) {
+    ASSERT_TRUE(cx_cross_is_linear(cx_cross_c, cx_line_c_unclosed, "unclosed.c"));
+    PASS();
+}
+TEST(complexity_cpp_cross_on_unclosed_nesting_is_linear) {
+    ASSERT_TRUE(cx_cross_is_linear(cx_cross_cpp, cx_line_cpp_unclosed, "unclosed.cpp"));
+    PASS();
+}
+TEST(complexity_c_shared_cross_on_unclosed_nesting_is_linear) {
+    ASSERT_TRUE(cx_cross_is_linear(cx_cross_c_shared, cx_line_c_unclosed, "shared.c"));
+    PASS();
+}
+TEST(complexity_js_proof_on_unclosed_nesting_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_extract_ratio(CBM_LANG_JAVASCRIPT, "unclosed.js", "", cx_line_js_unclosed, "",
+                                    false, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+TEST(complexity_dart_usages_on_unclosed_nesting_is_linear) {
+    /* The walk's own cursor answers, so nothing need be counted at all. */
+    uint64_t base = 0;
+    (void)cx_extract_ratio(CBM_LANG_DART, "unclosed.dart", "", cx_line_dart_unclosed, "", false,
+                           CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    uint64_t twice =
+        cx_extract_work(CBM_LANG_DART, "unclosed.dart", "", cx_line_dart_unclosed, "",
+                        CX_BINDING_LINES * 2, false, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS);
+    ASSERT_TRUE((double)twice <= CX_RATIO_HI * (double)(base + CX_BINDING_LINES));
+    PASS();
+}
+/* The same declarations closed: now the depth is real. Each identifier's usage
+ * classifiers climb towards the root, and Kotlin's grammar gives them little to stop at. */
+enum { CX_NEST_DEPTH = 400 };
+static uint64_t cx_usage_climb_work(int depth) {
+    static const char open[] = "object A {\n", close[] = "}\n";
+    size_t room = (size_t)depth * (sizeof(open) + sizeof(close)) + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    for (int i = 0; i < depth; i++)
+        length += (size_t)snprintf(source + length, room - length, "%s", open);
+    for (int i = 0; i < depth; i++)
+        length += (size_t)snprintf(source + length, room - length, "%s", close);
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_KOTLIN, "test", "nest.kt", 0, NULL, NULL);
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+TEST(complexity_usage_classifiers_on_deep_nesting_are_linear) {
+    uint64_t first = cx_usage_climb_work(CX_NEST_DEPTH);
+    uint64_t second = cx_usage_climb_work(CX_NEST_DEPTH * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    nest.kt usage climb %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)CX_NEST_DEPTH);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+/* A definition's decorators start from the sibling before it. */
+static const char *cx_line_kotlin_object(char *out, size_t cap, int i) {
+    snprintf(out, cap, "object A_%d { }\n", i);
+    return out;
+}
+TEST(complexity_decorator_lookup_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_extract_ratio(CBM_LANG_KOTLIN, "objects.kt", "", cx_line_kotlin_object, "",
+                                    false, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+TEST(complexity_ts_proof_narrowing_lookup_is_linear) {
+    static const char head[] = "class C { m() {} }\nfunction f(x: C) {\n";
+    uint64_t first = cx_extract_lsp_steps(CBM_LANG_TYPESCRIPT, "narrow.ts", head,
+                                          cx_line_ts_narrowing, "}\n", CX_BINDING_LINES);
+    uint64_t second = cx_extract_lsp_steps(CBM_LANG_TYPESCRIPT, "narrow.ts", head,
+                                           cx_line_ts_narrowing, "}\n", CX_BINDING_LINES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    narrow.ts lsp steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+TEST(complexity_ts_class_registration_is_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_TYPESCRIPT, "classes.ts", "", cx_line_ts_class));
+    PASS();
+}
+static const char *cx_line_rust_derive(char *out, size_t cap, int i) {
+    snprintf(out, cap, "#[derive(Clone, Debug)]\npub struct S%d { pub a: i32 }\n", i);
+    return out;
+}
+TEST(complexity_rust_derive_registration_is_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_RUST, "derive.rs", "", cx_line_rust_derive));
+    PASS();
+}
+static const char *cx_line_go_generic(char *out, size_t cap, int i) {
+    snprintf(out, cap, "func F%d[T any](a T) T { return a }\n", i);
+    return out;
+}
+TEST(complexity_go_generic_registration_is_linear) {
+    ASSERT_TRUE(
+        cx_pass_steps_are_linear(CBM_LANG_GO, "generic.go", "package p\n", cx_line_go_generic));
+    PASS();
+}
+/* Each C# class looked through the file's top level for a file-scoped namespace. */
+TEST(complexity_csharp_namespace_lookup_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_extract_ratio(CBM_LANG_CSHARP, "classes.cs", "", cx_line_csharp_class, "",
+                                    false, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+/* The tail index must answer what the scan answers, duplicates and later indexes included. */
+static int cx_type_row(const CBMTypeRegistry *reg, const char *name) {
+    const CBMRegisteredType *found = cbm_registry_lookup_type(reg, name);
+    return found ? (int)(found - reg->types) : -1;
+}
+static int cx_func_row(const CBMTypeRegistry *reg, const char *name) {
+    const CBMRegisteredFunc *found = cbm_registry_lookup_func(reg, name);
+    return found ? (int)(found - reg->funcs) : -1;
+}
+TEST(complexity_registry_tail_answers_as_a_scan_does) {
+    enum { ROWS = 600, NAMES = 250, INDEX_AT = 200, PROBE_STEP = 37 };
+    CBMArena arena, tail_arena, idx_arena;
+    cbm_arena_init(&arena);
+    cbm_arena_init(&tail_arena);
+    cbm_arena_init(&idx_arena);
+    CBMTypeRegistry with, without;
+    cbm_registry_init(&with, &arena);
+    cbm_registry_init(&without, &arena);
+    with.tail_arena = &tail_arena;
+    bool memo_used = false;
+    for (int i = 0; i < ROWS; i++) {
+        char name[CX_BINDING_LINE_ROOM];
+        snprintf(name, sizeof(name), "t%d", i % NAMES);
+        const char *qn = cbm_arena_strdup(&arena, name);
+        CBMRegisteredType type = {.qualified_name = qn, .short_name = qn};
+        CBMRegisteredFunc func = {.qualified_name = qn, .short_name = qn};
+        cbm_registry_add_type(&with, type);
+        cbm_registry_add_type(&without, type);
+        cbm_registry_add_func(&with, func);
+        cbm_registry_add_func(&without, func);
+        if (i == INDEX_AT) {
+            cbm_registry_finalize_into(&with, &idx_arena);
+            cbm_registry_finalize_into(&without, &idx_arena);
+        }
+        memo_used = memo_used || with.type_tail.synced > with.type_tail.start;
+        for (int probe = 0; probe < NAMES + PROBE_STEP; probe += PROBE_STEP) {
+            char ask[CX_BINDING_LINE_ROOM];
+            snprintf(ask, sizeof(ask), "t%d", probe);
+            ASSERT_EQ(cx_type_row(&with, ask), cx_type_row(&without, ask));
+            ASSERT_EQ(cx_func_row(&with, ask), cx_func_row(&without, ask));
+            const CBMRegisteredType *own_with = cbm_registry_first_own_type(&with, ask);
+            const CBMRegisteredType *own_without = cbm_registry_first_own_type(&without, ask);
+            ASSERT_EQ(own_with ? (int)(own_with - with.types) : -1,
+                      own_without ? (int)(own_without - without.types) : -1);
+        }
+    }
+    ASSERT_TRUE(memo_used);
+    cbm_arena_destroy(&idx_arena);
+    cbm_arena_destroy(&tail_arena);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+TEST(complexity_kotlin_pass_registry_lookups_are_linear) {
+    ASSERT_TRUE(cx_pass_steps_are_linear(CBM_LANG_KOTLIN, "pairs.kt", "package p\n",
+                                         cx_line_kotlin_function_pair));
+    PASS();
+}
+
+/* Each call in a body asks whether its name is a local, and the answer walked them all. */
+static const char *cx_line_rust_let(char *out, size_t cap, int i) {
+    snprintf(out, cap, "    let v_%d = f(1);\n", i);
+    return out;
+}
+static const char *cx_line_rust_inline_mod(char *out, size_t cap, int i) {
+    snprintf(out, cap, "pub mod m_%d { pub fn f() -> i32 { 1 } }\nfn g_%d() -> i32 { m_%d::f() }\n",
+             i, i, i);
+    return out;
+}
+static uint64_t cx_rust_flow_probes(const char *head, CxLineFn line, const char *tail, int lines) {
+    static const char manifest[] = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    length += (size_t)snprintf(source + length, room - length, "%s", tail);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_RUST, "p", "src/lib.rs", 0, NULL, NULL);
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    if (parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST)))
+        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    if (parser)
+        ts_parser_delete(parser);
+    cbm_rust_project_t *project = cbm_rust_project_new();
+    uint64_t work = 0;
+    if (result && tree && project &&
+        cbm_rust_project_add_manifest(project, "Cargo.toml", manifest, strlen(manifest)) &&
+        cbm_rust_project_add_file(project, "src/lib.rs", result, source, length,
+                                  ts_tree_root_node(tree)) &&
+        cbm_rust_project_seal(project)) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        cbm_rust_file_analysis_t *analysis = cbm_rust_analyze_file(
+            project, &arena, "src/lib.rs", source, length, ts_tree_root_node(tree));
+        cbm_resolve_stats_bind(previous);
+        if (analysis)
+            work = cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+        cbm_arena_destroy(&arena);
+    }
+    cbm_rust_project_free(project);
+    if (tree)
+        ts_tree_delete(tree);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+static bool cx_rust_flow_is_linear(const char *what, const char *head, CxLineFn line,
+                                   const char *tail) {
+    uint64_t first = cx_rust_flow_probes(head, line, tail, CX_BINDING_LINES);
+    uint64_t second = cx_rust_flow_probes(head, line, tail, CX_BINDING_LINES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    rust %s probes %llu -> %llu (ratio %.2f)\n", what, (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    return first >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_rust_local_lookup_is_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("locals", "fn f(a: i32) -> i32 { a }\nfn big() {\n",
+                                       cx_line_rust_let, "}\n"));
+    PASS();
+}
+/* A crate root's modules were a list, walked per path and per inline module. */
+/* Every method on a std type looked through all the project's impls on outside types. */
+static const char *cx_line_rust_ext_impl(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "trait T%d{fn m%d(&self);}\nimpl T%d for String{fn m%d(&self){}}\n"
+             "fn g%d(s:String){s.m%d();}\n",
+             i, i, i, i, i, i);
+    return out;
+}
+TEST(complexity_rust_outside_impls_are_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("outside impls", "", cx_line_rust_ext_impl, ""));
+    PASS();
+}
+/* Each impl walked looked itself up in its module's list. */
+static const char *cx_line_rust_impl(char *out, size_t cap, int i) {
+    snprintf(out, cap, "pub struct S%d;\nimpl S%d { pub fn m(&self) -> i32 { 1 } }\n", i, i);
+    return out;
+}
+TEST(complexity_rust_impl_lookup_is_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("impls", "", cx_line_rust_impl, ""));
+    PASS();
+}
+/* A module's uses, walked for each local item found (a conditional use of its name), for each
+ * imported name, and for each trait a method call asks about. */
+static const char *cx_line_rust_use_and_fn(char *out, size_t cap, int i) {
+    snprintf(out, cap, "use a::b%d;\nfn f%d() { f%d(); }\n", i, i, i);
+    return out;
+}
+static const char *cx_line_rust_use_and_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "use a::b%d;\nfn f%d() { b%d(); }\n", i, i, i);
+    return out;
+}
+static const char *cx_line_rust_use_of_trait(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "mod b%d{pub trait T%d{fn m%d(&self);}impl T%d for u8{fn m%d(&self){}}}\n"
+             "use b%d::T%d;\nfn f%d(s:u8){s.m%d();}\n",
+             i, i, i, i, i, i, i, i, i);
+    return out;
+}
+TEST(complexity_rust_conditional_use_lookup_is_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("uses beside items", "", cx_line_rust_use_and_fn, ""));
+    PASS();
+}
+TEST(complexity_rust_named_use_lookup_is_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("uses named", "", cx_line_rust_use_and_call, ""));
+    PASS();
+}
+TEST(complexity_rust_trait_in_scope_is_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("uses of traits", "", cx_line_rust_use_of_trait, ""));
+    PASS();
+}
+TEST(complexity_rust_module_children_are_linear) {
+    ASSERT_TRUE(cx_rust_flow_is_linear("children", "", cx_line_rust_inline_mod, ""));
+    PASS();
+}
+
+/* Imports, then a use of each: every use used to scan them. */
+typedef struct {
+    CBMLanguage language;
+    const char *path, *head, *imported, *middle, *used, *tail;
+} CxImportShape;
+static const CxImportShape CX_IMPORT_SHAPES[] = {
+    {CBM_LANG_JAVASCRIPT, "uses.js", "", "import { n_%d } from './m_%d.js';\n", "", "n_%d();\n",
+     ""},
+    {CBM_LANG_TYPESCRIPT, "uses.ts", "", "import { n_%d } from './m_%d';\n", "", "n_%d();\n", ""},
+    {CBM_LANG_JAVA, "Uses.java", "", "import p.q%d.R%d;\n", "public class Uses { void f() {\n",
+     "  R%d.call();\n", "} }\n"},
+    {CBM_LANG_KOTLIN, "uses.kt", "package p\n", "import q.r%d.S%d\n", "fun f() {\n",
+     "  S%d.call()\n", "}\n"},
+    {CBM_LANG_PHP, "uses.php", "<?php\nnamespace App;\n", "use Lib\\A%d;\n", "function f() {\n",
+     "  A%d::go();\n", "}\n"},
+    {CBM_LANG_RUST, "uses.rs", "", "use crate::m%d::f%d;\n", "fn run() {\n", "    f%d();\n", "}\n"},
+    {CBM_LANG_GO, "uses.go", "package p\nimport (\n", "\tq%d \"example.com/q%d\"\n",
+     ")\nfunc F() {\n", "\tq%d.G()\n", "}\n"},
+};
+static uint64_t cx_import_shape_steps(const CxImportShape *shape, int lines) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM * 2 + CX_BINDING_LINE_ROOM * 2;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "%s", shape->head);
+    for (int i = 0; i < lines; i++)
+        length += (size_t)snprintf(source + length, room - length, shape->imported, i, i);
+    length += (size_t)snprintf(source + length, room - length, "%s", shape->middle);
+    for (int i = 0; i < lines; i++)
+        length += (size_t)snprintf(source + length, room - length, shape->used, i, i);
+    length += (size_t)snprintf(source + length, room - length, "%s", shape->tail);
+    (void)cbm_lsp_work_take();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, shape->language, "test", shape->path, 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+TEST(complexity_import_uses_are_linear_in_every_language_pass) {
+    bool all = true;
+    for (size_t i = 0; i < sizeof(CX_IMPORT_SHAPES) / sizeof(CX_IMPORT_SHAPES[0]); i++) {
+        const CxImportShape *shape = &CX_IMPORT_SHAPES[i];
+        uint64_t first = cx_import_shape_steps(shape, CX_BINDING_LINES);
+        uint64_t second = cx_import_shape_steps(shape, CX_BINDING_LINES * 2);
+        double ratio = cx_ratio((double)second, (double)first);
+        printf("    %s lsp steps %llu -> %llu (ratio %.2f)\n", shape->path,
+               (unsigned long long)first, (unsigned long long)second, ratio);
+        all = all && first >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+    }
+    ASSERT_TRUE(all);
+    PASS();
+}
+
+/* Which `import a.b` rows carry their root's fact. A root's first dotted row does, unless a
+ * row imports that root plainly. */
+extern int cbm_resolver_test_python_root_facts(const CBMFileResult *result);
+static const char *cx_line_py_root_import(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import pkg_%d.part\n", i);
+    return out;
+}
+static uint64_t cx_python_root_probes(const char *source, int *facts) {
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                             "roots.py", 0, NULL, NULL);
+    if (!result)
+        return 0;
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    *facts = cbm_resolver_test_python_root_facts(result);
+    cbm_resolve_stats_bind(previous);
+    cbm_free_result(result);
+    return cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+}
+static uint64_t cx_python_root_shape(int lines, int *facts) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    source[0] = '\0';
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s",
+                                   cx_line_py_root_import(row, sizeof(row), i));
+    }
+    uint64_t work = cx_python_root_probes(source, facts);
+    free(source);
+    return work;
+}
+TEST(complexity_python_root_facts_are_linear) {
+    int first_facts = 0, second_facts = 0;
+    uint64_t first = cx_python_root_shape(CX_BINDING_LINES, &first_facts);
+    uint64_t second = cx_python_root_shape(CX_BINDING_LINES * 2, &second_facts);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    python root facts probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_EQ(first_facts, CX_BINDING_LINES);
+    ASSERT_EQ(second_facts, CX_BINDING_LINES * 2);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    /* The rule, row by row: only a's first row counts, and b has a plain row. */
+    int facts = -1;
+    (void)cx_python_root_probes("import a.x\nimport a.y\nimport b.x\nimport b\nimport c.d.e\n",
+                                &facts);
+    ASSERT_EQ(facts, 2);
+    (void)cx_python_root_probes("import b\nimport b.x\n", &facts);
+    ASSERT_EQ(facts, 0);
+    PASS();
+}
+
+/* Python's builtins are declared by every Python file, so each new file asked whether it
+ * was on the list of each of them, and each call to a builtin could ask again. */
+extern bool cbm_resolver_test_target_files(int count);
+static uint64_t cx_target_file_probes(int count, bool *answers) {
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    *answers = cbm_resolver_test_target_files(count);
+    cbm_resolve_stats_bind(previous);
+    return cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+}
+TEST(complexity_target_file_list_is_near_linear) {
+    bool first_ok = false, second_ok = false;
+    uint64_t first = cx_target_file_probes(CX_BINDING_LINES, &first_ok);
+    uint64_t second = cx_target_file_probes(CX_BINDING_LINES * 2, &second_ok);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    target file probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_TRUE(first_ok);
+    ASSERT_TRUE(second_ok);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    /* Short lists are walked, and answer the same. */
+    uint64_t small_probes = cx_target_file_probes(TARGET_FILES_SHORT, &first_ok);
+    ASSERT_TRUE(first_ok);
+    ASSERT_GTE(small_probes, (uint64_t)TARGET_FILES_SHORT);
+    PASS();
+}
+
+/* The table says the same whichever way a name is found. */
+TEST(complexity_name_rows_answer_as_a_scan_does) {
+    enum { COUNT = 64 };
+    const char *names[COUNT];
+    char storage[COUNT][8];
+    for (int i = 0; i < COUNT; i++) {
+        snprintf(storage[i], sizeof(storage[i]), "n%d", i % 7);
+        names[i] = i % 11 == 5 ? NULL : storage[i];
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMNameRows rows = {0};
+    bool same = true;
+    /* Both short of the threshold and past it; the table may grow between questions. */
+    for (int count = 1; count <= COUNT; count++) {
+        for (int v = 0; v < 8; v++) {
+            char name[8];
+            snprintf(name, sizeof(name), "n%d", v);
+            int expected = -1;
+            for (int i = 0; i < count && expected < 0; i++)
+                if (names[i] && !strcmp(names[i], name))
+                    expected = i;
+            int got = cbm_name_rows_first(&rows, &arena, names, count, name);
+            while (same && expected >= 0) {
+                same = got == expected;
+                int after = -1;
+                for (int i = expected + 1; i < count && after < 0; i++)
+                    if (names[i] && !strcmp(names[i], name))
+                        after = i;
+                got = cbm_name_rows_next(&rows, names, count, name, got);
+                expected = after;
+            }
+            same = same && got == -1;
+        }
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(same);
+    PASS();
+}
+
+/* A definition's parent comes through a short list of cached children; the wide root has to
+ * stay on that list while its narrow children come and go. */
+static const char *cx_line_erlang_function(char *out, size_t cap, int i) {
+    snprintf(out, cap, "%% doc %d\nf_%d(A) -> g_%d(A).\ng_%d(B) -> B.\n", i, i, i, i);
+    return out;
+}
+TEST(complexity_doc_lookup_keeps_a_wide_root_cached) {
+    uint64_t base = 0;
+    double ratio =
+        cx_extract_ratio(CBM_LANG_ERLANG, "funcs.erl", "-module(m).\n", cx_line_erlang_function, "",
+                         false, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each struct's fields fold into one text, and each struct used to scan the file's defs. */
+static const char *cx_line_go_struct(char *out, size_t cap, int i) {
+    snprintf(out, cap, "type T%d struct {\n\tA int\n\tB string\n}\n", i);
+    return out;
+}
+static uint64_t cx_field_fold_probes(int lines, int *folded) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM + CX_BINDING_LINE_ROOM;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "package p\n");
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s",
+                                   cx_line_go_struct(row, sizeof(row), i));
+    }
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_GO, "p", "a.go", 0, NULL, NULL);
+    uint64_t work = 0;
+    if (result) {
+        CBMFileResult *cache[] = {result};
+        cbm_file_info_t files[] = {{.rel_path = "a.go", .language = CBM_LANG_GO}};
+        char *modules[1] = {NULL};
+        int starts[2] = {0}, count = 0;
+        const char *saved_source = result->source;
+        int saved_length = result->source_len;
+        result->source = source;
+        result->source_len = (int)length;
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        CBMLSPDef *defs =
+            cbm_pxc_collect_all_defs(NULL, &arena, cache, files, 1, "p", modules, &count, starts);
+        cbm_resolve_stats_bind(previous);
+        work = cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+        *folded = 0;
+        for (int i = 0; defs && i < count; i++) {
+            if (defs[i].label && !strcmp(defs[i].label, "Struct") && defs[i].field_defs &&
+                !strcmp(defs[i].field_defs, "A:int|B:string")) {
+                (*folded)++;
+            }
+        }
+        cbm_arena_destroy(&arena);
+        result->source = saved_source;
+        result->source_len = saved_length;
+        cbm_free_result(result);
+    }
+    free(source);
+    return work;
+}
+TEST(complexity_struct_field_fold_is_linear) {
+    int folded_first = 0, folded_second = 0;
+    uint64_t first = cx_field_fold_probes(CX_BINDING_LINES, &folded_first);
+    uint64_t second = cx_field_fold_probes(CX_BINDING_LINES * 2, &folded_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    struct field fold probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_EQ(folded_first, CX_BINDING_LINES);
+    ASSERT_EQ(folded_second, CX_BINDING_LINES * 2);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A leading doc comment is the child before the definition; it used to be found by
+ * counting up to the definition from the parent's first child. */
+static const char *cx_line_php_function(char *out, size_t cap, int i) {
+    snprintf(out, cap, "function f_%d() { return 1; }\n", i);
+    return out;
+}
+static const char *cx_line_php_method(char *out, size_t cap, int i) {
+    snprintf(out, cap, "  public function m_%d() { return 1; }\n", i);
+    return out;
+}
+static bool cx_php_doc_shape_binds(const char *path, const char *head, CxLineFn line,
+                                   const char *tail) {
+    uint64_t base = 0;
+    double plain = cx_extract_ratio(CBM_LANG_PHP, path, head, line, tail, true,
+                                    CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    if (base < CX_BINDING_LINES || plain < 3.2)
+        return false;
+    double indexed = cx_extract_ratio(CBM_LANG_PHP, path, head, line, tail, false,
+                                      CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    return base >= CX_BINDING_LINES && indexed >= CX_RATIO_LO && indexed <= CX_RATIO_HI;
+}
+/* A call to a name nothing declares looked through every registered function. */
+static const char *cx_line_php_unknown_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "function f_%d() { return g_%d(); }\n", i, i);
+    return out;
+}
+TEST(complexity_php_short_name_fallback_is_linear) {
+    ASSERT_TRUE(
+        cx_pass_steps_are_linear(CBM_LANG_PHP, "calls.php", "<?php\n", cx_line_php_unknown_call));
+    PASS();
+}
+TEST(complexity_php_doc_lookup_is_linear) {
+    ASSERT_TRUE(cx_php_doc_shape_binds("flat.php", "<?php\n", cx_line_php_function, ""));
+    ASSERT_TRUE(
+        cx_php_doc_shape_binds("wide.php", "<?php\nclass C {\n", cx_line_php_method, "}\n"));
+    PASS();
+}
+
+/* Python's own pass joined each import row to every import statement, each statement's
+ * names to every row, and each reference to every row. */
+static const char *cx_line_py_import_pair(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import pkg_%d.part\nfrom mod_%d import name_%d\nname_%d()\n", i, i, i, i);
+    return out;
+}
+static const char *cx_line_py_from_item(char *out, size_t cap, int i) {
+    snprintf(out, cap, "    name_%d,\n", i);
+    return out;
+}
+TEST(complexity_python_pass_import_join_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_extract_ratio(CBM_LANG_PYTHON, "pairs.py", "", cx_line_py_import_pair, "",
+                                    false, CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+/* One statement can hold them all: generated SDK packages re-export thousands of names. */
+TEST(complexity_python_pass_wide_from_import_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_extract_ratio(CBM_LANG_PYTHON, "reexport.py", "from .models import (\n",
+                         cx_line_py_from_item, ")\n", false, CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* ── Faster routes store the same thing ────────────────────────────── */
+
+extern bool cbm_pipeline_test_resolver_stage_off;
+extern bool cbm_pipeline_test_prepare_on_one_thread;
+extern _Atomic size_t cbm_binding_cache_test_hits;
+extern _Atomic size_t cbm_parse_test_trees_shared;
+
+/* Everything the views say, except each row's ordinal: that follows worker scheduling. */
+static bool cx_evidence_hash(const char *db_path, unsigned char digest[32], bool *intact) {
+    static const char occurrences[] =
+        "SELECT project,file_path,scope,relation,spelling,start_byte,end_byte,source_origin,"
+        "binding,domain,analysis,rule,facts,target,candidate_count,reason,emitted,rules_version,"
+        "properties_json FROM resolver_occurrences ORDER BY "
+        "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19";
+    static const char edges[] =
+        "SELECT s.qualified_name,e.type,t.qualified_name,e.properties FROM edges e "
+        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id ORDER BY 1,2,3,4";
+    const char *const queries[] = {
+        occurrences,
+        "SELECT project,id,kind,source_file,digest,payload FROM resolver_facts ORDER BY project,id",
+        "SELECT project,fact,ordinal,premise FROM resolver_supports ORDER BY project,fact,ordinal",
+        "SELECT project,fact,domain,key,status FROM resolver_lookups ORDER BY project,fact",
+        "SELECT * FROM resolver_file_summaries ORDER BY project,file_path",
+        "SELECT * FROM resolver_derived_bindings ORDER BY project,file_path,key,kind",
+        edges,
+        "SELECT name,sql FROM sqlite_master WHERE name LIKE 'resolver_%' ORDER BY name"};
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    uint64_t rows = 0;
+    bool ok = true;
+    for (size_t q = 0; ok && q < sizeof(queries) / sizeof(queries[0]); q++) {
+        sqlite3_stmt *s = NULL;
+        ok = sqlite3_prepare_v2(db, queries[q], -1, &s, NULL) == SQLITE_OK;
+        int step = SQLITE_DONE;
+        while (ok && (step = sqlite3_step(s)) == SQLITE_ROW) {
+            rows++;
+            for (int c = 0; c < sqlite3_column_count(s); c++) {
+                const void *bytes = sqlite3_column_blob(s, c);
+                int length = sqlite3_column_bytes(s, c);
+                int type = sqlite3_column_type(s, c);
+                cbm_sha256_update(&hash, &type, sizeof(type));
+                cbm_sha256_update(&hash, &length, sizeof(length));
+                if (bytes && length)
+                    cbm_sha256_update(&hash, bytes, (size_t)length);
+            }
+        }
+        ok = ok && step == SQLITE_DONE;
+        sqlite3_finalize(s);
+    }
+    sqlite3_stmt *check = NULL;
+    *intact = sqlite3_prepare_v2(db, "PRAGMA integrity_check(1)", -1, &check, NULL) == SQLITE_OK &&
+              sqlite3_step(check) == SQLITE_ROW &&
+              !strcmp((const char *)sqlite3_column_text(check, 0), "ok");
+    sqlite3_finalize(check);
+    sqlite3_close(db);
+    cbm_sha256_final(&hash, digest);
+    return ok && rows > 0;
+}
+
+static bool cx_index_and_hash(const char *root, const char *name, unsigned char digest[32],
+                              bool *intact) {
+    char db_path[600];
+    int n = snprintf(db_path, sizeof(db_path), "%s/%s", root, name);
+    if (n < 0 || (size_t)n >= sizeof(db_path))
+        return false;
+    cbm_pipeline_t *p = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    if (!p)
+        return false;
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc == 0 && cx_evidence_hash(db_path, digest, intact);
+}
+
+/* Evidence written straight into a new file's pages reads back exactly as SQL's does,
+ * with the same schema text, and SQLite finds nothing wrong with the file. */
+TEST(complexity_evidence_page_route_stores_what_sql_stores) {
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm_cxroute_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    ASSERT_EQ(cx_build_corpus(root, CX_K_BASE), 0);
+    unsigned char direct[32], sql[32];
+    bool direct_intact = false, sql_intact = false;
+    bool direct_ok = cx_index_and_hash(root, "direct.db", direct, &direct_intact);
+    cbm_pipeline_test_resolver_stage_off = true;
+    bool sql_ok = cx_index_and_hash(root, "sql.db", sql, &sql_intact);
+    cbm_pipeline_test_resolver_stage_off = false;
+    ASSERT_EQ(cx_remove_corpus(root), 0);
+    ASSERT_TRUE(direct_ok);
+    ASSERT_TRUE(sql_ok);
+    ASSERT_TRUE(direct_intact);
+    ASSERT_TRUE(sql_intact);
+    ASSERT_EQ(memcmp(direct, sql, sizeof(direct)), 0);
+    PASS();
+}
+
+/* The shared indexes and parse batches change how long preparation takes and nothing it
+ * decides. The counters show they really were used on the first run. */
+TEST(complexity_shared_preparation_decides_the_same) {
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm_cxprep_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    ASSERT_EQ(cx_build_corpus(root, CX_K_BASE), 0);
+    unsigned char shared[32], alone[32];
+    bool shared_intact = false, alone_intact = false;
+    size_t hits_before = atomic_load(&cbm_binding_cache_test_hits);
+    size_t trees_before = atomic_load(&cbm_parse_test_trees_shared);
+    bool shared_ok = cx_index_and_hash(root, "shared.db", shared, &shared_intact);
+    size_t hits = atomic_load(&cbm_binding_cache_test_hits) - hits_before;
+    size_t trees = atomic_load(&cbm_parse_test_trees_shared) - trees_before;
+    cbm_pipeline_test_prepare_on_one_thread = true;
+    hits_before = atomic_load(&cbm_binding_cache_test_hits);
+    trees_before = atomic_load(&cbm_parse_test_trees_shared);
+    bool alone_ok = cx_index_and_hash(root, "alone.db", alone, &alone_intact);
+    size_t hits_alone = atomic_load(&cbm_binding_cache_test_hits) - hits_before;
+    size_t trees_alone = atomic_load(&cbm_parse_test_trees_shared) - trees_before;
+    cbm_pipeline_test_prepare_on_one_thread = false;
+    ASSERT_EQ(cx_remove_corpus(root), 0);
+    ASSERT_TRUE(shared_ok);
+    ASSERT_TRUE(alone_ok);
+    ASSERT_TRUE(shared_intact);
+    ASSERT_GT(hits, (size_t)0);
+    ASSERT_GT(trees, (size_t)0);
+    ASSERT_EQ(hits_alone, (size_t)0);
+    /* Workers still share a tree between their passes over one file; preparation does not. */
+    ASSERT_LT(trees_alone, trees);
+    ASSERT_EQ(memcmp(shared, alone, sizeof(shared)), 0);
+    PASS();
+}
+
+/* A bound tree answers only the exact parse it stands for. */
+TEST(complexity_parse_bind_answers_only_the_same_parse) {
+    static const char source[] = "x = 1\n";
+    static const char other[] = "y = 1\n";
+    static const char unterminated[] = "x = 1";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    const TSLanguage *python = cbm_ts_language(CBM_LANG_PYTHON);
+    ASSERT_TRUE(ts_parser_set_language(parser, python));
+    uint32_t length = (uint32_t)strlen(source);
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, length);
+    ASSERT_NOT_NULL(tree);
+    cbm_parse_bound_t bound = {.mode = CBM_PARSE_PLAIN,
+                               .language = python,
+                               .source = source,
+                               .length = length,
+                               .tree = tree};
+    cbm_parse_bind(&bound);
+    size_t before = atomic_load(&cbm_parse_test_trees_shared);
+#define CX_SHARED() (atomic_load(&cbm_parse_test_trees_shared) - before)
+    /* The same bytes elsewhere in memory, and either mode: a newline-terminated file. */
+    char copy[sizeof(source)];
+    memcpy(copy, source, sizeof(source));
+    TSTree *same = cbm_parse_plain(parser, copy, length);
+    ASSERT_EQ(CX_SHARED(), (size_t)1);
+    ts_tree_delete(same);
+    same = cbm_parse_source(parser, source, length, (TSParseOptions){0});
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    /* Different bytes of the same length, a different length, another grammar, the C mode. */
+    same = cbm_parse_plain(parser, other, length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    same = cbm_parse_plain(parser, unterminated, (uint32_t)strlen(unterminated));
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    TSParser *go = ts_parser_new();
+    ASSERT_TRUE(ts_parser_set_language(go, cbm_ts_language(CBM_LANG_GO)));
+    same = cbm_parse_plain(go, source, length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    ts_parser_delete(go);
+    /* A tree of the C route holds what that route decided, and only it gets that tree. */
+    bound.mode = CBM_PARSE_C;
+    same = cbm_parse_plain(parser, source, length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    bound.mode = CBM_PARSE_PLAIN;
+    /* A parser reading part of the file does not get the whole file's tree. */
+    TSRange part = {.start_byte = 0, .end_byte = 1, .start_point = {0, 0}, .end_point = {0, 1}};
+    ASSERT_TRUE(ts_parser_set_included_ranges(parser, &part, 1));
+    same = cbm_parse_plain(parser, source, length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    ASSERT_TRUE(ts_parser_set_included_ranges(parser, NULL, 0));
+    /* An unterminated file: the two modes are different parses. */
+    TSTree *plain =
+        ts_parser_parse_string(parser, NULL, unterminated, (uint32_t)strlen(unterminated));
+    bound = (cbm_parse_bound_t){.mode = CBM_PARSE_PLAIN,
+                                .language = python,
+                                .source = unterminated,
+                                .length = (uint32_t)strlen(unterminated),
+                                .tree = plain};
+    same =
+        cbm_parse_source(parser, unterminated, (uint32_t)strlen(unterminated), (TSParseOptions){0});
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(same);
+    same = cbm_parse_plain(parser, unterminated, (uint32_t)strlen(unterminated));
+    ASSERT_EQ(CX_SHARED(), (size_t)3);
+    ts_tree_delete(same);
+    cbm_parse_bind(NULL);
+    same = cbm_parse_plain(parser, unterminated, (uint32_t)strlen(unterminated));
+    ASSERT_EQ(CX_SHARED(), (size_t)3);
+    ts_tree_delete(same);
+#undef CX_SHARED
+    ts_tree_delete(plain);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+/* A file's import map: each import asks what path its name has and whether it is mapped
+ * already. A page of generated HTML has thousands of them; so can a Kotlin file. */
+static uint64_t cx_import_map_probes(CBMLanguage language, const char *path, CxLineFn line,
+                                     int lines, int *mapped) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM + CX_BINDING_LINE_ROOM;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, language, "test", path, 0, NULL, NULL);
+    uint64_t work = 0;
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("test", "/tmp/test");
+    if (result && gbuf) {
+        cbm_pipeline_ctx_t ctx = {.project_name = "test", .gbuf = gbuf};
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        const char **keys = NULL, **values = NULL;
+        int count = 0;
+        int rc =
+            cbm_pxc_build_import_map_ex(&ctx, path, language, result, true, &keys, &values, &count);
+        cbm_resolve_stats_bind(previous);
+        if (rc == 0)
+            work = cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+        *mapped = count;
+        cbm_pxc_free_import_map(keys, values, count);
+    }
+    cbm_gbuf_free(gbuf);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+static const char *cx_line_kt_import(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import q.r_%d.S_%d\n", i, i);
+    return out;
+}
+TEST(complexity_import_map_is_linear_in_a_files_imports) {
+    int mapped_first = 0, mapped_second = 0;
+    uint64_t first = cx_import_map_probes(CBM_LANG_KOTLIN, "imports.kt", cx_line_kt_import,
+                                          CX_BINDING_LINES, &mapped_first);
+    uint64_t second = cx_import_map_probes(CBM_LANG_KOTLIN, "imports.kt", cx_line_kt_import,
+                                           CX_BINDING_LINES * 2, &mapped_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    import map lookups %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_EQ(mapped_first, CX_BINDING_LINES);
+    ASSERT_EQ(mapped_second, CX_BINDING_LINES * 2);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A conflicting name blanks its edge entry and every later entry, and a repeated plain
+ * name is mapped once: what the two scans did, in the order they did it. */
+TEST(complexity_import_map_keeps_conflicts_and_repeats) {
+    static const char source[] =
+        "import a.b.S\nimport c.d.S\nimport e.f.T\nimport e.f.T\nimport g.h.U\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_KOTLIN, "test",
+                                             "conflicts.kt", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("test", "/tmp/test");
+    ASSERT_NOT_NULL(gbuf);
+    cbm_pipeline_ctx_t ctx = {.project_name = "test", .gbuf = gbuf};
+    const char **keys = NULL, **values = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_pxc_build_import_map_ex(&ctx, "conflicts.kt", CBM_LANG_KOTLIN, result, true,
+                                          &keys, &values, &count),
+              0);
+    ASSERT_EQ(count, 4);
+    ASSERT_STR_EQ(keys[0], "S");
+    ASSERT_STR_EQ(values[0], "");
+    ASSERT_STR_EQ(keys[1], "S");
+    ASSERT_STR_EQ(values[1], "");
+    ASSERT_STR_EQ(keys[2], "T");
+    ASSERT_STR_EQ(values[2], "e.f.T");
+    ASSERT_STR_EQ(keys[3], "U");
+    ASSERT_STR_EQ(values[3], "g.h.U");
+    cbm_pxc_free_import_map(keys, values, count);
+    cbm_gbuf_free(gbuf);
+    cbm_free_result(result);
+    PASS();
+}
+
+/* A worker's passes over one file share one parse, and a later file gets its own. */
+TEST(complexity_parse_memo_lasts_one_file) {
+    static const char first[] = "x = 1\n";
+    static const char second[] = "yy = 2\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_PYTHON)));
+    uint32_t first_length = (uint32_t)strlen(first), second_length = (uint32_t)strlen(second);
+    size_t before = atomic_load(&cbm_parse_test_trees_shared);
+#define CX_SHARED() (atomic_load(&cbm_parse_test_trees_shared) - before)
+    /* Nothing is kept outside a memo. */
+    TSTree *tree = cbm_parse_plain(parser, first, first_length);
+    ts_tree_delete(tree);
+    tree = cbm_parse_plain(parser, first, first_length);
+    ts_tree_delete(tree);
+    ASSERT_EQ(CX_SHARED(), (size_t)0);
+    cbm_parse_memo_begin();
+    tree = cbm_parse_source(parser, first, first_length, (TSParseOptions){0});
+    ASSERT_EQ(CX_SHARED(), (size_t)0);
+    /* The caller's tree and bytes may go away: the memo keeps its own. */
+    char *moved = malloc(first_length);
+    ASSERT_NOT_NULL(moved);
+    memcpy(moved, first, first_length);
+    ts_tree_delete(tree);
+    tree = cbm_parse_plain(parser, moved, first_length);
+    free(moved);
+    ASSERT_EQ(CX_SHARED(), (size_t)1);
+    ASSERT_STR_EQ(ts_node_type(ts_tree_root_node(tree)), "module");
+    ts_tree_delete(tree);
+    tree = cbm_parse_plain(parser, second, second_length);
+    ASSERT_EQ(CX_SHARED(), (size_t)1);
+    ts_tree_delete(tree);
+    tree = cbm_parse_plain(parser, second, second_length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(tree);
+    cbm_parse_memo_begin();
+    tree = cbm_parse_plain(parser, first, first_length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(tree);
+    cbm_parse_memo_end();
+    tree = cbm_parse_plain(parser, first, first_length);
+    ASSERT_EQ(CX_SHARED(), (size_t)2);
+    ts_tree_delete(tree);
+#undef CX_SHARED
+    ts_parser_delete(parser);
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
+    RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
+    RUN_TEST(complexity_parse_memo_lasts_one_file);
+    RUN_TEST(complexity_evidence_page_route_stores_what_sql_stores);
+    RUN_TEST(complexity_shared_preparation_decides_the_same);
+    RUN_TEST(complexity_parse_bind_answers_only_the_same_parse);
+    RUN_TEST(complexity_binding_wide_module_questions_are_linear);
+    RUN_TEST(complexity_binding_wide_inner_nodes_are_linear);
+    RUN_TEST(complexity_syntax_index_answers_as_tree_sitter_does);
+    RUN_TEST(complexity_syntax_index_wide_lists_match_tree_sitter);
+    RUN_TEST(complexity_js_value_join_is_linear_in_a_repeated_name);
+    RUN_TEST(complexity_python_dotted_imports_are_linear);
+    RUN_TEST(complexity_python_import_join_is_linear);
+    RUN_TEST(complexity_js_pass_registry_lookups_are_linear);
+    RUN_TEST(complexity_import_uses_are_linear_in_every_language_pass);
+    RUN_TEST(complexity_name_rows_answer_as_a_scan_does);
+    RUN_TEST(complexity_target_file_list_is_near_linear);
+    RUN_TEST(complexity_python_root_facts_are_linear);
+    RUN_TEST(complexity_rust_pass_registration_is_linear);
+    RUN_TEST(complexity_rust_local_lookup_is_linear);
+    RUN_TEST(complexity_rust_conditional_use_lookup_is_linear);
+    RUN_TEST(complexity_rust_named_use_lookup_is_linear);
+    RUN_TEST(complexity_rust_trait_in_scope_is_linear);
+    RUN_TEST(complexity_rust_module_children_are_linear);
+    RUN_TEST(complexity_rust_outside_impls_are_linear);
+    RUN_TEST(complexity_rust_impl_lookup_is_linear);
+    RUN_TEST(complexity_go_pass_registration_is_linear);
+    RUN_TEST(complexity_java_short_name_fallback_is_linear);
+    RUN_TEST(complexity_csharp_pass_registration_is_linear);
+    RUN_TEST(complexity_kotlin_class_registration_is_linear);
+    RUN_TEST(complexity_java_class_registration_is_linear);
+    RUN_TEST(complexity_ts_proof_callee_imports_are_linear);
+    RUN_TEST(complexity_ts_proof_annotation_imports_are_linear);
+    RUN_TEST(complexity_ts_proof_narrowing_lookup_is_linear);
+    RUN_TEST(complexity_rust_source_facts_on_unclosed_nesting_are_linear);
+    RUN_TEST(complexity_kotlin_cross_on_unclosed_nesting_is_linear);
+    RUN_TEST(complexity_c_cross_on_unclosed_nesting_is_linear);
+    RUN_TEST(complexity_cpp_cross_on_unclosed_nesting_is_linear);
+    RUN_TEST(complexity_c_shared_cross_on_unclosed_nesting_is_linear);
+    RUN_TEST(complexity_js_proof_on_unclosed_nesting_is_linear);
+    RUN_TEST(complexity_dart_usages_on_unclosed_nesting_is_linear);
+    RUN_TEST(complexity_usage_classifiers_on_deep_nesting_are_linear);
+    RUN_TEST(complexity_decorator_lookup_is_linear);
+    RUN_TEST(complexity_ts_class_registration_is_linear);
+    RUN_TEST(complexity_rust_derive_registration_is_linear);
+    RUN_TEST(complexity_go_generic_registration_is_linear);
+    RUN_TEST(complexity_csharp_namespace_lookup_is_linear);
+    RUN_TEST(complexity_registry_tail_answers_as_a_scan_does);
+    RUN_TEST(complexity_kotlin_pass_registry_lookups_are_linear);
+    RUN_TEST(complexity_doc_lookup_keeps_a_wide_root_cached);
+    RUN_TEST(complexity_struct_field_fold_is_linear);
+    RUN_TEST(complexity_php_doc_lookup_is_linear);
+    RUN_TEST(complexity_php_short_name_fallback_is_linear);
+    RUN_TEST(complexity_python_pass_import_join_is_linear);
+    RUN_TEST(complexity_python_pass_wide_from_import_is_linear);
     RUN_TEST(complexity_flat_file_syntax_walk_is_linear);
+    RUN_TEST(complexity_oo_local_lookup_is_linear);
+    RUN_TEST(complexity_oo_explicit_imports_are_linear);
     RUN_TEST(complexity_resolver_counters_are_run_scoped);
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
