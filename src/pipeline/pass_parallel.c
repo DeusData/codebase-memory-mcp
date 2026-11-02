@@ -1077,25 +1077,32 @@ static int pp_spill_sweep(extract_ctx_t *ec, int worker_id) {
  * So extraction end projects that growth from the result counts and spills
  * before handing over when charged + growth would cross the latch. A pure
  * function of counts (O9): the same repo decides the same way on every run.
- * Per-unit costs fitted 2026-09-25 (M5 Pro, release build, 8 workers) on the
- * charge growth from the parallel_extract mark to the parallel_resolve mark:
+ * Per-unit costs refitted 2026-11-02 for the strict resolver, whose proofs and
+ * occurrences made resolve grow far more per reference than the 160 bytes fitted
+ * before it (elasticsearch: projected 2534 MB, 25549 MB measured, 28.8 GB charged
+ * against a 24 GB budget with spill never entered). Charge growth from the
+ * parallel_extract mark to the parallel_resolve mark, default workers:
  *
- *   corpus    files   defs    calls+usages  growth   model
- *   go        21882  735895     5,504,282   1307 MB  1909 MB
- *   django     4169   75419       591,350    231 MB   215 MB
- *   kotlin     5247   49669       421,788    129 MB   166 MB
- *   rust        818   23717       265,957     79 MB    76 MB
- *   php        2435   14691       137,969     47 MB    58 MB
- *   openclaw  48203  748829   >= 7,402,832   2151 MB >= 2419 MB
+ *   corpus         files   defs    calls+usages  growth    model
+ *   elasticsearch  40698  747710     8,543,542  26486 MB  28933 MB
+ *   kubernetes     21907  714993     5,377,047   8384 MB  18479 MB
+ *   kilocode        8195  286702     2,111,808   3301 MB   7262 MB
+ *   django          5462   95488       591,412   1250 MB   2077 MB
+ *   exposed         5247   50286       424,639    899 MB   1479 MB
  *
- * It never under-reads by more than 7% (inside the budget/16 margin) and
- * over-reads Go by 46% -- the safe side: an unneeded spill costs disk reads,
- * never graph content (spilled and in-memory runs build the same graph). */
+ * It is fitted to the most expensive language per reference, Java, so it over-reads
+ * the others -- the safe side: an unneeded spill costs disk reads, never graph
+ * content (spilled and in-memory runs build the same graph). */
 enum {
     PP_POST_BYTES_PER_DEF = 1280,  /* registry entry + LSP def + cross registries */
-    PP_POST_BYTES_PER_REF = 160,   /* per call / usage: resolved edge + appends */
+    PP_POST_BYTES_PER_REF = 3400,  /* per call / usage: edge, proofs, occurrence, appends */
     PP_POST_BYTES_PER_FILE = 8192, /* per-file tables: modules, surfaces, imports */
 };
+
+size_t cbm_parallel_post_extract_growth_bytes(int64_t defs, int64_t refs, int64_t files) {
+    return (size_t)defs * PP_POST_BYTES_PER_DEF + (size_t)refs * PP_POST_BYTES_PER_REF +
+           (size_t)files * PP_POST_BYTES_PER_FILE;
+}
 
 static size_t pp_post_extract_growth(const extract_ctx_t *ec, int64_t *defs_out,
                                      int64_t *refs_out) {
@@ -1110,8 +1117,7 @@ static size_t pp_post_extract_growth(const extract_ctx_t *ec, int64_t *defs_out,
     }
     *defs_out = defs;
     *refs_out = refs;
-    return (size_t)defs * PP_POST_BYTES_PER_DEF + (size_t)refs * PP_POST_BYTES_PER_REF +
-           (size_t)ec->file_count * PP_POST_BYTES_PER_FILE;
+    return cbm_parallel_post_extract_growth_bytes(defs, refs, ec->file_count);
 }
 
 /* Enter spill mode at extraction end when the projected post-extraction growth

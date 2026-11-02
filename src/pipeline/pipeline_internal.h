@@ -1275,6 +1275,10 @@ struct CBMModuleDefIndex;
  * pulling lsp/go_lsp.h into every TU that includes pipeline_internal.h.
  * Callers cast a CBMCrossLspRegistries* (defined in pass_lsp_cross.h). */
 
+/* What the phases after extraction are projected to add to the charge, from the result
+ * counts. A pure function, so a run's spill decision can be checked without running it. */
+size_t cbm_parallel_post_extract_growth_bytes(int64_t defs, int64_t refs, int64_t files);
+
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count,
