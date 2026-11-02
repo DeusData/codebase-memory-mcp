@@ -527,6 +527,7 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_DOC_CANDIDATES "doc_candidates"
+#define CBM_CONFIG_INSTALL_HOOKS "install_hooks"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
 #define CBM_CONFIG_WATCH_NON_GIT "watch_non_git"

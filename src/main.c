@@ -1133,7 +1133,7 @@ static void print_help(void) {
            "[args]\n");
     printf("                                      Run one tool locally, then exit\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] "
-           "[--dir=<path>] [--skip-config]\n");
+           "[--dir=<path>] [--skip-config] [--hooks|--no-hooks]\n");
     printf("                                      [--clients=<tokens>]  Run "
            "'install --clients' to list tokens\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");

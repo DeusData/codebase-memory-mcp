@@ -79,6 +79,7 @@ codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config set watcher_enabled false
 codebase-memory-mcp config reset auto_index
+codebase-memory-mcp config get install_hooks
 ```
 
 Current keys:
@@ -93,6 +94,9 @@ Current keys:
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `install_hooks` | `true` | Install CBM-managed client hooks. `install --no-hooks` persists `false`; `install --hooks` restores `true`. |
+
+Bare installs and updates respect the stored hook preference. MCP registration, skills, instructions, and profiles remain installed when hooks are disabled.
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the

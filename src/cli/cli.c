@@ -8095,6 +8095,7 @@ static const config_key_def_t CONFIG_KEYS[] = {
      "Run the background watcher thread (auto-reindex); false to disable"},
     {CBM_CONFIG_WATCH_NON_GIT, "false",
      "Also poll non-git project roots for changes (file-tree scan); off by default"},
+    {CBM_CONFIG_INSTALL_HOOKS, "true", "Install managed client hooks"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -8828,6 +8829,11 @@ typedef struct {
 static cbm_install_plan_t *g_install_plan = NULL;
 static int g_agent_install_errors = 0;
 static int g_agent_uninstall_errors = 0;
+static bool g_install_hooks = true;
+
+static void print_hooks_skipped(void) {
+    printf("  hooks: skipped (install --hooks to enable)\n");
+}
 
 /* Every agent configuration uninstall could not clean, kept for the closing
  * summary. A cleanup failure no longer stops executable and index removal
@@ -8915,6 +8921,9 @@ static void agent_uninstall_failures_report(bool dry_run) {
 
 static void plan_record(const char *agent, const char *kind, const char *path) {
     if (!g_install_plan || !path || !path[0]) {
+        return;
+    }
+    if (!g_install_hooks && strcmp(kind, "hook") == 0) {
         return;
     }
     cbm_install_plan_t *pl = g_install_plan;
@@ -9044,6 +9053,93 @@ static void uninstall_tiered_profile_prompts(const char *label, const char *veri
                                              cbm_graph_profile_dialect_t dialect,
                                              const char *legacy_verify_content, bool dry_run);
 
+static int remove_claude_owned_hook_scripts(const char *config_dir, const char *binary_path,
+                                            bool uninstall) {
+    char current_gate[CLI_BUF_8K];
+    char current_session[CLI_BUF_8K];
+    char current_subagent[CLI_BUF_8K];
+    char released_gate[CLI_BUF_8K];
+    const char *const gate_legacy[] = {released_gate};
+    const char *const session_legacy[] = {cmm_released_session_script};
+    const char *const subagent_legacy[] = {cmm_released_subagent_script};
+    size_t gate_legacy_count =
+        cbm_build_released_gate_script(binary_path, released_gate, sizeof(released_gate)) == CLI_OK
+            ? 1U
+            : 0U;
+    static const struct {
+        const char *name;
+        const char *legacy_name;
+        const char *prefix;
+    } hook_types[] = {
+        {CMM_HOOK_GATE_SCRIPT, CMM_HOOK_GATE_SCRIPT_LEGACY, cmm_gate_script_prefix},
+        {CMM_SESSION_REMINDER_SCRIPT, CMM_SESSION_REMINDER_SCRIPT_LEGACY,
+         cmm_session_script_prefix},
+        {CMM_SUBAGENT_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY,
+         cmm_subagent_script_prefix},
+    };
+    struct {
+        const char *name;
+        const char *legacy_name;
+        const char *current;
+        const char *const *legacy;
+        size_t legacy_count;
+        bool current_valid;
+    } owned_scripts[] = {
+        {hook_types[0].name, hook_types[0].legacy_name, current_gate, gate_legacy,
+         gate_legacy_count,
+         cbm_build_current_hook_script(hook_types[0].prefix, binary_path, current_gate,
+                                       sizeof(current_gate)) == CLI_OK},
+        {hook_types[1].name, hook_types[1].legacy_name, current_session, session_legacy, 1U,
+         cbm_build_current_hook_script(hook_types[1].prefix, binary_path, current_session,
+                                       sizeof(current_session)) == CLI_OK},
+        {hook_types[2].name, hook_types[2].legacy_name, current_subagent, subagent_legacy, 1U,
+         cbm_build_current_hook_script(hook_types[2].prefix, binary_path, current_subagent,
+                                       sizeof(current_subagent)) == CLI_OK},
+    };
+    char hooks_dir[CLI_BUF_1K];
+    int hooks_written = snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    bool hooks_dir_valid = hooks_written > 0 && (size_t)hooks_written < sizeof(hooks_dir);
+    int rc = CLI_OK;
+    const char *op = uninstall ? "hook_script_uninstall" : "hook_script_disable";
+    for (size_t i = 0; i < sizeof(owned_scripts) / sizeof(owned_scripts[0]); i++) {
+        char script_path[CLI_BUF_1K];
+        int script_written = hooks_dir_valid ? snprintf(script_path, sizeof(script_path), "%s/%s",
+                                                        hooks_dir, owned_scripts[i].name)
+                                             : CLI_ERR;
+        bool script_path_valid = script_written > 0 && (size_t)script_written < sizeof(script_path);
+        if (!owned_scripts[i].current_valid) {
+            record_agent_config_error(uninstall, "Claude Code", op, owned_scripts[i].name);
+            rc = CLI_ERR;
+            continue;
+        }
+        if (!script_path_valid ||
+            cbm_remove_owned_hook_script(script_path, owned_scripts[i].current,
+                                         owned_scripts[i].legacy,
+                                         owned_scripts[i].legacy_count) < CLI_OK) {
+            record_agent_config_error(uninstall, "Claude Code", op,
+                                      script_path_valid ? script_path : owned_scripts[i].name);
+            rc = CLI_ERR;
+        }
+#ifdef _WIN32
+        if (!hooks_dir_valid ||
+            cbm_remove_owned_legacy_hook_script(hooks_dir, owned_scripts[i].legacy_name,
+                                                owned_scripts[i].current, owned_scripts[i].legacy,
+                                                owned_scripts[i].legacy_count) != CLI_OK) {
+            char legacy_path[CLI_BUF_1K];
+            int written = hooks_dir_valid ? snprintf(legacy_path, sizeof(legacy_path), "%s/%s",
+                                                     hooks_dir, owned_scripts[i].legacy_name)
+                                          : CLI_ERR;
+            record_agent_config_error(uninstall, "Claude Code", "legacy_hook_script_uninstall",
+                                      written > 0 && (size_t)written < sizeof(legacy_path)
+                                          ? legacy_path
+                                          : owned_scripts[i].legacy_name);
+            rc = CLI_ERR;
+        }
+#endif
+    }
+    return rc;
+}
+
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
                                        bool dry_run) {
     char config_dir[CLI_BUF_1K];
@@ -9122,6 +9218,23 @@ static void install_claude_code_config(const char *home, const char *binary_path
 
     char settings_path[CLI_BUF_1K];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    if (!g_install_hooks) {
+        if (!dry_run) {
+            if (cbm_remove_claude_hooks_with_binary(settings_path, binary_path) != CLI_OK) {
+                record_agent_config_error(false, "Claude Code", "hook_disable", settings_path);
+            }
+            if (cbm_remove_session_hooks(settings_path, binary_path) != CLI_OK) {
+                record_agent_config_error(false, "Claude Code", "hook_disable", settings_path);
+            }
+            if (cbm_remove_claude_subagent_hooks_with_binary(settings_path, binary_path) !=
+                CLI_OK) {
+                record_agent_config_error(false, "Claude Code", "hook_disable", settings_path);
+            }
+            remove_claude_owned_hook_scripts(config_dir, binary_path, false);
+        }
+        print_hooks_skipped();
+        goto claude_hooks_done;
+    }
     bool gate_ok = dry_run;
     bool session_ok = dry_run;
     bool subagent_ok = dry_run;
@@ -9201,6 +9314,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
         }
     }
 
+claude_hooks_done:
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
      * still exists, mention it so users can clean up stale artifacts. */
     if (home && home[0]) {
@@ -9858,6 +9972,14 @@ static void install_copilot_durable_context(const char *home, const char *binary
         plan_record("Copilot", "hook", hook_path);
         return;
     }
+    if (!g_install_hooks) {
+        if (!dry_run && cbm_file_exists(hook_path) &&
+            cbm_remove_copilot_hooks(hook_path, binary_path) != CLI_OK) {
+            record_agent_config_error(false, "Copilot", "hook_disable", hook_path);
+        }
+        print_hooks_skipped();
+        return;
+    }
     bool hook_ok = true;
     if (!dry_run && (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED) ||
                      cbm_upsert_copilot_hooks(binary_path, hook_path) != CLI_OK)) {
@@ -10034,6 +10156,14 @@ static void install_qoder_durable_context(const char *home, const char *binary_p
         }
         return;
     }
+    if (!g_install_hooks) {
+        if (!dry_run && config_resolved && cbm_file_exists(settings_path) &&
+            cbm_remove_qoder_context_hook(settings_path, binary_path) != CLI_OK) {
+            record_agent_config_error(false, "Qoder CLI", "hook_disable", settings_path);
+        }
+        print_hooks_skipped();
+        return;
+    }
     if (!hook_supported) {
         printf("  hooks: withheld because no documented executor is available\n");
         return;
@@ -10093,6 +10223,14 @@ static void install_gitlab_durable_context(const cbm_agent_registry_context_t *r
         }
         return;
     }
+    if (!g_install_hooks) {
+        if (!dry_run && cbm_file_exists(hooks_path) &&
+            cbm_remove_gitlab_session_hook(hooks_path, binary_path) != CLI_OK) {
+            record_agent_config_error(false, "GitLab Duo CLI", "hook_disable", hooks_path);
+        }
+        print_hooks_skipped();
+        return;
+    }
     if (!hook_supported) {
         printf("  hook: withheld on Windows (vendor hook shell is undocumented)\n");
         return;
@@ -10128,6 +10266,14 @@ static void install_devin_durable_context(const cbm_agent_registry_context_t *re
         if (hook_supported) {
             plan_record("Devin CLI / Local", "hook", config_path);
         }
+        return;
+    }
+    if (!g_install_hooks) {
+        if (!dry_run && config_resolved && cbm_file_exists(config_path) &&
+            cbm_remove_devin_context_hooks(config_path, binary_path) != CLI_OK) {
+            record_agent_config_error(false, "Devin CLI / Local", "hook_disable", config_path);
+        }
+        print_hooks_skipped();
         return;
     }
     if (!hook_supported) {
@@ -10265,6 +10411,14 @@ static void install_kimi_durable_context(const cbm_agent_registry_context_t *reg
     install_agent_skill("Kimi Code CLI", skills_dir, force, dry_run);
     if (g_install_plan) {
         plan_record("Kimi Code CLI", "hook", config_path);
+        return;
+    }
+    if (!g_install_hooks) {
+        if (!dry_run && cbm_file_exists(config_path) &&
+            cbm_remove_kimi_context_hook(config_path) != CLI_OK) {
+            record_agent_config_error(false, "Kimi Code CLI", "hook_disable", config_path);
+        }
+        print_hooks_skipped();
         return;
     }
     bool installed = true;
@@ -10486,6 +10640,22 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
         plan_record("Gemini CLI", "hook", cp); /* BeforeTool + SessionStart in settings.json */
         return;
     }
+    if (!g_install_hooks) {
+        if (!dry_run) {
+            int tool_result = cbm_remove_gemini_hooks(cp);
+            int coverage_result = CLI_OK;
+#ifndef _WIN32
+            coverage_result = cbm_remove_gemini_coverage_hook(cp, binary_path);
+#endif
+            int session_result = cbm_remove_gemini_session_hooks(cp);
+            if (tool_result != CLI_OK || coverage_result != CLI_OK || session_result != CLI_OK) {
+                record_agent_config_error(false, "Gemini CLI", "hook_disable", cp);
+            }
+        }
+        print_hooks_skipped();
+        printf("  subagents: Scout + Verify + Auditor\n");
+        return;
+    }
     if (!dry_run) {
         if (cbm_upsert_gemini_hooks(cp) != CLI_OK) {
             record_agent_config_error(false, "Gemini CLI", "before_tool_hook_install", cp);
@@ -10529,8 +10699,9 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
             cbm_build_augment_command_windows(binary_path, command_windows,
                                               sizeof(command_windows)) == CLI_OK;
-        cbm_toml_codex_hook_action_t preflight_action =
-            use_hooks_json ? CBM_TOML_CODEX_HOOK_REMOVE : CBM_TOML_CODEX_HOOK_UPSERT;
+        cbm_toml_codex_hook_action_t preflight_action = !g_install_hooks || use_hooks_json
+                                                            ? CBM_TOML_CODEX_HOOK_REMOVE
+                                                            : CBM_TOML_CODEX_HOOK_UPSERT;
         cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
         int preflight_result = commands_ok ? cbm_reconcile_codex_hooks_command_detailed(
                                                  cp, command, command_windows, preflight_action,
@@ -10578,7 +10749,20 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         } else {
             bool hook_ok = true;
             int pretool_written = 1;
-            if (!dry_run && use_hooks_json) {
+            if (!g_install_hooks && !dry_run) {
+                int toml_result = cbm_reconcile_codex_hooks_command(
+                    cp, command, command_windows, CBM_TOML_CODEX_HOOK_REMOVE, false);
+                int json_result = !cbm_file_exists(hooks_json)
+                                      ? CLI_OK
+                                      : cbm_remove_paired_lifecycle_hooks_json(hooks_json, command);
+                /* #2719: the PreToolUse Bash hook shares hooks.json with the
+                 * lifecycle pair, so the opt-out removes it the way uninstall does. */
+                int pretool_result = !cbm_file_exists(hooks_json)
+                                         ? CLI_OK
+                                         : cbm_remove_codex_pretool_hooks_json(hooks_json, command);
+                hook_ok =
+                    toml_result == CLI_OK && json_result == CLI_OK && pretool_result == CLI_OK;
+            } else if (!dry_run && use_hooks_json) {
                 hook_ok =
                     cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
                                                            NULL, CMM_HOOK_TIMEOUT_SEC) == CLI_OK &&
@@ -10592,7 +10776,11 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                               &pretool_written) == CLI_OK;
             }
             if (!hook_ok) {
-                record_agent_config_error(false, "Codex CLI", "hook_install", hook_target);
+                record_agent_config_error(false, "Codex CLI",
+                                          g_install_hooks ? "hook_install" : "hook_disable",
+                                          hook_target);
+            } else if (!g_install_hooks) {
+                print_hooks_skipped();
             } else {
                 printf(pretool_written
                            ? "  hooks: SessionStart + SubagentStart + PreToolUse Bash (dynamic "
@@ -10638,8 +10826,17 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         char plugin_path[CLI_BUF_1K];
         snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
                  home);
-        install_generated_client_extension("OpenCode", plugin_path, binary_path,
-                                           cbm_client_adapter_opencode, dry_run);
+        if (g_install_hooks) {
+            install_generated_client_extension("OpenCode", plugin_path, binary_path,
+                                               cbm_client_adapter_opencode, dry_run);
+        } else if (!g_install_plan) {
+            if (!dry_run && cbm_file_exists(plugin_path) &&
+                cbm_text_remove_managed_block(plugin_path, CBM_ADAPTER_MARKER_START,
+                                              CBM_ADAPTER_MARKER_END) != 0) {
+                record_agent_config_error(false, "OpenCode", "hook_disable", plugin_path);
+            }
+            print_hooks_skipped();
+        }
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];
@@ -10921,6 +11118,13 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
             bool workspace_ok = cbm_openclaw_workspace_path(home, cp, workspace, sizeof(workspace));
             (void)install_generic_agent_config("OpenClaw", binary_path, cp, NULL, dry_run,
                                                cbm_install_openclaw_mcp);
+            if (!g_install_hooks && !g_install_plan) {
+                if (!dry_run && cbm_file_exists(cp) &&
+                    cbm_remove_openclaw_compaction(cp) != CLI_OK) {
+                    record_agent_config_error(false, "OpenClaw", "hook_disable", cp);
+                }
+                print_hooks_skipped();
+            }
             if (workspace_ok) {
                 char agents_path[CLI_BUF_1K];
                 char tools_path[CLI_BUF_1K];
@@ -10943,16 +11147,16 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
                             record_agent_config_error(false, "OpenClaw", "tools_context_install",
                                                       tools_path);
                         }
-                        if (cbm_upsert_openclaw_compaction(cp) != CLI_OK) {
+                        if (g_install_hooks && cbm_upsert_openclaw_compaction(cp) != CLI_OK) {
                             compaction_installed = false;
                             record_agent_config_error(false, "OpenClaw", "compaction_install", cp);
                         }
                     }
                     printf("  instructions: %s\n", agents_path);
                     printf("  tools context: %s\n", tools_path);
-                    if (compaction_installed) {
+                    if (g_install_hooks && compaction_installed) {
                         printf("  compaction: reinjects Codebase Memory\n");
-                    } else {
+                    } else if (g_install_hooks) {
                         printf("  compaction: could not update exact-owned augmentation\n");
                     }
                 }
@@ -11039,14 +11243,19 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
         } else {
             int hook_result = CBM_YAML_IDENTITY_EDIT_OK;
             if (!dry_run) {
-                hook_result = prepare_config_parent(cp)
-                                  ? cbm_upsert_hermes_context_hook(cp, binary_path)
-                                  : CBM_YAML_IDENTITY_EDIT_ERROR;
+                hook_result = g_install_hooks
+                                  ? (prepare_config_parent(cp)
+                                         ? cbm_upsert_hermes_context_hook(cp, binary_path)
+                                         : CBM_YAML_IDENTITY_EDIT_ERROR)
+                                  : cbm_remove_hermes_context_hook(cp, binary_path);
             }
             if (hook_result == CBM_YAML_IDENTITY_EDIT_FOREIGN) {
                 record_agent_config_error(false, "Hermes", "pre_llm_hook_foreign", cp);
             } else if (hook_result != CBM_YAML_IDENTITY_EDIT_OK) {
-                record_agent_config_error(false, "Hermes", "pre_llm_hook_install", cp);
+                record_agent_config_error(
+                    false, "Hermes", g_install_hooks ? "pre_llm_hook_install" : "hook_disable", cp);
+            } else if (!g_install_hooks) {
+                print_hooks_skipped();
             } else {
                 printf("  hook: %s (pre_llm_call)\n", cp);
             }
@@ -11113,7 +11322,11 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
         } else {
             bool hook_ok = true;
             if (!dry_run) {
-                if (!cbm_install_augment_session_script(binary_path, session_hp)) {
+                if (!g_install_hooks) {
+                    int session_result = cbm_remove_augment_session_hook(cp, session_hp);
+                    int coverage_result = cbm_remove_augment_coverage_hook(cp, coverage_hp);
+                    hook_ok = session_result == CLI_OK && coverage_result == CLI_OK;
+                } else if (!cbm_install_augment_session_script(binary_path, session_hp)) {
                     hook_ok = false;
                     record_agent_config_error(false, "Augment/Auggie", "session_script_install",
                                               session_hp);
@@ -11121,16 +11334,23 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
                     hook_ok = false;
                     record_agent_config_error(false, "Augment/Auggie", "session_hook_install", cp);
                 }
-                if (!cbm_install_augment_coverage_script(binary_path, coverage_hp)) {
-                    hook_ok = false;
-                    record_agent_config_error(false, "Augment/Auggie", "coverage_script_install",
-                                              coverage_hp);
-                } else if (cbm_upsert_augment_coverage_hook(cp, coverage_hp) != CLI_OK) {
-                    hook_ok = false;
-                    record_agent_config_error(false, "Augment/Auggie", "coverage_hook_install", cp);
+                if (g_install_hooks) {
+                    if (!cbm_install_augment_coverage_script(binary_path, coverage_hp)) {
+                        hook_ok = false;
+                        record_agent_config_error(false, "Augment/Auggie",
+                                                  "coverage_script_install", coverage_hp);
+                    } else if (cbm_upsert_augment_coverage_hook(cp, coverage_hp) != CLI_OK) {
+                        hook_ok = false;
+                        record_agent_config_error(false, "Augment/Auggie", "coverage_hook_install",
+                                                  cp);
+                    }
                 }
             }
-            if (hook_ok) {
+            if (!hook_ok && !g_install_hooks) {
+                record_agent_config_error(false, "Augment/Auggie", "hook_disable", cp);
+            } else if (!g_install_hooks) {
+                print_hooks_skipped();
+            } else if (hook_ok) {
                 printf("  hooks: SessionStart + PostToolUse view coverage\n");
             }
         }
@@ -11191,11 +11411,20 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
 #else
             bool windows = false;
 #endif
-            if (cbm_upsert_qwen_lifecycle_hooks(cp, binary_path, windows) != CLI_OK) {
-                record_agent_config_error(false, "Qwen Code", "lifecycle_hook_install", cp);
+            int hook_result = g_install_hooks
+                                  ? cbm_upsert_qwen_lifecycle_hooks(cp, binary_path, windows)
+                                  : cbm_remove_qwen_lifecycle_hooks(cp, binary_path, windows);
+            if (hook_result != CLI_OK) {
+                record_agent_config_error(
+                    false, "Qwen Code", g_install_hooks ? "lifecycle_hook_install" : "hook_disable",
+                    cp);
+            } else if (!g_install_hooks) {
+                print_hooks_skipped();
             } else {
                 printf("  hooks: SessionStart + SubagentStart + PostToolUse ReadFile\n");
             }
+        } else if (!g_install_hooks) {
+            print_hooks_skipped();
         }
     }
     if (agents->copilot_cli) {
@@ -11240,6 +11469,12 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
             if (hook_supported) {
                 plan_record("Factory Droid", "hook", hp);
             }
+        } else if (!g_install_hooks) {
+            if (!dry_run && cbm_file_exists(hp) &&
+                cbm_remove_factory_hooks(hp, binary_path) != CLI_OK) {
+                record_agent_config_error(false, "Factory Droid", "hook_disable", hp);
+            }
+            print_hooks_skipped();
         } else if (!hook_supported) {
             printf("  hooks: withheld on Windows (vendor documents Bash only)\n");
         } else {
@@ -11790,6 +12025,44 @@ static bool cli_binary_is_externally_managed(const char *self_path, bool self_pa
     return cli_external_manager_name(self_path) != NULL;
 }
 
+static int cli_resolve_install_hooks(bool override_set, bool override_value) {
+    bool enabled = true;
+    if (!override_set) {
+        const char *cache_dir = cbm_resolve_cache_dir();
+        char db_path[CLI_BUF_1K];
+        int written =
+            cache_dir ? snprintf(db_path, sizeof(db_path), "%s/_config.db", cache_dir) : CLI_ERR;
+        if (written <= 0 || (size_t)written >= sizeof(db_path)) {
+            (void)fprintf(stderr, "error: config database path is unavailable\n");
+            return CLI_ERR;
+        }
+        if (cbm_file_exists(db_path)) {
+            cbm_config_t *cfg = cbm_config_open(cache_dir);
+            if (!cfg) {
+                (void)fprintf(stderr, "error: cannot read install_hooks preference\n");
+                return CLI_ERR;
+            }
+            enabled = cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, true);
+            cbm_config_close(cfg);
+        }
+    } else {
+        enabled = override_value;
+    }
+    g_install_hooks = enabled;
+    return CLI_OK;
+}
+
+static int cli_persist_install_hooks(void) {
+    const char *cache_dir = cbm_resolve_cache_dir();
+    cbm_config_t *cfg = cache_dir ? cbm_config_open(cache_dir) : NULL;
+    if (!cfg) {
+        return CLI_ERR;
+    }
+    int result = cbm_config_set(cfg, CBM_CONFIG_INSTALL_HOOKS, g_install_hooks ? "true" : "false");
+    cbm_config_close(cfg);
+    return result;
+}
+
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
  * the config / instruction / skill / agent / hook files `install` WOULD write, produced by
  * running the real install dispatch in record-only mode (no mutation, no
@@ -11938,6 +12211,7 @@ typedef struct {
     bool skip_binary;
     bool delete_indexes;
     bool skip_config;
+    bool persist_install_hooks;
     bool force;
     bool dry_run;
 } cli_install_activation_t;
@@ -11992,6 +12266,13 @@ static int cli_install_activate(void *opaque) {
             return CLI_TRUE;
         }
         printf("Installed binary -> %s\n\n", activation->bin_target);
+    }
+    if (!activation->dry_run && activation->persist_install_hooks &&
+        cli_persist_install_hooks() != CLI_OK) {
+        cli_activation_transaction_finalize_committed_or_fail_stop(
+            &activation->binary_transaction, "install_transaction_config_failure_finalize");
+        (void)fprintf(stderr, "error: cannot persist install_hooks preference\n");
+        return CLI_ACTIVATION_PARTIAL;
     }
     /* Config and PATH refreshes are install mutations too. Keep them in this
      * callback so the startup lock covers the complete filesystem window,
@@ -12067,6 +12348,7 @@ static int cli_install_activate(void *opaque) {
 
 int cbm_cmd_install(int argc, char **argv) {
     parse_auto_answer(argc, argv);
+    g_client_selection = NULL;
     bool dry_run = false;
     bool force = false;
     bool plan = false;
@@ -12074,6 +12356,8 @@ int cbm_cmd_install(int argc, char **argv) {
     bool skip_config = false;
     bool skip_binary = false;
     bool force_binary = false;
+    bool hooks_flag = false;
+    bool no_hooks_flag = false;
     const char *requested_clients = NULL;
     const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
@@ -12087,6 +12371,10 @@ int cbm_cmd_install(int argc, char **argv) {
             reset_indexes = true;
         } else if (strcmp(argv[i], "--skip-config") == 0) {
             skip_config = true;
+        } else if (strcmp(argv[i], "--hooks") == 0) {
+            hooks_flag = true;
+        } else if (strcmp(argv[i], "--no-hooks") == 0) {
+            no_hooks_flag = true;
         } else if (strncmp(argv[i], "--clients=", SLEN("--clients=")) == 0) {
             requested_clients = argv[i] + SLEN("--clients=");
             if (!requested_clients[0]) {
@@ -12124,9 +12412,17 @@ int cbm_cmd_install(int argc, char **argv) {
         }
     }
 
+    if (hooks_flag && no_hooks_flag) {
+        (void)fprintf(stderr, "error: --hooks and --no-hooks cannot be used together\n");
+        return CLI_TRUE;
+    }
+
     const char *home = cbm_get_home_dir();
     if (!home) {
         (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
+        return CLI_TRUE;
+    }
+    if (cli_resolve_install_hooks(hooks_flag || no_hooks_flag, hooks_flag) != CLI_OK) {
         return CLI_TRUE;
     }
 
@@ -12395,6 +12691,7 @@ int cbm_cmd_install(int argc, char **argv) {
         .copy_binary = do_copy,
         .delete_indexes = delete_indexes,
         .skip_config = skip_config,
+        .persist_install_hooks = hooks_flag || no_hooks_flag,
         .skip_binary = skip_binary,
         .force = force,
         .dry_run = dry_run,
@@ -12500,86 +12797,7 @@ static void uninstall_claude_code(const char *home, const char *installed_binary
             record_agent_config_error(true, "Claude Code", "subagent_hook_uninstall",
                                       settings_path);
         }
-        char current_gate[CLI_BUF_8K];
-        char current_session[CLI_BUF_8K];
-        char current_subagent[CLI_BUF_8K];
-        char released_gate[CLI_BUF_8K];
-        const char *const gate_legacy[] = {released_gate};
-        const char *const session_legacy[] = {cmm_released_session_script};
-        const char *const subagent_legacy[] = {cmm_released_subagent_script};
-        size_t gate_legacy_count = cbm_build_released_gate_script(installed_binary, released_gate,
-                                                                  sizeof(released_gate)) == CLI_OK
-                                       ? 1U
-                                       : 0U;
-        static const struct {
-            const char *name;
-            const char *legacy_name;
-            const char *prefix;
-        } hook_types[] = {
-            {CMM_HOOK_GATE_SCRIPT, CMM_HOOK_GATE_SCRIPT_LEGACY, cmm_gate_script_prefix},
-            {CMM_SESSION_REMINDER_SCRIPT, CMM_SESSION_REMINDER_SCRIPT_LEGACY,
-             cmm_session_script_prefix},
-            {CMM_SUBAGENT_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY,
-             cmm_subagent_script_prefix},
-        };
-        struct {
-            const char *name;
-            const char *legacy_name;
-            const char *current;
-            const char *const *legacy;
-            size_t legacy_count;
-            bool current_valid;
-        } owned_scripts[] = {
-            {hook_types[0].name, hook_types[0].legacy_name, current_gate, gate_legacy,
-             gate_legacy_count,
-             cbm_build_current_hook_script(hook_types[0].prefix, installed_binary, current_gate,
-                                           sizeof(current_gate)) == CLI_OK},
-            {hook_types[1].name, hook_types[1].legacy_name, current_session, session_legacy, 1U,
-             cbm_build_current_hook_script(hook_types[1].prefix, installed_binary, current_session,
-                                           sizeof(current_session)) == CLI_OK},
-            {hook_types[2].name, hook_types[2].legacy_name, current_subagent, subagent_legacy, 1U,
-             cbm_build_current_hook_script(hook_types[2].prefix, installed_binary, current_subagent,
-                                           sizeof(current_subagent)) == CLI_OK},
-        };
-        char hooks_dir[CLI_BUF_1K];
-        int hooks_written = snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
-        bool hooks_dir_valid = hooks_written > 0 && (size_t)hooks_written < sizeof(hooks_dir);
-        for (size_t i = 0; i < sizeof(owned_scripts) / sizeof(owned_scripts[0]); i++) {
-            char script_path[CLI_BUF_1K];
-            int script_written = hooks_dir_valid
-                                     ? snprintf(script_path, sizeof(script_path), "%s/%s",
-                                                hooks_dir, owned_scripts[i].name)
-                                     : CLI_ERR;
-            bool script_path_valid =
-                script_written > 0 && (size_t)script_written < sizeof(script_path);
-            if (!owned_scripts[i].current_valid) {
-                record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
-                                          owned_scripts[i].name);
-                continue;
-            }
-            if (!script_path_valid ||
-                cbm_remove_owned_hook_script(script_path, owned_scripts[i].current,
-                                             owned_scripts[i].legacy,
-                                             owned_scripts[i].legacy_count) < CLI_OK) {
-                record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
-                                          script_path_valid ? script_path : owned_scripts[i].name);
-            }
-#ifdef _WIN32
-            if (!hooks_dir_valid ||
-                cbm_remove_owned_legacy_hook_script(
-                    hooks_dir, owned_scripts[i].legacy_name, owned_scripts[i].current,
-                    owned_scripts[i].legacy, owned_scripts[i].legacy_count) != CLI_OK) {
-                char legacy_path[CLI_BUF_1K];
-                int written = hooks_dir_valid ? snprintf(legacy_path, sizeof(legacy_path), "%s/%s",
-                                                         hooks_dir, owned_scripts[i].legacy_name)
-                                              : CLI_ERR;
-                record_agent_config_error(true, "Claude Code", "legacy_hook_script_uninstall",
-                                          written > 0 && (size_t)written < sizeof(legacy_path)
-                                              ? legacy_path
-                                              : owned_scripts[i].legacy_name);
-            }
-#endif
-        }
+        remove_claude_owned_hook_scripts(config_dir, installed_binary, true);
     }
     printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
 }
@@ -14586,6 +14804,9 @@ int cbm_cmd_update(int argc, char **argv) {
         (void)fprintf(stderr, "note: --ui/--standard are accepted but no longer do anything; since "
                               "v0.10.0 there is one build per platform and it always includes the "
                               "graph UI.\n");
+    }
+    if (cli_resolve_install_hooks(false, true) != CLI_OK) {
+        return CLI_TRUE;
     }
 
     /* #1566: we cannot update a binary a package manager owns, and pretending
