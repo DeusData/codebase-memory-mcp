@@ -2042,9 +2042,10 @@ static const char *cx_line_ts_imported_annotation(char *out, size_t cap, int i) 
     snprintf(out, cap, "import { t%d } from './m';\nlet a%d: C[] = [];\na%d[0].m();\n", i, i, i);
     return out;
 }
+/* A narrowing covers its whole function, so the search for the one covering a receiver only
+ * gets long across functions narrowing the same name. */
 static const char *cx_line_ts_narrowing(char *out, size_t cap, int i) {
-    (void)i;
-    snprintf(out, cap, "if (x instanceof C) { x.m(); }\n");
+    snprintf(out, cap, "function f_%d(x: C) { if (x instanceof C) { x.m(); } }\n", i);
     return out;
 }
 TEST(complexity_ts_proof_callee_imports_are_linear) {
@@ -2233,11 +2234,11 @@ TEST(complexity_decorator_lookup_is_linear) {
     PASS();
 }
 TEST(complexity_ts_proof_narrowing_lookup_is_linear) {
-    static const char head[] = "class C { m() {} }\nfunction f(x: C) {\n";
+    static const char head[] = "class C { m() {} }\n";
     uint64_t first = cx_extract_lsp_steps(CBM_LANG_TYPESCRIPT, "narrow.ts", head,
-                                          cx_line_ts_narrowing, "}\n", CX_BINDING_LINES);
+                                          cx_line_ts_narrowing, "", CX_BINDING_LINES);
     uint64_t second = cx_extract_lsp_steps(CBM_LANG_TYPESCRIPT, "narrow.ts", head,
-                                           cx_line_ts_narrowing, "}\n", CX_BINDING_LINES * 2);
+                                           cx_line_ts_narrowing, "", CX_BINDING_LINES * 2);
     double ratio = cx_ratio((double)second, (double)first);
     printf("    narrow.ts lsp steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
            (unsigned long long)second, ratio);
