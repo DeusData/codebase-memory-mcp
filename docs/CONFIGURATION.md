@@ -154,6 +154,15 @@ The main checkout of the same repository is unaffected, as are ordinary clones
 and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
 file pointing at a gitdir that contains a `commondir` entry.
 
+A subdirectory counts as the worktree it sits in. Detection walks up from the
+given path to the nearest `.git` entry, so `index_repository` on any
+subdirectory of a linked worktree is refused the same way, and a session root or
+hook working directory inside one is treated as that worktree. The walk stops at
+the first `.git` it finds; a main checkout or a submodule ends it as "not a
+worktree". A path outside any git checkout is checked one directory at a time up
+to the filesystem root and is never treated as a worktree. None of this runs
+while the key is off.
+
 The default is `false`, so indexing behavior is unchanged unless you opt in.
 
 ## 3. UI Settings
