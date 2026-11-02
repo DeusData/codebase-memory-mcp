@@ -551,6 +551,9 @@ static const tool_def_t TOOLS[] = {
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"index_worktree\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Index repo_path even when it is a linked git worktree and the "
+     "ignore_worktrees config key is enabled. No effect otherwise.\"},"
      "\"doc_candidates\":{\"type\":\"boolean\",\"description\":"
      "\"Doc-code candidates; default: the doc_candidates setting, else on for full, off for "
      "moderate/fast.\"},"
@@ -13050,6 +13053,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(boundary_err, true);
     }
 
+    /* ignore_worktrees: an EXPLICIT index_repository call on a linked worktree
+     * is refused with the two ways forward (per-call override, or turn the
+     * setting off) rather than silently skipped — a silent success would be
+     * indistinguishable from a real index to the caller. */
+    if (cbm_mcp_ignore_worktrees_enabled(srv) && !cbm_mcp_get_bool_arg(args, "index_worktree") &&
+        cbm_git_is_linked_worktree(repo_path)) {
+        index_args_free(repo_path, mode_str, name_override);
+        return cbm_mcp_text_result(
+            "repo_path is a linked git worktree and ignore_worktrees is enabled. Pass "
+            "index_worktree=true to index it anyway, or run: codebase-memory-mcp config set "
+            "ignore_worktrees false",
+            true);
+    }
+
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         if (async_mode) {
             index_args_free(repo_path, mode_str, name_override);
@@ -21551,6 +21568,44 @@ static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
     return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, true);
 }
 
+/* ignore_worktrees config: gates automatic indexing of LINKED git worktrees
+ * (default off, so existing setups keep indexing them). Users who create many
+ * short-lived worktrees can stop each throwaway checkout from registering a
+ * new permanent project with `config set ignore_worktrees true`. */
+bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv) {
+    if (!srv || !srv->config) {
+        return false; /* default off */
+    }
+    return cbm_config_get_bool(srv->config, CBM_CONFIG_IGNORE_WORKTREES, false);
+}
+
+/* The same key for a caller whose server may have no store: the stand-alone
+ * lifecycle hook builds one with cbm_mcp_server_new(NULL), and the daemon lends
+ * its session server, which this must not modify. A server with a store answers
+ * from it. Otherwise the runtime store is opened only to read this key, and only
+ * when it exists: a missing store leaves every key at its default, so this read
+ * never creates one. */
+bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv) {
+    if (srv && srv->config) {
+        return cbm_mcp_ignore_worktrees_enabled(srv);
+    }
+    const char *store_dir = cbm_resolve_cache_dir();
+    if (!store_dir) {
+        return false;
+    }
+    char store_path[CBM_SZ_4K];
+    int written = snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, store_dir);
+    cbm_path_info_t info;
+    if (written < 0 || (size_t)written >= sizeof(store_path) ||
+        cbm_path_info_utf8(store_path, &info) != CBM_PATH_INFO_OK || !info.is_regular) {
+        return false;
+    }
+    cbm_config_t *config = cbm_config_open(store_dir);
+    bool enabled = config && cbm_config_get_bool(config, CBM_CONFIG_IGNORE_WORKTREES, false);
+    cbm_config_close(config);
+    return enabled;
+}
+
 /* Register the session project with the background watcher for ongoing
  * change detection — unless auto_watch is disabled. */
 static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
@@ -21702,6 +21757,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
                      "run: codebase-memory-mcp config set auto_index true");
+        return;
+    }
+
+    if (cbm_mcp_ignore_worktrees_enabled(srv) && cbm_git_is_linked_worktree(srv->session_root)) {
+        cbm_log_info("autoindex.skip", "reason", "linked_worktree", "project",
+                     srv->session_project);
         return;
     }
 

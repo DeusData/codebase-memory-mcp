@@ -263,6 +263,8 @@ To turn the watcher off entirely, set `config set watcher_enabled false` (defaul
 
 The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
+Linked git worktrees are indexed as their own projects by default. Set `config set ignore_worktrees true` to skip them on the automatic paths — useful when short-lived `git worktree add` checkouts would otherwise each leave behind a permanent index of the same repository. An explicit `index_repository` call on a worktree is then refused unless you pass `index_worktree=true`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#ignore_worktrees).
+
 ### Keeping Up to Date
 
 **Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
@@ -1016,6 +1018,7 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # remove/disable all background watches (default: true)
+codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)

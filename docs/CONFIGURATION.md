@@ -87,6 +87,7 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) when indexing automatically. |
 | `auto_watch` | `true` | Global switch for MCP session watch registration. On the next refresh or registration request, `true` allows session roots and successful `index_repository` targets to be watched; `false` removes all watches. The background watcher can still run with no registered projects. |
 | `doc_candidates` | `auto` | Score documentation sections against code to store doc↔code candidates (the possible targets of a section, and the sections that may describe a function or file, each with a judged probability). Unset (`auto`), the index mode decides: on for `full` indexes (the default mode), off for `moderate` and `fast`. Set `true` or `false` to choose for every mode; `config reset doc_candidates` returns to `auto`. The scoring grows with sections × functions: under a second up to ~100k functions, ~15 s at ~400k, ~3 minutes on the Linux kernel. Off stores no candidates and leaves the rest of the graph unchanged; on in `fast` mode stores candidates without adding `fast`'s skipped `SIMILAR_TO` / `SEMANTICALLY_RELATED` edges. `index_repository` also takes `doc_candidates` for a single index, which wins over this setting. Applies from the next index. |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Active MCP sessions can register their root project and successful explicit index targets; under `daemon start` those watches outlive the session until the daemon stops, the project is deleted, its directory disappears, or `auto_watch` is set to `false`. `index_status` reports the current state in its `watch` object. |
@@ -141,6 +142,44 @@ Equality is allowed; exceeding either setting fails the complete index request
 and preserves any previously serving database. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
+
+### `ignore_worktrees`
+
+Every indexed project is registered under its own absolute root path, so each
+linked worktree becomes a separate permanent index. On machines that create many
+short-lived worktrees, the automatic paths (`auto_index`, and the session hook's
+"index this project first" guidance) turn every throwaway checkout into another
+stored index of what is largely the same repository.
+
+Enable the key to keep those checkouts out of the index:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees true
+```
+
+With it enabled:
+
+- automatic indexing skips a session whose root is a linked worktree;
+- the `hook-augment` context says the worktree is unindexed on purpose instead
+  of telling the agent to run `index_repository`;
+- an explicit `index_repository` call on a linked worktree is refused, and names
+  both ways forward — pass `index_worktree=true` for that one call, or turn the
+  key back off.
+
+The main checkout of the same repository is unaffected, as are ordinary clones
+and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
+file pointing at a gitdir that contains a `commondir` entry.
+
+A subdirectory counts as the worktree it sits in. Detection walks up from the
+given path to the nearest `.git` entry, so `index_repository` on any
+subdirectory of a linked worktree is refused the same way, and a session root or
+hook working directory inside one is treated as that worktree. The walk stops at
+the first `.git` it finds; a main checkout or a submodule ends it as "not a
+worktree". A path outside any git checkout is checked one directory at a time up
+to the filesystem root and is never treated as a worktree. None of this runs
+while the key is off.
+
+The default is `false`, so indexing behavior is unchanged unless you opt in.
 
 ## 3. UI Settings
 
