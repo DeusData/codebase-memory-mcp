@@ -303,6 +303,9 @@ struct cbm_pipeline {
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
     void *before_publish_hook_ctx;
+    /* Production publication gate (cbm_pipeline_set_publish_gate). */
+    cbm_pipeline_publish_gate_fn publish_gate;
+    void *publish_gate_ctx;
     /* Test-only: sees the complete graph buffer before the dump releases its indexes. */
     void (*before_dump_hook)(const cbm_gbuf_t *, void *);
     void *before_dump_hook_ctx;
@@ -894,6 +897,14 @@ static int pipeline_refresh_git_context(cbm_pipeline_t *p) {
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+void cbm_pipeline_set_publish_gate(cbm_pipeline_t *p, cbm_pipeline_publish_gate_fn gate,
+                                   void *context) {
+    if (p) {
+        p->publish_gate = gate;
+        p->publish_gate_ctx = gate ? context : NULL;
     }
 }
 
@@ -4756,6 +4767,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_userconfig_free(fresh_config);
     if (!source_matches) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_source_changed");
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        pipeline_release_test_config(p);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+
+    /* Last point at which the serving database is still untouched: the
+     * destination preparation below may already move it aside. */
+    if (p->publish_gate && !p->publish_gate(p->publish_gate_ctx)) {
+        cbm_log_warn("pipeline.publish_refused", "path", final_path);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);

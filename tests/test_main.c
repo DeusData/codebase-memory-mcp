@@ -455,10 +455,12 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         FILE *ready = marker ? cbm_fopen(marker, "wb") : NULL;
         if (ready) {
             (void)fprintf(
-                ready, "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\n",
+                ready,
+                "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\nfence=%s\n",
                 getenv("CBM_INDEX_SINGLE_THREAD") ? getenv("CBM_INDEX_SINGLE_THREAD") : "", marker,
                 getenv("CBM_INDEX_QUARANTINE_FILE") ? getenv("CBM_INDEX_QUARANTINE_FILE") : "",
-                cbm_mem_budget(), descendant);
+                cbm_mem_budget(), descendant,
+                cbm_index_worker_publish_fence() ? cbm_index_worker_publish_fence() : "");
             (void)fclose(ready);
         }
         (void)fprintf(stderr, "async worker hang-tree probe\n");
@@ -509,6 +511,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
+    cbm_index_set_worker_publish_fence(invocation.publish_fence_file);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
     cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);

@@ -56,6 +56,17 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Apply a validated discovery resource policy. The value is copied. */
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
 
+/* Publication gate. cbm_pipeline_run calls it once, after the last
+ * pre-publication check and immediately before the serving database is
+ * touched (never for a live no-op, which replaces nothing). Returning false
+ * aborts the run with CBM_PIPELINE_ABORT_PRESERVE_DB and the previous
+ * generation stays exactly as it was. A supervised index worker uses it to
+ * claim publication from its supervisor (see the publication fence in
+ * mcp/index_supervisor.h). NULL removes the gate. */
+typedef bool (*cbm_pipeline_publish_gate_fn)(void *context);
+void cbm_pipeline_set_publish_gate(cbm_pipeline_t *p, cbm_pipeline_publish_gate_fn gate,
+                                   void *context);
+
 /* Doc -> code candidates (the doc_candidates setting). Never set, the index
  * mode decides: on for full, off for moderate and fast. The setter makes an
  * explicit choice that wins in every mode. Off skips scoring documentation

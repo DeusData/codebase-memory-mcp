@@ -42,6 +42,7 @@ void cbm_index_set_worker_role(bool is_worker, const char *response_out);
 #define CBM_INDEX_WORKER_QUARANTINE_ARG "--index-worker-quarantine"
 #define CBM_INDEX_WORKER_MEMORY_BUDGET_ARG "--index-worker-memory-budget-bytes"
 #define CBM_INDEX_WORKER_BUILD_ARG "--index-worker-build"
+#define CBM_INDEX_WORKER_PUBLISH_FENCE_ARG "--index-worker-publish-fence"
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_LENGTH 64U
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE 65U
 void cbm_index_set_worker_role_options(bool is_worker, const char *response_out, bool single_thread,
@@ -50,6 +51,32 @@ void cbm_index_set_worker_role_options(bool is_worker, const char *response_out,
 bool cbm_index_worker_active(void);
 const char *cbm_index_worker_response_out(void);
 size_t cbm_index_worker_memory_budget_bytes(void);
+
+/* Publication fence. A worker resource limit (index_max_rss_mb,
+ * index_max_duration_seconds) is enforced by the supervisor, while only the
+ * worker replaces the serving database. When such a limit is enabled, every
+ * worker attempt gets a fence file path, and publication and resource
+ * termination both CLAIM it by creating that file exclusively, so exactly one
+ * of them can win:
+ *   - the worker claims immediately before it replaces the serving database;
+ *     losing means the supervisor already decided to stop it for a limit, so
+ *     the run aborts before publication and the previous index stays intact;
+ *   - the supervisor claims before it terminates the worker for a limit;
+ *     losing means the worker already committed to publishing, so the limit is
+ *     no longer enforced for that attempt and the attempt runs to completion.
+ * A reported resource failure therefore never follows a publication by the
+ * same attempt. Without an enabled worker limit there is no fence and nothing
+ * changes. The supervisor passes the path on the worker argv; the worker entry
+ * installs it here (NULL clears it). */
+void cbm_index_set_worker_publish_fence(const char *fence_file);
+const char *cbm_index_worker_publish_fence(void);
+
+/* Worker side: claim publication. True when publishing may proceed: no fence
+ * is installed, or this call created the fence file. False when the
+ * supervisor already claimed it (a resource limit stopped this attempt) or the
+ * claim could not be made; the caller must then leave the serving database
+ * untouched. Idempotent after a successful claim. */
+bool cbm_index_worker_claim_publication(void);
 
 /* Event name of the worker log's startup header. Shared with the tests so the
  * contract has exactly one spelling. */
@@ -96,6 +123,7 @@ typedef struct {
     const char *marker_file;
     const char *quarantine_file;
     size_t memory_budget_bytes;
+    const char *publish_fence_file;
 } cbm_index_worker_invocation_t;
 
 typedef enum {
@@ -160,6 +188,12 @@ typedef struct {
     bool response_rejected; /* clean worker exceeded the bounded response protocol */
     cbm_index_resource_violation_t resource_violation;
     bool resource_probe_failed;
+    /* The worker claimed the publication fence: it committed to replacing the
+     * serving database (whether or not it got that far). Also true when the
+     * fence state could not be read, because a report may only claim the
+     * previous index was preserved when it can prove it. Always false without
+     * a fence (no worker limit enabled) and for an attempt stopped by a limit. */
+    bool publication_committed;
     char *response; /* worker result only after a contained, uncancelled CLEAN exit;
                      * borrowed for async polls, caller-owned from the sync wrapper */
 } cbm_index_worker_result_t;
@@ -283,6 +317,9 @@ void cbm_index_supervisor_set_resource_hooks_for_testing(cbm_index_supervisor_cl
                                                          cbm_index_supervisor_rss_fn rss_fn,
                                                          void *context);
 void cbm_index_supervisor_reset_resource_hooks_for_testing(void);
+/* Borrowed fence path of an attempt; NULL when it has no fence. */
+const char *cbm_index_worker_publish_fence_path_for_testing(
+    const cbm_index_worker_handle_t *handle);
 #endif
 
 #endif /* CBM_INDEX_SUPERVISOR_H */

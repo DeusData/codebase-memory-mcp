@@ -239,18 +239,59 @@ TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar) {
         "/tmp/m",
         CBM_INDEX_WORKER_QUARANTINE_ARG,
         "/tmp/q",
+        CBM_INDEX_WORKER_PUBLISH_FENCE_ARG,
+        "/tmp/f",
         NULL,
     };
     cbm_index_worker_invocation_t invocation;
-    ASSERT_EQ(cbm_index_worker_parse_process_argv(16, valid, &invocation),
+    ASSERT_EQ(cbm_index_worker_parse_process_argv(18, valid, &invocation),
               CBM_INDEX_WORKER_ARGV_VALID);
-    ASSERT_EQ(cbm_daemon_process_role(16, valid), CBM_DAEMON_PROCESS_WORKER);
+    ASSERT_EQ(cbm_daemon_process_role(18, valid), CBM_DAEMON_PROCESS_WORKER);
     ASSERT_STR_EQ(invocation.args_json, valid[6]);
     ASSERT_STR_EQ(invocation.response_out, valid[8]);
     ASSERT_EQ(invocation.memory_budget_bytes, 1024);
     ASSERT_TRUE(invocation.single_thread);
     ASSERT_STR_EQ(invocation.marker_file, valid[13]);
     ASSERT_STR_EQ(invocation.quarantine_file, valid[15]);
+    ASSERT_STR_EQ(invocation.publish_fence_file, valid[17]);
+    /* Without a worker limit there is no fence: the shorter grammar stays valid. */
+    ASSERT_EQ(cbm_index_worker_parse_process_argv(16, valid, &invocation),
+              CBM_INDEX_WORKER_ARGV_VALID);
+    ASSERT_EQ(cbm_daemon_process_role(16, valid), CBM_DAEMON_PROCESS_WORKER);
+    ASSERT_NULL(invocation.publish_fence_file);
+
+    char *fence_before_quarantine[] = {"test-runner",
+                                       "cli",
+                                       "--index-worker",
+                                       CBM_INDEX_WORKER_BUILD_ARG,
+                                       (char *)captured,
+                                       "index_repository",
+                                       "{}",
+                                       "--response-out",
+                                       "/tmp/r",
+                                       CBM_INDEX_WORKER_PUBLISH_FENCE_ARG,
+                                       "/tmp/f",
+                                       CBM_INDEX_WORKER_QUARANTINE_ARG,
+                                       "/tmp/q",
+                                       NULL};
+    char *empty_fence[] = {"test-runner",
+                           "cli",
+                           "--index-worker",
+                           CBM_INDEX_WORKER_BUILD_ARG,
+                           (char *)captured,
+                           "index_repository",
+                           "{}",
+                           "--response-out",
+                           "/tmp/r",
+                           CBM_INDEX_WORKER_PUBLISH_FENCE_ARG,
+                           "",
+                           NULL};
+    ASSERT_EQ(cbm_index_worker_parse_process_argv(13, fence_before_quarantine, &invocation),
+              CBM_INDEX_WORKER_ARGV_INVALID);
+    ASSERT_EQ(cbm_daemon_process_role(13, fence_before_quarantine), CBM_DAEMON_PROCESS_INVALID);
+    ASSERT_EQ(cbm_index_worker_parse_process_argv(11, empty_fence, &invocation),
+              CBM_INDEX_WORKER_ARGV_INVALID);
+    ASSERT_EQ(cbm_daemon_process_role(11, empty_fence), CBM_DAEMON_PROCESS_INVALID);
 
     char *missing_build[] = {"test-runner",      "cli", "--index-worker",
                              "index_repository", "{}",  "--response-out",
@@ -1071,12 +1112,15 @@ TEST(index_supervisor_disabled_limits_do_not_probe) {
     cbm_index_worker_handle_t *handle = NULL;
     int start_rc = cbm_index_worker_start_with_policy("{\"__cbm_test_worker\":\"clean\"}", 0,
                                                       &policy, false, NULL, NULL, 0, &handle);
+    /* Opt-in: no worker limit, no publication fence, no claim. */
+    bool fenced = !handle || cbm_index_worker_publish_fence_path_for_testing(handle) != NULL;
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(
                                   handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
     cbm_index_resource_t resource =
         result ? result->resource_violation.resource : CBM_INDEX_RESOURCE_RSS_BYTES;
     bool probe_failed = result && result->resource_probe_failed;
+    bool committed = !result || result->publication_committed;
     if (terminal) {
         cbm_index_worker_destroy(handle);
     } else {
@@ -1090,6 +1134,8 @@ TEST(index_supervisor_disabled_limits_do_not_probe) {
     ASSERT_EQ(fake.clock_calls, 0);
     ASSERT_EQ(resource, CBM_INDEX_RESOURCE_NONE);
     ASSERT_FALSE(probe_failed);
+    ASSERT_FALSE(fenced);
+    ASSERT_FALSE(committed);
     PASS();
 }
 
@@ -1352,6 +1398,179 @@ TEST(index_supervisor_three_failed_rss_probes_fail_closed) {
     PASS();
 }
 
+/* Publication fence (index_supervisor.h). The hang-tree probe reports the fence
+ * path it received on its argv in its marker, and the test plays the worker's
+ * publication claim through the production entry point with that path. */
+typedef struct {
+    char directory[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    char marker[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    char fence[INDEX_SUPERVISOR_TEST_PATH_CAP];
+} index_supervisor_fence_fixture_t;
+
+static bool index_supervisor_fence_fixture_init(index_supervisor_fence_fixture_t *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    (void)snprintf(fixture->directory, sizeof(fixture->directory), "%s/cbm-index-fence-XXXXXX",
+                   cbm_tmpdir());
+    if (!cbm_mkdtemp(fixture->directory)) {
+        return false;
+    }
+    (void)snprintf(fixture->marker, sizeof(fixture->marker), "%s/marker", fixture->directory);
+    return true;
+}
+
+/* True once the worker started with exactly this attempt's fence. */
+static bool index_supervisor_fence_fixture_started(index_supervisor_fence_fixture_t *fixture,
+                                                   cbm_index_worker_handle_t *handle) {
+    const char *fence = handle ? cbm_index_worker_publish_fence_path_for_testing(handle) : NULL;
+    if (!fence) {
+        return false;
+    }
+    (void)snprintf(fixture->fence, sizeof(fixture->fence), "%s", fence);
+    char expected[INDEX_SUPERVISOR_TEST_PATH_CAP + 16];
+    (void)snprintf(expected, sizeof(expected), "fence=%s\n", fixture->fence);
+    return index_supervisor_test_wait_file_text(fixture->marker, expected,
+                                                INDEX_SUPERVISOR_TEST_READY_MS);
+}
+
+static bool index_supervisor_fence_fixture_worker_claims(
+    index_supervisor_fence_fixture_t *fixture) {
+    cbm_index_set_worker_publish_fence(fixture->fence);
+    bool claimed = cbm_index_worker_claim_publication();
+    cbm_index_set_worker_publish_fence(NULL);
+    return claimed;
+}
+
+static void index_supervisor_fence_fixture_cleanup(index_supervisor_fence_fixture_t *fixture) {
+    (void)cbm_unlink(fixture->marker);
+    (void)cbm_rmdir(fixture->directory);
+}
+
+static int g_index_supervisor_after_publication_logs;
+
+static void index_supervisor_test_after_publication_sink(const char *line) {
+    if (line && strstr(line, "index.supervisor.resource_limit_after_publication")) {
+        g_index_supervisor_after_publication_logs++;
+    }
+}
+
+TEST(index_supervisor_limit_claims_publication_before_terminating) {
+    index_supervisor_resource_fake_t fake = {
+        .now_ms = 100,
+        .rss_status = CBM_PROC_TREE_RSS_EMPTY,
+    };
+    index_supervisor_fence_fixture_t fixture;
+    bool fixture_ready = index_supervisor_fence_fixture_init(&fixture);
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_supervisor_fake_clock,
+                                                        index_supervisor_fake_charged_rss, &fake);
+    cbm_index_resource_policy_t policy = index_supervisor_test_worker_policy(0, 1000);
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc =
+        fixture_ready
+            ? cbm_index_worker_start_with_policy("{\"__cbm_test_worker\":\"hang-tree\"}", 0,
+                                                 &policy, false, fixture.marker, NULL, 100, &handle)
+            : -1;
+    bool started = start_rc == 0 && index_supervisor_fence_fixture_started(&fixture, handle);
+    /* The limit is crossed while the worker has not claimed publication: the
+     * supervisor claims the fence in this poll, before it stops the worker. */
+    fake.now_ms = 1101;
+    const cbm_index_worker_result_t *result = NULL;
+    cbm_index_worker_poll_t decided =
+        handle ? cbm_index_worker_poll(handle, &result) : CBM_INDEX_WORKER_POLL_ERROR;
+    /* Whatever the worker does next, it can no longer publish. */
+    bool worker_barred = started && !index_supervisor_fence_fixture_worker_claims(&fixture);
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool limited = terminal && result &&
+                   result->resource_violation.resource == CBM_INDEX_RESOURCE_DURATION_MS &&
+                   result->resource_violation.observed == 1001 && !result->publication_committed &&
+                   !result->cancellation_requested && result->tree_quiesced;
+    bool fence_removed = terminal && fixture.fence[0] && cbm_file_size(fixture.fence) < 0;
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    if (!started) {
+        index_supervisor_test_dump("marker", fixture.marker);
+    }
+    index_supervisor_fence_fixture_cleanup(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(started);
+    ASSERT_EQ(decided, CBM_INDEX_WORKER_POLL_RUNNING);
+    ASSERT_TRUE(worker_barred);
+    ASSERT_TRUE(limited);
+    ASSERT_TRUE(fence_removed);
+    PASS();
+}
+
+TEST(index_supervisor_limit_after_worker_publication_claim_is_not_enforced) {
+    index_supervisor_resource_fake_t fake = {
+        .now_ms = 100,
+        .rss_status = CBM_PROC_TREE_RSS_EMPTY,
+    };
+    index_supervisor_fence_fixture_t fixture;
+    bool fixture_ready = index_supervisor_fence_fixture_init(&fixture);
+    CBMLogLevel saved_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    g_index_supervisor_after_publication_logs = 0;
+    cbm_log_set_sink_ex(index_supervisor_test_after_publication_sink, CBM_LOG_SINK_TEE);
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_supervisor_fake_clock,
+                                                        index_supervisor_fake_charged_rss, &fake);
+    cbm_index_resource_policy_t policy = index_supervisor_test_worker_policy(0, 1000);
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc =
+        fixture_ready
+            ? cbm_index_worker_start_with_policy("{\"__cbm_test_worker\":\"hang-tree\"}", 0,
+                                                 &policy, false, fixture.marker, NULL, 100, &handle)
+            : -1;
+    bool started = start_rc == 0 && index_supervisor_fence_fixture_started(&fixture, handle);
+    /* The worker commits to publishing first; only then is the limit crossed. */
+    bool worker_claimed = started && index_supervisor_fence_fixture_worker_claims(&fixture);
+    fake.now_ms = 1101;
+    const cbm_index_worker_result_t *result = NULL;
+    cbm_index_worker_poll_t decided =
+        handle ? cbm_index_worker_poll(handle, &result) : CBM_INDEX_WORKER_POLL_ERROR;
+    int clock_calls_at_decision = fake.clock_calls;
+    cbm_index_worker_poll_t after =
+        handle ? cbm_index_worker_poll(handle, &result) : CBM_INDEX_WORKER_POLL_ERROR;
+    bool disarmed = fake.clock_calls == clock_calls_at_decision;
+    /* The attempt runs on; the test ends it with an ordinary cancellation. */
+    bool cancel_accepted = handle && cbm_index_worker_request_cancel(handle);
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool committed = terminal && result && result->cancellation_requested &&
+                     result->resource_violation.resource == CBM_INDEX_RESOURCE_NONE &&
+                     !result->resource_probe_failed && result->publication_committed &&
+                     result->tree_quiesced;
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    if (!started) {
+        index_supervisor_test_dump("marker", fixture.marker);
+    }
+    index_supervisor_fence_fixture_cleanup(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(worker_claimed);
+    ASSERT_EQ(decided, CBM_INDEX_WORKER_POLL_RUNNING);
+    ASSERT_EQ(after, CBM_INDEX_WORKER_POLL_RUNNING);
+    ASSERT_TRUE(disarmed);
+    ASSERT_EQ(g_index_supervisor_after_publication_logs, 1);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(committed);
+    PASS();
+}
+
 SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow);
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
@@ -1370,4 +1589,6 @@ SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_quiet_timeout_remains_hang_with_duration_enabled);
     RUN_TEST(index_supervisor_cancel_precedes_resource_probe);
     RUN_TEST(index_supervisor_three_failed_rss_probes_fail_closed);
+    RUN_TEST(index_supervisor_limit_claims_publication_before_terminating);
+    RUN_TEST(index_supervisor_limit_after_worker_publication_claim_is_not_enforced);
 }

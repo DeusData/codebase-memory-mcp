@@ -58,6 +58,18 @@ terminal only after the tree is quiescent or a bounded containment failure is
 explicitly surfaced. Resource termination is not retried and does not
 quarantine a source file.
 
+A worker limit never stops a worker after it has started to publish. The
+supervisor enforces the limits, but only the worker replaces the serving
+database, so the two coordinate through a per-attempt publication claim that
+exactly one of them can win. The worker claims it immediately before it
+replaces the serving database; the supervisor claims it before it stops the
+worker for a limit. If the limit is reached first, the worker can no longer
+publish and the previous index stays untouched. If the worker claimed first,
+the limits no longer apply to that attempt: the new index is published and the
+rest of the attempt, including the persistence artifact export, runs to
+completion. The supervisor then logs `index.supervisor.resource_limit_after_publication`
+instead of stopping it. With both worker limits `off` there is no claim.
+
 If RSS is enabled and three consecutive probes cannot obtain any trustworthy
 tree measurement while the root worker is still running, CBM fails closed with
 `code=resource_probe_failed`. A probe is untrustworthy as soon as one member of
@@ -102,7 +114,10 @@ Worker limit failures use the same shape with `stage=worker`,
 `resource=rss_bytes` and `unit=bytes`, or `resource=duration_ms` and
 `unit=milliseconds`. RSS measurement failures use `code=resource_probe_failed`
 and omit `observed`, `limit`, and `unit` because no trustworthy observation was
-available.
+available. For a worker failure `serving_index_preserved` describes the whole
+request: it is true only when a servable index existed when the request began,
+no attempt of the request (including an earlier one that crashed and was
+recovered) claimed publication, and that index still serves.
 
 ## Trust and compatibility
 

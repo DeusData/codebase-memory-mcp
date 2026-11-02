@@ -92,6 +92,63 @@ size_t cbm_index_worker_memory_budget_bytes(void) {
     return g_worker_memory_budget_bytes;
 }
 
+/* ── Publication fence (see index_supervisor.h) ───────────────────── */
+
+typedef enum {
+    INDEX_PUBLICATION_CLAIMED = 0, /* this caller created the fence file */
+    INDEX_PUBLICATION_TAKEN,       /* the other side created it first */
+    INDEX_PUBLICATION_CLAIM_ERROR, /* neither could be established */
+} index_publication_claim_t;
+
+/* Exclusive creation is the single atomic decision both processes race for:
+ * "x" is O_CREAT|O_EXCL on POSIX and CREATE_NEW on Windows, so exactly one
+ * creator succeeds and the other gets EEXIST. A deletion-based claim would
+ * be ambiguous on Windows, where a delete-pending file reports access denied. */
+static index_publication_claim_t index_publication_claim(const char *fence_file) {
+    if (!fence_file || !fence_file[0]) {
+        return INDEX_PUBLICATION_CLAIM_ERROR;
+    }
+    errno = 0;
+    FILE *claim = cbm_fopen(fence_file, "wbx");
+    if (claim) {
+        (void)fclose(claim);
+        return INDEX_PUBLICATION_CLAIMED;
+    }
+    return errno == EEXIST ? INDEX_PUBLICATION_TAKEN : INDEX_PUBLICATION_CLAIM_ERROR;
+}
+
+static char g_worker_publish_fence[CBM_SZ_4K] = {0};
+static bool g_worker_publication_claimed = false;
+
+void cbm_index_set_worker_publish_fence(const char *fence_file) {
+    if (fence_file && fence_file[0]) {
+        (void)snprintf(g_worker_publish_fence, sizeof(g_worker_publish_fence), "%s", fence_file);
+    } else {
+        g_worker_publish_fence[0] = '\0';
+    }
+    g_worker_publication_claimed = false;
+}
+
+const char *cbm_index_worker_publish_fence(void) {
+    return g_worker_publish_fence[0] ? g_worker_publish_fence : NULL;
+}
+
+bool cbm_index_worker_claim_publication(void) {
+    if (!g_worker_publish_fence[0] || g_worker_publication_claimed) {
+        return true;
+    }
+    index_publication_claim_t claim = index_publication_claim(g_worker_publish_fence);
+    if (claim == INDEX_PUBLICATION_CLAIMED) {
+        g_worker_publication_claimed = true;
+        cbm_log_info("index.worker.publication_claimed", "fence", g_worker_publish_fence);
+        return true;
+    }
+    cbm_log_warn("index.worker.publication_refused", "reason",
+                 claim == INDEX_PUBLICATION_TAKEN ? "resource_limit" : "claim_failed", "fence",
+                 g_worker_publish_fence);
+    return false;
+}
+
 /* Worker log startup header — see index_supervisor.h. */
 static atomic_flag g_worker_log_begun = ATOMIC_FLAG_INIT;
 
@@ -248,6 +305,13 @@ cbm_index_worker_argv_status_t cbm_index_worker_parse_process_argv(
             return CBM_INDEX_WORKER_ARGV_INVALID;
         }
         parsed.quarantine_file = argv[next + 1];
+        next += 2;
+    }
+    if (next < argc && argv[next] && strcmp(argv[next], CBM_INDEX_WORKER_PUBLISH_FENCE_ARG) == 0) {
+        if (next + 1 >= argc || !argv[next + 1] || !argv[next + 1][0]) {
+            return CBM_INDEX_WORKER_ARGV_INVALID;
+        }
+        parsed.publish_fence_file = argv[next + 1];
         next += 2;
     }
     if (next != argc) {
@@ -477,7 +541,7 @@ static void worker_log_last_phase(const char *log_path, char *out, size_t out_si
 
 enum {
     INDEX_WORKER_PATH_CAP = CBM_SZ_4K,
-    INDEX_WORKER_ARGV_CAP = 17,
+    INDEX_WORKER_ARGV_CAP = 19,
     INDEX_WORKER_SYNC_POLL_NS = 10000000,
     INDEX_WORKER_RELAY_LINES_PER_POLL = 64,
     INDEX_WORKER_RELAY_BYTES_PER_POLL = 64 * 1024,
@@ -491,6 +555,14 @@ typedef enum {
     INDEX_WORKER_TERMINATION_CANCEL,
     INDEX_WORKER_TERMINATION_RESOURCE,
 } index_worker_termination_reason_t;
+
+/* Who owns the publication fence of one attempt. Only the polling owner thread
+ * reads or writes it. */
+typedef enum {
+    INDEX_WORKER_PUBLICATION_OPEN = 0, /* unclaimed, or no fence at all */
+    INDEX_WORKER_PUBLICATION_SUPERVISOR,
+    INDEX_WORKER_PUBLICATION_WORKER,
+} index_worker_publication_owner_t;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 static cbm_index_supervisor_clock_fn g_resource_clock;
@@ -545,10 +617,23 @@ struct cbm_index_worker_handle {
     uint64_t last_rss_probe_ms;
     unsigned int rss_probe_failures;
     bool rss_probe_started;
+    /* Publication fence: a never-created path next to a reserved unique file
+     * (both removed at terminal). Empty when no worker limit is enabled. */
+    char publish_fence_reserve[INDEX_WORKER_PATH_CAP];
+    char publish_fence_path[INDEX_WORKER_PATH_CAP];
+    index_worker_publication_owner_t publication_owner;
+    bool publication_claim_error_logged;
     atomic_int termination_reason;
     atomic_bool terminal;
     cbm_index_worker_result_t result;
 };
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+const char *cbm_index_worker_publish_fence_path_for_testing(
+    const cbm_index_worker_handle_t *handle) {
+    return handle && handle->publish_fence_path[0] ? handle->publish_fence_path : NULL;
+}
+#endif
 
 /* The generic subprocess supervisor tails logs in bounded batches to preserve
  * its nonblocking poll contract. A short-lived worker can therefore become
@@ -801,9 +886,58 @@ size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
     return memory_budget_bytes > SIZE_MAX - headroom ? SIZE_MAX : memory_budget_bytes + headroom;
 }
 
+/* Claim the publication fence before stopping the worker for a resource limit
+ * (see index_supervisor.h). True when the termination may proceed. */
+static bool worker_claim_publication_for_limit(cbm_index_worker_handle_t *handle,
+                                               cbm_index_resource_t resource, uint64_t observed,
+                                               uint64_t limit, bool probe_failed) {
+    if (!handle->publish_fence_path[0] ||
+        handle->publication_owner == INDEX_WORKER_PUBLICATION_SUPERVISOR) {
+        return true;
+    }
+    if (handle->publication_owner == INDEX_WORKER_PUBLICATION_WORKER) {
+        return false;
+    }
+    index_publication_claim_t claim = index_publication_claim(handle->publish_fence_path);
+    if (claim == INDEX_PUBLICATION_CLAIMED) {
+        handle->publication_owner = INDEX_WORKER_PUBLICATION_SUPERVISOR;
+        return true;
+    }
+    if (claim == INDEX_PUBLICATION_TAKEN) {
+        /* The worker committed to publishing before the limit was observed.
+         * Stopping it now could leave a new generation serving behind a report
+         * that the previous index was preserved, so this attempt is no longer
+         * limited; the crossing is recorded here instead. */
+        handle->publication_owner = INDEX_WORKER_PUBLICATION_WORKER;
+        char observed_text[CBM_SZ_32];
+        char limit_text[CBM_SZ_32];
+        (void)snprintf(observed_text, sizeof(observed_text), "%llu", (unsigned long long)observed);
+        (void)snprintf(limit_text, sizeof(limit_text), "%llu", (unsigned long long)limit);
+        cbm_log_warn("index.supervisor.resource_limit_after_publication", "resource",
+                     cbm_index_resource_name(resource), "observed",
+                     probe_failed ? "unmeasured" : observed_text, "limit", limit_text, "action",
+                     "not_enforced", "log", handle->log_path);
+        return false;
+    }
+    /* Neither side holds the fence and it could not be created. Terminating
+     * now could race a later successful claim by the worker, so the decision
+     * is retried on the next poll instead. */
+    if (!handle->publication_claim_error_logged) {
+        handle->publication_claim_error_logged = true;
+        char errno_text[CBM_SZ_32];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_error("index.supervisor.publication_claim_failed", "errno", errno_text, "action",
+                      "retry_next_poll", "log", handle->log_path);
+    }
+    return false;
+}
+
 static void worker_request_resource_termination(cbm_index_worker_handle_t *handle,
                                                 cbm_index_resource_t resource, uint64_t observed,
                                                 uint64_t limit, bool probe_failed) {
+    if (!worker_claim_publication_for_limit(handle, resource, observed, limit, probe_failed)) {
+        return;
+    }
     int expected = INDEX_WORKER_TERMINATION_NONE;
     if (!atomic_compare_exchange_strong_explicit(&handle->termination_reason, &expected,
                                                  INDEX_WORKER_TERMINATION_RESOURCE,
@@ -824,7 +958,9 @@ static void worker_request_resource_termination(cbm_index_worker_handle_t *handl
 }
 
 static bool worker_check_resource_limits(cbm_index_worker_handle_t *handle) {
-    if (atomic_load_explicit(&handle->termination_reason, memory_order_acquire) !=
+    /* A worker that committed to publishing is no longer resource-limited. */
+    if (handle->publication_owner == INDEX_WORKER_PUBLICATION_WORKER ||
+        atomic_load_explicit(&handle->termination_reason, memory_order_acquire) !=
             INDEX_WORKER_TERMINATION_NONE ||
         cbm_subprocess_termination_pending(handle->process) ||
         !cbm_subprocess_supervision_active(handle->process)) {
@@ -875,6 +1011,56 @@ duration_check:
         }
     }
     return rss_probe_failed;
+}
+
+/* Reserve a unique private name and derive the fence path from it. The fence
+ * itself is never created here: creating it IS the claim. */
+static bool worker_publish_fence_create(cbm_index_worker_handle_t *handle) {
+    if (!worker_unique_file(handle->publish_fence_reserve, sizeof(handle->publish_fence_reserve),
+                            "publish")) {
+        return false;
+    }
+    int written = snprintf(handle->publish_fence_path, sizeof(handle->publish_fence_path),
+                           "%s.claim", handle->publish_fence_reserve);
+    if (written <= 0 || written >= (int)sizeof(handle->publish_fence_path)) {
+        (void)cbm_unlink(handle->publish_fence_reserve);
+        handle->publish_fence_reserve[0] = '\0';
+        handle->publish_fence_path[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static void worker_publish_fence_remove(cbm_index_worker_handle_t *handle) {
+    if (handle->publish_fence_path[0]) {
+        (void)cbm_unlink(handle->publish_fence_path);
+    }
+    if (handle->publish_fence_reserve[0]) {
+        (void)cbm_unlink(handle->publish_fence_reserve);
+    }
+}
+
+/* Settle who held the fence once the attempt is terminal. Claiming an unowned
+ * fence now also bars any later claim, so a stray member of an unquiesced tree
+ * can never publish after this report. */
+static bool worker_publication_committed_at_terminal(cbm_index_worker_handle_t *handle) {
+    if (!handle->publish_fence_path[0] ||
+        handle->publication_owner == INDEX_WORKER_PUBLICATION_SUPERVISOR) {
+        return false;
+    }
+    if (handle->publication_owner == INDEX_WORKER_PUBLICATION_WORKER) {
+        return true;
+    }
+    index_publication_claim_t claim = index_publication_claim(handle->publish_fence_path);
+    if (claim == INDEX_PUBLICATION_CLAIMED) {
+        handle->publication_owner = INDEX_WORKER_PUBLICATION_SUPERVISOR;
+        return false;
+    }
+    if (claim == INDEX_PUBLICATION_TAKEN) {
+        handle->publication_owner = INDEX_WORKER_PUBLICATION_WORKER;
+    }
+    /* Taken: the worker committed. Unreadable: preservation cannot be proven. */
+    return true;
 }
 
 static int worker_start_internal(const char *args_json, size_t memory_budget_bytes,
@@ -935,6 +1121,19 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
         free(handle);
         return -1;
     }
+    /* Opt-in: only an enabled worker limit can stop a worker, so only then is
+     * there a publication to coordinate. */
+    if (cbm_index_policy_worker_enabled(&handle->resource_policy) &&
+        !worker_publish_fence_create(handle)) {
+        char error_text[CBM_SZ_32];
+        (void)snprintf(error_text, sizeof(error_text), "%d", errno);
+        cbm_log_error("index.supervisor.artifact_create_failed", "artifact", "publish_fence",
+                      "errno", error_text);
+        (void)cbm_unlink(handle->response_path);
+        (void)cbm_unlink(handle->log_path);
+        free(handle);
+        return -1;
+    }
 
     const char *argv[INDEX_WORKER_ARGV_CAP];
     size_t argc = 0;
@@ -964,6 +1163,10 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
         argv[argc++] = CBM_INDEX_WORKER_QUARANTINE_ARG;
         argv[argc++] = quarantine_file;
     }
+    if (handle->publish_fence_path[0]) {
+        argv[argc++] = CBM_INDEX_WORKER_PUBLISH_FENCE_ARG;
+        argv[argc++] = handle->publish_fence_path;
+    }
     argv[argc] = NULL;
 
     cbm_proc_opts_t options = {0};
@@ -981,6 +1184,7 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
     if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
         (void)cbm_unlink(handle->response_path);
         (void)cbm_unlink(handle->log_path);
+        worker_publish_fence_remove(handle);
         free(handle);
         cbm_log_error("index.supervisor.spawn_failed", "action", "fail_closed");
         return -1;
@@ -1089,6 +1293,12 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
     handle->result.forced = process_result->forced;
     handle->result.tree_quiesced = process_result->tree_quiesced;
     handle->result.supervision_failed = process_result->supervision_failed;
+    handle->result.publication_committed = worker_publication_committed_at_terminal(handle);
+    if (handle->result.tree_quiesced) {
+        /* An unquiesced tree keeps the fence as it is: removing a claim the
+         * supervisor holds would let a surviving member publish later. */
+        worker_publish_fence_remove(handle);
+    }
     if (worker_result_succeeded(&handle->result)) {
         worker_response_read_status_t response_status;
         handle->result.response = slurp_worker_response(handle->response_path, &response_status);

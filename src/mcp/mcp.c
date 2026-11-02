@@ -11277,16 +11277,50 @@ static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_ou
     return index_worker_json_result(doc, repo_path, NULL, NULL);
 }
 
-char *cbm_mcp_index_worker_resource_response(const char *args,
-                                             const cbm_index_worker_result_t *worker_result) {
+/* Whether the project named by internal worker args has a servable index now. */
+static bool index_args_serving_index_servable(const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
     char *project_name =
         cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
-    char db_path[CBM_SZ_1K] = {0};
+    bool servable = false;
     if (project_name) {
+        char db_path[CBM_SZ_1K] = {0};
         project_db_path(project_name, db_path, sizeof(db_path));
+        servable = project_db_is_servable(project_name, db_path);
     }
+    free(repo_path);
+    free(name_override);
+    free(project_name);
+    return servable;
+}
+
+void cbm_mcp_index_request_facts_begin(const char *args, cbm_mcp_index_request_facts_t *facts) {
+    if (!facts) {
+        return;
+    }
+    facts->serving_index_existed = index_args_serving_index_servable(args);
+    facts->publication_committed = false;
+}
+
+void cbm_mcp_index_request_facts_record(cbm_mcp_index_request_facts_t *facts,
+                                        const cbm_index_worker_result_t *worker_result) {
+    if (facts && worker_result && worker_result->publication_committed) {
+        facts->publication_committed = true;
+    }
+}
+
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result,
+                                             const cbm_mcp_index_request_facts_t *facts) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    /* The publication fence makes a limit-stopped attempt and a publication by
+     * that attempt mutually exclusive; an EARLIER attempt of the request may
+     * still have published (it crashed after committing), and an index that
+     * appeared during the request (artifact bootstrap) was not preserved. */
+    bool serving_index_preserved =
+        facts && facts->serving_index_existed && !facts->publication_committed &&
+        !worker_result->publication_committed && index_args_serving_index_servable(args);
 
     const cbm_index_resource_violation_t *violation = &worker_result->resource_violation;
     const char *config_key = cbm_index_resource_config_key(violation->resource);
@@ -11311,13 +11345,12 @@ char *cbm_mcp_index_worker_resource_response(const char *args,
         yyjson_mut_obj_add_str(doc, root, "unit", cbm_index_resource_unit(violation->resource));
     }
     yyjson_mut_obj_add_bool(doc, root, "retryable", true);
-    yyjson_mut_obj_add_bool(doc, root, "serving_index_preserved",
-                            project_name && project_db_is_servable(project_name, db_path));
+    yyjson_mut_obj_add_bool(doc, root, "serving_index_preserved", serving_index_preserved);
     yyjson_mut_obj_add_strcpy(doc, root, "message", message);
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
-    return index_worker_json_result(doc, repo_path, name_override, project_name);
+    return index_worker_json_result(doc, repo_path, NULL, NULL);
 }
 
 /* Drop the cached store so the next query reopens whatever the worker wrote (each
@@ -11618,6 +11651,12 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
                                   const cbm_index_resource_policy_t *resource_policy) {
     invalidate_cached_store(srv);
     uint64_t request_started_ms = cbm_index_worker_now_ms();
+    /* Only an enabled worker limit can produce a worker resource failure, the
+     * one response these facts are reported in. */
+    cbm_mcp_index_request_facts_t facts = {0};
+    if (cbm_index_policy_worker_enabled(resource_policy)) {
+        cbm_mcp_index_request_facts_begin(args, &facts);
+    }
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
@@ -11627,6 +11666,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
         request_started_ms, &wr);
     cbm_mcp_supervised_result_disposition_t disposition =
         cbm_mcp_supervised_result_disposition(rc, &wr);
+    cbm_mcp_index_request_facts_record(&facts, &wr);
 
     if (wr.response_missing) {
         /* #1300: a clean exit without a response is a named failure. */
@@ -11649,7 +11689,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
         return failure;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
-        char *failure = cbm_mcp_index_worker_resource_response(args, &wr);
+        char *failure = cbm_mcp_index_worker_resource_response(args, &wr, &facts);
         cbm_index_worker_result_free(&wr);
         invalidate_cached_store(srv);
         return failure;
@@ -11709,6 +11749,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
             srv ? &srv->pipeline_cancel_requested : NULL, request_started_ms, &wr2);
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
+        cbm_mcp_index_request_facts_record(&facts, &wr2);
         if (wr2.response_missing) {
             /* #1300: a recovery run that exits cleanly without a response is
              * reported as such, not as a failed recovery start. */
@@ -11732,7 +11773,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
             break;
         }
         if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
-            resp = cbm_mcp_index_worker_resource_response(args, &wr2);
+            resp = cbm_mcp_index_worker_resource_response(args, &wr2, &facts);
             cbm_index_worker_result_free(&wr2);
             break;
         }
@@ -11836,6 +11877,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
             srv ? &srv->pipeline_cancel_requested : NULL, request_started_ms, &wrp);
         cbm_mcp_supervised_result_disposition_t partial_disposition =
             cbm_mcp_supervised_result_disposition(rcp, &wrp);
+        cbm_mcp_index_request_facts_record(&facts, &wrp);
         if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
             resp = wrp.response; /* transfer ownership to caller */
             wrp.response = NULL;
@@ -11848,7 +11890,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
             unsafe_terminal = true;
             terminal_cancelled = wrp.cancellation_requested;
         } else if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
-            resp = cbm_mcp_index_worker_resource_response(args, &wrp);
+            resp = cbm_mcp_index_worker_resource_response(args, &wrp, &facts);
         }
         cbm_index_worker_result_free(&wrp);
     }
@@ -12293,6 +12335,11 @@ static char *handle_index_repository_status(cbm_mcp_server_t *srv, const char *a
     return result ? result : cbm_mcp_text_result("index job status is unavailable", true);
 }
 
+static bool index_worker_publish_gate(void *context) {
+    (void)context;
+    return cbm_index_worker_claim_publication();
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     bool async_mode = false;
     bool status_mode = false;
@@ -12492,6 +12539,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
+    if (cbm_index_worker_publish_fence()) {
+        /* Supervised worker with a worker limit: claim publication from the
+         * supervisor before the serving database is replaced. */
+        cbm_pipeline_set_publish_gate(p, index_worker_publish_gate, NULL);
+    }
     index_doc_candidates_apply(p, doc_candidates);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));

@@ -160,6 +160,10 @@ struct cbm_daemon_application_job {
     bool async_owned;
     bool worker_started;
     uint64_t request_started_ms;
+    /* What a worker resource failure of this job is reported against; set
+     * before the first attempt, folded over every attempt (mcp_internal.h). */
+    bool request_facts_begun;
+    cbm_mcp_index_request_facts_t request_facts;
     cbm_daemon_application_job_t *next;
 };
 
@@ -1346,6 +1350,17 @@ static void application_cancelled_result(cbm_index_worker_result_t *result) {
     result->tree_quiesced = true;
 }
 
+/* Only an enabled worker limit can end a job in a worker resource failure, the
+ * one response the request facts feed; without one nothing is read. */
+static void application_job_request_facts_begin(cbm_daemon_application_job_t *job) {
+    cbm_index_resource_policy_t policy;
+    char error[CBM_SZ_256] = {0};
+    if (cbm_mcp_index_policy_from_internal_args(job->args_json, &policy, error, sizeof(error)) &&
+        cbm_index_policy_worker_enabled(&policy)) {
+        cbm_mcp_index_request_facts_begin(job->args_json, &job->request_facts);
+    }
+}
+
 static application_attempt_status_t application_job_run_attempt(cbm_daemon_application_job_t *job,
                                                                 const char *marker_path,
                                                                 const char *quarantine_path,
@@ -1381,6 +1396,10 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     cbm_daemon_application_worker_t worker = NULL;
     if (job->request_started_ms == 0) {
         job->request_started_ms = cbm_index_worker_now_ms();
+    }
+    if (!job->request_facts_begun) {
+        job->request_facts_begun = true;
+        application_job_request_facts_begin(job);
     }
     application_tmp_lock();
     int start_result = application->worker_ops.start(
@@ -1573,6 +1592,7 @@ static application_attempt_decision_t application_consume_attempt(
         application_attempt_disposition(job, attempt);
     application_record_attempt(attempt, &execution->last_result, &execution->have_last_result,
                                execution->last_log);
+    cbm_mcp_index_request_facts_record(&job->request_facts, &attempt->result);
     if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
         execution->response = attempt->result.response;
         attempt->result.response = NULL;
@@ -1581,8 +1601,8 @@ static application_attempt_decision_t application_consume_attempt(
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
-        execution->response =
-            cbm_mcp_index_worker_resource_response(job->args_json, &attempt->result);
+        execution->response = cbm_mcp_index_worker_resource_response(
+            job->args_json, &attempt->result, &job->request_facts);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_STOP;
     }
