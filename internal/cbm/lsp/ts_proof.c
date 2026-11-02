@@ -28,7 +28,8 @@ typedef struct {
 typedef struct {
     const char *path;
     uint32_t start, end;
-    TSNode guard; /* The callee; null for instanceof. */
+    TSNode guard;   /* The callee; null for instanceof. */
+    uint32_t reach; /* Once sorted: the furthest end among this path's entries up to this one. */
 } ts_proof_narrowing_t;
 
 struct CBMTSProofAudit {
@@ -1010,6 +1011,12 @@ static void settle_guards(TSLSPContext *ctx) {
     audit->narrowing_count = kept;
     if (kept > 1)
         qsort(audit->narrowings, kept, sizeof(*audit->narrowings), narrowing_compare);
+    for (size_t i = 0; i < kept; i++) {
+        ts_proof_narrowing_t *entry = &audit->narrowings[i];
+        const ts_proof_narrowing_t *prior = i ? &audit->narrowings[i - 1] : NULL;
+        bool same_path = prior && !strcmp(prior->path, entry->path);
+        entry->reach = same_path && prior->reach > entry->end ? prior->reach : entry->end;
+    }
 }
 
 /* The checker selects on what the value was narrowed to, and this proof reads declarations, so
@@ -1026,18 +1033,21 @@ static bool receiver_narrowed(TSLSPContext *ctx, TSNode receiver, uint32_t at) {
     const char *path = narrowing_path(ctx, receiver, 0);
     if (!path)
         return false;
+    /* This path's entries starting at or before `at` are a prefix of its sorted entries, so one of
+     * them covers `at` exactly when the furthest end among them passes it. */
+    CBM_LSP_WORK(1);
     size_t low = 0, high = audit->narrowing_count;
     while (low < high) {
         size_t mid = low + (high - low) / 2;
-        if (strcmp(audit->narrowings[mid].path, path) < 0)
+        int order = strcmp(audit->narrowings[mid].path, path);
+        if (order < 0 || (order == 0 && audit->narrowings[mid].start <= at))
             low = mid + 1;
         else
             high = mid;
     }
-    for (; low < audit->narrowing_count && !strcmp(audit->narrowings[low].path, path); low++)
-        if (at >= audit->narrowings[low].start && at < audit->narrowings[low].end)
-            return true;
-    return false;
+    if (!low || strcmp(audit->narrowings[low - 1].path, path))
+        return false;
+    return at < audit->narrowings[low - 1].reach;
 }
 
 /* The registered function a call's callee names: a module function, an import, or a method of a
@@ -1067,11 +1077,8 @@ static const CBMRegisteredFunc *callee_function(TSLSPContext *ctx, TSNode callee
                 return NULL;
             qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
         } else {
-            for (int i = 0; i < ctx->import_count; i++) {
-                const char *key = ctx->import_local_names[i];
+            for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
                 const char *value = ctx->import_module_qns[i];
-                if (!key || strcmp(key, name))
-                    continue;
                 if (!value || !*value || (qn && strcmp(qn, value)))
                     return NULL;
                 qn = value;
@@ -1123,10 +1130,7 @@ static bool annotation_names_local_type(TSLSPContext *ctx, TSNode annotation, ui
     (void)find_binding(ctx, name, at, &occupied);
     if (occupied)
         return true;
-    for (int i = 0; i < ctx->import_count; i++)
-        if (ctx->import_local_names[i] && !strcmp(ctx->import_local_names[i], name))
-            return true;
-    return false;
+    return ts_import_first(ctx, name) >= 0;
 }
 
 /* The class the elements of this value are: `items[i]` and `for (const x of items)`. */

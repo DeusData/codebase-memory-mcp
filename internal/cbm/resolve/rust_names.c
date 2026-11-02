@@ -981,8 +981,71 @@ static void rs_mod_index_impls(CBMArena *arena, rs_mod_t *mod) {
     mod->nimpl_rows = count;
 }
 
+static void rs_mod_index_uses(CBMArena *arena, rs_mod_t *mod) {
+    int count = 0;
+    for (const rs_use_t *use = mod->uses; use; use = use->next)
+        count++;
+    if (count < CBM_NAME_ROWS_MIN)
+        return;
+    const rs_use_t **by_name = cbm_arena_alloc(arena, (size_t)count * sizeof(*by_name));
+    const rs_use_t **by_tail = cbm_arena_alloc(arena, (size_t)count * sizeof(*by_tail));
+    if (!by_name || !by_tail)
+        return; /* the list still answers */
+    int names = 0, tails = 0;
+    for (const rs_use_t *use = mod->uses; use; use = use->next) {
+        if (use->local) {
+            by_name[names] = use;
+            if (!cbm_name_rows_add(arena, &mod->use_name_rows, NULL, use->local, names++))
+                return;
+        }
+        if (use->nseg) {
+            by_tail[tails] = use;
+            if (!cbm_name_rows_add(arena, &mod->use_tail_rows, NULL, use->segs[use->nseg - 1],
+                                   tails++))
+                return;
+        }
+    }
+    mod->uses_by_name = by_name;
+    mod->uses_by_tail = by_tail;
+}
+
+/* The first or next use binding this local name, in list order. */
+const rs_use_t *rs_use_named(const rs_mod_t *mod, const rs_use_t *after, const char *name,
+                             int *row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (mod->uses_by_name) {
+        *row = after ? mod->use_name_rows.next[*row]
+                     : cbm_name_rows_lookup(&mod->use_name_rows, NULL, name);
+        return *row >= 0 ? mod->uses_by_name[*row] : NULL;
+    }
+    for (const rs_use_t *use = after ? after->next : mod->uses; use; use = use->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        if (use->local && !strcmp(use->local, name))
+            return use;
+    }
+    return NULL;
+}
+
+/* The first or next use whose path ends in this name, in list order. */
+const rs_use_t *rs_use_ending(const rs_mod_t *mod, const rs_use_t *after, const char *name,
+                              int *row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (mod->uses_by_tail) {
+        *row = after ? mod->use_tail_rows.next[*row]
+                     : cbm_name_rows_lookup(&mod->use_tail_rows, NULL, name);
+        return *row >= 0 ? mod->uses_by_tail[*row] : NULL;
+    }
+    for (const rs_use_t *use = after ? after->next : mod->uses; use; use = use->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        if (use->nseg && !strcmp(use->segs[use->nseg - 1], name))
+            return use;
+    }
+    return NULL;
+}
+
 void rs_mod_seal(CBMArena *arena, rs_mod_t *mod) {
     rs_mod_index_impls(arena, mod);
+    rs_mod_index_uses(arena, mod);
     for (rs_impl_t *impl = mod->impls; impl; impl = impl->next)
         rs_consts_seal(arena, impl->consts, &impl->sorted_consts, &impl->nconsts);
     for (rs_item_t *item = mod->item_list; item; item = item->next)
@@ -2339,9 +2402,9 @@ static rs_ent_t rs_named_uses(rs_query_t *q, rs_inst_t *inst, const char *name, 
                               rs_inst_t *from) {
     rs_ent_t found = rs_ent(RS_ENT_NONE, RS_VIA_NONE);
     bool hidden = false, found_cfg = false;
-    for (const rs_use_t *use = inst->syn->uses; use; use = use->next) {
-        if (!use->local || strcmp(use->local, name) != 0)
-            continue;
+    int row = -1;
+    for (const rs_use_t *use = rs_use_named(inst->syn, NULL, name, &row); use;
+         use = rs_use_named(inst->syn, use, name, &row)) {
         if (!rs_visible(use->vis, inst->syn, from)) {
             hidden = true;
             continue;
@@ -2484,8 +2547,10 @@ static rs_ent_t rs_lookup_steps(rs_query_t *q, rs_inst_t *inst, const char *name
         /* `#[cfg(a)] use x::f; #[cfg(not(a))] fn f() {}`: one name, a different declaration under
          * each configuration, and nothing here says which one applies. Without cfg this does
          * not compile, so only a conditional use can stand beside a local item. */
-        for (const rs_use_t *use = inst->syn->uses; use; use = use->next) {
-            if (!use->has_cfg || !use->local || strcmp(use->local, name) != 0)
+        int row = -1;
+        for (const rs_use_t *use = rs_use_named(inst->syn, NULL, name, &row); use;
+             use = rs_use_named(inst->syn, use, name, &row)) {
+            if (!use->has_cfg)
                 continue;
             rs_ent_t imported = rs_named_uses(q, inst, name, ns, from);
             if (rs_ent_found(&imported) && !rs_ent_same(&ent, &imported))

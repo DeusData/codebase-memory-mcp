@@ -722,9 +722,9 @@ static bool rs_inst_binds_trait(rs_walk_t *w, rs_inst_t *inst, const rs_item_t *
     const rs_mod_t *syn = inst->syn;
     if (trait->owner == syn)
         return true;
-    for (const rs_use_t *use = syn->uses; use; use = use->next) {
-        if (!use->nseg || strcmp(use->segs[use->nseg - 1], trait->name) != 0)
-            continue;
+    int row = -1;
+    for (const rs_use_t *use = rs_use_ending(syn, NULL, trait->name, &row); use;
+         use = rs_use_ending(syn, use, trait->name, &row)) {
         int consumed = 0;
         rs_ent_t ent = rs_resolve_path(&w->q, inst, NULL, 0, use->segs, use->nseg, use->absolute,
                                        RS_NS_TYPE, true, NULL, &consumed);

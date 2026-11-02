@@ -216,6 +216,12 @@ typedef struct rs_use {
     struct rs_use *next;
 } rs_use_t;
 
+/* The first or next use of a module binding a local name, and whose path ends in a name. */
+const rs_use_t *rs_use_named(const rs_mod_t *mod, const rs_use_t *after, const char *name,
+                             int *row);
+const rs_use_t *rs_use_ending(const rs_mod_t *mod, const rs_use_t *after, const char *name,
+                              int *row);
+
 /* One syntactic module: a file's top level, an inline `mod x { }`, or the
  * item scope of a block. The same file reached from two crate roots has one
  * syntactic module and two instances. */
@@ -230,6 +236,10 @@ struct rs_mod {
     rs_item_t **items; /* sorted by name after sealing the module */
     int nitems;
     rs_use_t *uses;  /* named leaves */
+    /* A long uses list by local name and by last segment, in list order: every name looked up
+     * and every trait asked about would walk it. */
+    const rs_use_t **uses_by_name, **uses_by_tail;
+    CBMNameRows use_name_rows, use_tail_rows;
     rs_use_t *globs; /* glob leaves */
     rs_impl_t *impls;
     /* A long impls list by start byte, then list position: each impl walked looks itself up. */
