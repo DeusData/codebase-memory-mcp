@@ -754,6 +754,21 @@ static bool perl_is_direct_coderef_argument(TSNode refgen) {
     return !ts_node_is_null(args) && ts_node_eq(args, container);
 }
 
+/* `$f ? \&a : \&b` and `$f || \&a` hand over one of several values, so each \&name there only
+ * mentions its sub. Parentheses change nothing. */
+static bool perl_coderef_in_composite(TSNode refgen) {
+    for (TSNode parent = ts_node_parent(refgen); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        const char *kind = ts_node_type(parent);
+        if (strcmp(kind, "conditional_expression") == 0 || strcmp(kind, "binary_expression") == 0 ||
+            strcmp(kind, "lowprec_logical_expression") == 0)
+            return true;
+        if (strcmp(kind, "list_expression") != 0)
+            return false;
+    }
+    return false;
+}
+
 static void perl_emit_non_direct_coderef_usage(PerlLSPContext *ctx, TSNode refgen) {
     if (!ctx || !ctx->usages || !ctx->enclosing_func_qn ||
         perl_is_direct_coderef_argument(refgen)) {
@@ -777,6 +792,7 @@ static void perl_emit_non_direct_coderef_usage(PerlLSPContext *ctx, TSNode refge
     usage.ref_name = name;
     usage.enclosing_func_qn = ctx->enclosing_func_qn;
     usage.kind = CBM_USAGE_VALUE;
+    usage.may_be_call_reference = !perl_coderef_in_composite(refgen);
     usage.site_start_byte = start;
     usage.site_end_byte = end;
     cbm_usages_push(ctx->usages, ctx->arena, usage);

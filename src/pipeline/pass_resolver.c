@@ -4702,8 +4702,7 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
         /* Source binding can establish a direct callable argument without a
          * hybrid row. Composite expressions remain USAGE: the extraction
          * carrier deliberately leaves may_be_call_reference false for them. */
-        if (!site && (usage->may_be_call_reference || resolver->file->language == CBM_LANG_PERL) &&
-            cbm_resolve_admit(&outcome) &&
+        if (!site && usage->may_be_call_reference && cbm_resolve_admit(&outcome) &&
             callable_node(cbm_gbuf_find_by_qn(resolver->file->graph, outcome.target)))
             relation = "CALL_REFERENCE";
         /* Reading a property hands over its result, not the function. */
