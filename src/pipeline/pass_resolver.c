@@ -4421,7 +4421,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
              resolver->file->language == CBM_LANG_SCALA) &&
             target->label &&
             (!strcmp(target->label, "Class") ||
-             (resolver->file->language == CBM_LANG_SWIFT && !strcmp(target->label, "Struct"))))) &&
+             (resolver->file->language == CBM_LANG_SWIFT && !strcmp(target->label, "Struct")))) ||
+           (resolver->file->language == CBM_LANG_RUST && target->label &&
+            cbm_label_is_type_like(target->label))) &&
           (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
@@ -4534,7 +4536,10 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
                                                call->source_origin, true);
             }
         }
-        if (!record_result(resolver, call->enclosing_func_qn, call->callee_name, "CALLS",
+        /* Go's T(x) converts. No function runs, and the site uses the type. */
+        const char *relation =
+            go && outcome.reason == cbm_go_type_conversion ? "USES_TYPE" : "CALLS";
+        if (!record_result(resolver, call->enclosing_func_qn, call->callee_name, relation,
                            call->site_start_byte, call->site_end_byte, call->source_origin, outcome,
                            call))
             return false;
@@ -4759,7 +4764,8 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
         if (!tree) {
             TSParser *parser = ts_parser_new();
             if (parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST)))
-                rust_tree = cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
+                rust_tree = cbm_parse_rust_file(parser, file->rel_path, source, (uint32_t)length,
+                                                (TSParseOptions){0});
             if (parser)
                 ts_parser_delete(parser);
             tree = rust_tree;

@@ -12,6 +12,7 @@
  */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "resolve/rust_macros.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/resolver_ecma.h"
@@ -3437,6 +3438,34 @@ static bool build_compile_import_context(const cbm_pipeline_ctx_t *ctx, CBMHashT
     return complete;
 }
 
+/* Read every macro definition before any Rust file is parsed: a macro's meaning decides how
+ * its callers parse, and it may live in any file of the package. Linear in the bytes of Rust,
+ * which extraction reads again anyway; a project with none pays one pass over the list. */
+void cbm_pipeline_install_rust_item_macros(const cbm_file_info_t *files, int count) {
+    bool any = false;
+    for (int i = 0; !any && i < count; i++)
+        any = files[i].language == CBM_LANG_RUST;
+    cbm_rust_item_macros_t *table = any ? cbm_rust_item_macros_new() : NULL;
+    for (int i = 0; table && i < count; i++) {
+        if (strcmp(path_leaf(files[i].rel_path), "Cargo.toml") != 0)
+            continue;
+        int length = 0;
+        char *text = pkgmap_read_file(files[i].path, &length);
+        (void)cbm_rust_item_macros_add_manifest(table, files[i].rel_path, text, (size_t)length);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, text);
+    }
+    for (int i = 0; table && i < count; i++) {
+        if (files[i].language != CBM_LANG_RUST)
+            continue;
+        int length = 0;
+        char *source = pkgmap_read_file(files[i].path, &length);
+        if (source)
+            (void)cbm_rust_item_macros_add_source(table, files[i].rel_path, source, (size_t)length);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+    }
+    cbm_rust_item_macros_install(table);
+}
+
 /* One Rust project model for the whole index: crates and dependency names from
  * every Cargo.toml, module trees from each crate root, and each file's items and
  * use trees. Built before any dependency or binding is projected. */
@@ -3457,7 +3486,8 @@ static bool rust_project_add_file(cbm_rust_project_t *project, const cbm_pipelin
     TSTree *owned_tree = NULL;
     const TSTree *tree = result->cached_tree;
     if (!tree && source && length >= 0) {
-        owned_tree = cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
+        owned_tree = cbm_parse_rust_file(parser, file->rel_path, source, (uint32_t)length,
+                                         (TSParseOptions){0});
         tree = owned_tree;
     }
     bool ok = true;
@@ -5145,6 +5175,9 @@ static const cbm_gbuf_node_t *typescript_paths_target(const cbm_pipeline_ctx_t *
     return ecma_directory_entry(ctx, "", aliased, language);
 }
 
+static const cbm_gbuf_node_t *go_import_by_source_module(const cbm_pipeline_ctx_t *ctx,
+                                                         const char *source_rel, const char *path);
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const CBMImport *imp,
     CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only, bool *ambiguous) {
@@ -5192,6 +5225,9 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     if (module_rule) {
         char *qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
         const cbm_gbuf_node_t *target = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+        /* An empty answer: several directories declare this module path. */
+        if (!target && qn && !*qn && src_lang == CBM_LANG_GO)
+            target = go_import_by_source_module(ctx, source_rel, imp->module_path);
         free(qn);
         if (target && (!php_only || node_in_php_file(target)) &&
             (import_language_matches(src_lang, target) ||
@@ -5927,6 +5963,37 @@ static bool go_workspace_lists(const cbm_pipeline_ctx_t *ctx, const char *source
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     return has_source && has_target;
+}
+
+/* A fixture or a vendored copy can declare the same module path as the module around it, which
+ * leaves the flat package map with no single directory for that path. An import is still one
+ * package: inside a module its own path means itself, and otherwise its go.mod's replace
+ * directive names the directory. Without either the path comes from the module cache. */
+static const cbm_gbuf_node_t *go_import_by_source_module(const cbm_pipeline_ctx_t *ctx,
+                                                         const char *source_rel, const char *path) {
+    char owner[PKGMAP_PATH_BUF], module[PKGMAP_PATH_BUF], base[PKGMAP_PATH_BUF];
+    char old[PKGMAP_PATH_BUF], directory[PKGMAP_PATH_BUF], package[PKGMAP_PATH_BUF];
+    if (!go_module_owner(ctx, source_rel, false, owner, module, sizeof(owner)))
+        return NULL;
+    size_t size = strlen(module);
+    if (!strncmp(path, module, size) && (!path[size] || path[size] == '/')) {
+        snprintf(base, sizeof(base), "%s", owner);
+    } else if (go_module_replacement(ctx, owner, path, old, directory, sizeof(directory))) {
+        size = strlen(old);
+        if (!cbm_repo_rel_join(owner, directory, base, sizeof(base)))
+            return NULL;
+    } else {
+        return NULL;
+    }
+    const char *suffix = path + size;
+    if (*suffix)
+        suffix++;
+    if (!cbm_repo_rel_join(base, suffix, package, sizeof(package)))
+        return NULL;
+    char *qn = cbm_pipeline_fqn_folder(ctx->project_name, package);
+    const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    free(qn);
+    return node && node->label && !strcmp(node->label, "Folder") ? node : NULL;
 }
 
 static bool go_import_inside_module(const char *import, const char *module, const char *owner,

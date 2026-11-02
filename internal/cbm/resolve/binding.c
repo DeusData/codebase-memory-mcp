@@ -5508,7 +5508,10 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
     if (!tree) {
         TSParser *parser = ts_parser_new();
         if (parser && ts_parser_set_language(parser, cbm_ts_language(language))) {
-            owned_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+            owned_tree = language == CBM_LANG_RUST
+                             ? cbm_parse_rust_file(parser, result->source_file, source,
+                                                   (uint32_t)source_len, (TSParseOptions){0})
+                             : ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
         }
         if (parser) {
             ts_parser_delete(parser);

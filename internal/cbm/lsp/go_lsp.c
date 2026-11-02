@@ -3982,7 +3982,8 @@ void cbm_run_go_lsp_cross_with_source(CBMArena *arena, const char *source, int s
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        tree = cbm_parse_source_repairing(parser, CBM_LANG_GO, source, (uint32_t)source_len,
+                                          (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -4419,7 +4420,8 @@ void cbm_run_go_lsp_cross_with_registry_with_source(
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        tree = cbm_parse_source_repairing(parser, CBM_LANG_GO, source, (uint32_t)source_len,
+                                          (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);

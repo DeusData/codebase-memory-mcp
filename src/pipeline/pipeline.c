@@ -25,6 +25,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "resolve/rust_names.h"
+#include "resolve/rust_macros.h"
 #include "pipeline/shared_resolver.h"
 #include "pipeline/resolver_ecma.h"
 #include "resolve/policy.h"
@@ -3680,6 +3681,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     }
 
     cbm_log_info("pipeline.route", "path", "incremental_manifest");
+    cbm_pipeline_install_rust_item_macros(files, file_count);
     int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, baseline_manifest,
                                           baseline_count, force_full_on_mismatch);
     /* Delete the existing generation ONLY when we are about to rebuild it.
@@ -4703,6 +4705,7 @@ static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
                                         const cbm_file_info_t *files, int file_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_install_rust_item_macros(files, file_count);
     CBM_PROF_START(t_struct);
     pass_structure(p, ctx->stem_marks, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
@@ -4959,6 +4962,7 @@ cleanup:
     cbm_pipeline_set_pkgmap(NULL);
     cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
     cbm_pipeline_set_nsmap(NULL);
+    cbm_rust_item_macros_install(NULL);
     cbm_discover_free(files, file_count);
     if (p->frozen) {
         p->frozen->baseline = baseline_manifest;

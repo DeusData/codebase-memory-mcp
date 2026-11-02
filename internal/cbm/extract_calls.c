@@ -2287,6 +2287,16 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
     if (call_node_is_definition_container(lang, node, source)) {
         return NULL;
     }
+    /* Rust `f::<T>(x)` and `v.collect::<Vec<_>>()`: what is called is inside the turbofish. */
+    if (lang == CBM_LANG_RUST && strcmp(ts_node_type(node), "call_expression") == 0) {
+        TSNode callee = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "generic_function") == 0) {
+            TSNode inner = ts_node_child_by_field_name(callee, TS_FIELD("function"));
+            if (!ts_node_is_null(inner)) {
+                return cbm_node_text(a, inner, source);
+            }
+        }
+    }
     if (is_nested_verilog_call_wrapper(lang, node)) {
         return NULL;
     }
@@ -4406,6 +4416,14 @@ static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx, TSNode site
     }
     if (!cbm_is_keyword(callee->name, ctx->language) ||
         cbm_is_resolvable_builtin(callee->name, ctx->language)) {
+        return true;
+    }
+    /* Rust's list holds macro and prelude names, but `write(&path, text)` calling a function of
+     * that name is a call. The macro's own spelling is a macro_invocation. The prelude's
+     * constructors are every other call in a file and name nothing in the project. */
+    if (ctx->language == CBM_LANG_RUST && !strcmp(ts_node_type(site), "call_expression") &&
+        strcmp(callee->name, "Some") != 0 && strcmp(callee->name, "Ok") != 0 &&
+        strcmp(callee->name, "Err") != 0) {
         return true;
     }
     /* `Foo->new` names a method in a grammar-proven role. A generic keyword list

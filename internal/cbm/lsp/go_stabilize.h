@@ -26,6 +26,8 @@ bool cbm_go_stabilization_seal(cbm_go_stabilization_t *);
  * result is missing knowledge: a caller may keep a proof it holds independently, but never
  * replace an ambiguous result. Published results/proofs are immutable and safe for
  * concurrent workers. */
+/* The reason of a call site that is a conversion, compared by identity. */
+extern const char cbm_go_type_conversion[];
 bool cbm_go_stabilization_call(const cbm_go_stabilization_t *, const char *, const char *, uint32_t,
                                uint32_t, cbm_resolve_result_t *);
 /* A non-call reference token: a package-scope name, a qualified name or a selected member.

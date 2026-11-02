@@ -41,6 +41,7 @@ typedef enum {
     RS_TS_PATH,
     RS_TS_PRIM,
     RS_TS_REF,
+    RS_TS_PTR, /* *const T and *mut T */
     RS_TS_TUPLE,
     RS_TS_ARRAY,
     RS_TS_UNIT,
@@ -75,6 +76,7 @@ typedef struct rs_field {
     const char *qn;
     const char *label;
     rs_vis_t vis;
+    bool pinned; /* #[pin]: the macro's projection gives Pin<&mut F> */
     struct rs_field *next;
 } rs_field_t;
 
@@ -95,6 +97,12 @@ struct rs_fn {
     /* Another fn of this file shares the QN (cfg twins, From<A> and From<B>): one graph
      * identity, but its signature is not this fn's alone. */
     bool qn_twin;
+    /* Every twin writes the same return type, and none implements a trait: `cfg_rt! { fn current()
+     * -> Handle }` beside `cfg_not_rt! { fn current() -> Handle }`. */
+    bool twin_return_agrees;
+    /* A trait impl's `fn m(&self) { self.m() }`. That is no recursion: the self type has an
+     * inherent m, which a method call prefers. */
+    bool delegates_to_own_name;
     rs_vis_t vis;
     rs_self_kind_t self_kind;
     bool is_async;
@@ -108,12 +116,22 @@ struct rs_fn {
     rs_fn_t *next;    /* next in impl, trait or item chain */
 };
 
+/* `const ALL: Ready = ...` in an impl or a trait. */
+typedef struct rs_assoc_const {
+    const char *name;
+    rs_tsyn_t *type;
+    struct rs_assoc_const *next;
+} rs_assoc_const_t;
+
 struct rs_impl {
     rs_generics_t *generics;
     rs_tsyn_t *self_syn;
     rs_tsyn_t *trait_syn; /* NULL for an inherent impl */
     rs_mod_t *owner;
     rs_fn_t *methods;
+    rs_assoc_const_t *consts;
+    const rs_assoc_const_t **sorted_consts; /* by name, after sealing the module */
+    int nconsts;
     /* name -> type pairs: `type Target = X;` */
     const char **assoc_names;
     rs_tsyn_t **assoc_types;
@@ -129,6 +147,9 @@ struct rs_impl {
 };
 
 struct rs_item {
+    rs_assoc_const_t *consts; /* a trait's */
+    const rs_assoc_const_t **sorted_consts;
+    int nconsts;
     const char *name;
     unsigned ns;
     rs_item_kind_t kind;
@@ -141,6 +162,9 @@ struct rs_item {
     /* #[derive(thiserror::Error)] with #[from], derive_more::From: conversions
      * exist that no impl block in the source shows. */
     bool derives_conversion;
+    /* Known only from `impl X` beside a macro: no fields, no node, and its members are not all
+     * written where this model can read them. */
+    bool macro_declared;
     rs_item_t *next; /* next in the owner module, sorted later */
     rs_generics_t *generics;
     /* MOD */
@@ -149,6 +173,7 @@ struct rs_item {
     /* STRUCT/UNION */
     rs_field_t *fields;
     bool tuple_struct, unit_struct;
+    bool pin_projected; /* a #[pin] field: pin-project gave it project() and project_ref() */
     /* ENUM */
     rs_variant_t *variants;
     /* TRAIT */
@@ -261,6 +286,9 @@ struct rs_file {
     rs_mod_t *root;
     rs_def_t *defs; /* sorted by line, then name */
     int ndefs;
+    /* Where each expression macro's `(` stands, sorted: its value is not its argument's. */
+    const uint32_t *expression_macros;
+    int nexpression_macros;
 };
 
 typedef struct rs_child {
@@ -312,8 +340,9 @@ struct cbm_rust_project {
     int nfiles, cap_files;
     rs_package_t *packages;
     rs_crate_t *crates;
-    rs_impl_t *ext_impls;     /* impls on a type outside the project */
+    CBMHashTable *ext_impls;  /* normalized path -> impls on that type outside the project */
     rs_impl_t *blanket_impls; /* impl<T> Trait for T */
+    CBMHashTable *patches;    /* manifest dir, separator, name -> [patch.crates-io] entry */
     bool sealed;
 };
 
@@ -384,6 +413,9 @@ typedef struct {
     size_t length;
     rs_file_t *file;
     bool block_scope; /* collecting a block's items: no module-level claims ran */
+    /* Sorted [start, end) pairs: items a passthrough macro wraps, which it wraps to add #[cfg]. */
+    const uint32_t *wrapped;
+    int nwrapped;
 } rs_builder_t;
 
 void rs_collect_items(rs_builder_t *b, rs_mod_t *mod, TSNode container);
@@ -391,6 +423,11 @@ void rs_mod_seal(CBMArena *arena, rs_mod_t *mod);
 rs_tsyn_t *rs_tsyn_from(rs_builder_t *b, TSNode node);
 rs_generics_t *rs_generics_from(rs_builder_t *b, TSNode owner);
 const char *rs_text(rs_builder_t *b, TSNode node);
+/* A sealed impl's or trait's const of this name: generated tables can hold thousands. */
+const rs_assoc_const_t *rs_const_named(const rs_assoc_const_t *const *sorted, int count,
+                                       const char *name);
+/* The same type as written, both known: never true of syntax this model does not read. */
+bool rs_tsyn_same(const rs_tsyn_t *a, const rs_tsyn_t *b);
 TSNode rs_field(TSNode node, const char *name);
 bool rs_is(TSNode node, const char *kind);
 void rs_settle_impl(rs_query_t *q, rs_impl_t *impl, rs_inst_t *inst);

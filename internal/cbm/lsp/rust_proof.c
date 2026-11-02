@@ -225,7 +225,8 @@ bool cbm_rust_collect_source_facts(CBMArena *arena, const char *source, int leng
     if (!parser)
         return false;
     ts_parser_set_language(parser, tree_sitter_rust());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_source_repairing(parser, CBM_LANG_RUST, source, (uint32_t)length,
+                                              (TSParseOptions){0});
     ts_parser_delete(parser);
     if (!tree)
         return false;
@@ -828,7 +829,8 @@ static void rust_proof_resolve(CBMArena *arena, const char *source, int length,
     if (!parser)
         return;
     ts_parser_set_language(parser, tree_sitter_rust());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_source_repairing(parser, CBM_LANG_RUST, source, (uint32_t)length,
+                                              (TSParseOptions){0});
     ts_parser_delete(parser);
     if (!tree)
         return;

@@ -11,6 +11,7 @@
  *   declarations stay ambiguous.
  */
 #include "rust_names_internal.h"
+#include "rust_macros.h"
 #include "../helpers.h"
 #include "../lang_specs.h"
 
@@ -30,10 +31,18 @@ TSNode rs_field(TSNode node, const char *name) {
                                  : ts_node_child_by_field_name(node, name, (uint32_t)strlen(name));
 }
 
+/* `r#match` is the identifier `match`, unlike a raw string `r#"..."#`. */
+static size_t rs_raw_prefix(const char *text, size_t length) {
+    return length > 2 && text[0] == 'r' && text[1] == '#' && text[2] != '"' && text[2] != '#' ? 2
+                                                                                              : 0;
+}
+
 const char *rs_text(rs_builder_t *b, TSNode node) {
     if (ts_node_is_null(node))
         return NULL;
     uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    if (end > start && end <= b->length)
+        start += (uint32_t)rs_raw_prefix(b->source + start, end - start);
     return end > start && end <= b->length
                ? cbm_arena_strndup(b->arena, b->source + start, end - start)
                : NULL;
@@ -166,6 +175,10 @@ rs_tsyn_t *rs_tsyn_from(rs_builder_t *b, TSNode node) {
         }
     } else if (!strcmp(kind, "reference_type")) {
         syn = rs_tsyn_new(b, RS_TS_REF);
+        if (syn)
+            syn->inner = rs_tsyn_from(b, rs_field(node, "type"));
+    } else if (!strcmp(kind, "pointer_type")) {
+        syn = rs_tsyn_new(b, RS_TS_PTR);
         if (syn)
             syn->inner = rs_tsyn_from(b, rs_field(node, "type"));
     } else if (!strcmp(kind, "unit_type")) {
@@ -331,11 +344,14 @@ static rs_vis_t rs_vis_of(rs_builder_t *b, TSNode node) {
             return RS_VIS_PRIVATE;
         if (!strcmp(text, "pub"))
             return RS_VIS_PUB;
+        /* pub(in super::super) names an ancestor: at most the crate, and the program compiles. */
+        if (strstr(text, "(in "))
+            return RS_VIS_CRATE;
         if (strstr(text, "self"))
             return RS_VIS_PRIVATE;
         if (strstr(text, "super"))
             return RS_VIS_SUPER;
-        return RS_VIS_CRATE; /* pub(crate), crate, pub(in path) within the crate */
+        return RS_VIS_CRATE; /* pub(crate), crate */
     }
     return RS_VIS_PRIVATE;
 }
@@ -441,7 +457,12 @@ static void rs_fields_from(rs_builder_t *b, TSNode body, rs_field_t **out, bool 
     } else {
         rs_children_t children = rs_children(body);
         TSNode child;
+        bool pinned = false;
         while (rs_children_next(&children, &child)) {
+            if (rs_is(child, "attribute_item")) {
+                const char *text = rs_text(b, child);
+                pinned = pinned || (text && !strcmp(text, "#[pin]"));
+            }
             if (!rs_is(child, "field_declaration"))
                 continue;
             rs_field_t *entry = cbm_arena_calloc(b->arena, sizeof(*entry));
@@ -452,6 +473,8 @@ static void rs_fields_from(rs_builder_t *b, TSNode body, rs_field_t **out, bool 
             }
             entry->name = name;
             entry->vis = rs_vis_of(b, child);
+            entry->pinned = pinned;
+            pinned = false;
             entry->type = rs_tsyn_from(b, rs_field(child, "type"));
             rs_attach_def(b, child, name, RS_LABELS_FIELD, &entry->qn, &entry->label, NULL);
             *tail = entry;
@@ -481,6 +504,18 @@ static void rs_collect_enum(rs_builder_t *b, rs_item_t *item, TSNode body) {
     }
 }
 
+static void rs_assoc_const_add(rs_builder_t *b, TSNode node, rs_assoc_const_t **list) {
+    rs_assoc_const_t *entry = cbm_arena_calloc(b->arena, sizeof(*entry));
+    if (!entry)
+        return;
+    entry->name = rs_text(b, rs_field(node, "name"));
+    entry->type = rs_tsyn_from(b, rs_field(node, "type"));
+    if (!entry->name)
+        return;
+    entry->next = *list;
+    *list = entry;
+}
+
 static void rs_collect_trait(rs_builder_t *b, rs_mod_t *mod, rs_item_t *item, TSNode node) {
     enum { CAP = 16 };
     item->supers = cbm_arena_calloc(b->arena, CAP * sizeof(*item->supers));
@@ -489,6 +524,8 @@ static void rs_collect_trait(rs_builder_t *b, rs_mod_t *mod, rs_item_t *item, TS
     rs_children_t children = rs_children(rs_field(node, "body"));
     TSNode child;
     while (rs_children_next(&children, &child)) {
+        if (rs_is(child, "const_item"))
+            rs_assoc_const_add(b, child, &item->consts);
         if (!rs_is(child, "function_item") && !rs_is(child, "function_signature_item"))
             continue;
         rs_fn_t *fn = rs_fn_from(b, mod, child);
@@ -499,6 +536,24 @@ static void rs_collect_trait(rs_builder_t *b, rs_mod_t *mod, rs_item_t *item, TS
         fn->next = item->methods;
         item->methods = fn;
     }
+}
+
+/* Linear in the method's own text, once per trait-impl method. */
+static bool rs_calls_own_name(const rs_builder_t *b, TSNode fn, const char *name) {
+    TSNode body = rs_field(fn, "body");
+    if (ts_node_is_null(body) || ts_node_end_byte(body) > b->length)
+        return false;
+    const char *text = b->source + ts_node_start_byte(body);
+    size_t length = ts_node_end_byte(body) - ts_node_start_byte(body);
+    static const char *const owners[] = {"self.", "Self::"};
+    for (size_t i = 0; i < sizeof(owners) / sizeof(owners[0]); i++) {
+        char spelled[256];
+        int size = snprintf(spelled, sizeof(spelled), "%s%s(", owners[i], name);
+        if (size > 0 && (size_t)size < sizeof(spelled) &&
+            cbm_memmem(text, length, spelled, (size_t)size))
+            return true;
+    }
+    return false;
 }
 
 static void rs_collect_impl(rs_builder_t *b, rs_mod_t *mod, TSNode node) {
@@ -524,9 +579,13 @@ static void rs_collect_impl(rs_builder_t *b, rs_mod_t *mod, TSNode node) {
             rs_fn_t *fn = rs_fn_from(b, mod, child);
             if (fn) {
                 fn->impl = impl;
+                fn->delegates_to_own_name =
+                    impl->trait_syn && rs_calls_own_name(b, child, fn->name);
                 fn->next = impl->methods;
                 impl->methods = fn;
             }
+        } else if (rs_is(child, "const_item")) {
+            rs_assoc_const_add(b, child, &impl->consts);
         } else if (rs_is(child, "type_item") && impl->assoc_names) {
             const char *name = rs_text(b, rs_field(child, "name"));
             if (name) {
@@ -665,6 +724,8 @@ static void rs_collect_struct(rs_builder_t *b, rs_item_t *item, TSNode node) {
     item->generics = rs_generics_from(b, node);
     TSNode body = rs_field(node, "body");
     rs_fields_from(b, body, &item->fields, &item->tuple_struct);
+    for (const rs_field_t *field = item->fields; field; field = field->next)
+        item->pin_projected = item->pin_projected || field->pinned;
     item->unit_struct = ts_node_is_null(body);
     if (item->tuple_struct || item->unit_struct)
         item->ns |= RS_NS_VALUE;
@@ -758,8 +819,10 @@ static void rs_collect_one(rs_builder_t *b, rs_mod_t *mod, TSNode node, const ch
         mod->has_macro_items = true;
         return;
     } else if (!strcmp(kind, "expression_statement")) {
-        if (ts_node_named_child_count(node) &&
-            rs_is(ts_node_named_child(node, 0), "macro_invocation"))
+        /* At module level an expression is only ever an expression macro of the view, whose
+         * definition can also declare items. */
+        if (!b->block_scope || (ts_node_named_child_count(node) &&
+                                rs_is(ts_node_named_child(node, 0), "macro_invocation")))
             mod->has_macro_items = true;
         return;
     }
@@ -773,6 +836,20 @@ static void rs_collect_one(rs_builder_t *b, rs_mod_t *mod, TSNode node, const ch
 static bool rs_derive_adds_conversion(const char *text) {
     const char *derive = text ? strstr(text, "derive") : NULL;
     return derive && (strstr(derive, "Error") || strstr(derive, "From") || strstr(derive, "Into"));
+}
+
+static bool rs_in_wrapper(const rs_builder_t *b, uint32_t at) {
+    int low = 0, high = b->nwrapped;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (at >= b->wrapped[mid * 2 + 1])
+            low = mid + 1;
+        else if (at < b->wrapped[mid * 2])
+            high = mid;
+        else
+            return true;
+    }
+    return false;
 }
 
 void rs_collect_items(rs_builder_t *b, rs_mod_t *mod, TSNode container) {
@@ -796,6 +873,7 @@ void rs_collect_items(rs_builder_t *b, rs_mod_t *mod, TSNode container) {
             derives_conversion |= rs_derive_adds_conversion(text);
             continue;
         }
+        has_cfg = has_cfg || rs_in_wrapper(b, ts_node_start_byte(node));
         rs_collect_one(b, mod, node, path_attr, macro_export, has_cfg, derives_conversion);
         path_attr = NULL;
         macro_export = false;
@@ -804,12 +882,85 @@ void rs_collect_items(rs_builder_t *b, rs_mod_t *mod, TSNode container) {
     }
 }
 
+/* `features! { ... }` beside `impl Features { ... }`. An inherent impl is legal only on a type of
+ * this crate, and its name has to resolve here. With no item, `use` or glob to supply it, only
+ * a macro of this module can have declared it. Indexed by name: these modules can be large. */
+static void rs_declare_macro_types(rs_builder_t *b, rs_mod_t *mod) {
+    if (mod->has_macro_items && !mod->globs) {
+        CBMHashTable *names = cbm_ht_create(32);
+        for (const rs_item_t *item = mod->item_list; names && item; item = item->next)
+            cbm_ht_set(names, item->name, (void *)item);
+        for (const rs_use_t *use = mod->uses; names && use; use = use->next)
+            if (use->local)
+                cbm_ht_set(names, use->local, (void *)use);
+        for (const rs_impl_t *impl = mod->impls; names && impl; impl = impl->next) {
+            const rs_tsyn_t *self = impl->self_syn;
+            if (impl->trait_syn || !self || self->kind != RS_TS_PATH || self->nseg != 1 ||
+                !strcmp(self->segs[0], "Self") || cbm_ht_get(names, self->segs[0]))
+                continue;
+            rs_item_t *item =
+                rs_item_add(b, mod, self->segs[0], RS_NS_TYPE, RS_ITEM_STRUCT, RS_VIS_PUB);
+            if (item) {
+                item->macro_declared = true;
+                cbm_ht_set(names, item->name, item);
+            }
+        }
+        cbm_ht_free(names);
+    }
+    for (rs_mod_t *child = mod->children; child; child = child->next_child)
+        rs_declare_macro_types(b, child);
+}
+
 static int rs_item_compare(const void *left, const void *right) {
     const rs_item_t *a = *(rs_item_t *const *)left, *b = *(rs_item_t *const *)right;
     return strcmp(a->name, b->name);
 }
 
+static int rs_const_compare(const void *left, const void *right) {
+    const rs_assoc_const_t *a = *(const rs_assoc_const_t *const *)left;
+    const rs_assoc_const_t *b = *(const rs_assoc_const_t *const *)right;
+    return strcmp(a->name, b->name);
+}
+
+static void rs_consts_seal(CBMArena *arena, const rs_assoc_const_t *list,
+                           const rs_assoc_const_t ***sorted, int *count) {
+    int total = 0;
+    for (const rs_assoc_const_t *entry = list; entry; entry = entry->next)
+        total++;
+    if (!total)
+        return;
+    const rs_assoc_const_t **table = cbm_arena_alloc(arena, (size_t)total * sizeof(*table));
+    if (!table)
+        return;
+    int at = 0;
+    for (const rs_assoc_const_t *entry = list; entry; entry = entry->next)
+        table[at++] = entry;
+    qsort(table, (size_t)total, sizeof(*table), rs_const_compare);
+    *sorted = table;
+    *count = total;
+}
+
+const rs_assoc_const_t *rs_const_named(const rs_assoc_const_t *const *sorted, int count,
+                                       const char *name) {
+    int low = 0, high = count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        int order = strcmp(sorted[mid]->name, name);
+        if (!order)
+            return sorted[mid];
+        if (order < 0)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return NULL;
+}
+
 void rs_mod_seal(CBMArena *arena, rs_mod_t *mod) {
+    for (rs_impl_t *impl = mod->impls; impl; impl = impl->next)
+        rs_consts_seal(arena, impl->consts, &impl->sorted_consts, &impl->nconsts);
+    for (rs_item_t *item = mod->item_list; item; item = item->next)
+        rs_consts_seal(arena, item->consts, &item->sorted_consts, &item->nconsts);
     if (mod->nitems) {
         mod->items = cbm_arena_alloc(arena, (size_t)mod->nitems * sizeof(*mod->items));
         int n = 0;
@@ -827,10 +978,12 @@ void rs_mod_seal(CBMArena *arena, rs_mod_t *mod) {
 /* ── Project and files ─────────────────────────────────────────────── */
 
 typedef struct rs_dep {
-    const char *key;  /* the extern name with - already folded to _ */
-    const char *path; /* relative to the declaring manifest, or NULL */
-    bool workspace;   /* resolved through [workspace.dependencies] */
-    bool renamed;     /* `package = "real"`: the key, not the lib, is the crate name */
+    const char *key;   /* the extern name with - already folded to _ */
+    const char *path;  /* relative to the declaring manifest, or NULL */
+    bool workspace;    /* resolved through [workspace.dependencies] */
+    bool renamed;      /* `package = "real"`: the key, not the lib, is the crate name */
+    bool other_source; /* git or registry: a [patch.crates-io] does not reach it */
+    const char *version;
     struct rs_dep *next;
 } rs_dep_t;
 
@@ -849,6 +1002,9 @@ struct rs_package {
     const char *lib_path;
     const char *build_path;
     bool has_package;
+    bool workspace_root;
+    const char *version;
+    rs_dep_t *patches; /* [patch.crates-io] */
     bool edition_2015;
     bool edition_inherited;
     bool auto_bins, auto_tests, auto_benches, auto_examples;
@@ -872,6 +1028,8 @@ cbm_rust_project_t *cbm_rust_project_new(void) {
 void cbm_rust_project_free(cbm_rust_project_t *project) {
     if (!project)
         return;
+    cbm_ht_free(project->patches);
+    cbm_ht_free(project->ext_impls);
     cbm_arena_destroy(&project->arena);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, project);
 }
@@ -899,6 +1057,8 @@ typedef struct {
     int claims;
     int fn_claims; /* a field sharing a method's name is no signature twin */
     bool conflict;
+    const rs_fn_t *first_fn;
+    bool returns_differ;
 } rs_qn_claim_t;
 
 static rs_qn_claim_t *rs_claim(CBMArena *arena, CBMHashTable *claims, const char *qn,
@@ -918,23 +1078,42 @@ static rs_qn_claim_t *rs_claim(CBMArena *arena, CBMHashTable *claims, const char
     return claim;
 }
 
-static void rs_claim_fn(CBMArena *arena, CBMHashTable *claims, const char *qn,
+bool rs_tsyn_same(const rs_tsyn_t *a, const rs_tsyn_t *b) {
+    if (!a || !b || a->kind != b->kind || a->kind == RS_TS_UNKNOWN || a->nseg != b->nseg ||
+        a->nargs != b->nargs || a->absolute != b->absolute || !a->prim != !b->prim ||
+        !a->inner != !b->inner || (a->prim && strcmp(a->prim, b->prim)))
+        return false;
+    for (int i = 0; i < a->nseg; i++)
+        if (strcmp(a->segs[i], b->segs[i]))
+            return false;
+    for (int i = 0; i < a->nargs; i++)
+        if (!rs_tsyn_same(a->args[i], b->args[i]))
+            return false;
+    return !a->inner || rs_tsyn_same(a->inner, b->inner);
+}
+
+static void rs_claim_fn(CBMArena *arena, CBMHashTable *claims, const rs_fn_t *fn,
                         const rs_mod_t *owner) {
-    rs_qn_claim_t *claim = rs_claim(arena, claims, qn, owner);
-    if (claim)
-        claim->fn_claims++;
+    rs_qn_claim_t *claim = rs_claim(arena, claims, fn->qn, owner);
+    if (!claim)
+        return;
+    claim->returns_differ |= !fn->ret || (fn->impl && fn->impl->trait_syn) ||
+                             (claim->first_fn && !rs_tsyn_same(claim->first_fn->ret, fn->ret));
+    if (!claim->first_fn)
+        claim->first_fn = fn;
+    claim->fn_claims++;
 }
 
 static void rs_claim_fns(CBMArena *arena, CBMHashTable *claims, rs_fn_t *fn,
                          const rs_mod_t *owner) {
     for (; fn; fn = fn->next)
-        rs_claim_fn(arena, claims, fn->qn, owner);
+        rs_claim_fn(arena, claims, fn, owner);
 }
 
 static void rs_claim_mod(CBMArena *arena, CBMHashTable *claims, rs_mod_t *mod) {
     for (rs_item_t *item = mod->item_list; item; item = item->next) {
         if (item->kind == RS_ITEM_FN && item->fn)
-            rs_claim_fn(arena, claims, item->fn->qn, mod);
+            rs_claim_fn(arena, claims, item->fn, mod);
         else
             rs_claim(arena, claims, item->qn, mod);
         for (rs_field_t *field = item->fields; field; field = field->next)
@@ -961,19 +1140,22 @@ static bool rs_claim_shared(CBMHashTable *claims, const char *qn) {
     return claim && claim->fn_claims > 1;
 }
 
+static void rs_mark_fn(CBMHashTable *claims, CBMHashTable *counts, rs_fn_t *fn) {
+    fn->qn_conflict = rs_claim_lost(claims, counts, fn->qn);
+    fn->qn_twin = rs_claim_shared(claims, fn->qn);
+    const rs_qn_claim_t *claim = fn->qn_twin ? cbm_ht_get(claims, fn->qn) : NULL;
+    fn->twin_return_agrees = claim && !claim->returns_differ;
+}
+
 static void rs_mark_fns(CBMHashTable *claims, CBMHashTable *counts, rs_fn_t *fn) {
-    for (; fn; fn = fn->next) {
-        fn->qn_conflict = rs_claim_lost(claims, counts, fn->qn);
-        fn->qn_twin = rs_claim_shared(claims, fn->qn);
-    }
+    for (; fn; fn = fn->next)
+        rs_mark_fn(claims, counts, fn);
 }
 
 static void rs_mark_mod(CBMHashTable *claims, CBMHashTable *counts, rs_mod_t *mod) {
     for (rs_item_t *item = mod->item_list; item; item = item->next) {
-        if (item->kind == RS_ITEM_FN && item->fn) {
-            item->fn->qn_conflict = rs_claim_lost(claims, counts, item->fn->qn);
-            item->fn->qn_twin = rs_claim_shared(claims, item->fn->qn);
-        }
+        if (item->kind == RS_ITEM_FN && item->fn)
+            rs_mark_fn(claims, counts, item->fn);
         item->qn_conflict = rs_claim_lost(claims, counts, item->qn);
         rs_mark_fns(claims, counts, item->methods);
     }
@@ -996,7 +1178,8 @@ static bool rs_file_defs(cbm_rust_project_t *project, rs_file_t *file, const CBM
             continue;
         rs_def_t *entry = &file->defs[file->ndefs++];
         entry->line = (uint32_t)def->start_line;
-        entry->name = cbm_arena_strdup(&project->arena, def->name);
+        entry->name = cbm_arena_strdup(&project->arena,
+                                       def->name + rs_raw_prefix(def->name, strlen(def->name)));
         entry->qn = cbm_arena_strdup(&project->arena, def->qualified_name);
         entry->label = cbm_arena_strdup(&project->arena, def->label);
         if (!entry->name || !entry->qn || !entry->label)
@@ -1051,7 +1234,14 @@ bool cbm_rust_project_add_file(cbm_rust_project_t *project, const char *rel,
     if (ok) {
         rs_builder_t builder = {
             .arena = &project->arena, .source = source, .length = length, .file = file};
+        cbm_rust_item_spans_t spans;
+        ok = cbm_rust_item_spans(&project->arena, rel, source, length, &spans);
+        builder.wrapped = spans.wrapped;
+        builder.nwrapped = spans.nwrapped;
+        file->expression_macros = spans.expressions;
+        file->nexpression_macros = spans.nexpressions;
         rs_collect_items(&builder, top, root);
+        rs_declare_macro_types(&builder, top);
         rs_claim_mod(&project->arena, claims, top);
         rs_mark_mod(claims, counts, top);
         rs_mod_seal(&project->arena, top);
@@ -1158,6 +1348,13 @@ static void rs_dep_note(CBMArena *arena, rs_dep_t **list, const char *key, const
         dep->workspace = true;
     if (rs_inline_value(value, "package"))
         dep->renamed = true;
+    if (rs_inline_value(value, "git") || rs_inline_value(value, "registry"))
+        dep->other_source = true;
+    const char *version = rs_inline_value(value, "version");
+    if (*value == '"' || *value == '\'')
+        dep->version = rs_quoted(arena, value);
+    else if (version)
+        dep->version = rs_quoted(arena, version);
 }
 
 typedef enum {
@@ -1167,7 +1364,8 @@ typedef enum {
     RS_SEC_TARGET,
     RS_SEC_DEPS,
     RS_SEC_WS_DEPS,
-    RS_SEC_WS_PACKAGE
+    RS_SEC_WS_PACKAGE,
+    RS_SEC_PATCH
 } rs_section_t;
 
 static rs_section_t rs_section_of(CBMArena *arena, const char *header, rs_target_t **target,
@@ -1192,6 +1390,14 @@ static rs_section_t rs_section_of(CBMArena *arena, const char *header, rs_target
             return RS_SEC_TARGET;
         }
     }
+    if (!strncmp(header, "[patch.crates-io.", 17)) {
+        const char *close = strchr(header, ']');
+        if (close)
+            *dep_table = cbm_arena_strndup(arena, header + 17, (size_t)(close - header - 17));
+        return close ? RS_SEC_PATCH : RS_SEC_OTHER;
+    }
+    if (!strncmp(header, "[patch.crates-io]", 17))
+        return RS_SEC_PATCH;
     if (!strncmp(header, "[package]", 9))
         return RS_SEC_PACKAGE;
     if (!strncmp(header, "[lib]", 5))
@@ -1238,6 +1444,8 @@ static void rs_manifest_line(CBMArena *arena, rs_package_t *package, rs_section_
     case RS_SEC_PACKAGE:
         if (!strcmp(key, "name"))
             package->name = rs_quoted(arena, value);
+        else if (!strcmp(key, "version"))
+            package->version = rs_quoted(arena, value);
         else if (!strcmp(key, "edition"))
             package->edition_2015 = value && strstr(value, "2015");
         else if (!strcmp(key, "edition.workspace"))
@@ -1270,8 +1478,11 @@ static void rs_manifest_line(CBMArena *arena, rs_package_t *package, rs_section_
             package->workspace_edition = rs_quoted(arena, value);
         break;
     case RS_SEC_DEPS:
+    case RS_SEC_PATCH:
     case RS_SEC_WS_DEPS: {
-        rs_dep_t **list = section == RS_SEC_DEPS ? &package->deps : &package->workspace_deps;
+        rs_dep_t **list = section == RS_SEC_DEPS    ? &package->deps
+                          : section == RS_SEC_PATCH ? &package->patches
+                                                    : &package->workspace_deps;
         if (dep_table) {
             /* [dependencies.foo]: key = value */
             rs_dep_note(arena, list, dep_table, cbm_arena_sprintf(arena, "%s = %s", key, value));
@@ -1320,6 +1531,7 @@ bool cbm_rust_project_add_manifest(cbm_rust_project_t *project, const char *rel,
         if (*line == '[') {
             section = rs_section_of(arena, line, &target, package, &dep_table);
             package->has_package |= section == RS_SEC_PACKAGE;
+            package->workspace_root |= !strncmp(line, "[workspace", 10);
         } else if (*line) {
             char *equal = strchr(line, '=');
             if (equal) {
@@ -1391,13 +1603,32 @@ static void rs_note_macro_export(CBMArena *arena, rs_crate_t *crate, rs_item_t *
     crate->macro_exports[crate->nmacro_exports++] = item;
 }
 
+static int rs_items_lower_bound(const rs_mod_t *mod, const char *name);
+
+/* cfg twins of one file: `cfg_rt! { pub mod runtime; } cfg_not_rt! { pub(crate) mod runtime; }`
+ * are one module, whichever configuration declares it. Only a second declaration of a name
+ * walks the children, so a flat module of many `mod` lines stays linear. */
+static bool rs_inst_twin(CBMArena *arena, rs_inst_t *inst, const rs_item_t *item) {
+    const rs_mod_t *syn = inst->syn;
+    int first = rs_items_lower_bound(syn, item->name);
+    bool repeated = first + 1 < syn->nitems && !strcmp(syn->items[first + 1]->name, item->name);
+    if (!repeated || item->inline_mod || item->path_attr)
+        return false;
+    for (rs_child_t *child = inst->children; child; child = child->next)
+        if (child->inst && !strcmp(child->name, item->name)) {
+            rs_child_add(arena, inst, item->name, child->inst);
+            return true;
+        }
+    return false;
+}
+
 static void rs_inst_children(cbm_rust_project_t *project, rs_inst_t *inst, unsigned depth) {
     CBMArena *arena = &project->arena;
     rs_mod_t *syn = inst->syn;
     for (rs_item_t *item = syn->item_list; item; item = item->next) {
         if (item->kind == RS_ITEM_MACRO && item->unit_struct)
             rs_note_macro_export(arena, inst->crate, item);
-        if (item->kind != RS_ITEM_MOD)
+        if (item->kind != RS_ITEM_MOD || rs_inst_twin(arena, inst, item))
             continue;
         const char *child_dir = rs_join(arena, inst->dir, item->name);
         if (item->inline_mod) {
@@ -1614,6 +1845,89 @@ static const rs_dep_t *rs_workspace_dep(const cbm_rust_project_t *project, const
     return found;
 }
 
+/* Cargo's default requirement: `0.4` accepts 0.4.5, not 0.5.0 or 0.3.9. An operator or a wildcard
+ * is not read, and neither is a version the manifest inherits. */
+static bool rs_version_accepts(const char *requirement, const char *version) {
+    if (!requirement || !version)
+        return false;
+    if (*requirement == '^')
+        requirement++;
+    long wanted[3] = {0, 0, 0}, have[3] = {0, 0, 0};
+    int parts = 0;
+    for (const char *at = requirement; parts < 3;) {
+        char *end = NULL;
+        if (!isdigit((unsigned char)*at))
+            return false;
+        wanted[parts++] = strtol(at, &end, 10);
+        if (!*end)
+            break;
+        if (*end != '.')
+            return false;
+        at = end + 1;
+    }
+    const char *at = version;
+    for (int i = 0; i < 3; i++) {
+        char *end = NULL;
+        if (!isdigit((unsigned char)*at))
+            return false;
+        have[i] = strtol(at, &end, 10);
+        if (i < 2 && *end != '.')
+            return false;
+        at = end + 1;
+    }
+    /* Everything up to the leftmost non-zero part must match; past it, no lower. */
+    int first = parts - 1;
+    for (int i = parts - 1; i >= 0; i--)
+        if (wanted[i])
+            first = i;
+    for (int i = 0; i <= first; i++)
+        if (have[i] != wanted[i])
+            return false;
+    for (int i = first + 1; i < parts; i++)
+        if (have[i] != wanted[i])
+            return have[i] > wanted[i];
+    return true;
+}
+
+/* [patch.crates-io] of the workspace root replaces a registry dependency with a directory of the
+ * project, and that directory's package is what the code names. Keyed by (manifest dir, name), so
+ * a dependency walks only its own ancestors. */
+static const char *rs_patched_dir(cbm_rust_project_t *project, const rs_package_t *package,
+                                  const rs_dep_t *dep) {
+    if (!project->patches || !dep || dep->other_source || dep->renamed || !dep->version)
+        return NULL;
+    CBMArena *arena = &project->arena;
+    for (const char *dir = package->dir; dir;) {
+        const char *key = cbm_arena_sprintf(arena, "%s\x1f%s", dir, dep->key);
+        const rs_dep_t *patch = key ? cbm_ht_get(project->patches, key) : NULL;
+        if (patch && patch->path) {
+            const char *target = rs_join(arena, dir, patch->path);
+            const rs_package_t *found = target ? rs_package_at(project, target) : NULL;
+            return found && rs_version_accepts(dep->version, found->version) ? target : NULL;
+        }
+        if (!*dir)
+            return NULL;
+        dir = rs_dirname(arena, dir);
+    }
+    return NULL;
+}
+
+static void rs_index_patches(cbm_rust_project_t *project) {
+    for (const rs_package_t *package = project->packages; package; package = package->next) {
+        /* Cargo reads [patch] from the workspace root alone. */
+        if (!package->workspace_root)
+            continue;
+        for (rs_dep_t *patch = package->patches; patch; patch = patch->next) {
+            if (!project->patches)
+                project->patches = cbm_ht_create(8);
+            const char *key =
+                cbm_arena_sprintf(&project->arena, "%s\x1f%s", package->dir, patch->key);
+            if (project->patches && key)
+                cbm_ht_set(project->patches, key, patch);
+        }
+    }
+}
+
 static void rs_extern_add(CBMArena *arena, rs_crate_t *crate, const char *name,
                           rs_crate_t *target) {
     rs_extern_t *entry = cbm_arena_calloc(arena, sizeof(*entry));
@@ -1637,14 +1951,17 @@ static void rs_wire_externs(cbm_rust_project_t *project) {
             const char *path = dep->path;
             const char *base = package->dir;
             bool renamed = dep->renamed;
+            const rs_dep_t *source = dep;
             if (dep->workspace) {
                 const rs_package_t *owner = NULL;
                 const rs_dep_t *shared = rs_workspace_dep(project, package->dir, dep->key, &owner);
                 path = shared ? shared->path : NULL;
                 base = owner ? owner->dir : "";
                 renamed = renamed || (shared && shared->renamed);
+                source = shared;
             }
-            const char *dir = path ? rs_join(arena, base, path) : NULL;
+            const char *dir =
+                path ? rs_join(arena, base, path) : rs_patched_dir(project, package, source);
             const rs_package_t *target = dir ? rs_package_at(project, dir) : NULL;
             /* Code names a dependency by its [lib] name unless Cargo.toml renamed it. */
             const char *name = target && !renamed && target->lib_name ? target->lib_name : dep->key;
@@ -1703,6 +2020,7 @@ bool cbm_rust_project_seal(cbm_rust_project_t *project) {
                 (void)rs_crate_add(project, NULL, "crate", rel, RS_CRATE_AUX);
         }
     }
+    rs_index_patches(project);
     rs_wire_externs(project);
     for (rs_crate_t *crate = project->crates; crate; crate = crate->next)
         rs_crate_root(project, crate);
@@ -2054,8 +2372,20 @@ static rs_ent_t rs_glob_uses(rs_query_t *q, rs_inst_t *inst, const char *name, u
 static rs_ent_t rs_lookup_steps(rs_query_t *q, rs_inst_t *inst, const char *name, unsigned ns,
                                 rs_inst_t *from) {
     rs_ent_t ent = rs_local_items(inst, name, ns, from);
-    if (rs_ent_found(&ent))
+    if (rs_ent_found(&ent)) {
+        /* `#[cfg(a)] use x::f; #[cfg(not(a))] fn f() {}`: one name, a different declaration under
+         * each configuration, and nothing here says which one applies. Without cfg this does
+         * not compile, so only a conditional use can stand beside a local item. */
+        for (const rs_use_t *use = inst->syn->uses; use; use = use->next) {
+            if (!use->has_cfg || !use->local || strcmp(use->local, name) != 0)
+                continue;
+            rs_ent_t imported = rs_named_uses(q, inst, name, ns, from);
+            if (rs_ent_found(&imported) && !rs_ent_same(&ent, &imported))
+                return rs_ent(RS_ENT_AMBIGUOUS, RS_VIA_LOCAL);
+            break;
+        }
         return ent;
+    }
     ent = rs_named_uses(q, inst, name, ns, from);
     if (rs_ent_found(&ent))
         return ent;

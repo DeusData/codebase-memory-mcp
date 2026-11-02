@@ -533,6 +533,7 @@ PIPELINE_SRCS = \
     internal/cbm/resolve/types.c \
     internal/cbm/resolve/binding.c \
     internal/cbm/resolve/py_members.c \
+    internal/cbm/resolve/rust_macros.c \
     internal/cbm/resolve/rust_names.c \
     internal/cbm/resolve/rust_flow.c \
     internal/cbm/resolve/source_adapter.c \

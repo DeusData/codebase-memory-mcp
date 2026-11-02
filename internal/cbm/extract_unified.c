@@ -985,6 +985,12 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (jvm_anonymous_member(ctx->language, node) && state->enclosing_func_qn) {
         return state->enclosing_func_qn;
     }
+    /* Nor has a Rust fn nested in a function body, or a method of an impl written there, and
+     * the QN it would compute can be a top-level namesake's. */
+    if (ctx->language == CBM_LANG_RUST && state->enclosing_func_qn &&
+        state->enclosing_func_qn != ctx->module_qn) {
+        return state->enclosing_func_qn;
+    }
 
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {

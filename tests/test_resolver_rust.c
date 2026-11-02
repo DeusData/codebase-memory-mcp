@@ -1285,6 +1285,903 @@ static int rust_occurrences_like(cbm_store_t *store, const char *relation, const
     return count;
 }
 
+/* snapbox's `str![[...]]` is in nearly every cargo test, and edition 2015 calls `try!`. The
+ * grammar reads those names as keywords and leaves an ERROR, which used to void every name in
+ * the file. A comparison and a cast that merely look alike stay what they are. */
+TEST(resolver_rust_macro_named_like_a_keyword_keeps_the_file) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "fn helper(x: &str) -> u8 { x.len() as u8 }\n"
+         "fn expected() -> &'static str { \"s\" }\n"
+         "fn expect(_: u32) {}\n"
+         "fn bracketed() { helper(str![[r#\"text ( { [\"#]]); expected(); }\n"
+         "fn scoped() { helper(snapbox::str![\"x\"]); expected(); }\n"
+         "fn spaced() { helper(str ! (\"x\")); expected(); }\n"
+         "fn numeric() { let _ = u8!(1); helper(\"y\"); }\n"
+         "fn old_style() -> Result<(), ()> { try!(expected2()); helper(\"z\"); Ok(()) }\n"
+         "fn expected2() -> Result<(), ()> { Ok(()) }\n"
+         "fn compared(n: u8) { if n as u8 != 1 { helper(\"c\"); } expect(1); }\n"
+         "str! { top level }\n"
+         "fn after_item_macro() { helper(\"after\"); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.bracketed", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.bracketed", "src.main.expected"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.scoped", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.spaced", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.numeric", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.old_style", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.compared", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.compared", "src.main.expect"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.after_item_macro", "src.main.helper"), 1);
+        /* The macro's own name is read from the file, never from the view: `_` is LIKE's any
+         * one character, so anything spelled `_tr` would count here and not as `str`. */
+        ASSERT_GT(rust_occurrences_like(store, "CALLS", "str"), 0);
+        ASSERT_EQ(rust_occurrences_like(store, "CALLS", "_tr"),
+                  rust_occurrences_like(store, "CALLS", "str"));
+    }
+    PASS();
+}
+
+/* A parse error the view does not repair still voids the file: no scope is faithful there. */
+TEST(resolver_rust_unrepaired_syntax_error_stays_unresolved) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "fn helper() {}\n"
+         "fn broken() { let = ; str![\"x\"]; helper(); }\n"
+         "fn main() { helper(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.broken", "src.main.helper"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.main", "src.main.helper"), 0);
+        ASSERT(rust_occurrence_reason(store, "CALLS", "helper", "rust_project_model_missing"));
+    }
+    PASS();
+}
+
+/* tokio declares most of its tree inside cfg_*! macros whose expansion is their input items. The
+ * definition says so, so those items are plain items, wherever the macro is called. Each other
+ * shape keeps its body opaque: one that moves the items, a name with two definitions that
+ * disagree, and a name whose only "definition" is in a comment. */
+TEST(resolver_rust_item_passthrough_macro_declares_its_items) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml", "[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n"},
+        {"src/macros.rs",
+         "macro_rules! cfg_on {\n    ($($item:item)*) => {\n        $(\n"
+         "            #[cfg(feature = \"on\")]\n"
+         "            #[cfg_attr(docsrs, doc(cfg(feature = \"on\")))]\n"
+         "            $item\n        )*\n    }\n}\n"
+         "macro_rules! cfg_off { ( $( $item:item )* ) => { $( #[cfg(not(feature = \"on\"))] $item )* } }\n"
+         "macro_rules! feature { (#![$meta:meta] $($item:item)*) => { $( #[cfg($meta)] $item )* } }\n"
+         "macro_rules! wrapper { ($($item:item)*) => { mod inner { $($item)* } } }\n"
+         "macro_rules! twice { ($($item:item)*) => { $($item)* } }\n"
+         "mod other { macro_rules! twice { ($($item:item)*) => { mod x { $($item)* } } } }\n"
+         "// macro_rules! commented { ($($item:item)*) => { $($item)* } }\n"},
+        {"src/runtime/mod.rs",
+         "pub struct Builder;\n"
+         "fn note() {}\n"
+         "impl Builder {\n"
+         "    pub fn new() -> Builder { Builder }\n"
+         "    cfg_on! {\n"
+         "        /// Inside an impl too.\n"
+         "        pub fn enable(self) -> Builder { note(); self }\n"
+         "    }\n"
+         "    pub fn build(self) {}\n"
+         "}\n"},
+        {"src/lib.rs",
+         "#[macro_use]\nmod macros;\n"
+         "cfg_on! {\n    pub mod runtime;\n}\n"
+         "cfg_off! {\n    pub(crate) mod runtime;\n}\n"
+         "feature! {\n    #![any(feature = \"a\", feature = \"b\")]\n"
+         "    pub fn flagged() -> u32 { helper() }\n}\n"
+         "fn helper() -> u32 { 1 }\n"
+         "pub fn caller() {\n"
+         "    runtime::Builder::new().enable().build();\n"
+         "    flagged();\n"
+         "}\n"
+         "cfg_on!(fn parenthesized() { helper(); });\n"
+         "wrapper! { pub fn hidden() {} }\n"
+         "pub fn use_hidden() { hidden(); }\n"
+         "twice! { pub fn twice_fn() {} }\n"
+         "pub fn use_twice() { twice_fn(); }\n"
+         "commented! { pub fn nowhere() {} }\n"
+         "pub fn use_nowhere() { nowhere(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.caller", "src.runtime.mod.Builder.new"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.caller", "src.runtime.mod.Builder.enable"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.caller", "src.runtime.mod.Builder.build"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.caller", "src.lib.flagged"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.flagged", "src.lib.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.parenthesized", "src.lib.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.runtime.mod.Builder.enable", "src.runtime.mod.note"),
+                  1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.use_hidden"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.use_twice"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.use_nowhere"), 0);
+    }
+    PASS();
+}
+
+/* A definition speaks only for its own package, and a file that imports the name from outside
+ * calls that macro instead. */
+TEST(resolver_rust_item_macro_is_read_per_package_and_import_wins) {
+    static const rust_proof_file_t files[] = {
+        {"a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"1.0.0\"\n"},
+        {"a/src/lib.rs",
+         "macro_rules! cfg_x { ($($item:item)*) => { $($item)* } }\n"
+         "cfg_x! { pub fn in_a() {} }\n"
+         "pub fn call_a() { in_a(); }\n"},
+        {"b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"1.0.0\"\n"},
+        {"b/src/lib.rs",
+         "macro_rules! cfg_x { ($($item:item)*) => { mod hidden { $($item)* } } }\n"
+         "cfg_x! { pub fn in_b() {} }\n"
+         "pub fn call_b() { in_b(); }\n"},
+        {"c/Cargo.toml", "[package]\nname = \"c\"\nversion = \"1.0.0\"\n"},
+        {"c/src/lib.rs",
+         "macro_rules! cfg_y { ($($item:item)*) => { $($item)* } }\n"
+         "mod imports;\n"},
+        {"c/src/imports.rs",
+         "use ext::cfg_y;\n"
+         "cfg_y! { pub fn imported() {} }\n"
+         "pub fn call_c() { imported(); }\n"},
+        {"d/Cargo.toml", "[package]\nname = \"d\"\nversion = \"1.0.0\"\n"},
+        {"d/src/lib.rs",
+         "cfg_x! { pub fn in_d() {} }\n"
+         "pub fn call_d() { in_d(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "a.src.lib.call_a", "a.src.lib.in_a"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "b.src.lib.call_b"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "c.src.imports.call_c"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "d.src.lib.call_d"), 0);
+    }
+    PASS();
+}
+
+/* These macros exist to add #[cfg], so a `use` inside one is conditional: an external path beside a
+ * project path may be the same namespace in another configuration, and nothing settles which. */
+TEST(resolver_rust_use_inside_item_macro_is_conditional) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n[dependencies]\nexternal = \"1\"\n"},
+        {"src/main.rs",
+         "macro_rules! cfg_x { ($($item:item)*) => { $( #[cfg(x)] $item )* } }\n"
+         "mod errors { pub struct Error; impl Error { pub fn new() -> Error { Error } } }\n"
+         "cfg_x! { use external::Error; }\n"
+         "use crate::errors::Error;\n"
+         "fn run() { Error::new(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.run"), 0);
+    }
+    PASS();
+}
+
+/* `contention::<10>(g)` and `s.pick::<u8>()`: the call is to what the turbofish wraps. */
+TEST(resolver_rust_turbofish_call_is_a_call) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod inner { pub fn scoped<T>() {} }\n"
+         "fn make<const N: usize>() {}\n"
+         "struct S;\n"
+         "impl S { fn pick<T>(&self) -> S { S } fn other(&self) {} }\n"
+         "fn run(s: S) {\n"
+         "    make::<10>();\n"
+         "    inner::scoped::<u8>();\n"
+         "    s.pick::<u8>().other();\n"
+         "}\n"
+         "fn unknown() { missing::<u8>(); Vec::<u8>::new(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.run", "src.main.make"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.run", "src.main.scoped"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.run", "src.main.S.pick"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.run", "src.main.S.other"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.unknown"), 0);
+    }
+    PASS();
+}
+
+/* tokio's workspace root patches crates.io to its own directories, so `tokio-test = "0.4"` in a
+ * member is that directory. Cargo ignores a patch whose version does not satisfy the requirement,
+ * and a [patch] of another source, or a git dependency, is not the registry. */
+TEST(resolver_rust_workspace_patch_names_a_project_package) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[workspace]\nmembers = [\"app\", \"helper\", \"old\", \"second\", \"third\", \"nested\"]\n\n"
+         "[patch.crates-io]\n"
+         "helper = { path = \"helper\" }\n"
+         "old = { path = \"old\" }\n"
+         "second = { path = \"second\" }\n"
+         "[patch.crates-io.nested]\n"
+         "path = \"nested\"\n"
+         "[patch.\"https://example.com/x\"]\n"
+         "third = { path = \"third\" }\n"},
+        {"app/Cargo.toml",
+         "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+         "[dev-dependencies]\n"
+         "helper = \"0.4\"\n"
+         "old = \"2\"\n"
+         "second = { version = \"1\", git = \"https://example.com/x\" }\n"
+         "third = \"1\"\n"
+         "nested = { version = \"1.2\" }\n"},
+        {"helper/Cargo.toml", "[package]\nname = \"helper\"\nversion = \"0.4.5\"\n"},
+        {"old/Cargo.toml", "[package]\nname = \"old\"\nversion = \"1.0.0\"\n"},
+        {"second/Cargo.toml", "[package]\nname = \"second\"\nversion = \"1.0.0\"\n"},
+        {"third/Cargo.toml", "[package]\nname = \"third\"\nversion = \"1.0.0\"\n"},
+        {"nested/Cargo.toml", "[package]\nname = \"nested\"\nversion = \"1.3.0\"\n"},
+        {"helper/src/lib.rs", "pub fn h() {}\n"},
+        {"old/src/lib.rs", "pub fn o() {}\n"},
+        {"second/src/lib.rs", "pub fn s() {}\n"},
+        {"third/src/lib.rs", "pub fn t() {}\n"},
+        {"nested/src/lib.rs", "pub fn n() {}\n"},
+        {"app/src/lib.rs",
+         "pub fn run() { helper::h(); nested::n(); }\n"
+         "pub fn unpatched() { old::o(); second::s(); third::t(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.run", "helper.src.lib.h"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.run", "nested.src.lib.n"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "app.src.lib.unpatched"), 0);
+    }
+    PASS();
+}
+
+/* A tuple struct's name is its constructor function in the value namespace. A named struct has
+ * none, and a unit struct's name is a value that nothing calls. */
+TEST(resolver_rust_tuple_struct_constructor_is_a_call) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "struct Pair(u32, u32);\n"
+         "struct Named { a: u32 }\n"
+         "struct Unit;\n"
+         "impl Pair { fn new() -> Self { Self(1, 2) } }\n"
+         "fn direct() -> Pair { Pair(1, 2) }\n"
+         "fn literal() -> Named { Named { a: 1 } }\n"
+         "fn unit() -> Unit { Unit }\n"
+         "fn value() -> fn(u32, u32) -> Pair { Pair }\n"
+         "fn shadowed() { let Pair = |a: u32, b: u32| a + b; Pair(1, 2); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.direct", "src.main.Pair"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.Pair.new", "src.main.Pair"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.literal"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.unit"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.value"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.shadowed"), 0);
+    }
+    PASS();
+}
+
+/* cargo's tests write `snapbox::cmd::Command::cargo_ui()`: the type is spelled out and external, the
+ * associated function comes from a project trait in scope. A name no such trait supplies stays
+ * external, and a trait out of scope supplies nothing. */
+TEST(resolver_rust_spelled_external_type_takes_a_project_trait) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n[dependencies]\nsnapbox = \"1\"\n"},
+        {"src/lib.rs",
+         "pub trait CommandExt { fn cargo_ui() -> Self; fn line(self) -> Self; }\n"
+         "impl CommandExt for snapbox::cmd::Command {\n"
+         "    fn cargo_ui() -> Self { todo!() }\n"
+         "    fn line(self) -> Self { self }\n"
+         "}\n"
+         "mod hidden {\n"
+         "    pub trait Other { fn only_other() -> Self; }\n"
+         "    impl Other for snapbox::cmd::Command { fn only_other() -> Self { todo!() } }\n"
+         "}\n"
+         "pub fn case() { snapbox::cmd::Command::cargo_ui().line(); }\n"
+         "pub fn inherent() { snapbox::cmd::Command::new(); }\n"
+         "pub fn out_of_scope() { snapbox::cmd::Command::only_other(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.case", "src.lib.snapbox::cmd::Command.cargo_ui"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.case", "src.lib.snapbox::cmd::Command.line"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.inherent"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.out_of_scope"), 0);
+    }
+    PASS();
+}
+
+/* `impl Wait for StdChild { fn id(&self) -> u32 { self.id() } }` is no recursion: the external type
+ * has an inherent id, and a method call prefers that. Nothing on that type calls the trait's. */
+TEST(resolver_rust_trait_on_external_type_delegating_to_inherent) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "use std::process::Child as StdChild;\n"
+         "trait Wait { fn id(&self) -> u32; fn extra(&self) -> u32; fn make() -> Self; }\n"
+         "impl Wait for StdChild {\n"
+         "    fn id(&self) -> u32 { self.id() }\n"
+         "    fn extra(&self) -> u32 { 0 }\n"
+         "    fn make() -> Self { Self::make() }\n"
+         "}\n"
+         "fn inherent(c: StdChild) { c.id(); }\n"
+         "fn trait_only(c: StdChild) { c.extra(); }\n"
+         "fn assoc() { StdChild::make(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.StdChild.id"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.StdChild.make"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.inherent"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.assoc"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.trait_only", "src.main.StdChild.extra"), 1);
+    }
+    PASS();
+}
+
+/* tokio's blocking.rs: `cfg_rt! { pub(crate) use crate::runtime::spawn_blocking; }` beside
+ * `cfg_not_rt! { pub(crate) fn spawn_blocking() {} }`. Each configuration has a different declaration,
+ * so neither is the answer. A plain #[cfg] twin is the same case. */
+TEST(resolver_rust_conditional_use_beside_a_local_item_is_ambiguous) {
+    static const rust_proof_file_t files[] = {
+        {"src/runtime.rs", "pub fn spawn() {}\npub fn plain() {}\npub fn solo() {}\n"},
+        {"src/main.rs",
+         "macro_rules! cfg_on { ($($item:item)*) => { $( #[cfg(on)] $item )* } }\n"
+         "macro_rules! cfg_off { ($($item:item)*) => { $( #[cfg(not(on))] $item )* } }\n"
+         "mod runtime;\n"
+         "cfg_on! { use crate::runtime::spawn; }\n"
+         "cfg_off! { fn spawn() {} }\n"
+         "#[cfg(on)]\nuse crate::runtime::plain;\n"
+         "#[cfg(not(on))]\nfn plain() {}\n"
+         "cfg_on! { use crate::runtime::solo; }\n"
+         "fn via_macro() { spawn(); }\n"
+         "fn via_attribute() { plain(); }\n"
+         "fn no_twin() { solo(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.via_macro"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.via_attribute"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.no_twin", "src.runtime.solo"), 1);
+    }
+    PASS();
+}
+
+/* actix's Path<T> dereferences to T, but into_inner is its own. */
+TEST(resolver_rust_wrapper_keeps_into_inner_for_itself) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n[dependencies]\nactix_web = \"4\"\n"},
+        {"src/lib.rs",
+         "use actix_web::web::Path;\n"
+         "pub struct Uid;\n"
+         "impl Uid { pub fn into_inner(self) -> u32 { 0 } pub fn other(&self) {} }\n"
+         "pub fn inner(p: Path<Uid>) { p.into_inner(); }\n"
+         "pub fn through(p: Path<Uid>) { p.other(); }\n"
+         "pub fn unwrapped(p: Path<Uid>) { p.into_inner().other(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.inner"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.through", "src.lib.Uid.other"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.unwrapped", "src.lib.Uid.other"), 1);
+    }
+    PASS();
+}
+
+/* pin_project_lite's contract: the struct in the body is declared as written, and project() gives
+ * its fields, #[pin] ones as Pin<&mut F>. A file that does not name the crate has some other
+ * pin_project!, and a Pin's own as_mut is not F's. */
+TEST(resolver_rust_pin_project_declares_its_struct) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n[dependencies]\npin-project-lite = \"0.2\"\n"},
+        {"src/lib.rs", "pub mod inner;\npub mod chain;\npub mod other;\n"},
+        {"src/inner.rs",
+         "pub struct Fuse;\n"
+         "impl Fuse {\n"
+         "    pub fn new() -> Fuse { Fuse }\n"
+         "    pub fn poll_next(&mut self) {}\n"
+         "    pub fn as_mut(&mut self) {}\n"
+         "}\n"},
+        {"src/chain.rs",
+         "use std::pin::Pin;\n"
+         "use pin_project_lite::pin_project;\n"
+         "use crate::inner::Fuse;\n"
+         "pin_project! {\n"
+         "    /// Documented.\n"
+         "    #[must_use]\n"
+         "    pub struct Chain {\n"
+         "        #[pin]\n"
+         "        first: Fuse,\n"
+         "        second: Fuse,\n"
+         "    }\n"
+         "}\n"
+         "impl Chain {\n"
+         "    pub fn make() -> Chain { Chain { first: Fuse::new(), second: Fuse::new() } }\n"
+         "    pub fn poll(self: Pin<&mut Self>) {\n"
+         "        let me = self.project();\n"
+         "        me.first.poll_next();\n"
+         "        me.second.poll_next();\n"
+         "    }\n"
+         "    pub fn pinned(self: Pin<&mut Self>) {\n"
+         "        let me = self.project();\n"
+         "        me.first.as_mut();\n"
+         "    }\n"
+         "    pub fn again(mut self: Pin<&mut Self>) {\n"
+         "        self.as_mut().project().second.poll_next();\n"
+         "    }\n"
+         "}\n"
+         "pub fn caller() { Chain::make(); }\n"},
+        {"src/other.rs",
+         "use crate::inner::Fuse;\n"
+         "use elsewhere::pin_project;\n"
+         "pin_project! { pub struct Hidden { x: Fuse } }\n"
+         "impl Hidden { pub fn make() -> Hidden { todo!() } }\n"
+         "pub fn caller(h: Hidden) { h.x.poll_next(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.chain.caller", "src.chain.Chain.make"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.chain.Chain.poll", "src.inner.Fuse.poll_next"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.chain.Chain.again", "src.inner.Fuse.poll_next"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.chain.Chain.pinned"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.other.caller"), 0);
+    }
+    PASS();
+}
+
+/* tokio_test's assert_ok! takes an expression of the caller's and evaluates it, whichever of its
+ * rules matches, and a test helper of the same package does too. What the macro yields is its own
+ * business, so nothing is known of the result. A macro that only stringifies its argument, one with
+ * syntax of its own, and an unrelated crate's macro of the same name each keep their tokens opaque. */
+TEST(resolver_rust_expression_macro_arguments_are_the_callers) {
+    static const rust_proof_file_t files[] = {
+        {"helpers/Cargo.toml", "[package]\nname = \"my-helpers\"\nversion = \"1.0.0\"\n"},
+        {"helpers/src/lib.rs",
+         "#[macro_export]\n"
+         "macro_rules! assert_ok {\n"
+         "    ($e:expr) => { assert_ok!($e,) };\n"
+         "    ($e:expr,) => {{ match $e { Ok(v) => v, Err(e) => panic!(\"{:?}\", e) } }};\n"
+         "    ($e:expr, $($t:tt)+) => {{ match $e { Ok(v) => v, Err(e) => panic!(\"{:?}\", e) } }};\n"
+         "}\n"
+         "#[macro_export]\n"
+         "macro_rules! only_text { ($e:expr) => { stringify!($e) } }\n"
+         "#[macro_export]\n"
+         "macro_rules! custom { ($a:ident => $b:expr) => { $b } }\n"},
+        {"app/Cargo.toml",
+         "[package]\nname = \"app\"\nversion = \"1.0.0\"\n"
+         "[dependencies]\nmy-helpers = { path = \"../helpers\" }\nforeign = \"1\"\n"},
+        {"app/src/lib.rs",
+         "use my_helpers::{assert_ok, only_text, custom};\n"
+         "pub struct Thing;\n"
+         "impl Thing { pub fn method(&self) {} }\n"
+         "fn make() -> Result<Thing, ()> { Ok(Thing) }\n"
+         "fn second() -> Result<Thing, ()> { Ok(Thing) }\n"
+         "fn tail() -> u32 { 1 }\n"
+         "fn hidden() -> u32 { 1 }\n"
+         "macro_rules! t { ($e:expr) => { match $e { Ok(v) => v, Err(e) => panic!(\"{}\", e) } } }\n"
+         "pub fn run() {\n"
+         "    let v = assert_ok!(make());\n"
+         "    v.method();\n"
+         "    my_helpers::assert_ok!(second(), \"message {}\", tail());\n"
+         "}\n"
+         "pub fn local() { t!(make()); }\n"
+         "macro_rules! many { ($($x:expr),* $(,)?) => { [$($x),*] } }\n"
+         "macro_rules! fmt { ($e:expr, $($t:tt)*) => { ($e, format!($($t)*)) } }\n"
+         "static label: u32 = 1;\n"
+         "pub fn repeated() { many!(tail(), hidden()); }\n"
+         "pub fn named() { fmt!(tail(), \"{label}\", label = hidden()); }\n"
+         "pub fn text() { only_text!(hidden()); }\n"
+         "pub fn syntax() { custom!(a => hidden()); }\n"
+         "mod elsewhere;\n"
+         "mod globbed;\n"},
+        {"app/src/globbed.rs",
+         "use my_helpers::*;\n"
+         "fn g() -> Result<u32, ()> { Ok(1) }\n"
+         "pub fn glob_caller() { assert_ok!(g()); }\n"},
+        {"app/src/elsewhere.rs",
+         "use foreign::t;\n"
+         "fn hidden_too() -> u32 { 1 }\n"
+         "pub fn imported() { t!(hidden_too()); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.run", "app.src.lib.make"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.run", "app.src.lib.second"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.run", "app.src.lib.tail"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.run", "app.src.lib.Thing.method"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.local", "app.src.lib.make"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.repeated", "app.src.lib.tail"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.repeated", "app.src.lib.hidden"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.lib.named", "app.src.lib.hidden"), 1);
+        ASSERT_EQ(rust_edge(store, "WRITES", "app.src.lib.named", "app.src.lib.label"), 0);
+        ASSERT_EQ(rust_edge(store, "USAGE", "app.src.lib.named", "app.src.lib.label"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.globbed.glob_caller", "app.src.globbed.g"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "app.src.lib.text"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "app.src.lib.syntax"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "app.src.elsewhere.imported"), 0);
+    }
+    PASS();
+}
+
+/* tokio-stream's `impl<St: Stream> StreamExt for St` with an external Stream: the orphan rule puts any
+ * impl of Stream for a project type in the project, so a future that has none does not get StreamExt,
+ * and futures::FutureExt supplies its map. A stream that has one does. */
+TEST(resolver_rust_blanket_impl_external_bound_checks_a_project_type) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n[dependencies]\nfutures = \"0.3\"\n"},
+        {"src/lib.rs",
+         "use futures::{FutureExt, Stream};\n"
+         "pub trait StreamExt { fn map_items(self) -> u32 where Self: Sized { 1 } fn map(self) -> u32 where Self: Sized { 1 } }\n"
+         "impl<St: Stream> StreamExt for St {}\n"
+         "pub struct Next;\n"
+         "impl std::future::Future for Next { type Output = (); }\n"
+         "pub struct Items;\n"
+         "impl Stream for Items { type Item = (); }\n"
+         "pub fn on_future(n: Next) { n.map(); }\n"
+         "pub fn on_stream(i: Items) { i.map(); }\n"
+         "pub fn on_param<S: Stream>(s: S) { s.map_items(); }\n"
+         "pub fn other_bound<S: Clone>(s: S) { s.map_items(); }\n"
+         "pub fn no_bound<S>(s: S) { s.map_items(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.on_future"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.on_stream", "src.lib.StreamExt.map"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.on_param", "src.lib.StreamExt.map_items"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.other_bound"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.lib.no_bound"), 0);
+    }
+    PASS();
+}
+
+/* Rust's extraction skips words like write and print as macro names, but a call to a function of
+ * that name is a call. And pub(in super::super) reaches past the one level pub(super) does. */
+TEST(resolver_rust_function_named_like_a_macro_and_deep_visibility) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "fn write(x: u32) -> Result<u32, ()> { Ok(x) }\n"
+         "fn print() {}\n"
+         "fn run() { write(1).unwrap(); print(); }\n"
+         "mod a {\n"
+         "    pub mod b {\n"
+         "        pub(in super::super) fn deep() {}\n"
+         "        pub(super) fn shallow() {}\n"
+         "    }\n"
+         "    pub fn inner() { b::deep(); b::shallow(); }\n"
+         "}\n"
+         "fn outer() { a::b::deep(); }\n"
+         "fn hidden() { a::b::shallow(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.run", "src.main.write"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.run", "src.main.print"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.outer", "src.main.deep"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.inner", "src.main.deep"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.inner", "src.main.shallow"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.hidden", "src.main.shallow"), 0);
+    }
+    PASS();
+}
+
+/* meilisearch: `impl async_openai::config::Config for Config` calls config.headers() on what it
+ * wraps, with no `use` of the trait. Rust puts a trait in scope inside its own impl, and only there. */
+TEST(resolver_rust_trait_is_in_scope_inside_its_own_impl) {
+    static const rust_proof_file_t files[] = {
+        {"src/lib.rs",
+         "pub mod config {\n"
+         "    pub trait Config { fn headers(&self); }\n"
+         "    pub trait Other { fn extra(&self); }\n"
+         "    pub struct Inner;\n"
+         "    impl Config for Inner { fn headers(&self) {} }\n"
+         "    impl Other for Inner { fn extra(&self) {} }\n"
+         "}\n"
+         "pub struct Mine { inner: config::Inner }\n"
+         "impl config::Config for Mine {\n"
+         "    fn headers(&self) { self.inner.headers(); self.inner.extra(); }\n"
+         "}\n"
+         "impl Mine { pub fn plain(&self) { self.inner.headers(); } }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.Mine.headers", "src.lib.Inner.headers"), 1);
+        /* Other is implemented for Inner, but is in scope nowhere here. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.Mine.headers", "src.lib.Inner.extra"), 0);
+        /* Outside the impl Config is not in scope either. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.lib.Mine.plain", "src.lib.Inner.headers"), 0);
+    }
+    PASS();
+}
+
+/* What these macros take is ordinary expressions of the caller, when they are those crates'. */
+TEST(resolver_rust_logging_and_error_macros_take_expressions) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+         "[dependencies]\ntracing = \"0.1\"\nlog = \"0.4\"\nanyhow = \"1\"\nmylog = \"1\"\nother = \"1\"\n"},
+        {"src/main.rs",
+         "use tracing::debug;\n"
+         "use anyhow::bail;\n"
+         "use mylog::info;\n"
+         "macro_rules! warn { ($($t:tt)*) => {}; }\n"
+         "fn helper() -> u8 { 1 }\n"
+         "fn imported() { debug!(\"{}\", helper()); }\n"
+         "fn spelled() { log::error!(\"{}\", helper()); }\n"
+         "fn named_field() { tracing::info!(value = helper(), \"m\"); }\n"
+         "fn error_value() -> anyhow::Result<()> { bail!(helper()) }\n"
+         "fn other_crate() { info!(\"{}\", helper()); }\n"
+         "fn project_macro() { warn!(\"{}\", helper()); }\n"
+         "fn other_path() { other::debug!(\"{}\", helper()); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.imported", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.spelled", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.named_field", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.error_value", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.other_crate", "src.main.helper"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.project_macro", "src.main.helper"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.other_path", "src.main.helper"), 0);
+    }
+    PASS();
+}
+
+/* cargo: `fn update_submodules` nested in a method of that name, tokio's tests: `impl Drop for D`
+ * inside a test. Neither has a node. What they call belongs to the function they are written in:
+ * not to the file, and not to a top-level function of the same name. */
+TEST(resolver_rust_nested_item_belongs_to_its_enclosing_function) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "fn helper() {}\n"
+         "fn other() {}\n"
+         "fn outer() {\n"
+         "    fn inner() { helper(); }\n"
+         "    inner();\n"
+         "}\n"
+         "struct S;\n"
+         "impl S {\n"
+         "    fn method(&self) {\n"
+         "        fn nested() { helper(); }\n"
+         "        nested();\n"
+         "    }\n"
+         "}\n"
+         "fn holder() {\n"
+         "    struct L;\n"
+         "    impl L { fn own(&self) { helper(); } }\n"
+         "}\n"
+         "fn twice() {\n"
+         "    fn twin() { helper(); }\n"
+         "    twin();\n"
+         "}\n"
+         "fn twin() { other(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.outer", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.S.method", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.holder", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.twice", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.twin", "src.main.other"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.twin", "src.main.helper"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.rs.__file__"), 0);
+    }
+    PASS();
+}
+
+/* meilisearch: `mod r#match;` is the module `match` in match.rs. */
+TEST(resolver_rust_raw_identifier_names_the_plain_item) {
+    static const rust_proof_file_t files[] = {
+        {"src/match.rs",
+         "pub struct Match;\n"
+         "impl Match { pub fn pos(&self) {} pub fn r#use(&self) {} }\n"
+         "pub fn r#try() {}\n"},
+        {"src/other.rs", "pub struct Match;\nimpl Match { pub fn pos(&self) {} }\n"},
+        {"src/main.rs",
+         "mod r#match;\n"
+         "mod other;\n"
+         "use r#match::{Match, r#try};\n"
+         "struct W { r#type: Match }\n"
+         "fn direct(m: &Match) { m.pos(); }\n"
+         "fn field(w: &W) { w.r#type.pos(); }\n"
+         "fn method(m: &Match) { m.r#use(); }\n"
+         "fn named() { r#try(); }\n"
+         "fn path() { r#match::r#try(); }\n"
+         "fn r#gen(m: &Match) { m.pos(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.direct", "src.match.Match.pos"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.direct", "src.other.Match.pos"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.field", "src.match.Match.pos"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.method", "src.match.Match.r#use"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.named", "src.match.r#try"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.path", "src.match.r#try"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.r#gen", "src.match.Match.pos"), 1);
+    }
+    PASS();
+}
+
+/* tokio: Ready::ALL.as_usize(). What the const's impl leaves open stays unknown. */
+TEST(resolver_rust_associated_const_has_its_declared_type) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "struct Ready(usize);\n"
+         "impl Ready {\n"
+         "    pub const ALL: Ready = Ready(1);\n"
+         "    pub const SELF: Self = Ready(2);\n"
+         "    pub fn as_usize(&self) -> usize { self.0 }\n"
+         "}\n"
+         "trait Db { const DATABASE: Ready; }\n"
+         "trait Other { const DATABASE: Ready; }\n"
+         "struct Holder<T>(T);\n"
+         "impl<T> Holder<T> { pub const HELD: Option<T> = None; }\n"
+         "struct Open;\n"
+         "impl Open { pub fn as_usize(&self) -> usize { 0 } }\n"
+         "impl<T> Holder<T> { pub const INNER: T = panic!(); }\n"
+         "fn named() -> usize { Ready::ALL.as_usize() }\n"
+         "fn selfish() -> usize { Ready::SELF.as_usize() }\n"
+         "fn param<D: Db>() -> usize { D::DATABASE.as_usize() }\n"
+         "fn two<D: Db + Other>() -> usize { D::DATABASE.as_usize() }\n"
+         "fn generic() -> usize { Holder::<Open>::INNER.as_usize() }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.named", "src.main.Ready.as_usize"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.selfish", "src.main.Ready.as_usize"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.param", "src.main.Ready.as_usize"), 1);
+        /* Two bounds offer the name: illegal unless qualified, so nothing is claimed. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.two", "src.main.Ready.as_usize"), 0);
+        /* T is the impl's. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.generic", "src.main.Open.as_usize"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.generic", "src.main.Ready.as_usize"), 0);
+    }
+    PASS();
+}
+
+/* tokio: `let raw = raw as *const Inner; (*raw).unpark()` and L::pointers(p).as_mut().set_next().
+ * A raw pointer has no autoderef, so calling through one without `*` selects no pointee method. */
+TEST(resolver_rust_raw_pointer_reaches_its_pointee_only_by_deref) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "use std::ptr::NonNull;\n"
+         "struct Inner;\n"
+         "impl Inner { fn unpark(&self) {} fn set(&mut self) {} }\n"
+         "unsafe fn cast(raw: *const ()) { let raw = raw as *const Inner; unsafe { (*raw).unpark(); } }\n"
+         "unsafe fn reborrow(inner: *mut Inner) { let inner = unsafe { &mut *inner }; inner.set(); }\n"
+         "unsafe fn no_autoderef(raw: *const Inner) { raw.unpark(); }\n"
+         "unsafe fn non_null(p: NonNull<Inner>) { p.as_ref().unpark(); }\n"
+         "unsafe fn non_null_mut(mut p: NonNull<Inner>) { p.as_mut().set(); }\n"
+         "unsafe fn non_null_ptr(p: NonNull<Inner>) { (*p.as_ptr()).unpark(); }\n"
+         "unsafe fn non_null_direct(p: NonNull<Inner>) { p.unpark(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.cast", "src.main.Inner.unpark"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.reborrow", "src.main.Inner.set"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.no_autoderef", "src.main.Inner.unpark"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.non_null", "src.main.Inner.unpark"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.non_null_mut", "src.main.Inner.set"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.non_null_ptr", "src.main.Inner.unpark"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.non_null_direct", "src.main.Inner.unpark"), 0);
+    }
+    PASS();
+}
+
+/* tokio: Handle::current() under cfg_rt! and cfg_not_rt!. Whichever one a build keeps, it returns
+ * what both of them write. Twins that write different types tell nothing. */
+TEST(resolver_rust_cfg_twins_with_one_return_type_type_their_call) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "struct Inner;\n"
+         "impl Inner { fn unpark(&self) {} }\n"
+         "struct Other;\n"
+         "impl Other { fn unpark(&self) {} }\n"
+         "struct Handle;\n"
+         "impl Handle {\n"
+         "    #[cfg(feature = \"a\")]\n"
+         "    pub fn inner() -> Inner { Inner }\n"
+         "    #[cfg(not(feature = \"a\"))]\n"
+         "    pub fn inner() -> Inner { panic!() }\n"
+         "    #[cfg(feature = \"a\")]\n"
+         "    pub fn either() -> Inner { Inner }\n"
+         "    #[cfg(not(feature = \"a\"))]\n"
+         "    pub fn either() -> Other { Other }\n"
+         "}\n"
+         "fn agree() { Handle::inner().unpark(); }\n"
+         "fn differ() { Handle::either().unpark(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.agree", "src.main.Inner.unpark"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.differ", "src.main.Inner.unpark"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.differ", "src.main.Other.unpark"), 0);
+    }
+    PASS();
+}
+
+/* cargo: `impl ToDep for &'static str`, then "x".to_dep(). A primitive's own methods are std's. */
+TEST(resolver_rust_project_trait_on_a_primitive) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "struct Dep;\n"
+         "impl Dep { fn optional(&mut self) {} }\n"
+         "trait ToDep { fn to_dep(self) -> Dep; fn opt(self) -> Dep; }\n"
+         "impl ToDep for &'static str {\n"
+         "    fn to_dep(self) -> Dep { Dep }\n"
+         "    fn opt(self) -> Dep { let mut dep = self.to_dep(); dep.optional(); dep }\n"
+         "}\n"
+         "trait Count { fn count_it(&self) -> Dep; fn zero() -> Dep; }\n"
+         "impl Count for u32 { fn count_it(&self) -> Dep { Dep } fn zero() -> Dep { Dep } }\n"
+         "fn literal() { let mut d = \"x\".to_dep(); d.optional(); }\n"
+         "fn param(s: &'static str) { let mut d = s.to_dep(); d.optional(); }\n"
+         "fn number(n: u32) { n.count_it(); }\n"
+         "fn assoc() { u32::zero(); }\n"
+         "fn others(n: u64, s: &'static str) { n.count_it(); s.len(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.literal", "src.main.&'static str.to_dep"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.literal", "src.main.Dep.optional"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.param", "src.main.Dep.optional"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.number", "src.main.u32.count_it"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.assoc", "src.main.u32.zero"), 1);
+        /* u64 has no such impl, and str::len is std's. */
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.others"), 0);
+    }
+    PASS();
+}
+
+/* cargo: `features! { ... }` beside `impl Features { ... }`, and bitflags everywhere. The inherent
+ * impl proves a type of this crate only a macro can have declared. Beside a glob the name may be
+ * the glob's, and an unseen inherent method would come before a visible trait's. */
+TEST(resolver_rust_inherent_impl_proves_a_macro_declared_type) {
+    static const rust_proof_file_t files[] = {
+        {"src/flags.rs",
+         "external_macro! { pub struct Flags; }\n"
+         "impl Flags { pub fn require(&self) {} }\n"
+         "pub trait Named { fn name(&self); }\n"
+         "impl Named for Flags { fn name(&self) {} }\n"},
+        {"src/globbed.rs",
+         "pub use crate::flags::*;\n"
+         "external_macro! { pub struct Glob; }\n"
+         "impl Glob { pub fn seen(&self) {} }\n"},
+        {"src/main.rs",
+         "mod flags;\n"
+         "mod globbed;\n"
+         "use flags::{Flags, Named};\n"
+         "fn make() -> Flags { todo!() }\n"
+         "fn inherent(f: &Flags) { f.require(); }\n"
+         "fn through_return() { make().require(); }\n"
+         "fn trait_method(f: &Flags) { f.name(); }\n"
+         "fn globbed(g: &globbed::Glob) { g.seen(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.inherent", "src.flags.Flags.require"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_return", "src.flags.Flags.require"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.trait_method"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.globbed"), 0);
+    }
+    PASS();
+}
+
+/* tokio has `impl<P> AsyncWrite for Pin<P>` beside `self: Pin<&mut Self>` methods. On a Pin<&mut W>
+ * receiver the method's Self is W: the impl on Pin would need a Pin of a Pin. */
+TEST(resolver_rust_pin_receiver_selects_the_pinned_type) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "use std::pin::Pin;\n"
+         "trait Flush { fn poll_flush(self: Pin<&mut Self>); }\n"
+         "impl<P> Flush for Pin<P> { fn poll_flush(self: Pin<&mut Self>) {} }\n"
+         "struct W;\n"
+         "impl Flush for W { fn poll_flush(self: Pin<&mut Self>) {} }\n"
+         "fn direct(w: Pin<&mut W>) { w.poll_flush(); }\n"
+         "fn generic<T: Flush>(w: Pin<&mut T>) { w.poll_flush(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.direct", "src.main.W.poll_flush"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.direct"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.generic", "src.main.Flush.poll_flush"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.generic"), 1);
+    }
+    PASS();
+}
+
 /* async-openai keeps retired names commented out inside its use lists. */
 TEST(resolver_rust_use_list_comment_is_not_a_leaf) {
     static const rust_proof_file_t files[] = {
@@ -1728,6 +2625,32 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_methods_follow_the_language_probe);
     RUN_TEST(resolver_rust_macro_declared_item_hides_module_name_in_its_block);
     RUN_TEST(resolver_rust_std_macro_arguments_are_expressions);
+    RUN_TEST(resolver_rust_macro_named_like_a_keyword_keeps_the_file);
+    RUN_TEST(resolver_rust_unrepaired_syntax_error_stays_unresolved);
+    RUN_TEST(resolver_rust_spelled_external_type_takes_a_project_trait);
+    RUN_TEST(resolver_rust_trait_on_external_type_delegating_to_inherent);
+    RUN_TEST(resolver_rust_conditional_use_beside_a_local_item_is_ambiguous);
+    RUN_TEST(resolver_rust_wrapper_keeps_into_inner_for_itself);
+    RUN_TEST(resolver_rust_pin_project_declares_its_struct);
+    RUN_TEST(resolver_rust_expression_macro_arguments_are_the_callers);
+    RUN_TEST(resolver_rust_blanket_impl_external_bound_checks_a_project_type);
+    RUN_TEST(resolver_rust_function_named_like_a_macro_and_deep_visibility);
+    RUN_TEST(resolver_rust_trait_is_in_scope_inside_its_own_impl);
+    RUN_TEST(resolver_rust_logging_and_error_macros_take_expressions);
+    RUN_TEST(resolver_rust_nested_item_belongs_to_its_enclosing_function);
+    RUN_TEST(resolver_rust_raw_identifier_names_the_plain_item);
+    RUN_TEST(resolver_rust_associated_const_has_its_declared_type);
+    RUN_TEST(resolver_rust_raw_pointer_reaches_its_pointee_only_by_deref);
+    RUN_TEST(resolver_rust_cfg_twins_with_one_return_type_type_their_call);
+    RUN_TEST(resolver_rust_project_trait_on_a_primitive);
+    RUN_TEST(resolver_rust_inherent_impl_proves_a_macro_declared_type);
+    RUN_TEST(resolver_rust_pin_receiver_selects_the_pinned_type);
+    RUN_TEST(resolver_rust_item_passthrough_macro_declares_its_items);
+    RUN_TEST(resolver_rust_item_macro_is_read_per_package_and_import_wins);
+    RUN_TEST(resolver_rust_use_inside_item_macro_is_conditional);
+    RUN_TEST(resolver_rust_turbofish_call_is_a_call);
+    RUN_TEST(resolver_rust_workspace_patch_names_a_project_package);
+    RUN_TEST(resolver_rust_tuple_struct_constructor_is_a_call);
     RUN_TEST(resolver_rust_big_file_keeps_every_edge);
     RUN_TEST(resolver_rust_qualified_trait_path);
     RUN_TEST(resolver_rust_generic_signatures_at_a_use);

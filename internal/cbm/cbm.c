@@ -22,6 +22,7 @@
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
+#include "resolve/rust_macros.h"
 #include "lsp/lsp_work.h"
 #include "preprocessor.h"
 #include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
@@ -1159,14 +1160,122 @@ static char *csharp_parse_view(const char *source, uint32_t length, bool *hid_br
     return view;
 }
 
+/* Rust: every macro may be named `str` or `u8`, and edition 2015 calls `try!`, but the grammar
+ * reads those words as keywords, so snapbox's `str![[...]]` is an ERROR that voids the whole
+ * file for the name rules. This view has the same length and the same lines, with the first
+ * byte of such a macro's name changed to `_`. That makes the name an identifier and nothing
+ * else: node text comes from the source itself, and bytes inside a literal or a comment have
+ * no structure to change. NULL when no name needed it.
+ *
+ * Linear: each `!` looks back over one whitespace run and one bounded word, and whitespace
+ * runs end at the `!` that scanned them. */
+static char *rust_parse_view(const char *source, uint32_t length) {
+    static const char *const names[] = {"bool",  "char",  "str", "i8",  "i16",   "i32", "i64",
+                                        "i128",  "isize", "u8",  "u16", "u32",   "u64", "u128",
+                                        "usize", "f32",   "f64", "try", "async", NULL};
+    enum { LONGEST_NAME = 5 };
+    char *view = NULL;
+    for (const char *bang = source; (bang = memchr(bang, '!', (size_t)(source + length - bang)));
+         bang++) {
+        const char *after = bang + 1, *stop = source + length;
+        while (after < stop && isspace((unsigned char)*after))
+            after++;
+        if (after == stop || (*after != '(' && *after != '[' && *after != '{'))
+            continue;
+        const char *word_end = bang;
+        while (word_end > source && isspace((unsigned char)word_end[-1]))
+            word_end--;
+        const char *word = word_end;
+        while (word > source && word_end - word <= LONGEST_NAME &&
+               (isalnum((unsigned char)word[-1]) || word[-1] == '_'))
+            word--;
+        size_t size = (size_t)(word_end - word);
+        /* `r#try!` is already a name to the grammar, and `$str!` is a token of a macro body. */
+        if (!size || size > LONGEST_NAME || (word > source && (word[-1] == '#' || word[-1] == '$')))
+            continue;
+        bool reserved = false;
+        for (int i = 0; names[i] && !reserved; i++)
+            reserved = strlen(names[i]) == size && !memcmp(word, names[i], size);
+        if (!reserved)
+            continue;
+        if (!view) {
+            view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)length + 1);
+            if (!view)
+                return NULL;
+            memcpy(view, source, length);
+            view[length] = '\0';
+        }
+        view[word - source] = '_';
+    }
+    return view;
+}
+
+/* Whether what follows `new(` is an expression, which only Go 1.26 allows: a literal, or a name
+ * that goes on to be called, built or combined. A bare name, or anything starting a type, stays
+ * the type argument the grammar reads. */
+static bool go_new_takes_expression(const char *at, const char *stop) {
+    while (at < stop && (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r'))
+        at++;
+    if (at == stop)
+        return false;
+    unsigned char first = (unsigned char)*at;
+    if (isdigit(first) || (first && strchr("\"`'-+!^&", first)))
+        return true;
+    if (!isalpha(first) && first != '_' && first < 0x80)
+        return false;
+    const char *name = at;
+    while (at < stop &&
+           (isalnum((unsigned char)*at) || *at == '_' || *at == '.' || (unsigned char)*at >= 0x80))
+        at++;
+    size_t size = (size_t)(at - name);
+    if ((size == 4 && !strncmp(name, "true", 4)) || (size == 5 && !strncmp(name, "false", 5)))
+        return true;
+    /* Keywords that start a type never read as a value here. */
+    static const char *const type_words[] = {"map", "chan", "func", "struct", "interface", NULL};
+    for (int i = 0; type_words[i]; i++)
+        if (strlen(type_words[i]) == size && !strncmp(name, type_words[i], size))
+            return false;
+    while (at < stop && (*at == ' ' || *at == '\t'))
+        at++;
+    return at < stop && *at != ')' && *at != ',' && *at != '[' && *at != '\n' && *at != '\r';
+}
+
+/* Go: since 1.26 `new(uint64(1))` takes an expression, and the grammar reads an ERROR there, which
+ * costs the declaration around it. This view has the same length and the same lines, with such a
+ * `new` spelled `_ew`, which the grammar reads as an ordinary call. Node text comes from the
+ * source itself, so the name is still new. NULL when nothing needed it. Linear. */
+static char *go_parse_view(const char *source, uint32_t length) {
+    char *view = NULL;
+    const char *stop = source + length;
+    for (const char *at = source; (at = cbm_memmem(at, (size_t)(stop - at), "new", 3)); at += 3) {
+        bool starts = at == source || !(isalnum((unsigned char)at[-1]) || at[-1] == '_' ||
+                                        at[-1] == '.' || (unsigned char)at[-1] >= 0x80);
+        if (!starts || at + 3 >= stop || at[3] != '(' || !go_new_takes_expression(at + 4, stop))
+            continue;
+        if (!view) {
+            view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)length + 1);
+            if (!view)
+                return NULL;
+            memcpy(view, source, length);
+            view[length] = '\0';
+        }
+        view[at - source] = '_';
+    }
+    return view;
+}
+
 TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, const char *source,
                                       uint32_t source_len, TSParseOptions opts,
                                       TSTree **unrepaired) {
     TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
-    if (!tree || language != CBM_LANG_CSHARP || !ts_node_has_error(ts_tree_root_node(tree)))
+    bool rust = language == CBM_LANG_RUST, go = language == CBM_LANG_GO;
+    if (!tree || (language != CBM_LANG_CSHARP && !rust && !go) ||
+        !ts_node_has_error(ts_tree_root_node(tree)))
         return tree;
     bool hid_branch = false;
-    char *view = csharp_parse_view(source, source_len, &hid_branch);
+    char *view = rust ? rust_parse_view(source, source_len)
+                 : go ? go_parse_view(source, source_len)
+                      : csharp_parse_view(source, source_len, &hid_branch);
     if (!view)
         return tree;
     ts_parser_reset(parser);
@@ -1174,7 +1283,9 @@ TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, co
     cbm_free(CBM_MEM_CLASS_EXTRACT, view);
     if (!repaired)
         return tree;
-    if (parse_error_bytes(repaired) < parse_error_bytes(tree)) {
+    /* A MISSING token has no bytes, so a repair is also the parse with no error left. */
+    if (((rust || go) && !ts_node_has_error(ts_tree_root_node(repaired))) ||
+        parse_error_bytes(repaired) < parse_error_bytes(tree)) {
         if (unrepaired && hid_branch)
             *unrepaired = tree;
         else
@@ -1188,6 +1299,27 @@ TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, co
 TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
                                    uint32_t source_len, TSParseOptions opts) {
     return cbm_parse_source_repairing_ex(parser, language, source, source_len, opts, NULL);
+}
+
+TSTree *cbm_parse_rust_file(TSParser *parser, const char *rel_path, const char *source,
+                            uint32_t source_len, TSParseOptions opts) {
+    char *items = cbm_rust_item_view(rel_path, source, source_len);
+    if (!items)
+        return cbm_parse_source_repairing(parser, CBM_LANG_RUST, source, source_len, opts);
+    TSTree *tree = cbm_parse_source_repairing(parser, CBM_LANG_RUST, items, source_len, opts);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, items);
+    if (!tree || !ts_node_has_error(ts_tree_root_node(tree)))
+        return tree;
+    /* A body that did not read as items: the file as written decides, if it reads better. */
+    ts_parser_reset(parser);
+    TSTree *written = cbm_parse_source_repairing(parser, CBM_LANG_RUST, source, source_len, opts);
+    if (written && parse_error_bytes(written) <= parse_error_bytes(tree)) {
+        ts_tree_delete(tree);
+        return written;
+    }
+    if (written)
+        ts_tree_delete(written);
+    return tree;
 }
 
 static CBM_TLS TSParser *tl_parser = NULL;
@@ -4384,11 +4516,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     bool c_family = language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
     TSTree *unrepaired = NULL;
-    TSTree *tree =
-        c_family
-            ? cbm_parse_c_source_defined(parser, source, (uint32_t)source_len, opts, extra_defines)
-            : cbm_parse_source_repairing_ex(parser, language, source, (uint32_t)source_len, opts,
-                                            &unrepaired);
+    TSTree *tree = c_family ? cbm_parse_c_source_defined(parser, source, (uint32_t)source_len, opts,
+                                                         extra_defines)
+                   : language == CBM_LANG_RUST
+                       ? cbm_parse_rust_file(parser, rel_path, source, (uint32_t)source_len, opts)
+                       : cbm_parse_source_repairing_ex(parser, language, source,
+                                                       (uint32_t)source_len, opts, &unrepaired);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }

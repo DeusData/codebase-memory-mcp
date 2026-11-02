@@ -179,6 +179,21 @@ static bool is_void_macro(const char *name) {
     return false;
 }
 
+/* log, tracing, anyhow and eyre by the macro's last segment. This only surfaces the sites: whether
+ * the name really is one of theirs is proved by the resolver's walk. */
+static bool is_library_expr_macro(const char *name) {
+    static const char *m[] = {"trace",  "debug",  "info", "warn",       "error", "bail",
+                              "ensure", "anyhow", "eyre", "format_err", NULL};
+    const char *colon = strrchr(name, ':');
+    const char *tail = colon ? colon + 1 : name;
+    for (const char **p = m; *p; p++) {
+        if (strcmp(*p, tail) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Names of macros that produce a `String` value. */
 static bool is_string_macro(const char *name) {
     if (!name) {
@@ -4821,7 +4836,8 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                         strcmp(mname, "assert") == 0 || strcmp(mname, "assert_eq") == 0 ||
                         strcmp(mname, "assert_ne") == 0 || strcmp(mname, "debug_assert") == 0 ||
                         strcmp(mname, "debug_assert_eq") == 0 ||
-                        strcmp(mname, "debug_assert_ne") == 0 || strcmp(mname, "dbg") == 0;
+                        strcmp(mname, "debug_assert_ne") == 0 || strcmp(mname, "dbg") == 0 ||
+                        is_library_expr_macro(mname);
                     if (expr_arg_macro) {
                         rust_resolve_macro_arg_exprs(ctx, node);
                     }
@@ -6454,7 +6470,8 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_rust());
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        tree = cbm_parse_source_repairing(parser, CBM_LANG_RUST, source, (uint32_t)source_len,
+                                          (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -6489,7 +6506,8 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_rust());
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        tree = cbm_parse_source_repairing(parser, CBM_LANG_RUST, source, (uint32_t)source_len,
+                                          (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);

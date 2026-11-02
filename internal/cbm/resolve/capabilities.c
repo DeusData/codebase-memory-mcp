@@ -23,7 +23,8 @@ typedef struct {
 static const edge_row_t edge_rows[] = {
     {CBM_LANG_GO, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
      "Exact project package paths from the source's module, its go.mod replace directives and "
-     "the enclosing go.work; every other package abstains."},
+     "the enclosing go.work, also when another go.mod declares the same module path; every "
+     "other package abstains."},
     {CBM_LANG_C, C_EDGES,
      "Literal include paths, configured search roots, and a spelling only one project "
      "file can satisfy; translation-unit visibility through includes; unproved "
@@ -87,8 +88,9 @@ static const edge_row_t edge_rows[] = {
      "require_relative of a literal path, and require of a path under the lib directory of an "
      "ancestor of the importing file; other load paths and interpolation abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
-     "Cargo crates, module trees, use trees, re-exports and globs; macro-generated items and "
-     "unmodeled receiver types abstain."},
+     "Cargo crates, workspace [patch.crates-io] directories, module trees, use trees, re-exports "
+     "and globs; items a macro's definition passes through count as items. Other macro-generated "
+     "items and unmodeled receiver types abstain."},
     {CBM_LANG_SWIFT, EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "Modules from SwiftPM targets; lexical scope, extensions, inheritance and argument labels; "
      "declared and constructed receiver types. Xcode module membership abstains."},
@@ -271,10 +273,15 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = "Lexical scope, declared static types and Go's selector rule for "
-                          "embedding. Exported names behind an embedded type outside the project, "
-                          "a map's key type, a type parameter's constraint methods and competing "
-                          "targets abstain.";
+        out->limitation = "Lexical scope, declared static types including anonymous structs and "
+                          "types local to a function, function values by result position, a "
+                          "const list's implicit repetition, and Go's selector rule for "
+                          "embedding. The standard library's errors.AsType, slices.Clone, "
+                          "slices.All, slices.Backward and maps.All are read through. A "
+                          "conversion T(x) uses the type and calls nothing. Exported names "
+                          "behind an embedded type outside the project, a map's key type, a "
+                          "type parameter's constraint methods, methods declared through an "
+                          "alias and competing targets abstain.";
         break;
     case CBM_LANG_C:
     case CBM_LANG_CPP:
@@ -402,11 +409,16 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_TYPE_FLOW;
         out->limitation =
             "Cargo crates and module trees, use trees, re-exports, globs, same-module items, "
-            "inherent "
-            "and in-scope trait methods with autoderef, and declared receiver types. Items a macro "
-            "generates, variants as call targets, fields sharing a method's name and external "
-            "return "
-            "types abstain.";
+            "inherent and in-scope trait methods with autoderef, tuple struct constructors, "
+            "project "
+            "traits on external and primitive types, associated consts, raw pointer dereference, "
+            "and "
+            "declared receiver types. A macro_rules! whose definition passes its items through or "
+            "evaluates its expression arguments is read through, and so is pin_project_lite's "
+            "pin_project!. An inherent impl proves a type only a macro of its module can have "
+            "declared. Other items a macro generates, variants as call targets, fields sharing a "
+            "method's name, a name bound differently under two cfg configurations, and external "
+            "return types abstain.";
         break;
     case CBM_LANG_DART:
         out->adapter = "dart_source";

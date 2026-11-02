@@ -1842,6 +1842,383 @@ TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_s
 TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_parallel) {
     return declarations_case(true);
 }
+/* cli/cli keeps a CodeQL fixture whose go.mod declares the repository's own module path. Two
+ * directories then claim that path, but an import still means one of them: the importing
+ * package's own module, or the directory its go.mod's replace directive names. A module with
+ * neither takes that path from the module cache, so nothing in this tree is the target. */
+static int go_duplicate_module_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_go_dup_module");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "pkg/mock"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "api"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "fixture/pkg/mock"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "fixture/app"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "foreign"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "sibling"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example/cli/v2\ngo 1.22\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "fixture/go.mod"), "module example/cli/v2\ngo 1.22\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "foreign/go.mod"), "module example/foreign\ngo 1.22\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "sibling/go.mod"),
+                            "module example/sibling\ngo 1.22\n\n"
+                            "replace example/cli/v2 => ../\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/mock/mock.go"),
+                            "package mock\n\ntype Reg struct{}\n\n"
+                            "func New() *Reg { return nil }\n\n"
+                            "func (r *Reg) Verify() {}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "fixture/pkg/mock/mock.go"),
+                            "package mock\n\nfunc New() int { return 0 }\n"),
+              0);
+    const char *import = "import \"example/cli/v2/pkg/mock\"\n\n";
+    char body[256];
+    snprintf(body, sizeof(body), "package api\n\n%sfunc Run() {\n\tr := mock.New()\n\tr.Verify()\n}\n",
+             import);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "api/client.go"), body), 0);
+    snprintf(body, sizeof(body), "package app\n\n%sfunc Own() int { return mock.New() }\n", import);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "fixture/app/app.go"), body), 0);
+    snprintf(body, sizeof(body), "package foreign\n\n%sfunc Cached() { mock.New() }\n", import);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "foreign/use.go"), body), 0);
+    snprintf(body, sizeof(body), "package sibling\n\n%sfunc Replaced() { mock.New() }\n", import);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "sibling/use.go"), body), 0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.api.Run", "test.pkg.mock.New"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.api.Run", "test.pkg.mock.Reg.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.api.Run", "test.fixture.pkg.mock.New"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.fixture.app.Own", "test.fixture.pkg.mock.New"),
+              1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.fixture.app.Own", "test.pkg.mock.New"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.foreign.Cached", "test.pkg.mock.New"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.foreign.Cached", "test.fixture.pkg.mock.New"),
+              0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.sibling.Replaced", "test.pkg.mock.New"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.sibling.Replaced", "test.fixture.pkg.mock.New"),
+              0);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+/* Go 1.26's new(expr) is an ERROR to the grammar, which used to cost the declaration around it.
+ * A decoy method and a function that merely end in new stay what they are. */
+static int go_new_expression_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_go_new");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "pkg"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example\ngo 1.26\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/lib.go"),
+                            "package pkg\n\n"
+                            "type T struct{}\n\n"
+                            "func (t *T) M() {}\n\n"
+                            "func Make() T { return T{} }\n\n"
+                            "func helper() {}\n\n"
+                            "func renew(x int) {}\n\n"
+                            "type F struct{}\n\n"
+                            "func (f F) new(x int) {}\n\n"
+                            "func Literal() { x := new(\"text\"); _ = x; helper() }\n\n"
+                            "func Number() { _ = new(48 * 2); helper() }\n\n"
+                            "func Conversion(n int) { _ = new(uint64(n)); helper() }\n\n"
+                            "func CallResult() { new(Make()).M(); helper() }\n\n"
+                            "func Composite() { new(T{}).M() }\n\n"
+                            "func TypeArgument() { new(T).M() }\n\n"
+                            "func Others(f F) { renew(1); f.new(2) }\n"),
+              0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Literal", "test.pkg.helper"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Number", "test.pkg.helper"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Conversion", "test.pkg.helper"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.CallResult", "test.pkg.helper"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.CallResult", "test.pkg.Make"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.CallResult", "test.pkg.T.M"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Composite", "test.pkg.T.M"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.TypeArgument", "test.pkg.T.M"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Others", "test.pkg.renew"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Others", "test.pkg.F.new"), 1);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+TEST(resolver_stabilization_go_new_takes_an_expression_sequential) {
+    return go_new_expression_case(false);
+}
+TEST(resolver_stabilization_go_new_takes_an_expression_parallel) {
+    return go_new_expression_case(true);
+}
+/* A table test's []struct{...} and a field's []struct{...} are types written where they stand. A
+ * field holding a function with two results selects its declared results by position, and T(x)
+ * converts: the site uses the type and nothing is called, though T's own method still is. */
+static int go_anonymous_struct_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_go_anon");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "lib"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "app"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example\ngo 1.22\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "lib/lib.go"),
+                            "package lib\n\n"
+                            "type Reg struct{}\n\n"
+                            "func (r *Reg) Verify() {}\n\n"
+                            "type Level string\n\n"
+                            "func (l Level) Name() string { return string(l) }\n\n"
+                            "type Options struct {\n"
+                            "\tMake  func() (*Reg, error)\n"
+                            "\tOne   func() *Reg\n"
+                            "\tNodes []struct{ Inner *Reg }\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "app/app.go"),
+                            "package app\n\n"
+                            "import (\n\t\"example/lib\"\n\t\"example/external\"\n)\n\n"
+                            "type other struct{}\n\n"
+                            "func (o *other) Verify() {}\n\n"
+                            "func Table() {\n"
+                            "\tcases := []struct {\n\t\tname  string\n\t\tin    *lib.Reg\n"
+                            "\t\tlevel lib.Level\n\t}{{name: \"a\"}}\n"
+                            "\tfor _, tt := range cases {\n\t\ttt.in.Verify()\n"
+                            "\t\ttt.level.Name()\n\t}\n}\n\n"
+                            "func Decoy() {\n"
+                            "\tcases := []struct{ in *other }{}\n"
+                            "\tfor _, tt := range cases {\n\t\ttt.in.Verify()\n\t}\n}\n\n"
+                            "func Foreign() {\n"
+                            "\tc := struct{ in *external.T }{}\n"
+                            "\tc.in.Verify()\n}\n\n"
+                            "func Nested(o lib.Options) {\n"
+                            "\tfor _, n := range o.Nodes {\n\t\tn.Inner.Verify()\n\t}\n}\n\n"
+                            "func Tuple(o lib.Options) {\n"
+                            "\tr, err := o.Make()\n\t_ = err\n\tr.Verify()\n}\n\n"
+                            "func Second(o lib.Options) {\n"
+                            "\t_, r := o.Make()\n\tr.Verify()\n}\n\n"
+                            "func Single(o lib.Options) {\n\to.One().Verify()\n}\n\n"
+                            "func Convert(s string) lib.Level {\n\treturn lib.Level(s)\n}\n\n"
+                            "func Chain(s string) string {\n\treturn lib.Level(s).Name()\n}\n\n"
+                            "func pair() (*lib.Reg, error) {\n\treturn nil, nil\n}\n\n"
+                            "var global, _ = pair()\n\n"
+                            "func VarTuple() {\n\tvar (\n\t\tr, _ = pair()\n\t)\n\tr.Verify()\n}\n\n"
+                            "func GlobalTuple() {\n\tglobal.Verify()\n}\n\n"
+                            "func maker() func() *lib.Reg {\n\treturn nil\n}\n\n"
+                            "func ViaLocal() {\n\tmk := maker()\n\tmk()\n}\n"),
+              0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Table", "test.lib.Reg.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Table", "test.lib.Level.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Decoy", "test.app.other.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Decoy", "test.lib.Reg.Verify"), 0);
+    ASSERT_EQ(scalar(db, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                         "WHERE e.type='CALLS' AND s.qualified_name='test.app.Foreign'"),
+              0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Nested", "test.lib.Reg.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Tuple", "test.lib.Reg.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Second", "test.lib.Reg.Verify"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Single", "test.lib.Reg.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "USES_TYPE", "test.app.Convert", "test.lib.Level"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Convert", "test.lib.Level"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Chain", "test.lib.Level.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Chain", "test.lib.Level"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.VarTuple", "test.lib.Reg.Verify"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.GlobalTuple", "test.lib.Reg.Verify"), 1);
+    /* Calling a local function value names no type, whatever it returns. */
+    ASSERT_EQ(count_edge_between(db, "USES_TYPE", "test.app.ViaLocal", "test.lib.Reg"), 0);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+/* What a function value yields, by position, whatever declared it; a const list's implicit
+ * repetition; a local type; a variadic; two imports whose paths end alike; and the standard
+ * library generics whose results the call spells, only when the file really imports them. */
+static int go_function_values_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_go_fnvalues");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "lib"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "app"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "repo/v1"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "fake"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example\ngo 1.22\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "repo/v1/repo.go"),
+                            "package repo\n\nfunc Find() {}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "fake/fake.go"),
+                            "package fake\n\n"
+                            "type Decoy struct{}\n\nfunc (d *Decoy) Verify() {}\n\n"
+                            "func AsType[T any](v any) (*Decoy, bool) { return nil, false }\n\n"
+                            "func Backward(v any) []*Decoy { return nil }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "lib/lib.go"),
+                            "package lib\n\n"
+                            "type Reg struct{}\n\nfunc (r *Reg) Verify() {}\n\n"
+                            "type Level int\n\n"
+                            "const (\n\tLow Level = iota\n\tHigh\n\tTop\n)\n\n"
+                            "func (l Level) Name() string { return \"\" }\n\n"
+                            "type Fn func() (*Reg, error)\n\n"
+                            "type One func() *Reg\n\n"
+                            "type Cap struct{}\n\nfunc (c *Cap) Copy() *Cap { return c }\n\n"
+                            "var Default = func() *Cap { return &Cap{} }()\n"),
+              0);
+    ASSERT_EQ(
+        th_write_file(TH_PATH(repo, "app/app.go"),
+                      "package app\n\n"
+                      "import (\n\t\"errors\"\n\t\"slices\"\n\n"
+                      "\t\"example/lib\"\n\t\"example/repo/v1\"\n\tv1 \"k8s.io/api/core/v1\"\n)\n\n"
+                      "type other struct{}\n\nfunc (o *other) Verify() {}\n\n"
+                      "func Enum() string { return lib.High.Name() }\n\n"
+                      "func Literal() { lib.Default.Copy() }\n\n"
+                      "func Closure() {\n\tmk := func() (*lib.Reg, error) { return nil, nil }\n"
+                      "\tr, _ := mk()\n\tr.Verify()\n}\n\n"
+                      "func First() {\n\tmk := func() (*other, *lib.Reg) { return nil, nil }\n"
+                      "\tr, _ := mk()\n\tr.Verify()\n}\n\n"
+                      "func Last() {\n\tmk := func() (*other, *lib.Reg) { return nil, nil }\n"
+                      "\t_, s := mk()\n\ts.Verify()\n}\n\n"
+                      "func Param(mk func() (*lib.Reg, error)) {\n\tr, _ := mk()\n\tr.Verify()\n}\n\n"
+                      "func Named(mk lib.Fn) {\n\tr, _ := mk()\n\tr.Verify()\n}\n\n"
+                      "func NamedOne(mk lib.One) {\n\tmk().Verify()\n}\n\n"
+                      "func Reused(mk lib.Fn) {\n\tmk, err := mk()\n\t_ = err\n\tmk.Verify()\n}\n\n"
+                      "func Table() {\n\tfor _, tt := range []struct {\n"
+                      "\t\tmake func() (*lib.Reg, error)\n\t}{} {\n"
+                      "\t\tr, _ := tt.make()\n\t\tr.Verify()\n\t}\n}\n\n"
+                      "func TableOne() {\n\tfor _, tt := range []struct{ one func() *lib.Reg }{} {\n"
+                      "\t\ttt.one().Verify()\n\t}\n}\n\n"
+                      "func Local() {\n\ttype holder struct{ reg *lib.Reg }\n"
+                      "\tcases := []holder{}\n\tfor _, c := range cases {\n\t\tc.reg.Verify()\n\t}\n}\n\n"
+                      "func LocalShadow() {\n\ttype Reg struct{ inner *other }\n\tvar r Reg\n"
+                      "\tr.inner.Verify()\n}\n\n"
+                      "func Renamed(x *lib.Reg) {\n\ttype mine lib.Reg\n\tm := mine(*x)\n"
+                      "\tm.Verify()\n}\n\n"
+                      "func Many(rs ...lib.Reg) {\n\tfor _, r := range rs {\n\t\tr.Verify()\n\t}\n}\n\n"
+                      "func Immediately() {\n\tr, _ := func() (*lib.Reg, error) { return nil, nil }()\n"
+                      "\tr.Verify()\n}\n\n"
+                      "func ImmediatelyOne() {\n\tfunc() *lib.Reg { return nil }().Verify()\n}\n\n"
+                      "func Paths() {\n\trepo.Find()\n\tv1.Find()\n}\n\n"
+                      "func Received() {\n\tch := make(chan *lib.Reg)\n"
+                      "\tfor r := range ch {\n\t\tr.Verify()\n\t}\n}\n\n"
+                      "func ReceivedParam(ch <-chan *lib.Reg) {\n"
+                      "\tfor r := range ch {\n\t\tr.Verify()\n\t}\n}\n\n"
+                      "func Indexes(xs []*lib.Reg) {\n\tfor r := range xs {\n\t\tr.Verify()\n\t}\n}\n\n"
+                      "func Cast(err error) {\n\tif r, ok := errors.AsType[*lib.Reg](err); ok {\n"
+                      "\t\tr.Verify()\n\t}\n}\n\n"
+                      "func Backward(xs []*lib.Reg) {\n\tfor _, r := range slices.Backward(xs) {\n"
+                      "\t\tr.Verify()\n\t}\n}\n\n"
+                      "func Cloned(xs []*lib.Reg) {\n\tys := slices.Clone(xs)\n"
+                      "\tfor _, r := range ys {\n\t\tr.Verify()\n\t}\n}\n"),
+        0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "app/decoy.go"),
+                            "package app\n\n"
+                            "import (\n\terrors \"example/fake\"\n\tslices \"example/fake\"\n\n"
+                            "\t\"example/lib\"\n)\n\n"
+                            "func Imposter(err error) {\n"
+                            "\tif r, ok := errors.AsType[*lib.Reg](err); ok {\n\t\tr.Verify()\n\t}\n}\n\n"
+                            "func ImposterBackward(xs []*lib.Reg) {\n"
+                            "\tfor _, r := range slices.Backward(xs) {\n\t\tr.Verify()\n\t}\n}\n"),
+              0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    static const char reg_verify[] = "test.lib.Reg.Verify", other_verify[] = "test.app.other.Verify";
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Enum", "test.lib.Level.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Literal", "test.lib.Cap.Copy"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Closure", reg_verify), 1);
+    /* By position: the first name is not the second result. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.First", other_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.First", reg_verify), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Last", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Last", other_verify), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Param", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Named", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.NamedOne", reg_verify), 1);
+    /* The right side reads the parameter, which the left side then redeclares. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Reused", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Table", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.TableOne", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Local", reg_verify), 1);
+    /* A local type hides the package's, and has no methods of its own. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.LocalShadow", other_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.LocalShadow", reg_verify), 0);
+    /* `type mine lib.Reg` keeps the fields, not the methods. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Renamed", reg_verify), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Many", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Immediately", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.ImmediatelyOne", reg_verify), 1);
+    /* Package repo at path .../v1 beside an alias v1: two different names, and only one is ours. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Paths", "test.repo.v1.Find"), 1);
+    ASSERT_EQ(scalar(db, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                         "WHERE e.type='CALLS' AND s.qualified_name='test.app.Paths'"),
+              1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Received", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.ReceivedParam", reg_verify), 1);
+    /* Over a slice one variable is the index. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Indexes", reg_verify), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Cast", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Backward", reg_verify), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Cloned", reg_verify), 1);
+    /* The same spellings under an import that is not the standard library. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Imposter", reg_verify), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.ImposterBackward", reg_verify), 0);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+TEST(resolver_stabilization_go_function_values_by_position_sequential) {
+    return go_function_values_case(false);
+}
+TEST(resolver_stabilization_go_function_values_by_position_parallel) {
+    return go_function_values_case(true);
+}
+TEST(resolver_stabilization_go_anonymous_structs_and_conversions_sequential) {
+    return go_anonymous_struct_case(false);
+}
+TEST(resolver_stabilization_go_anonymous_structs_and_conversions_parallel) {
+    return go_anonymous_struct_case(true);
+}
+TEST(resolver_stabilization_go_duplicate_module_path_sequential) {
+    return go_duplicate_module_case(false);
+}
+TEST(resolver_stabilization_go_duplicate_module_path_parallel) {
+    return go_duplicate_module_case(true);
+}
 TEST(resolver_stabilization_go_pipeline_references_sequential) {
     return go_references_case(false);
 }
@@ -1952,6 +2329,14 @@ SUITE(resolver_stabilization) {
     RUN_TEST(resolver_stabilization_go_workspace_use_proves_a_listed_module);
     RUN_TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_sequential);
     RUN_TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_parallel);
+    RUN_TEST(resolver_stabilization_go_new_takes_an_expression_sequential);
+    RUN_TEST(resolver_stabilization_go_new_takes_an_expression_parallel);
+    RUN_TEST(resolver_stabilization_go_function_values_by_position_sequential);
+    RUN_TEST(resolver_stabilization_go_function_values_by_position_parallel);
+    RUN_TEST(resolver_stabilization_go_anonymous_structs_and_conversions_sequential);
+    RUN_TEST(resolver_stabilization_go_anonymous_structs_and_conversions_parallel);
+    RUN_TEST(resolver_stabilization_go_duplicate_module_path_sequential);
+    RUN_TEST(resolver_stabilization_go_duplicate_module_path_parallel);
     RUN_TEST(resolver_stabilization_go_pipeline_references_sequential);
     RUN_TEST(resolver_stabilization_go_pipeline_references_parallel);
     RUN_TEST(resolver_stabilization_go_pipeline_twins_and_package_level_sequential);

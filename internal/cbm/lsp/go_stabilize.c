@@ -10,6 +10,8 @@
 
 extern const TSLanguage *tree_sitter_go(void);
 
+const char cbm_go_type_conversion[] = "go_type_conversion";
+
 typedef struct go_support {
     const char *key;
     const cbm_resolve_proof_t *audit;
@@ -75,7 +77,10 @@ struct cbm_go_stabilization {
 };
 typedef struct go_local {
     const char *name, *fact, *declared_fact;
+    const char *local_type; /* `type T struct{...}` inside a function: T's own fact. */
+    TSNode signature;       /* The function type or literal a function value was declared with. */
     bool type_shadow, call_blocked, escaped, nonlocal;
+    bool channel; /* Declared as one: ranging over it yields elements, not indexes. */
     struct go_local *next;
 } go_local_t;
 typedef struct go_frame {
@@ -94,6 +99,7 @@ typedef struct {
     go_ref_t *refs;
     size_t ref_count, ref_capacity;
     go_frame_t *frame;
+    TSNode const_type, const_value; /* What a bare const_spec of this list repeats. */
     unsigned depth;
 } go_collect_t;
 
@@ -358,6 +364,33 @@ static const char *function_result(go_collect_t *c, TSNode node) {
     return total == 1 ? type_fact(c, field(named_child(result, 0), "type")) : GO_UNKNOWN;
 }
 static const char *type_fact_inner(go_collect_t *, TSNode);
+static void struct_members(go_collect_t *, const char *, TSNode, const cbm_resolve_proof_t *, bool);
+static go_type_info_t *type_info(cbm_go_stabilization_t *, const char *);
+/* A table test's `[]struct{ in *T }{...}` and a field's `[]struct{ X T }`: the literal is its own
+ * type, its fields are written right there, and it has no methods and no graph node. A fact per
+ * occurrence, so two identical literals are two facts with the same answers. */
+static const char *anonymous_struct(go_collect_t *c, TSNode node) {
+    const char *key = node_key(c, node, "anonymous-struct");
+    if (!remember(c, &key))
+        return key;
+    const char *qn = cbm_arena_sprintf(&c->call_arena, "%s.%s", c->module, key);
+    const cbm_resolve_proof_t *proof = audit(c, node, key, "source_type_annotation");
+    go_type_info_t *info = type_info(c->shared, qn);
+    if (!info) {
+        c->shared->failed = true;
+        return GO_UNKNOWN;
+    }
+    info->declared = true;
+    check(c, cbm_resolve_solver_leaf(
+                 c->shared->solver, key, CBM_SOLVER_KNOWN,
+                 (cbm_resolve_solver_value_t){.target = cbm_arena_strdup(c->shared->arena, qn),
+                                              .fact_kind = CBM_SOLVER_FACT_TYPE,
+                                              .type = cbm_type_named(c->shared->arena, qn),
+                                              .declaration_identity = key},
+                 proof));
+    struct_members(c, qn, node, proof, true);
+    return key;
+}
 static const char *type_fact(go_collect_t *c, TSNode node) {
     if (ts_node_is_null(node))
         return NULL;
@@ -386,9 +419,14 @@ static const char *type_fact_inner(go_collect_t *c, TSNode node) {
     /* So does calling a function value: Go has no way to range or index one that returns. */
     if (kind(node, "function_type"))
         return wrapped(c, node, function_result(c, node), CBM_TYPE_SLICE);
+    if (kind(node, "struct_type"))
+        return anonymous_struct(c, node);
     if (kind(node, "type_identifier")) {
         const char *name = text(c, node);
-        if (!name || local_binding(c, name) || universe_type(name))
+        const go_local_t *scoped = local_binding(c, name);
+        if (scoped && scoped->local_type)
+            return scoped->local_type;
+        if (!name || scoped || universe_type(name))
             return GO_UNKNOWN;
         return stable(c, cbm_arena_sprintf(&c->call_arena, "go/type:%s.%s", c->module, name));
     }
@@ -611,7 +649,10 @@ static const char *builtin_call(go_collect_t *c, TSNode node, TSNode function, b
     TSNode first = named_child(arguments, 0);
     if (!strcmp(name, "new")) {
         *handled = true;
-        return wrapped(c, node, type_fact(c, first), CBM_TYPE_POINTER);
+        /* Since Go 1.26 new(T(x)) and new(T{}) point at the value of an expression. */
+        bool value = kind(first, "call_expression") || kind(first, "composite_literal");
+        return wrapped(c, node, value ? expression(c, first) : type_fact(c, first),
+                       CBM_TYPE_POINTER);
     }
     if (!strcmp(name, "make")) {
         *handled = true;
@@ -619,6 +660,8 @@ static const char *builtin_call(go_collect_t *c, TSNode node, TSNode function, b
     }
     return NULL;
 }
+static const char *errors_as_type(go_collect_t *, TSNode);
+static bool std_call(go_collect_t *, TSNode, const char *, const char *);
 static const char *expression_inner(go_collect_t *c, TSNode node) {
     if (kind(node, "identifier")) {
         const char *name = text(c, node);
@@ -632,7 +675,11 @@ static const char *expression_inner(go_collect_t *c, TSNode node) {
         return type_fact(c, field(node, "type"));
     if (kind(node, "func_literal"))
         return wrapped(c, node, function_result(c, node), CBM_TYPE_SLICE);
-    if (kind(node, "type_assertion_expression") || kind(node, "type_conversion_expression"))
+    if (kind(node, "type_conversion_expression")) {
+        const char *found = errors_as_type(c, node);
+        return found ? found : type_fact(c, field(node, "type"));
+    }
+    if (kind(node, "type_assertion_expression"))
         return type_fact(c, field(node, "type"));
     if (kind(node, "selector_expression"))
         return selected_field(c, node);
@@ -658,6 +705,11 @@ static const char *expression_inner(go_collect_t *c, TSNode node) {
         const char *builtin = builtin_call(c, node, function, &handled);
         if (handled)
             return builtin;
+        /* `var Default = func() *T { ... }()`: the literal is called where it is written. */
+        if (kind(function, "func_literal"))
+            return function_result(c, function);
+        if (std_call(c, node, "slices", "Clone") && named_count(field(node, "arguments")))
+            return expression(c, named_child(field(node, "arguments"), 0));
         cbm_resolve_rule_t rule;
         const char *binding = callable(c, function, &rule);
         if (binding)
@@ -666,6 +718,8 @@ static const char *expression_inner(go_collect_t *c, TSNode node) {
          * callable, so what it yields is its declared result. */
         go_local_t *value =
             kind(function, "identifier") ? local_binding(c, text(c, function)) : NULL;
+        if (value && value->local_type)
+            return value->local_type; /* T(x) of a local type T. */
         if (value)
             return element_of(c, node, value->fact);
         if (!binding)
@@ -688,13 +742,83 @@ static const char *expression(go_collect_t *c, TSNode node) {
     c->depth--;
     return result;
 }
+/* Whether `package.member` names this member of this standard library package: the spelling alone
+ * says nothing, a file can import anything under that name. */
+static bool std_member(go_collect_t *c, const char *package, const char *member, const char *path,
+                       const char *wanted) {
+    if (!package || !member || strcmp(member, wanted) != 0 || local_binding(c, package))
+        return false;
+    for (int i = 0; i < c->result->imports.count; i++) {
+        const CBMImport *import = &c->result->imports.items[i];
+        if (import->local_name && !strcmp(import->local_name, package))
+            return import->module_path && !strcmp(import->module_path, path);
+    }
+    return false;
+}
+static bool std_call(go_collect_t *c, TSNode call, const char *path, const char *wanted) {
+    TSNode function = field(call, "function");
+    if (!kind(call, "call_expression") || !kind(function, "selector_expression"))
+        return false;
+    TSNode operand = field(function, "operand");
+    return kind(operand, "identifier") &&
+           std_member(c, text(c, operand), text(c, field(function, "field")), path, wanted);
+}
+/* `v, ok := errors.AsType[T](err)`, which the grammar reads as a conversion to a generic type. */
+static const char *errors_as_type(go_collect_t *c, TSNode conversion) {
+    TSNode type = field(conversion, "type");
+    TSNode named = kind(type, "generic_type") ? field(type, "type") : (TSNode){0};
+    TSNode arguments = field(type, "type_arguments");
+    if (!kind(named, "qualified_type") || named_count(arguments) != 1 ||
+        !std_member(c, text(c, field(named, "package")), text(c, field(named, "name")), "errors",
+                    "AsType"))
+        return NULL;
+    TSNode element = named_child(arguments, 0);
+    return type_fact(c, kind(element, "type_elem") ? named_child(element, 0) : element);
+}
+/* The index-th result a function type or literal declares. */
+static const char *declared_result(go_collect_t *c, TSNode function, unsigned index) {
+    TSNode result = field(function, "result");
+    if (ts_node_is_null(result))
+        return GO_UNKNOWN;
+    if (!kind(result, "parameter_list"))
+        return index == 0 ? type_fact(c, result) : GO_UNKNOWN;
+    unsigned first = 0;
+    for (uint32_t i = 0; i < named_count(result); i++) {
+        TSNode parameter = named_child(result, i);
+        first += result_names(parameter);
+        if (index < first)
+            return type_fact(c, field(parameter, "type"));
+    }
+    return GO_UNKNOWN;
+}
 /* The value `a, b := right` gives its index-th name. */
 static const char *tuple_element(go_collect_t *c, TSNode node, unsigned index) {
     while (kind(node, "parenthesized_expression") && named_count(node) == 1)
         node = named_child(node, 0);
     if (kind(node, "call_expression")) {
+        TSNode function = field(node, "function");
+        if (kind(function, "func_literal"))
+            return declared_result(c, function, index);
+        /* A local holds a function value of one static type: written where it was declared,
+         * or a named function type, whose results are registered under that name. */
+        const go_local_t *value =
+            kind(function, "identifier") ? local_binding(c, text(c, function)) : NULL;
+        if (value && !ts_node_is_null(value->signature))
+            return declared_result(c, value->signature, index);
+        if (value) {
+            if (!value->fact || value->fact == GO_UNKNOWN)
+                return GO_UNKNOWN;
+            const char *key =
+                cbm_arena_sprintf(&c->call_arena, "go/result-from#%u:%s", index, value->fact);
+            if (remember(c, &key))
+                check(c, cbm_resolve_solver_select(
+                             c->shared->solver, key, value->fact,
+                             cbm_arena_sprintf(&c->call_arena, "go/return#%u:", index), "",
+                             audit(c, node, key, "resolved_callable_tuple_return")));
+            return key;
+        }
         cbm_resolve_rule_t rule;
-        const char *binding = callable(c, field(node, "function"), &rule);
+        const char *binding = callable(c, function, &rule);
         if (!binding)
             return NULL;
         if (binding == GO_UNKNOWN)
@@ -791,6 +915,9 @@ static void bind_parameters(go_collect_t *c, TSNode parameters) {
     for (uint32_t i = 0; i < named_count(parameters); i++) {
         TSNode parameter = named_child(parameters, i);
         const char *fact = type_fact(c, field(parameter, "type"));
+        /* `xs ...T` is a []T inside the function. */
+        if (kind(parameter, "variadic_parameter_declaration"))
+            fact = wrapped(c, parameter, fact, CBM_TYPE_SLICE);
         reference_types(c, field(parameter, "type"), 0);
         for (uint32_t child = 0; child < ts_node_child_count(parameter); child++) {
             const char *role = ts_node_field_name_for_child(parameter, child);
@@ -801,6 +928,9 @@ static void bind_parameters(go_collect_t *c, TSNode parameters) {
                 if (binding) {
                     binding->call_blocked = true;
                     binding->declared_fact = fact;
+                    binding->channel = kind(field(parameter, "type"), "channel_type");
+                    if (kind(field(parameter, "type"), "function_type"))
+                        binding->signature = field(parameter, "type");
                 }
             }
         }
@@ -912,6 +1042,19 @@ static TSNode list_item(TSNode list, uint32_t index) {
 static uint32_t list_count(TSNode list) {
     return ts_node_is_null(list) ? 0 : kind(list, "expression_list") ? named_count(list) : 1;
 }
+static bool makes_channel(go_collect_t *c, TSNode value) {
+    TSNode function = field(value, "function");
+    if (!kind(value, "call_expression") || !kind(function, "identifier"))
+        return false;
+    const char *name = text(c, function);
+    return name && !strcmp(name, "make") && !local_binding(c, name) &&
+           kind(named_child(field(value, "arguments"), 0), "channel_type");
+}
+static void note_signature(go_collect_t *c, TSNode name, TSNode signature) {
+    go_local_t *item = local_binding(c, text(c, name));
+    if (item)
+        item->signature = signature;
+}
 static void assignment(go_collect_t *c, TSNode node, bool declaration) {
     TSNode left = field(node, "left"), right = field(node, "right");
     uint32_t names = list_count(left), values = list_count(right);
@@ -927,6 +1070,13 @@ static void assignment(go_collect_t *c, TSNode node, bool declaration) {
                            : values == 1   ? tuple_element(c, list_item(right, 0), i)
                                            : NULL;
         bind(c, name, fact, declaration);
+        if (declaration && names == values && kind(list_item(right, i), "func_literal"))
+            note_signature(c, name, list_item(right, i));
+        if (declaration && names == values && makes_channel(c, list_item(right, i))) {
+            go_local_t *item = local_binding(c, text(c, name));
+            if (item)
+                item->channel = true;
+        }
     }
 }
 static void range_clause(go_collect_t *c, TSNode node) {
@@ -934,11 +1084,20 @@ static void range_clause(go_collect_t *c, TSNode node) {
     walk_calls(c, right, 0);
     bool declaration = has_token(node, ":=");
     uint32_t names = list_count(left);
-    const char *container = names > 1 ? expression(c, right) : NULL;
+    /* A channel has no index: its only variable is the element. */
+    const go_local_t *source = kind(right, "identifier") ? local_binding(c, text(c, right)) : NULL;
+    bool received = names == 1 && source && source->channel;
+    /* slices.Backward(xs), slices.All(xs) and maps.All(m) iterate what they were given. */
+    TSNode iterated =
+        names > 1 && (std_call(c, right, "slices", "Backward") ||
+                      std_call(c, right, "slices", "All") || std_call(c, right, "maps", "All"))
+            ? named_child(field(right, "arguments"), 0)
+            : right;
+    const char *container = names > 1 || received ? expression(c, iterated) : NULL;
     for (uint32_t i = 0; i < names; i++) {
         TSNode name = list_item(left, i);
         if (kind(name, "identifier"))
-            bind(c, name, i == 1 ? element_of(c, right, container) : NULL, declaration);
+            bind(c, name, i == 1 || received ? element_of(c, right, container) : NULL, declaration);
     }
 }
 /* Every statement of one switch or select arm, in that arm's own frame. */
@@ -994,6 +1153,20 @@ static void switch_statement(go_collect_t *c, TSNode node, unsigned depth, bool 
     }
     pop_frame(c);
 }
+/* Inside a parenthesized const list a spec without values repeats the last one that has them,
+ * type included: `const (A T = iota; B; C)` makes all three T. */
+static bool const_spec_repeats(go_collect_t *c, TSNode spec, TSNode *annotation, TSNode *value) {
+    if (!kind(spec, "const_spec"))
+        return false;
+    if (ts_node_is_null(*value)) {
+        *annotation = c->const_type;
+        *value = c->const_value;
+        return true;
+    }
+    c->const_type = *annotation;
+    c->const_value = *value;
+    return false;
+}
 static void statement(go_collect_t *c, TSNode node, unsigned depth) {
     if (ts_node_is_null(node) || depth >= 64)
         return;
@@ -1012,8 +1185,19 @@ static void statement(go_collect_t *c, TSNode node, unsigned depth) {
         for (uint32_t i = 0; i < named_count(node); i++) {
             TSNode declaration = named_child(node, i);
             TSNode name = field(declaration, "name");
-            if (!ts_node_is_null(name))
-                shadow(c, name, true);
+            if (ts_node_is_null(name))
+                continue;
+            shadow(c, name, true);
+            /* No method can be declared inside a function, so what a local struct selects is
+             * written right here. `type T U` drops U's methods, and is left unknown, as a local
+             * alias is. */
+            TSNode declared = field(declaration, "type");
+            bool renamed = kind(declaration, "type_alias") || kind(declared, "type_identifier") ||
+                           kind(declared, "qualified_type") || kind(declared, "generic_type");
+            go_local_t *item = local_binding(c, text(c, name));
+            reference_types(c, declared, 0);
+            if (item && !renamed)
+                item->local_type = type_fact(c, declared);
         }
         return;
     }
@@ -1027,30 +1211,47 @@ static void statement(go_collect_t *c, TSNode node, unsigned depth) {
     }
     if (kind(node, "var_declaration") || kind(node, "const_declaration") ||
         kind(node, "var_spec_list")) {
+        c->const_type = c->const_value = (TSNode){0};
         for (uint32_t i = 0; i < named_count(node); i++)
             statement(c, named_child(node, i), depth + 1);
         return;
     }
     if (kind(node, "var_spec") || kind(node, "const_spec")) {
         TSNode annotation = field(node, "type"), value = field(node, "value");
-        walk_calls(c, value, 0);
-        reference_types(c, annotation, 0);
-        const char *fact = !ts_node_is_null(annotation) ? type_fact(c, annotation)
-                           : named_count(value) == 1    ? expression(c, named_child(value, 0))
-                                                        : NULL;
+        bool repeated = const_spec_repeats(c, node, &annotation, &value);
+        if (!repeated) {
+            walk_calls(c, value, 0);
+            reference_types(c, annotation, 0);
+        }
+        const char *annotated = !ts_node_is_null(annotation) ? type_fact(c, annotation) : NULL;
         unsigned names = 0;
         for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
             const char *role = ts_node_field_name_for_child(node, i);
             names += role && !strcmp(role, "name");
         }
+        unsigned index = 0;
         for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
             const char *role = ts_node_field_name_for_child(node, i);
             if (role && !strcmp(role, "name")) {
                 TSNode name = ts_node_child(node, i);
-                bind(c, name, !ts_node_is_null(annotation) || names == 1 ? fact : NULL, true);
+                /* `var a, b = f()` takes f's results by position, as `a, b := f()` does. */
+                const char *fact =
+                    !ts_node_is_null(annotation) ? annotated
+                    : names == list_count(value) ? expression(c, list_item(value, index))
+                    : list_count(value) == 1     ? tuple_element(c, list_item(value, 0), index)
+                                                 : NULL;
+                TSNode initial = names == list_count(value) ? list_item(value, index) : (TSNode){0};
+                index++;
+                bind(c, name, fact, true);
                 go_local_t *item = local_binding(c, text(c, name));
                 if (item && !ts_node_is_null(annotation))
-                    item->declared_fact = fact;
+                    item->declared_fact = annotated;
+                if (item && kind(annotation, "channel_type"))
+                    item->channel = true;
+                if (kind(annotation, "function_type"))
+                    note_signature(c, name, annotation);
+                else if (ts_node_is_null(annotation) && kind(initial, "func_literal"))
+                    note_signature(c, name, initial);
             }
         }
         return;
@@ -1178,16 +1379,17 @@ static void publish_member(cbm_go_stabilization_t *state, const char *qn, const 
                 !domain || !contribute_domain(state, domain, member->declaration, member->proof);
         }
         if (member->field) {
-            if (member->key == GO_UNKNOWN)
-                continue;
-            const char *prefix = member_prefix(state->arena, member->module, member->name,
-                                               "go/field:", "go/private-field:");
-            const char *domain =
-                identity && prefix
-                    ? cbm_arena_sprintf(state->arena, "%s%s.%s", prefix, identity, member->name)
-                    : NULL;
-            state->failed |=
-                !domain || !contribute_domain(state, domain, member->key, member->proof);
+            /* A function with several results has no one value type, but is still selected. */
+            if (member->key != GO_UNKNOWN) {
+                const char *prefix = member_prefix(state->arena, member->module, member->name,
+                                                   "go/field:", "go/private-field:");
+                const char *domain =
+                    identity && prefix
+                        ? cbm_arena_sprintf(state->arena, "%s%s.%s", prefix, identity, member->name)
+                        : NULL;
+                state->failed |=
+                    !domain || !contribute_domain(state, domain, member->key, member->proof);
+            }
             if (!member->function_value || !member->declaration)
                 continue;
         }
@@ -1337,23 +1539,37 @@ static void shadow_type_parameters(go_collect_t *c, TSNode node) {
     }
 }
 /* The fact naming one extracted declaration, or NULL when extraction has none. */
-static const char *declared_name(go_collect_t *c, TSNode node, TSNode name,
-                                 const cbm_resolve_proof_t *proof) {
-    const CBMDefinition *def = definition(c, node, name);
-    if (!def || !def->qualified_name)
-        return NULL;
+static const char *declared_target(go_collect_t *c, TSNode name, const char *target,
+                                   const cbm_resolve_proof_t *proof) {
     const char *key = node_key(c, name, "declared-name");
     if (remember(c, &key))
         check(c, cbm_resolve_solver_leaf(
                      c->shared->solver, key, CBM_SOLVER_KNOWN,
-                     (cbm_resolve_solver_value_t){.target = def->qualified_name,
+                     (cbm_resolve_solver_value_t){.target = target,
                                                   .fact_kind = CBM_SOLVER_FACT_BINDING,
                                                   .declaration_identity = key},
                      proof));
     return key;
 }
+static const char *declared_name(go_collect_t *c, TSNode node, TSNode name,
+                                 const cbm_resolve_proof_t *proof) {
+    const CBMDefinition *def = definition(c, node, name);
+    return def && def->qualified_name ? declared_target(c, name, def->qualified_name, proof) : NULL;
+}
+static void declared_returns(go_collect_t *c, TSNode node, const char *qn,
+                             const cbm_resolve_proof_t *proof);
+/* `func() (*T, error)`: several results, so no one value type, but each has its own. */
+static bool several_results(TSNode function_type) {
+    TSNode result = field(function_type, "result");
+    if (ts_node_is_null(result) || !kind(result, "parameter_list"))
+        return false;
+    unsigned total = 0;
+    for (uint32_t i = 0; i < named_count(result); i++)
+        total += result_names(named_child(result, i));
+    return total > 1;
+}
 static void struct_members(go_collect_t *c, const char *qn, TSNode declared,
-                           const cbm_resolve_proof_t *proof) {
+                           const cbm_resolve_proof_t *proof, bool anonymous) {
     TSNode list = {0};
     for (uint32_t i = 0; i < named_count(declared); i++)
         if (kind(named_child(declared, i), "field_declaration_list"))
@@ -1372,15 +1588,21 @@ static void struct_members(go_collect_t *c, const char *qn, TSNode declared,
                 TSNode name = ts_node_child(member, child);
                 const char *declaration = declared_name(c, member, name, proof);
                 const CBMDefinition *def = definition(c, member, name);
-                bool function_value = kind(type, "function_type") && declaration && def;
+                const char *field_qn = def ? def->qualified_name : NULL;
+                /* Selecting one only ever yields its result's type: `func() int` has none. */
+                bool yields =
+                    kind(type, "function_type") && (fact != GO_UNKNOWN || several_results(type));
+                /* A field of a struct literal has no graph node. It still has a declared result:
+                 * `tt.setup()`. A name nothing can emit, so that only the type comes of this. */
+                if (yields && !def && anonymous) {
+                    field_qn = cbm_arena_sprintf(c->shared->arena, "%s.%s", qn, text(c, name));
+                    declaration = field_qn ? declared_target(c, name, field_qn, proof) : NULL;
+                }
+                bool function_value = yields && declaration && field_qn;
                 add_member(c, qn, text(c, name), fact, declaration, proof, true, false,
                            function_value);
-                const char *result = function_value ? function_result(c, type) : NULL;
-                if (result && result != GO_UNKNOWN)
-                    check(c, contribute(c,
-                                        cbm_arena_sprintf(&c->call_arena, "go/return:%s",
-                                                          def->qualified_name),
-                                        result, proof));
+                if (function_value)
+                    declared_returns(c, type, field_qn, proof);
             }
         }
         if (named)
@@ -1480,7 +1702,7 @@ static void type_declaration(go_collect_t *c, TSNode node, const CBMDefinition *
                 info->underlying = named_type_qn(c, declared);
         }
         if (kind(declared, "struct_type"))
-            struct_members(c, qn, declared, proof);
+            struct_members(c, qn, declared, proof, false);
         else if (kind(declared, "interface_type"))
             interface_members(c, qn, declared, proof);
         const char *element = NULL;
@@ -1489,6 +1711,13 @@ static void type_declaration(go_collect_t *c, TSNode node, const CBMDefinition *
             element = type_fact(c, field(declared, "element"));
         else if (kind(declared, "map_type") || kind(declared, "channel_type"))
             element = type_fact(c, field(declared, "value"));
+        /* Calling a value of `type F func() R` yields R, as for a function type written out.
+         * F(x) still converts to F, so one result cannot live under go/return:F. */
+        else if (kind(declared, "function_type")) {
+            element = function_result(c, declared);
+            if (several_results(declared))
+                declared_returns(c, declared, def ? def->qualified_name : qn, proof);
+        }
         const char *identity = element && element != GO_UNKNOWN
                                    ? cbm_resolve_solver_type_identity(&c->call_arena, named)
                                    : NULL;
@@ -1563,6 +1792,7 @@ static void declaration(go_collect_t *c, TSNode node) {
 static void package_values(go_collect_t *c, TSNode node) {
     if (kind(node, "var_declaration") || kind(node, "const_declaration") ||
         kind(node, "var_spec_list")) {
+        c->const_type = c->const_value = (TSNode){0};
         for (uint32_t i = 0; i < named_count(node); i++)
             package_values(c, named_child(node, i));
         return;
@@ -1570,9 +1800,12 @@ static void package_values(go_collect_t *c, TSNode node) {
     if (!kind(node, "var_spec") && !kind(node, "const_spec"))
         return;
     TSNode annotation = field(node, "type"), value = field(node, "value");
+    bool repeated = const_spec_repeats(c, node, &annotation, &value);
     c->scope = c->module;
-    walk_calls(c, value, 0);
-    reference_types(c, annotation, 0);
+    if (!repeated) {
+        walk_calls(c, value, 0);
+        reference_types(c, annotation, 0);
+    }
     unsigned names = 0;
     for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
         const char *role = ts_node_field_name_for_child(node, i);
@@ -1594,7 +1827,8 @@ static void package_values(go_collect_t *c, TSNode node) {
                              named_declaration, declared));
         const char *fact = !ts_node_is_null(annotation) ? type_fact(c, annotation)
                            : names == list_count(value) ? expression(c, list_item(value, index))
-                                                        : NULL;
+                           : list_count(value) == 1 ? tuple_element(c, list_item(value, 0), index)
+                                                    : NULL;
         index++;
         if (fact && fact != GO_UNKNOWN && name && strcmp(name, "_"))
             check(c,
@@ -1767,7 +2001,8 @@ bool cbm_go_stabilization_collect(cbm_go_stabilization_t *state, const CBMFileRe
     if (!parser)
         return false;
     ts_parser_set_language(parser, tree_sitter_go());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_source_repairing(parser, CBM_LANG_GO, source, (uint32_t)length,
+                                              (TSParseOptions){0});
     ts_parser_delete(parser);
     if (!tree)
         return false;
@@ -1838,11 +2073,15 @@ bool cbm_go_stabilization_collect(cbm_go_stabilization_t *state, const CBMFileRe
         !strcmp(imports->source.content_identity, context->content_identity) &&
         imports->source.configuration_identity && context->configuration_identity &&
         !strcmp(imports->source.configuration_identity, context->configuration_identity);
+    /* `v1 "k8s.io/api/core/v1"` beside `"example/repo/v1"` of package repo: two names, however
+     * alike their paths end. */
     for (int i = 0; import_counts && i < result->imports.count; i++) {
         const CBMImport *import = &result->imports.items[i];
-        if (import->local_name)
-            put(&c, import_counts, import->local_name,
-                cbm_ht_get(import_counts, import->local_name) ? &c : (void *)import);
+        if (!import->local_name)
+            continue;
+        const char *bound =
+            import_binding_name(state, import, snapshot ? &imports->items[i] : NULL);
+        put(&c, import_counts, bound, cbm_ht_get(import_counts, bound) ? &c : (void *)import);
     }
     for (int i = 0; import_counts && i < result->imports.count; i++) {
         const CBMImport *import = &result->imports.items[i];
@@ -1856,7 +2095,7 @@ bool cbm_go_stabilization_collect(cbm_go_stabilization_t *state, const CBMFileRe
         if (cbm_ht_get(c.imports, bound))
             continue;
         put(&c, c.imports, bound, (void *)key);
-        bool unique = cbm_ht_get(import_counts, name) != &c;
+        bool unique = cbm_ht_get(import_counts, bound) != &c;
         bool known = unique && fact && fact->closed && fact->local_name &&
                      !strcmp(fact->local_name, name) && fact->module_path && import->module_path &&
                      !strcmp(fact->module_path, import->module_path) &&
@@ -2121,17 +2360,24 @@ bool cbm_go_stabilization_seal(cbm_go_stabilization_t *state) {
         cbm_resolve_solver_get(state->solver, site->key, &binding);
         cbm_resolve_result_t result = {.analysis = CBM_RESOLVE_ANALYSIS_UNKNOWN,
                                        .reason = "shared_binding_type_fixed_point"};
+        /* T(x) has the syntax of a call and selects the type's declaration. Calling a local
+         * function value also reaches a type, the one it returns, but names no type here. */
+        bool conversion = binding.status == CBM_SOLVER_KNOWN &&
+                          binding.value.fact_kind == CBM_SOLVER_FACT_TYPE &&
+                          strncmp(site->key, "go/callable-from:", 17) != 0;
+        const char *role = conversion ? "USES_TYPE" : "CALLS";
         switch (binding.status) {
         case CBM_SOLVER_KNOWN:
-            result = (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_UNIQUE,
-                                            .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-                                            .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-                                            .rule = site->rule,
-                                            .facts = cbm_resolve_rule_required_facts(site->rule) |
-                                                     CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-                                            .target = binding.value.target,
-                                            .candidate_count = 1,
-                                            .reason = "shared_binding_type_fixed_point"};
+            result = (cbm_resolve_result_t){
+                .binding = CBM_RESOLVE_BINDING_UNIQUE,
+                .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                .rule = site->rule,
+                .facts =
+                    cbm_resolve_rule_required_facts(site->rule) | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+                .target = binding.value.target,
+                .candidate_count = 1,
+                .reason = conversion ? cbm_go_type_conversion : "shared_binding_type_fixed_point"};
             break;
         case CBM_SOLVER_AMBIGUOUS:
             result.binding = CBM_RESOLVE_BINDING_AMBIGUOUS;
@@ -2162,14 +2408,14 @@ bool cbm_go_stabilization_seal(cbm_go_stabilization_t *state) {
                                             .start_byte = site->start,
                                             .end_byte = site->end,
                                             .lookup_closed = true,
-                                            .detail = "CALLS"};
+                                            .detail = role};
             cbm_resolve_result_t observed = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE};
             const cbm_resolve_proof_t *audited = cbm_resolve_proof_leaf(
                 state->proofs, CBM_PROOF_SOURCE_FACT, &source, &fact, &observed);
             cbm_resolve_proof_key_t key = {.lookup_domain = site->scope,
                                            .lookup_key = site->spelling,
                                            .binding_identity = result.target,
-                                           .detail = "CALLS",
+                                           .detail = role,
                                            .start_byte = site->start,
                                            .end_byte = site->end,
                                            .lookup_closed = binding.predecessors_closed};

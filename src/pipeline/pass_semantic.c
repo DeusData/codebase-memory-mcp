@@ -1003,7 +1003,11 @@ static bool semantic_source_facts(cbm_semantic_bindings_t *bindings, cbm_pipelin
     if (!tree) {
         TSParser *parser = ts_parser_new();
         if (parser && ts_parser_set_language(parser, cbm_ts_language(info->language)))
-            owned_tree = cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
+            owned_tree =
+                info->language == CBM_LANG_RUST
+                    ? cbm_parse_rust_file(parser, info->rel_path, source, (uint32_t)length,
+                                          (TSParseOptions){0})
+                    : cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
         if (parser)
             ts_parser_delete(parser);
         tree = owned_tree;

@@ -48,9 +48,15 @@ struct rs_type {
     const rs_type_t *inner;
     rs_item_t **traits;
     int ntraits;
+    bool projected; /* what project() returned: fields read through the projection */
+    /* RT_PARAM: its bounds as written, the external ones included. */
+    rs_tsyn_t *const *bounds;
+    int nbounds;
 };
 
 static const rs_type_t RS_UNKNOWN_TYPE = {.kind = RT_UNKNOWN};
+/* A raw pointer has no autoderef: only an explicit `*p` reaches what it points at. */
+static const char RS_RAW_POINTER[] = "std::ptr::raw";
 static const rs_type_t RS_UNIT_TYPE = {.kind = RT_UNIT};
 
 typedef struct rs_binding {
@@ -261,6 +267,8 @@ static const rs_type_t *rs_param_type(rs_env_t *env, const char *name, rs_tsyn_t
     if (!type)
         return &RS_UNKNOWN_TYPE;
     type->name = name;
+    type->bounds = bounds;
+    type->nbounds = nbounds;
     if (nbounds > 0) {
         type->traits = cbm_arena_calloc(env->q->arena, (size_t)nbounds * sizeof(*type->traits));
         for (int i = 0; type->traits && i < nbounds; i++) {
@@ -398,6 +406,8 @@ static const rs_type_t *rs_lower(rs_env_t *env, const rs_tsyn_t *syn) {
             type->name = syn->prim;
         return type ? type : &RS_UNKNOWN_TYPE;
     }
+    case RS_TS_PTR:
+        return rs_ext_type(env->q->arena, RS_RAW_POINTER, rs_lower(env, syn->inner), NULL);
     case RS_TS_REF:
         return rs_ref_of(arena, rs_lower(env, syn->inner));
     case RS_TS_UNIT:
@@ -471,6 +481,17 @@ void rs_settle_impl(rs_query_t *q, rs_impl_t *impl, rs_inst_t *inst) {
             rs_attach_impl(trait, impl);
         return;
     }
+    /* `impl Tr for &str`, `impl Tr for u32`: the type is std's, the trait this project's. */
+    if (self_syn->kind == RS_TS_PRIM && self_syn->prim) {
+        impl->ext_path = self_syn->prim;
+        if (!project->ext_impls)
+            project->ext_impls = cbm_ht_create(16);
+        if (project->ext_impls) {
+            impl->next_self = cbm_ht_get(project->ext_impls, impl->ext_path);
+            cbm_ht_set(project->ext_impls, impl->ext_path, impl);
+        }
+        return;
+    }
     if (self_syn->kind != RS_TS_PATH || !self_syn->nseg)
         return;
     if (self_syn->nseg == 1 && rs_generics_has(impl->generics, self_syn->segs[0])) {
@@ -493,8 +514,12 @@ void rs_settle_impl(rs_query_t *q, rs_impl_t *impl, rs_inst_t *inst) {
     } else if (ent.kind == RS_ENT_EXTERNAL || ent.kind == RS_ENT_PRELUDE ||
                ent.kind == RS_ENT_BUILTIN) {
         impl->ext_path = rs_normal_ext_path(q->arena, ent.external_path);
-        impl->next_self = project->ext_impls;
-        project->ext_impls = impl;
+        if (!project->ext_impls)
+            project->ext_impls = cbm_ht_create(16);
+        if (project->ext_impls && impl->ext_path) {
+            impl->next_self = cbm_ht_get(project->ext_impls, impl->ext_path);
+            cbm_ht_set(project->ext_impls, impl->ext_path, impl);
+        }
     }
 }
 
@@ -598,7 +623,12 @@ static void rs_emit(rs_walk_t *w, cbm_rust_site_kind_t kind, uint32_t start, uin
                             .target = sel->target,
                             .label = sel->label,
                             .rule = sel->rule,
-                            .facts = sel->target ? rs_rule_facts(sel->rule) : 0,
+                            /* A tuple struct's name is its constructor function. */
+                            .facts = sel->target ? rs_rule_facts(sel->rule) |
+                                                       (kind == CBM_RUST_SITE_CALL && sel->ctor
+                                                            ? CBM_RESOLVE_FACT_CLASS_CALLABLE
+                                                            : 0)
+                                                 : 0,
                             .binding = sel->binding,
                             .domain = sel->domain,
                             .analysis = sel->analysis,
@@ -689,6 +719,10 @@ static bool rs_inst_binds_trait(rs_walk_t *w, rs_inst_t *inst, const rs_item_t *
 }
 
 static bool rs_trait_in_scope(rs_walk_t *w, const rs_item_t *trait) {
+    /* The compiler puts the trait being implemented in scope inside its own impl, written by
+     * path or not: `impl lib::Config for Mine { fn url(&self) { self.inner.url() } }`. */
+    if (w->impl && w->impl->trait_item == trait)
+        return true;
     for (int i = w->nblocks - 1; i >= 0; i--)
         if (rs_inst_binds_trait(w, w->blocks[i], trait))
             return true;
@@ -813,6 +847,12 @@ static void rs_pick_on_item(rs_walk_t *w, const rs_item_t *item, const rs_type_t
         pick->reason = "rust_inherent_method";
         return;
     }
+    /* The macro may have written an inherent method of this name, which would come first. */
+    if (item->macro_declared && (trait_fn || trait_ambiguous)) {
+        pick->stop = true;
+        pick->reason = "rust_macro_declared_item";
+        return;
+    }
     if (trait_ambiguous) {
         pick->ambiguous = true;
         pick->stop = true;
@@ -845,6 +885,38 @@ static const rs_fn_t *rs_trait_member(rs_walk_t *w, const rs_item_t *trait, cons
     return NULL;
 }
 
+static bool rs_trait_in_scope(rs_walk_t *w, const rs_item_t *trait);
+static const char *rs_bound_last_segment(const rs_tsyn_t *syn) {
+    return syn && syn->kind == RS_TS_PATH && syn->nseg ? syn->segs[syn->nseg - 1] : NULL;
+}
+
+/* `impl<St: Stream> StreamExt for St` serves `s: S` where `S: Stream`, whatever Stream is. Every
+ * bound the impl states must be stated on the parameter: nothing else is known about it. */
+static bool rs_param_meets_blanket(const rs_type_t *type, const rs_impl_t *impl) {
+    const rs_generics_t *generics = impl->generics;
+    const char *param =
+        impl->self_syn && impl->self_syn->kind == RS_TS_PATH && impl->self_syn->nseg == 1
+            ? impl->self_syn->segs[0]
+            : NULL;
+    bool some_bound = false;
+    for (int i = 0; param && generics && i < generics->count; i++) {
+        if (strcmp(generics->names[i], param) != 0)
+            continue;
+        for (int b = 0; b < generics->nbounds[i]; b++) {
+            const char *wanted = rs_bound_last_segment(generics->bounds[i][b]);
+            bool stated = false;
+            for (int have = 0; wanted && !stated && have < type->nbounds; have++) {
+                const char *written = rs_bound_last_segment(type->bounds[have]);
+                stated = written && !strcmp(written, wanted);
+            }
+            if (!stated)
+                return false;
+            some_bound = true;
+        }
+    }
+    return some_bound;
+}
+
 static void rs_pick_on_param(rs_walk_t *w, const rs_type_t *type, const char *name, bool need_self,
                              rs_pick_t *pick) {
     const rs_fn_t *found = NULL;
@@ -864,6 +936,27 @@ static void rs_pick_on_param(rs_walk_t *w, const rs_type_t *type, const char *na
         pick->fn = found;
         pick->self_ty = type;
         pick->reason = "rust_trait_bound_method";
+        return;
+    }
+    for (const rs_impl_t *impl = w->project->blanket_impls; impl; impl = impl->next_self) {
+        const rs_fn_t *fn = rs_fn_in(impl->methods, name, need_self);
+        if (!fn && impl->trait_item)
+            fn = rs_fn_in(impl->trait_item->methods, name, need_self);
+        if (!fn || !impl->trait_item || !rs_trait_in_scope(w, impl->trait_item) ||
+            !rs_param_meets_blanket(type, impl))
+            continue;
+        if (found && !rs_same_fn(found, fn)) {
+            pick->ambiguous = true;
+            pick->stop = true;
+            pick->reason = "rust_trait_methods_ambiguous";
+            return;
+        }
+        found = fn;
+    }
+    if (found) {
+        pick->fn = found;
+        pick->self_ty = type;
+        pick->reason = "rust_blanket_impl_method";
     }
 }
 
@@ -904,9 +997,9 @@ static bool rs_deref_wrapper(const rs_type_t *type) {
 /* Methods the wrapper answers itself; everything else autoderefs to its content. */
 static bool rs_wrapper_own_method(const char *name) {
     static const char *const own[] = {
-        "clone",    "as_ref",    "as_mut",  "borrow",     "borrow_mut",  "into", "try_into",
-        "to_owned", "eq",        "ne",      "cmp",        "partial_cmp", "hash", "fmt",
-        "deref",    "deref_mut", "type_id", "into_owned", "to_mut",      NULL};
+        "clone",    "as_ref",    "as_mut",  "borrow",     "borrow_mut",  "into",       "try_into",
+        "to_owned", "eq",        "ne",      "cmp",        "partial_cmp", "hash",       "fmt",
+        "deref",    "deref_mut", "type_id", "into_owned", "to_mut",      "into_inner", NULL};
     for (const char *const *at = own; *at; at++)
         if (!strcmp(name, *at))
             return true;
@@ -1014,27 +1107,34 @@ static void rs_pick_ext_impls(rs_walk_t *w, const rs_type_t *type, const char *n
     if (!path)
         return;
     const rs_fn_t *found = NULL;
-    bool result_like = rs_ext_is_result(type);
-    for (const rs_impl_t *impl = w->project->ext_impls; impl; impl = impl->next_self) {
-        if (!impl->ext_path)
-            continue;
-        /* A crate's Result<T> alias is std's Result, so impls on Result serve it. */
-        if (strcmp(impl->ext_path, path) != 0 &&
-            !(result_like && !strcmp(impl->ext_path, "std::result::Result")))
-            continue;
-        const rs_fn_t *fn = rs_fn_in(impl->methods, name, need_self);
-        if (!fn && impl->trait_item)
-            fn = rs_fn_in(impl->trait_item->methods, name, need_self);
-        if (!fn || (impl->trait_item && !rs_trait_in_scope(w, impl->trait_item)))
-            continue;
-        if (found && !rs_same_fn(found, fn)) {
-            pick->ambiguous = true;
-            pick->stop = true;
-            pick->reason = "rust_trait_methods_ambiguous";
-            return;
+    if (!w->project->ext_impls)
+        return;
+    /* A crate's Result<T> alias is std's Result, so impls on Result serve it. */
+    static const char std_result[] = "std::result::Result";
+    const char *const owners[] = {
+        path, rs_ext_is_result(type) && strcmp(path, std_result) ? std_result : NULL};
+    for (size_t round = 0; round < 2 && owners[round]; round++)
+        for (const rs_impl_t *impl = cbm_ht_get(w->project->ext_impls, owners[round]); impl;
+             impl = impl->next_self) {
+            const rs_fn_t *fn = rs_fn_in(impl->methods, name, need_self);
+            if (!fn && impl->trait_item)
+                fn = rs_fn_in(impl->trait_item->methods, name, need_self);
+            if (!fn || (impl->trait_item && !rs_trait_in_scope(w, impl->trait_item)))
+                continue;
+            /* This impl's own body shows the external type has an inherent method of this name. */
+            if (fn->delegates_to_own_name) {
+                pick->stop = true;
+                pick->reason = "rust_external_receiver_method";
+                return;
+            }
+            if (found && !rs_same_fn(found, fn)) {
+                pick->ambiguous = true;
+                pick->stop = true;
+                pick->reason = "rust_trait_methods_ambiguous";
+                return;
+            }
+            found = fn;
         }
-        found = fn;
-    }
     if (found) {
         pick->fn = found;
         pick->self_ty = type;
@@ -1042,10 +1142,26 @@ static void rs_pick_ext_impls(rs_walk_t *w, const rs_type_t *type, const char *n
     }
 }
 
-/* `impl<T: Bound> Tr for T` serves any type meeting Bound. A project bound is checked
- * against the type's impls; an external bound cannot be and does not veto, because
- * the name resolved nowhere else and the program compiles. */
+static bool rs_name_in(const char *name, const char *const *names);
+
+/* Bounds a type can meet with no impl written for it in the project: auto traits, derives, and
+ * traits their own crate implements blanket-wide. */
+static bool rs_bound_needs_no_impl(const char *name) {
+    static const char *const names[] = {
+        "Send",         "Sync",    "Sized",     "Unpin",       "Copy",    "Clone",
+        "Debug",        "Default", "Eq",        "PartialEq",   "Ord",     "PartialOrd",
+        "Hash",         "Any",     "From",      "Into",        "TryFrom", "TryInto",
+        "AsRef",        "AsMut",   "Borrow",    "BorrowMut",   "ToOwned", "ToString",
+        "IntoIterator", "Display", "Serialize", "Deserialize", NULL};
+    return rs_name_in(name, names);
+}
+
+/* `impl<T: Bound> Tr for T` serves any type meeting Bound. A project bound is checked against the
+ * type's impls. So is an external one when the type is the project's: the orphan rule puts every
+ * impl for it in its own crate, unless the trait's crate implements it blanket-wide. */
 static bool rs_item_meets_bounds(rs_walk_t *w, const rs_item_t *item, const rs_impl_t *impl) {
+    if (item->macro_declared)
+        return false;
     const rs_generics_t *generics = impl->generics;
     const char *param =
         impl->self_syn && impl->self_syn->kind == RS_TS_PATH && impl->self_syn->nseg == 1
@@ -1059,12 +1175,20 @@ static bool rs_item_meets_bounds(rs_walk_t *w, const rs_item_t *item, const rs_i
         if (strcmp(generics->names[i], param) != 0)
             continue;
         for (int b = 0; b < generics->nbounds[i]; b++) {
-            const rs_item_t *bound = rs_trait_of_syn(&env, generics->bounds[i][b]);
-            if (!bound)
+            const rs_tsyn_t *syn = generics->bounds[i][b];
+            const rs_item_t *bound = rs_trait_of_syn(&env, syn);
+            const char *spelled = !bound && syn && syn->kind == RS_TS_PATH && syn->nseg
+                                      ? syn->segs[syn->nseg - 1]
+                                      : NULL;
+            if (!bound && (!spelled || rs_bound_needs_no_impl(spelled)))
                 continue;
             bool met = false;
-            for (const rs_impl_t *have = item->impls; have && !met; have = have->next_self)
-                met = have->trait_item == bound;
+            for (const rs_impl_t *have = item->impls; have && !met; have = have->next_self) {
+                const rs_tsyn_t *written = have->trait_syn;
+                met = bound ? have->trait_item == bound
+                            : written && written->kind == RS_TS_PATH && written->nseg &&
+                                  !strcmp(written->segs[written->nseg - 1], spelled);
+            }
             if (!met)
                 return false;
         }
@@ -1125,7 +1249,10 @@ static rs_pick_t rs_find_method(rs_walk_t *w, const rs_type_t *receiver, const c
                 pick.reason = "rust_method_not_in_known_bounds";
             return pick;
         case RT_EXT:
-            rs_pick_ext_impls(w, type, name, true, &pick);
+            /* `self: Pin<&mut Self>` makes a Pin<&mut W> receiver mean Self = W at the first
+             * probing step. `impl<P> Tr for Pin<P>` would need Pin<&mut Pin<P>>. */
+            if (!rs_ext_is(type, "std::pin::Pin"))
+                rs_pick_ext_impls(w, type, name, true, &pick);
             if (pick.fn || pick.stop)
                 return pick;
             if (rs_deref_wrapper(type) && type->nargs && !rs_wrapper_own_method(name)) {
@@ -1135,6 +1262,10 @@ static rs_pick_t rs_find_method(rs_walk_t *w, const rs_type_t *receiver, const c
             pick.reason = "rust_external_receiver_method";
             return pick;
         case RT_PRIM:
+            rs_pick_ext_impls(w, type, name, true, &pick);
+            if (!pick.fn && !pick.stop)
+                pick.reason = "rust_external_receiver_method";
+            return pick;
         case RT_TUPLE:
         case RT_ARRAY:
         case RT_UNIT:
@@ -1160,7 +1291,7 @@ static rs_pick_t rs_find_assoc(rs_walk_t *w, const rs_type_t *type, const char *
         rs_pick_on_item(w, type->item, type, name, false, &pick);
     else if (type->kind == RT_PARAM)
         rs_pick_on_param(w, type, name, false, &pick);
-    else if (type->kind == RT_EXT)
+    else if (type->kind == RT_EXT || type->kind == RT_PRIM)
         rs_pick_ext_impls(w, type, name, false, &pick);
     else if (type->kind == RT_UNKNOWN)
         pick.reason = "rust_receiver_type_unknown";
@@ -1212,7 +1343,36 @@ static const rs_type_t *rs_field_type(rs_walk_t *w, const rs_field_pick_t *pick)
                     .subst_names = count ? (const char *const *)item->generics->names : NULL,
                     .subst_types = types,
                     .nsubst = types ? count : 0};
-    return rs_lower(&env, pick->field->type);
+    const rs_type_t *declared = rs_lower(&env, pick->field->type);
+    return pick->owner->projected && pick->field->pinned
+               ? rs_ext_type(w->arena, "std::pin::Pin", declared, NULL)
+               : declared;
+}
+
+/* pin-project generates project() and project_ref() on a struct with a #[pin] field. No source
+ * declares them, so the call has no target, but what they return reads the struct's own fields. */
+static const rs_type_t *rs_pin_projection(rs_walk_t *w, const rs_type_t *receiver,
+                                          const char *name) {
+    if (strcmp(name, "project") != 0 && strcmp(name, "project_ref") != 0)
+        return NULL;
+    const rs_type_t *type = receiver;
+    for (int step = 0; type && step < RS_MAX_DEREF; step++) {
+        type = rs_peel(type);
+        if (type->kind == RT_ITEM) {
+            if (!type->item->pin_projected)
+                return NULL;
+            rs_type_t *projected = rs_type_new(w->arena, RT_ITEM);
+            if (!projected)
+                return NULL;
+            *projected = *type;
+            projected->projected = true;
+            return projected;
+        }
+        if (type->kind != RT_EXT || !rs_deref_wrapper(type) || !type->nargs)
+            return NULL;
+        type = type->args[0];
+    }
+    return NULL;
 }
 
 /* The values passed fix generic parameters the receiver left open:
@@ -1247,8 +1407,9 @@ static const rs_type_t *rs_fn_return_for(rs_walk_t *w, const rs_fn_t *fn, const 
                                          const rs_type_t **types, int nargs, int offset) {
     if (!fn)
         return &RS_UNKNOWN_TYPE;
-    /* Twins share a node, not a signature: only `Self` is the same across them. */
-    if (fn->qn_twin && fn->ret &&
+    /* Twins share a node, not a signature: only `Self` is the same across them, and whatever
+     * every one of them writes alike. */
+    if (fn->qn_twin && !fn->twin_return_agrees && fn->ret &&
         !(fn->ret->kind == RS_TS_PATH && fn->ret->nseg == 1 && !strcmp(fn->ret->segs[0], "Self")))
         return &RS_UNKNOWN_TYPE;
     const rs_impl_t *impl = fn->impl;
@@ -1688,6 +1849,13 @@ static const rs_type_t *rs_ext_method_ret(rs_walk_t *w, const rs_type_t *receive
             rs_anyhow_context_in_scope(w))
             return rs_result_of(arena, rs_arg(type, 0),
                                 rs_ext_type(arena, "anyhow::Error", NULL, NULL));
+        if (rs_ext_is(type, "std::ptr::NonNull")) {
+            if (!strcmp(name, "as_ref") || !strcmp(name, "as_mut"))
+                return rs_ref_of(arena, rs_arg(type, 0));
+            if (!strcmp(name, "as_ptr"))
+                return rs_ext_type(arena, RS_RAW_POINTER, rs_arg(type, 0), NULL);
+            return &RS_UNKNOWN_TYPE;
+        }
         if (rs_ext_is(type, "std::option::Option"))
             return rs_option_method(w, type, name, closure_ret);
         if (rs_ext_is_result(type))
@@ -1744,6 +1912,9 @@ static const rs_type_t *rs_ext_method_ret(rs_walk_t *w, const rs_type_t *receive
                 return type;
             if (!strcmp(name, "as_ref") || !strcmp(name, "as_mut") || !strcmp(name, "borrow"))
                 return rs_ref_of(arena, rs_arg(type, 0));
+            /* What it wraps, or for Data an Arc of that, which reads the same. */
+            if (!strcmp(name, "into_inner"))
+                return rs_arg(type, 0);
             type = type->nargs ? type->args[0] : NULL;
             continue;
         }
@@ -1927,6 +2098,66 @@ static const rs_type_t *rs_std_assoc_return(rs_walk_t *w, const rs_type_t *type,
 
 /* `Type::member` on an established type. A member with no node of its own, such
  * as an enum variant or associated constant, still names its type at this site. */
+/* Whether a type written in this impl names one of its parameters: nothing here binds it. */
+static bool rs_mentions_generic(const rs_tsyn_t *syn, const rs_generics_t *generics) {
+    if (!syn || !generics)
+        return false;
+    if (syn->kind == RS_TS_PATH && syn->nseg >= 1)
+        for (int i = 0; i < generics->count; i++)
+            if (!strcmp(generics->names[i], syn->segs[0]))
+                return true;
+    for (int i = 0; i < syn->nargs; i++)
+        if (rs_mentions_generic(syn->args[i], generics))
+            return true;
+    return rs_mentions_generic(syn->inner, generics);
+}
+
+/* `Ready::ALL`, `D::DATABASE`: an associated const's value has its declared type. An inherent one
+ * is searched before a trait's, as for a method. A second candidate at the same rank answers
+ * only if it writes the same type. */
+static const rs_type_t *rs_assoc_const_type(rs_walk_t *w, const rs_type_t *type, const char *name) {
+    const rs_type_t *peeled = rs_peel(type);
+    const rs_assoc_const_t *found = NULL;
+    const rs_impl_t *owner_impl = NULL;
+    rs_mod_t *owner = NULL;
+    if (peeled->kind == RT_ITEM) {
+        for (int inherent = 1; inherent >= 0 && !found; inherent--)
+            for (const rs_impl_t *impl = peeled->item->impls; impl; impl = impl->next_self) {
+                if ((impl->trait_syn == NULL) != (inherent == 1))
+                    continue;
+                const rs_assoc_const_t *hit =
+                    rs_const_named(impl->sorted_consts, impl->nconsts, name);
+                if (!hit)
+                    continue;
+                if (found && !rs_tsyn_same(found->type, hit->type))
+                    return &RS_UNKNOWN_TYPE;
+                found = hit;
+                owner_impl = impl;
+                owner = impl->owner;
+            }
+    } else if (peeled->kind == RT_PARAM) {
+        for (int i = 0; i < peeled->ntraits; i++) {
+            const rs_assoc_const_t *hit = peeled->traits[i]
+                                              ? rs_const_named(peeled->traits[i]->sorted_consts,
+                                                               peeled->traits[i]->nconsts, name)
+                                              : NULL;
+            if (!hit)
+                continue;
+            if (found)
+                return &RS_UNKNOWN_TYPE;
+            found = hit;
+            owner = peeled->traits[i]->owner;
+        }
+    }
+    if (!found || !owner || (owner_impl && rs_mentions_generic(found->type, owner_impl->generics)))
+        return &RS_UNKNOWN_TYPE;
+    rs_env_t env = {.q = &w->q,
+                    .inst = rs_inst_for(owner, w->inst ? w->inst->crate : NULL),
+                    .self_ty = peeled,
+                    .impl = owner_impl};
+    return rs_lower(&env, found->type);
+}
+
 static rs_sel_t rs_member_of_type(rs_walk_t *w, const rs_type_t *type, const char *member) {
     const rs_type_t *peeled = rs_peel(type);
     if (peeled->kind == RT_ITEM && peeled->item->kind == RS_ITEM_ENUM) {
@@ -1941,7 +2172,7 @@ static rs_sel_t rs_member_of_type(rs_walk_t *w, const rs_type_t *type, const cha
     if (peeled->kind == RT_ITEM && peeled->item->qn) {
         sel = rs_sel_target(peeled->item->qn, peeled->item->label, peeled->item->qn_conflict,
                             CBM_RESOLVE_RULE_MODULE_PATH, "rust_assoc_member_of_type");
-        sel.value_type = &RS_UNKNOWN_TYPE;
+        sel.value_type = rs_assoc_const_type(w, type, member);
         sel.fn = NULL;
         sel.assoc_return = rs_std_assoc_return(w, type, member);
         return sel;
@@ -1951,6 +2182,8 @@ static rs_sel_t rs_member_of_type(rs_walk_t *w, const rs_type_t *type, const cha
         sel.assoc_return = rs_std_assoc_return(w, type, member);
         return sel;
     }
+    if (peeled->kind == RT_PARAM)
+        sel.value_type = rs_assoc_const_type(w, type, member);
     return sel;
 }
 
@@ -1994,6 +2227,19 @@ static rs_sel_t rs_value_path(rs_walk_t *w, const rs_tsyn_t *path) {
         return rs_sel_from_type_item(w, ent.item, path->segs[path->nseg - 1]);
     if (ent.kind == RS_ENT_ITEM && consumed < path->nseg)
         return rs_sel_open("rust_assoc_path_too_deep");
+    /* `ext::Type::name()`: a project trait implemented for that external type can supply it. */
+    if ((ent.kind == RS_ENT_EXTERNAL || ent.kind == RS_ENT_BUILTIN) && path->nseg >= 2 &&
+        w->project->ext_impls) {
+        rs_tsyn_t owner = *path;
+        owner.nseg--;
+        rs_env_t env = rs_env_here(w);
+        const rs_type_t *type = rs_peel(rs_lower(&env, &owner));
+        if (type->kind == RT_EXT || type->kind == RT_PRIM) {
+            rs_pick_t pick = rs_find_assoc(w, type, path->segs[path->nseg - 1]);
+            if (pick.fn || pick.ambiguous)
+                return rs_sel_from_pick(&pick);
+        }
+    }
     if (ent.kind == RS_ENT_ITEM && consumed == path->nseg && ent.item->kind == RS_ITEM_TYPE) {
         /* An alias of a tuple or unit struct can stand as its constructor. */
         rs_env_t env = {.q = &w->q, .inst = rs_inst_for(ent.item->owner, w->inst->crate)};
@@ -2795,6 +3041,15 @@ static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode ca
         pick = rs_find_method(w, receiver, name);
         w->call_arg0 = NULL;
     }
+    if (!pick.fn && !pick.ambiguous) {
+        const rs_type_t *projection = rs_pin_projection(w, receiver, name);
+        if (projection) {
+            rs_sel_t generated = rs_sel_settled("rust_pin_projection", CBM_RESOLVE_DOMAIN_EXTERNAL);
+            rs_emit(w, CBM_RUST_SITE_CALL, ts_node_start_byte(call), ts_node_end_byte(call),
+                    &generated);
+            return projection;
+        }
+    }
     rs_sel_t sel = rs_sel_from_pick(&pick);
     if (pick.fn && rs_call_conflicts(w, pick.fn, pick.self_ty, nodes, types, args.count, true)) {
         rs_sel_t blocked =
@@ -3219,9 +3474,35 @@ static TSNode rs_macro_tree(TSNode invocation) {
 }
 
 /* A project macro of the same name is not the standard one. */
-static bool rs_std_expression_macro(rs_walk_t *w, const char *name) {
-    if (!name || !rs_expression_macro(name))
+/* log's and tracing's levels and anyhow's and eyre's errors take expressions of the caller, by
+ * their documented contract. Only under those crates' own paths: anything else named debug! is
+ * opaque. */
+static bool rs_external_expression_macro(rs_walk_t *w, const char *name) {
+    static const char *const levels[] = {"trace", "debug", "info", "warn", "error", NULL};
+    static const char *const errors[] = {"bail", "ensure", "anyhow", "eyre", "format_err", NULL};
+    const char *path = name;
+    if (!strstr(name, "::")) {
+        rs_ent_t ent = rs_lookup_lexical(&w->q, w->inst, w->blocks, w->nblocks, name, RS_NS_MACRO);
+        if (ent.kind != RS_ENT_EXTERNAL || !ent.external_path)
+            return false;
+        path = ent.external_path;
+    }
+    const char *tail = strstr(path, "::");
+    if (!tail || strstr(tail + 2, "::"))
         return false;
+    size_t crate = (size_t)(tail - path);
+    if ((crate == 3 && !strncmp(path, "log", 3)) || (crate == 7 && !strncmp(path, "tracing", 7)))
+        return rs_name_in(tail + 2, levels);
+    if ((crate == 6 && !strncmp(path, "anyhow", 6)) || (crate == 4 && !strncmp(path, "eyre", 4)))
+        return rs_name_in(tail + 2, errors);
+    return false;
+}
+
+static bool rs_std_expression_macro(rs_walk_t *w, const char *name) {
+    if (!name)
+        return false;
+    if (!rs_expression_macro(name))
+        return rs_external_expression_macro(w, name);
     rs_ent_t ent = rs_lookup_lexical(&w->q, w->inst, w->blocks, w->nblocks, name, RS_NS_MACRO);
     return ent.kind != RS_ENT_ITEM;
 }
@@ -3329,6 +3610,28 @@ static const rs_type_t *rs_walk_macro(rs_walk_t *w, TSNode node) {
     return &RS_UNKNOWN_TYPE;
 }
 
+/* These parentheses are an expression macro's, in the view of the file: what the macro yields is
+ * whatever its definition makes of the argument. */
+static bool rs_is_expression_macro(const rs_walk_t *w, TSNode node) {
+    const rs_file_t *file = w->b.file;
+    if (!file || !file->nexpression_macros || w->site_delta != 0 ||
+        (!rs_is(node, "parenthesized_expression") && !rs_is(node, "tuple_expression") &&
+         !rs_is(node, "unit_expression")))
+        return false;
+    uint32_t start = ts_node_start_byte(node);
+    int low = 0, high = file->nexpression_macros;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (file->expression_macros[mid] < start)
+            low = mid + 1;
+        else if (file->expression_macros[mid] > start)
+            high = mid;
+        else
+            return true;
+    }
+    return false;
+}
+
 static const rs_type_t *rs_walk_children(rs_walk_t *w, TSNode node) {
     rs_children_t children = rs_children(node);
     TSNode child;
@@ -3370,7 +3673,7 @@ static const rs_type_t *rs_walk_deref(rs_walk_t *w, TSNode node) {
         return text && text[0] == '-' ? inner : &RS_UNKNOWN_TYPE;
     if (inner->kind == RT_REF)
         return inner->inner ? inner->inner : &RS_UNKNOWN_TYPE;
-    if (rs_deref_wrapper(inner) && inner->nargs)
+    if ((rs_deref_wrapper(inner) || rs_ext_is(inner, RS_RAW_POINTER)) && inner->nargs)
         return inner->args[0];
     if (inner->kind == RT_ITEM) {
         const rs_type_t *target = rs_item_deref(w, inner);
@@ -3439,6 +3742,17 @@ static const rs_type_t *rs_walk_expr_inner(rs_walk_t *w, TSNode node, const char
         const rs_type_t *inner = rs_walk_expr(w, rs_field(node, "value"));
         return rs_ref_of(w->arena, inner);
     }
+    if (rs_is_expression_macro(w, node)) {
+        /* `name = value` among format arguments binds only inside the macro. */
+        rs_children_t arguments = rs_children(node);
+        TSNode argument;
+        while (rs_children_next(&arguments, &argument))
+            (void)rs_walk_expr(w, rs_is(argument, "assignment_expression") &&
+                                          rs_is(rs_field(argument, "left"), "identifier")
+                                      ? rs_field(argument, "right")
+                                      : argument);
+        return &RS_UNKNOWN_TYPE;
+    }
     if (!strcmp(kind, "parenthesized_expression"))
         return ts_node_named_child_count(node) ? rs_walk_expr(w, ts_node_named_child(node, 0))
                                                : &RS_UNKNOWN_TYPE;
@@ -3491,8 +3805,9 @@ static const rs_type_t *rs_walk_expr_inner(rs_walk_t *w, TSNode node, const char
         return rs_walk_integer(w, node);
     if (!strcmp(kind, "boolean_literal"))
         return rs_literal_type(w, "bool");
-    if (!strcmp(kind, "string_literal") || !strcmp(kind, "raw_string_literal") ||
-        !strcmp(kind, "char_literal") || !strcmp(kind, "float_literal") ||
+    if (!strcmp(kind, "string_literal") || !strcmp(kind, "raw_string_literal"))
+        return rs_ref_of(w->arena, rs_literal_type(w, "str"));
+    if (!strcmp(kind, "char_literal") || !strcmp(kind, "float_literal") ||
         !strcmp(kind, "line_comment") || !strcmp(kind, "block_comment") || !strcmp(kind, "label") ||
         !strcmp(kind, "lifetime"))
         return &RS_UNKNOWN_TYPE;

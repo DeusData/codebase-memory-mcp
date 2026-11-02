@@ -745,6 +745,7 @@ void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
 #define CBM_PKGMAP_DART_ROOT_PREFIX "@cbm:raw:dart:"
 #define CBM_PKGMAP_SWIFT_DIR_PREFIX "@cbm:raw:swift-dir:"
 #define CBM_PKGMAP_SWIFT_TARGET_PREFIX "@cbm:raw:swift-target:"
+void cbm_pipeline_install_rust_item_macros(const cbm_file_info_t *files, int count);
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 

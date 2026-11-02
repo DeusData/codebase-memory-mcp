@@ -1283,10 +1283,16 @@ void cbm_result_compact_release_thread(void);
 TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
                          TSParseOptions opts);
 
-/* cbm_parse_source, then for a C# file the grammar could not read, a parse of a
- * same-length view of it. Offsets and lines are the source's own. */
+/* cbm_parse_source, then for a C#, Go or Rust file the grammar could not read, a parse of a
+ * same-length view of it. Offsets and lines are the source's own. Every whole-file parse of
+ * Go and Rust goes through here, so a retained tree and a re-parse read one tree shape. */
 TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
                                    uint32_t source_len, TSParseOptions opts);
+/* The one whole-file parse of a Rust file whose path is known: also reads through the same-length
+ * view of its item-passthrough macros (resolve/rust_macros.h). Offsets and lines are the source's.
+ */
+TSTree *cbm_parse_rust_file(TSParser *parser, const char *rel_path, const char *source,
+                            uint32_t source_len, TSParseOptions opts);
 /* As above. When the view that was used hid a branch of a conditional, *unrepaired receives the
  * parse of the file itself, for a reader that must see what the view left out; the caller deletes
  * it. Otherwise *unrepaired is left alone. */
