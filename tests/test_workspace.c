@@ -75,6 +75,74 @@ TEST(ws_posix_top_level_trees_are_too_shallow) {
     PASS();
 }
 
+/* A recorded broad approval (allow-root --approve-broad) is the only thing that
+ * lifts CBM_WS_DENY_TOO_SHALLOW, and only for that exact path. Classification
+ * and cbm_workspace_verdict_is_overridable stay exactly as strict as the test
+ * above checks; the approval is a grant, so it is listed like any other human
+ * decision, and it lifts no other verdict. */
+TEST(ws_allow_broad_root_lifts_too_shallow_for_an_exact_match_only) {
+    char cache[256];
+    char *created = th_mktempdir("cbm_ws_allow_broad");
+    ASSERT_NOT_NULL(created);
+    snprintf(cache, sizeof(cache), "%s", created);
+
+    char err[1024];
+    char listed[4096];
+    /* Refused out of the box, and the refusal names the command a person runs. */
+    ASSERT_FALSE(cbm_workspace_root_allowed("/usr", HOME, cache, NULL, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "allow-root --approve-broad /usr"));
+
+    /* Neither an ordinary grant nor a sensitive approval lifts breadth; a broad
+     * approval lifts neither an absolute nor a sensitive verdict. A refused grant
+     * records nothing. */
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, "/usr", false, false, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-broad"));
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, "/usr", true, false, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, "/", false, true, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_grant_add(cache, HOME, HOME, false, true, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
+    ASSERT_FALSE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+
+    /* The explicit approval is recorded and marked. */
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, "/usr", false, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+    ASSERT_STR_EQ(listed, "(approved broad) /usr\n");
+
+#ifndef _WIN32
+    /* Containment resolves real paths, so the rest needs a top-level directory
+     * that exists on every POSIX host: "/usr". A repeated approval is recognized
+     * rather than appended again. */
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, "/usr", false, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+    ASSERT_STR_EQ(listed, "(approved broad) /usr\n");
+
+    /* It lifts exactly that path. A configured root of "/" puts "/dev" inside the
+     * declared boundary too, so the only thing still refusing it is that the
+     * approval names another path. */
+    ASSERT_TRUE(cbm_workspace_root_allowed("/usr", HOME, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed("/usr", HOME, cache, "/", err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed("/dev", HOME, cache, "/", err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "allow-root --approve-broad /dev"));
+#endif
+
+    /* Each marker lifts only its own verdict: a broad mark on a credential
+     * directory, which grant_add would never write, still does not lift it. */
+    char secret[1024];
+    snprintf(secret, sizeof(secret), "%s/.ssh", cache);
+    ASSERT_EQ(cbm_mkdir(secret), 0);
+    char store[1024];
+    ASSERT_TRUE(cbm_workspace_grant_path(cache, store, sizeof(store)));
+    FILE *f = cbm_fopen(store, "a");
+    ASSERT_NOT_NULL(f);
+    (void)fprintf(f, "^%s\n", secret);
+    ASSERT_EQ(fclose(f), 0);
+    ASSERT_FALSE(cbm_workspace_root_allowed(secret, HOME, cache, NULL, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
+
+    th_cleanup(cache);
+    PASS();
+}
+
 /* Legitimately shallow project roots must survive: these are the false positives
  * a blanket depth rule would cause, which is why Windows counts drive-relative. */
 TEST(ws_legitimate_shallow_roots_are_allowed) {
@@ -177,7 +245,7 @@ TEST(ws_sensitive_root_explicit_approval_is_preserved) {
     char err[1024];
     ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
     ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, false, err, sizeof(err)));
     ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
 
     th_cleanup(root);
@@ -197,14 +265,14 @@ TEST(ws_sensitive_approval_upgrades_existing_ordinary_exact_grant) {
     snprintf(cache, sizeof(cache), "%s", created);
 
     char err[1024];
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, root, false, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, root, false, false, err, sizeof(err)));
     ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
 
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, false, err, sizeof(err)));
     ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
     /* A repeated explicit approval must recognize the marked exact grant rather
      * than append another exception. */
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, false, err, sizeof(err)));
 
     char listed[4096];
     char expected[4096];
@@ -232,13 +300,15 @@ TEST(ws_sensitive_approval_adds_exact_exception_under_ordinary_ancestor) {
     snprintf(sensitive, sizeof(sensitive), "%s/private-project", ancestor);
     ASSERT_EQ(cbm_mkdir(sensitive), 0);
     char err[1024];
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, ancestor, false, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, ancestor, false, false, err, sizeof(err)));
     ASSERT_FALSE(cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
 
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
+    ASSERT_TRUE(
+        cbm_workspace_grant_add(cache, sensitive, sensitive, true, false, err, sizeof(err)));
     ASSERT_TRUE(
         cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
+    ASSERT_TRUE(
+        cbm_workspace_grant_add(cache, sensitive, sensitive, true, false, err, sizeof(err)));
 
     char listed[4096];
     char expected[4096];
@@ -411,6 +481,100 @@ TEST(ws_manifest_approval_refuses_overbroad_requests) {
     ASSERT_TRUE(strstr(err, refusal) != NULL);
     th_cleanup(base);
     th_cleanup(cache);
+    PASS();
+}
+
+/* #1718: the sensitive-root escape hatch broke on Windows separator spelling.
+ * The grant is recorded from cbm_canonical_path — backslashes — while the
+ * indexer hands the candidate already normalized to '/'. A byte-exact
+ * comparison made the grant never match the candidate, so an approved
+ * "Program Files" root stayed refused. '/' and '\' are equivalent everywhere
+ * else in this module (ws_is_sep); the boundary comparison must treat them
+ * equally. The classify_root home rule uses the same ws_paths_equal, so a
+ * mixed-separator home spelling is the string-level regression check; the
+ * FS-backed grant round-trip lives in the _WIN32 half, where the real
+ * canonicalization exercises it. */
+TEST(ws_approve_sensitive_matches_across_separator_styles) {
+    /* canonical spelled with '\' vs home spelled with '/' — must classify as
+     * the same directory. Pre-fix: strncmp mismatch at the separator byte, so
+     * the home rule never matched and an ordinary path under "C:\Users" fell
+     * through to CBM_WS_ALLOW. */
+    ASSERT_EQ(cbm_workspace_classify_root("C:\\Users\\dev", "C:/Users/dev", CACHE),
+              CBM_WS_DENY_SENSITIVE);
+    ASSERT_EQ(cbm_workspace_classify_root("C:/Users/dev", "C:\\Users\\dev", CACHE),
+              CBM_WS_DENY_SENSITIVE);
+    /* A sibling that differs after the same separator boundary is still a
+     * different directory: "/a/bc" must never look like "/a/b". */
+    ASSERT_EQ(cbm_workspace_classify_root("C:\\Users\\devx", "C:/Users/dev", CACHE), CBM_WS_ALLOW);
+#ifdef _WIN32
+    /* Full grant round-trip on real filesystem paths: the grant stored with
+     * '\' must lift the exact candidate the indexer passes with '/'. The
+     * sensitive class is exercised by a credential-named directory (".ssh"),
+     * which is DENY_SENSITIVE at any depth — equivalent to "Program Files"
+     * for the refusal path under test. */
+    char *cache = th_mktempdir("cbm_ws_sw");
+    ASSERT(cache != NULL);
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.ssh/cfg", cache);
+    ASSERT_TRUE(cbm_mkdir_p(dir, 0700));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/allowed_roots", cache);
+
+    char grant[2048];
+    snprintf(grant, sizeof(grant), "!%s\\.ssh\\cfg\n", cache);
+    FILE *f = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    (void)fprintf(f, "%s", grant);
+    (void)fclose(f);
+
+    char candidate[2048];
+    snprintf(candidate, sizeof(candidate), "%s/.ssh/cfg", cache);
+    /* Convert to '/' spelling, exactly as cbm_normalize_path_sep does for the
+     * indexer's candidate. */
+    char *p;
+    for (p = candidate; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    char err[1024];
+    err[0] = '\0';
+    ASSERT_TRUE(cbm_workspace_root_allowed(candidate, NULL, cache, NULL, err, sizeof(err)));
+
+    /* An unapproved sibling under the same sensitive tree stays refused. It
+     * lies outside every granted root, so the refusal is the boundary wording
+     * (kept verbatim by contract), not the sensitive hint. */
+    char sibling[2048];
+    snprintf(sibling, sizeof(sibling), "%s/.ssh/keys", cache);
+    for (p = sibling; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    err[0] = '\0';
+    ASSERT_FALSE(cbm_workspace_root_allowed(sibling, NULL, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "outside the allowed root") != NULL);
+
+    /* A strict descendant INSIDE the approved sensitive grant is contained
+     * (boundary passes) but not the exact grant, so the sensitive refusal
+     * applies and the hint names the flag. */
+    char descendant[2048];
+    snprintf(descendant, sizeof(descendant), "%s/.ssh/cfg/sub", cache);
+    for (p = descendant; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    /* Containment canonicalizes the candidate, which on Windows opens it
+     * (CreateFileW, OPEN_EXISTING): a descendant that is not on disk is
+     * "outside the allowed root" instead of reaching the sensitive hint. */
+    ASSERT_TRUE(cbm_mkdir_p(descendant, 0700));
+    err[0] = '\0';
+    ASSERT_FALSE(cbm_workspace_root_allowed(descendant, NULL, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "--approve-sensitive") != NULL);
+
+    th_cleanup(cache);
+#endif
     PASS();
 }
 
@@ -680,7 +844,7 @@ TEST(ws_manifest_ordinary_entries_unchanged) {
 
     char err[1024];
     /* The grant store names a root the sdk is not under. */
-    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, granted, false, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, HOME, granted, false, false, err, sizeof(err)));
 
     ws_manifest_write_line(base, sdk);
     ASSERT_TRUE(cbm_workspace_manifest_approve(cache, HOME, base, err, sizeof(err)));
@@ -824,6 +988,7 @@ SUITE(workspace) {
     RUN_TEST(ws_volume_roots_are_absolutely_denied);
     RUN_TEST(ws_non_absolute_paths_are_denied);
     RUN_TEST(ws_posix_top_level_trees_are_too_shallow);
+    RUN_TEST(ws_allow_broad_root_lifts_too_shallow_for_an_exact_match_only);
     RUN_TEST(ws_legitimate_shallow_roots_are_allowed);
     RUN_TEST(ws_home_itself_is_sensitive_but_subdirs_are_fine);
     RUN_TEST(ws_credential_directories_are_sensitive_at_any_depth);
@@ -835,6 +1000,7 @@ SUITE(workspace) {
     RUN_TEST(ws_posix_matching_is_case_sensitive);
     RUN_TEST(ws_null_context_disables_dependent_checks);
     RUN_TEST(ws_every_verdict_has_a_reason);
+    RUN_TEST(ws_approve_sensitive_matches_across_separator_styles);
     RUN_TEST(ws_home_dir_is_resolved);
     RUN_TEST(ws_linked_home_classified_as_home);
     RUN_TEST(ws_manifest_entry_classified_in_resolved_form);

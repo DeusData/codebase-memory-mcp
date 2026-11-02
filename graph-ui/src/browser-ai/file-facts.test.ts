@@ -102,3 +102,10 @@ describe('facts read from a configuration or text file (K12)', () => {
         expect(readerFacts(reader('manage.py', 'import os\n'))).toEqual([]);
     });
 });
+
+// Removing a comment must not create a root tag that was absent from the input.
+it('does not join XML markup across removed declarations or comments', () => {
+    expect(fileFactLines('pom.xml', '<<!-- ignored -->fake/><project/>')).toContain('Root element: `<project>`.');
+    expect(fileFactLines('pom.xml', '<<?meta?>fake/><project/>')).toContain('Root element: `<project>`.');
+    expect(fileFactLines('pom.xml', '<!-- <hidden/> --><project/>')).toContain('Root element: `<project>`.');
+});

@@ -108,11 +108,30 @@ typedef struct {
     CBMHashTable *dirs;   /* every directory holding a file (not the root) */
 } dk_index_t;
 
+/* Where a value came from: the ARGs whose default (`dflt`) or build argument
+ * (`ovr`) supplied part of it, as '\x1f'-separated names; NULL: none. */
+typedef struct {
+    const char *dflt;
+    const char *ovr;
+} dk_prov_t;
+
 typedef struct dk_var {
     const char *name;
     const char *value; /* NULL: declared without a value */
+    bool arg;          /* an ARG: a build argument can set it */
+    dk_prov_t prov;
     struct dk_var *next;
 } dk_var_t;
+
+/* An image reference of FROM / COPY --from, linked once the file is read. */
+typedef struct {
+    int64_t img;
+    const char *ref;
+    const char *via;
+    int stage;
+    int line;
+    dk_prov_t prov;
+} dk_ref_t;
 
 typedef struct {
     cbm_pipeline_ctx_t *ctx;
@@ -131,6 +150,14 @@ typedef struct {
     dk_entry_t entry;             /* the current stage's ENTRYPOINT */
     dk_entry_t cmd;               /* the current stage's CMD */
     const dk_index_t *ix;
+    dk_ref_t *refs; /* FROM / COPY --from references, in file order */
+    int nrefs;
+    int refs_cap;
+    /* A build's view (dk_build_args): its build arguments set the ARGs they
+     * name, and the references they change link from the Image it builds. */
+    const dk_var_t *build_args;
+    int64_t built;           /* 0: the Dockerfile's own view */
+    const char *build_props; /* the build's tool / file / build_line members */
 } dk_t;
 
 static bool dk_type(TSNode n, const char *t) {
@@ -172,12 +199,70 @@ static const dk_var_t *dk_find(const dk_var_t *v, const char *name, size_t nl) {
     return NULL;
 }
 
-static void dk_set(dk_t *d, dk_var_t **list, const char *name, const char *value) {
+static void dk_set(dk_t *d, dk_var_t **list, const char *name, const char *value, bool arg,
+                   dk_prov_t prov) {
     dk_var_t *v = cbm_arena_alloc(d->a, sizeof(*v));
     if (v) {
-        *v = (dk_var_t){.name = name, .value = value, .next = *list};
+        *v = (dk_var_t){.name = name, .value = value, .arg = arg, .prov = prov, .next = *list};
         *list = v;
     }
+}
+
+enum { DK_NAME_SEP = '\x1f' };
+
+static bool dk_names_has(const char *list, const char *name, size_t nl) {
+    for (const char *p = list; p && *p;) {
+        size_t l = strcspn(p, "\x1f");
+        if (l == nl && strncmp(p, name, nl) == 0) {
+            return true;
+        }
+        p += l;
+        p += *p ? SKIP_ONE : 0;
+    }
+    return false;
+}
+
+/* `list` with `name` appended unless it holds it already. */
+static const char *dk_names_add(dk_t *d, const char *list, const char *name, size_t nl) {
+    if (dk_names_has(list, name, nl)) {
+        return list;
+    }
+    return list && list[0] ? cbm_arena_sprintf(d->a, "%s%c%.*s", list, DK_NAME_SEP, (int)nl, name)
+                           : cbm_arena_strndup(d->a, name, nl);
+}
+
+static const char *dk_names_union(dk_t *d, const char *a, const char *b) {
+    for (const char *p = b; p && *p;) {
+        size_t l = strcspn(p, "\x1f");
+        a = dk_names_add(d, a, p, l);
+        p += l;
+        p += *p ? SKIP_ONE : 0;
+    }
+    return a;
+}
+
+static void dk_prov_merge(dk_t *d, dk_prov_t *into, dk_prov_t from) {
+    into->dflt = dk_names_union(d, into->dflt, from.dflt);
+    into->ovr = dk_names_union(d, into->ovr, from.ovr);
+}
+
+/* `,"key":["A","B"]` for a non-empty name list, else "". */
+static const char *dk_names_member(dk_t *d, const char *key, const char *list) {
+    if (!list || !list[0]) {
+        return "";
+    }
+    const char *out = cbm_arena_sprintf(d->a, ",\"%s\":[", key);
+    for (const char *p = list; out && *p;) {
+        size_t l = strcspn(p, "\x1f");
+        char esc[CBM_SZ_256];
+        char name[CBM_SZ_256];
+        snprintf(name, sizeof(name), "%.*s", (int)l, p);
+        cbm_json_escape(esc, (int)sizeof(esc), name);
+        out = cbm_arena_sprintf(d->a, "%s%s\"%s\"", out, p == list ? "" : ",", esc);
+        p += l;
+        p += *p ? SKIP_ONE : 0;
+    }
+    return out ? cbm_arena_sprintf(d->a, "%s]", out) : "";
 }
 
 /* ASCII case-insensitive equality (stage names, `scratch`). */
@@ -195,8 +280,10 @@ static bool dk_name_char(char c) {
 }
 
 /* `text` with $X / ${X} / ${X:-d} / ${X-d} expanded from `vars`; NULL when a
- * reference has no value. */
-static const char *dk_expand(dk_t *d, const dk_var_t *vars, const char *text) {
+ * reference has no value. `prov` (may be NULL) gains the ARGs whose default
+ * or build argument supplied a value -- an inline `${X:-d}` default counts
+ * only for a declared ARG X, the one thing a build argument can set. */
+static const char *dk_expand(dk_t *d, const dk_var_t *vars, const char *text, dk_prov_t *prov) {
     size_t cap = strlen(text) + SKIP_ONE;
     size_t len = 0;
     char *out = cbm_arena_alloc(d->a, cap);
@@ -249,6 +336,11 @@ static const char *dk_expand(dk_t *d, const dk_var_t *vars, const char *text) {
             return NULL;
         }
         const char *from = val ? val : dflt;
+        if (prov && v && val) {
+            dk_prov_merge(d, prov, v->prov);
+        } else if (prov && v && v->arg) {
+            prov->dflt = dk_names_add(d, prov->dflt, name, nl);
+        }
         if (len + vl + SKIP_ONE > cap) {
             size_t ncap = (len + vl + SKIP_ONE) * PAIR_LEN;
             char *grown = cbm_arena_alloc(d->a, ncap);
@@ -370,6 +462,139 @@ static int dk_stage_of(const dk_t *d, const char *ref) {
     return found;
 }
 
+/* A path component: [a-z0-9]+ joined by `.`, `_`, `__` or `-`+. */
+static bool dk_ref_component(const char *s, size_t n) {
+    if (n == 0 || !isalnum((unsigned char)s[0]) || !isalnum((unsigned char)s[n - SKIP_ONE])) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (isupper(c)) {
+            return false;
+        }
+        if (isalnum(c)) {
+            continue;
+        }
+        size_t run = SKIP_ONE;
+        while (i + run < n && s[i + run] == c) {
+            run++;
+        }
+        if (!((c == '.' && run == SKIP_ONE) || (c == '_' && run <= PAIR_LEN) || c == '-')) {
+            return false;
+        }
+        i += run - SKIP_ONE;
+    }
+    return true;
+}
+
+/* A registry host: DNS labels (`.`-joined), or an IPv6 literal, with an
+ * optional :port. */
+static bool dk_ref_domain(const char *s, size_t n) {
+    const char *colon = memchr(s, ':', n);
+    if (n && s[0] == '[') {
+        const char *close = memchr(s, ']', n);
+        colon = close && (size_t)(close - s) + SKIP_ONE < n ? close + SKIP_ONE : NULL;
+        if (!close) {
+            return false;
+        }
+    }
+    size_t hl = colon ? (size_t)(colon - s) : n;
+    if (hl == 0) {
+        return false;
+    }
+    if (s[0] != '[') {
+        for (size_t i = 0; i < hl; i++) {
+            unsigned char c = (unsigned char)s[i];
+            if (!isalnum(c) && c != '.' && c != '-') {
+                return false;
+            }
+        }
+    }
+    for (size_t i = hl + SKIP_ONE; colon && i < n; i++) {
+        if (!isdigit((unsigned char)s[i])) {
+            return false;
+        }
+    }
+    return !colon || hl + SKIP_ONE < n;
+}
+
+bool cbm_image_ref_valid(const char *ref) {
+    if (!ref || !ref[0]) {
+        return false;
+    }
+    size_t n = strlen(ref);
+    const char *at = strchr(ref, '@');
+    if (at) {
+        const char *colon = strchr(at, ':');
+        if (!colon || colon == at + SKIP_ONE || strlen(colon + SKIP_ONE) < CBM_SZ_32) {
+            return false;
+        }
+        for (const char *p = at + SKIP_ONE; p < colon; p++) {
+            if (!isalnum((unsigned char)*p) && !strchr("+.-_", *p)) {
+                return false;
+            }
+        }
+        for (const char *p = colon + SKIP_ONE; *p; p++) {
+            if (!isxdigit((unsigned char)*p)) {
+                return false;
+            }
+        }
+        n = (size_t)(at - ref);
+    }
+    /* the tag: after the last ':' that follows the last '/' */
+    size_t name_end = n;
+    for (size_t i = n; i > 0; i--) {
+        if (ref[i - SKIP_ONE] == '/') {
+            break;
+        }
+        if (ref[i - SKIP_ONE] == ':') {
+            name_end = i - SKIP_ONE;
+            break;
+        }
+    }
+    if (name_end < n) {
+        size_t tl = n - name_end - SKIP_ONE;
+        const char *tag = ref + name_end + SKIP_ONE;
+        if (tl == 0 || tl > CBM_SZ_128 || !(isalnum((unsigned char)tag[0]) || tag[0] == '_')) {
+            return false;
+        }
+        for (size_t i = 0; i < tl; i++) {
+            if (!isalnum((unsigned char)tag[i]) && !strchr("_.-", tag[i])) {
+                return false;
+            }
+        }
+    }
+    const char *p = ref;
+    const char *end = ref + name_end;
+    const char *slash = memchr(p, '/', (size_t)(end - p));
+    if (slash) {
+        size_t fl = (size_t)(slash - p);
+        bool host = memchr(p, '.', fl) || memchr(p, ':', fl) ||
+                    (fl == strlen("localhost") && memcmp(p, "localhost", fl) == 0);
+        if (host) {
+            if (!dk_ref_domain(p, fl)) {
+                return false;
+            }
+            p = slash + SKIP_ONE;
+        }
+    }
+    if (p >= end) {
+        return false;
+    }
+    while (p < end) {
+        const char *s = memchr(p, '/', (size_t)(end - p));
+        size_t cl = s ? (size_t)(s - p) : (size_t)(end - p);
+        if (!dk_ref_component(p, cl)) {
+            return false;
+        }
+        p += cl + (s ? SKIP_ONE : 0);
+        if (s && p >= end) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref) {
     char repo[CBM_SZ_512];
     char reg[CBM_SZ_512];
@@ -438,19 +663,101 @@ int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *
     return id;
 }
 
-/* DEPENDS_ON from the Dockerfile to the Image of resolved reference `ref`. */
-static void dk_link(dk_t *d, const char *ref, const char *via, int line) {
+/* Record the Image of resolved reference `ref`, linked by dk_refs_link. */
+static void dk_link(dk_t *d, const char *ref, const char *via, int line, dk_prov_t prov) {
     int64_t img = cbm_pipeline_image_node(d->ctx, ref);
     if (img <= 0) {
         return;
     }
-    char esc_ref[CBM_SZ_1K];
-    cbm_json_escape(esc_ref, (int)sizeof(esc_ref), ref);
-    char props[CBM_SZ_2K];
-    snprintf(props, sizeof(props), "{\"via\":\"%s\",\"image\":\"%s\",\"stage\":%d,\"line\":%d}",
-             via, esc_ref, d->stage, line);
-    cbm_gbuf_insert_edge(d->ctx->gbuf, d->module, img, "DEPENDS_ON", props);
-    d->edges++;
+    if (d->nrefs == d->refs_cap) {
+        int cap = d->refs_cap ? d->refs_cap * PAIR_LEN : DK_MAX_STAGES;
+        dk_ref_t *grown = cbm_arena_alloc(d->a, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        if (d->nrefs) {
+            memcpy(grown, d->refs, (size_t)d->nrefs * sizeof(*grown));
+        }
+        d->refs = grown;
+        d->refs_cap = cap;
+    }
+    d->refs[d->nrefs++] = (dk_ref_t){img, ref, via, d->stage, line, prov};
+}
+
+/* The names a default supplies to the references of Image `img`: their union,
+ * or NULL when any of them names it without a default (a literal reference
+ * wins -- the edges to one Image are one edge, so every one of them carries
+ * the same mark). */
+static const char *dk_refs_defaults(dk_t *d, int64_t img) {
+    const char *names = NULL;
+    for (int i = 0; i < d->nrefs; i++) {
+        if (d->refs[i].img != img) {
+            continue;
+        }
+        if (!d->refs[i].prov.dflt) {
+            return NULL;
+        }
+        names = dk_names_union(d, names, d->refs[i].prov.dflt);
+    }
+    return names;
+}
+
+/* The Dockerfile's own view: DEPENDS_ON from its Module to each Image FROM /
+ * COPY --from names {via, image, stage, line[, default_of: the ARGs whose
+ * defaults named it]}. */
+static void dk_refs_link(dk_t *d) {
+    for (int i = 0; i < d->nrefs; i++) {
+        const dk_ref_t *r = &d->refs[i];
+        char esc_ref[CBM_SZ_1K];
+        cbm_json_escape(esc_ref, (int)sizeof(esc_ref), r->ref);
+        const char *dflt = dk_names_member(d, "default_of", dk_refs_defaults(d, r->img));
+        const char *props =
+            cbm_arena_sprintf(d->a, "{\"via\":\"%s\",\"image\":\"%s\",\"stage\":%d,\"line\":%d%s}",
+                              r->via, esc_ref, r->stage, r->line, dflt);
+        if (props) {
+            cbm_gbuf_insert_edge(d->ctx->gbuf, d->module, r->img, "DEPENDS_ON", props);
+            d->edges++;
+        }
+    }
+}
+
+/* A build's view: each Image a reference the build's arguments changed names
+ * -- the first reference to it, its build arguments unioned --
+ * DEPENDS_ON from the Image the build makes {via, image, override_of[,
+ * default_of], dockerfile, stage, line, tool, file, build_line}. A reference
+ * no build argument reached is the Dockerfile's own edge already. */
+static void dk_refs_link_build(dk_t *d) {
+    for (int i = 0; i < d->nrefs; i++) {
+        const dk_ref_t *r = &d->refs[i];
+        bool first = r->prov.ovr != NULL && r->img != d->built;
+        for (int j = 0; first && j < i; j++) {
+            first = !(d->refs[j].img == r->img && d->refs[j].prov.ovr);
+        }
+        if (!first) {
+            continue;
+        }
+        dk_prov_t all = {0};
+        for (int j = i; j < d->nrefs; j++) {
+            if (d->refs[j].img == r->img && d->refs[j].prov.ovr) {
+                dk_prov_merge(d, &all, d->refs[j].prov);
+            }
+        }
+        char esc_ref[CBM_SZ_1K];
+        char esc_file[CBM_SZ_1K];
+        cbm_json_escape(esc_ref, (int)sizeof(esc_ref), r->ref);
+        cbm_json_escape(esc_file, (int)sizeof(esc_file), d->file);
+        const char *props = cbm_arena_sprintf(
+            d->a,
+            "{\"via\":\"%s\",\"image\":\"%s\"%s%s,\"dockerfile\":\"%s\",\"stage\":%d,"
+            "\"line\":%d,%s}",
+            r->via, esc_ref, dk_names_member(d, "override_of", all.ovr),
+            dk_names_member(d, "default_of", all.dflt), esc_file, r->stage, r->line,
+            d->build_props);
+        if (props) {
+            cbm_gbuf_insert_edge(d->ctx->gbuf, d->built, r->img, "DEPENDS_ON", props);
+            d->edges++;
+        }
+    }
 }
 
 static int dk_line(TSNode n) {
@@ -467,19 +774,33 @@ static void dk_arg(dk_t *d, TSNode ins) {
     if (!name) {
         return;
     }
-    if (d->stage < 0) {
-        dk_set(d, &d->global, name, ts_node_is_null(df) ? NULL : dk_value(d, df));
+    size_t nl = strlen(name);
+    dk_var_t **list = d->stage < 0 ? &d->global : &d->local;
+    /* A build argument sets the ARG it names, in every stage declaring it,
+     * whatever its default. */
+    const dk_var_t *set = dk_find(d->build_args, name, nl);
+    if (set) {
+        dk_set(d, list, name, set->value, true,
+               (dk_prov_t){.ovr = dk_names_add(d, NULL, name, nl)});
         return;
     }
     const char *value = NULL;
+    dk_prov_t prov = {0};
     if (!ts_node_is_null(df)) {
+        /* A default may name ARGs declared before it (ARG BASE=golang:${GO}). */
         const char *raw = dk_value(d, df);
-        value = raw ? dk_expand(d, d->local, raw) : NULL;
-    } else {
-        const dk_var_t *g = dk_find(d->global, name, strlen(name));
-        value = g ? g->value : NULL;
+        value = raw ? dk_expand(d, *list, raw, &prov) : NULL;
+        if (value) {
+            prov.dflt = dk_names_add(d, prov.dflt, name, nl);
+        }
+    } else if (d->stage >= 0) {
+        const dk_var_t *g = dk_find(d->global, name, nl);
+        if (g) {
+            value = g->value;
+            prov = g->prov;
+        }
     }
-    dk_set(d, &d->local, name, value);
+    dk_set(d, list, name, value, true, prov);
 }
 
 static void dk_env(dk_t *d, TSNode ins) {
@@ -498,7 +819,9 @@ static void dk_env(dk_t *d, TSNode ins) {
         }
         const char *raw = ts_node_is_null(vl) ? NULL : dk_value(d, vl);
         const char *name = dk_text(d, nm);
-        dk_set(d, &d->local, name, raw ? dk_expand(d, d->local, raw) : NULL);
+        dk_prov_t prov = {0};
+        const char *value = raw ? dk_expand(d, d->local, raw, &prov) : NULL;
+        dk_set(d, &d->local, name, value, false, prov);
         dk_envkey_t *k = d->stage < DK_MAX_STAGES ? cbm_arena_alloc(d->a, sizeof(*k)) : NULL;
         if (k && name) {
             *k = (dk_envkey_t){name, dk_line(pair), d->st[d->stage].envs};
@@ -515,7 +838,9 @@ static void dk_from(dk_t *d, TSNode ins) {
             spec = ts_node_named_child(ins, i);
         }
     }
-    const char *ref = ts_node_is_null(spec) ? NULL : dk_expand(d, d->global, dk_text(d, spec));
+    dk_prov_t prov = {0};
+    const char *ref =
+        ts_node_is_null(spec) ? NULL : dk_expand(d, d->global, dk_text(d, spec), &prov);
     d->stage++;
     d->local = NULL;
     d->workdir = "/";
@@ -523,7 +848,7 @@ static void dk_from(dk_t *d, TSNode ins) {
     d->cmd.set = false;
     bool stage = ref && dk_is_stage(d, ref);
     if (ref && !stage) {
-        dk_link(d, ref, "from", dk_line(ins));
+        dk_link(d, ref, "from", dk_line(ins), prov);
     }
     if (d->stage < DK_MAX_STAGES) {
         d->st[d->stage].parent = stage ? dk_stage_of(d, ref) : -1;
@@ -605,7 +930,7 @@ static int dk_copy_json(dk_t *d, const char *p, const char **out, int max) {
     if (yyjson_is_arr(arr)) {
         for (yyjson_arr_iter_init(arr, &it); n < max && (v = yyjson_arr_iter_next(&it));) {
             const char *s = yyjson_get_str(v);
-            out[n++] = s ? dk_expand(d, d->local, cbm_arena_strdup(d->a, s)) : NULL;
+            out[n++] = s ? dk_expand(d, d->local, cbm_arena_strdup(d->a, s), NULL) : NULL;
         }
     }
     if (doc) {
@@ -639,11 +964,12 @@ static void dk_copy(dk_t *d, TSNode ins) {
         if (l > sizeof(FROM) - SKIP_ONE && strncmp(p, FROM, sizeof(FROM) - SKIP_ONE) == 0) {
             const char *v =
                 cbm_arena_strndup(d->a, p + sizeof(FROM) - SKIP_ONE, l - (sizeof(FROM) - SKIP_ONE));
-            const char *ref = v ? dk_expand(d, d->local, v) : NULL;
+            dk_prov_t prov = {0};
+            const char *ref = v ? dk_expand(d, d->local, v, &prov) : NULL;
             c->has_from = true;
             c->from = ref;
             if (ref && ref[0] && !dk_is_stage(d, ref)) {
-                dk_link(d, ref, "copy-from", dk_line(ins));
+                dk_link(d, ref, "copy-from", dk_line(ins), prov);
             }
         }
         p += l;
@@ -652,7 +978,7 @@ static void dk_copy(dk_t *d, TSNode ins) {
     while (!json && *p && nw < DK_MAX_WORDS) {
         size_t l = strcspn(p, " \t");
         const char *w = cbm_arena_strndup(d->a, p, l);
-        words[nw++] = w && strncmp(w, "<<", PAIR_LEN) != 0 ? dk_expand(d, d->local, w) : NULL;
+        words[nw++] = w && strncmp(w, "<<", PAIR_LEN) != 0 ? dk_expand(d, d->local, w, NULL) : NULL;
         p += l;
         p += strspn(p, " \t");
     }
@@ -1023,8 +1349,8 @@ static void dk_go_builds(dk_t *d, const char **w, int n) {
         if (!b) {
             return;
         }
-        *b = (dk_build_t){.out = out ? dk_expand(d, d->local, out) : NULL,
-                          .pkg = dk_expand(d, d->local, pkg ? pkg : "."),
+        *b = (dk_build_t){.out = out ? dk_expand(d, d->local, out, NULL) : NULL,
+                          .pkg = dk_expand(d, d->local, pkg ? pkg : ".", NULL),
                           .workdir = d->workdir,
                           .next = d->st[d->stage].builds};
         d->st[d->stage].builds = b;
@@ -1066,7 +1392,7 @@ static void dk_workdir(dk_t *d, TSNode ins) {
             continue;
         }
         const char *raw = dk_text(d, pn);
-        const char *v = raw ? dk_expand(d, d->local, raw) : NULL;
+        const char *v = raw ? dk_expand(d, d->local, raw, NULL) : NULL;
         const char *w = v ? v : raw;
         if (w) {
             d->workdir = dk_absolute(d, w, d->workdir);
@@ -1431,9 +1757,29 @@ static void dk_file(dk_t *d, TSNode root) {
             dk_entry(d, ins, &d->cmd);
         }
     }
+    dk_refs_link(d);
     dk_spawn(d);
     dk_envs(d);
     dk_image_set(d);
+}
+
+/* A build's view of the Dockerfile: only what decides its image references
+ * (ARG, ENV, FROM, COPY --from) is read, under the build's arguments. */
+static void dk_file_build(dk_t *d, TSNode root) {
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
+        TSNode ins = ts_node_named_child(root, i);
+        if (dk_type(ins, "arg_instruction")) {
+            dk_arg(d, ins);
+        } else if (dk_type(ins, "env_instruction")) {
+            dk_env(d, ins);
+        } else if (dk_type(ins, "from_instruction")) {
+            dk_from(d, ins);
+        } else if ((dk_type(ins, "copy_instruction") || dk_type(ins, "add_instruction")) &&
+                   d->stage >= 0) {
+            dk_copy(d, ins);
+        }
+    }
+    dk_refs_link_build(d);
 }
 
 static char *dk_read(const char *path, size_t *len) {
@@ -1545,12 +1891,15 @@ static void dk_build_site(const cbm_build_site_t *s, void *ud) {
     char esc_img[CBM_SZ_1K];
     cbm_json_escape(esc_file, (int)sizeof(esc_file), b->file);
     cbm_json_escape(esc_img, (int)sizeof(esc_img), s->image);
-    char props[CBM_SZ_4K];
-    snprintf(props, sizeof(props),
-             "{\"via\":\"build\",\"tool\":\"%s\",\"file\":\"%s\",\"image\":\"%s\",\"line\":%d}",
-             s->via, esc_file, esc_img, s->line);
-    cbm_gbuf_insert_edge(b->ctx->gbuf, img, mod->id, "DEPENDS_ON", props);
-    b->edges++;
+    const char *props = cbm_arena_sprintf(
+        b->a,
+        "{\"via\":\"build\",\"tool\":\"%s\",\"file\":\"%s\",\"image\":\"%s\",\"line\":%d%s%s}",
+        s->via, esc_file, esc_img, s->line, s->build_args ? ",\"build_args\":" : "",
+        s->build_args ? s->build_args : "");
+    if (props) {
+        cbm_gbuf_insert_edge(b->ctx->gbuf, img, mod->id, "DEPENDS_ON", props);
+        b->edges++;
+    }
 }
 
 typedef struct {
@@ -1599,6 +1948,41 @@ static void dk_compose_connects(dk_compose_t *c, const cbm_compose_service_t *s,
  * DEFINES; it DEPENDS_ON the services it depends on / links, USAGE
  * {ref:image} its image, DEPENDS_ON {via:build} the Dockerfile it builds and
  * CONNECTS_TO the services its environment addresses. */
+/* The image a service runs: USAGE {ref: image, image[, default_of]} -- the
+ * variables whose inline default named it. When the project's .env replaced
+ * a default, the edge carries {override_of, override_source: ".env"}, and
+ * the image the defaults alone name is kept: on the same Image as
+ * `default_image`, else its own USAGE {ref: image_default, default_of}, a
+ * reference the service does not run. */
+static void dk_compose_image(dk_compose_t *c, const cbm_compose_service_t *s, int64_t self) {
+    int64_t img = cbm_pipeline_image_node(c->ctx, s->image);
+    int64_t dimg = s->default_image ? cbm_pipeline_image_node(c->ctx, s->default_image) : 0;
+    char esc[CBM_SZ_1K];
+    char desc[CBM_SZ_1K];
+    cbm_json_escape(esc, (int)sizeof(esc), s->image);
+    cbm_json_escape(desc, (int)sizeof(desc), s->default_image ? s->default_image : "");
+    const char *props =
+        cbm_arena_sprintf(c->a, "{\"ref\":\"image\",\"image\":\"%s\"%s%s%s%s%s%s%s}", esc,
+                          s->image_default_of ? ",\"default_of\":" : "",
+                          s->image_default_of ? s->image_default_of : "",
+                          s->image_override_of ? ",\"override_of\":" : "",
+                          s->image_override_of ? s->image_override_of : "",
+                          s->image_override_of ? ",\"override_source\":\".env\"" : "",
+                          dimg > 0 && dimg == img ? ",\"default_image\":\"" : "",
+                          dimg > 0 && dimg == img ? cbm_arena_sprintf(c->a, "%s\"", desc) : "");
+    if (props) {
+        dk_compose_edge(c, self, img, "USAGE", props);
+    }
+    if (dimg > 0 && dimg != img && s->image_override_of) {
+        const char *dprops = cbm_arena_sprintf(
+            c->a, "{\"ref\":\"image_default\",\"image\":\"%s\",\"default_of\":%s}", desc,
+            s->image_override_of);
+        if (dprops) {
+            dk_compose_edge(c, self, dimg, "USAGE", dprops);
+        }
+    }
+}
+
 static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
     dk_compose_t *c = ud;
     const char *qn = dk_compose_qn(c, s->name);
@@ -1635,11 +2019,7 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
     }
     dk_compose_connects(c, s, self->id);
     if (s->image) {
-        char esc[CBM_SZ_1K];
-        cbm_json_escape(esc, (int)sizeof(esc), s->image);
-        char props[CBM_SZ_2K];
-        snprintf(props, sizeof(props), "{\"ref\":\"image\",\"image\":\"%s\"}", esc);
-        dk_compose_edge(c, self->id, cbm_pipeline_image_node(c->ctx, s->image), "USAGE", props);
+        dk_compose_image(c, s, self->id);
     }
     if (s->dockerfile) {
         const char *mqn = cbm_fqn_module(c->a, c->ctx->project_name, s->dockerfile);
@@ -1704,6 +2084,152 @@ static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
         cbm_free(CBM_MEM_CLASS_OTHER, src);
     }
     return b.edges;
+}
+
+static bool dk_prop(const char *props, const char *key, char *out, size_t out_sz);
+static void *dk_grow(CBMArena *a, void *v, int n, int *cap, size_t size);
+
+/* A build that passes build arguments (compose build.args, docker build
+ * --build-arg; on its build edge as `build_args`). */
+typedef struct {
+    int64_t img;
+    int64_t module;
+    const char *dockerfile;
+    const dk_var_t *args;
+    const char *props; /* "tool":..,"file":..,"build_line":N */
+} dk_argbuild_t;
+
+/* The build arguments of build edge properties `props` (NULL: none). */
+static const dk_var_t *dk_build_args_of(CBMArena *a, const char *props) {
+    if (!props || !strstr(props, "\"build_args\"")) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    yyjson_val *args = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "build_args") : NULL;
+    dk_var_t *list = NULL;
+    yyjson_obj_iter it;
+    yyjson_val *k;
+    if (yyjson_is_obj(args)) {
+        yyjson_obj_iter_init(args, &it);
+        while ((k = yyjson_obj_iter_next(&it))) {
+            const char *v = yyjson_get_str(yyjson_obj_iter_get_val(k));
+            dk_var_t *var = v ? cbm_arena_alloc(a, sizeof(*var)) : NULL;
+            if (var) {
+                *var = (dk_var_t){.name = cbm_arena_strdup(a, yyjson_get_str(k)),
+                                  .value = cbm_arena_strdup(a, v),
+                                  .arg = true,
+                                  .next = list};
+                list = var;
+            }
+        }
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return list;
+}
+
+/* Every build edge (Image -DEPENDS_ON {via: build}-> Dockerfile) that passes
+ * build arguments, into out (arena); returns how many. */
+static int dk_argbuilds(cbm_pipeline_ctx_t *ctx, CBMArena *a, dk_argbuild_t **out) {
+    const cbm_gbuf_node_t **imgs = NULL;
+    int ni = 0;
+    *out = NULL;
+    if (cbm_gbuf_find_by_label(ctx->gbuf, "Image", &imgs, &ni) != 0) {
+        return 0;
+    }
+    int n = 0;
+    int cap = 0;
+    for (int i = 0; i < ni; i++) {
+        const cbm_gbuf_edge_t **es = NULL;
+        int ne = 0;
+        if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, imgs[i]->id, "DEPENDS_ON", &es, &ne) !=
+            0) {
+            continue;
+        }
+        for (int j = 0; j < ne; j++) {
+            const char *p = es[j]->properties_json;
+            char via[CBM_SZ_32];
+            const dk_var_t *args = NULL;
+            if (!dk_prop(p, "via", via, sizeof(via)) || strcmp(via, "build") != 0 ||
+                !(args = dk_build_args_of(a, p))) {
+                continue;
+            }
+            const cbm_gbuf_node_t *mod = cbm_gbuf_find_by_id(ctx->gbuf, es[j]->target_id);
+            char tool[CBM_SZ_64];
+            char file[CBM_SZ_1K];
+            char esc[CBM_SZ_2K];
+            if (!mod || !mod->file_path || !dk_prop(p, "tool", tool, sizeof(tool)) ||
+                !dk_prop(p, "file", file, sizeof(file))) {
+                continue;
+            }
+            const char *line = strstr(p, "\"line\":");
+            if (n == cap) {
+                *out = dk_grow(a, *out, n, &cap, sizeof(**out));
+                if (!*out) {
+                    return 0;
+                }
+            }
+            cbm_json_escape(esc, (int)sizeof(esc), file);
+            (*out)[n++] = (dk_argbuild_t){
+                .img = imgs[i]->id,
+                .module = mod->id,
+                .dockerfile = cbm_arena_strdup(a, mod->file_path),
+                .args = args,
+                .props = cbm_arena_sprintf(a, "\"tool\":\"%s\",\"file\":\"%s\",\"build_line\":%d",
+                                           tool, esc, line ? atoi(line + strlen("\"line\":")) : 0)};
+        }
+    }
+    return n;
+}
+
+/* Each build passing build arguments reads its Dockerfile in its own view
+ * (dk_file_build): what those arguments change, it builds FROM. Image-sourced
+ * DEPENDS_ON edges, recomputed whole every run (CBM_BUILD_EDGE_SOURCE). */
+static int dk_link_build_args(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
+    dk_argbuild_t *bs = NULL;
+    int n = ctx->repo_path ? dk_argbuilds(ctx, a, &bs) : 0;
+    if (n == 0) {
+        return 0;
+    }
+    TSParser *parser = ts_parser_new();
+    if (!parser || !ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_DOCKERFILE))) {
+        if (parser) {
+            ts_parser_delete(parser);
+        }
+        return 0;
+    }
+    int edges = 0;
+    for (int i = 0; i < n; i++) {
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, bs[i].dockerfile);
+        size_t len = 0;
+        char *src = dk_read(path, &len);
+        if (!src) {
+            continue;
+        }
+        dk_uncomment(src, len);
+        TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
+        if (tree) {
+            dk_t d = {.ctx = ctx,
+                      .a = a,
+                      .src = src,
+                      .file = bs[i].dockerfile,
+                      .module = bs[i].module,
+                      .stage = -1,
+                      .dir = "",
+                      .workdir = "/",
+                      .build_args = bs[i].args,
+                      .built = bs[i].img,
+                      .build_props = bs[i].props};
+            dk_file_build(&d, ts_tree_root_node(tree));
+            edges += d.edges;
+            ts_tree_delete(tree);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    ts_parser_delete(parser);
+    return edges;
 }
 
 static bool dk_node_before(const cbm_gbuf_node_t *a, const cbm_gbuf_node_t *b) {
@@ -1891,17 +2417,19 @@ static void dk_hub_push(CBMArena *a, dk_hub_edges_t *l, const cbm_gbuf_edge_t *e
  * USAGE {ref:image}, or DEPENDS_ON {via:from|copy-from}? */
 static bool dk_hub_ref(const char *type, const char *p) {
     char v[CBM_SZ_32];
-    if (strcmp(type, "USAGE") == 0) {
+    if (strcmp(type, "USAGE") == 0 || strcmp(type, "DEPLOYS") == 0) {
         return dk_prop(p, "ref", v, sizeof(v)) && strcmp(v, "image") == 0;
     }
     return dk_prop(p, "via", v, sizeof(v)) &&
            (strcmp(v, "from") == 0 || strcmp(v, "copy-from") == 0);
 }
 
-/* The edges of Image `img`: build edges out (DEPENDS_ON {via:build}) and
- * references in, each with the tag of its `image` reference. */
+/* The edges of Image `img`: build edges out (DEPENDS_ON {via:build}), the
+ * base images a build's arguments chose out (DEPENDS_ON {via: from |
+ * copy-from, build_line}: they follow their build) and references in, each
+ * with the tag of its `image` reference. */
 static void dk_hub_collect(cbm_pipeline_ctx_t *ctx, CBMArena *a, int64_t img,
-                           dk_hub_edges_t *builds, dk_hub_edges_t *refs) {
+                           dk_hub_edges_t *builds, dk_hub_edges_t *refs, dk_hub_edges_t *follows) {
     const cbm_gbuf_edge_t **es = NULL;
     int n = 0;
     char ref[CBM_SZ_1K];
@@ -1909,8 +2437,13 @@ static void dk_hub_collect(cbm_pipeline_ctx_t *ctx, CBMArena *a, int64_t img,
     if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, img, "DEPENDS_ON", &es, &n) == 0) {
         for (int i = 0; i < n; i++) {
             char via[CBM_SZ_32];
-            if (!dk_prop(es[i]->properties_json, "via", via, sizeof(via)) ||
-                strcmp(via, "build") != 0) {
+            if (!dk_prop(es[i]->properties_json, "via", via, sizeof(via))) {
+                continue;
+            }
+            if (strcmp(via, "build") != 0) {
+                if (strstr(es[i]->properties_json, "\"build_line\":")) {
+                    dk_hub_push(a, follows, es[i], "");
+                }
                 continue;
             }
             tag[0] = '\0';
@@ -1921,7 +2454,7 @@ static void dk_hub_collect(cbm_pipeline_ctx_t *ctx, CBMArena *a, int64_t img,
         }
         atomic_fetch_add_explicit(&g_dk_hub_edges, (uint64_t)n, memory_order_relaxed);
     }
-    static const char *const REF_TYPES[] = {"USAGE", "DEPENDS_ON"};
+    static const char *const REF_TYPES[] = {"USAGE", "DEPENDS_ON", "DEPLOYS"};
     for (size_t t = 0; t < sizeof(REF_TYPES) / sizeof(REF_TYPES[0]); t++) {
         if (cbm_gbuf_find_edges_by_target_type(ctx->gbuf, img, REF_TYPES[t], &es, &n) != 0) {
             continue;
@@ -2122,6 +2655,27 @@ static int dk_hub_move(cbm_pipeline_ctx_t *ctx, CBMArena *a, const dk_hub_edge_t
     return SKIP_ONE;
 }
 
+static int dk_prop_int(const char *props, const char *key) {
+    char pat[CBM_SZ_64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = props ? strstr(props, pat) : NULL;
+    return p ? atoi(p + strlen(pat)) : -SKIP_ONE;
+}
+
+/* Does base-image edge `f` come from build edge `b`: one source, and its
+ * tool / file / build_line those of the build? */
+static bool dk_hub_follows(const dk_hub_edge_t *f, const dk_hub_edge_t *b) {
+    char ft[CBM_SZ_64];
+    char bt[CBM_SZ_64];
+    char ff[CBM_SZ_1K];
+    char bf[CBM_SZ_1K];
+    return f->src == b->src && dk_prop(f->props, "tool", ft, sizeof(ft)) &&
+           dk_prop(b->props, "tool", bt, sizeof(bt)) && strcmp(ft, bt) == 0 &&
+           dk_prop(f->props, "file", ff, sizeof(ff)) && dk_prop(b->props, "file", bf, sizeof(bf)) &&
+           strcmp(ff, bf) == 0 &&
+           dk_prop_int(f->props, "build_line") == dk_prop_int(b->props, "line");
+}
+
 /* One repository's Images (imgs[0..n)): split it by component when it is
  * built from several Dockerfiles, else keep (or bring back) everything on
  * the repository Image. Returns the edges moved. */
@@ -2129,10 +2683,11 @@ static int dk_hub_repo(cbm_pipeline_ctx_t *ctx, CBMArena *a, const dk_img_t *img
                        dk_drop_t *drop) {
     dk_hub_edges_t builds = {0};
     dk_hub_edges_t refs = {0};
+    dk_hub_edges_t follows = {0};
     bool has_sub = false;
     for (int i = 0; i < n; i++) {
         has_sub = has_sub || strcmp(imgs[i].name, imgs[i].repo) != 0;
-        dk_hub_collect(ctx, a, imgs[i].id, &builds, &refs);
+        dk_hub_collect(ctx, a, imgs[i].id, &builds, &refs, &follows);
     }
     const char **comps = NULL;
     size_t pre = 0;
@@ -2158,6 +2713,11 @@ static int dk_hub_repo(cbm_pipeline_ctx_t *ctx, CBMArena *a, const dk_img_t *img
         int k = builds.v[i].comp;
         int64_t src = sub && k >= 0 && sub[k] > 0 ? sub[k] : repo_img;
         moved += dk_hub_move(ctx, a, &builds.v[i], src, builds.v[i].tgt, drop);
+        for (int f = 0; f < follows.n; f++) {
+            if (dk_hub_follows(&follows.v[f], &builds.v[i])) {
+                moved += dk_hub_move(ctx, a, &follows.v[f], src, follows.v[f].tgt, drop);
+            }
+        }
     }
     for (int i = 0; i < refs.n; i++) {
         int k = sub ? dk_hub_match(refs.v[i].tag, comps, nc) : -1;
@@ -2274,6 +2834,7 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
         cbm_ht_free(ix.dirs);
     }
     edges += dk_link_builds(ctx, &arena);
+    edges += dk_link_build_args(ctx, &arena);
     edges += dk_image_hubs(ctx, &arena);
     cbm_arena_destroy(&arena);
     if (edges > 0) {

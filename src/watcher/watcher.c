@@ -522,14 +522,28 @@ static watcher_git_status_t git_repo_status(cbm_watcher_t *w, project_state_t *s
  * a `.git` file (the gitlink form used by linked worktrees and initialized
  * submodules). Deliberately a filesystem check, not a git invocation — the whole
  * point is to learn something `rev-parse` cannot tell us, because it walks up. */
+/* Preserve stat's link-following behavior while inspecting UTF-8 paths. */
+static int watcher_path_info(const char *path, cbm_path_info_t *info) {
+    int status = cbm_path_info_utf8(path, info);
+    if (status == CBM_PATH_INFO_OK && info->is_symlink) {
+        char canonical[CBM_SZ_4K];
+        if (!cbm_canonical_path(path, canonical, sizeof(canonical))) {
+            return CBM_PATH_INFO_UNAVAILABLE;
+        }
+        status = cbm_path_info_utf8(canonical, info);
+    }
+    return status;
+}
+
 static bool git_has_own_dot_git(const char *root_path) {
     char path[CBM_SZ_4K];
     int written = snprintf(path, sizeof(path), "%s/.git", root_path);
     if (written <= 0 || (size_t)written >= sizeof(path)) {
         return false;
     }
-    struct stat st;
-    return stat(path, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode));
+    cbm_path_info_t info;
+    return watcher_path_info(path, &info) == CBM_PATH_INFO_OK &&
+           (info.is_directory || info.is_regular);
 }
 
 /* Does the ancestor repository actually track anything inside this directory?
@@ -990,13 +1004,17 @@ static root_status_t root_status(const char *root_path, int *out_errno) {
     if (!root_path) {
         return ROOT_UNCERTAIN;
     }
-    struct stat st;
-    if (stat(root_path, &st) == 0) {
-        /* Exists but is no longer a directory → the root directory is gone. */
-        return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
+    cbm_path_info_t info;
+    int status = watcher_path_info(root_path, &info);
+    if (status == CBM_PATH_INFO_OK) {
+        return info.is_directory ? ROOT_PRESENT : ROOT_MISSING;
     }
+#ifdef _WIN32
+    *out_errno = status == CBM_PATH_INFO_ABSENT ? ENOENT : EIO;
+#else
     *out_errno = errno;
-    return cbm_watcher_root_missing_errno(errno) ? ROOT_MISSING : ROOT_UNCERTAIN;
+#endif
+    return status == CBM_PATH_INFO_ABSENT ? ROOT_MISSING : ROOT_UNCERTAIN;
 }
 
 /* Sustained-absence window (seconds) before a missing root may be pruned.
@@ -1338,8 +1356,8 @@ static void publish_status(project_state_t *s, bool scanned) {
 
 /* Init baseline for a project: check if git, get HEAD, count files */
 static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
-    struct stat st;
-    if (stat(s->root_path, &st) != 0) {
+    cbm_path_info_t info;
+    if (watcher_path_info(s->root_path, &info) != CBM_PATH_INFO_OK || !info.is_directory) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;

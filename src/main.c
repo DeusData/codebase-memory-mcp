@@ -902,6 +902,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
          * own here, and only here (cbm_sqlite_dedicated_heap). */
         cbm_sqlite_dedicated_heap(true);
         cbm_memev_process_role("worker");
+        /* A full index saturates every core; run it below normal priority so
+         * interactive CLI/MCP queries are not starved. Before any indexing
+         * thread exists, so they all inherit it. Failure is harmless. */
+        if (!cbm_lower_cpu_priority()) {
+            cbm_log_info("index.worker.priority", "lowered", "false");
+        }
     }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
@@ -1092,6 +1098,11 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         } else {
             exit_code = cli_print_mcp_result(result);
         }
+        /* One place for both presentations: a gate reading the status must get
+         * the same verdict whether or not the caller asked for --json. */
+        if (tool_name && strcmp(tool_name, "index_repository") == 0) {
+            exit_code = cbm_cli_index_exit_status(result, exit_code);
+        }
         exit_code = cbm_cli_exit_status_after_maintenance(exit_code, maintenance_cancelled);
         if (cbm_index_worker_active()) {
             /* The supervisor protocol classifies the PROCESS, not the tool
@@ -1134,6 +1145,10 @@ static void print_help(void) {
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp daemon <start|stop|status>\n");
+    printf("                                      start keeps a daemon warm: CLI calls skip\n");
+    printf("                                      the per-command start-up, and hooks add\n");
+    printf("                                      graph context only while a daemon runs\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
     printf("\nCLI output options:\n");
@@ -1175,21 +1190,27 @@ static void print_help(void) {
 
 /* Try to handle a subcommand (cli/install/uninstall/update/config/--version/--help).
  * Returns -1 if no subcommand matched, otherwise the exit code. */
-/* `allow-root [--approve-sensitive] <path>` — record an indexing root.
+/* `allow-root [--approve-sensitive | --approve-broad] <path>` — record an
+ * indexing root.
  *
  * Enrollment lives here, in a command a person types, and deliberately nowhere
  * else: the whole point of the grant store is that neither an indexed repository
  * nor a tool caller can widen its own boundary. A confirmation delivered through
  * the MCP surface would be answered by the same agent that may have been
- * influenced, so it would not be a human decision at all. */
+ * influenced, so it would not be a human decision at all. --approve-broad is the
+ * same kind of record for one exact root refused as too broad ("/work", "/app"),
+ * so it is listed, revocable and seen identically by stdio and daemon sessions. */
 static int main_run_allow_root(int argc, char **argv) {
     const char *path = NULL;
     bool approve_sensitive = false;
+    bool approve_broad = false;
     bool list_only = false;
     bool approve_manifest = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--approve-sensitive") == 0) {
             approve_sensitive = true;
+        } else if (strcmp(argv[i], "--approve-broad") == 0) {
+            approve_broad = true;
         } else if (strcmp(argv[i], "--list") == 0) {
             list_only = true;
         } else if (strcmp(argv[i], "--approve-manifest") == 0) {
@@ -1221,7 +1242,8 @@ static int main_run_allow_root(int argc, char **argv) {
         }
         if (!path && !list_only) {
             (void)fprintf(stderr,
-                          "usage: codebase-memory-mcp allow-root [--approve-sensitive] <path>\n"
+                          "usage: codebase-memory-mcp allow-root [--approve-sensitive | "
+                          "--approve-broad] <path>\n"
                           "       codebase-memory-mcp allow-root --approve-manifest <project>\n"
                           "       codebase-memory-mcp allow-root --list\n");
             return EXIT_FAILURE;
@@ -1264,7 +1286,7 @@ static int main_run_allow_root(int argc, char **argv) {
 
     char err[CBM_SZ_1K];
     if (!cbm_workspace_grant_add(cache_dir, cbm_workspace_home_dir(), canonical, approve_sensitive,
-                                 err, sizeof(err))) {
+                                 approve_broad, err, sizeof(err))) {
         (void)fprintf(stderr, "refused: %s\n", err[0] ? err : "not an allowable root");
         return EXIT_FAILURE;
     }
@@ -1645,20 +1667,24 @@ static bool main_project_lock_manager_close(cbm_project_lock_manager_t **manager
 }
 
 static bool main_local_transition_close(cbm_daemon_ipc_local_transition_t **transition) {
-    uint64_t deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
+    uint64_t ceiling = main_deadline_after(MAIN_STARTUP_CONTENTION_CEILING_MS);
+    uint64_t error_deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
     while (transition && *transition) {
-        /* A failed release always RETAINS the transition and is retriable by
-         * contract: the Windows release transition must briefly try-hold the
-         * shared startup-v2/legacy gates, so concurrent one-shot teardowns
-         * legitimately collide and succeed on retry. Success consumes the
-         * transition; only never-finishing cleanup is a failure, and the
-         * deadline escalation below owns that. */
-        (void)cbm_daemon_ipc_local_transition_release(transition);
+        /* Windows teardown reacquires the startup-v2/legacy gates before
+         * releasing its participant claim. A live startup owner can hold them
+         * beyond the native cleanup deadline. Retain protection and use the
+         * acquisition backstop for contention; repeated native errors still
+         * get only the short cleanup deadline. Success consumes the handle. */
+        int status = cbm_daemon_ipc_local_transition_try_release(transition);
         if (*transition) {
-            if (cbm_now_ms() >= deadline) {
+            uint64_t now = cbm_now_ms();
+            if (now >= ceiling || (status < 0 && now >= error_deadline)) {
                 main_coordination_cleanup_fail_stop("local_transition_cleanup");
             }
-            cbm_usleep(1000);
+            if (status == 0) {
+                error_deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
+            }
+            cbm_usleep(status == 0 ? 10000 : 1000);
         }
     }
     return true;
@@ -2872,18 +2898,19 @@ int main(int argc, char **argv) {
         cbm_hook_augment_arm_deadline();
 #endif
         /* Read stdin now and bail before executable-identity hashing when the
-         * event can never produce output (an un-forced PreToolUse Bash call
-         * that is not a search). The identity hash costs ~1.1 s of user CPU
+         * event can never produce output (an un-forced PreToolUse Bash call,
+         * or Copilot's forced PostToolUse after a shell call, that is not a
+         * search). The identity hash costs ~1.1 s of user CPU
          * per invocation, and with Bash in the installed matcher nearly every
          * agent command would pay it for nothing. A no-op touches no shared
          * state, so it needs no identity. Anything else is handed back via
          * the prefetch so downstream readers see stdin exactly once. */
-        if (!hook_event) {
+        if (!hook_event || strcmp(hook_event, "PostToolUse") == 0) {
             char *hook_input = cbm_hook_augment_read_stdin();
             if (!hook_input) {
                 return EXIT_SUCCESS; /* fail open, nothing to augment */
             }
-            if (cbm_hook_augment_input_is_noop_bash(hook_input)) {
+            if (cbm_hook_augment_input_is_noop_for(hook_input, hook_event, hook_dialect)) {
                 free(hook_input);
                 return EXIT_SUCCESS;
             }

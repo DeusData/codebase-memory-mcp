@@ -130,8 +130,12 @@ function patternFacts(text: string): string[] {
 }
 
 function xmlFacts(text: string): string[] {
-    const root = /<([A-Za-z_][\w:.-]*)[\s>/]/.exec(text.replace(/<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<![^>]*>/g, ''));
-    return root ? [words.root(quote(`<${root[1]}>`))] : [];
+    // Skip markup in the original input: deleting it could join fragments into a new tag.
+    const tokens = /<\?[\s\S]*?(?:\?>|$)|<!--[\s\S]*?(?:-->|$)|<![^>]*>|<([A-Za-z_][\w:.-]*)[\s>/]/g;
+    for (const match of text.matchAll(tokens)) {
+        if (match[1]) return [words.root(quote(`<${match[1]}>`))];
+    }
+    return [];
 }
 
 /** The structure of the text, by the kind its name gives. */
