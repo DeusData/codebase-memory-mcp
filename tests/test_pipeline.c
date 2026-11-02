@@ -24175,7 +24175,7 @@ TEST(pipeline_python_explicit_package_reexports_keep_identity) {
                     .label = "Class",
                     .declaration_line = 3,
                     .declaration_text = "class Doc:"}}};
-    char tmp[] = "/tmp/cbm_py_explicit_reexport_XXXXXX";
+    char tmp[512] = "/tmp/cbm_py_explicit_reexport_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
         write_temp_file(tmp, sources[i].path, sources[i].text);
@@ -24258,7 +24258,7 @@ TEST(pipeline_python_dunder_file_reexports_keep_symbol_identity) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "def __file__():"}}};
-    char tmp[] = "/tmp/cbm_py_dunder_file_XXXXXX";
+    char tmp[512] = "/tmp/cbm_py_dunder_file_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
         write_temp_file(tmp, sources[i].path, sources[i].text);
@@ -24301,7 +24301,7 @@ TEST(pipeline_python_from_import_dependency_is_not_a_local_binding) {
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        char tmp[] = "/tmp/cbm_python_dependency_XXXXXX";
+        char tmp[512] = "/tmp/cbm_python_dependency_XXXXXX";
         ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
         write_temp_file(tmp, "pkg/__init__.py", cases[i].parent);
         if (cases[i].child)
@@ -24390,7 +24390,7 @@ static void python_submodule_diagnostic(cbm_store_t *store, const char *project)
 
 static int python_submodule_case_run(const python_submodule_case *fixture, bool *quality,
                                      RQ_Report *report) {
-    char tmp[] = "/tmp/cbm_python_submodule_XXXXXX";
+    char tmp[512] = "/tmp/cbm_python_submodule_XXXXXX";
     *quality = false;
     if (!cbm_mkdtemp(tmp))
         return -1;
@@ -27073,7 +27073,7 @@ TEST(pipeline_python_nested_class_methods_resolve_parallel) {
 }
 
 TEST(pipeline_python_default_callable_references_have_execution_owner) {
-    char tmp[] = "/tmp/cbm_py_default_owner_XXXXXX";
+    char tmp[512] = "/tmp/cbm_py_default_owner_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "app.py",
                     "def target():\n"

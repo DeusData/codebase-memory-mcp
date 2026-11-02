@@ -13,6 +13,8 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/shared_resolver.h"
+#include "pipeline/resolver_ecma.h"
+#include "resolve/rust_names.h"
 #include "pipeline/lsp_resolve.h"
 #include "lsp/oo_strict.h"
 #include "pipeline/worker_pool.h"
@@ -200,6 +202,10 @@ static void harness_ctx_free_tables(cbm_pipeline_ctx_t *ctx) {
         free((void *)ctx->return_type_table);
         ctx->return_type_table = NULL;
     }
+    cbm_ecma_surfaces_free(ctx->ecma_surfaces);
+    ctx->ecma_surfaces = NULL;
+    cbm_rust_project_free(ctx->rust_project);
+    ctx->rust_project = NULL;
 }
 
 /* Mirror production occurrence capture while the extraction cache, cross

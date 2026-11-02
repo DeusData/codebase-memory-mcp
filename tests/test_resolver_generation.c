@@ -1228,7 +1228,7 @@ TEST(resolver_generation_publish_keeps_the_wal_small) {
         rows[i].start_byte = (uint32_t)i;
         rows[i].end_byte = (uint32_t)i + 1;
     }
-    char dir[] = "/tmp/cbm_generation_wal_XXXXXX";
+    char dir[512] = "/tmp/cbm_generation_wal_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(dir));
     char db_path[256], wal_path[256];
     snprintf(db_path, sizeof(db_path), "%s/stage.db", dir);

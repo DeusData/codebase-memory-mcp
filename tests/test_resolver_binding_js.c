@@ -585,9 +585,10 @@ TEST(resolver_binding_js_const_export_requires_unique_materialized_value) {
  * Kilo-Org/kilocode, with a decoy beside it that must keep abstaining.
  * ------------------------------------------------------------------------- */
 
+/* The fixture is returned by value and the index keeps its arena, so the arena must not move. */
 typedef struct {
     CBMFileResult *result;
-    CBMArena arena;
+    CBMArena *arena;
     cbm_resolve_binding_index_t *index;
 } js_fixture_t;
 
@@ -596,15 +597,20 @@ static js_fixture_t js_fixture(const char *source, CBMLanguage language, const c
     js_fixture_t fixture = {0};
     fixture.result =
         cbm_extract_file(source, (int)strlen(source), language, "test", file, 0, NULL, NULL);
-    cbm_arena_init(&fixture.arena);
+    fixture.arena = malloc(sizeof(*fixture.arena));
+    if (!fixture.arena)
+        return fixture;
+    cbm_arena_init(fixture.arena);
     if (fixture.result)
         fixture.index = cbm_resolve_binding_build_declared_module(
-            &fixture.arena, fixture.result, language, source, strlen(source), declared_module);
+            fixture.arena, fixture.result, language, source, strlen(source), declared_module);
     return fixture;
 }
 
 static void js_fixture_free(js_fixture_t *fixture) {
-    cbm_arena_destroy(&fixture->arena);
+    if (fixture->arena)
+        cbm_arena_destroy(fixture->arena);
+    free(fixture->arena);
     cbm_free_result(fixture->result);
 }
 
@@ -618,7 +624,7 @@ static bool js_binds_at(js_fixture_t *fixture, const char *source, const char *c
     uint32_t start = (uint32_t)(site - source);
     cbm_resolve_result_t resolved = cbm_resolve_binding_validate(
         fixture->index, name, start, start + (uint32_t)strlen(spelling), CBM_SOURCE_ORIGIN_RAW,
-        js_local(&fixture->arena, fixture->result, name));
+        js_local(fixture->arena, fixture->result, name));
     return cbm_resolve_admit(&resolved);
 }
 
