@@ -26,6 +26,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 
 #include <stdbool.h>
@@ -66,6 +67,15 @@ static char *strip_resolved_ext(char *path) {
     return path;
 }
 
+static char *alias_strndup(const char *text, size_t length) {
+    char *copy = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, length + 1);
+    if (copy) {
+        memcpy(copy, text, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
+
 /* Join dir_prefix with target, collapsing "." and ".." segments so aliases
  * that climb out of their tsconfig's directory (the common monorepo
  * pattern: a tsconfig at apps/web/tsconfig.json pointing an alias at a
@@ -83,7 +93,7 @@ static char *resolve_target_relative(const char *dir_prefix, const char *target)
     }
     size_t dp_len = (dir_prefix && dir_prefix[0] != '\0') ? strlen(dir_prefix) : 0;
     size_t t_len = strlen(target);
-    char *buf = malloc(dp_len + t_len + 2);
+    char *buf = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, dp_len + t_len + 2);
     if (!buf) {
         return NULL;
     }
@@ -193,7 +203,7 @@ static yyjson_doc *read_tsconfig_doc(const char *abs_path) {
         fclose(f);
         return NULL;
     }
-    char *buf = malloc((size_t)len + 1);
+    char *buf = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)len + 1);
     if (!buf) {
         fclose(f);
         return NULL;
@@ -204,7 +214,7 @@ static yyjson_doc *read_tsconfig_doc(const char *abs_path) {
 
     yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_TRAILING_COMMAS;
     yyjson_doc *doc = yyjson_read(buf, nread, flg);
-    free(buf);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
     return doc;
 }
 
@@ -238,7 +248,7 @@ static bool extends_rel_path(const char *dir_prefix, const char *value, char *ou
     /* `"extends": "./base"` reads ./base.json, like TypeScript. */
     bool suffixed = length > 5 && !strcmp(joined + length - 5, ".json");
     int n = snprintf(out, cap, "%s%s", joined, suffixed ? "" : ".json");
-    free(joined);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, joined);
     return n > 0 && (size_t)n < cap;
 }
 
@@ -249,8 +259,9 @@ static void tsconfig_note_base(cbm_path_alias_collection_t *coll, const char *re
     if (!coll) {
         return;
     }
-    char **grown = realloc(coll->bases, ((size_t)coll->base_count + 1) * sizeof(*grown));
-    char *copy = grown ? strdup(rel) : NULL;
+    char **grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, coll->bases,
+                               ((size_t)coll->base_count + 1) * sizeof(*grown));
+    char *copy = grown ? cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, rel) : NULL;
     if (grown) {
         coll->bases = grown;
     }
@@ -309,7 +320,7 @@ static bool tsconfig_read_chain(const char *repo_path, const char *abs_path, con
     if (!out->paths && yyjson_is_obj(paths)) {
         out->paths = paths;
         out->paths_doc = doc;
-        out->paths_dir = strdup(dir_prefix);
+        out->paths_dir = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, dir_prefix);
         keep = true;
     }
     const char *base_url = yyjson_get_str(yyjson_obj_get(options, "baseUrl"));
@@ -367,23 +378,25 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *repo_path, const cha
         !tsconfig_read_chain(repo_path, abs_path, dir_prefix, 0, &options)) {
         return NULL;
     }
-    cbm_path_alias_map_t *map = calloc(1, sizeof(*map));
+    cbm_path_alias_map_t *map = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*map));
     if (!map) {
         yyjson_doc_free(options.paths_doc);
         yyjson_doc_free(options.conditions_doc);
-        free(options.paths_dir);
-        free(options.base_root);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, options.paths_dir);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, options.base_root);
         return NULL;
     }
     if (options.base_root && options.base_root[0]) {
-        map->base_url = strdup(options.base_root);
+        map->base_url = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, options.base_root);
     }
     size_t conditions = options.conditions ? yyjson_arr_size(options.conditions) : 0;
-    map->custom_conditions = conditions ? calloc(conditions, sizeof(char *)) : NULL;
+    map->custom_conditions =
+        conditions ? cbm_calloc(CBM_MEM_CLASS_SEMANTIC, conditions * sizeof(char *)) : NULL;
     for (size_t i = 0; map->custom_conditions && i < conditions; i++) {
         const char *condition = yyjson_get_str(yyjson_arr_get(options.conditions, i));
         if (condition) {
-            map->custom_conditions[map->custom_condition_count++] = strdup(condition);
+            map->custom_conditions[map->custom_condition_count++] =
+                cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, condition);
         }
     }
     yyjson_doc_free(options.conditions_doc);
@@ -397,13 +410,14 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *repo_path, const cha
         bool capped = obj_size > CBM_PATH_ALIAS_MAX_ENTRIES;
         int capacity = (int)(capped ? (size_t)CBM_PATH_ALIAS_MAX_ENTRIES : obj_size);
         if (capacity > 0) {
-            map->entries = calloc((size_t)capacity, sizeof(cbm_path_alias_t));
+            map->entries =
+                cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)capacity * sizeof(cbm_path_alias_t));
             if (!map->entries) {
-                free(map->base_url);
-                free(map);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, map->base_url);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, map);
                 yyjson_doc_free(options.paths_doc);
-                free(options.paths_dir);
-                free(options.base_root);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, options.paths_dir);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, options.base_root);
                 return NULL;
             }
             yyjson_val *key;
@@ -423,22 +437,22 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *repo_path, const cha
                 if (star) {
                     entry->has_wildcard = true;
                     entry->alias_prefix =
-                        cbm_strndup(alias_pattern, (size_t)(star - alias_pattern));
-                    entry->alias_suffix = strdup(star + 1);
+                        alias_strndup(alias_pattern, (size_t)(star - alias_pattern));
+                    entry->alias_suffix = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, star + 1);
                 } else {
                     entry->has_wildcard = false;
-                    entry->alias_prefix = strdup(alias_pattern);
-                    entry->alias_suffix = strdup("");
+                    entry->alias_prefix = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, alias_pattern);
+                    entry->alias_suffix = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "");
                 }
                 const char *tstar = strchr(target_pattern, '*');
                 if (tstar) {
-                    char *pre = cbm_strndup(target_pattern, (size_t)(tstar - target_pattern));
+                    char *pre = alias_strndup(target_pattern, (size_t)(tstar - target_pattern));
                     entry->target_prefix = resolve_target_relative(target_root, pre);
-                    free(pre);
-                    entry->target_suffix = strdup(tstar + 1);
+                    cbm_free(CBM_MEM_CLASS_SEMANTIC, pre);
+                    entry->target_suffix = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, tstar + 1);
                 } else {
                     entry->target_prefix = resolve_target_relative(target_root, target_pattern);
-                    entry->target_suffix = strdup("");
+                    entry->target_suffix = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "");
                 }
                 map->count++;
             }
@@ -453,8 +467,8 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *repo_path, const cha
     }
 
     yyjson_doc_free(options.paths_doc);
-    free(options.paths_dir);
-    free(options.base_root);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, options.paths_dir);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, options.base_root);
     return map;
 }
 
@@ -465,18 +479,18 @@ static void free_alias_map(cbm_path_alias_map_t *map) {
         return;
     }
     for (int j = 0; j < map->count; j++) {
-        free(map->entries[j].alias_prefix);
-        free(map->entries[j].alias_suffix);
-        free(map->entries[j].target_prefix);
-        free(map->entries[j].target_suffix);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, map->entries[j].alias_prefix);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, map->entries[j].alias_suffix);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, map->entries[j].target_prefix);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, map->entries[j].target_suffix);
     }
-    free(map->entries);
-    free(map->base_url);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, map->entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, map->base_url);
     for (int j = 0; j < map->custom_condition_count; j++) {
-        free(map->custom_conditions[j]);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, map->custom_conditions[j]);
     }
-    free(map->custom_conditions);
-    free(map);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, map->custom_conditions);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, map);
 }
 
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
@@ -484,16 +498,16 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
         return;
     }
     for (int i = 0; i < coll->count; i++) {
-        free(coll->scopes[i].dir_prefix);
-        free(coll->scopes[i].source_rel_path);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, coll->scopes[i].dir_prefix);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, coll->scopes[i].source_rel_path);
         free_alias_map(coll->scopes[i].map);
     }
     for (int i = 0; i < coll->base_count; i++) {
-        free(coll->bases[i]);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, coll->bases[i]);
     }
-    free(coll->bases);
-    free(coll->scopes);
-    free(coll);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, coll->bases);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, coll->scopes);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, coll);
 }
 
 bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
@@ -642,7 +656,8 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     if (!repo_path) {
         return NULL;
     }
-    alias_config_hit_t *hits = calloc(CBM_PATH_ALIAS_MAX_FILES, sizeof(*hits));
+    alias_config_hit_t *hits =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, CBM_PATH_ALIAS_MAX_FILES * sizeof(*hits));
     if (!hits) {
         return NULL;
     }
@@ -653,19 +668,20 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
     }
     if (count == 0) {
-        free(hits);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, hits);
         return NULL;
     }
 
-    cbm_path_alias_collection_t *coll = calloc(1, sizeof(*coll));
+    cbm_path_alias_collection_t *coll = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*coll));
     if (!coll) {
-        free(hits);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, hits);
         return NULL;
     }
-    coll->scopes = calloc((size_t)count, sizeof(cbm_path_alias_scope_t));
+    coll->scopes =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)count * sizeof(cbm_path_alias_scope_t));
     if (!coll->scopes) {
-        free(coll);
-        free(hits);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, coll);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, hits);
         return NULL;
     }
 
@@ -682,11 +698,11 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         } else {
             snprintf(selected_rel, sizeof(selected_rel), "%s", base);
         }
-        char *dir_prefix = strdup(hits[i].rel);
-        char *source_rel_path = strdup(selected_rel);
+        char *dir_prefix = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, hits[i].rel);
+        char *source_rel_path = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, selected_rel);
         if (!dir_prefix || !source_rel_path) {
-            free(dir_prefix);
-            free(source_rel_path);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, dir_prefix);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, source_rel_path);
             free_alias_map(map);
             continue;
         }
@@ -695,7 +711,7 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         coll->scopes[coll->count].map = map;
         coll->count++;
     }
-    free(hits);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, hits);
 
     /* Configs that alias nothing leave no scope worth a collection, unless a base config could
      * start to: the planner must still recognize a change to it. */

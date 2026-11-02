@@ -669,7 +669,6 @@ static void jw_emit_type_mentions(jw_t *j, TSNode node, unsigned depth) {
 
 /* `@Nullable`, `@Foo(Bar.BAZ)`: the annotation's type and its value expressions. */
 static void jw_annotation(jw_t *j, TSNode node) {
-    oo_walk_t *w = j->w;
     TSNode name = j_field(node, "name");
     const char *spelled = ts_node_is_null(name) ? NULL : j_compact(&j->text, name);
     if (spelled) {
@@ -679,7 +678,7 @@ static void jw_annotation(jw_t *j, TSNode node) {
         TSNode leaf =
             j_is(name, "scoped_identifier") && parts ? ts_node_named_child(name, parts - 1) : name;
         if (type.type && type.type->graph_qn)
-            oo_emit_usage(w, leaf, type.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+            oo_emit_usage(j->w, leaf, type.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
                           CBM_RESOLVE_RULE_DECLARED_TYPE, "java-annotation-type");
     }
     TSNode arguments = j_field(node, "arguments");

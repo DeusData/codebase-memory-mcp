@@ -148,12 +148,15 @@ static bool pattern_binder(TSNode node) {
     return false;
 }
 
+static size_t audit_binding_count(const TSLSPContext *ctx) {
+    return ctx->proof_audit->count;
+}
+
 static void add_rebinding(TSLSPContext *ctx, TSNode target) {
-    struct CBMTSProofAudit *audit = ctx->proof_audit;
-    size_t before = audit->count;
+    size_t before = audit_binding_count(ctx);
     add_binding(ctx, target, target, target, false);
-    if (audit->count > before)
-        audit->bindings[before].pending = true;
+    if (audit_binding_count(ctx) > before)
+        ctx->proof_audit->bindings[before].pending = true;
 }
 
 /* A write's target. Rebinding a name changes the one declaration lexical scope picks for

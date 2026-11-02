@@ -479,7 +479,7 @@ static void node_workspace_paths(yyjson_val *root, const char *directory,
      * can never be dropped and leave only the convenient positive half. */
     yyjson_arr_foreach(workspaces, i, count, item) {
         if (!node_workspace_path(yyjson_get_str(item), directory, path, sizeof(path), &glob)) {
-            const char *patterns[NODE_WORKSPACE_PATTERNS];
+            const char *patterns[NODE_WORKSPACE_PATTERNS] = {NULL};
             int listed = 0;
             size_t at, total;
             yyjson_val *pattern;
@@ -541,7 +541,8 @@ static bool node_manifest_unique(yyjson_val *value, unsigned depth) {
 static bool node_version_parts(const char *text, long parts[3], int *given) {
     *given = 0;
     parts[0] = parts[1] = parts[2] = 0;
-    for (const char *at = text; *given < 3;) {
+    const char *at = text;
+    for (int index = 0; index < 3; index++) {
         if (*at == 'x' || *at == 'X' || *at == '*') {
             at++;
             if (*at)
@@ -551,12 +552,12 @@ static bool node_version_parts(const char *text, long parts[3], int *given) {
         if (!isdigit((unsigned char)*at))
             return false;
         char *end = NULL;
-        parts[*given] = strtol(at, &end, 10);
-        (*given)++;
+        parts[index] = strtol(at, &end, 10);
+        *given = index + 1;
         at = end;
         if (!*at)
             break;
-        if (*at != '.' || *given == 3)
+        if (*at != '.' || index == 2)
             return false;
         at++;
     }
@@ -4879,6 +4880,16 @@ bool cbm_pipeline_python_submodule_candidate(const cbm_gbuf_t *graph, const char
     return true;
 }
 
+/* The key and value arrays of an import map that will not be returned. */
+static void import_map_arrays_free(const char **keys, const char **values, int count) {
+    for (int i = 0; i < count; i++) {
+        free((void *)keys[i]);
+        free((void *)values[i]);
+    }
+    free(keys);
+    free(values);
+}
+
 static bool python_map_put(CBMHashTable *by_local, const char **keys, const char **vals, int *count,
                            const char *local, char *value) {
     if (!value)
@@ -4968,12 +4979,7 @@ int cbm_pipeline_ecma_import_map(const cbm_pipeline_ctx_t *ctx, const char *sour
     return 0;
 failed:
     cbm_ht_free(locals);
-    for (int i = 0; i < count; i++) {
-        free((void *)keys[i]);
-        free((void *)values[i]);
-    }
-    free(keys);
-    free(values);
+    import_map_arrays_free(keys, values, count);
     return -1;
 }
 
@@ -5023,12 +5029,7 @@ int cbm_pipeline_python_import_map(const cbm_gbuf_t *gbuf, const char *project,
 
 failed:
     cbm_ht_free(by_local);
-    for (int i = 0; i < count; i++) {
-        free((void *)keys[i]);
-        free((void *)vals[i]);
-    }
-    free(keys);
-    free(vals);
+    import_map_arrays_free(keys, vals, count);
     return -1;
 }
 
@@ -5213,9 +5214,9 @@ static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx,
     const cbm_path_alias_map_t *config =
         split && ctx->path_aliases ? cbm_path_alias_find_for_file(ctx->path_aliases, source) : NULL;
     for (int i = 0; config && i < config->custom_condition_count; i++) {
-        size_t length = strlen(config->custom_conditions[i]);
-        if (length == (size_t)(split - first) &&
-            !memcmp(config->custom_conditions[i], first, length)) {
+        size_t condition_length = strlen(config->custom_conditions[i]);
+        if (condition_length == (size_t)(split - first) &&
+            !memcmp(config->custom_conditions[i], first, condition_length)) {
             entry = split + 1;
             break;
         }
@@ -7013,12 +7014,7 @@ int cbm_pipeline_php_import_map(const cbm_gbuf_t *graph, const char *project,
     cbm_pipeline_php_vendor_names_free(&bindings);
     cbm_ht_free(by_local);
     if (!ok) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-            free((void *)values[i]);
-        }
-        free(keys);
-        free(values);
+        import_map_arrays_free(keys, values, count);
         return -1;
     }
     *out_keys = keys;
@@ -7346,12 +7342,7 @@ static int source_import_map(const cbm_gbuf_t *graph, const char *project, const
     }
     cbm_ht_free(locals);
     if (!ok) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-            free((void *)values[i]);
-        }
-        free(keys);
-        free(values);
+        import_map_arrays_free(keys, values, count);
         return -1;
     }
     *out_keys = keys;

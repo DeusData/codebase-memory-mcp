@@ -545,6 +545,12 @@ static void rs_dir_of(const char *rel, char *dir, size_t capacity) {
         dir[0] = '\0';
 }
 
+static const char *rs_skip_blanks(const char *at, const char *end) {
+    while (at < end && (*at == ' ' || *at == '\t'))
+        at++;
+    return at;
+}
+
 /* The lib crate's name as code spells it: [lib] name, else [package] name, with - folded to _. */
 static const char *rs_manifest_crate(CBMArena *arena, const char *text, size_t length) {
     const char *names[2] = {NULL, NULL}; /* [package], [lib] */
@@ -553,9 +559,7 @@ static const char *rs_manifest_crate(CBMArena *arena, const char *text, size_t l
     for (const char *line = text; line < stop;) {
         const char *end = memchr(line, '\n', (size_t)(stop - line));
         end = end ? end : stop;
-        const char *at = line;
-        while (at < end && (*at == ' ' || *at == '\t'))
-            at++;
+        const char *at = rs_skip_blanks(line, end);
         size_t room = (size_t)(end - at);
         if (room && *at == '[') {
             section = room >= 9 && !strncmp(at, "[package]", 9) ? 0
@@ -682,7 +686,8 @@ static rs_mac_class_t rs_lookup(const CBMHashTable *macros, const char *owner, c
                         (int)(name->end - name->start), text + name->start);
     if (size < 0 || (size_t)size >= sizeof(key))
         return RS_MAC_NONE;
-    return (rs_mac_class_t)(uintptr_t)cbm_ht_get(macros, key);
+    uintptr_t found = (uintptr_t)cbm_ht_get(macros, key);
+    return (rs_mac_class_t)found;
 }
 
 static const char *rs_tok_copy(CBMArena *arena, const rs_lex_t *lx, const rs_tok_t *tok) {
@@ -1004,13 +1009,18 @@ static bool rs_scan_file(const char *rel, const char *source, size_t length, rs_
     cbm_arena_init_lazy(&names, 256);
     rs_imports_t imports = {.table = table, .package = package, .arena = &names};
     rs_read_imports(&imports, source, length);
-    scan->table = table;
-    scan->package = package;
-    scan->imports = &imports;
+    rs_scan_t run = *scan;
+    run.table = table;
+    run.package = package;
+    run.imports = &imports;
     /* Delimiters that do not balance by these tokens: nothing here can be trusted as a wrapper. */
-    bool ok = rs_scan_tokens(scan) && !scan->wrappers && !scan->failed;
-    cbm_free(CBM_MEM_CLASS_EXTRACT, scan->stack);
-    scan->stack = NULL;
+    bool ok = rs_scan_tokens(&run) && !run.wrappers && !run.failed;
+    cbm_free(CBM_MEM_CLASS_EXTRACT, run.stack);
+    run.stack = NULL;
+    /* They end with this function, and the caller keeps the scan. */
+    run.package = NULL;
+    run.imports = NULL;
+    *scan = run;
     cbm_ht_free(imports.names);
     cbm_arena_destroy(&names);
     return ok;

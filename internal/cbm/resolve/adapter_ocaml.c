@@ -613,10 +613,11 @@ static void ocaml_collect_structure(cbm_source_walk_t *walk, const char *owner, 
                     ocaml_collect_binding(walk, owner, ts_node_named_child(item, p));
         } else if (cbm_source_is(item, "external")) {
             const char *name = cbm_source_text(walk, ocaml_child(item, "value_name"));
-            uint32_t line = ts_node_start_point(item).row + 1;
-            if (name)
+            if (name) {
+                uint32_t line = ts_node_start_point(item).row + 1;
                 (void)cbm_source_declare(walk, owner, name, cbm_source_def_qn(walk, name, line), 0,
                                          line);
+            }
         } else if (cbm_source_is(item, "module_definition")) {
             TSNode binding = ocaml_child(item, "module_binding");
             const char *name = cbm_source_text(walk, ocaml_child(binding, "module_name"));
