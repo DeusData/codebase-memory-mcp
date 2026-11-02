@@ -594,6 +594,45 @@ TEST(store_graph_digest_concurrent_isolation_with_held_callback_gates) {
     cbm_store_close(a);cbm_store_close(b);PASS();
 }
 
+/* BT-240 (#1561): the indexed checkout is source identity, which the digest
+ * never binds, so it lives outside the digested tables. A store written through
+ * the real coverage API, with and without a checkout SHA, keeps passing the
+ * live-schema check (test-impact falls back to running everything otherwise),
+ * and recording or changing the SHA leaves the digest unchanged. */
+TEST(store_graph_digest_indexed_checkout_identity_is_not_bound) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/live"), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "g",
+                                .index_mode = "full",
+                                .recorded_at = "t",
+                                .recording_status = "complete",
+                                .coverage_version = 1,
+                                .hash_records_complete = true};
+    cbm_store_graph_digest_t none = {0}, first = {0}, second = {0};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "p", NULL, 0, &meta), CBM_STORE_OK);
+    bool none_ok = gd_p(s, &none);
+    meta.indexed_checkout_sha = "0123456789abcdef0123456789abcdef01234567";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "p", NULL, 0, &meta), CBM_STORE_OK);
+    bool first_ok = gd_p(s, &first);
+    meta.indexed_checkout_sha = "89abcdef0123456789abcdef0123456789abcdef";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "p", NULL, 0, &meta), CBM_STORE_OK);
+    bool second_ok = gd_p(s, &second);
+    cbm_coverage_meta_t got = {0};
+    int got_rc = cbm_store_coverage_meta_get(s, "p", &got);
+    bool sha_kept = got_rc == CBM_STORE_OK && got.indexed_checkout_sha &&
+                    strcmp(got.indexed_checkout_sha, "89abcdef0123456789abcdef0123456789abcdef") == 0;
+    cbm_store_coverage_meta_clear(&got);
+    cbm_store_close(s);
+    ASSERT_TRUE(none_ok);
+    ASSERT_TRUE(first_ok);
+    ASSERT_TRUE(second_ok);
+    ASSERT_TRUE(sha_kept);
+    ASSERT_TRUE(gd_equal(&none, &first));
+    ASSERT_TRUE(gd_equal(&first, &second));
+    PASS();
+}
+
 SUITE(store_graph_digest) {
     RUN_TEST(store_graph_digest_independent_canonical_golden);
     RUN_TEST(store_graph_digest_logical_order_and_excluded_storage_are_stable);
@@ -607,4 +646,5 @@ SUITE(store_graph_digest) {
     RUN_TEST(store_graph_digest_cancellation_large_blob_never_publishes_prefix);
     RUN_TEST(store_graph_digest_sql_errors_cleanup_no_mutation_and_close_discard);
     RUN_TEST(store_graph_digest_concurrent_isolation_with_held_callback_gates);
+    RUN_TEST(store_graph_digest_indexed_checkout_identity_is_not_bound);
 }
