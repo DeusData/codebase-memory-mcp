@@ -6,6 +6,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
+#include "discover/discover_policy_internal.h"
 #include "foundation/platform.h"
 
 typedef struct {
@@ -151,6 +153,12 @@ TEST(skip_fast_3rdparty) {
 }
 TEST(skip_fast_e2e) {
     ASSERT_TRUE(cbm_should_skip_dir("e2e", CBM_MODE_FAST));
+    PASS();
+}
+TEST(no_skip_fast_external) {
+    ASSERT_FALSE(cbm_should_skip_dir("external", CBM_MODE_FAST));
+    ASSERT_FALSE(cbm_should_skip_dir("external", CBM_MODE_MODERATE));
+    ASSERT_FALSE(cbm_should_skip_dir("shop-external-api", CBM_MODE_FAST));
     PASS();
 }
 
@@ -891,6 +899,76 @@ TEST(discover_gitignore_dir_excluded_issue234) {
     PASS();
 }
 
+static int disc_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=master %s",
+             dir, args);
+    return system(cmd);
+}
+
+static bool disc_has(const cbm_file_info_t *files, int count, const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A .gitignore never hides a file git tracks: git applies ignore rules to
+ * untracked paths only. cluster-api's nested `.gitignore` line `manager`,
+ * meant for a built binary, hid its tracked config/manager/ kustomization.
+ * Untracked ignored files stay out, also inside a directory that is entered
+ * only for its tracked content. */
+TEST(discover_gitignore_never_hides_tracked_files) {
+    char *base = th_mktempdir("cbm_disc_tracked");
+    ASSERT(base != NULL);
+    if (disc_git(base, "init -q") != 0) {
+        th_cleanup(base);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(base, ".gitignore"), "manager\n*.gen.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n\nfunc main() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/manager.go"), "package manager\n\nfunc Run() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/scratch.go"), "package manager\n\nfunc S() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/sub/deep.go"), "package sub\n\nfunc Deep() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/tmp/build.go"), "package tmp\n\nfunc B() {}\n");
+    th_write_file(TH_PATH(base, "api/types.gen.go"), "package api\n\nfunc Gen() {}\n");
+    th_write_file(TH_PATH(base, "api/other.gen.go"), "package api\n\nfunc Other() {}\n");
+    int add_rc = disc_git(base, "add .gitignore main.go");
+    int force_rc = disc_git(base, "add -f config/manager/manager.go config/manager/sub/deep.go "
+                                  "api/types.gen.go");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    bool main_found = rc == 0 && disc_has(files, count, "main.go");
+    bool manager_found = rc == 0 && disc_has(files, count, "config/manager/manager.go");
+    bool deep_found = rc == 0 && disc_has(files, count, "config/manager/sub/deep.go");
+    bool gen_found = rc == 0 && disc_has(files, count, "api/types.gen.go");
+    bool scratch_found = rc == 0 && disc_has(files, count, "config/manager/scratch.go");
+    bool build_found = rc == 0 && disc_has(files, count, "config/manager/tmp/build.go");
+    bool other_found = rc == 0 && disc_has(files, count, "api/other.gen.go");
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_EQ(force_rc, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(main_found);
+    /* Tracked: kept although .gitignore matches them or a directory above. */
+    ASSERT_TRUE(manager_found);
+    ASSERT_TRUE(deep_found);
+    ASSERT_TRUE(gen_found);
+    /* Untracked and ignored: still out, also below the entered directory. */
+    ASSERT_FALSE(scratch_found);
+    ASSERT_FALSE(build_found);
+    ASSERT_FALSE(other_found);
+    PASS();
+}
+
 TEST(discover_max_file_size) {
     char *base = th_mktempdir("cbm_disc_size");
     ASSERT(base != NULL);
@@ -1253,6 +1331,73 @@ TEST(discover_cbmignore_negates_always_skip_dir) {
     ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "obj"));
 
     cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* ── JVM packages named like build output (issue #2661) ─────────── */
+
+/* Below src/<set>/{java,kotlin,scala,groovy}/ every directory is a package, so
+ * "target", "tmp", "vendor" there are package names, not build output. */
+TEST(jvm_package_path_predicate_issue2661) {
+    ASSERT_TRUE(cbm_discover_path_in_jvm_package("src/main/java/com/acme/target"));
+    ASSERT_TRUE(cbm_discover_path_in_jvm_package("app/src/test/kotlin/x/tmp"));
+    ASSERT_TRUE(cbm_discover_path_in_jvm_package("src/main/scala/vendor"));
+    /* The language root itself and its siblings are not packages. */
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("src/main/java"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("src/main/target"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("target"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("module/target/classes"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("src/java/main/tmp"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package(NULL));
+    PASS();
+}
+
+TEST(discover_keeps_jvm_packages_named_like_build_dirs_issue2661) {
+    char *base = th_mktempdir("cbm_disc_jvm_pkg");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main/java/com/acme/target/Foo.java"),
+                  "package com.acme.target;\nclass Foo {}\n");
+    th_write_file(TH_PATH(base, "src/test/java/com/acme/tmp/T.java"),
+                  "package com.acme.tmp;\nclass T {}\n");
+    th_write_file(TH_PATH(base, "src/main/kotlin/com/acme/vendor/V.kt"),
+                  "package com.acme.vendor\nclass V\n");
+    /* Real build output stays skipped. */
+    th_write_file(TH_PATH(base, "target/classes/Gen.java"), "class Gen {}\n");
+    th_write_file(TH_PATH(base, "src/main/target/Out.java"), "class Out {}\n");
+    /* The safety core is never un-skipped, even below a package root. */
+    th_write_file(TH_PATH(base, "src/main/java/com/.git/H.java"), "class H {}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/java/com/acme/target/Foo.java"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/test/java/com/acme/tmp/T.java"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/kotlin/com/acme/vendor/V.kt"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "target/classes/Gen.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "src/main/target/Out.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "src/main/java/com/.git/H.java"));
+    ASSERT_EQ(count, 3);
+    cbm_discover_free(files, count);
+
+    /* Moderate/fast mode: a package named like a fast-mode skip dir is kept
+     * below a JVM source root, while the same name at the top stays skipped. */
+    th_write_file(TH_PATH(base, "src/main/java/com/acme/integration/I.java"),
+                  "package com.acme.integration;\nclass I {}\n");
+    th_write_file(TH_PATH(base, "integration/Top.java"), "class Top {}\n");
+
+    cbm_discover_opts_t mod_opts = {.mode = CBM_MODE_MODERATE};
+    files = NULL;
+    count = 0;
+    rc = cbm_discover(base, &mod_opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/java/com/acme/integration/I.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "integration/Top.java"));
+
     cbm_discover_free(files, count);
     th_cleanup(base);
     PASS();
@@ -2052,6 +2197,34 @@ static CBMLanguage discover_lang_of(const cbm_file_info_t *files, int count, con
     return CBM_LANG_COUNT;
 }
 
+/* #1803: a symlink is skipped by policy on every walk. A bounded count must
+ * skip it too, not abort: aborting made auto-index admission refuse every
+ * repository containing any symlink ("unsafe_or_unavailable_path"), while
+ * an explicit index of the same tree succeeded. */
+TEST(discover_count_bounded_survives_a_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: symlinks need admin / symlink() unavailable");
+#else
+    char *base = th_mktempdir("cbm_disc_link");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "sub/helper.go"), "package sub\n");
+    ASSERT_EQ(symlink("sub", TH_PATH(base, "linkdir")), 0);
+
+    cbm_discover_opts_t opts = {0};
+    int count = -1;
+    /* deadline 0 = no deadline: only the symlink can decide this count. */
+    cbm_discover_status_t status = cbm_discover_count_bounded(base, &opts, 50000, 0, &count);
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 2);
+
+    th_cleanup(base);
+    PASS();
+#endif
+}
+
 /* Write raw bytes (may contain embedded NUL) to base/rel. Parent must exist. */
 static int write_bytes_file(const char *path, const void *data, size_t n) {
     FILE *f = cbm_fopen(path, "wb");
@@ -2272,6 +2445,49 @@ TEST(shebang_oversized_first_line_unindexed) {
     PASS();
 }
 
+/* ── .d: D source vs make/cargo dep-info ───────────────────────── */
+
+/* rustc/cargo dep-info (and gcc -MD, CMake .o.d) files share .d with D source
+ * but are Makefile rules the D grammar parses slowly into nothing useful, so
+ * they must not be indexed as D. */
+static const char CARGO_DEP_INFO[] = "/home/u/proj/t/debug/deps/foo-abc123.d: src/lib.rs src/a.rs\n"
+                                     "\n"
+                                     "src/lib.rs:\n"
+                                     "src/a.rs:\n";
+
+TEST(discover_d_dep_info_not_indexed_as_dlang) {
+    CBMLanguage dep;
+    CBMLanguage src;
+    ASSERT(shebang_probe("cbm_disc_dotd", "t/debug/deps/foo-abc123.d", CARGO_DEP_INFO, &dep));
+    ASSERT(shebang_probe("cbm_disc_dotd", "app.d", "module app;\nimport std.stdio : writeln;\n",
+                         &src));
+    ASSERT_EQ(dep, CBM_LANG_COUNT);
+    ASSERT_EQ(src, CBM_LANG_DLANG);
+    PASS();
+}
+
+/* The probe runs only while .d maps to D, so a user override to another
+ * language wins. */
+TEST(discover_d_user_override_skips_dep_info_probe) {
+    char *cfg_dir = th_mktempdir("cbm_disc_dotd_uc");
+    ASSERT(cfg_dir != NULL);
+    ASSERT_EQ(th_write_file(TH_PATH(cfg_dir, ".codebase-memory.json"),
+                            "{\"extra_extensions\":{\".d\":\"makefile\"}}"),
+              0);
+    cbm_userconfig_t *cfg = cbm_userconfig_load(cfg_dir);
+    th_cleanup(cfg_dir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_set_user_lang_config(cfg);
+    CBMLanguage lang;
+    bool ok = shebang_probe("cbm_disc_dotd_uc", "foo-abc123.d", CARGO_DEP_INFO, &lang);
+    cbm_set_user_lang_config(NULL);
+    cbm_userconfig_free(cfg);
+    ASSERT(ok);
+    ASSERT_EQ(lang, CBM_LANG_MAKEFILE);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -2283,6 +2499,8 @@ SUITE(discover) {
     RUN_TEST(skip_venv);
     RUN_TEST(skip_dist);
     RUN_TEST(skip_target);
+    RUN_TEST(jvm_package_path_predicate_issue2661);
+    RUN_TEST(discover_keeps_jvm_packages_named_like_build_dirs_issue2661);
     RUN_TEST(skip_vendor);
     RUN_TEST(skip_vendored);
     RUN_TEST(skip_terraform);
@@ -2306,6 +2524,7 @@ SUITE(discover) {
     RUN_TEST(skip_fast_assets);
     RUN_TEST(skip_fast_3rdparty);
     RUN_TEST(skip_fast_e2e);
+    RUN_TEST(no_skip_fast_external);
 
     /* Suffix filters */
     RUN_TEST(suffix_pyc);
@@ -2364,6 +2583,10 @@ SUITE(discover) {
     RUN_TEST(shebang_embedded_nul_unindexed);
     RUN_TEST(shebang_oversized_first_line_unindexed);
 
+    /* .d: D source vs make/cargo dep-info */
+    RUN_TEST(discover_d_dep_info_not_indexed_as_dlang);
+    RUN_TEST(discover_d_user_override_skips_dep_info_probe);
+
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
     RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
@@ -2382,6 +2605,7 @@ SUITE(discover) {
     RUN_TEST(discover_missing_global_excludes_is_noop);
     RUN_TEST(discover_cbmignore_negates_global_ignore);
     RUN_TEST(discover_gitignore_dir_excluded_issue234);
+    RUN_TEST(discover_gitignore_never_hides_tracked_files);
     RUN_TEST(discover_max_file_size);
     RUN_TEST(discover_null_path);
     RUN_TEST(discover_nonexistent_path);
@@ -2436,4 +2660,7 @@ SUITE(discover) {
     RUN_TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973);
     RUN_TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern);
     RUN_TEST(discover_nested_gitignore_three_levels_deeper_file_wins);
+
+    /* A symlink must not abort a bounded count (auto-index admission, #1803) */
+    RUN_TEST(discover_count_bounded_survives_a_symlink);
 }

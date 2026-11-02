@@ -1177,6 +1177,10 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     /* TypeBox parameters schema is embedded with Type.Object syntax. */
     ASSERT_NOT_NULL(strstr(js, "Type.Object("));
     ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* #2787: String enums must use Type.String({ enum: [...] }) without anyOf/const */
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
     /* A numeric registry property must remain numeric in the generated schema. */
     ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
     /* TypeBox import should be present. */
@@ -1240,6 +1244,23 @@ TEST(client_adapter_pi_wraps_result_and_honors_abort) {
         strstr(js, "[{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }]"));
     ASSERT_NOT_NULL(strstr(js, "signal?.addEventListener('abort', onAbort, { once: true })"));
     ASSERT_NOT_NULL(strstr(js, "if (!child.killed) child.kill();"));
+    free(js);
+    PASS();
+}
+
+/* #2787: Pi extension must emit string enums as Type.String({ enum: [...] })
+ * rather than Type.Union([Type.Literal(...)]) which TypeBox serializes as
+ * anyOf/const, breaking Gemini / Antigravity function declaration validation. */
+TEST(client_adapter_pi_emits_string_enum_issue2787) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NOT_NULL(strstr(js, "'full'"));
+    ASSERT_NOT_NULL(strstr(js, "'moderate'"));
+    ASSERT_NOT_NULL(strstr(js, "'fast'"));
+    ASSERT_NOT_NULL(strstr(js, "'cross-repo-intelligence'"));
     free(js);
     PASS();
 }
@@ -1321,19 +1342,121 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
     PASS();
 }
 
-/* #2077: OpenCode's V2 loader only reads the default export and needs an
- * id plus a setup()/effect() function; the old named export had neither. */
+/* #2077/#2089/#2204: the two OpenCode runtimes read different entries of the
+ * default export. 1.18.x dispatches the hooks returned by `server(ctx)`; 2.x
+ * ignores `server` and calls `setup(ctx)`, whose context provides the tool hook
+ * domain. The registration fails open, and the server() tool hook yields once
+ * it is registered. OpenCode 2 adds no note to a compaction (pinned by the
+ * compaction test below). */
 TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "export default {"));
     ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
-    /* Hooks live under server(), which the server runtime reads; setup()
-     * stays empty since the V2 config loader has no tool domain yet. */
-    ASSERT_NOT_NULL(strstr(js, "setup() {}"));
+    /* OpenCode 1.18.x server runtime. */
     ASSERT_NOT_NULL(strstr(js, "server: async (ctx) => {"));
-    ASSERT_NULL(strstr(js, "async setup(ctx) {"));
+    /* OpenCode 2 registers through the setup context; the domains exist on
+     * 2.x, so setup is no longer the empty placeholder #2089 pinned. */
+    ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.tool.hook('execute.after'"));
+    /* content is the surface the model reads; prefer it over output, and never
+     * synthesize content that would hide the tool's own result. */
+    const char *content_first = strstr(js, "if (typeof result.content === 'string') {");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(content_first);
+    ASSERT_NOT_NULL(output_fallback);
+    ASSERT_TRUE(content_first < output_fallback);
+    ASSERT_NULL(strstr(js, "if (result.content === undefined)"));
+    /* The V2 hooks read the session id with optional chaining (fail open). */
+    ASSERT_NOT_NULL(strstr(js, "event?.sessionID"));
+    /* The plugin instance's location is not the session's location in a
+     * multi-project server: resolve each session's directory. */
+    ASSERT_NOT_NULL(strstr(js, "const dir = await dirFor("));
+    ASSERT_NOT_NULL(strstr(js, "ctx.session.get({ sessionID })"));
+    ASSERT_NOT_NULL(strstr(js, "dirs.has(sessionID)"));
+    ASSERT_NOT_NULL(strstr(js, "if (!dir) return;"));
+    /* No fallback to the plugin instance's location: that is not the session's
+     * location in a multi-project server. */
+    ASSERT_NULL(strstr(js, "ctx?.location?.directory"));
+    ASSERT_NULL(strstr(js, "pendingReinject"));
+    /* The registration fails open; the server() tool hook yields once it is in. */
+    ASSERT_NOT_NULL(strstr(js, "toolHooksRegistered = true;"));
+    ASSERT_NOT_NULL(strstr(js, "if (toolHooksRegistered) return;"));
+    ASSERT_NOT_NULL(strstr(js, "catch {"));
+    ASSERT_NOT_NULL(strstr(js, "event.result = appendResult(event.result, extra);"));
+    /* The empty setup placeholder and the old named export must both be gone. */
+    ASSERT_NULL(strstr(js, "setup() {}"));
     ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
+    free(js);
+    PASS();
+}
+
+/* #2204: OpenCode 2 gets no note after compaction until a compaction channel has
+ * run on a real 2.x host. A plain object pushed into `event.messages` would be
+ * rejected, if at all, inside OpenCode's own compaction, where the plugin's
+ * try/catch cannot reach it, so an untested channel could break compaction for
+ * every OpenCode 2 user. The note must not reach the system prompt either: not
+ * through `event.system`, and not through a session instruction entry. The
+ * 1.18.x server() path keeps its documented compaction surface. */
+TEST(client_adapter_opencode_v2_adds_no_note_to_the_compaction) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NULL(strstr(js, "ctx.session.hook("));
+    ASSERT_NULL(strstr(js, "event.messages"));
+    ASSERT_NULL(strstr(js, "sessionHooksRegistered"));
+    ASSERT_NULL(strstr(js, ".system"));
+    ASSERT_NULL(strstr(js, "instructions"));
+    ASSERT_NULL(strstr(js, "entry.put"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
+    free(js);
+    PASS();
+}
+
+/* #2204: Tool.Result allows `content: []`. appendResult adds a text part to a
+ * parts array only when the array already holds a part; an empty array falls
+ * through to the string `output` (or the unchanged result), so the note never
+ * becomes the whole content of a tool result. */
+TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    const char *parts =
+        strstr(js, "if (Array.isArray(result.content) && result.content.length > 0) {");
+    const char *add_part = strstr(js, "content.push({ type: 'text', text: extra });");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(parts);
+    ASSERT_NOT_NULL(add_part);
+    ASSERT_NOT_NULL(output_fallback);
+    /* The only part-adding push sits inside the non-empty branch; the string
+     * output fallback, where `content: []` lands, comes after it. */
+    ASSERT_TRUE(parts < add_part);
+    ASSERT_TRUE(add_part < output_fallback);
+    ASSERT_NULL(strstr(add_part + 1, "content.push("));
+    /* No unguarded array branch is left. */
+    ASSERT_NULL(strstr(js, "if (Array.isArray(result.content)) {"));
+    free(js);
+    PASS();
+}
+
+/* augment() is awaited inline inside 'tool.execute.after', so a hook-augment
+ * that never exits would stall every grep/glob/read completion in the host
+ * session until the agent is restarted. The generated plugin must bound the
+ * wait: SIGKILL the child after AUGMENT_TIMEOUT_MS and resolve with '' (fail
+ * open). The promise keeps the first resolution, so the kill-triggered
+ * 'close' event arriving late cannot smuggle in partial output. Stream
+ * errors fire on child.stdin, not the child — the emitted listener and the
+ * guarded end() keep a failed write (EPIPE, ENOENT) from crashing the host
+ * as an unhandled 'error' event (reproduced under Bun 1.4 with a >64KB
+ * payload and a non-reading child). */
+TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "const AUGMENT_TIMEOUT_MS = 10000;"));
+    ASSERT_NOT_NULL(strstr(js, "const timer = setTimeout("));
+    ASSERT_NOT_NULL(strstr(js, "child.kill('SIGKILL');"));
+    /* error and close must both stop the timer once they own the outcome. */
+    ASSERT_NOT_NULL(strstr(js, "clearTimeout(timer);"));
+    /* stream-level failures must not escape as unhandled 'error' events. */
+    ASSERT_NOT_NULL(strstr(js, "child.stdin.on('error', () => {});"));
     free(js);
     PASS();
 }
@@ -1381,9 +1504,13 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
     RUN_TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834);
     RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
+    RUN_TEST(client_adapter_pi_emits_string_enum_issue2787);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
+    RUN_TEST(client_adapter_opencode_v2_adds_no_note_to_the_compaction);
+    RUN_TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content);
+    RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }
