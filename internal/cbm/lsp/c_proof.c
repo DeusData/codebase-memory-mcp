@@ -698,8 +698,152 @@ static bool csp_append_member(CBMArena *arena, CBMCMacroMember **items, int *cou
     return true;
 }
 
+/* The end of the `(` at `open`, or 0 when it does not close. Comments and literals have been left
+ * to the caller: a replacement with a string in its type part reads as no type at all. */
+static uint32_t csp_macro_close(const char *text, uint32_t length, uint32_t open) {
+    int depth = 0;
+    for (uint32_t at = open; at < length; at++) {
+        if (text[at] == '"' || text[at] == '\'') {
+            char quote = text[at];
+            for (at++; at < length && text[at] != quote; at++)
+                if (text[at] == '\\')
+                    at++;
+        } else if (text[at] == '(') {
+            depth++;
+        } else if (text[at] == ')' && --depth == 0) {
+            return at + 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t csp_macro_skip_space(const char *text, uint32_t length, uint32_t at) {
+    while (at < length) {
+        if (text[at] == ' ' || text[at] == '\t' || text[at] == '\r' || text[at] == '\n' ||
+            (text[at] == '\\' && at + 1 < length && text[at + 1] == '\n')) {
+            at++;
+        } else if (text[at] == '/' && at + 1 < length && text[at + 1] == '*') {
+            for (at += 2; at + 1 < length && !(text[at] == '*' && text[at + 1] == '/'); at++)
+                ;
+            at = at + 2 <= length ? at + 2 : length;
+        } else if (text[at] == '/' && at + 1 < length && text[at + 1] == '/') {
+            return length;
+        } else {
+            break;
+        }
+    }
+    return at;
+}
+
+/* `((T *)operand)`. The parentheses around it have to close at its end: bare `(T *)p` used as
+ * `X->y` would cast p->y instead. The operand may be followed by nothing that takes the value out
+ * of the pointer type, which rules out comparisons, `?:` and `,`, and by no `+` or `-`, which would
+ * need the other operand read. A value the replacement's own parameter names as the type is not
+ * written. */
+static void csp_macro_cast(csp_context_t *ctx, CBMCMacroShape *shape, const char *text,
+                           uint32_t length, const csp_macro_params_t *params) {
+    uint32_t begin = csp_macro_skip_space(text, length, 0), end = length;
+    /* The end, past trailing space and comments. */
+    for (uint32_t at = begin; at < length;) {
+        uint32_t next = csp_macro_skip_space(text, length, at);
+        if (next >= length)
+            break;
+        at = next + 1;
+        end = at;
+    }
+    bool wrapped = false;
+    while (begin < end && text[begin] == '(' && csp_macro_close(text, end, begin) == end) {
+        wrapped = true;
+        begin = csp_macro_skip_space(text, end, begin + 1);
+        end--;
+        while (end > begin &&
+               (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r' ||
+                text[end - 1] == '\n' || text[end - 1] == '\\'))
+            end--;
+    }
+    if (!wrapped || begin >= end || text[begin] != '(')
+        return;
+    uint32_t close = csp_macro_close(text, end, begin);
+    if (!close || close >= end)
+        return;
+    /* The type part: qualifiers and keywords, one name, `*`s. */
+    const char *word = NULL;
+    size_t word_length = 0;
+    uint32_t pointers = 0;
+    int paste_param = -1;
+    for (uint32_t at = csp_macro_skip_space(text, close - 1, begin + 1); at < close - 1;
+         at = csp_macro_skip_space(text, close - 1, at)) {
+        if (text[at] == '*') {
+            pointers++;
+            at++;
+            continue;
+        }
+        if (!isalpha((unsigned char)text[at]) && text[at] != '_')
+            return;
+        uint32_t start = at;
+        while (at < close - 1 && (isalnum((unsigned char)text[at]) || text[at] == '_'))
+            at++;
+        size_t size = at - start;
+        static const char *const skipped[] = {"const", "volatile", "struct", "union", "enum"};
+        bool keyword = false;
+        for (size_t k = 0; k < sizeof(skipped) / sizeof(skipped[0]); k++)
+            keyword |= strlen(skipped[k]) == size && !memcmp(text + start, skipped[k], size);
+        if (keyword)
+            continue;
+        if (word || pointers)
+            return;
+        word = text + start;
+        word_length = size;
+        if (at + 1 < close - 1 && text[at] == '#' && text[at + 1] == '#') {
+            at += 2;
+            uint32_t param_start = at;
+            while (at < close - 1 && (isalnum((unsigned char)text[at]) || text[at] == '_'))
+                at++;
+            for (int i = 0; i < params->count; i++)
+                if (strlen(params->names[i]) == at - param_start &&
+                    !memcmp(params->names[i], text + param_start, at - param_start))
+                    paste_param = i;
+            if (paste_param < 0)
+                return;
+        }
+    }
+    if (!word || pointers > 8)
+        return;
+    if (paste_param < 0)
+        for (int i = 0; i < params->count; i++)
+            if (strlen(params->names[i]) == word_length &&
+                !memcmp(params->names[i], word, word_length))
+                return;
+    /* The operand. */
+    uint32_t operand = csp_macro_skip_space(text, end, close);
+    if (operand >= end || text[operand] == '.' || text[operand] == '[' ||
+        (text[operand] == '-' && operand + 1 < end && text[operand + 1] == '>'))
+        return;
+    int depth = 0;
+    for (uint32_t at = operand; at < end; at++) {
+        char ch = text[at];
+        if (ch == '"' || ch == '\'') {
+            for (at++; at < end && text[at] != ch; at++)
+                if (text[at] == '\\')
+                    at++;
+        } else if (ch == '(' || ch == '[') {
+            depth++;
+        } else if (ch == ')' || ch == ']') {
+            depth--;
+        } else if (depth == 0 && at > operand && strchr("+*/%&|^<>=!?:,", ch)) {
+            return;
+        } else if (depth == 0 && ch == '-' && !(at + 1 < end && text[at + 1] == '>')) {
+            return;
+        }
+    }
+    shape->cast_type = cbm_arena_strndup(ctx->arena, word, word_length);
+    shape->cast_pointers = (uint8_t)pointers;
+    shape->cast_pastes = paste_param >= 0;
+    shape->cast_param = paste_param >= 0 ? (uint8_t)paste_param : 0;
+}
+
 static const CBMCMacroShape *csp_macro_shape_keep(csp_context_t *ctx, const CBMCMacroShape *shape) {
-    if (shape->object_like && !shape->call_count && !shape->value_count)
+    if (shape->object_like && !shape->call_count && !shape->value_count && !shape->cast_type)
         return NULL;
     CBMCMacroShape *kept = cbm_arena_alloc(ctx->arena, sizeof(*kept));
     if (!kept) {
@@ -733,6 +877,7 @@ static const CBMCMacroShape *csp_macro_shape(csp_context_t *ctx, TSNode node) {
         return csp_macro_shape_keep(ctx, shape);
     const char *text = ctx->source + begin;
     uint32_t length = end - begin;
+    csp_macro_cast(ctx, shape, text, length, &params);
     if (shape->object_like) {
         /* Up to a comment or the end of the line: names joined by single dots, nothing else. */
         uint32_t last = 0;
@@ -822,9 +967,8 @@ static const CBMCMacroShape *csp_macro_shape(csp_context_t *ctx, TSNode node) {
             bool after_star = csp_token_is(&back1, "*") || parenthesized;
             const csp_token_t *before_star = parenthesized ? &back3 : &back2;
             csp_token_t following = next;
-            uint32_t peek = at;
             if (parenthesized && csp_token_is(&following, ")"))
-                (void)csp_macro_token(text, length, peek, &following);
+                (void)csp_macro_token(text, length, at, &following);
             bool star_declares = after_star && before_star->identifier &&
                                  !csp_token_precedes_expression(before_star) &&
                                  csp_token_ends_declarator(&following);
@@ -919,9 +1063,10 @@ static const CBMCMacroShape *csp_macro_shape(csp_context_t *ctx, TSNode node) {
                         * and stays unbound for it, which costs a value and proves nothing false. */
                        (after_star && before_star->identifier && csp_token_is(&next, ")") &&
                         !csp_token_precedes_expression(before_star))) {
-                const char *local = cbm_arena_strndup(ctx->arena, current.text, current.length);
-                if (!local ||
-                    !csp_append_file(ctx->arena, &locals, &local_count, &local_cap, local)) {
+                const char *declared_name =
+                    cbm_arena_strndup(ctx->arena, current.text, current.length);
+                if (!declared_name || !csp_append_file(ctx->arena, &locals, &local_count,
+                                                       &local_cap, declared_name)) {
                     ctx->failed = true;
                     return NULL;
                 }
@@ -1041,6 +1186,24 @@ static void csp_note_macro(csp_context_t *ctx, TSNode node) {
     }
 }
 
+static void csp_note_quoted_include(csp_context_t *ctx, TSNode node) {
+    TSNode path = csp_field(node, "path");
+    if (!ctx->facts || !csp_is(path, "string_literal"))
+        return;
+    const char *text = csp_text(ctx, path);
+    size_t length = text ? strlen(text) : 0;
+    const char *spelled = length >= 3 ? cbm_arena_strndup(ctx->arena, text + 1, length - 2) : NULL;
+    if (spelled && !csp_append_file(ctx->arena, &ctx->facts->quoted_includes,
+                                    &ctx->facts->quoted_include_count,
+                                    &ctx->facts->quoted_include_cap, spelled))
+        ctx->failed = true;
+}
+
+static bool csp_text_starts_with(const char *at, const char *end, const char *word) {
+    size_t length = strlen(word);
+    return (size_t)(end - at) >= length && !memcmp(at, word, length);
+}
+
 /* A `#define` inside a function body stays defined to the end of the file: malloc_vsnprintf's
  * APPEND_C, do_sub's ADJUST_SUB_FIRSTLNUM. Most bodies hold none, and the text says so. */
 bool cbm_c_text_defines_macro(const char *text, uint32_t length) {
@@ -1049,7 +1212,7 @@ bool cbm_c_text_defines_macro(const char *text, uint32_t length) {
         const char *word = at + 1;
         while (word < end && (*word == ' ' || *word == '\t'))
             word++;
-        if (end - word >= 6 && !memcmp(word, "define", 6))
+        if (csp_text_starts_with(word, end, "define"))
             return true;
         at = word;
     }
@@ -1091,8 +1254,6 @@ static void csp_free_function(csp_context_t *ctx, TSNode node, const char *owner
     const char *qn = name ? cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name) : NULL;
     if (csp_is(node, "declaration") && name)
         csp_note_prototype(ctx, node, decl, owner, name);
-    else if (name && ctx->branch_group)
-        (void)csp_add_decl(ctx, CBM_C_DECL_DEFINED_IN_BRANCH, csp_relative(ctx, owner, name), 0);
     csp_entry_t *entry = csp_entry(ctx, qn, ts_node_start_point(node).row + 1);
     /* A macro over a builtin type word (`#define int double`) falsifies what the
      * signature below would say, so the definition's linkage facts stay unknown. */
@@ -1344,7 +1505,7 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
         return;
     bool complete = true, body_complete = true;
     uint32_t access =
-        csp_is(node, "struct_specifier") ? CBM_SOURCE_DECL_PUBLIC : CBM_SOURCE_DECL_PRIVATE;
+        csp_is(node, "class_specifier") ? CBM_SOURCE_DECL_PRIVATE : CBM_SOURCE_DECL_PUBLIC;
     TSTreeCursor header = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&header))
         do {
@@ -1399,10 +1560,10 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
  * an ERROR. Definition extraction recovers that function from the expanded source, so it has an
  * entry here to find: the signature standing in the ERROR says how it is linked. */
 static void csp_note_stranded_definitions(csp_context_t *ctx, TSNode error, const char *owner) {
-    bool is_static = false;
-    uint32_t first_line = 0;
     TSTreeCursor cursor = ts_tree_cursor_new(error);
-    if (ts_tree_cursor_goto_first_child(&cursor))
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        bool is_static = false;
+        uint32_t first_line = 0;
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
             if (!ts_node_is_named(child) || csp_is(child, "comment"))
@@ -1410,6 +1571,7 @@ static void csp_note_stranded_definitions(csp_context_t *ctx, TSNode error, cons
             if (csp_is(child, "storage_class_specifier")) {
                 const char *word = csp_text(ctx, child);
                 is_static |= word && !strcmp(word, "static");
+                continue;
             } else if (csp_is(child, "primitive_type") || csp_is(child, "type_identifier") ||
                        csp_is(child, "sized_type_specifier") || csp_is(child, "type_qualifier") ||
                        csp_is(child, "struct_specifier")) {
@@ -1442,6 +1604,7 @@ static void csp_note_stranded_definitions(csp_context_t *ctx, TSNode error, cons
             is_static = false;
             first_line = 0;
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
     ts_tree_cursor_delete(&cursor);
 }
 
@@ -1528,6 +1691,10 @@ static void csp_walk(csp_context_t *ctx, TSNode node, const char *owner, unsigne
         csp_note_macro(ctx, node);
         return;
     }
+    if (csp_is(node, "preproc_include")) {
+        csp_note_quoted_include(ctx, node);
+        return;
+    }
     if (csp_preprocessor_branch(node)) {
         bool saved = ctx->conditional;
         uint32_t saved_group = ctx->branch_group, saved_branch = ctx->branch;
@@ -1559,6 +1726,9 @@ static void csp_walk(csp_context_t *ctx, TSNode node, const char *owner, unsigne
     if (csp_is(node, "type_definition")) {
         TSNode type = csp_field(node, "type"), declarator = csp_field(node, "declarator");
         csp_note_enumerators(ctx, type, owner);
+        if (csp_is(declarator, "type_identifier") && !ts_node_is_null(csp_field(type, "body")) &&
+            ts_node_is_null(csp_field(type, "name")))
+            (void)csp_add_decl(ctx, CBM_C_DECL_UNNAMED_TYPEDEF, csp_text(ctx, declarator), 0);
         /* An error among the members does not change which struct this is. */
         if (csp_is(type, "class_specifier") || csp_is(type, "struct_specifier") ||
             csp_is(type, "union_specifier"))

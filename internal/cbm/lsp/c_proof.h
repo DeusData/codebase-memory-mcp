@@ -23,7 +23,7 @@ typedef enum {
     CBM_C_DECL_CLASS_TEMPLATE, /* `template <class T> class Name`: a base of this name can depend */
     CBM_C_DECL_TEMPLATE_PARAMETER, /* `template <class Value> class Pair`: name is Value, type_name
                                     * is Pair. What it means comes with each instantiation. */
-    CBM_C_DECL_DEFINED_IN_BRANCH,  /* a function defined inside a conditional */
+    CBM_C_DECL_UNNAMED_TYPEDEF,    /* `typedef struct {...} Name;`: no tag is called Name */
 } CBMCDeclKind;
 
 enum {
@@ -95,6 +95,12 @@ typedef struct CBMCMacroShape {
     /* `#define w_p_list w_onebuf_opt.wo_list`: an object-like replacement that is nothing but
      * dotted names, which can stand after `->` and name members there. */
     const char *field_path;
+    /* `#define hl_table ((HlGroup *)(ga.ga_data))`, `#define SDS_HDR(T, s) ((struct sdshdr##T
+     * *)...)`: a replacement that is one cast as a whole writes the type of what it gives. */
+    const char *cast_type;
+    uint8_t cast_pointers;
+    bool cast_pastes; /* the type's name is cast_type, then the argument cast_param */
+    uint8_t cast_param;
 } CBMCMacroShape;
 
 typedef struct CBMCDecl {
@@ -135,6 +141,9 @@ typedef struct CBMCFileFacts {
     int include_count, include_cap;
     const char **generated_for; /* source files declared through a generated header */
     int generated_count, generated_cap;
+    const char **quoted_includes; /* every `#include "x"`, as spelled */
+    int quoted_include_count, quoted_include_cap;
+    bool has_unknown_include; /* one of them has nothing in the index behind it */
 } CBMCFileFacts;
 
 /* As cbm_c_collect_source_facts, also filling facts when it is not NULL. */

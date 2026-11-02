@@ -944,9 +944,9 @@ static void cbm_attr_collect(TSNode node, const char *source, CBMAttrWords *word
         return;
     }
     bool container = cbm_attr_is_container(ts_node_type(node));
-    bool unterminated = false;
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
+        bool unterminated = false;
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
             if (!ts_node_is_named(child)) {
@@ -1048,6 +1048,64 @@ typedef struct {
     TSRange directive;
 } CBMAttrConditional;
 
+/* Past spaces and comments, on the same line only when `same_line` asks for it. */
+static uint32_t cbm_attr_text_skip(const char *source, uint32_t length, uint32_t at,
+                                   bool same_line) {
+    while (at < length) {
+        char ch = source[at];
+        if (ch == ' ' || ch == '\t' || ch == '\r' || (!same_line && ch == '\n')) {
+            at++;
+        } else if (ch == '/' && at + 1 < length && source[at + 1] == '*') {
+            for (at += 2; at + 1 < length && !(source[at] == '*' && source[at + 1] == '/'); at++)
+                ;
+            at = at + 2 <= length ? at + 2 : length;
+        } else if (ch == '/' && at + 1 < length && source[at + 1] == '/') {
+            while (at < length && source[at] != '\n')
+                at++;
+        } else {
+            break;
+        }
+    }
+    return at;
+}
+
+/* `void f(void)` with no `;` or brace of its own: a function's head, its body after the branch. */
+static bool cbm_attr_text_is_head(const char *source, uint32_t from, uint32_t to) {
+    char last = 0;
+    for (uint32_t at = cbm_attr_text_skip(source, to, from, false); at < to;
+         at = cbm_attr_text_skip(source, to, at + 1, false)) {
+        char ch = source[at];
+        if (ch == ';' || ch == '{' || ch == '}' || ch == '"' || ch == '\'')
+            return false;
+        last = ch;
+    }
+    return last == ')';
+}
+
+/* The `#endif` that closes the conditional whose `#else` line ended at `from`, or `length`. */
+static uint32_t cbm_attr_text_endif(const char *source, uint32_t length, uint32_t from) {
+    int nesting = 0;
+    for (uint32_t at = from; at < length; at++) {
+        if (source[at] != '\n')
+            continue;
+        uint32_t word = cbm_attr_text_skip(source, length, at + 1, true);
+        if (word >= length || source[word] != '#')
+            continue;
+        word = cbm_attr_text_skip(source, length, word + 1, true);
+        if (word + 2 < length && !memcmp(source + word, "if", 2)) {
+            nesting++;
+        } else if (word + 5 < length && !memcmp(source + word, "endif", 5)) {
+            if (!nesting)
+                return at + 1;
+            nesting--;
+        } else if (!nesting && word + 4 < length &&
+                   (!memcmp(source + word, "else", 4) || !memcmp(source + word, "elif", 4))) {
+            return length; /* one alternative is all this reads */
+        }
+    }
+    return length;
+}
+
 static void cbm_attr_expression_branches(const char *source, uint32_t length, CBMAttrWords *words) {
     CBMAttrConditional stack[CBM_ATTR_MAX_CONDITIONALS];
     int top = 0, skipping = 0, depth = 0, overflow = 0;
@@ -1056,7 +1114,7 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
     /* Braces opened by `= {`. An initializer holds no `;`, so one closes the count whatever two
      * branches of a conditional did to it. */
     uint32_t initializer = 0;
-    bool after_assign = false;
+    bool after_assign = false, after_string = false;
     while (at < length) {
         char ch = source[at];
         if (ch == '\n') {
@@ -1162,6 +1220,28 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
                     frame->skip_start = at;
                     frame->skip_point = begin_point;
                     skipping++;
+                } else if (!frame->in_expression && !skipping && depth == frame->depth_at_open &&
+                           cbm_attr_text_is_head(source, frame->directive.end_byte, at)) {
+                    /* `#ifndef X / void f(void) / #else / void g(void) / #endif / {`: two heads and
+                     * one body, and no grammar reads both. The first is read, as it is in a split
+                     * expression, and the body is the same in either configuration. */
+                    uint32_t close = cbm_attr_text_endif(source, length, end);
+                    uint32_t after = close;
+                    if (close < length) {
+                        after = cbm_attr_text_skip(source, length, close, true);
+                        while (after < length && source[after] != '\n')
+                            after++;
+                        after = cbm_attr_text_skip(source, length, after, false);
+                    }
+                    if (close < length && after < length && source[after] == '{' &&
+                        cbm_attr_text_is_head(source, end, close)) {
+                        frame->in_expression = true;
+                        frame->skipping = true;
+                        frame->skip_start = at;
+                        frame->skip_point = begin_point;
+                        skipping++;
+                        cbm_attr_range_add(words, frame->directive);
+                    }
                 } else if (!frame->in_expression && !skipping) {
                     /* `#if A / f(x, / #else / g(x, / #endif`: the branch leaves a parenthesis open
                      * that the code after the conditional closes, so each branch is half of a
@@ -1205,8 +1285,52 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
             }
             if (at < length && source[at] == quote)
                 at++;
+            after_string = quote == '"';
             continue;
         }
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_') {
+            /* `"x" LUA_QL("=") " or "`: a macro call standing among string literals has to expand
+             * to a string, so the concatenation holds without it, and no grammar reads a call
+             * there. */
+            uint32_t word_end = at;
+            bool caps = true;
+            while (word_end < length && ((source[word_end] >= 'A' && source[word_end] <= 'Z') ||
+                                         (source[word_end] >= '0' && source[word_end] <= '9') ||
+                                         (source[word_end] >= 'a' && source[word_end] <= 'z') ||
+                                         source[word_end] == '_')) {
+                caps &= !(source[word_end] >= 'a' && source[word_end] <= 'z');
+                word_end++;
+            }
+            uint32_t open = cbm_attr_text_skip(source, length, word_end, true);
+            uint32_t quote = open < length && source[open] == '('
+                                 ? cbm_attr_text_skip(source, length, open + 1, true)
+                                 : length;
+            if (!skipping && caps && word_end - at >= CBM_ATTR_MIN_CAPS && quote < length &&
+                source[quote] == '"') {
+                uint32_t close = quote + 1;
+                while (close < length && source[close] != '"' && source[close] != '\n')
+                    close += source[close] == '\\' ? 2 : 1;
+                uint32_t paren = close < length && source[close] == '"'
+                                     ? cbm_attr_text_skip(source, length, close + 1, true)
+                                     : length;
+                if (paren < length && source[paren] == ')') {
+                    uint32_t next = cbm_attr_text_skip(source, length, paren + 1, false);
+                    if (after_string || (next < length && source[next] == '"')) {
+                        cbm_attr_range_add(words, (TSRange){{row, at - line_start},
+                                                            {row, paren + 1 - line_start},
+                                                            at,
+                                                            paren + 1});
+                        at = paren + 1;
+                        continue;
+                    }
+                }
+            }
+            after_string = false;
+            after_assign = false;
+            at = word_end;
+            continue;
+        }
+        after_string = false;
         if (!skipping) {
             if (ch == '(') {
                 depth++;

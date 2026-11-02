@@ -299,7 +299,10 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->limitation = "Exact visibility and owner proofs; overloads of one parameter count "
                           "with separate nodes, a template's dependent names, specialized class "
                           "templates, ADL with a second visible function, callable-field "
-                          "selection and what only some definitions of a macro name abstain.";
+                          "selection, what only some definitions of a macro name, a name that is "
+                          "a macro in one preprocessor branch and a function in another, and a "
+                          "macro that an included header the index cannot read may redefine "
+                          "abstain.";
         break;
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:

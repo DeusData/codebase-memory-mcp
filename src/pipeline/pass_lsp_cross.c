@@ -1205,6 +1205,17 @@ static void pxc_collect_c_file(const cbm_pipeline_ctx_t *ctx, CBMArena *arena, c
             (void)cbm_c_facts_add_generated(arena, facts, cbm_arena_strdup(arena, generated));
         free(generated);
     }
+    /* A quoted include nothing proves is text this index cannot read. */
+    for (int q = 0; q < facts->quoted_include_count && !facts->has_unknown_include; q++) {
+        bool known = false;
+        for (size_t i = 0; snapshot && i < snapshot->count && !known; i++) {
+            const cbm_resolve_import_fact_t *fact = &snapshot->items[i];
+            known = fact->module_path && !strcmp(fact->module_path, facts->quoted_includes[q]) &&
+                    cbm_resolve_admit(&fact->dependency) && cbm_resolve_admit(&fact->binding) &&
+                    fact->dependency.target;
+        }
+        facts->has_unknown_include = !known;
+    }
     CBMLSPDef *record = &defs[count];
     memset(record, 0, sizeof(*record));
     record->qualified_name = cbm_arena_sprintf(arena, "%s.@c-file-facts", module);

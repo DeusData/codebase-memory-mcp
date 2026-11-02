@@ -24,11 +24,15 @@ typedef struct {
     struct CProofDeclaration *proof_declarations;
     int proof_declaration_count, proof_declaration_cap;
     struct CProofInclude *proof_includes;
+    /* Where this file includes a quoted header the index holds nothing for, in file order. */
+    uint32_t *proof_unknown_includes;
+    int proof_unknown_include_count, proof_unknown_include_cap;
     /* The translation unit: every file this one includes, through other files
      * too, with the point in this file where it became visible. */
     struct CTUModule *tu_modules;
     uint32_t tu_cap, tu_count;
     bool tu_adding_includer_context;
+    bool local_tag_declared; /* a block of this file declared a tag of its own */
     const struct CBMCDeclIndex *c_decls;
     const char *own_file_qn; /* NULL when only the module identifies this file */
     /* C++: the class whose member function this is, inline or out of line. Its members

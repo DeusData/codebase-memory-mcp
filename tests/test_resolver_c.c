@@ -10,6 +10,7 @@
 #include "pipeline/pipeline.h"
 #include "test_helpers.h"
 #include "resolver_quality.h"
+#include "lsp/lsp_work.h"
 
 extern const TSLanguage *tree_sitter_c(void);
 extern const TSLanguage *tree_sitter_cpp(void);
@@ -810,6 +811,14 @@ static const char C_PP_PERSIST_GUESSED[] =
 static const char C_PP_PERSIST_MISSING[] =
     "#define CALL() missing_target()\n#include \"missing.h\"\n"
     "void missing_target(void) {}\nvoid missing_run(void) { CALL(); }\n";
+/* The same header ahead of the definition can do nothing to it, unless the definition is
+ * conditional: then the header may be what decides the branch. */
+static const char C_PP_PERSIST_AFTER[] =
+    "#include \"missing.h\"\n#define CALL() after_target()\n"
+    "void after_target(void) {}\nvoid after_run(void) { CALL(); }\n";
+static const char C_PP_PERSIST_GUARDED[] =
+    "#include \"missing.h\"\n#ifndef CALL\n#define CALL() guarded_target()\n#endif\n"
+    "void guarded_target(void) {}\nvoid guarded_run(void) { CALL(); }\n";
 
 TEST(resolver_c_preprocessed_proofs_require_complete_explicit_configuration) {
     const char *defined[] = {"LIB_API=1", NULL};
@@ -918,6 +927,8 @@ TEST(resolver_c_preprocessed_proofs_require_complete_explicit_configuration) {
 TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships) {
     const RQ_Source sources[] = {{.path = "guessed.c", .text = C_PP_PERSIST_GUESSED},
                                  {.path = "missing.c", .text = C_PP_PERSIST_MISSING},
+                                 {.path = "after.c", .text = C_PP_PERSIST_AFTER},
+                                 {.path = "guarded.c", .text = C_PP_PERSIST_GUARDED},
                                  {.path = "raw.c", .text = C_PP_RAW}};
     const RQ_Expected expected[] = {
         {.case_id = "raw-direct-positive",
@@ -928,25 +939,38 @@ TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "void raw_target(void) {}"}},
-        /* No preprocessed text speaks here. The raw #define does, the way a direct call of this
-         * function in this file would bind in spite of the same missing header. */
-        {.case_id = "raw-define-beside-a-missing-header",
-         .site = {.file = "missing.c",
-                  .caller = "missing.missing_run",
+        {.case_id = "raw-define-after-a-missing-header",
+         .site = {.file = "after.c",
+                  .caller = "after.after_run",
                   .needle = "CALL()",
                   .occurrence_index = 1},
          .relation = "CALLS",
-         .target = {.file = "missing.c",
-                    .suffix = "missing.missing_target",
+         .target = {.file = "after.c",
+                    .suffix = "after.after_target",
                     .label = "Function",
                     .declaration_line = 3,
-                    .declaration_text = "void missing_target(void) {}"}}};
+                    .declaration_text = "void after_target(void) {}"}}};
     const RQ_Forbidden forbidden[] = {
         {.case_id = "guessed-config-negative",
          .site = {.file = "guessed.c",
                   .caller = "guessed.guessed_run",
                   .needle = "CALL()",
                   .occurrence_index = 2},
+         .relation = "CALLS",
+         .any_target = true},
+        /* `missing.h` stands between the definition and the use, and may redefine CALL. */
+        {.case_id = "missing-header-negative",
+         .site = {.file = "missing.c",
+                  .caller = "missing.missing_run",
+                  .needle = "CALL()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "a-missing-header-may-decide-the-branch",
+         .site = {.file = "guarded.c",
+                  .caller = "guarded.guarded_run",
+                  .needle = "CALL()",
+                  .occurrence_index = 1},
          .relation = "CALLS",
          .any_target = true},
     };
@@ -1981,6 +2005,14 @@ TEST(resolver_c_known_gaps_stay_honest) {
                     .label = "Field",
                     .declaration_line = 4,
                     .declaration_text = "  struct tabpage_S *tp_next;"}},
+        {.case_id = "the-tag-in-the-signature",
+         .site = C_TU_WORD("use_gaps.c", use, "use_gaps.use_union", "struct item *o", "item"),
+         .relation = "USAGE",
+         .target = {.file = "gaps.h",
+                    .suffix = "gaps.item",
+                    .label = "Class",
+                    .declaration_line = 10,
+                    .declaration_text = "struct item {"}},
         {.case_id = "anonymous-aggregate-member",
          .site = C_TU_WORD("use_gaps.c", use, "use_gaps.use_union", "o->value", "value"),
          .relation = "USAGE",
@@ -3129,6 +3161,18 @@ TEST(resolver_c_struct_shapes_real_headers_use) {
          .site = C_TU_WORD("list.c", impl, "list.read_opaque", "(opaque *o", "opaque"),
          .relation = "USAGE",
          .target = opaque_class},
+        {.case_id = "a-tag-in-its-own-file",
+         .site = C_TU_WORD("list.c", impl, "list.read_tag", "struct opaque *o", "opaque"),
+         .relation = "USAGE",
+         .target = opaque_class},
+        {.case_id = "the-name-of-a-struct-with-two-layouts",
+         .site = C_TU_WORD("use_shapes.c", use, "use_shapes.use_swapped", "struct swapped *s", "swapped"),
+         .relation = "USAGE",
+         .target = {.file = "swap.h",
+                    .suffix = "swap.swapped",
+                    .label = "Class",
+                    .declaration_line = 6,
+                    .declaration_text = "struct swapped { int size; };"}},
         {.case_id = "member-through-the-typedef-name-in-its-own-file",
          .site = C_TU_WORD("list.c", impl, "list.read_node", "n->", "sz"),
          .relation = "USAGE",
@@ -3568,6 +3612,11 @@ TEST(resolver_c_fragment_sees_what_its_one_includer_saw) {
     "#define ONE_BRANCH(x)\n"                                                                   \
     "#define BOTH_BRANCHES(x) report_failure(\"b\")\n"                                           \
     "#endif\n"                                                                                  \
+    "#ifdef FEATURE\n"                                                                          \
+    "#define LATER_BRANCH(x)\n"                                                                 \
+    "#else\n"                                                                                   \
+    "#define LATER_BRANCH(x) report_failure(\"x\")\n"                                           \
+    "#endif\n"                                                                                  \
     "#endif\n"
 #define C_TU_BODY_API_C                                                                         \
     "void report_failure(const char *what) { (void)what; }\n"                                   \
@@ -3594,6 +3643,7 @@ TEST(resolver_c_fragment_sees_what_its_one_includer_saw) {
     "struct holder { int report_failure; };\n"                                                  \
     "int member(struct holder *h) { return MEMBER_OF(h); }\n"                                   \
     "void one_branch(int v) { ONE_BRANCH(v); }\n"                                               \
+    "void later_branch(int v) { LATER_BRANCH(v); }\n"                                           \
     "void both_branches(int v) { BOTH_BRANCHES(v); }\n"                                         \
     "int read_len(list_T *l) { return LIST_LEN(l); }\n"                                         \
     "int read_next(list_T *l) { return NEXT_LEN(l); }\n"                                        \
@@ -3644,6 +3694,15 @@ static const RQ_Source C_TU_BODY[] = {{.path = "body_api.h", .text = C_TU_BODY_A
 
 TEST(resolver_c_macro_replacement_compiles_at_its_use) {
     const char *body_use = C_TU_BODY_USE;
+    const RQ_Expected holder_row = {
+        .case_id = "the-tag-in-the-signature",
+        .site = C_TU_WORD("body_use.c", body_use, "body_use.member", "struct holder *h", "holder"),
+        .relation = "USAGE",
+        .target = {.file = "body_use.c",
+                   .suffix = "body_use.holder",
+                   .label = "Class",
+                   .declaration_line = 14,
+                   .declaration_text = "struct holder { int report_failure; };"}};
     const RQ_Target list_type = {.file = "body_api.h",
                                  .suffix = "body_api.list_T",
                                  .label = "Type",
@@ -3668,6 +3727,7 @@ TEST(resolver_c_macro_replacement_compiles_at_its_use) {
                                .declaration_line = 2,
                                .declaration_text = "int counter;"};
     const RQ_Expected expected[] = {
+        holder_row,
         {.case_id = "call-in-a-replacement",
          .site = {.file = "body_use.c", .caller = "body_use.checked", .needle = "CHECK(v)"},
          .relation = "CALLS",
@@ -3852,6 +3912,10 @@ TEST(resolver_c_macro_replacement_compiles_at_its_use) {
          .site = {.file = "body_use.c", .caller = "body_use.one_branch", .needle = "ONE_BRANCH(v)"},
          .relation = "CALLS",
          .any_target = true},
+        {.case_id = "only-the-other-definition-names-it",
+         .site = {.file = "body_use.c", .caller = "body_use.later_branch", .needle = "LATER_BRANCH(v)"},
+         .relation = "CALLS",
+         .any_target = true},
         {.case_id = "local-at-the-use-takes-the-name",
          .site = {.file = "body_use.c", .caller = "body_use.shadowed", .needle = "READ_COUNTER()"},
          .relation = "USAGE",
@@ -3909,41 +3973,47 @@ TEST(resolver_c_macro_replacement_compiles_at_its_use) {
     "#define sometimes(x) (x)\n"                                                                \
     "#endif\n"                                                                                  \
     "int sometimes(int x);\n"                                                                   \
+    "int plain_control(int x);\n"                                                               \
     "#endif\n"
 #define C_TU_ALT_C                                                                              \
     "int (get_len)(int x) { return x; }\n"                                                      \
     "int (always)(int x) { return x; }\n"                                                       \
-    "int (sometimes)(int x) { return x; }\n"
+    "int (sometimes)(int x) { return x; }\n" \
+    "int (plain_control)(int x) { return x; }\n"
 #define C_TU_ALT_USE                                                                            \
     "#include \"alt.h\"\n"                                                                      \
     "int use_len(int v) { return get_len(v); }\n"                                               \
     "int use_swap(int v) { return swap_bytes(v); }\n"                                           \
     "int use_always(int v) { return always(v); }\n"                                             \
-    "int use_sometimes(int v) { return sometimes(v); }\n"
+    "int use_sometimes(int v) { return sometimes(v); }\n"                                        \
+    "int use_plain(int v) { return plain_control(v); }\n"
 static const RQ_Source C_TU_ALT[] = {{.path = "alt.h", .text = C_TU_ALT_H},
                                      {.path = "alt.c", .text = C_TU_ALT_C},
                                      {.path = "alt_use.c", .text = C_TU_ALT_USE}};
 
-TEST(resolver_c_macro_in_one_branch_leaves_the_function_in_another) {
+/* A macro in one branch and the function in the other: in one configuration this is a call and in the
+ * other it may be no call at all, so with no compile configuration the name is unknown. An edge here
+ * would hold only by chance. See also pipeline_c_call_targets_definition_before_macro_c1. */
+TEST(resolver_c_macro_in_one_branch_leaves_the_name_unknown) {
     const RQ_Expected expected[] = {
+        {.case_id = "a-name-no-macro-touches",
+         .site = {.file = "alt_use.c", .caller = "alt_use.use_plain", .needle = "plain_control(v)"},
+         .relation = "CALLS",
+         .target = {.file = "alt.c",
+                    .suffix = "alt.plain_control",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "int (plain_control)(int x) { return x; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
         {.case_id = "prototype-in-the-other-branch",
          .site = {.file = "alt_use.c", .caller = "alt_use.use_len", .needle = "get_len(v)"},
          .relation = "CALLS",
-         .target = {.file = "alt.c",
-                    .suffix = "alt.get_len",
-                    .label = "Function",
-                    .declaration_line = 1,
-                    .declaration_text = "int (get_len)(int x) { return x; }"}},
+         .any_target = true},
         {.case_id = "definition-in-the-other-branch",
          .site = {.file = "alt_use.c", .caller = "alt_use.use_swap", .needle = "swap_bytes(v)"},
          .relation = "CALLS",
-         .target = {.file = "alt.h",
-                    .suffix = "alt.swap_bytes",
-                    .label = "Function",
-                    .declaration_line = 11,
-                    .declaration_text = "static int swap_bytes(int v) { return v; }"}},
-    };
-    const RQ_Forbidden forbidden[] = {
+         .any_target = true},
         {.case_id = "macro-outside-any-conditional",
          .site = {.file = "alt_use.c", .caller = "alt_use.use_always", .needle = "always(v)"},
          .relation = "CALLS",
@@ -4622,11 +4692,14 @@ TEST(resolver_cpp_member_template_is_a_method_of_its_class) {
     "#endif\n"
 #define C_TU_SW_TABLE                                                                           \
     "#include \"sw.h\"\n"                                                                       \
-    "static const int table[] = {\n"                                                            \
-    "#define OP(n) n,\n"                                                                        \
+    "typedef struct { const char *a; int b; } node_t;\n"                                        \
+    "static const char *NAME(const char *n) { return n; }\n"                                    \
+    "static int CTL(int v) { return v; }\n"                                                     \
+    "static const node_t table[] = {\n"                                                         \
+    "#define OP(n) {NAME(#n), CHILD(named, stats_##n)},\n"                                      \
     "LIST\n"                                                                                    \
     "#undef OP\n"                                                                               \
-    "  0\n"                                                                                     \
+    "  {NAME(\"reset\"), CTL(1)}\n"                                                             \
     "};\n"                                                                                      \
     "static int after_table(int v) { return v; }\n"                                             \
     "int call_after(int v) { return after_table(v); }\n"
@@ -4637,7 +4710,32 @@ TEST(resolver_cpp_member_template_is_a_method_of_its_class) {
     "static int inside(int v) { return v; }\n"                                                  \
     "int call_inside(int v) { return inside(v); }\n"                                            \
     "}\n"
+#define C_TU_SW_HEADS                                                                           \
+    "#include \"sw.h\"\n"                                                                       \
+    "static int helper(int v) { return v; }\n"                                                  \
+    "#ifndef CONFIG_ONE\n"                                                                      \
+    "void prefork(void)\n"                                                                      \
+    "#else\n"                                                                                   \
+    "void other_prefork(void)\n"                                                                \
+    "#endif\n"                                                                                  \
+    "{\n"                                                                                       \
+    "  helper(1);\n"                                                                            \
+    "}\n"                                                                                       \
+    "void caller(void) { prefork(); }\n"
+#define C_TU_SW_LUA                                                                             \
+    "#include \"sw.h\"\n"                                                                       \
+    "#define QUOTED(x) \"'\" x \"'\"\n"                                                          \
+    "static void report(const char *m) { (void)m; }\n"                                          \
+    "static void before(int c) {\n"                                                             \
+    "  switch (c) {\n"                                                                          \
+    "    case 1: report(QUOTED(\"=\") \" or \" QUOTED(\"in\") \" expected\"); break;\n"           \
+    "    default: report(\"no \" QUOTED(\"x\")); break;\n"                                        \
+    "  }\n"                                                                                     \
+    "}\n"                                                                                       \
+    "static void after_it(void) { report(\"x\"); before(1); }\n"
 static const RQ_Source C_TU_SW[] = {{.path = "sw.h", .text = C_TU_SW_H},
+                                    {.path = "sw_heads.c", .text = C_TU_SW_HEADS},
+                                    {.path = "sw_lua.c", .text = C_TU_SW_LUA},
                                     {.path = "sw_table.c", .text = C_TU_SW_TABLE},
                                     {.path = "sw_ns.cpp", .text = C_TU_SW_NS}};
 
@@ -4649,8 +4747,76 @@ TEST(resolver_c_a_broken_head_does_not_swallow_the_functions_after_it) {
          .target = {.file = "sw_table.c",
                     .suffix = "sw_table.after_table",
                     .label = "Function",
-                    .declaration_line = 8,
+                    .declaration_line = 11,
                     .declaration_text = "static int after_table(int v) { return v; }"}},
+        {.case_id = "a-call-in-the-table-belongs-to-the-file",
+         .site = {.file = "sw_table.c", .caller = "sw_table", .needle = "NAME(\"reset\")"},
+         .relation = "CALLS",
+         .target = {.file = "sw_table.c",
+                    .suffix = "sw_table.NAME",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "static const char *NAME(const char *n) { return n; }"}},
+        {.case_id = "and-so-does-the-next-one",
+         .site = {.file = "sw_table.c", .caller = "sw_table", .needle = "CTL(1)"},
+         .relation = "CALLS",
+         .target = {.file = "sw_table.c",
+                    .suffix = "sw_table.CTL",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "static int CTL(int v) { return v; }"}},
+        {.case_id = "the-body-belongs-to-the-first-head",
+         .site = {.file = "sw_heads.c", .caller = "sw_heads.prefork", .needle = "helper(1)"},
+         .relation = "CALLS",
+         .target = {.file = "sw_heads.c",
+                    .suffix = "sw_heads.helper",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "static int helper(int v) { return v; }"}},
+        {.case_id = "a-call-of-the-first-head",
+         .site = {.file = "sw_heads.c", .caller = "sw_heads.caller", .needle = "prefork()"},
+         .relation = "CALLS",
+         .target = {.file = "sw_heads.c",
+                    .suffix = "sw_heads.prefork",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "void prefork(void)"}},
+        {.case_id = "a-call-with-a-macro-among-its-strings",
+         .site = {.file = "sw_lua.c",
+                  .caller = "sw_lua.before",
+                  .needle = "report(QUOTED(\"=\") \" or \" QUOTED(\"in\") \" expected\")"},
+         .relation = "CALLS",
+         .target = {.file = "sw_lua.c",
+                    .suffix = "sw_lua.report",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "static void report(const char *m) { (void)m; }"}},
+        {.case_id = "a-macro-after-a-string",
+         .site = {.file = "sw_lua.c",
+                  .caller = "sw_lua.before",
+                  .needle = "report(\"no \" QUOTED(\"x\"))"},
+         .relation = "CALLS",
+         .target = {.file = "sw_lua.c",
+                    .suffix = "sw_lua.report",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "static void report(const char *m) { (void)m; }"}},
+        {.case_id = "the-call-after-those-strings",
+         .site = {.file = "sw_lua.c", .caller = "sw_lua.after_it", .needle = "report(\"x\")"},
+         .relation = "CALLS",
+         .target = {.file = "sw_lua.c",
+                    .suffix = "sw_lua.report",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "static void report(const char *m) { (void)m; }"}},
+        {.case_id = "the-function-before-them",
+         .site = {.file = "sw_lua.c", .caller = "sw_lua.after_it", .needle = "before(1)"},
+         .relation = "CALLS",
+         .target = {.file = "sw_lua.c",
+                    .suffix = "sw_lua.before",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "static void before(int c) {"}},
         {.case_id = "a-function-after-a-word-before-namespace",
          .site = {.file = "sw_ns.cpp", .caller = "sw_ns.lib.call_inside", .needle = "inside(v)"},
          .relation = "CALLS",
@@ -4810,7 +4976,27 @@ static const RQ_Source C_TU_KV[] = {{.path = "kv.h", .text = C_TU_KV_H},
 
 TEST(resolver_c_macro_typed_member_keeps_its_own_name) {
     const char *use = C_TU_KV_USE;
+    const RQ_Target buffer = {.file = "kv.h",
+                              .suffix = "kv.buffer",
+                              .label = "Class",
+                              .declaration_line = 5,
+                              .declaration_text = "struct buffer {"};
     const RQ_Expected expected[] = {
+        {.case_id = "the-tag-of-the-first-reader",
+         .site = C_TU_WORD("kv_use.c", use, "kv_use.read_channels",
+                           "buffer *b) { return &b->update_channels", "buffer"),
+         .relation = "USAGE",
+         .target = buffer},
+        {.case_id = "the-tag-of-the-second-reader",
+         .site = C_TU_WORD("kv_use.c", use, "kv_use.read_callbacks",
+                           "buffer *b) { return &b->update_callbacks", "buffer"),
+         .relation = "USAGE",
+         .target = buffer},
+        {.case_id = "the-tag-of-the-third-reader",
+         .site = C_TU_WORD("kv_use.c", use, "kv_use.read_pointers", "buffer *b) { return &b->pointer_vec",
+                           "buffer"),
+         .relation = "USAGE",
+         .target = buffer},
         {.case_id = "a-member-whose-name-the-grammar-split-off",
          .site = C_TU_WORD("kv_use.c", use, "kv_use.read_channels", "update_channels; }",
                            "update_channels"),
@@ -4967,6 +5153,795 @@ TEST(resolver_cpp_template_field_reads_the_template_and_not_its_parameter_spelli
                              .expected_count = sizeof(expected) / sizeof(expected[0]),
                              .forbidden = forbidden,
                              .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `struct X *p` had no occurrence at all: the specifier's name counted as a declaration, so a tag in a
+ * signature, a body, a cast or sizeof had no edge. Only a body or a lone `struct X;` declares. A tag is
+ * not a typedef: `struct Thing *t` beside `typedef struct impl Thing;` is a tag Thing of its own. */
+#define C_TU_TAG_H                                                                              \
+    "#ifndef TAG_H\n"                                                                           \
+    "#define TAG_H\n"                                                                           \
+    "struct header_tag { int size; };\n"                                                        \
+    "union shared_u { int a; };\n"                                                              \
+    "enum shared_e { E_ONE };\n"                                                                \
+    "struct real_impl { int r; };\n"                                                            \
+    "typedef struct real_impl Thing;\n"                                                         \
+    "typedef struct { int n; } NoTag;\n"                                                        \
+    "typedef union { int n; } NoTagU;\n"                                                        \
+    "typedef enum { NT_ONE } NoTagE;\n"                                                         \
+    "struct second_tag { int size; };\n"                                                        \
+    "struct fourth_tag { int size; };\n"                                                        \
+    "struct fifth_tag { int size; };\n"                                                        \
+    "#endif\n"
+#define C_TU_TAG_USE                                                                            \
+    "#include \"tag.h\"\n"                                                                      \
+    "struct local_tag { int a; };\n"                                                            \
+    "struct local_tag;\n"                                                                       \
+    "int signature(struct header_tag *h) { return h != 0; }\n"                                  \
+    "int in_body(void) { union shared_u u; enum shared_e e; (void)u; (void)e; return 0; }\n"    \
+    "unsigned long sized(void) { return sizeof(struct header_tag); }\n"                         \
+    "int cast_of(void *v) { return ((struct header_tag *)v) != 0; }\n"                          \
+    "int own_file(struct local_tag *l) { return l != 0; }\n"                                    \
+    "int opaque(struct only_here *o) { return o != 0; }\n"                                      \
+    "int through_alias_tag(struct Thing *t) { return t->r; }\n"                                 \
+    "int shadowed(void) { struct header_tag { int other; }; struct header_tag mine; return 0; }\n" \
+    "void *in_macro_argument(void *p) { return container_of(p, struct header_tag, size); }\n"   \
+    "void *alias_in_macro_argument(void *p) { return container_of(p, struct Thing, r); }\n"   \
+    "int lone_in_body(void) { struct second_tag; struct second_tag *mine = 0; return mine != 0; }\n"\
+    "int after_the_block(struct second_tag *s) { return s != 0; }\n"                            \
+    "int no_tag(struct NoTag *t) { return t != 0; }\n"                                          \
+    "int no_tag_member(struct NoTag *u) { return u->n; }\n"                                     \
+    "int no_tag_union(union NoTagU *x) { return x != 0; }\n"                                    \
+    "int no_tag_enum(enum NoTagE *y) { return y != 0; }\n"                                      \
+    "int typedef_name(NoTag *v) { return v->n; }\n"                                             \
+    "int hidden_member(void) { struct fourth_tag { int size; }; struct fourth_tag w; return w.size; }\n" \
+    "int variable_of_that_spelling(void) { struct fifth_tag fifth_tag; return fifth_tag.size; }\n" \
+    "typedef struct { int n; } OwnNoTag;\n"                                                     \
+    "typedef union { int n; } OwnNoTagU;\n"                                                     \
+    "int own_no_tag(struct OwnNoTag *o) { return o != 0; }\n"                                   \
+    "int own_no_tag_member(struct OwnNoTag *p) { return p->n; }\n"                              \
+    "int own_no_tag_union(union OwnNoTagU *q) { return q != 0; }\n"
+static const RQ_Source C_TU_TAG[] = {{.path = "tag.h", .text = C_TU_TAG_H},
+                                     {.path = "tag_use.c", .text = C_TU_TAG_USE}};
+
+TEST(resolver_c_struct_tag_is_a_use_unless_it_declares) {
+    const char *use = C_TU_TAG_USE;
+    const RQ_Target header_tag = {.file = "tag.h",
+                                  .suffix = "tag.header_tag",
+                                  .label = "Class",
+                                  .declaration_line = 3,
+                                  .declaration_text = "struct header_tag { int size; };"};
+#define TAG_USE(id, caller, context, word, target_)                                             \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("tag_use.c", use, "tag_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+    const RQ_Expected expected[] = {
+        TAG_USE("a-tag-in-a-signature", "signature", "header_tag *h", "header_tag", header_tag),
+        TAG_USE("a-union-in-a-body", "in_body", "shared_u u", "shared_u",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.shared_u",
+                             .label = "Class",
+                             .declaration_line = 4,
+                             .declaration_text = "union shared_u { int a; };"})),
+        TAG_USE("an-enum-in-a-body", "in_body", "shared_e e", "shared_e",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.shared_e",
+                             .label = "Enum",
+                             .declaration_line = 5,
+                             .declaration_text = "enum shared_e { E_ONE };"})),
+        TAG_USE("a-tag-in-sizeof", "sized", "sizeof(struct header_tag", "header_tag", header_tag),
+        TAG_USE("a-tag-in-a-cast", "cast_of", "(struct header_tag *)v", "header_tag", header_tag),
+        TAG_USE("a-tag-among-call-arguments", "in_macro_argument", "struct header_tag, size",
+                "header_tag", header_tag),
+        TAG_USE("a-tag-of-this-file", "own_file", "local_tag *l", "local_tag",
+                ((RQ_Target){.file = "tag_use.c",
+                             .suffix = "tag_use.local_tag",
+                             .label = "Class",
+                             .declaration_line = 2,
+                             .declaration_text = "struct local_tag { int a; };"})),
+        TAG_USE("a-lone-tag-hides-only-in-its-block", "after_the_block", "second_tag *s", "second_tag",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.second_tag",
+                             .label = "Class",
+                             .declaration_line = 11,
+                             .declaration_text = "struct second_tag { int size; };"})),
+        TAG_USE("a-typedef-name-is-the-type", "typedef_name", "NoTag *v", "NoTag",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.NoTag",
+                             .label = "Class",
+                             .declaration_line = 8,
+                             .declaration_text = "typedef struct { int n; } NoTag;"})),
+        TAG_USE("a-member-through-the-typedef-name", "typedef_name", "v->n", "n",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.NoTag.n",
+                             .label = "Field",
+                             .declaration_line = 8,
+                             .declaration_text = "typedef struct { int n; } NoTag;"})),
+        TAG_USE("a-tag-beside-a-variable-of-its-spelling", "variable_of_that_spelling",
+                "struct fifth_tag fifth_tag", "fifth_tag",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.fifth_tag",
+                             .label = "Class",
+                             .declaration_line = 13,
+                             .declaration_text = "struct fifth_tag { int size; };"})),
+        TAG_USE("that-variable-is-no-tag-of-its-own", "variable_of_that_spelling", "fifth_tag.size",
+                "size",
+                ((RQ_Target){.file = "tag.h",
+                             .suffix = "tag.fifth_tag.size",
+                             .label = "Field",
+                             .declaration_line = 13,
+                             .declaration_text = "struct fifth_tag { int size; };"})),
+    };
+#undef TAG_USE
+#define TAG_NEVER(id, caller, context, word)                                                    \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("tag_use.c", use, caller, context, word),                                 \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Forbidden forbidden[] = {
+        TAG_NEVER("a-lone-tag-declares-it", "tag_use", "struct local_tag;", "local_tag"),
+        TAG_NEVER("a-tag-this-unit-does-not-declare", "tag_use.opaque", "only_here *o", "only_here"),
+        TAG_NEVER("a-tag-is-not-the-typedef-of-its-spelling", "tag_use.through_alias_tag", "Thing *t",
+                  "Thing"),
+        TAG_NEVER("nothing-through-that-tag", "tag_use.through_alias_tag", "t->r", "r"),
+        TAG_NEVER("nor-among-call-arguments", "tag_use.alias_in_macro_argument", "struct Thing, r",
+                  "Thing"),
+        TAG_NEVER("a-tag-defined-in-the-function", "tag_use.shadowed", "struct header_tag mine",
+                  "header_tag"),
+        TAG_NEVER("a-lone-tag-in-a-block-is-a-new-one", "tag_use.lone_in_body", "second_tag *mine",
+                  "second_tag"),
+        TAG_NEVER("an-unnamed-struct-has-no-tag", "tag_use.no_tag", "NoTag *t", "NoTag"),
+        TAG_NEVER("nor-through-it", "tag_use.no_tag_member", "NoTag *u", "NoTag"),
+        TAG_NEVER("nor-a-member-through-it", "tag_use.no_tag_member", "u->n", "n"),
+        TAG_NEVER("an-unnamed-union-has-no-tag", "tag_use.no_tag_union", "NoTagU *x", "NoTagU"),
+        TAG_NEVER("an-unnamed-enum-has-no-tag", "tag_use.no_tag_enum", "NoTagE *y", "NoTagE"),
+        TAG_NEVER("a-member-of-a-local-struct-is-not-the-outer-one", "tag_use.hidden_member", "w.size",
+                  "size"),
+        TAG_NEVER("nor-does-this-file-s-own-typedef-give-a-tag", "tag_use.own_no_tag", "OwnNoTag *o",
+                  "OwnNoTag"),
+        TAG_NEVER("nor-through-its-own", "tag_use.own_no_tag_member", "OwnNoTag *p", "OwnNoTag"),
+        TAG_NEVER("nor-a-member-through-its-own", "tag_use.own_no_tag_member", "p->n", "n"),
+        TAG_NEVER("nor-its-own-union", "tag_use.own_no_tag_union", "OwnNoTagU *q", "OwnNoTagU"),
+    };
+#undef TAG_NEVER
+    const CTUCase fixture = {.suite = "c-tu-struct-tags",
+                             .sources = C_TU_TAG,
+                             .source_count = sizeof(C_TU_TAG) / sizeof(C_TU_TAG[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `static int f(int x)` with an #ifdef splitting its braces is left loose in an ERROR, and the
+ * signature there says how it is linked. It must still read as static, or a caller in another file
+ * binds to it: through a prototype with no other definition, and in place of the real definition. */
+#define C_TU_STRANDED_BODY                                                                      \
+    "\n"                                                                                         \
+    "{\n"                                                                                        \
+    "#ifdef A\n"                                                                                 \
+    "    if (x) {\n"                                                                             \
+    "#else\n"                                                                                    \
+    "    if (!x) {\n"                                                                            \
+    "#endif\n"                                                                                   \
+    "        return 1;\n"                                                                        \
+    "    }\n"                                                                                    \
+    "    return 0;\n"                                                                            \
+    "}\n"
+#define C_TU_STRANDED_CALLER                                                                    \
+    "#include \"sapi.h\"\n"                                                                      \
+    "int run_shared(void) { return shared(1); }\n"                                               \
+    "int run_alone(void) { return alone(2); }\n"
+static const RQ_Source C_TU_STRANDED[] = {
+    {.path = "sapi.h",
+     .text = "#ifndef SAPI_H\n#define SAPI_H\nint shared(int x);\nint alone(int x);\n#endif\n"},
+    {.path = "split_shared.c", .text = "static int shared(int x)" C_TU_STRANDED_BODY},
+    {.path = "split_alone.c", .text = "static int alone(int x)" C_TU_STRANDED_BODY},
+    {.path = "real.c", .text = "int shared(int x) { return x; }\n"},
+    {.path = "scaller.c", .text = C_TU_STRANDED_CALLER},
+};
+
+TEST(resolver_c_a_static_left_in_an_error_stays_static) {
+    const char *caller = C_TU_STRANDED_CALLER;
+    const RQ_Expected expected[] = {
+        {.case_id = "the-real-definition-not-the-static-one",
+         .site = C_TU_WORD("scaller.c", caller, "scaller.run_shared", "shared(1)", "shared(1)"),
+         .relation = "CALLS",
+         .target = {.file = "real.c",
+                    .suffix = "real.shared",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "int shared(int x) { return x; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-static-in-another-file-is-not-the-definition",
+         .site = C_TU_WORD("scaller.c", caller, "scaller.run_alone", "alone(2)", "alone(2)"),
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-stranded-static",
+                             .sources = C_TU_STRANDED,
+                             .source_count = sizeof(C_TU_STRANDED) / sizeof(C_TU_STRANDED[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Whether a body holds a `#define`, to its last byte: a `#` with nothing after it, a word cut off by the
+ * end of the text, a directive with space after the `#`, one after another directive. */
+TEST(resolver_c_text_defines_macro_reads_to_the_end_of_the_text) {
+    static const struct {
+        const char *text;
+        bool defines;
+    } cases[] = {
+        {"", false},          {"#", false},         {"#   ", false},          {"#defin", false},
+        {"#define", true},    {"# \tdefine X", true}, {"x = 1;\n#define Y 2", true},
+        {"#include <a.h>\n#define Z", true},        {"#include <a.h>\n", false},
+        {"# # define", true}, {"a # b", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool found = cbm_c_text_defines_macro(cases[i].text, (uint32_t)strlen(cases[i].text));
+        ASSERT_EQ(found, cases[i].defines);
+    }
+    PASS();
+}
+
+/* A header runs on the pass over one file alone, with no source file on its types and in C++ mode:
+ * `struct other *p;` as a member and in a prototype name the header's own tag. One in a namespace is
+ * out of reach of code outside it there as well. */
+#define C_TU_TAG_HEADER                                                                         \
+    "struct other { int a; };\n"                                                                 \
+    "namespace within { struct nested { int b; }; }\n"                                           \
+    "struct holder {\n"                                                                          \
+    "  struct other *member;\n"                                                                  \
+    "  struct nested *wrong_member;\n"                                                           \
+    "};\n"                                                                                       \
+    "int prototype(struct other *q);\n"                                                          \
+    "namespace within { struct inner_holder { struct nested *right_member; }; }\n"
+static const RQ_Source C_TU_TAG_HEADERS[] = {{.path = "taghdr.hpp", .text = C_TU_TAG_HEADER}};
+
+TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module) {
+    const char *source = C_TU_TAG_HEADER;
+    const RQ_Target other = {.file = "taghdr.hpp",
+                             .suffix = "taghdr.other",
+                             .label = "Class",
+                             .declaration_line = 1,
+                             .declaration_text = "struct other { int a; };"};
+    const RQ_Expected expected[] = {
+        {.case_id = "a-member-names-the-header-s-own-tag",
+         .site = C_TU_WORD("taghdr.hpp", source, "taghdr", "other *member", "other"),
+         .relation = "USAGE",
+         .target = other},
+        {.case_id = "a-prototype-names-it-too",
+         .site = C_TU_WORD("taghdr.hpp", source, "taghdr", "other *q", "other"),
+         .relation = "USAGE",
+         .target = other},
+        {.case_id = "a-namespace-reaches-its-own-tag",
+         .site = C_TU_WORD("taghdr.hpp", source, "taghdr", "nested *right_member", "nested"),
+         .relation = "USAGE",
+         .target = {.file = "taghdr.hpp",
+                    .suffix = "taghdr.within.nested",
+                    .label = "Class",
+                    .declaration_line = 2,
+                    .declaration_text = "namespace within { struct nested { int b; }; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "C-NAMESPACED-CLASS-MEMBER-TYPE",
+         .why = "A member declared in a class inside a namespace has no type row. At the top level of "
+                "a file it has one.",
+         .tried = "Read on the binaries before and after the tag rule: the row is absent on both, so "
+                  "it is not the lookup. Sized and left for a later rule."},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "outside-the-namespace-it-is-another-tag",
+         .site = C_TU_WORD("taghdr.hpp", source, "taghdr", "nested *wrong_member", "nested"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-tag-in-header",
+                             .sources = C_TU_TAG_HEADERS,
+                             .source_count = 1,
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .known_gaps = 1,
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* A lone tag declares it, wherever it stands. Nothing resolves there, so the decoys above stay
+ * quiet with or without this: what it changes is an occurrence with no answer, counted as unresolved. */
+static int c_usage_rows_named(const CBMFileResult *result, const char *name) {
+    int count = 0;
+    for (int i = 0; i < result->usages.count; i++)
+        count += result->usages.items[i].ref_name && !strcmp(result->usages.items[i].ref_name, name);
+    return count;
+}
+
+TEST(resolver_c_lone_tag_is_no_occurrence) {
+    static const char source[] = "struct lone_file;\n"
+                                 "struct used_file *a;\n"
+                                 "int f(void) { struct lone_body; struct used_body *b; return b != 0; }\n"
+                                 "struct holder { struct lone_member; struct used_member *c; };\n";
+    CBMFileResult *c_file =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_C, "p", "tag.c", 0, NULL, NULL);
+    ASSERT(c_file != NULL);
+    ASSERT_EQ(c_usage_rows_named(c_file, "lone_file"), 0);
+    ASSERT_EQ(c_usage_rows_named(c_file, "lone_body"), 0);
+    ASSERT_EQ(c_usage_rows_named(c_file, "lone_member"), 0);
+    ASSERT_EQ(c_usage_rows_named(c_file, "used_file"), 1);
+    ASSERT_EQ(c_usage_rows_named(c_file, "used_body"), 1);
+    ASSERT_EQ(c_usage_rows_named(c_file, "used_member"), 1);
+    cbm_free_result(c_file);
+    static const char cxx_source[] = "class lone_class;\n"
+                                     "template <class T> struct lone_template;\n"
+                                     "namespace n { struct lone_in_namespace; }\n"
+                                     "class used_class *d;\n";
+    CBMFileResult *cxx_file = cbm_extract_file(cxx_source, (int)strlen(cxx_source), CBM_LANG_CPP, "p",
+                                               "tag.cpp", 0, NULL, NULL);
+    ASSERT(cxx_file != NULL);
+    ASSERT_EQ(c_usage_rows_named(cxx_file, "lone_class"), 0);
+    ASSERT_EQ(c_usage_rows_named(cxx_file, "lone_template"), 0);
+    ASSERT_EQ(c_usage_rows_named(cxx_file, "lone_in_namespace"), 0);
+    ASSERT_EQ(c_usage_rows_named(cxx_file, "used_class"), 1);
+    cbm_free_result(cxx_file);
+    PASS();
+}
+
+/* C++ looks a tag up as it looks up anything: a class in a block hides the outer one from there on, and
+ * one in a namespace is out of reach of code outside it. `struct Name` needs no earlier declaration, so
+ * it compiles where a plain `Name` would not, and it means a new type there. */
+#define C_TU_TL                                                                                 \
+    "struct Outer { int o; };\n"                                                                \
+    "class Klass { public: int k; };\n"                                                         \
+    "namespace ns {\n"                                                                          \
+    "struct InNs { int n; };\n"                                                                 \
+    "int inside(struct InNs *a) { return a->n; }\n"                                             \
+    "}\n"                                                                                       \
+    "namespace used { struct Used { int u; }; }\n"                                              \
+    "using namespace used;\n"                                                                   \
+    "int via_using(struct Used *b) { return b->u; }\n"                                          \
+    "int outside(struct InNs *c) { return c != nullptr; }\n"                                    \
+    "int outside_member(struct InNs *d) { return d->n; }\n"                                     \
+    "int local_class() { class Klass { public: int k; }; Klass e; return e.k; }\n"              \
+    "int lone_class() { class Klass; Klass *f = nullptr; return f != nullptr; }\n"              \
+    "int lone_struct() { struct Outer; Outer *g = nullptr; return g != nullptr; }\n"            \
+    "int plain_class() { Klass h; return h.k; }\n"                                              \
+    "int elaborated_class() { class Klass *i = nullptr; return i->k; }\n"
+static const RQ_Source C_TU_TAG_LOOKUP[] = {{.path = "tl.cpp", .text = C_TU_TL}};
+
+TEST(resolver_cpp_tag_lookup_stops_where_the_language_does) {
+    const char *source = C_TU_TL;
+    const RQ_Target klass = {.file = "tl.cpp",
+                             .suffix = "tl.Klass",
+                             .label = "Class",
+                             .declaration_line = 2,
+                             .declaration_text = "class Klass { public: int k; };"};
+    const RQ_Target klass_k = {.file = "tl.cpp",
+                               .suffix = "tl.Klass.k",
+                               .label = "Field",
+                               .declaration_line = 2,
+                               .declaration_text = "class Klass { public: int k; };"};
+#define TL_USE(id, caller, context, word, target_)                                              \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("tl.cpp", source, "tl." caller, context, word),                           \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+#define TL_NEVER(id, caller, context, word)                                                     \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("tl.cpp", source, "tl." caller, context, word),                           \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Expected expected[] = {
+        TL_USE("a-tag-in-the-namespace-around", "ns.inside", "InNs *a", "InNs",
+               ((RQ_Target){.file = "tl.cpp",
+                            .suffix = "tl.ns.InNs",
+                            .label = "Class",
+                            .declaration_line = 4,
+                            .declaration_text = "struct InNs { int n; };"})),
+        TL_USE("a-member-through-it", "ns.inside", "a->n", "n",
+               ((RQ_Target){.file = "tl.cpp",
+                            .suffix = "tl.ns.InNs.n",
+                            .label = "Field",
+                            .declaration_line = 4,
+                            .declaration_text = "struct InNs { int n; };"})),
+        TL_USE("a-tag-by-a-using-directive", "via_using", "Used *b", "Used",
+               ((RQ_Target){.file = "tl.cpp",
+                            .suffix = "tl.used.Used",
+                            .label = "Class",
+                            .declaration_line = 7,
+                            .declaration_text = "namespace used { struct Used { int u; }; }"})),
+        TL_USE("a-member-by-a-using-directive", "via_using", "b->u", "u",
+               ((RQ_Target){.file = "tl.cpp",
+                            .suffix = "tl.used.Used.u",
+                            .label = "Field",
+                            .declaration_line = 7,
+                            .declaration_text = "namespace used { struct Used { int u; }; }"})),
+        TL_USE("the-outer-class-by-name", "plain_class", "Klass h", "Klass", klass),
+        TL_USE("a-member-of-it", "plain_class", "h.k", "k", klass_k),
+        TL_USE("the-outer-class-by-its-tag", "elaborated_class", "Klass *i", "Klass", klass),
+        TL_USE("a-member-through-the-tag", "elaborated_class", "i->k", "k", klass_k),
+    };
+    const RQ_Forbidden forbidden[] = {
+        TL_NEVER("a-tag-out-of-reach-is-a-new-one", "outside", "InNs *c", "InNs"),
+        TL_NEVER("and-through-the-other-route", "outside_member", "InNs *d", "InNs"),
+        TL_NEVER("with-no-member-through-it", "outside_member", "d->n", "n"),
+        TL_NEVER("a-local-class-hides-the-outer-one", "local_class", "Klass e", "Klass"),
+        TL_NEVER("and-its-members-with-it", "local_class", "e.k", "k"),
+        TL_NEVER("a-lone-class-in-a-block-too", "lone_class", "Klass *f", "Klass"),
+        TL_NEVER("a-lone-struct-in-a-block-too", "lone_struct", "Outer *g", "Outer"),
+    };
+#undef TL_USE
+#undef TL_NEVER
+    const CTUCase fixture = {.suite = "c-tu-tag-lookup",
+                             .sources = C_TU_TAG_LOOKUP,
+                             .source_count = sizeof(C_TU_TAG_LOOKUP) / sizeof(C_TU_TAG_LOOKUP[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `hl_table[i].x` with `#define hl_table ((HlGroup *)(ga.ga_data))`: the replacement writes the type,
+ * and with a paste `SDS_HDR(8, s)->len` writes it through the argument. It has to be one cast as a whole
+ * and in parentheses: `(T *)p` used as `X->y` casts p->y. Every definition in force has to agree. */
+#define C_TU_CAST_H                                                                             \
+    "#ifndef C_H\n"                                                                             \
+    "#define C_H\n"                                                                             \
+    "typedef struct { int a; } Group;\n"                                                        \
+    "struct sdshdr8 { int len; };\n"                                                            \
+    "struct sdshdr16 { int len; };\n"                                                           \
+    "typedef struct { void *data; } GA;\n"                                                      \
+    "extern GA ga;\n"                                                                           \
+    "typedef struct { int a; } T;\n"                                                            \
+    "typedef struct { int a; } Other;\n"                                                        \
+    "#define table ((Group *)(ga.data))\n"                                                      \
+    "#define ITEMS(g) ((Group *)((g)->data))\n"                                                 \
+    "#define HDR(T, s) ((struct sdshdr##T *)((s) - sizeof(struct sdshdr##T)))\n"                \
+    "#define BARE (Group *)ga.data\n"                                                           \
+    "#define PARAM_TYPE(T, p) ((T *)(p))\n"                                                     \
+    "#define SUM(p) ((Group *)(p) + 1)\n"                                                       \
+    "#ifdef FEATURE\n"                                                                          \
+    "#define BRANCHED ((Group *)ga.data)\n"                                                     \
+    "#else\n"                                                                                   \
+    "#define BRANCHED ((Other *)ga.data)\n"                                                        \
+    "#endif\n"                                                                                  \
+    "#endif\n"
+#define C_TU_CAST_USE                                                                           \
+    "#include \"cast.h\"\n"                                                                     \
+    "int from_table(int i) { return table[i].a; }\n"                                            \
+    "int from_call(GA *g, int i) { return ITEMS(g)[i].a; }\n"                                   \
+    "int pasted8(char *s) { return HDR(8, s)->len; }\n"                                         \
+    "int pasted16(char *s) { return HDR(16, s)->len; }\n"                                       \
+    "int bare(void) { return BARE->a; }\n"                                                      \
+    "int param(GA *g) { return PARAM_TYPE(Group, g)->a; }\n"                                    \
+    "int summed(void) { return SUM(ga.data)->a; }\n"                                            \
+    "int branched(void) { return BRANCHED->a; }\n"
+static const RQ_Source C_TU_CAST[] = {{.path = "cast.h", .text = C_TU_CAST_H},
+                                      {.path = "cast_use.c", .text = C_TU_CAST_USE}};
+
+TEST(resolver_c_macro_that_is_one_cast_writes_the_receiver_type) {
+    const char *use = C_TU_CAST_USE;
+    const RQ_Target group = {.file = "cast.h",
+                             .suffix = "cast.Group",
+                             .label = "Class",
+                             .declaration_line = 3,
+                             .declaration_text = "typedef struct { int a; } Group;"};
+    const RQ_Target member_a = {.file = "cast.h",
+                                .suffix = "cast.Group.a",
+                                .label = "Field",
+                                .declaration_line = 3,
+                                .declaration_text = "typedef struct { int a; } Group;"};
+    const RQ_Target ga_type = {.file = "cast.h",
+                               .suffix = "cast.GA",
+                               .label = "Class",
+                               .declaration_line = 6,
+                               .declaration_text = "typedef struct { void *data; } GA;"};
+    const RQ_Target ga_data = {.file = "cast.h",
+                               .suffix = "cast.GA.data",
+                               .label = "Field",
+                               .declaration_line = 6,
+                               .declaration_text = "typedef struct { void *data; } GA;"};
+#define CAST_USE(id, caller, context, word, target_)                                            \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("cast_use.c", use, "cast_use." caller, context, word),                    \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+    const RQ_Expected expected[] = {
+        CAST_USE("the-type-an-object-macro-casts-to", "from_table", "table[i]", "table", group),
+        CAST_USE("a-member-through-an-object-macro", "from_table", "a; }\nint from_call", "a", member_a),
+        CAST_USE("the-parameter-type", "from_call", "GA *g", "GA", ga_type),
+        {.case_id = "the-type-a-function-macro-casts-to",
+         .site = {.file = "cast_use.c", .caller = "cast_use.from_call", .needle = "ITEMS(g)"},
+         .relation = "USAGE",
+         .dispatch_group = "what-items-reads",
+         .target = group},
+        {.case_id = "the-member-a-function-macro-reads",
+         .site = {.file = "cast_use.c", .caller = "cast_use.from_call", .needle = "ITEMS(g)"},
+         .relation = "USAGE",
+         .dispatch_group = "what-items-reads",
+         .target = ga_data},
+        CAST_USE("a-member-through-a-function-macro", "from_call", "a; }\nint pasted8", "a", member_a),
+        CAST_USE("a-paste-of-one-argument", "pasted8", "HDR(8, s)->len", "len",
+                 ((RQ_Target){.file = "cast.h",
+                              .suffix = "cast.sdshdr8.len",
+                              .label = "Field",
+                              .declaration_line = 4,
+                              .declaration_text = "struct sdshdr8 { int len; };"})),
+        CAST_USE("a-paste-of-another", "pasted16", "HDR(16, s)->len", "len",
+                 ((RQ_Target){.file = "cast.h",
+                              .suffix = "cast.sdshdr16.len",
+                              .label = "Field",
+                              .declaration_line = 5,
+                              .declaration_text = "struct sdshdr16 { int len; };"})),
+        CAST_USE("the-type-in-a-bare-cast", "bare", "BARE->a", "BARE", group),
+        CAST_USE("the-parameter-of-the-parameter-case", "param", "GA *g) { return PARAM", "GA", ga_type),
+        {.case_id = "the-type-in-a-sum",
+         .site = {.file = "cast_use.c", .caller = "cast_use.summed", .needle = "SUM(ga.data)"},
+         .relation = "USAGE",
+         .target = group},
+        CAST_USE("the-argument-of-the-sum", "summed", "ga.data)->a", "data", ga_data),
+    };
+#undef CAST_USE
+#define CAST_NEVER(id, caller, context)                                                         \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("cast_use.c", use, "cast_use." caller, context, "a; }"),                  \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "no-parentheses-means-the-member-is-cast",
+         .site = C_TU_WORD("cast_use.c", use, "cast_use.bare", "BARE->a", "a"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "a-parameter-as-the-type",
+         .site = C_TU_WORD("cast_use.c", use, "cast_use.param", "g)->a", "a"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "a-sum-is-not-read",
+         .site = C_TU_WORD("cast_use.c", use, "cast_use.summed", ")->a", "a"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "definitions-that-cast-differently",
+         .site = C_TU_WORD("cast_use.c", use, "cast_use.branched", "BRANCHED->a", "a"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+#undef CAST_NEVER
+    const CTUCase fixture = {.suite = "c-tu-cast-macros",
+                             .sources = C_TU_CAST,
+                             .source_count = sizeof(C_TU_CAST) / sizeof(C_TU_CAST[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `#define M0(x) M1(x) M1(x)` and so on, down `levels` macros to `leaf`. */
+static size_t c_handoff_chain(char *out, size_t cap, const char *name, int levels, int fan,
+                              const char *leaf) {
+    size_t at = 0;
+    for (int level = 0; level < levels; level++) {
+        at += (size_t)snprintf(out + at, cap - at, "#define %s%d(x)", name, level);
+        for (int i = 0; i < fan; i++)
+            at += (size_t)snprintf(out + at, cap - at, " %s%d(x)", name, level + 1);
+        at += (size_t)snprintf(out + at, cap - at, "\n");
+    }
+    at += (size_t)snprintf(out + at, cap - at, "#define %s%d(x) %s\n", name, levels, leaf);
+    return at;
+}
+
+/* The work of one use at the top of a chain whose every macro hands its argument on twice. */
+static uint64_t c_handoff_work(int levels, const char *use) {
+    char source[8192];
+    size_t at = c_handoff_chain(source, sizeof(source), "M", levels, 2, "sink(x)");
+    snprintf(source + at, sizeof(source) - at,
+             "void sink(int v);\nint value;\nvoid run(void) { %s }\n", use);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.@c-file-facts",
+                         .short_name = "@c-file-facts",
+                         .label = CBM_C_FILE_FACTS_LABEL,
+                         .def_module_qn = "test.main"}};
+    CBMCFileFacts facts = {0};
+    bool collected = cbm_c_collect_file_facts(&arena, source, (int)strlen(source), "test.main",
+                                              CBM_LANG_C, defs, 1, &facts);
+    defs[0].c_file_facts = &facts;
+    CBMResolvedCallArray rows = {0};
+    (void)cbm_lsp_work_take();
+    if (collected)
+        c_cross(&arena, source, false, defs, 1, NULL, NULL, 0, &rows);
+    uint64_t work = cbm_lsp_work_take();
+    cbm_arena_destroy(&arena);
+    return collected ? work : 0;
+}
+
+/* Following every hand-off doubles with each hop: 2^16 reads of a declaration bucket for one use,
+ * under the old limit. Each (macro, position) is read once now, so the work follows the chain's
+ * length, on both walks. Counted, not timed. */
+TEST(resolver_c_macro_handoffs_are_read_once_per_macro) {
+    const char *const uses[] = {"M0(value);", "M0(item) { sink(1); }"};
+    for (size_t i = 0; i < sizeof(uses) / sizeof(uses[0]); i++) {
+        uint64_t shorter = c_handoff_work(6, uses[i]);
+        uint64_t longer = c_handoff_work(12, uses[i]);
+        printf("    %s work: 6 levels=%llu  12 levels=%llu\n", uses[i],
+               (unsigned long long)shorter, (unsigned long long)longer);
+        ASSERT_GT(shorter, 0);
+        ASSERT(longer < shorter * 3);
+    }
+    PASS();
+}
+
+/* What a hand-off proves does not depend on how many there are: the old limit of 16 was a work bound
+ * that decided the answer. A cycle ends where the preprocessor ends it, since a macro is not expanded
+ * inside its own expansion, and what a definition in the cycle does to its argument still counts. */
+TEST(resolver_c_macro_handoff_chain_has_no_length_limit) {
+    static char source[16384];
+    size_t at = (size_t)snprintf(source, sizeof(source),
+                                 "struct Item { int a; };\n"
+                                 "int value;\n"
+                                 "int cycled;\n"
+                                 "int broken;\n"
+                                 "void sink(int v);\n");
+    at += c_handoff_chain(source + at, sizeof(source) - at, "P", 40, 1, "sink(x)");
+    at += c_handoff_chain(source + at, sizeof(source) - at, "L", 40, 1,
+                          "for (struct Item *(x) = 0; (x); (x) = 0)");
+    snprintf(source + at, sizeof(source) - at,
+             "#define A0(x) A1(x)\n"
+             "#define A1(x) A0(x)\n"
+             "#define B0(x) B1(x)\n"
+             "#define B1(x) B0(x) x##_y\n"
+             "void read_value(void) { P0(value); }\n"
+             "void read_member(void) { L0(it) { sink(it->a); } }\n"
+             "void read_cycled(void) { A0(cycled); }\n"
+             "void read_broken(void) { B0(broken); }\n");
+    const RQ_Source sources[] = {{.path = "chain.c", .text = source}};
+#define CHAIN_USE(id, caller, context, word, suffix_, label_, line, declaration)                \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("chain.c", source, "chain." caller, context, word),                       \
+     .relation = "USAGE",                                                                        \
+     .target = {.file = "chain.c",                                                               \
+                .suffix = suffix_,                                                               \
+                .label = label_,                                                                 \
+                .declaration_line = line,                                                        \
+                .declaration_text = declaration}}
+    const RQ_Expected expected[] = {
+        CHAIN_USE("forty-hops-reach-the-value", "read_value", "P0(value)", "value", "chain.value",
+                  "Variable", 2, "int value;"),
+        CHAIN_USE("forty-hops-reach-the-declaration", "read_member", "it->a", "a", "chain.Item.a",
+                  "Field", 1, "struct Item { int a; };"),
+        CHAIN_USE("a-cycle-ends-at-the-argument", "read_cycled", "A0(cycled)", "cycled",
+                  "chain.cycled", "Variable", 3, "int cycled;"),
+    };
+#undef CHAIN_USE
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-paste-in-the-cycle-still-counts",
+         .site = C_TU_WORD("chain.c", source, "chain.read_broken", "B0(broken)", "broken"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-handoff-chains",
+                             .sources = sources,
+                             .source_count = 1,
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* The includes of a sole includer are marked while that step adds them, and only then. The step's
+ * usual exit is the top of the chain, in the middle of its loop. */
+TEST(resolver_c_includer_context_ends_with_its_step) {
+    const char *source = "int f(void) { return 0; }\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ts_parser_set_language(parser, tree_sitter_c());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    ts_parser_delete(parser);
+    ASSERT_NOT_NULL(tree);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.@c-file-facts",
+                         .short_name = "@c-file-facts",
+                         .label = CBM_C_FILE_FACTS_LABEL,
+                         .def_module_qn = "test.main"}};
+    CBMCFileFacts facts = {0};
+    bool collected = cbm_c_collect_file_facts(&arena, source, (int)strlen(source), "test.main",
+                                              CBM_LANG_C, defs, 1, &facts);
+    defs[0].c_file_facts = &facts;
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    registry.c_decls = cbm_c_decl_index_build(&arena, defs, 1);
+    cbm_registry_finalize(&registry);
+    CBMResolvedCallArray out = {0};
+    CLSPContext ctx;
+    c_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, "test.main", false, &out);
+    c_lsp_process_file(&ctx, ts_tree_root_node(tree));
+    bool facts_found = cbm_c_file_facts(ctx.c_decls, "test.main") != NULL;
+    bool still_marking = ctx.tu_adding_includer_context;
+    cbm_arena_destroy(&arena);
+    ts_tree_delete(tree);
+    ASSERT(collected);
+    ASSERT(facts_found);
+    ASSERT(!still_marking);
+    PASS();
+}
+
+/* A C++ union with member functions is a class: its methods read its members, and its members are
+ * public by default. The class path of the LSP listed only `class` and `struct`. */
+#define C_TU_UN                                                                                 \
+    "union Number {\n"                                                                          \
+    "  int i;\n"                                                                                \
+    "  int helper() { return i; }\n"                                                            \
+    "  int get() { return helper(); }\n"                                                        \
+    "};\n"                                                                                      \
+    "int caller(Number &n) { return n.get(); }\n"
+static const RQ_Source C_TU_UNION[] = {{.path = "un.cpp", .text = C_TU_UN}};
+
+TEST(resolver_cpp_union_is_a_class_with_public_members) {
+    const char *source = C_TU_UN;
+    const RQ_Expected expected[] = {
+        {.case_id = "a-member-from-a-method",
+         .site = C_TU_WORD("un.cpp", source, "un.Number.helper", "return i;", "i"),
+         .relation = "USAGE",
+         .target = {.file = "un.cpp",
+                    .suffix = "un.Number.i",
+                    .label = "Field",
+                    .declaration_line = 2,
+                    .declaration_text = "  int i;"}},
+        {.case_id = "a-sibling-from-a-method",
+         .site = {.file = "un.cpp",
+                  .caller = "un.Number.get",
+                  .needle = "helper()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "un.cpp",
+                    .suffix = "un.Number.helper",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text = "  int helper() { return i; }"}},
+        {.case_id = "a-method-from-outside",
+         .site = {.file = "un.cpp", .caller = "un.caller", .needle = "n.get()"},
+         .relation = "CALLS",
+         .target = {.file = "un.cpp",
+                    .suffix = "un.Number.get",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "  int get() { return helper(); }"}},
+        {.case_id = "the-union-in-a-signature",
+         .site = C_TU_WORD("un.cpp", source, "un.caller", "Number &n", "Number"),
+         .relation = "USAGE",
+         .target = {.file = "un.cpp",
+                    .suffix = "un.Number",
+                    .label = "Class",
+                    .declaration_line = 1,
+                    .declaration_text = "union Number {"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-cxx-unions",
+                             .sources = C_TU_UNION,
+                             .source_count = sizeof(C_TU_UNION) / sizeof(C_TU_UNION[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
     for (int driver = 0; driver < 2; driver++)
         ASSERT(c_tu_run(&fixture, driver));
     PASS();
@@ -5655,7 +6630,7 @@ SUITE(resolver_c) {
     RUN_TEST(resolver_c_struct_shapes_real_headers_use);
     RUN_TEST(resolver_c_parse_repairs_keep_declarations);
     RUN_TEST(resolver_c_macro_replacement_compiles_at_its_use);
-    RUN_TEST(resolver_c_macro_in_one_branch_leaves_the_function_in_another);
+    RUN_TEST(resolver_c_macro_in_one_branch_leaves_the_name_unknown);
     RUN_TEST(resolver_c_macro_after_the_parameters_keeps_what_follows);
     RUN_TEST(resolver_c_designated_member_binds_through_the_type_being_initialized);
     RUN_TEST(resolver_cpp_anonymous_namespace_declares_in_its_file);
@@ -5668,6 +6643,17 @@ SUITE(resolver_c) {
     RUN_TEST(resolver_c_macro_after_an_arrow_reads_the_members_it_names);
     RUN_TEST(resolver_c_macro_typed_member_keeps_its_own_name);
     RUN_TEST(resolver_cpp_template_field_reads_the_template_and_not_its_parameter_spelling);
+    RUN_TEST(resolver_c_struct_tag_is_a_use_unless_it_declares);
+    RUN_TEST(resolver_c_lone_tag_is_no_occurrence);
+    RUN_TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module);
+    RUN_TEST(resolver_c_a_static_left_in_an_error_stays_static);
+    RUN_TEST(resolver_c_text_defines_macro_reads_to_the_end_of_the_text);
+    RUN_TEST(resolver_c_macro_handoffs_are_read_once_per_macro);
+    RUN_TEST(resolver_c_macro_handoff_chain_has_no_length_limit);
+    RUN_TEST(resolver_c_includer_context_ends_with_its_step);
+    RUN_TEST(resolver_cpp_tag_lookup_stops_where_the_language_does);
+    RUN_TEST(resolver_c_macro_that_is_one_cast_writes_the_receiver_type);
+    RUN_TEST(resolver_cpp_union_is_a_class_with_public_members);
     RUN_TEST(resolver_c_macro_behind_a_switch_this_unit_leaves_off);
     RUN_TEST(resolver_cpp_templates_bind_what_is_not_dependent);
     RUN_TEST(resolver_c_fragment_sees_what_its_one_includer_saw);

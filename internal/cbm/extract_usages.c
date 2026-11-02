@@ -1154,6 +1154,7 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
 
     TSNode current = node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    bool bodyless_tag = false;
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
@@ -1163,6 +1164,15 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         if (is_value_field(field)) {
             return false;
         }
+        /* `struct X;` at file scope or in a body has no node of its own around the specifier. */
+        if (bodyless_tag && !field &&
+            (strcmp(ts_node_type(parent), "translation_unit") == 0 ||
+             strcmp(ts_node_type(parent), "compound_statement") == 0 ||
+             strcmp(ts_node_type(parent), "declaration_list") == 0 ||
+             strcmp(ts_node_type(parent), "field_declaration_list") == 0 ||
+             strcmp(ts_node_type(parent), "template_declaration") == 0)) {
+            return true;
+        }
         /* A declaration container binds its name/pattern, not the symbols used
          * by its type annotation.  Both TypeScript (`cfg: Config`) and Go
          * (`cfg Config`) expose that annotation through the exact `type` field;
@@ -1170,10 +1180,29 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
          * The emitted occurrence remains an ordinary USAGE, never a callable
          * reference merely because the target happens to be a type. */
         if (field && strcmp(field, "type") == 0) {
+            /* `struct X;` declares the tag: nothing here uses the type. */
+            if (bodyless_tag &&
+                (strcmp(ts_node_type(parent), "declaration") == 0 ||
+                 strcmp(ts_node_type(parent), "field_declaration") == 0) &&
+                ts_node_is_null(ts_node_child_by_field_name(parent, TS_FIELD("declarator")))) {
+                return true;
+            }
             return false;
         }
 
         const char *kind = ts_node_type(parent);
+        /* `struct X *p` names a tag declared elsewhere. Only a body or a lone `struct X;` makes
+         * this the tag's own declaration. */
+        if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP ||
+             ctx->language == CBM_LANG_CUDA) &&
+            field && strcmp(field, "name") == 0 &&
+            (strcmp(kind, "struct_specifier") == 0 || strcmp(kind, "union_specifier") == 0 ||
+             strcmp(kind, "enum_specifier") == 0 || strcmp(kind, "class_specifier") == 0) &&
+            ts_node_is_null(ts_node_child_by_field_name(parent, TS_FIELD("body")))) {
+            bodyless_tag = true;
+            current = parent;
+            continue;
+        }
         /* PL/SQL: `parameter` is a ref_call ARGUMENT wrapper (upstream grammar
          * naming), not a declaration; definition-side bindings use the distinct
          * parameter_declaration kind. Skip it so call arguments stay ordinary

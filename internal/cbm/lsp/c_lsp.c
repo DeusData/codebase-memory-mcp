@@ -1264,6 +1264,28 @@ static int c_proof_include_compare(const void *left, const void *right) {
     return order ? order : strcmp(a->module, b->module);
 }
 
+static int c_proof_offset_compare(const void *left, const void *right) {
+    uint32_t a = *(const uint32_t *)left, b = *(const uint32_t *)right;
+    return (a > b) - (a < b);
+}
+
+static void c_proof_add_unknown_include(CLSPContext *ctx, uint32_t at) {
+    if (ctx->proof_unknown_include_count == ctx->proof_unknown_include_cap) {
+        int cap = ctx->proof_unknown_include_cap ? ctx->proof_unknown_include_cap * 2 : 8;
+        uint32_t *next = cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*next));
+        if (!next) {
+            ctx->binding_failed = true;
+            return;
+        }
+        if (ctx->proof_unknown_include_count)
+            memcpy(next, ctx->proof_unknown_includes,
+                   (size_t)ctx->proof_unknown_include_count * sizeof(*next));
+        ctx->proof_unknown_includes = next;
+        ctx->proof_unknown_include_cap = cap;
+    }
+    ctx->proof_unknown_includes[ctx->proof_unknown_include_count++] = at;
+}
+
 static void c_proof_include_site(CLSPContext *ctx, TSNode node) {
     TSNode path = ts_node_child_by_field_name(node, "path", 4);
     if (ts_node_is_null(path))
@@ -1273,6 +1295,7 @@ static void c_proof_include_site(CLSPContext *ctx, TSNode node) {
     if (len < 3 ||
         !((text[0] == '"' && text[len - 1] == '"') || (text[0] == '<' && text[len - 1] == '>')))
         return;
+    bool quoted = text[0] == '"';
     text[len - 1] = '\0';
     text++;
     int lo = 0, hi = ctx->include_count;
@@ -1283,10 +1306,16 @@ static void c_proof_include_site(CLSPContext *ctx, TSNode node) {
         else
             hi = mid;
     }
+    bool known = false;
     for (int i = lo; i < ctx->include_count && !strcmp(ctx->proof_includes[i].path, text); i++) {
         if (ts_node_start_byte(node) < ctx->proof_includes[i].at)
             ctx->proof_includes[i].at = ts_node_start_byte(node);
+        known |= ctx->proof_includes[i].file_qn ||
+                 (ctx->proof_includes[i].module[0] && ctx->c_decls &&
+                  cbm_c_file_facts(ctx->c_decls, ctx->proof_includes[i].module));
     }
+    if (quoted && !known)
+        c_proof_add_unknown_include(ctx, ts_node_start_byte(node));
 }
 
 static TSNode c_proof_function_name(TSNode declaration) {
@@ -1457,6 +1486,14 @@ static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, in
                     text ? cbm_arena_sprintf(ctx->arena, "$type:%s.%s", owner, text) : NULL;
                 if (qn)
                     c_proof_add_declaration(ctx, qn, ts_node_end_byte(alias));
+                /* `typedef struct {...} Name;` gives no tag of that name. */
+                if (text && !ts_node_is_null(type) &&
+                    ts_node_is_null(ts_node_child_by_field_name(type, "name", 4)) &&
+                    !ts_node_is_null(ts_node_child_by_field_name(type, "body", 4))) {
+                    const char *key = cbm_arena_sprintf(ctx->arena, "$no-tag:%s", text);
+                    if (key)
+                        c_proof_add_declaration(ctx, key, ts_node_end_byte(alias));
+                }
                 break;
             }
             alias = ts_node_child_by_field_name(alias, "declarator", 10);
@@ -1756,15 +1793,8 @@ static bool c_tu_add_closure(CLSPContext *ctx, const char *file, const cbm_resol
  * what that includer had in view ahead of the `#include` was in view for this file too. A source
  * file with includes of its own is another matter: Lua's lbaselib.c also sits in one amalgamation
  * and is compiled alone. Each hop goes up one file, and a file seen twice ends it. */
-static void c_proof_add_includer_context(CLSPContext *ctx) {
-    const char *current = c_own_file_key(ctx);
-    if (!ctx->c_decls || !current)
-        return;
-    const CBMCFileFacts *own_facts = cbm_c_file_facts(ctx->c_decls, current);
-    if (!own_facts || (own_facts->source_file && own_facts->include_count > 0))
-        return;
+static void c_proof_walk_includers(CLSPContext *ctx, const char *current) {
     const cbm_resolve_proof_t *via = NULL;
-    ctx->tu_adding_includer_context = true;
     for (uint32_t hop = 0; hop < 64; hop++) {
         const CBMCFileFacts *includer = cbm_c_sole_includer(ctx->c_decls, current);
         const char *key =
@@ -1800,6 +1830,17 @@ static void c_proof_add_includer_context(CLSPContext *ctx) {
         }
         current = key;
     }
+}
+
+static void c_proof_add_includer_context(CLSPContext *ctx) {
+    const char *current = c_own_file_key(ctx);
+    if (!ctx->c_decls || !current)
+        return;
+    const CBMCFileFacts *own_facts = cbm_c_file_facts(ctx->c_decls, current);
+    if (!own_facts || (own_facts->source_file && own_facts->include_count > 0))
+        return;
+    ctx->tu_adding_includer_context = true;
+    c_proof_walk_includers(ctx, current);
     ctx->tu_adding_includer_context = false;
 }
 
@@ -1846,6 +1887,8 @@ static void c_proof_build_translation_unit(CLSPContext *ctx) {
             facts = cbm_c_file_facts(ctx->c_decls, queue[head++]);
             if (!facts)
                 continue;
+            if (facts->has_unknown_include)
+                c_proof_add_unknown_include(ctx, include->at);
             for (int g = 0; g < facts->generated_count; g++) {
                 const char *source = facts->generated_for[g];
                 if (!c_tu_find(ctx, source, strlen(source)) && strcmp(source, own_key) &&
@@ -1943,6 +1986,9 @@ static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
               sizeof(*ctx->proof_declarations), c_proof_declaration_compare);
     c_proof_build_translation_unit(ctx);
     c_proof_add_includer_context(ctx);
+    if (ctx->proof_unknown_include_count > 1)
+        qsort(ctx->proof_unknown_includes, (size_t)ctx->proof_unknown_include_count,
+              sizeof(*ctx->proof_unknown_includes), c_proof_offset_compare);
 }
 
 static void c_proof_record_using(CLSPContext *ctx, TSNode node) {
@@ -2435,7 +2481,6 @@ typedef struct {
     const CBMCDecl **items;
     uint32_t *from; /* first byte of this file where the definition is in force */
     int count;
-    int8_t beside_function; /* c_macro_only_beside_function, once known: 0 unknown, 1 yes, -1 no */
 } CMacroDefs;
 
 /* `#if defined(REDISMODULE_CORE) / #define RedisModuleString robj / #endif`: server.h defines the
@@ -2462,7 +2507,6 @@ static bool c_macro_branch_is_off(CLSPContext *ctx, const CBMCDecl *decl) {
 }
 
 static CMacroDefs *c_macro_defs(CLSPContext *ctx, const char *name) {
-    /* Written only through a real entry: a count of zero returns before beside_function is set. */
     static CMacroDefs none = {0};
     const CBMCDeclLink *first = cbm_c_decl_lookup(ctx->c_decls, name);
     if (!first)
@@ -2522,34 +2566,46 @@ static bool c_proof_macro_visible(CLSPContext *ctx, const char *name, uint32_t a
     return false;
 }
 
-/* `#if COMPAT / #define getn(L) objlen(L) / #else / int (getn)(State *L); / #endif`: a function
- * stands in the branch beside every definition of the macro this unit sees, so the macro does not
- * decide the name. Every branch of a conditional is read, and the function's is one of them. */
-static bool c_macro_only_beside_function(CLSPContext *ctx, const char *name) {
-    CMacroDefs *defs = c_macro_defs(ctx, name);
-    if (!defs->count)
+/* `#define CALL() f()`, `#include "gen.h"` with nothing in the index behind it, then the use: that
+ * text may `#undef` and redefine CALL, so the definition read here is not shown to be the one in
+ * force. An unknown header before an unconditional definition changes nothing, since the later
+ * definition wins. Before a conditional one it may have decided the branch. Inside an included file
+ * the order is not known here, so an unknown header anywhere under the same include counts. `<...>`
+ * is the toolchain, which defines its own names. */
+static bool c_macro_definition_unproven(CLSPContext *ctx, const CBMCDecl *decl, uint32_t at) {
+    if (!ctx->proof_unknown_include_count)
         return false;
-    if (defs->beside_function)
-        return defs->beside_function > 0;
-    const CBMCDeclLink *first = cbm_c_decl_lookup(ctx->c_decls, name);
-    defs->beside_function = -1;
-    for (int i = 0; i < defs->count; i++) {
-        const CBMCDecl *macro = defs->items[i];
-        if (!macro->branch_group)
-            return false;
-        bool beside = false;
-        for (const CBMCDeclLink *link = first; link && !beside; link = link->next) {
-            const CBMCDecl *other = link->decl;
-            beside = (other->kind == CBM_C_DECL_PROTOTYPE ||
-                      other->kind == CBM_C_DECL_DEFINED_IN_BRANCH) &&
-                     other->branch_group == macro->branch_group && other->branch != macro->branch &&
-                     !strcmp(other->name, name) && !strcmp(other->file, macro->file);
+    uint32_t from = 0; /* the first offset where an unknown header could still matter */
+    if (!decl->branch_group) {
+        if (!strcmp(decl->file, c_own_file_key(ctx))) {
+            const char *key = cbm_arena_sprintf(ctx->arena, "$macro:%s", decl->name);
+            int low = 0, high = ctx->proof_declaration_count;
+            while (key && low < high) {
+                int mid = low + (high - low) / 2;
+                if (strcmp(ctx->proof_declarations[mid].qn, key) < 0)
+                    low = mid + 1;
+                else
+                    high = mid;
+            }
+            for (; key && low < ctx->proof_declaration_count &&
+                   !strcmp(ctx->proof_declarations[low].qn, key) &&
+                   ctx->proof_declarations[low].at < at;
+                 low++)
+                from = ctx->proof_declarations[low].at + 1;
+        } else {
+            const CTUModule *entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+            from = entry ? entry->at : 0;
         }
-        if (!beside)
-            return false;
     }
-    defs->beside_function = 1;
-    return true;
+    int low = 0, high = ctx->proof_unknown_include_count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (ctx->proof_unknown_includes[mid] < from)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return low < ctx->proof_unknown_include_count && ctx->proof_unknown_includes[low] < at;
 }
 
 static bool c_proof_using_visible(CLSPContext *ctx, const CProofUsing *using, uint32_t at) {
@@ -2597,7 +2653,7 @@ static cbm_resolve_result_t c_proof_name_lookup(CLSPContext *ctx, const char *te
     }
     if (cbm_scope_contains(ctx->current_scope, name))
         return c_proof_missing("c_name_shadowed");
-    if (c_proof_macro_visible(ctx, name, at) && !c_macro_only_beside_function(ctx, name))
+    if (c_proof_macro_visible(ctx, name, at))
         return c_proof_missing("c_macro_may_rewrite_name");
     cbm_resolve_result_t result = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE};
     const char *relative =
@@ -3217,8 +3273,9 @@ const CBMType *c_parse_type_node(CLSPContext *ctx, TSNode node) {
         return cbm_type_func(ctx->arena, NULL, NULL, NULL);
     }
 
-    // struct_specifier / class_specifier (inline struct/class type)
-    if (strcmp(kind, "struct_specifier") == 0 || strcmp(kind, "class_specifier") == 0) {
+    // struct_specifier / class_specifier / union_specifier (inline type)
+    if (strcmp(kind, "struct_specifier") == 0 || strcmp(kind, "class_specifier") == 0 ||
+        strcmp(kind, "union_specifier") == 0) {
         TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
         if (!ts_node_is_null(name_node)) {
             char *name = c_node_text(ctx, name_node);
@@ -5328,9 +5385,34 @@ static bool c_nested_type_in_scope(const CLSPContext *ctx, const char *scope) {
            (klass->embedded_types && klass->embedded_types[0]);
 }
 
+/* A scope named from a module of `module_len` bytes: the top level of that file, a namespace around
+ * this code, or one a visible `using namespace` brings here. */
+static bool c_scope_reached(CLSPContext *ctx, const char *written, const char *scope,
+                            size_t module_len, uint32_t at) {
+    if (!scope[module_len])
+        return true;
+    if (written[0] == ':')
+        return false;
+    const char *from = scope + module_len + 1;
+    size_t from_len = strlen(from);
+    const char *around = ctx->current_namespace;
+    if (around && ctx->module_qn && !strncmp(around, ctx->module_qn, ctx->module_qn_len) &&
+        around[ctx->module_qn_len] == '.') {
+        around += ctx->module_qn_len + 1;
+        if (!strncmp(around, from, from_len) && (!around[from_len] || around[from_len] == '.'))
+            return true;
+    }
+    for (int i = 0; i < ctx->proof_using_count; i++) {
+        const CProofUsing *using = &ctx->proof_usings[i];
+        if (using->namespace && using->supported && !strcmp(using->target, from) &&
+            c_proof_using_visible(ctx, using, at))
+            return true;
+    }
+    return false;
+}
+
 /* `ns::Name`: what the first segment means depends on where lookup starts. The declaration's scope,
- * with the written qualifier taken off, has to be a place that lookup reaches: the top level of
- * its file, a namespace around this code, or one a visible `using namespace` brings here. */
+ * with the written qualifier taken off, has to be a place that lookup reaches. */
 static bool c_qualifier_starts_here(CLSPContext *ctx, const char *written, const char *file_qn,
                                     const char *scope, uint32_t at) {
     /* `p.dir.t.hpp.__file__` is the file whose declarations are named `p.dir.t.Name`. */
@@ -5347,26 +5429,7 @@ static bool c_qualifier_starts_here(CLSPContext *ctx, const char *written, const
     file_len--;
     if (strncmp(scope, file_qn, file_len) || (scope[file_len] && scope[file_len] != '.'))
         return false;
-    if (!scope[file_len])
-        return true;
-    if (written[0] == ':')
-        return false;
-    const char *from = scope + file_len + 1;
-    size_t from_len = strlen(from);
-    const char *around = ctx->current_namespace;
-    if (around && ctx->module_qn && !strncmp(around, ctx->module_qn, ctx->module_qn_len) &&
-        around[ctx->module_qn_len] == '.') {
-        around += ctx->module_qn_len + 1;
-        if (!strncmp(around, from, from_len) && (!around[from_len] || around[from_len] == '.'))
-            return true;
-    }
-    for (int i = 0; i < ctx->proof_using_count; i++) {
-        const CProofUsing *using = &ctx->proof_usings[i];
-        if (using->namespace && using->supported && !strcmp(using->target, from) &&
-            c_proof_using_visible(ctx, using, at))
-            return true;
-    }
-    return false;
+    return c_scope_reached(ctx, written, scope, file_len, at);
 }
 
 /* Every declaration of this type name the translation unit sees. A name may be
@@ -5501,6 +5564,60 @@ static bool c_base_may_depend(CLSPContext *ctx, const char *name) {
     return ctx->in_template && name && c_name_is_declared_as(ctx, name, CBM_C_DECL_CLASS_TEMPLATE);
 }
 
+/* `struct Name` is looked up among tags, and where lookup finds none it declares a new one. So it
+ * is not a typedef of something else (`typedef struct impl Name;`), not the typedef of an unnamed
+ * aggregate (`typedef struct {...} Name;` gave no tag), and in C++ not a namesake in a namespace
+ * that lookup does not reach from here. A plain `Name` had to be declared to compile. This need
+ * not. */
+static bool c_tag_is_other_than(CLSPContext *ctx, const CBMRegisteredType *type, const char *name,
+                                bool qualified, uint32_t at) {
+    if (type->alias_of && strcmp(type->alias_of, name))
+        return true;
+    /* This file's own typedefs are known on every pass, an included file's only where facts are. */
+    const char *no_tag = cbm_arena_sprintf(ctx->arena, "$no-tag:%s", name);
+    if (no_tag && c_proof_declared(ctx, no_tag, at))
+        return true;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind == CBM_C_DECL_UNNAMED_TYPEDEF && !strcmp(decl->name, name) &&
+            c_tu_find(ctx, decl->file, strlen(decl->file)))
+            return true;
+    }
+    if (!ctx->cpp_mode || ctx->plain_header || qualified)
+        return false;
+    const char *qn = type->qualified_name;
+    const char *dot = qn ? strrchr(qn, '.') : NULL;
+    const char *scope = dot ? cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn)) : NULL;
+    if (!scope)
+        return true;
+    /* A type nested in a class passed the scope check of that class on its way here. */
+    if (cbm_registry_lookup_type(ctx->proof_registry, scope))
+        return false;
+    if (type->source_file_qn)
+        return !c_qualifier_starts_here(ctx, name, type->source_file_qn, scope, at);
+    /* The pass over one file alone has no facts, and every project type in it is this file's own.
+     */
+    size_t module_len = ctx->module_qn_len;
+    return strncmp(scope, ctx->module_qn, module_len) ||
+           (scope[module_len] && scope[module_len] != '.') ||
+           !c_scope_reached(ctx, name, scope, module_len, at);
+}
+
+/* `struct S { ... }; struct S x;` in a block: x has the block's S, whatever an outer S declares.
+ * Bound under a key of its own, because `struct config config;` is an ordinary variable that hides
+ * no tag: C keeps the two names apart. */
+static bool c_name_bound_locally(CLSPContext *ctx, const char *name);
+static const char *c_local_tag_key(CLSPContext *ctx, const char *name) {
+    return cbm_arena_sprintf(ctx->arena, "struct %s", name);
+}
+static bool c_local_tag_hides(CLSPContext *ctx, const char *name) {
+    if (!ctx->local_tag_declared || strstr(name, "::"))
+        return false;
+    const char *key = c_local_tag_key(ctx, name);
+    return key && c_name_bound_locally(ctx, key);
+}
+
 static const CBMRegisteredType *c_annotation_owner(CLSPContext *ctx, TSNode site) {
     TSNode annotation = ts_node_child_by_field_name(site, "type", 4);
     if (ts_node_is_null(annotation)) {
@@ -5508,6 +5625,7 @@ static const CBMRegisteredType *c_annotation_owner(CLSPContext *ctx, TSNode site
         if (!ts_node_is_null(declaration))
             annotation = ts_node_child_by_field_name(declaration, "type", 4);
     }
+    bool elaborated = false;
     for (int depth = 0; depth < 8 && !ts_node_is_null(annotation); depth++) {
         const char *kind = ts_node_type(annotation);
         if (!strcmp(kind, "type_descriptor")) {
@@ -5516,6 +5634,7 @@ static const CBMRegisteredType *c_annotation_owner(CLSPContext *ctx, TSNode site
         }
         if (!strcmp(kind, "struct_specifier") || !strcmp(kind, "union_specifier") ||
             !strcmp(kind, "class_specifier")) {
+            elaborated = true;
             annotation = ts_node_child_by_field_name(annotation, "name", 4);
             continue;
         }
@@ -5558,8 +5677,15 @@ static const CBMRegisteredType *c_annotation_owner(CLSPContext *ctx, TSNode site
                     return NULL;
             }
         }
-        return c_proof_follow_alias(
-            ctx, c_proof_type_by_name(ctx, name, ts_node_start_byte(annotation)));
+        if (c_local_tag_hides(ctx, name))
+            return NULL;
+        uint32_t at = ts_node_start_byte(annotation);
+        const CBMRegisteredType *named = c_proof_type_by_name(ctx, name, at);
+        /* That tag says nothing about the type its namesake is. */
+        if (elaborated && named &&
+            c_tag_is_other_than(ctx, named, name, strstr(name, "::") != NULL, at))
+            return NULL;
+        return c_proof_follow_alias(ctx, named);
     }
     return NULL;
 }
@@ -7376,6 +7502,67 @@ static const CBMRegisteredType *c_proof_written_cast(CLSPContext *ctx, TSNode si
     return owner;
 }
 
+static uint32_t c_macro_use_arguments(TSNode call, TSNode *out, uint32_t cap);
+
+/* `hl_table[i].x` with `#define hl_table ((HlGroup *)(ga.ga_data))`, `SDS_HDR(8, s)->len` with
+ * `#define SDS_HDR(T, s) ((struct sdshdr##T *)...)`: whatever the operand is, the replacement
+ * writes the type. Every definition in force has to write the same one. */
+static const CBMRegisteredType *c_macro_cast_owner(CLSPContext *ctx, const char *macro, TSNode site,
+                                                   TSNode call, const cbm_resolve_proof_t **proof,
+                                                   const CBMType **shape) {
+    uint32_t at = ts_node_start_byte(site);
+    if (!ctx->c_decls || !macro || c_name_bound_locally(ctx, macro) ||
+        !c_proof_macro_visible(ctx, macro, at))
+        return NULL;
+    const CMacroDefs *defs = c_macro_defs(ctx, macro);
+    const char *own = c_own_file_key(ctx);
+    const CBMCMacroShape *agreed = NULL;
+    for (int d = 0; d < defs->count; d++) {
+        const CBMCDecl *decl = defs->items[d];
+        if (defs->from[d] >= at && strcmp(decl->file, own))
+            continue;
+        const CBMCMacroShape *written = decl->macro;
+        if (c_macro_definition_unproven(ctx, decl, at) || !written || !written->cast_type ||
+            written->object_like != ts_node_is_null(call))
+            return NULL;
+        if (agreed && (strcmp(agreed->cast_type, written->cast_type) ||
+                       agreed->cast_pointers != written->cast_pointers ||
+                       agreed->cast_pastes != written->cast_pastes ||
+                       agreed->cast_param != written->cast_param))
+            return NULL;
+        agreed = written;
+    }
+    if (!agreed)
+        return NULL;
+    const char *name = agreed->cast_type;
+    if (agreed->cast_pastes) {
+        TSNode arguments[32];
+        uint32_t count = c_macro_use_arguments(call, arguments, 32);
+        const char *argument =
+            agreed->cast_param < count ? c_node_text(ctx, arguments[agreed->cast_param]) : NULL;
+        for (const char *c = argument; c && *c; c++)
+            if (!isalnum((unsigned char)*c) && *c != '_')
+                argument = NULL;
+        name = argument ? cbm_arena_sprintf(ctx->arena, "%s%s", name, argument) : NULL;
+    }
+    const CBMRegisteredType *owner = name ? c_proof_named_class(ctx, name, at) : NULL;
+    if (!owner)
+        return NULL;
+    cbm_resolve_result_t typed = cbm_lsp_proof_type_lookup(
+        &ctx->field_types, macro, site, "c-macro-replacement-cast", owner->qualified_name,
+        owner->declaration_identity, owner->graph_qualified_name, owner->source_flags,
+        "cast-written-in-the-replacement");
+    typed = c_proof_type_import(ctx, owner->qualified_name, at, typed);
+    if (!cbm_resolve_admit(&typed))
+        return NULL;
+    const CBMType *type = cbm_type_named(ctx->arena, owner->qualified_name);
+    for (int i = 0; i < agreed->cast_pointers; i++)
+        type = cbm_type_pointer(ctx->arena, type);
+    *proof = typed.proof;
+    *shape = type;
+    return owner;
+}
+
 /* The struct an expression denotes, as the written declarations along it establish
  * it: a typed name, an extern object, a member of a known struct, or any of those
  * under `*`, `&`, `[]` and parentheses. No initializer is consulted and nothing
@@ -7390,6 +7577,20 @@ static const CBMRegisteredType *c_proof_expression_owner(CLSPContext *ctx, TSNod
     uint32_t at = ts_node_start_byte(node);
     if (!strcmp(kind, "parenthesized_expression") && ts_node_named_child_count(node) == 1)
         return c_proof_expression_owner(ctx, ts_node_named_child(node, 0), depth + 1, proof, shape);
+    if (!strcmp(kind, "identifier")) {
+        const CBMRegisteredType *cast =
+            c_macro_cast_owner(ctx, c_node_text(ctx, node), node, (TSNode){0}, proof, shape);
+        if (cast)
+            return cast;
+    } else if (!strcmp(kind, "call_expression")) {
+        TSNode callee = ts_node_child_by_field_name(node, "function", 8);
+        const CBMRegisteredType *cast =
+            !ts_node_is_null(callee) && !strcmp(ts_node_type(callee), "identifier")
+                ? c_macro_cast_owner(ctx, c_node_text(ctx, callee), node, node, proof, shape)
+                : NULL;
+        if (cast)
+            return cast;
+    }
     if (!strcmp(kind, "subscript_expression") || !strcmp(kind, "pointer_expression")) {
         const CBMRegisteredType *base = c_proof_expression_owner(
             ctx, ts_node_child_by_field_name(node, "argument", 8), depth + 1, proof, shape);
@@ -7558,6 +7759,8 @@ static bool c_field_is_macro_path(CLSPContext *ctx, TSNode argument, TSNode fiel
         const CBMCDecl *decl = defs->items[d];
         if (defs->from[d] >= at && strcmp(decl->file, own))
             continue;
+        if (c_macro_definition_unproven(ctx, decl, at))
+            return true;
         const char *written = decl->macro ? decl->macro->field_path : NULL;
         if (!written || (path && strcmp(path, written)))
             return false;
@@ -8146,41 +8349,89 @@ static int c_macro_parameter(const CBMCMacroShape *shape, int position) {
     return shape->variadic ? shape->param_count - 1 : -1;
 }
 
+/* A macro may hand an argument on several times, to macros that do the same, so following every
+ * hand-off doubles with each hop. A walk reads each (macro, position) once. Meeting one again adds
+ * nothing: its answer is already part of this one, and a macro is not expanded again inside its
+ * own expansion. */
+typedef struct {
+    const char *macro;
+    int position;
+} CMacroArgument;
+
+static const char *c_macro_argument_key(CLSPContext *ctx, const char *macro, int position) {
+    return cbm_arena_sprintf(ctx->arena, "%d#%s", position, macro);
+}
+
 /* Does this written name, as argument `position` of the macro, reach the expansion as itself in
  * every definition the unit sees? The name then means what it means at the use, because
  * substitution puts it there. A definition that pastes it, reads it as a member, declares it or
- * declares a local of that name says otherwise, and so does one this does not understand. */
+ * declares a local of that name says otherwise, and so does one this does not understand. One
+ * definition's answer does not depend on another's, so the order of the walk cannot change this. */
 static bool c_macro_argument_is_plain(CLSPContext *ctx, const char *macro, int position,
-                                      const char *written, uint32_t at, int depth) {
-    if (depth > 16)
-        return false;
-    bool seen = false;
-    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, macro); link;
-         link = link->next) {
-        const CBMCDecl *decl = link->decl;
-        if (decl->kind != CBM_C_DECL_MACRO || strcmp(decl->name, macro) ||
-            !c_macro_definition_visible(ctx, decl, at))
-            continue;
-        seen = true;
-        const CBMCMacroShape *shape = decl->macro;
-        int param = shape ? c_macro_parameter(shape, position) : -1;
-        if (param < 0 || !(shape->plain & (1u << param)))
-            return false;
-        for (int i = 0; i < shape->local_count; i++)
-            if (!strcmp(shape->locals[i], written))
-                return false;
-        for (int i = 0; i < shape->handoff_count; i++) {
-            const CBMCMacroHandoff *handoff = &shape->handoffs[i];
-            if (handoff->param != param || !c_proof_macro_visible(ctx, handoff->callee, at))
+                                      const char *written, uint32_t at) {
+    CMacroArgument top = {macro, position};
+    CMacroArgument *stack = &top;
+    int count = 1, cap = 1;
+    CBMHashTable *seen = NULL;
+    bool plain = true;
+    while (plain && count) {
+        CMacroArgument use = stack[--count];
+        bool defined = false;
+        for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, use.macro); link && plain;
+             link = link->next) {
+            const CBMCDecl *decl = link->decl;
+            if (decl->kind != CBM_C_DECL_MACRO || strcmp(decl->name, use.macro) ||
+                !c_macro_definition_visible(ctx, decl, at))
                 continue;
-            /* `__VA_ARGS__` handed on stands for several arguments at several positions. */
-            if ((shape->variadic && param == shape->param_count - 1) ||
-                !c_macro_argument_is_plain(ctx, handoff->callee, handoff->position, written, at,
-                                           depth + 1))
-                return false;
+            CBM_LSP_WORK(1);
+            defined = true;
+            const CBMCMacroShape *shape = decl->macro;
+            int param = shape ? c_macro_parameter(shape, use.position) : -1;
+            if (param < 0 || !(shape->plain & (1u << param))) {
+                plain = false;
+                break;
+            }
+            for (int i = 0; plain && i < shape->local_count; i++)
+                plain = strcmp(shape->locals[i], written) != 0;
+            for (int i = 0; plain && i < shape->handoff_count; i++) {
+                const CBMCMacroHandoff *handoff = &shape->handoffs[i];
+                if (handoff->param != param || !c_proof_macro_visible(ctx, handoff->callee, at))
+                    continue;
+                /* `__VA_ARGS__` handed on stands for several arguments at several positions. */
+                if (shape->variadic && param == shape->param_count - 1) {
+                    plain = false;
+                    break;
+                }
+                const char *key = c_macro_argument_key(ctx, handoff->callee, handoff->position);
+                if (!seen)
+                    seen = cbm_ht_create(8);
+                if (!key || !seen) {
+                    plain = false;
+                    break;
+                }
+                if (cbm_ht_get(seen, key))
+                    continue;
+                cbm_ht_set(seen, key, (void *)key);
+                if (count == cap) {
+                    int grown = cap * 2 + 6;
+                    CMacroArgument *next =
+                        cbm_arena_alloc(ctx->arena, (size_t)grown * sizeof(*next));
+                    if (!next) {
+                        plain = false;
+                        break;
+                    }
+                    memcpy(next, stack, (size_t)count * sizeof(*next));
+                    stack = next;
+                    cap = grown;
+                }
+                stack[count++] = (CMacroArgument){handoff->callee, handoff->position};
+            }
         }
+        plain = plain && defined;
     }
-    return seen;
+    if (seen)
+        cbm_ht_free(seen);
+    return plain;
 }
 
 static void c_macro_args_load(CLSPContext *ctx, TSNode list) {
@@ -8211,7 +8462,7 @@ static void c_macro_args_load(CLSPContext *ctx, TSNode list) {
                 continue;
             if (!strcmp(ts_node_type(argument), "identifier")) {
                 const char *written = c_node_text(ctx, argument);
-                if (written && c_macro_argument_is_plain(ctx, name, position, written, at, 0))
+                if (written && c_macro_argument_is_plain(ctx, name, position, written, at))
                     plain[count++] = ts_node_start_byte(argument);
             }
             position++;
@@ -8302,9 +8553,47 @@ static bool c_bare_argument_of_macro(CLSPContext *ctx, TSNode node) {
  * variable in every definition the unit sees, directly or by handing it to a macro that does:
  * `#define FOR_ALL_TABS(tp) for (tabpage_T *(tp) = first_tabpage; ...)`. */
 static const char *c_macro_declared_type(CLSPContext *ctx, const char *macro, int position,
-                                         uint32_t at, int depth, int *pointers) {
-    if (depth > 16)
+                                         uint32_t at, int depth, int *pointers,
+                                         CBMHashTable **answers);
+
+typedef struct {
+    const char *type;
+    int pointers;
+} CMacroDeclared;
+
+/* What the macro a hand-off reaches declares, read once per walk. Reached again while being read,
+ * in a cycle, the answer is still none: a macro is not expanded inside its own expansion. The depth
+ * only keeps a hostile chain off the stack: going to it from 16 changed no edge in redis, neovim,
+ * or the LLVM and kernel subtrees measured. */
+#define C_MACRO_HANDOFF_MAX_DEPTH 64
+static const char *c_macro_handed_type(CLSPContext *ctx, const CBMCMacroHandoff *handoff,
+                                       uint32_t at, int depth, int *pointers,
+                                       CBMHashTable **answers) {
+    if (depth > C_MACRO_HANDOFF_MAX_DEPTH)
         return NULL;
+    const char *key = c_macro_argument_key(ctx, handoff->callee, handoff->position);
+    if (!*answers)
+        *answers = cbm_ht_create(8);
+    CMacroDeclared *answer = key && *answers ? cbm_ht_get(*answers, key) : NULL;
+    if (answer) {
+        *pointers = answer->pointers;
+        return answer->type;
+    }
+    answer = key && *answers ? cbm_arena_alloc(ctx->arena, sizeof(*answer)) : NULL;
+    if (!answer)
+        return NULL;
+    *answer = (CMacroDeclared){0};
+    cbm_ht_set(*answers, key, answer);
+    const char *type = c_macro_declared_type(ctx, handoff->callee, handoff->position, at, depth,
+                                             pointers, answers);
+    answer->type = type;
+    answer->pointers = *pointers;
+    return type;
+}
+
+static const char *c_macro_declared_type(CLSPContext *ctx, const char *macro, int position,
+                                         uint32_t at, int depth, int *pointers,
+                                         CBMHashTable **answers) {
     const char *found = NULL;
     for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, macro); link;
          link = link->next) {
@@ -8312,6 +8601,9 @@ static const char *c_macro_declared_type(CLSPContext *ctx, const char *macro, in
         if (decl->kind != CBM_C_DECL_MACRO || strcmp(decl->name, macro) ||
             !c_macro_definition_visible(ctx, decl, at))
             continue;
+        CBM_LSP_WORK(1);
+        if (c_macro_definition_unproven(ctx, decl, at))
+            return NULL;
         const CBMCMacroShape *shape = decl->macro;
         int param = shape ? c_macro_parameter(shape, position) : -1;
         if (param < 0)
@@ -8325,8 +8617,7 @@ static const char *c_macro_declared_type(CLSPContext *ctx, const char *macro, in
             for (int i = 0; i < shape->handoff_count && !type; i++) {
                 const CBMCMacroHandoff *handoff = &shape->handoffs[i];
                 if (handoff->param == param && c_proof_macro_visible(ctx, handoff->callee, at))
-                    type = c_macro_declared_type(ctx, handoff->callee, handoff->position, at,
-                                                 depth + 1, &depth_found);
+                    type = c_macro_handed_type(ctx, handoff, at, depth + 1, &depth_found, answers);
             }
         }
         if (!type || (found && (strcmp(found, type) || *pointers != depth_found)))
@@ -8343,9 +8634,13 @@ static void c_bind_macro_declared(CLSPContext *ctx, const char *macro, int posit
     uint32_t at = ts_node_start_byte(name);
     const char *written = c_node_text(ctx, name);
     int pointers = 0;
-    const char *type_name = written && ctx->c_decls && c_proof_macro_visible(ctx, macro, at)
-                                ? c_macro_declared_type(ctx, macro, position, at, 0, &pointers)
-                                : NULL;
+    CBMHashTable *answers = NULL;
+    const char *type_name =
+        written && ctx->c_decls && c_proof_macro_visible(ctx, macro, at)
+            ? c_macro_declared_type(ctx, macro, position, at, 0, &pointers, &answers)
+            : NULL;
+    if (answers)
+        cbm_ht_free(answers);
     if (!type_name)
         return;
     const CBMRegisteredType *owner =
@@ -8518,7 +8813,7 @@ static bool c_macro_word_only_handed_on(CLSPContext *ctx, const CBMCMacroShape *
         if (strcmp(argument->name, name))
             continue;
         if (c_proof_macro_visible(ctx, argument->callee, at)) {
-            if (!c_macro_argument_is_plain(ctx, argument->callee, argument->position, name, at, 0))
+            if (!c_macro_argument_is_plain(ctx, argument->callee, argument->position, name, at))
                 return true;
             continue;
         }
@@ -8599,8 +8894,8 @@ static void c_macro_body_expand(CLSPContext *ctx, CMacroWalk *walk, const char *
         in_force[d] = defs->from[d] < at || !strcmp(decl->file, own);
         if (!in_force[d])
             continue;
-        /* A definition this cannot read may say anything. */
-        if (!decl->macro)
+        /* A definition this cannot read may say anything, and so may a header it cannot read. */
+        if (!decl->macro || c_macro_definition_unproven(ctx, decl, at))
             return;
         first = first ? first : decl->macro;
         visible++;
@@ -8626,9 +8921,6 @@ static void c_macro_body_expand(CLSPContext *ctx, CMacroWalk *walk, const char *
             continue;
         if (c_proof_macro_visible(ctx, name, at)) {
             c_macro_walk_push(ctx, walk, name);
-            /* Lua: `#define error(S,s)` in one branch and `static void error(...)` in the other. */
-            if (c_macro_only_beside_function(ctx, name))
-                c_macro_body_name(ctx, walk, name, true);
         } else {
             c_macro_body_name(ctx, walk, name, true);
         }
@@ -8748,10 +9040,25 @@ static bool c_is_sizeof_operand(TSNode node) {
 }
 
 static void c_emit_value_reference(CLSPContext *ctx, TSNode node) {
-    if (!ctx->c_decls || !ctx->enclosing_func_qn || c_bare_argument_of_macro(ctx, node))
+    if (!ctx->c_decls || !ctx->enclosing_func_qn)
         return;
     TSNode parent = ts_node_parent(node);
     const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    /* `container_of(p, struct X, m)`: no grammar has a type among call arguments, and the keyword
+     * lands in an error just before the name. That name is a tag and no value. */
+    if (!strcmp(parent_kind, "argument_list") && ts_node_has_error(parent)) {
+        TSNode before = ts_node_prev_sibling(node);
+        const char *keyword = !ts_node_is_null(before) && !strcmp(ts_node_type(before), "ERROR")
+                                  ? c_node_text(ctx, before)
+                                  : NULL;
+        if (keyword &&
+            (!strcmp(keyword, "struct") || !strcmp(keyword, "union") || !strcmp(keyword, "enum"))) {
+            c_emit_type_reference(ctx, node);
+            return;
+        }
+    }
+    if (c_bare_argument_of_macro(ctx, node))
+        return;
     if (!strcmp(parent_kind, "qualified_identifier")) {
         c_emit_scoped_enumerator(ctx, parent, node);
         return;
@@ -8845,18 +9152,31 @@ static void c_emit_value_reference(CLSPContext *ctx, TSNode node) {
 }
 
 /* A function can declare its own `enum { LIMIT = 8 }` or `struct node { ... }`. Those
- * names are in block scope and hide any file-scope namesake from here on. */
+ * names are in block scope and hide any file-scope namesake from here on. A lone `struct node;`
+ * does the same: it declares a new tag here, where `struct node *p;` would use the outer one. */
 static void c_bind_local_tag_and_enumerators(CLSPContext *ctx, TSNode node, const char *kind) {
     if (strcmp(kind, "struct_specifier") && strcmp(kind, "union_specifier") &&
-        strcmp(kind, "enum_specifier"))
+        strcmp(kind, "enum_specifier") && strcmp(kind, "class_specifier"))
         return;
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
-    if (ts_node_is_null(body))
-        return;
+    if (ts_node_is_null(body)) {
+        TSNode parent = ts_node_parent(node);
+        const char *around = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        if (strcmp(around, "compound_statement") &&
+            (strcmp(around, "declaration") ||
+             !ts_node_is_null(ts_node_child_by_field_name(parent, "declarator", 10))))
+            return;
+    }
     TSNode tag = ts_node_child_by_field_name(node, "name", 4);
     const char *tag_name = ts_node_is_null(tag) ? NULL : c_node_text(ctx, tag);
-    if (tag_name)
+    if (tag_name) {
         c_scope_bind(ctx, tag_name, cbm_type_unknown());
+        const char *tag_key = c_local_tag_key(ctx, tag_name);
+        if (tag_key) {
+            c_scope_bind(ctx, tag_key, cbm_type_unknown());
+            ctx->local_tag_declared = true;
+        }
+    }
     if (strcmp(kind, "enum_specifier"))
         return;
     uint32_t count = ts_node_named_child_count(body);
@@ -8946,13 +9266,18 @@ static void c_emit_type_reference(CLSPContext *ctx, TSNode node) {
         return;
     }
     /* `struct node {...}` defines a tag here rather than using one. */
-    if ((!strcmp(parent_kind, "struct_specifier") || !strcmp(parent_kind, "union_specifier") ||
-         !strcmp(parent_kind, "enum_specifier")) &&
-        !ts_node_is_null(ts_node_child_by_field_name(parent, "body", 4)))
+    bool in_specifier =
+        !strcmp(parent_kind, "struct_specifier") || !strcmp(parent_kind, "union_specifier") ||
+        !strcmp(parent_kind, "class_specifier") || !strcmp(parent_kind, "enum_specifier");
+    if (in_specifier && !ts_node_is_null(ts_node_child_by_field_name(parent, "body", 4)))
         return;
+    /* `struct X` and `container_of(p, struct X, m)` ask among tags, which a variable named X does
+     * not hide. */
+    bool is_tag = in_specifier || !strcmp(parent_kind, "argument_list");
     const char *name = c_node_text(ctx, node);
     if (!name || !ctx->module_qn ||
-        (!qualified && (c_is_template_parameter(ctx, name) || c_name_bound_locally(ctx, name))))
+        (!qualified && (c_is_template_parameter(ctx, name) ||
+                        (is_tag ? c_local_tag_hides(ctx, name) : c_name_bound_locally(ctx, name)))))
         return;
     /* `#define sds hisds`, `#define RedisModuleString robj`: the type is what the macro names. */
     if (!qualified && c_proof_macro_visible(ctx, name, ts_node_start_byte(node))) {
@@ -8961,6 +9286,9 @@ static void c_emit_type_reference(CLSPContext *ctx, TSNode node) {
     }
     uint32_t at = ts_node_start_byte(node);
     const CBMRegisteredType *type = c_proof_type_by_name(ctx, qualified ? qualified : name, at);
+    /* A tag, which may not be the type found for that spelling. */
+    if (type && is_tag && c_tag_is_other_than(ctx, type, name, qualified != NULL, at))
+        return;
     /* A member type of the class around this code hides a namesake outside the class. */
     if (type && !qualified && ctx->cpp_mode && c_enclosing_class_declares_other(ctx, name, type))
         return;
@@ -10600,7 +10928,8 @@ static void c_process_body_child(CLSPContext *ctx, TSNode child) {
         c_process_function(ctx, child);
     } else if (strcmp(ck, "namespace_definition") == 0) {
         c_process_namespace(ctx, child);
-    } else if (strcmp(ck, "class_specifier") == 0 || strcmp(ck, "struct_specifier") == 0) {
+    } else if (strcmp(ck, "class_specifier") == 0 || strcmp(ck, "struct_specifier") == 0 ||
+               strcmp(ck, "union_specifier") == 0) {
         c_process_class(ctx, child);
     } else if (strcmp(ck, "declaration") == 0) {
         // declaration may contain class/struct specifier: class Foo { ... };
@@ -10610,7 +10939,8 @@ static void c_process_body_child(CLSPContext *ctx, TSNode child) {
         for (uint32_t di = 0; di < dnc; di++) {
             TSNode dch = ts_node_named_child(child, di);
             const char *dk = ts_node_type(dch);
-            if (strcmp(dk, "class_specifier") == 0 || strcmp(dk, "struct_specifier") == 0) {
+            if (strcmp(dk, "class_specifier") == 0 || strcmp(dk, "struct_specifier") == 0 ||
+                strcmp(dk, "union_specifier") == 0) {
                 c_process_class(ctx, dch);
                 has_class = true;
             }
