@@ -1684,8 +1684,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      are preserved and dotted-name collisions are disambiguated before section
  *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
  *      and diagram owners agree.
+ *  13: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *      / route.js under app/ or src/app/ exports, carries the route_path its
+ *      directories name and HANDLES its Route (extract_nextjs.c). An index
+ *      built before has none of these Routes for its unchanged route files,
+ *      so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
