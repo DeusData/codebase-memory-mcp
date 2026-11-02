@@ -10,6 +10,9 @@ name: FreeBSD build (informational)
 
 on:
   workflow_dispatch:
+  # TEMPORARY - drop before merge: one proof run on the distill branch only.
+  push:
+    branches: [ci/freebsd-dispatch-workflow]
 
 permissions:
   contents: read
