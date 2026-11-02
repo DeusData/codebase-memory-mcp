@@ -210,6 +210,12 @@ bool cbm_resolve_binding_jsx_occurrence(const cbm_resolve_binding_index_t *index
  * and the selected declaration are the adapter's, and each is recorded. */
 /* An index that only attests adapter sites, for a language that also has its own
  * binding index whose completeness must not be claimed by those sites. */
+/* True when the same build without the manifest's declaration would differ, because
+ * nothing else makes this script a module. */
+bool cbm_resolve_binding_needs_declared_module(const cbm_resolve_binding_index_t *index);
+/* The caller's source bytes may go away. Queries never read them: they end with the build. */
+void cbm_resolve_binding_release_source(cbm_resolve_binding_index_t *index);
+
 cbm_resolve_binding_index_t *cbm_resolve_binding_source_index(CBMArena *arena,
                                                               const CBMFileResult *result,
                                                               CBMLanguage language,

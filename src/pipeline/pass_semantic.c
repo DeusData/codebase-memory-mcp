@@ -1,6 +1,8 @@
 #include "resolve/stats.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/binding_cache.h"
+#include "pipeline/parse_batch.h"
 /*
  * pass_semantic.c — Semantic edge passes: INHERITS, DECORATES, IMPLEMENTS.
  *
@@ -43,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "resolve/syntax_index.h"
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
  * (Java/Go package). MUST match cbm_lang_module_is_dir()
@@ -1025,12 +1028,16 @@ static bool semantic_source_facts(cbm_semantic_bindings_t *bindings, cbm_pipelin
     view.cached_lang = info->language;
     CBMArena temporary;
     cbm_arena_init(&temporary);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     cbm_resolve_binding_index_t *index = NULL;
     TSNode root = ts_tree_root_node(tree);
     file->has_imports = result->imports.count != 0;
     if (semantic_ecma(info->language)) {
-        index =
-            cbm_resolve_binding_build(&temporary, &view, info->language, source, (size_t)length);
+        index = cbm_binding_cache_get(ctx->binding_cache, info, result, false);
+        if (!index)
+            index = cbm_resolve_binding_build(&temporary, &view, info->language, source,
+                                              (size_t)length);
         ok = index && semantic_imports(bindings, ctx, file, info, result, index);
     } else if (info->language == CBM_LANG_KOTLIN) {
         TSNode header = semantic_child(root, "package_header");
@@ -1050,6 +1057,7 @@ static bool semantic_source_facts(cbm_semantic_bindings_t *bindings, cbm_pipelin
     else if (ok)
         ok = semantic_class_facts(bindings, ctx, file, info, result, source, length, root, index,
                                   &temporary);
+    cbm_syntax_index_end(&syntax);
     cbm_arena_destroy(&temporary);
 done:
     if (owned_tree)
@@ -1065,6 +1073,13 @@ static void semantic_check_domain(const cbm_gbuf_node_t *node, void *userdata) {
         bindings->kotlin_complete = false;
         bindings->csharp_complete = false;
     }
+}
+
+static cbm_parse_mode_t semantic_parse_mode(CBMLanguage language) {
+    return language == CBM_LANG_KOTLIN || language == CBM_LANG_PHP || semantic_ecma(language) ||
+                   semantic_typed_language(language)
+               ? CBM_PARSE_TERMINATED
+               : CBM_PARSE_NONE;
 }
 
 cbm_semantic_bindings_t *cbm_semantic_bindings_build(cbm_pipeline_ctx_t *ctx,
@@ -1091,30 +1106,41 @@ cbm_semantic_bindings_t *cbm_semantic_bindings_build(cbm_pipeline_ctx_t *ctx,
         goto failed;
     if (!relevant)
         return bindings;
+    cbm_parse_batch_t *parses = cbm_parse_batch_new(ctx, files, count, cache, semantic_parse_mode);
     for (int i = 0; i < count; i++) {
+        cbm_parse_batch_at(parses, i);
         if (!have_census && files[i].language != CBM_LANG_PHP &&
             !semantic_ecma(files[i].language) && !semantic_typed_language(files[i].language))
             continue;
         semantic_source_t *file = cbm_arena_calloc(&bindings->arena, sizeof(*file));
         const char *key = cbm_arena_strdup(&bindings->arena, files[i].rel_path);
-        if (!file || !key || cbm_ht_has(bindings->files, key))
+        if (!file || !key || cbm_ht_has(bindings->files, key)) {
+            cbm_parse_batch_free(parses);
             goto failed;
+        }
         file->language = files[i].language;
-        if (!semantic_put(bindings->files, key, file))
+        if (!semantic_put(bindings->files, key, file)) {
+            cbm_parse_batch_free(parses);
             goto failed;
+        }
         if (file->language != CBM_LANG_KOTLIN && file->language != CBM_LANG_PHP &&
             !semantic_ecma(file->language) && !semantic_typed_language(file->language))
             continue;
         file->imports = cbm_ht_create(0);
-        if (!file->imports)
+        if (!file->imports) {
+            cbm_parse_batch_free(parses);
             goto failed;
+        }
         bool loaded = false;
         CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
         bool ok = semantic_source_facts(bindings, ctx, file, &files[i], result);
         cbm_pipeline_result_release(result, loaded);
-        if (!ok)
+        if (!ok) {
+            cbm_parse_batch_free(parses);
             goto failed;
+        }
     }
+    cbm_parse_batch_free(parses);
     if (have_census)
         cbm_gbuf_foreach_node(ctx->gbuf, semantic_check_domain, bindings);
     return bindings;

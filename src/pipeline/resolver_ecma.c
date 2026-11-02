@@ -1,6 +1,7 @@
 #include "pipeline/resolver_ecma.h"
 
 #include "foundation/hash_table.h"
+#include "pipeline/binding_cache.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/shared_resolver.h"
 #include "resolve/policy.h"
@@ -220,6 +221,18 @@ cbm_ecma_table_t *cbm_ecma_surfaces_build(const cbm_pipeline_ctx_t *ctx,
         CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, f, NULL, &loaded);
         if (!result)
             continue;
+        const cbm_resolve_binding_index_t *cached =
+            cbm_binding_cache_get(ctx->binding_cache, &files[f], result, true);
+        if (cached) {
+            bool added =
+                cbm_ecma_table_add(table, ctx, files[f].rel_path, result->module_qn, cached, NULL);
+            cbm_pipeline_result_release(result, loaded);
+            if (!added) {
+                cbm_ecma_surfaces_free(table);
+                return NULL;
+            }
+            continue;
+        }
         size_t length = result->source_len > 0 ? (size_t)result->source_len : 0;
         char *owned =
             result->source ? NULL : cbm_shared_resolver_load_source(files[f].path, &length);

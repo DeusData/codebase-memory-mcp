@@ -455,6 +455,12 @@ typedef struct {
     cbm_shared_resolver_t *shared_resolver;
     /* ECMAScript export surfaces, ready before the cross-file type pass. */
     struct cbm_ecma_table *ecma_surfaces;
+    /* Binding indexes for the single-threaded preparation passes; see binding_cache.h. */
+    struct cbm_binding_cache *binding_cache;
+    /* Threads a preparation pass may use for pure per-file work; see parse_batch.h. */
+    int prepare_workers;
+    /* What this run's go.mod and go.work files say; see cbm_go_module_memo_new. */
+    struct cbm_go_module_memo *go_module_memo;
     /* Immutable Rust name model, sealed before import edges are projected. */
     struct cbm_rust_project *rust_project;
     cbm_resolve_stats_t *resolver_stats; /* run-owned; workers borrow until join */

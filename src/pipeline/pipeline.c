@@ -20,6 +20,8 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/binding_cache.h"
+#include "pipeline/import_resolve.h"
 #include "foundation/fast_format.h"
 #include "store/store_resolver_evidence.h"
 #include "pipeline/doc_links.h"
@@ -3303,9 +3305,33 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 }
 
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */
+static int run_parallel_pipeline_body(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                      const cbm_file_info_t *files, int file_count,
+                                      int worker_count, struct timespec *t);
+
 static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                  const cbm_file_info_t *files, int file_count, int worker_count,
                                  struct timespec *t) {
+    ctx->go_module_memo = cbm_go_module_memo_new();
+    int rc = run_parallel_pipeline_body(p, ctx, files, file_count, worker_count, t);
+    cbm_go_module_memo_free(ctx->go_module_memo);
+    ctx->go_module_memo = NULL;
+    return rc;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Preparation builds its own indexes and parses, as it would with no cache to read. */
+bool cbm_pipeline_test_prepare_on_one_thread;
+#endif
+
+static int run_parallel_pipeline_body(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                      const cbm_file_info_t *files, int file_count,
+                                      int worker_count, struct timespec *t) {
+    ctx->prepare_workers = worker_count;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_pipeline_test_prepare_on_one_thread)
+        ctx->prepare_workers = 0;
+#endif
     cbm_log_info("pipeline.mode", "mode", "parallel", "workers", itoa_buf(worker_count), "files",
                  itoa_buf(file_count));
     _Atomic int64_t shared_ids;
@@ -3395,6 +3421,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * disk by now); the per-language cross registries share it. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
+    ctx->binding_cache =
+        cbm_binding_cache_build(ctx, files, file_count, cache, ctx->prepare_workers);
     CBM_PROF_START(t_collect_defs);
     if (run_cross_lsp) {
         ctx->ecma_surfaces = cbm_ecma_surfaces_build(ctx, files, file_count, cache);
@@ -3502,6 +3530,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
     if (rc == 0 && !cbm_gbuf_resolutions_own_shared(ctx->gbuf))
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    cbm_binding_cache_free(ctx->binding_cache);
+    ctx->binding_cache = NULL;
     cbm_shared_resolver_free(ctx->shared_resolver);
     ctx->shared_resolver = NULL;
     cbm_ecma_surfaces_free(ctx->ecma_surfaces);

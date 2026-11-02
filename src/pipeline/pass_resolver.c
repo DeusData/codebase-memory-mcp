@@ -9,6 +9,9 @@
 #include "pipeline/import_resolve.h"
 #include "pipeline/resolver_ecma.h"
 #include "pipeline/shared_resolver.h"
+#include "pipeline/binding_cache.h"
+#include "foundation/fast_format.h"
+#include "pipeline/parse_batch.h"
 #include "resolve/binding.h"
 #include "resolve/lookup.h"
 #include "resolve/policy.h"
@@ -83,8 +86,11 @@ typedef struct {
     uint32_t start_line, end_line, second_start_line, second_end_line;
     unsigned declarations;
     conditional_owner_t *conditional;
-    /* Other files declaring this QN (Go build-tag twins, C declaration headers). */
+    /* Other files declaring this QN (Go build-tag twins, C declaration headers, the builtins
+     * every Python file declares). A long list is also kept sorted, to ask about one file. */
     target_file_t *other_files;
+    const char **other_sorted;
+    int other_count;
     bool ambiguous;
     /* Java/Kotlin/C# overloads of one owner share a qualified name, and the
      * graph keeps them as one node. That node faithfully names all of them. */
@@ -189,6 +195,7 @@ typedef struct {
 } http_import_site_t;
 
 struct cbm_shared_resolver {
+    const char *target_file_latest; /* add_target's copy of the file it is on */
     CBMArena arena;
     CBMHashTable *exports;
     CBMHashTable *targets;
@@ -342,7 +349,7 @@ static const CBMFileResult *owner_source_view(const CBMFileResult *result, CBMLa
         return result;
     TSParser *parser = ts_parser_new();
     if (parser && ts_parser_set_language(parser, cbm_ts_language(language)))
-        *owned = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+        *owned = cbm_parse_plain(parser, source, (uint32_t)length);
     if (parser)
         ts_parser_delete(parser);
     if (!*owned)
@@ -388,10 +395,57 @@ static bool ecma_merge_target(CBMArena *arena, target_proof_t *prior,
 static bool target_declared_in(const target_proof_t *target, const char *file) {
     if (!strcmp(target->file, file))
         return true;
-    for (const target_file_t *other = target->other_files; other; other = other->next)
+    if (target->other_sorted) {
+        int low = 0, high = target->other_count;
+        while (low < high) {
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            int mid = low + (high - low) / 2;
+            int compare = strcmp(target->other_sorted[mid], file);
+            if (!compare)
+                return true;
+            if (compare < 0)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        return false;
+    }
+    for (const target_file_t *other = target->other_files; other; other = other->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         if (!strcmp(other->file, file))
             return true;
+    }
     return false;
+}
+
+/* One copy of a file's path, however many names it declares. */
+static const char *target_file_copy(cbm_shared_resolver_t *resolver, const char *file) {
+    if (!resolver->target_file_latest || strcmp(resolver->target_file_latest, file))
+        resolver->target_file_latest = cbm_arena_strdup(&resolver->arena, file);
+    return resolver->target_file_latest;
+}
+
+static int compare_target_file(const void *left, const void *right) {
+    return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+
+enum { TARGET_SORTED_FILES_MIN = 16 };
+
+static void sort_target_files(const char *key, void *value, void *context) {
+    (void)key;
+    target_proof_t *target = value;
+    cbm_shared_resolver_t *resolver = context;
+    if (target->other_count < TARGET_SORTED_FILES_MIN)
+        return;
+    const char **sorted =
+        cbm_arena_alloc(&resolver->arena, (size_t)target->other_count * sizeof(*sorted));
+    if (!sorted)
+        return; /* the list still answers */
+    int at = 0;
+    for (const target_file_t *other = target->other_files; other; other = other->next)
+        sorted[at++] = other->file;
+    qsort(sorted, (size_t)at, sizeof(*sorted), compare_target_file);
+    target->other_sorted = sorted;
 }
 
 /* Overloads, trait impls and build-tag twins all stay live, so one node is exact for any of them.
@@ -459,14 +513,16 @@ static bool c_self_alias_definition(const CBMDefinition *definition) {
 
 static bool add_target_file(cbm_shared_resolver_t *resolver, target_proof_t *target,
                             const char *file) {
-    if (target_declared_in(target, file))
+    /* Files come one at a time, so a file seen before is the latest one seen. */
+    if (!strcmp(target->other_files ? target->other_files->file : target->file, file))
         return true;
     target_file_t *other = cbm_arena_calloc(&resolver->arena, sizeof(*other));
-    const char *copy = cbm_arena_strdup(&resolver->arena, file);
+    const char *copy = target_file_copy(resolver, file);
     if (!other || !copy)
         return false;
     *other = (target_file_t){.file = copy, .next = target->other_files};
     target->other_files = other;
+    target->other_count++;
     return true;
 }
 
@@ -554,7 +610,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     const char *key = cbm_arena_strdup(&resolver->arena, definition->qualified_name);
     if (!entry || !key)
         return false;
-    entry->file = cbm_arena_strdup(&resolver->arena, file);
+    entry->file = target_file_copy(resolver, file);
     entry->label = cbm_arena_strdup(&resolver->arena, definition->label);
     entry->start_line = definition->start_line;
     entry->end_line = definition->end_line;
@@ -1714,23 +1770,93 @@ static cbm_resolve_binding_index_t *binding_build_for(CBMArena *arena, const CBM
 /* `import a.b` binds the package a, and a.c reads through it. A dotted root import
  * therefore also needs a fact for a itself, once per file and only when no plain
  * `import a` already provides one. */
-static bool python_root_fact_needed(const CBMFileResult *result, int position) {
-    const CBMImport *import = &result->imports.items[position];
-    if (import->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !import->module_path ||
-        !import->local_name || !strchr(import->module_path, '.') ||
-        !cbm_import_binds_runtime_name(import))
-        return false;
-    for (int i = 0; i < result->imports.count; i++) {
-        const CBMImport *other = &result->imports.items[i];
-        if (other->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !other->local_name ||
-            !other->module_path || strcmp(other->local_name, import->local_name) ||
-            !cbm_import_binds_runtime_name(other))
+/* Which imports carry a root's fact: the first `import a.b` of each root name, provided no
+ * row of that name imports the root plainly. A file can hold thousands of these and each
+ * asked about all the others. out is NULL when no import does; false when memory ran out. */
+static bool python_root_facts(const CBMFileResult *result, bool **out) {
+    enum { ROOT_PLAIN = 1, ROOT_SHIFT = 1 };
+    *out = NULL;
+    int count = result->imports.count;
+    CBMHashTable *roots = NULL;
+    bool *needed = NULL;
+    for (int i = 0; i < count; i++) {
+        const CBMImport *import = &result->imports.items[i];
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        if (import->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !import->local_name ||
+            !import->module_path || !cbm_import_binds_runtime_name(import))
             continue;
-        if (!strchr(other->module_path, '.') || i < position)
-            return false;
+        if (!roots) {
+            roots = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 32);
+            needed = cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)count * sizeof(*needed));
+            if (!roots || !needed) {
+                cbm_ht_free(roots);
+                cbm_free(CBM_MEM_CLASS_EXTRACT, needed);
+                return false;
+            }
+        }
+        intptr_t state = (intptr_t)cbm_ht_get(roots, import->local_name);
+        if (!state)
+            state = (intptr_t)(i + 1) << ROOT_SHIFT;
+        if (!strchr(import->module_path, '.'))
+            state |= ROOT_PLAIN;
+        cbm_ht_set(roots, import->local_name, (void *)state);
     }
+    for (int i = 0; roots && i < count; i++) {
+        const CBMImport *import = &result->imports.items[i];
+        if (import->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !import->local_name ||
+            !import->module_path || !cbm_import_binds_runtime_name(import))
+            continue;
+        intptr_t state = (intptr_t)cbm_ht_get(roots, import->local_name);
+        needed[i] = !(state & ROOT_PLAIN) && (state >> ROOT_SHIFT) == (intptr_t)(i + 1);
+    }
+    cbm_ht_free(roots);
+    *out = needed;
     return true;
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* One name declared by every file, then asked about for each file. */
+bool cbm_resolver_test_target_files(int count) {
+    cbm_shared_resolver_t *resolver = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*resolver));
+    if (!resolver)
+        return false;
+    cbm_arena_init(&resolver->arena);
+    resolver->targets = cbm_ht_create(16);
+    const CBMDefinition definition = {
+        .qualified_name = "p.len", .label = "Function", .start_line = 1, .end_line = 1};
+    bool ok = resolver->targets != NULL;
+    for (int i = 0; ok && i < count; i++) {
+        char file[32];
+        snprintf(file, sizeof(file), "f%d.py", i);
+        ok = add_target(resolver, &definition, file, CBM_LANG_PYTHON);
+    }
+    if (ok)
+        cbm_ht_foreach(resolver->targets, sort_target_files, resolver);
+    const target_proof_t *target = ok ? cbm_ht_get(resolver->targets, "p.len") : NULL;
+    ok = target && target->other_count == count - 1;
+    for (int i = 0; ok && i < count; i++) {
+        char file[32];
+        snprintf(file, sizeof(file), "f%d.py", i);
+        ok = target_declared_in(target, file);
+    }
+    ok = ok && !target_declared_in(target, "absent.py");
+    cbm_ht_free(resolver->targets);
+    cbm_arena_destroy(&resolver->arena);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, resolver);
+    return ok;
+}
+
+int cbm_resolver_test_python_root_facts(const CBMFileResult *result) {
+    bool *needed = NULL;
+    if (!python_root_facts(result, &needed))
+        return -1;
+    int total = 0;
+    for (int i = 0; needed && i < result->imports.count; i++)
+        total += needed[i];
+    cbm_free(CBM_MEM_CLASS_EXTRACT, needed);
+    return total;
+}
+#endif
 
 static const char *python_root_key(CBMArena *arena, const char *file, const char *local) {
     return cbm_arena_sprintf(arena, "python_root:%zu:%s:%s", strlen(file), file, local);
@@ -1889,6 +2015,20 @@ static bool collect_source_adapter(cbm_shared_resolver_t *resolver, const CBMFil
     return ok;
 }
 
+/* note_owner_branch acts only on a module function already recorded as a pair of
+ * declarations in this file, and every such declaration is one of the file's own
+ * definitions. Without one, there is nothing for the owner audit's tree to find. */
+static bool python_owner_pair_present(const cbm_shared_resolver_t *resolver,
+                                      const CBMFileResult *result, const char *file) {
+    for (int d = 0; d < result->defs.count; d++) {
+        const char *qn = result->defs.items[d].qualified_name;
+        const target_proof_t *target = qn ? cbm_ht_get(resolver->targets, qn) : NULL;
+        if (target && target->ambiguous && target->declarations == 2 && !strcmp(target->file, file))
+            return true;
+    }
+    return false;
+}
+
 static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
                         const CBMFileResult *result, const cbm_file_info_t *file) {
     if (!export_language(file->language))
@@ -1899,10 +2039,15 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
         return false;
     CBMArena arena;
     cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *cached =
+        cbm_binding_cache_get(ctx->binding_cache, file, result, true);
+    /* A cached index was built from these verified bytes. Only an owner audit reads them. */
+    bool needs_source = !cached || (file->language == CBM_LANG_PYTHON &&
+                                    python_owner_pair_present(resolver, result, file->rel_path));
     size_t length = result->source_len > 0 ? (size_t)result->source_len : 0;
-    char *owned = result->source ? NULL : load_source(file->path, &length);
+    char *owned = result->source || !needs_source ? NULL : load_source(file->path, &length);
     const char *source = result->source ? result->source : owned;
-    if (!cbm_result_source_matches(result, source, length, CBM_SOURCE_ORIGIN_RAW)) {
+    if (needs_source && !cbm_result_source_matches(result, source, length, CBM_SOURCE_ORIGIN_RAW)) {
         resolver->http_domain_complete = false;
         resolver->complete = false;
         cbm_arena_destroy(&arena);
@@ -1911,9 +2056,12 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
     }
     CBMFileResult source_view;
     TSTree *owner_tree = NULL;
-    result = owner_source_view(result, file->language, source, length, &source_view, &owner_tree);
+    if (needs_source)
+        result =
+            owner_source_view(result, file->language, source, length, &source_view, &owner_tree);
     cbm_resolve_binding_index_t *index =
-        binding_build_for(&arena, result, file->language, file->rel_path, source, length);
+        cached ? cached
+               : binding_build_for(&arena, result, file->language, file->rel_path, source, length);
     /* Whether a star can rebind an earlier name is judged across modules. */
     cbm_resolve_binding_python_set_star_barrier(index, 0);
     /* Sequential extraction releases raw buffers. Audit the same verified
@@ -2005,6 +2153,9 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
     /* Every source-audited import gets its own immutable fact, including the
      * importing site's hop. A named import depends on the complete exported
      * binding; a module import uses the adapter's exact resolved namespace. */
+    bool *root_facts = NULL;
+    if (file->language == CBM_LANG_PYTHON)
+        ok = ok && python_root_facts(result, &root_facts);
     for (int i = 0; ok && file->language == CBM_LANG_PYTHON && i < result->imports.count; i++) {
         const CBMImport *import = &result->imports.items[i];
         if (!import->local_name || !cbm_import_binds_runtime_name(import))
@@ -2013,7 +2164,7 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
             python_export_import(resolver, ctx, result, file->rel_path, &arena, index, import,
                                  python_import_key(&resolver->arena, file->rel_path, i),
                                  cbm_resolve_binding_import(index, import->local_name), true, true);
-        if (ok && python_root_fact_needed(result, i)) {
+        if (ok && root_facts && root_facts[i]) {
             CBMImport root = *import;
             root.module_path = import->local_name;
             ok = python_export_import(
@@ -2022,6 +2173,7 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
                 cbm_resolve_binding_import(index, import->local_name), false, false);
         }
     }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, root_facts);
     size_t nested = ok && file->language == CBM_LANG_PYTHON
                         ? cbm_resolve_binding_python_nested_count(index)
                         : 0;
@@ -2677,20 +2829,27 @@ static CBMHashTable *python_import_map(CBMArena *arena, const char *file,
             return NULL;
         }
     }
-    for (int i = 0; i < result->imports.count; i++) {
-        if (!python_root_fact_needed(result, i))
+    bool *root_facts = NULL;
+    if (!python_root_facts(result, &root_facts)) {
+        cbm_ht_free(map);
+        return NULL;
+    }
+    for (int i = 0; root_facts && i < result->imports.count; i++) {
+        if (!root_facts[i])
             continue;
         const char *local = result->imports.items[i].local_name;
         python_import_t *entry = cbm_arena_calloc(arena, sizeof(*entry));
         const char *key = cbm_arena_strdup(arena, local);
         const char *slot = python_root_key(arena, file, local);
         if (!entry || !key || !slot) {
+            cbm_free(CBM_MEM_CLASS_EXTRACT, root_facts);
             cbm_ht_free(map);
             return NULL;
         }
         entry->slot = slot;
         cbm_ht_set(map, key, entry);
     }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, root_facts);
     return map;
 }
 
@@ -3049,6 +3208,11 @@ static char *solver_summary_payload(const cbm_resolve_solver_result_t *binding) 
     return json;
 }
 
+static cbm_parse_mode_t shared_resolver_parse_mode(CBMLanguage language) {
+    return language == CBM_LANG_GO || cbm_source_adapter_supported(language) ? CBM_PARSE_PLAIN
+                                                                             : CBM_PARSE_NONE;
+}
+
 cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
                                                  const cbm_file_info_t *files, int file_count,
                                                  CBMFileResult **cache) {
@@ -3098,7 +3262,10 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
+    cbm_parse_batch_t *parses =
+        cbm_parse_batch_new(ctx, files, file_count, cache, shared_resolver_parse_mode);
     for (int f = 0; f < file_count; f++) {
+        cbm_parse_batch_at(parses, f);
         /* Embedded ECMAScript surfaces need their own complete use audit.
          * Their absence from this adapter cannot certify non-mutation. */
         if (files[f].language == CBM_LANG_HTML || files[f].language == CBM_LANG_VUE ||
@@ -3133,10 +3300,14 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         if (!ok) {
             cbm_log_error("resolver.build.error", "file", files[f].rel_path, "reason",
                           "file_facts_failed");
+            cbm_parse_batch_free(parses);
             cbm_shared_resolver_free(resolver);
             return NULL;
         }
     }
+    cbm_parse_batch_free(parses);
+    cbm_binding_cache_release_after_resolver(ctx->binding_cache);
+    cbm_ht_foreach(resolver->targets, sort_target_files, resolver);
     if (!settle_python_imports(resolver) || !http_finalize_veto(resolver) ||
         !cbm_go_stabilization_register(resolver->go_types) || !stabilize_exports(resolver) ||
         !cbm_go_stabilization_seal(resolver->go_types) ||
@@ -3205,7 +3376,12 @@ bool cbm_shared_resolver_http_candidate_receiver(const cbm_shared_resolver_t *re
     char *key = cbm_alloc(CBM_MEM_CLASS_EXTRACT, length);
     if (!key)
         return true;
-    snprintf(key, length, "%zu:%s:%.*s", file_length, file, (int)root_length, call->callee_name);
+    char *key_end = cbm_put_u64(key, file_length);
+    *key_end++ = ':';
+    key_end = cbm_put_text(key_end, file, file_length);
+    *key_end++ = ':';
+    key_end = cbm_put_text(key_end, call->callee_name, root_length);
+    *key_end = '\0';
     const void *value = cbm_ht_get(resolver->http_veto, key);
     cbm_free(CBM_MEM_CLASS_EXTRACT, key);
     return value == resolver ||
@@ -4976,11 +5152,9 @@ bool cbm_shared_resolver_project(cbm_gbuf_t *graph) {
         qsort(ordered, admitted, sizeof(*ordered), compare_record);
     static const char *const labels[] = {"CALLS",  "USAGE",     "CALL_REFERENCE", "READS",
                                          "WRITES", "USES_TYPE", "IMPORTS"};
-    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
-        if (cbm_gbuf_delete_edges_by_type(graph, labels[i]) < 0) {
-            cbm_free(CBM_MEM_CLASS_EXTRACT, ordered);
-            return false;
-        }
+    if (cbm_gbuf_delete_edges_by_types(graph, labels, sizeof(labels) / sizeof(labels[0])) < 0) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, ordered);
+        return false;
     }
     bool ok = true;
     for (size_t r = 0; ok && r < admitted; r++) {

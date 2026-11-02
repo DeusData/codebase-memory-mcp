@@ -66,6 +66,12 @@ const cbm_resolve_import_snapshot_t *cbm_pipeline_import_snapshot(const cbm_gbuf
 /* True when the nearest package.json of this path declares `"type"`, which makes
  * its .js files modules whatever their syntax. */
 bool cbm_pipeline_node_declared_module(const char *source_rel);
+/* Every Go import of a project asks which module owns its file and its target: a walk up
+ * the directories with a stat per level, a read of the go.mod found, and for an import
+ * across modules its replace directives and the workspace too. A run's answers are fixed,
+ * so each is worked out once. Absent, each is worked out every time. */
+struct cbm_go_module_memo *cbm_go_module_memo_new(void);
+void cbm_go_module_memo_free(struct cbm_go_module_memo *memo);
 
 /* Source-audited Rust use bindings, separate from dependency File targets. */
 int cbm_pipeline_rust_import_map(const cbm_gbuf_t *, const char *, const char *,

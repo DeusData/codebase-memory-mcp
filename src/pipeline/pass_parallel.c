@@ -99,6 +99,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "foundation/fast_format.h"
+#include "pipeline/binding_cache.h"
 #include "pipeline/shared_resolver.h"
 #include "pipeline/worker_pool.h"
 #include "resolve/policy.h"
@@ -2356,10 +2358,11 @@ void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
         size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
         if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
-            int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
-            if (ln > 0) {
-                pos += (size_t)ln;
-            }
+            /* PP_LINE_MARGIN above leaves room for the key and every digit of an int. */
+            char *end = cbm_put_text(props + pos, ",\"line\":", sizeof(",\"line\":") - 1);
+            end = cbm_put_u64(end, (uint64_t)call->start_line);
+            *end = '\0';
+            pos = (size_t)(end - props);
         }
         if (pos < CBM_SZ_2K - SKIP_ONE) {
             props[pos] = '}';
@@ -3167,14 +3170,18 @@ static char *lsp_idx_key(const char *caller_qn, const char *leaf, bool exact_sit
     if (!key) {
         return NULL;
     }
-    int written = exact_site
-                      ? snprintf(key, cap, "%s|%s|%u:%u|%u", caller_qn, leaf, site_start_byte,
-                                 site_end_byte, (unsigned)source_origin)
-                      : snprintf(key, cap, "%s|%s|%u", caller_qn, leaf, (unsigned)source_origin);
-    if (written <= 0 || (size_t)written >= cap) {
-        free(key);
-        return NULL;
+    char *at = cbm_put_text(key, caller_qn, caller_len);
+    *at++ = '|';
+    at = cbm_put_text(at, leaf, leaf_len);
+    *at++ = '|';
+    if (exact_site) {
+        at = cbm_put_u64(at, site_start_byte);
+        *at++ = ':';
+        at = cbm_put_u64(at, site_end_byte);
+        *at++ = '|';
     }
+    at = cbm_put_u64(at, (unsigned)source_origin);
+    *at = '\0';
     return key;
 }
 
@@ -4546,6 +4553,9 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
             continue;
         }
 
+        /* Cross-file LSP, proofs and the shared resolver each parse this file. */
+        cbm_parse_memo_begin();
+
         /* Build import map ONCE (read-only access to main_gbuf). The
          * same imp_keys/imp_vals feed both the fused cross-file LSP
          * step below AND the resolve_file_* chain — no duplicate build. */
@@ -4761,6 +4771,7 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
         }
 
     resolve_file_cleanup:
+        cbm_parse_memo_end();
         /* Capture the resolved file and side evidence before releasing either,
          * including files loaded from the spill store. */
         resolve_capture_coverage(rc, rel, result, evidence);
@@ -4788,6 +4799,7 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
         ws->loaded = NULL;
     }
     cbm_pxc_set_rust_manifest(NULL);
+    cbm_parse_memo_end();
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
@@ -4844,6 +4856,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_semantic_bindings_t *structural_bindings =
         cbm_semantic_bindings_build(ctx, files, file_count, result_cache);
+    /* The indexes hold memory the workers need, and each worker builds its own. */
+    cbm_binding_cache_free(ctx->binding_cache);
+    ctx->binding_cache = NULL;
     if (!structural_bindings) {
         cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
         cbm_aligned_free(workers);

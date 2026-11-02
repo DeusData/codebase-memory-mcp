@@ -15,6 +15,7 @@
 #include "resolve/rust_macros.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/import_resolve.h"
+#include "pipeline/parse_batch.h"
 #include "pipeline/resolver_ecma.h"
 #include "pipeline/py_layout.h"
 
@@ -26,6 +27,7 @@
 #include "discover/discover.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_thread.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
@@ -3619,6 +3621,10 @@ static bool rust_project_add_file(cbm_rust_project_t *project, const cbm_pipelin
     return ok;
 }
 
+static cbm_parse_mode_t rust_project_parse_mode(CBMLanguage language) {
+    return language == CBM_LANG_RUST ? CBM_PARSE_TERMINATED : CBM_PARSE_NONE;
+}
+
 static bool rust_project_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int count,
                                CBMFileResult **cache) {
     cbm_rust_project_free(ctx->rust_project);
@@ -3631,7 +3637,10 @@ static bool rust_project_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     cbm_rust_project_t *project = cbm_rust_project_new();
     TSParser *parser = ts_parser_new();
     bool ok = project && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST));
+    cbm_parse_batch_t *parses =
+        cbm_parse_batch_new(ctx, files, count, cache, rust_project_parse_mode);
     for (int i = 0; ok && i < count; i++) {
+        cbm_parse_batch_at(parses, i);
         if (strcmp(path_leaf(files[i].rel_path), "Cargo.toml") == 0) {
             int length = 0;
             char *text = pkgmap_read_file(files[i].path, &length);
@@ -3643,6 +3652,7 @@ static bool rust_project_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             ok = rust_project_add_file(project, ctx, cache, &files[i], i, parser);
         }
     }
+    cbm_parse_batch_free(parses);
     ok = ok && cbm_rust_project_seal(project);
     if (parser)
         ts_parser_delete(parser);
@@ -5961,6 +5971,78 @@ static bool go_module_declaration(char *source, char *module, size_t capacity) {
     }
     return found;
 }
+struct cbm_go_module_memo {
+    cbm_mutex_t lock;
+    CBMHashTable *answers;
+    CBMArena arena;
+};
+typedef struct {
+    bool answer;
+    const char *first, *second;
+} go_memo_answer_t;
+
+struct cbm_go_module_memo *cbm_go_module_memo_new(void) {
+    struct cbm_go_module_memo *memo = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*memo));
+    if (!memo)
+        return NULL;
+    cbm_mutex_init(&memo->lock);
+    cbm_arena_init_lazy(&memo->arena, CBM_SZ_4K);
+    memo->answers = cbm_ht_create(128);
+    return memo;
+}
+
+void cbm_go_module_memo_free(struct cbm_go_module_memo *memo) {
+    if (!memo)
+        return;
+    cbm_ht_free(memo->answers);
+    cbm_arena_destroy(&memo->arena);
+    cbm_mutex_destroy(&memo->lock);
+    cbm_free(CBM_MEM_CLASS_OTHER, memo);
+}
+
+/* True and *out filled when this question was answered before. */
+static bool go_memo_get(const cbm_pipeline_ctx_t *ctx, const char *key, go_memo_answer_t *out) {
+    struct cbm_go_module_memo *memo = ctx->go_module_memo;
+    if (!memo || !memo->answers || !key)
+        return false;
+    cbm_mutex_lock(&memo->lock);
+    const go_memo_answer_t *known = cbm_ht_get(memo->answers, key);
+    if (known)
+        *out = *known;
+    cbm_mutex_unlock(&memo->lock);
+    return known != NULL;
+}
+
+/* Losing a memory race only means the question is asked again. */
+static void go_memo_put(const cbm_pipeline_ctx_t *ctx, const char *key, bool answer,
+                        const char *first, const char *second) {
+    struct cbm_go_module_memo *memo = ctx->go_module_memo;
+    if (!memo || !memo->answers || !key)
+        return;
+    cbm_mutex_lock(&memo->lock);
+    if (!cbm_ht_get(memo->answers, key)) {
+        go_memo_answer_t *stored = cbm_arena_calloc(&memo->arena, sizeof(*stored));
+        const char *copy = cbm_arena_strdup(&memo->arena, key);
+        const char *one = first ? cbm_arena_strdup(&memo->arena, first) : NULL;
+        const char *two = second ? cbm_arena_strdup(&memo->arena, second) : NULL;
+        if (stored && copy && (!first || one) && (!second || two)) {
+            *stored = (go_memo_answer_t){.answer = answer, .first = one, .second = two};
+            cbm_ht_set(memo->answers, copy, stored);
+        }
+    }
+    cbm_mutex_unlock(&memo->lock);
+}
+
+/* One question's key, or NULL when it will not fit. */
+static const char *go_memo_key(char *key, size_t capacity, char kind, const char *a,
+                               const char *b) {
+    int length = snprintf(key, capacity, "%c\n%s\n%s", kind, a, b ? b : "");
+    return length > 0 && (size_t)length < capacity ? key : NULL;
+}
+
+static bool go_module_owner_walk(const cbm_pipeline_ctx_t *ctx, char *owner, char *module,
+                                 size_t capacity);
+
 static bool go_module_owner(const cbm_pipeline_ctx_t *ctx, const char *path, bool directory,
                             char *owner, char *module, size_t capacity) {
     if (!ctx->repo_path || !path || !cbm_repo_rel_join("", path, owner, capacity))
@@ -5972,6 +6054,26 @@ static bool go_module_owner(const cbm_pipeline_ctx_t *ctx, const char *path, boo
         else
             owner[0] = '\0';
     }
+    char key_buffer[PKGMAP_PATH_BUF + 8];
+    const char *key = go_memo_key(key_buffer, sizeof(key_buffer), 'o', owner, NULL);
+    go_memo_answer_t known;
+    if (go_memo_get(ctx, key, &known)) {
+        if (!known.answer)
+            return false;
+        size_t owner_size = strlen(known.first) + 1, module_size = strlen(known.second) + 1;
+        if (owner_size <= capacity && module_size <= capacity) {
+            memcpy(owner, known.first, owner_size);
+            memcpy(module, known.second, module_size);
+            return true;
+        }
+    }
+    bool valid = go_module_owner_walk(ctx, owner, module, capacity);
+    go_memo_put(ctx, key, valid, valid ? owner : NULL, valid ? module : NULL);
+    return valid;
+}
+
+static bool go_module_owner_walk(const cbm_pipeline_ctx_t *ctx, char *owner, char *module,
+                                 size_t capacity) {
     for (;;) {
         char relative[PKGMAP_PATH_BUF], absolute[PKGMAP_PATH_BUF];
         if (!cbm_repo_rel_join(owner, "go.mod", relative, sizeof(relative)) ||
@@ -6040,8 +6142,33 @@ static bool go_replace_line(const char *line, const char *import, char *best, si
 }
 
 /* The module path and local directory of the longest replace matching this import. */
+static bool go_module_replacement_read(const cbm_pipeline_ctx_t *ctx, const char *owner,
+                                       const char *import, char *old, char *directory,
+                                       size_t capacity);
+
 static bool go_module_replacement(const cbm_pipeline_ctx_t *ctx, const char *owner,
                                   const char *import, char *old, char *directory, size_t capacity) {
+    char key_buffer[2 * PKGMAP_PATH_BUF];
+    const char *key = go_memo_key(key_buffer, sizeof(key_buffer), 'r', owner, import);
+    go_memo_answer_t known;
+    if (go_memo_get(ctx, key, &known)) {
+        if (!known.answer)
+            return false;
+        size_t old_size = strlen(known.first) + 1, directory_size = strlen(known.second) + 1;
+        if (old_size <= PKGMAP_PATH_BUF && directory_size <= capacity) {
+            memcpy(old, known.first, old_size);
+            memcpy(directory, known.second, directory_size);
+            return true;
+        }
+    }
+    bool found = go_module_replacement_read(ctx, owner, import, old, directory, capacity);
+    go_memo_put(ctx, key, found, found ? old : NULL, found ? directory : NULL);
+    return found;
+}
+
+static bool go_module_replacement_read(const cbm_pipeline_ctx_t *ctx, const char *owner,
+                                       const char *import, char *old, char *directory,
+                                       size_t capacity) {
     char relative[PKGMAP_PATH_BUF], absolute[PKGMAP_PATH_BUF];
     if (!cbm_repo_rel_join(owner, "go.mod", relative, sizeof(relative)) ||
         !import_absolute_path(ctx->repo_path, relative, absolute, sizeof(absolute)))
@@ -6219,7 +6346,14 @@ bool cbm_pipeline_go_import_owned(const cbm_pipeline_ctx_t *ctx, const char *sou
         return cbm_repo_rel_join(source_owner, directory, mapped, sizeof(mapped)) &&
                !strcmp(mapped, target_owner) && !strcmp(old, target_module);
     }
-    return go_workspace_lists(ctx, source_owner, target_owner);
+    char key_buffer[2 * PKGMAP_PATH_BUF];
+    const char *key = go_memo_key(key_buffer, sizeof(key_buffer), 'w', source_owner, target_owner);
+    go_memo_answer_t known;
+    if (go_memo_get(ctx, key, &known))
+        return known.answer;
+    bool listed = go_workspace_lists(ctx, source_owner, target_owner);
+    go_memo_put(ctx, key, listed, NULL, NULL);
+    return listed;
 }
 
 /* Coordinator normalization before shared semantic resolution. The ordinary

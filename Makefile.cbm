@@ -569,6 +569,8 @@ PIPELINE_SRCS = \
     src/pipeline/pass_calls.c \
     src/pipeline/pass_resolver.c \
     src/pipeline/resolver_ecma.c \
+    src/pipeline/binding_cache.c \
+    src/pipeline/parse_batch.c \
     src/pipeline/pass_spawns.c \
     src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_usages.c \
