@@ -5461,6 +5461,52 @@ TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module) {
     PASS();
 }
 
+/* `enum class E : int;` in a block is a lone tag with no enumerators: reading them from the body it does
+ * not have was a null dereference. A worker that crashes on one file has that file quarantined and the
+ * index still reports success, so a repository lost the file silently until a second such file made the
+ * whole index fail, as clang's own tests did. The name still hides the outer enum from there on. */
+#define C_TU_OPAQUE_ENUM                                                                        \
+    "enum class Outer : int { A };\n"                                                            \
+    "enum Plain : int { B };\n"                                                                  \
+    "int scoped_in_a_block() { enum class Outer : int; Outer *p = nullptr; return p != nullptr; }\n" \
+    "int plain_in_a_block() { enum Plain : int; Plain *q = nullptr; return q != nullptr; }\n"    \
+    "int after_the_blocks(Outer *r) { return r != nullptr; }\n"
+static const RQ_Source C_TU_OPAQUE_ENUMS[] = {{.path = "opaque.cpp", .text = C_TU_OPAQUE_ENUM}};
+
+TEST(resolver_cpp_opaque_enum_in_a_block_does_not_crash_and_hides_the_outer_one) {
+    const char *source = C_TU_OPAQUE_ENUM;
+    const RQ_Expected expected[] = {
+        {.case_id = "the-outer-enum-after-the-blocks",
+         .site = C_TU_WORD("opaque.cpp", source, "opaque.after_the_blocks", "Outer *r", "Outer"),
+         .relation = "USAGE",
+         .target = {.file = "opaque.cpp",
+                    .suffix = "opaque.Outer",
+                    .label = "Enum",
+                    .declaration_line = 1,
+                    .declaration_text = "enum class Outer : int { A };"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "a-scoped-enum-in-a-block-hides-the-outer-one",
+         .site = C_TU_WORD("opaque.cpp", source, "opaque.scoped_in_a_block", "Outer *p", "Outer"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "a-plain-enum-in-a-block-too",
+         .site = C_TU_WORD("opaque.cpp", source, "opaque.plain_in_a_block", "Plain *q", "Plain"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-opaque-enums",
+                             .sources = C_TU_OPAQUE_ENUMS,
+                             .source_count = 1,
+                             .expected = expected,
+                             .expected_count = 1,
+                             .forbidden = forbidden,
+                             .forbidden_count = 2};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 /* A lone tag declares it, wherever it stands. Nothing resolves there, so the decoys above stay
  * quiet with or without this: what it changes is an occurrence with no answer, counted as unresolved. */
 static int c_usage_rows_named(const CBMFileResult *result, const char *name) {
@@ -6645,6 +6691,7 @@ SUITE(resolver_c) {
     RUN_TEST(resolver_cpp_template_field_reads_the_template_and_not_its_parameter_spelling);
     RUN_TEST(resolver_c_struct_tag_is_a_use_unless_it_declares);
     RUN_TEST(resolver_c_lone_tag_is_no_occurrence);
+    RUN_TEST(resolver_cpp_opaque_enum_in_a_block_does_not_crash_and_hides_the_outer_one);
     RUN_TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module);
     RUN_TEST(resolver_c_a_static_left_in_an_error_stays_static);
     RUN_TEST(resolver_c_text_defines_macro_reads_to_the_end_of_the_text);

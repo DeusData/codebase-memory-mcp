@@ -9177,7 +9177,8 @@ static void c_bind_local_tag_and_enumerators(CLSPContext *ctx, TSNode node, cons
             ctx->local_tag_declared = true;
         }
     }
-    if (strcmp(kind, "enum_specifier"))
+    /* `enum class E : int;` in a block: a lone tag has no enumerators to read. */
+    if (strcmp(kind, "enum_specifier") || ts_node_is_null(body))
         return;
     uint32_t count = ts_node_named_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
