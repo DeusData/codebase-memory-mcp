@@ -612,7 +612,8 @@ PIPELINE_SRCS = \
     src/pipeline/pass_cross_repo.c \
     src/pipeline/artifact.c \
     src/pipeline/pass_ensemble_routing.c \
-    src/pipeline/pass_pkgmap.c
+    src/pipeline/pass_pkgmap.c \
+    src/pipeline/py_layout.c
 
 # SimHash / MinHash module
 SIMHASH_SRCS = src/simhash/minhash.c

@@ -69,6 +69,9 @@ typedef struct {
     const char *value_chain;
     uint32_t value_scope;
     bool value_none;
+    /* Python: from value_from to value_until every path reaches this binder. Zero until:
+     * no such stretch. */
+    uint32_t value_from, value_until;
     bool import_root;
 } binding_name_t;
 
@@ -165,6 +168,35 @@ typedef struct {
     const cbm_resolve_proof_t *proof;
 } binding_observation_t;
 
+typedef struct {
+    uint32_t start, end;
+    uint32_t parent; /* one-based enclosing loop */
+} python_loop_t;
+
+/* `if isinstance(E, C):` and its kin: in [from, until] E holds a C. */
+typedef struct {
+    const char *chain, *type;
+    uint32_t from, until, scope;
+    uint32_t parent; /* one-based enclosing narrowing */
+} python_narrow_t;
+
+typedef struct {
+    const char *chain;
+    uint32_t at; /* where the statement ends: its right side still reads what was there */
+    uint32_t scope;
+    const char *value; /* what a plain assignment stores, when followable */
+    uint32_t value_at;
+} python_store_t;
+
+typedef struct {
+    const char *name;   /* the local name the statement went through */
+    const char *member; /* the dotted path it writes, NULL when any name can change */
+} python_write_t;
+
+typedef struct {
+    const char *alias, *of;
+} python_alias_t;
+
 struct cbm_resolve_binding_index {
     CBMArena *arena;
     binding_observation_t *observation;
@@ -183,9 +215,21 @@ struct cbm_resolve_binding_index {
     bool javascript_module;
     bool python_annotation_binding_preserved;
     bool python_annotation_storage_bound;
-    const char **python_escapes;
-    size_t python_escape_count, python_escape_capacity;
+    python_write_t *python_writes;  /* sorted by name */
+    python_alias_t *python_aliases; /* `alias = name` statements */
+    size_t python_alias_count, python_alias_capacity;
+    size_t python_write_count, python_write_capacity;
     bool python_effects_complete;
+    bool python_writes_unseen;       /* the audit stopped before the end of the file */
+    bool python_name_handed;         /* __name__ goes to a call: that may build the module */
+    bool python_namespace_open;      /* a computed globals() store can add any name */
+    python_narrow_t *python_narrows; /* sorted by from, outermost first, once the walk ends */
+    size_t python_narrow_count, python_narrow_capacity;
+    python_store_t *python_stores; /* attribute stores, sorted by chain then position */
+    size_t python_store_count, python_store_capacity;
+    python_loop_t *python_loops; /* in start order: the walk's */
+    size_t python_loop_count, python_loop_capacity;
+    uint32_t python_open_loop; /* one-based innermost loop being walked */
     cbm_resolve_python_nested_import_t *python_nested;
     size_t python_nested_count, python_nested_capacity;
     cbm_resolve_python_star_t *python_stars;
@@ -196,9 +240,6 @@ struct cbm_resolve_binding_index {
     size_t python_member_count, python_member_capacity;
     cbm_resolve_python_decorated_t *python_decorated;
     size_t python_decorated_count, python_decorated_capacity;
-    /* Set while python_decorator_shape reads one function's returns. */
-    const char *python_shape_delegate;
-    bool python_shape_delegate_applied;
     const char *http_default_target, *http_default_base;
     cbm_resolve_http_dependency_t *http_dependencies;
     size_t http_dependency_count, http_dependency_capacity;
@@ -415,6 +456,51 @@ static bool jsx_component_site(const cbm_resolve_binding_index_t *index, TSNode 
            index->source[start] <= 'Z';
 }
 
+static const char *python_import_canonical(const cbm_resolve_binding_index_t *index,
+                                           const char *chain);
+static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, TSNode node,
+                                           unsigned depth);
+
+const char *cbm_resolve_python_typed_text(CBMArena *arena, const char *type, const char *rest) {
+    const char *marker = strchr(type, '@');
+    size_t head = marker ? (size_t)(marker - type) : strlen(type);
+    if (marker && !strcmp(marker, "@type"))
+        return cbm_arena_sprintf(arena, "%.*s%s", (int)head, type, rest);
+    return cbm_arena_sprintf(arena, "%.*s()%s%s", (int)head, type, marker ? marker : "", rest);
+}
+
+static bool listed(const char *kind, const char *const *list);
+
+/* The enclosing def declares this name as a parameter whose default is None. */
+static bool python_parameter_defaults_none(cbm_resolve_binding_index_t *index, TSNode node,
+                                           const char *name) {
+    TSNode function = node;
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH && !ts_node_is_null(function); depth++) {
+        if (kind_is(function, "lambda") || kind_is(function, "class_definition"))
+            return false;
+        if (kind_is(function, "function_definition"))
+            break;
+        function = ts_node_parent(function);
+    }
+    TSNode parameters =
+        kind_is(function, "function_definition") ? field(function, "parameters") : (TSNode){0};
+    if (ts_node_is_null(parameters) || !name)
+        return false;
+    bool found = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(parameters);
+    for (bool more = ts_tree_cursor_goto_first_child(&cursor); more && !found;
+         more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode parameter = ts_tree_cursor_current_node(&cursor);
+        if (!kind_is(parameter, "default_parameter") &&
+            !kind_is(parameter, "typed_default_parameter"))
+            continue;
+        const char *spelled = node_text(index, field(parameter, "name"));
+        found = spelled && !strcmp(spelled, name) && kind_is(field(parameter, "value"), "none");
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
 /* The access path of a Python expression, as text: names, member steps and
  * calls with their arguments dropped. Only forms whose value can be followed
  * statically have one. Two-argument super and one-argument type keep their
@@ -435,6 +521,30 @@ static const char *python_chain(cbm_resolve_binding_index_t *index, TSNode node,
         const char *member = node_text(index, field(node, "attribute"));
         return object && member ? cbm_arena_sprintf(index->arena, "%s.%s", object, member) : NULL;
     }
+    /* x[k] and x[a:b]: what the container holds, read at evaluation. */
+    if (kind_is(node, "subscript") && ts_node_named_child_count(node) == 2) {
+        const char *object = python_chain(index, field(node, "value"), depth + 1);
+        return object ? cbm_arena_sprintf(index->arena, "%s%s", object,
+                                          kind_is(field(node, "subscript"), "slice") ? "[:]" : "[]")
+                      : NULL;
+    }
+    /* `x or Y()` for a parameter defaulting to None: Y() is what the signature provides. */
+    if (kind_is(node, "boolean_operator")) {
+        const char *operator= node_text(index, field(node, "operator"));
+        TSNode left = field(node, "left");
+
+        if (operator&& !strcmp(operator, "or") && kind_is(left, "identifier") &&
+            python_parameter_defaults_none(index, node, node_text(index, left)))
+            return python_chain(index, field(node, "right"), depth + 1);
+        return NULL;
+    }
+    /* `A() if c else None`: a None says nothing about the class a member read finds. */
+    if (kind_is(node, "conditional_expression") && ts_node_named_child_count(node) == 3) {
+        TSNode first = ts_node_named_child(node, 0), second = ts_node_named_child(node, 2);
+        if (kind_is(first, "none") != kind_is(second, "none"))
+            return python_chain(index, kind_is(first, "none") ? second : first, depth + 1);
+        return NULL;
+    }
     if (!kind_is(node, "call"))
         return NULL;
     TSNode function = field(node, "function"), args = field(node, "arguments");
@@ -444,6 +554,30 @@ static const char *python_chain(cbm_resolve_binding_index_t *index, TSNode node,
     uint32_t count = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
     /* partial(f, ...) keeps what it wraps: py_members checks the import. */
     if (count && (!strcmp(callee, "partial") || !strcmp(callee, "functools.partial"))) {
+        const char *wrapped = python_chain(index, ts_node_named_child(args, 0), depth + 1);
+        if (wrapped)
+            return cbm_arena_sprintf(index->arena, "%s(%s)", callee, wrapped);
+    }
+    /* copy.copy(x) is an x, by the standard library's own signature. */
+    size_t spelled = strlen(callee);
+    if (count == 1 && ((spelled >= 4 && !strcmp(callee + spelled - 4, "copy")))) {
+        const char *canonical = python_import_canonical(index, callee);
+        if (canonical && (!strcmp(canonical, "copy.copy") || !strcmp(canonical, "copy.deepcopy")))
+            return python_chain(index, ts_node_named_child(args, 0), depth + 1);
+    }
+    /* typing.cast(T, x) is a T: that is all it does. */
+    if (count == 2 && spelled >= 4 && !strcmp(callee + spelled - 4, "cast")) {
+        const char *canonical = python_import_canonical(index, callee);
+        if (canonical &&
+            (!strcmp(canonical, "typing.cast") || !strcmp(canonical, "typing_extensions.cast"))) {
+            const char *type = python_annotation_chain(index, ts_node_named_child(args, 0), 0);
+            return type ? cbm_resolve_python_typed_text(index->arena, type, "") : NULL;
+        }
+    }
+    /* sorted(x) and friends hold what x holds; py_members checks the name is the builtin. */
+    static const char *const passing[] = {"list",   "tuple",    "set",  "frozenset",
+                                          "sorted", "reversed", "iter", NULL};
+    if (count >= 1 && listed(callee, passing)) {
         const char *wrapped = python_chain(index, ts_node_named_child(args, 0), depth + 1);
         if (wrapped)
             return cbm_arena_sprintf(index->arena, "%s(%s)", callee, wrapped);
@@ -872,10 +1006,26 @@ static bool python_namespace_call_writes(cbm_resolve_binding_index_t *index, TSN
     TSNode parent = ts_node_parent(call);
     if (kind_is(parent, "comparison_operator") || kind_is(parent, "dictionary_splat"))
         return false;
+    /* exec(code, globals(), d) stores in d. */
+    if (kind_is(parent, "argument_list") && ts_node_named_child_count(parent) == 3 &&
+        ts_node_eq(call, ts_node_named_child(parent, 1))) {
+        const char *runner = node_text(index, field(ts_node_parent(parent), "function"));
+        if (runner && (!strcmp(runner, "exec") || !strcmp(runner, "eval")))
+            return false;
+    }
     if (kind_is(parent, "subscript")) {
-        TSNode user = ts_node_parent(parent);
-        return (kind_is(user, "assignment") || kind_is(user, "augmented_assignment")) &&
-               ts_node_eq(parent, field(user, "left"));
+        TSNode user = ts_node_parent(parent), key = field(parent, "subscript");
+        bool stored = (kind_is(user, "assignment") || kind_is(user, "augmented_assignment")) &&
+                      ts_node_eq(parent, field(user, "left"));
+        bool literal = kind_is(key, "string") && ts_node_named_child_count(key) == 3 &&
+                       kind_is(ts_node_named_child(key, 1), "string_content");
+        /* A computed key names no binding this audit saw. Names bound by statements stay what
+         * those say, as celery's STATICA_HACK relies on; what the module lacks is unknowable. */
+        if (stored && !literal) {
+            index->python_namespace_open = true;
+            return false;
+        }
+        return stored;
     }
     if (kind_is(parent, "attribute")) {
         const char *member = node_text(index, field(parent, "attribute"));
@@ -890,13 +1040,22 @@ static bool python_namespace_call_writes(cbm_resolve_binding_index_t *index, TSN
  * A function's locals() is a snapshot: writing to it rebinds nothing, and vars(x)
  * reads x. Only the zero-argument form outside a function can write a binding;
  * any other read of those names passes the view on and stays unknown. */
-static bool python_namespace_view(const cbm_resolve_binding_index_t *index, TSNode node,
+static bool python_namespace_view(cbm_resolve_binding_index_t *index, TSNode node,
                                   const char *name) {
     if (strcmp(name, "locals") && strcmp(name, "vars"))
         return false;
     TSNode call = ts_node_parent(node);
     if (!kind_is(call, "call") || !ts_node_eq(node, field(call, "function")))
         return true;
+    /* A read-only method of the view leaves the namespace as it was. */
+    TSNode user = ts_node_parent(call);
+    if (kind_is(user, "attribute") && ts_node_eq(call, field(user, "object"))) {
+        const char *member = node_text(index, field(user, "attribute"));
+        if (member &&
+            (!strcmp(member, "get") || !strcmp(member, "keys") || !strcmp(member, "items") ||
+             !strcmp(member, "values") || !strcmp(member, "copy")))
+            return false;
+    }
     bool in_function = index->current_scope && index->current_scope < index->scope_count &&
                        !index->scopes[index->current_scope].class_scope;
     TSNode args = field(call, "arguments");
@@ -994,11 +1153,14 @@ static void note_import(cbm_resolve_binding_index_t *index, TSNode node, bool ne
 /* Only annotation lookups see these names: runtime reads find a blocked binder. */
 static void python_note_annotation_imports(cbm_resolve_binding_index_t *index, TSNode node) {
     size_t names = index->name_count, nested = index->python_nested_count;
+    size_t stars = index->python_star_count;
     note_import(index, node, true);
     for (size_t i = names; i < index->name_count; i++)
         index->names[i].flags = BINDING_BLOCKED;
     for (size_t i = nested; i < index->python_nested_count; i++)
         index->python_nested[i].annotation_only = true;
+    for (size_t i = stars; i < index->python_star_count; i++)
+        index->python_stars[i].annotation_only = true;
 }
 
 static void note_import(cbm_resolve_binding_index_t *index, TSNode node, bool nested) {
@@ -1166,14 +1328,6 @@ static const char *python_import_canonical(const cbm_resolve_binding_index_t *in
 static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, TSNode node,
                                            unsigned depth);
 
-/* typing.Optional however it was imported. A project class of that name says nothing
- * about its argument. */
-static bool python_is_typing_optional(cbm_resolve_binding_index_t *index, TSNode outer) {
-    const char *spelled = python_chain(index, outer, 0);
-    const char *canonical = spelled ? python_import_canonical(index, spelled) : NULL;
-    return canonical && !strcmp(canonical, "typing.Optional");
-}
-
 static bool python_annotation_is_none(TSNode node) {
     while (kind_is(node, "type") && ts_node_named_child_count(node) == 1)
         node = ts_node_named_child(node, 0);
@@ -1181,6 +1335,98 @@ static bool python_annotation_is_none(TSNode node) {
 }
 
 /* `X | None` says X. Two classes say neither. */
+/* What a generic annotation says a value is. Its marker: @seq holds and yields X, @map holds
+ * X by key, @type is the class X itself. A generic of the project's own is an instance of it. */
+static const char *python_generic_chain(cbm_resolve_binding_index_t *index, TSNode head,
+                                        const TSNode *args, uint32_t count, unsigned depth) {
+    static const char *const seq[] = {"list",
+                                      "set",
+                                      "frozenset",
+                                      "typing.List",
+                                      "typing.Set",
+                                      "typing.FrozenSet",
+                                      "typing.Sequence",
+                                      "typing.MutableSequence",
+                                      "typing.Iterable",
+                                      "typing.Iterator",
+                                      "typing.Collection",
+                                      "typing.Generator",
+                                      "typing.AsyncIterator",
+                                      "typing.AsyncIterable",
+                                      "typing.AsyncGenerator",
+                                      "typing.Deque",
+                                      "typing.Reversible",
+                                      "typing.AbstractSet",
+                                      "typing.MutableSet",
+                                      "collections.abc.Sequence",
+                                      "collections.abc.MutableSequence",
+                                      "collections.abc.Iterable",
+                                      "collections.abc.Iterator",
+                                      "collections.abc.Collection",
+                                      "collections.abc.Generator",
+                                      "collections.abc.AsyncIterator",
+                                      "collections.abc.AsyncIterable",
+                                      "collections.abc.AsyncGenerator",
+                                      "collections.abc.Set",
+                                      "collections.abc.MutableSet",
+                                      "collections.deque",
+                                      NULL};
+    static const char *const map[] = {"dict",
+                                      "typing.Dict",
+                                      "typing.Mapping",
+                                      "typing.MutableMapping",
+                                      "typing.DefaultDict",
+                                      "typing.OrderedDict",
+                                      "collections.abc.Mapping",
+                                      "collections.abc.MutableMapping",
+                                      "collections.OrderedDict",
+                                      "collections.defaultdict",
+                                      NULL};
+    static const char *const wrapper[] = {
+        "typing.Optional",           "typing.Annotated",
+        "typing.ClassVar",           "typing.Final",
+        "typing.Awaitable",          "typing_extensions.Annotated",
+        "collections.abc.Awaitable", NULL};
+    const char *spelled = python_chain(index, head, 0);
+    if (!spelled || !count)
+        return NULL;
+    const char *canonical = python_import_canonical(index, spelled);
+    if (!canonical)
+        canonical = spelled;
+    const char *marker = NULL;
+    uint32_t arg = 0;
+    if (listed(canonical, wrapper)) {
+        return python_annotation_chain(index, args[0], depth + 1);
+    } else if (!strcmp(canonical, "typing.Coroutine") ||
+               !strcmp(canonical, "collections.abc.Coroutine")) {
+        return count == 3 ? python_annotation_chain(index, args[2], depth + 1) : NULL;
+    } else if (listed(canonical, seq)) {
+        marker = "@seq";
+    } else if (!strcmp(canonical, "tuple") || !strcmp(canonical, "typing.Tuple")) {
+        if (count != 2 || !kind_is(args[1], "type") || !ts_node_named_child_count(args[1]) ||
+            !kind_is(ts_node_named_child(args[1], 0), "ellipsis"))
+            return NULL;
+        marker = "@seq";
+    } else if (listed(canonical, map)) {
+        if (count != 2)
+            return NULL;
+        marker = "@map";
+        arg = 1;
+    } else if (!strcmp(canonical, "type") || !strcmp(canonical, "typing.Type")) {
+        marker = "@type";
+    } else if (!strncmp(canonical, "typing.", 7) || !strncmp(canonical, "typing_extensions.", 18) ||
+               !strncmp(canonical, "collections.", 12)) {
+        return NULL;
+    } else {
+        return spelled; /* Repo[str] is a Repo. */
+    }
+    const char *element = python_annotation_chain(index, args[arg], depth + 1);
+    /* One layer: list[list[X]] says nothing this model can carry. */
+    return element && !strchr(element, '@')
+               ? cbm_arena_sprintf(index->arena, "%s%s", element, marker)
+               : NULL;
+}
+
 static const char *python_union_chain(cbm_resolve_binding_index_t *index, TSNode left, TSNode right,
                                       unsigned depth) {
     bool left_none = python_annotation_is_none(left), right_none = python_annotation_is_none(right);
@@ -1209,17 +1455,26 @@ static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, T
         return cbm_arena_strndup(index->arena, text + 1, length - 2);
     }
     if (kind_is(node, "generic_type") && ts_node_named_child_count(node) == 2) {
-        TSNode arguments = ts_node_named_child(node, 1);
-        if (!python_is_typing_optional(index, ts_node_named_child(node, 0)) ||
-            ts_node_named_child_count(arguments) != 1)
-            return NULL;
-        return python_annotation_chain(index, ts_node_named_child(arguments, 0), depth + 1);
+        TSNode arguments = ts_node_named_child(node, 1), args[3];
+        memset(args, 0, sizeof(args));
+        uint32_t count = ts_node_named_child_count(arguments);
+        for (uint32_t i = 0; i < count && i < 3; i++)
+            args[i] = ts_node_named_child(arguments, i);
+        return count <= 3
+                   ? python_generic_chain(index, ts_node_named_child(node, 0), args, count, depth)
+                   : NULL;
     }
     /* The grammar reads a dotted generic, typing.Optional[X], as a subscript. */
-    if (kind_is(node, "subscript") && ts_node_named_child_count(node) == 2)
-        return python_is_typing_optional(index, field(node, "value"))
-                   ? python_annotation_chain(index, field(node, "subscript"), depth + 1)
+    if (kind_is(node, "subscript")) {
+        TSNode args[3];
+        memset(args, 0, sizeof(args));
+        uint32_t count = ts_node_named_child_count(node), used = 0;
+        for (uint32_t i = 1; i < count && used < 3; i++)
+            args[used++] = ts_node_named_child(node, i);
+        return count >= 2 && count <= 4
+                   ? python_generic_chain(index, field(node, "value"), args, used, depth)
                    : NULL;
+    }
     if (kind_is(node, "union_type") && ts_node_named_child_count(node) == 2)
         return python_union_chain(index, ts_node_named_child(node, 0), ts_node_named_child(node, 1),
                                   depth);
@@ -1249,12 +1504,6 @@ static const char *python_import_canonical(const cbm_resolve_binding_index_t *in
         return cbm_arena_sprintf(index->arena, "%s%s", import->module_path, chain + root);
     }
     return NULL;
-}
-
-static TSNode python_function_of(TSNode statement) {
-    if (kind_is(statement, "decorated_definition"))
-        statement = field(statement, "definition");
-    return kind_is(statement, "function_definition") ? statement : (TSNode){0};
 }
 
 /* Every path through the block ends in return or raise: it cannot fall off the
@@ -1289,283 +1538,6 @@ static bool python_block_always_exits(TSNode block, unsigned depth) {
         }
     }
     return has_else;
-}
-
-static bool python_calls_name(cbm_resolve_binding_index_t *index, TSNode node, const char *name,
-                              unsigned depth) {
-    if (ts_node_is_null(node) || depth > 48)
-        return false;
-    if (kind_is(node, "call")) {
-        TSNode function = field(node, "function");
-        const char *text = kind_is(function, "identifier") ? node_text(index, function) : NULL;
-        if (text && !strcmp(text, name))
-            return true;
-    }
-    if (depth && (kind_is(node, "class_definition") || kind_is(node, "function_definition")))
-        return false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++)
-        if (python_calls_name(index, ts_node_named_child(node, i), name, depth + 1))
-            return true;
-    return false;
-}
-
-/* `@wraps(fn)` on a local def whose body calls fn: calling the wrapper is calling
- * the function it wraps. */
-static bool python_wrapper_of(cbm_resolve_binding_index_t *index, TSNode function, const char *fn) {
-    TSNode decorated = ts_node_parent(function);
-    if (!kind_is(decorated, "decorated_definition"))
-        return false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(decorated); i++) {
-        TSNode decorator = ts_node_named_child(decorated, i);
-        if (!kind_is(decorator, "decorator") || !ts_node_named_child_count(decorator))
-            continue;
-        TSNode call = ts_node_named_child(decorator, 0);
-        TSNode args = kind_is(call, "call") ? field(call, "arguments") : (TSNode){0};
-        if (ts_node_is_null(args) || !ts_node_named_child_count(args))
-            continue;
-        const char *spelled = python_chain(index, field(call, "function"), 0);
-        const char *canonical = spelled ? python_import_canonical(index, spelled) : NULL;
-        const char *first = kind_is(ts_node_named_child(args, 0), "identifier")
-                                ? node_text(index, ts_node_named_child(args, 0))
-                                : NULL;
-        if (canonical && !strcmp(canonical, "functools.wraps") && first && !strcmp(first, fn))
-            return python_calls_name(index, field(function, "body"), fn, 0);
-    }
-    return false;
-}
-
-static void python_collect_returns(cbm_resolve_binding_index_t *index, TSNode node, TSNode owner,
-                                   const char *parameter, unsigned depth, unsigned *shape,
-                                   bool *failed);
-
-/* What applying this function to a decorated declaration does, from its source.
- * DIRECT: `@deco` keeps the declaration callable as itself. FACTORY: `@deco(...)`
- * does. Every return must be accounted for; one unknown return proves nothing. */
-static unsigned python_decorator_shape(cbm_resolve_binding_index_t *index, TSNode function,
-                                       unsigned depth) {
-    TSNode body = field(function, "body"), parameters = field(function, "parameters");
-    if (depth > 4 || ts_node_is_null(body) || ts_node_is_null(parameters) ||
-        !python_block_always_exits(body, 0))
-        return 0;
-    TSNode first =
-        ts_node_named_child_count(parameters) ? ts_node_named_child(parameters, 0) : (TSNode){0};
-    if (kind_is(first, "typed_parameter") && ts_node_named_child_count(first))
-        first = ts_node_named_child(first, 0);
-    if (kind_is(first, "default_parameter") || kind_is(first, "typed_default_parameter"))
-        first = field(first, "name");
-    const char *parameter = kind_is(first, "identifier") ? node_text(index, first) : NULL;
-    unsigned shape = 0;
-    bool failed = false;
-    if (depth == 0) {
-        index->python_shape_delegate = NULL;
-        index->python_shape_delegate_applied = false;
-    }
-    python_collect_returns(index, body, function, parameter, depth, &shape, &failed);
-    return failed ? 0 : shape;
-}
-
-typedef bool (*python_def_check_t)(cbm_resolve_binding_index_t *, TSNode, const char *, unsigned);
-
-static bool python_def_calls(cbm_resolve_binding_index_t *index, TSNode function, const char *fn,
-                             unsigned depth) {
-    (void)depth;
-    return python_calls_name(index, field(function, "body"), fn, 0);
-}
-
-static bool python_def_wraps(cbm_resolve_binding_index_t *index, TSNode function, const char *fn,
-                             unsigned depth) {
-    (void)depth;
-    return python_wrapper_of(index, function, fn);
-}
-
-static bool python_def_decorates(cbm_resolve_binding_index_t *index, TSNode function,
-                                 const char *fn, unsigned depth) {
-    (void)fn;
-    return python_decorator_shape(index, function, depth) & CBM_PY_SHAPE_DIRECT;
-}
-
-static bool python_walk_local_defs(cbm_resolve_binding_index_t *index, TSNode node,
-                                   const char *name, const char *fn, python_def_check_t check,
-                                   unsigned check_depth, unsigned *found, unsigned depth) {
-    if (ts_node_is_null(node) || depth > 24)
-        return false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
-        TSNode function = python_function_of(child);
-        if (!ts_node_is_null(function)) {
-            const char *text = node_text(index, field(function, "name"));
-            if (text && !strcmp(text, name)) {
-                (*found)++;
-                if (!check(index, function, fn, check_depth))
-                    return false;
-            }
-            continue;
-        }
-        if (kind_is(child, "class_definition") || kind_is(child, "lambda") ||
-            kind_is(child, "expression_statement") || kind_is(child, "return_statement"))
-            continue;
-        if (!python_walk_local_defs(index, child, name, fn, check, check_depth, found, depth + 1))
-            return false;
-    }
-    return true;
-}
-
-/* The defs of `name` in this function's own body, outside nested scopes. Either arm
- * of a conditional pair can be the one bound at run time, so every def has to pass. */
-static bool python_local_defs_pass(cbm_resolve_binding_index_t *index, TSNode body,
-                                   const char *name, const char *fn, python_def_check_t check,
-                                   unsigned check_depth) {
-    unsigned found = 0;
-    return name && python_walk_local_defs(index, body, name, fn, check, check_depth, &found, 0) &&
-           found;
-}
-
-static bool python_is_parameter(cbm_resolve_binding_index_t *index, TSNode node,
-                                const char *parameter) {
-    const char *text = parameter && kind_is(node, "identifier") ? node_text(index, node) : NULL;
-    return text && !strcmp(text, parameter);
-}
-
-static TSNode python_call_argument(TSNode call, uint32_t position) {
-    TSNode args = field(call, "arguments");
-    return !ts_node_is_null(args) && ts_node_named_child_count(args) > position
-               ? ts_node_named_child(args, position)
-               : (TSNode){0};
-}
-
-/* update_wrapper(g, fn) anywhere in this body, outside nested scopes. */
-static bool python_body_updates_wrapper(cbm_resolve_binding_index_t *index, TSNode node,
-                                        const char *wrapper, const char *parameter,
-                                        unsigned depth) {
-    if (ts_node_is_null(node) || depth > 16)
-        return false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
-        if (kind_is(child, "function_definition") || kind_is(child, "class_definition") ||
-            kind_is(child, "decorated_definition") || kind_is(child, "lambda"))
-            continue;
-        if (kind_is(child, "call")) {
-            const char *callee = python_chain(index, field(child, "function"), 0);
-            const char *imported = callee ? python_import_canonical(index, callee) : NULL;
-            if (imported && !strcmp(imported, "functools.update_wrapper") &&
-                python_is_parameter(index, python_call_argument(child, 0), wrapper) &&
-                python_is_parameter(index, python_call_argument(child, 1), parameter))
-                return true;
-        }
-        if (python_body_updates_wrapper(index, child, wrapper, parameter, depth + 1))
-            return true;
-    }
-    return false;
-}
-
-/* The return hands the function to another decorator: X(fn) or X(...)(fn). Which
- * function X names, and what it does, is decided across files. */
-static bool python_note_delegate(cbm_resolve_binding_index_t *index, TSNode callee, bool applied,
-                                 unsigned *shape) {
-    const char *chain = python_chain(index, callee, 0);
-    if (!chain || (index->python_shape_delegate && strcmp(index->python_shape_delegate, chain)))
-        return false;
-    index->python_shape_delegate = chain;
-    index->python_shape_delegate_applied = applied;
-    *shape |= CBM_PY_SHAPE_DELEGATES;
-    return true;
-}
-
-static void python_classify_call_return(cbm_resolve_binding_index_t *index, TSNode value,
-                                        TSNode owner, const char *parameter, unsigned depth,
-                                        unsigned *shape, bool *failed) {
-    TSNode body = field(owner, "body"), callee = field(value, "function");
-    const char *name = kind_is(callee, "identifier") ? node_text(index, callee) : NULL;
-    /* decorator(func), the both-ways form: a local decorator applied here. */
-    if (python_local_defs_pass(index, body, name, NULL, python_def_decorates, depth + 1)) {
-        *shape |= CBM_PY_SHAPE_DIRECT;
-        return;
-    }
-    TSNode first = python_call_argument(value, 0);
-    const char *first_name = kind_is(first, "identifier") ? node_text(index, first) : NULL;
-    bool wrapper_calls = parameter && python_local_defs_pass(index, body, first_name, parameter,
-                                                             python_def_calls, 0);
-    /* wraps(fn)(g) and update_wrapper(g, fn): g calls fn. */
-    if (kind_is(callee, "call")) {
-        const char *outer = python_chain(index, field(callee, "function"), 0);
-        const char *imported = outer ? python_import_canonical(index, outer) : NULL;
-        if (imported && !strcmp(imported, "functools.wraps") && wrapper_calls &&
-            python_is_parameter(index, python_call_argument(callee, 0), parameter)) {
-            *shape |= CBM_PY_SHAPE_DIRECT;
-            return;
-        }
-        if (depth == 0 && python_is_parameter(index, first, parameter) &&
-            python_note_delegate(index, field(callee, "function"), true, shape))
-            return;
-        *failed = true;
-        return;
-    }
-    const char *spelled = python_chain(index, callee, 0);
-    const char *imported = spelled ? python_import_canonical(index, spelled) : NULL;
-    if (imported && !strcmp(imported, "functools.update_wrapper") && wrapper_calls &&
-        python_is_parameter(index, python_call_argument(value, 1), parameter)) {
-        *shape |= CBM_PY_SHAPE_DIRECT;
-        return;
-    }
-    if (depth == 0 && python_is_parameter(index, first, parameter) &&
-        python_note_delegate(index, callee, false, shape))
-        return;
-    *failed = true;
-}
-
-static void python_classify_return(cbm_resolve_binding_index_t *index, TSNode value, TSNode owner,
-                                   const char *parameter, unsigned depth, unsigned *shape,
-                                   bool *failed) {
-    TSNode body = field(owner, "body");
-    if (kind_is(value, "identifier")) {
-        const char *name = node_text(index, value);
-        if (name && parameter && !strcmp(name, parameter)) {
-            *shape |= CBM_PY_SHAPE_DIRECT;
-            return;
-        }
-        if (parameter &&
-            (python_local_defs_pass(index, body, name, parameter, python_def_wraps, 0) ||
-             (python_body_updates_wrapper(index, body, name, parameter, 0) &&
-              python_local_defs_pass(index, body, name, parameter, python_def_calls, 0)))) {
-            *shape |= CBM_PY_SHAPE_DIRECT;
-            return;
-        }
-        if (python_local_defs_pass(index, body, name, NULL, python_def_decorates, depth + 1))
-            *shape |= CBM_PY_SHAPE_FACTORY;
-        else
-            *failed = true;
-        return;
-    }
-    if (kind_is(value, "call")) {
-        python_classify_call_return(index, value, owner, parameter, depth, shape, failed);
-        return;
-    }
-    *failed = true;
-}
-
-static void python_collect_returns(cbm_resolve_binding_index_t *index, TSNode node, TSNode owner,
-                                   const char *parameter, unsigned depth, unsigned *shape,
-                                   bool *failed) {
-    for (uint32_t i = 0; !*failed && i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
-        if (kind_is(child, "function_definition") || kind_is(child, "class_definition") ||
-            kind_is(child, "decorated_definition") || kind_is(child, "lambda"))
-            continue;
-        if (kind_is(child, "yield")) {
-            /* A generator returns a generator, whatever its return says. */
-            *failed = true;
-            return;
-        }
-        if (kind_is(child, "return_statement")) {
-            if (!ts_node_named_child_count(child))
-                *failed = true;
-            else
-                python_classify_return(index, ts_node_named_child(child, 0), owner, parameter,
-                                       depth, shape, failed);
-            continue;
-        }
-        python_collect_returns(index, child, owner, parameter, depth, shape, failed);
-    }
 }
 
 /* Every value this function returns, outside nested scopes. A bare return and
@@ -1606,7 +1578,44 @@ static void python_note_returns(cbm_resolve_binding_index_t *index, TSNode funct
     enum { RETURNS_MAX = 16 };
     const char *chains[RETURNS_MAX];
     uint32_t count = 0;
-    if (member >= index->python_member_count || !ts_node_is_null(field(function, "return_type")) ||
+    /* `-> Self` and `def f(self: T) -> T` return the receiver, whichever class that is. */
+    TSNode declared_return = field(function, "return_type");
+    binding_scope_t *body_scope = scope < index->scope_count ? &index->scopes[scope] : NULL;
+    if (member < index->python_member_count && !ts_node_is_null(declared_return) && body_scope &&
+        body_scope->self_name) {
+        const char *declared = python_annotation_chain(index, declared_return, 0);
+        const char *canonical = declared ? python_import_canonical(index, declared) : NULL;
+        TSNode parameters = field(function, "parameters");
+        TSNode first = ts_node_named_child_count(parameters) ? ts_node_named_child(parameters, 0)
+                                                             : (TSNode){0};
+        const char *first_type = kind_is(first, "typed_parameter")
+                                     ? python_annotation_chain(index, field(first, "type"), 0)
+                                     : NULL;
+        if (declared && ((canonical && (!strcmp(canonical, "typing.Self") ||
+                                        !strcmp(canonical, "typing_extensions.Self"))) ||
+                         (first_type && !strcmp(first_type, declared)))) {
+            const char **kept = cbm_arena_alloc(index->arena, 2 * sizeof(*kept));
+            if (!kept) {
+                fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "python_member_allocation");
+                return;
+            }
+            kept[0] = body_scope->self_is_class
+                          ? cbm_arena_sprintf(index->arena, "%s()", body_scope->self_name)
+                          : body_scope->self_name;
+            kept[1] = NULL;
+            index->python_members[member].return_chain = NULL;
+            index->python_members[member].returned = kept;
+            index->python_members[member].returned_scope = scope;
+            return;
+        }
+    }
+    /* What __new__ and friends answer with decides whether they defer to the base, whatever
+     * they are annotated to return. */
+    const char *name = node_text(index, field(function, "name"));
+    bool special = name && (!strcmp(name, "__new__") || !strcmp(name, "__getattribute__") ||
+                            !strcmp(name, "__class_getitem__"));
+    if (member >= index->python_member_count ||
+        (!special && !ts_node_is_null(field(function, "return_type"))) ||
         !python_gather_returns(index, field(function, "body"), chains, &count, RETURNS_MAX, 0) ||
         !count)
         return;
@@ -1665,6 +1674,185 @@ static const char *python_decorator_chain(cbm_resolve_binding_index_t *index, TS
     return python_chain(index, value, 0);
 }
 
+static bool python_overload_stub(cbm_resolve_binding_index_t *index, TSNode decorated) {
+    uint32_t count = ts_node_named_child_count(decorated);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(decorated, i);
+        if (!kind_is(child, "decorator") || !ts_node_named_child_count(child))
+            continue;
+        const char *chain = python_chain(index, ts_node_named_child(child, 0), 0);
+        size_t length = chain ? strlen(chain) : 0;
+        if (length < 8 || strcmp(chain + length - 8, "overload"))
+            continue;
+        const char *canonical = python_import_canonical(index, chain);
+        if (canonical && (!strcmp(canonical, "typing.overload") ||
+                          !strcmp(canonical, "typing_extensions.overload")))
+            return true;
+    }
+    return false;
+}
+
+static void python_finish_narrows(cbm_resolve_binding_index_t *index);
+
+static void python_add_narrow(cbm_resolve_binding_index_t *index, TSNode test, uint32_t from,
+                              uint32_t until) {
+    TSNode function = field(test, "function"), args = field(test, "arguments");
+    const char *callee = kind_is(test, "call") && kind_is(function, "identifier")
+                             ? node_text(index, function)
+                             : NULL;
+    if (!callee || strcmp(callee, "isinstance") || ts_node_is_null(args) ||
+        ts_node_named_child_count(args) != 2 || until <= from)
+        return;
+    TSNode kind = ts_node_named_child(args, 1);
+    const char *chain = python_chain(index, ts_node_named_child(args, 0), 0);
+    /* A tuple of classes says only that it is one of them. */
+    const char *type = kind_is(kind, "identifier") || kind_is(kind, "attribute")
+                           ? python_chain(index, kind, 0)
+                           : NULL;
+    /* A call or subscript computes a new value each time. */
+    if (!chain || !type || strpbrk(chain, "([@"))
+        return;
+    python_narrow_t *items = grow_array(index, index->python_narrows, index->python_narrow_count,
+                                        &index->python_narrow_capacity, sizeof(*items));
+    if (!items) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "python_narrow_allocation");
+        return;
+    }
+    index->python_narrows = items;
+    items[index->python_narrow_count++] = (python_narrow_t){
+        .chain = chain, .type = type, .from = from, .until = until, .scope = index->current_scope};
+}
+
+/* Each conjunct of `a and b` holds in what follows it, up to the end of the block it guards. */
+static void python_note_condition(cbm_resolve_binding_index_t *index, TSNode condition,
+                                  uint32_t until, unsigned depth) {
+    if (kind_is(condition, "parenthesized_expression") && ts_node_named_child_count(condition) == 1)
+        condition = ts_node_named_child(condition, 0);
+    const char *operator= kind_is(condition, "boolean_operator")
+        ? node_text(index, field(condition, "operator"))
+        : NULL;
+    if (operator&& !strcmp(operator, "and") && depth < 8) {
+        python_note_condition(index, field(condition, "left"), until, depth + 1);
+        python_note_condition(index, field(condition, "right"), until, depth + 1);
+        return;
+    }
+    python_add_narrow(index, condition, ts_node_end_byte(condition), until);
+}
+
+static uint32_t python_block_end(TSNode statement);
+
+/* isinstance as if and elif conditions, as `if not isinstance: leave` and as an assert. */
+static void python_note_narrowing(cbm_resolve_binding_index_t *index, TSNode node,
+                                  const char *kind) {
+    if (!strcmp(kind, "assert_statement")) {
+        TSNode test = ts_node_named_child_count(node) ? ts_node_named_child(node, 0) : (TSNode){0};
+        python_add_narrow(index, test, ts_node_end_byte(node), python_block_end(node));
+        return;
+    }
+    TSNode condition = field(node, "condition"), body = field(node, "consequence");
+    if (ts_node_is_null(condition) || ts_node_is_null(body))
+        return;
+    if (kind_is(condition, "not_operator")) {
+        /* The other way to reach what follows left the block. */
+        if (!strcmp(kind, "if_statement") && python_block_always_exits(body, 0) &&
+            ts_node_is_null(field(node, "alternative")))
+            python_add_narrow(index, field(condition, "argument"), ts_node_end_byte(node),
+                              python_block_end(node));
+        return;
+    }
+    python_note_condition(index, condition, ts_node_end_byte(body), 0);
+}
+
+/* Where the block holding this statement ends. Later statements of a block run only after
+ * this one. A def or lambda in between means the statement is not in such a block. */
+static uint32_t python_block_end(TSNode statement) {
+    TSNode node = statement;
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
+        node = ts_node_parent(node);
+        if (ts_node_is_null(node) || kind_is(node, "lambda"))
+            return 0;
+        if (kind_is(node, "block") || kind_is(node, "module"))
+            return ts_node_end_byte(node);
+    }
+    return 0;
+}
+
+/* `with X() as y`: y holds what __enter__ returns, from there to the end of the with
+ * statement's block. `except E as e`: e holds an E, for that clause only. */
+static void python_note_as_target(cbm_resolve_binding_index_t *index, binding_name_t *name,
+                                  TSNode identifier) {
+    TSNode pattern = ts_node_parent(ts_node_parent(identifier));
+    TSNode holder = ts_node_parent(pattern);
+    if (!kind_is(pattern, "as_pattern") || !ts_node_named_child_count(pattern))
+        return;
+    const char *chain = python_chain(index, ts_node_named_child(pattern, 0), 0);
+    name->value_from = ts_node_end_byte(pattern);
+    if (kind_is(holder, "except_clause") || kind_is(holder, "except_group_clause")) {
+        name->value_chain = chain;
+        name->value_kind = CBM_PY_ROOT_TYPED;
+        name->value_until = ts_node_end_byte(holder);
+    } else if (kind_is(holder, "with_item")) {
+        TSNode statement = ts_node_parent(ts_node_parent(holder));
+        bool awaited = kind_is(statement, "with_statement") && ts_node_child_count(statement) &&
+                       kind_is(ts_node_child(statement, 0), "async");
+        name->value_chain = chain ? cbm_arena_sprintf(index->arena, "%s.%s()", chain,
+                                                      awaited ? "__aenter__" : "__enter__")
+                                  : NULL;
+        name->value_kind = CBM_PY_ROOT_ASSIGNED;
+        name->value_until = python_block_end(statement);
+    }
+}
+
+/* One name of a tuple a loop unpacks, when the iterable says what that position holds. */
+static void python_note_unpacked_loop_target(cbm_resolve_binding_index_t *index,
+                                             binding_name_t *name, TSNode identifier) {
+    TSNode pattern = ts_node_parent(identifier), loop = ts_node_parent(pattern);
+    if ((!kind_is(loop, "for_statement") && !kind_is(loop, "for_in_clause")) ||
+        !ts_node_eq(pattern, field(loop, "left")))
+        return;
+    uint32_t position = 0, count = ts_node_named_child_count(pattern);
+    bool located = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(pattern);
+    for (bool more = ts_tree_cursor_goto_first_child(&cursor); more && !located;
+         more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode child = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_eq(child, identifier))
+            located = true;
+        else if (ts_node_is_named(child))
+            position++;
+    }
+    ts_tree_cursor_delete(&cursor);
+    TSNode right = field(loop, "right");
+    TSNode function = field(right, "function"), args = field(right, "arguments");
+    if (!located || !kind_is(right, "call") || ts_node_is_null(args))
+        return;
+    uint32_t supplied = ts_node_named_child_count(args);
+    const char *value = NULL;
+    if (kind_is(function, "attribute")) {
+        /* d.items() against an annotated map: the second is the value. */
+        const char *member = node_text(index, field(function, "attribute"));
+        const char *object = python_chain(index, field(function, "object"), 0);
+        if (member && !strcmp(member, "items") && object && count == 2 && position == 1)
+            value = cbm_arena_sprintf(index->arena, "%s@values@iter", object);
+    } else if (kind_is(function, "identifier")) {
+        const char *callee = node_text(index, function);
+        const char *source = NULL;
+        if (callee && !strcmp(callee, "enumerate") && count == 2 && position == 1 && supplied >= 1)
+            source = python_chain(index, ts_node_named_child(args, 0), 0);
+        else if (callee && !strcmp(callee, "zip") && supplied == count)
+            source = python_chain(index, ts_node_named_child(args, position), 0);
+        /* The name is checked to be the builtin when this is read. */
+        value = source ? cbm_arena_sprintf(index->arena, "%s(%s)@iter", callee, source) : NULL;
+    }
+    if (!value)
+        return;
+    name->value_chain = value;
+    name->value_kind = CBM_PY_ROOT_ASSIGNED;
+    name->value_from = ts_node_end_byte(right);
+    TSNode body = kind_is(loop, "for_statement") ? field(loop, "body") : ts_node_parent(loop);
+    name->value_until = ts_node_is_null(body) ? 0 : ts_node_end_byte(body);
+}
+
 /* What the name just recorded was bound to, when that is statically followable.
  * Lookup uses it only while this stays the scope's one binder of the name. */
 static void python_note_binder_value(cbm_resolve_binding_index_t *index, TSNode identifier,
@@ -1672,9 +1860,53 @@ static void python_note_binder_value(cbm_resolve_binding_index_t *index, TSNode 
     binding_name_t *name = &index->names[index->name_count - 1];
     uint32_t scope = index->current_scope;
     name->value_scope = scope;
+    if (parent && !strcmp(parent, "as_pattern_target")) {
+        python_note_as_target(index, name, identifier);
+        return;
+    }
+
+    if (parent &&
+        (!strcmp(parent, "parameters") || !strcmp(parent, "typed_parameter") ||
+         !strcmp(parent, "typed_default_parameter") || !strcmp(parent, "default_parameter")))
+        name->value_until = UINT32_MAX;
+    /* `def make(self, Request=Request)`: what the signature says it holds unless told
+     * otherwise, read where the def stands. */
+    if (parent && !strcmp(parent, "default_parameter") && field_name &&
+        !strcmp(field_name, "name") && scope) {
+        name->value_chain = python_chain(index, field(ts_node_parent(identifier), "value"), 0);
+        name->value_kind = name->value_chain ? CBM_PY_ROOT_ASSIGNED : name->value_kind;
+        name->value_scope = index->scopes[scope].method_of ? index->scopes[scope].method_of - 1
+                                                           : index->scopes[scope].parent;
+        return;
+    }
+    /* `for k, v in d.items()`, `for i, x in enumerate(E)`, `for a, b in zip(A, B)`. */
+    if (parent && !strcmp(parent, "pattern_list")) {
+        python_note_unpacked_loop_target(index, name, identifier);
+        return;
+    }
+    /* `if (m := Foo()):` */
+    if (parent && !strcmp(parent, "named_expression")) {
+        name->value_chain = python_chain(index, field(ts_node_parent(identifier), "value"), 0);
+        name->value_kind = name->value_chain ? CBM_PY_ROOT_ASSIGNED : name->value_kind;
+        return;
+    }
+    /* `for x in E`: x holds what E yields, for the loop's body. */
+    if (parent && (!strcmp(parent, "for_statement") || !strcmp(parent, "for_in_clause")) &&
+        field_name && !strcmp(field_name, "left")) {
+        TSNode loop = ts_node_parent(identifier), right = field(loop, "right");
+        const char *chain = python_chain(index, right, 0);
+        TSNode body = !strcmp(parent, "for_statement") ? field(loop, "body") : ts_node_parent(loop);
+        name->value_chain = chain ? cbm_arena_sprintf(index->arena, "%s@iter", chain) : NULL;
+        name->value_kind = name->value_chain ? CBM_PY_ROOT_ASSIGNED : name->value_kind;
+        name->value_from = ts_node_end_byte(right);
+        name->value_until = ts_node_is_null(body) ? 0 : ts_node_end_byte(body);
+        return;
+    }
     if (parent && !strcmp(parent, "assignment") && field_name && !strcmp(field_name, "left")) {
         TSNode assignment = ts_node_parent(identifier);
         TSNode type = field(assignment, "type"), right = field(assignment, "right");
+        name->value_from = ts_node_end_byte(assignment);
+        name->value_until = python_block_end(assignment);
         if (!ts_node_is_null(type)) {
             name->value_chain = python_annotation_chain(index, type, 0);
             name->value_kind = CBM_PY_ROOT_TYPED;
@@ -1732,13 +1964,125 @@ static cbm_resolve_python_member_t *python_add_member(cbm_resolve_binding_index_
     return entry->target ? entry : NULL;
 }
 
+static bool python_constant_value(TSNode value) {
+    return kind_is(value, "integer") || kind_is(value, "float") || kind_is(value, "string") ||
+           kind_is(value, "concatenated_string") || kind_is(value, "true") ||
+           kind_is(value, "false") || kind_is(value, "none") || kind_is(value, "list") ||
+           kind_is(value, "dictionary") || kind_is(value, "tuple") || kind_is(value, "set");
+}
+
+/* This body can only hand back a constant or nothing: a decorator like that discards the
+ * function. A stub says nothing, and neither does a body that only raises. The walk stays
+ * out of nested scopes, so across a file each node is visited once per enclosing def. */
+static bool python_body_discards(TSNode body) {
+    bool returned = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool discards = true, more = ts_tree_cursor_goto_first_child(&cursor);
+    unsigned depth = 1;
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool nested = kind_is(node, "function_definition") || kind_is(node, "class_definition") ||
+                      kind_is(node, "decorated_definition") || kind_is(node, "lambda");
+        if (kind_is(node, "yield")) {
+            /* A generator returns a generator, whatever its return says. */
+            ts_tree_cursor_delete(&cursor);
+            return true;
+        }
+        if (kind_is(node, "return_statement")) {
+            returned = true;
+            if (ts_node_named_child_count(node) &&
+                !python_constant_value(ts_node_named_child(node, 0))) {
+                discards = false;
+                break;
+            }
+        }
+        if (!nested && !kind_is(node, "return_statement") &&
+            ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (--depth == 0 || !ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (!discards || returned)
+        return discards;
+    if (python_block_always_exits(body, 0))
+        return false;
+    uint32_t count = ts_node_named_child_count(body);
+    TSNode last = count ? ts_node_named_child(body, count - 1) : (TSNode){0};
+    return !(kind_is(last, "expression_statement") && ts_node_named_child_count(last) &&
+             kind_is(ts_node_named_child(last, 0), "ellipsis"));
+}
+
+/* The name of a def's first parameter, when it has one a body could spell. */
+static const char *python_first_parameter(cbm_resolve_binding_index_t *index, TSNode function) {
+    TSNode parameters = field(function, "parameters");
+    if (ts_node_is_null(parameters) || !ts_node_named_child_count(parameters))
+        return NULL;
+    TSNode first = ts_node_named_child(parameters, 0);
+    if (kind_is(first, "typed_parameter") && ts_node_named_child_count(first))
+        first = ts_node_named_child(first, 0);
+    else if (kind_is(first, "default_parameter") || kind_is(first, "typed_default_parameter"))
+        first = field(first, "name");
+    return kind_is(first, "identifier") ? node_text(index, first) : NULL;
+}
+
+static bool python_spells(const cbm_resolve_binding_index_t *index, TSNode node, const char *word) {
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    size_t length = strlen(word);
+    return end - start == length && end <= index->source_len &&
+           !memcmp(index->source + start, word, length);
+}
+
+/* `def replace(function): return other`. A body that returns a value and never spells its
+ * parameter cannot have built that value from the function. locals() and the like could reach
+ * it by another name. Stops at the first mention, and only top-level and nested defs get here,
+ * so across a file each node is visited once per enclosing def. */
+static bool python_body_replaces(cbm_resolve_binding_index_t *index, TSNode function) {
+    const char *parameter = python_first_parameter(index, function);
+    TSNode body = field(function, "body");
+    if (!parameter || ts_node_is_null(body))
+        return false;
+    bool returns = false, mentioned = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    unsigned depth = 1, nested = 0;
+    while (more && !mentioned) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (kind_is(node, "identifier"))
+            mentioned = python_spells(index, node, parameter) ||
+                        python_spells(index, node, "locals") ||
+                        python_spells(index, node, "vars") || python_spells(index, node, "eval") ||
+                        python_spells(index, node, "exec");
+        returns = returns ||
+                  (!nested && kind_is(node, "return_statement") && ts_node_named_child_count(node));
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            nested += kind_is(node, "function_definition") || kind_is(node, "lambda");
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (--depth == 0 || !ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+            TSNode up = ts_tree_cursor_current_node(&cursor);
+            nested -= nested && (kind_is(up, "function_definition") || kind_is(up, "lambda"));
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return returns && !mentioned;
+}
+
 static void python_note_member_shape(cbm_resolve_binding_index_t *index,
                                      cbm_resolve_python_member_t *member, TSNode function) {
-    member->shape = python_decorator_shape(index, function, 0);
-    if (member->shape & CBM_PY_SHAPE_DELEGATES) {
-        member->delegate_chain = index->python_shape_delegate;
-        member->delegate_applied = index->python_shape_delegate_applied;
-    }
+    member->discards = python_body_discards(field(function, "body"));
+    member->replaces = !member->discards && python_body_replaces(index, function);
 }
 
 /* A def directly in a class body. Its decorators are classified with the file's
@@ -1793,6 +2137,25 @@ static void python_note_function(cbm_resolve_binding_index_t *index, TSNode node
     python_note_member_shape(index, member, node);
 }
 
+/* `go = classmethod(go)` is the decorator spelled out: the callee, when this is that shape. */
+static const char *python_spelled_decorator(cbm_resolve_binding_index_t *index, TSNode target,
+                                            const char *name) {
+    TSNode assignment = ts_node_parent(target);
+    if (!kind_is(assignment, "assignment"))
+        return NULL;
+    TSNode right = field(assignment, "right");
+    TSNode function = field(right, "function"), args = field(right, "arguments");
+    if (!kind_is(right, "call") || !kind_is(function, "identifier") || ts_node_is_null(args) ||
+        ts_node_named_child_count(args) != 1)
+        return NULL;
+    TSNode only = ts_node_named_child(args, 0);
+    const char *callee = node_text(index, function);
+    return kind_is(only, "identifier") && python_spells(index, only, name) && callee &&
+                   (!strcmp(callee, "classmethod") || !strcmp(callee, "staticmethod"))
+               ? callee
+               : NULL;
+}
+
 /* Class-level assignment or declaration. No graph node carries it, but it stops
  * lookup: a base's method of the same name is not what this class exposes. */
 static void python_note_class_value(cbm_resolve_binding_index_t *index, const char *name, TSNode at,
@@ -1808,7 +2171,12 @@ static void python_note_class_value(cbm_resolve_binding_index_t *index, const ch
     else
         member->value_chain = chain;
     member->none_value = none;
-    member->chain_scope = owner;
+    member->spelled_decorator = python_spelled_decorator(index, at, name);
+    /* `ResultConsumer = ResultConsumer` in a class body reads the name from outside it: the
+     * binding does not exist until the statement has run. */
+    size_t root = chain ? strcspn(chain, ".(") : 0;
+    bool self_named = root && strlen(name) == root && !strncmp(chain, name, root);
+    member->chain_scope = self_named ? index->scopes[owner].parent : owner;
 }
 
 /* The method whose first parameter a name in this scope chain denotes. */
@@ -1886,8 +2254,6 @@ static void python_note_class(cbm_resolve_binding_index_t *index, TSNode node, u
     for (uint32_t i = 0; i < count; i++) {
         TSNode base = ts_node_named_child(bases, i);
         if (kind_is(base, "keyword_argument")) {
-            const char *keyword = node_text(index, field(base, "name"));
-            entry->metaclass |= keyword && !strcmp(keyword, "metaclass");
             continue;
         }
         if (kind_is(base, "comment"))
@@ -3912,10 +4278,53 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
             return state;
         }
     }
+    /* A star under TYPE_CHECKING states the module's names as its plain imports there do. */
     if (index->language == CBM_LANG_PYTHON && !strcmp(kind, "wildcard_import") &&
-        (inherited.scope || inherited.conditional)) {
+        (inherited.scope || (inherited.conditional && !python_type_checking_import(index, node)))) {
         fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "conditional_wildcard_import");
         return state;
+    }
+    if (index->language == CBM_LANG_PYTHON &&
+        (!strcmp(kind, "if_statement") || !strcmp(kind, "elif_clause") ||
+         !strcmp(kind, "assert_statement")))
+        python_note_narrowing(index, node, kind);
+    /* A store through an attribute ends what a narrowing said about that attribute. */
+    if (index->language == CBM_LANG_PYTHON && kind_is(node, "attribute") && field_name &&
+        !strcmp(field_name, "left") && parent_kind &&
+        (!strcmp(parent_kind, "assignment") || !strcmp(parent_kind, "augmented_assignment"))) {
+        const char *chain = python_chain(index, node, 0);
+        python_store_t *stores =
+            chain ? grow_array(index, index->python_stores, index->python_store_count,
+                               &index->python_store_capacity, sizeof(*stores))
+                  : NULL;
+        if (stores) {
+            index->python_stores = stores;
+            stores[index->python_store_count++] = (python_store_t){
+                .chain = chain,
+                .at = ts_node_end_byte(ts_node_parent(node)),
+                .scope = state.scope,
+                .value = strcmp(parent_kind, "assignment")
+                             ? NULL
+                             : python_chain(index, field(ts_node_parent(node), "right"), 0),
+                .value_at = ts_node_start_byte(node)};
+        }
+    }
+    if (index->language == CBM_LANG_PYTHON &&
+        (!strcmp(kind, "for_statement") || !strcmp(kind, "while_statement"))) {
+        python_loop_t *loops = grow_array(index, index->python_loops, index->python_loop_count,
+                                          &index->python_loop_capacity, sizeof(*loops));
+        if (!loops) {
+            fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "python_loop_allocation");
+            return state;
+        }
+        index->python_loops = loops;
+        uint32_t start = ts_node_start_byte(node);
+        /* Loops nest or are disjoint, so the walk's order alone says which are still open. */
+        while (index->python_open_loop && loops[index->python_open_loop - 1].end <= start)
+            index->python_open_loop = loops[index->python_open_loop - 1].parent;
+        loops[index->python_loop_count++] = (python_loop_t){
+            .start = start, .end = ts_node_end_byte(node), .parent = index->python_open_loop};
+        index->python_open_loop = (uint32_t)index->python_loop_count;
     }
     bool import = kind_is(node, "import_statement") || kind_is(node, "import_from_statement");
     if (import) {
@@ -3934,6 +4343,12 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
             note_import(index, node, true);
         }
     }
+    /* typing.overload stubs announce the def that follows: with it they are one declaration,
+     * and they bind nothing of their own. */
+    bool overload_stub = index->language == CBM_LANG_PYTHON &&
+                         !strcmp(kind, "function_definition") && parent_kind &&
+                         !strcmp(parent_kind, "decorated_definition") &&
+                         python_overload_stub(index, ts_node_parent(node));
     if (index->language == CBM_LANG_PYTHON && strcmp(kind, "class_definition") == 0) {
         /* A class creates a binding in its enclosing namespace. Its members
          * do not authorize callable targets, but must not erase independent
@@ -3947,7 +4362,8 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
             python_note_decorated(index, node, index->names[index->name_count - 1].target,
                                   class_name, true);
     }
-    if (strcmp(kind, "function_definition") == 0 || strcmp(kind, "function_declaration") == 0) {
+    if ((strcmp(kind, "function_definition") == 0 || strcmp(kind, "function_declaration") == 0) &&
+        !overload_stub) {
         TSNode name = field(node, "name");
         /* One binder proves identity wherever it is bound at all, so a def under
          * a condition still counts; an alternative def makes two binders. */
@@ -3973,9 +4389,9 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
         uint32_t enclosing_scope = state.scope;
         bool in_class = enclosing_scope && index->scopes[enclosing_scope].class_scope;
         size_t function_member = index->python_member_count;
-        if (in_class && !strcmp(kind, "function_definition"))
+        if (in_class && !strcmp(kind, "function_definition") && !overload_stub)
             python_note_method(index, node, parent_kind, enclosing_scope, state.conditional);
-        else if (!strcmp(kind, "function_definition"))
+        else if (!strcmp(kind, "function_definition") && !overload_stub)
             python_note_function(index, node, enclosing_scope);
         if (in_class && !strcmp(kind, "class_definition"))
             python_note_class_value(index, node_text(index, field(node, "name")), node, NULL, false,
@@ -3985,7 +4401,7 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
             python_child_scope(index, node, enclosing_scope, !strcmp(kind, "class_definition"));
         if (!strcmp(kind, "class_definition"))
             python_note_class(index, node, state.scope, enclosing_scope);
-        if (!strcmp(kind, "function_definition"))
+        if (!strcmp(kind, "function_definition") && !overload_stub)
             python_note_returns(index, node, function_member, state.scope);
         state.header_scope = enclosing_scope;
         state.conditional = false;
@@ -4688,47 +5104,102 @@ static cbm_resolve_result_t binding_query_finish(const cbm_resolve_binding_index
     return result;
 }
 
-/* A module value escaping to an unknown alias/callee can mutate its namespace.
- * This independent pass still visits syntax outside the positive-binding
- * subset. Imported-name queries are binary searches, never source rescans. */
-static bool python_namespace_read(cbm_resolve_binding_index_t *index, TSNode node) {
+typedef enum { PY_NS_READ, PY_NS_WRITE, PY_NS_ANY } python_namespace_use_t;
+
+/* A plain string's text, NULL for anything computed. */
+static const char *python_plain_string(cbm_resolve_binding_index_t *index, TSNode node) {
+    if (!kind_is(node, "string") || ts_node_named_child_count(node) != 3)
+        return NULL;
+    TSNode content = ts_node_named_child(node, 1);
+    return kind_is(content, "string_content") ? node_text(index, content) : NULL;
+}
+
+/* What one use of a name does to the module it may hold. A namespace changes by a
+ * statement that stores or deletes through it, and that statement names what it changes.
+ * Reading a member, calling, or handing the module to a call selects no other
+ * declaration: what a callee does with it is not a static fact. __dict__, vars() and a
+ * computed setattr can reach any name. Queries are binary searches, never rescans. */
+static python_namespace_use_t python_namespace_use(cbm_resolve_binding_index_t *index, TSNode node,
+                                                   const char **written) {
     TSNode parent = ts_node_parent(node);
-    if (kind_is(parent, "attribute") && ts_node_eq(node, field(parent, "attribute")))
-        return true; /* Attribute spelling is not a lexical module reference. */
-    if (kind_is(parent, "call") && ts_node_eq(node, field(parent, "function")))
-        return true; /* Calling a module is an error, not an alias escape. */
     if (kind_is(parent, "argument_list")) {
-        /* These builtins look at their argument and keep nothing of it. */
-        static const char *const readers[] = {"getattr", "hasattr",  "isinstance", "issubclass",
-                                              "dir",     "repr",     "str",        "id",
-                                              "type",    "callable", "print",      NULL};
         TSNode call = ts_node_parent(parent);
         const char *callee = node_text(index, field(call, "function"));
-        return callee && listed(callee, readers);
+        if (callee && !strcmp(callee, "vars"))
+            return PY_NS_ANY;
+        if (!callee || (strcmp(callee, "setattr") && strcmp(callee, "delattr")) ||
+            !ts_node_eq(node, ts_node_named_child(parent, 0)))
+            return PY_NS_READ;
+
+        *written = python_plain_string(index, ts_node_named_child(parent, 1));
+        return *written ? PY_NS_WRITE : PY_NS_ANY;
     }
     if (!kind_is(parent, "attribute") || !ts_node_eq(node, field(parent, "object")))
-        return kind_is(parent, "expression_statement");
-    /* Reading a member hands out that member, not the module it came from. Only
-     * storing through the path, or asking for __dict__, can reach the namespace. */
+        return PY_NS_READ;
+    const char *path = NULL;
     for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
         const char *member = node_text(index, field(parent, "attribute"));
         if (!member || !strcmp(member, "__dict__"))
-            return false;
+            return PY_NS_ANY;
+        path = path ? cbm_arena_sprintf(index->arena, "%s.%s", path, member) : member;
         node = parent;
         parent = ts_node_parent(node);
         if (kind_is(parent, "attribute") && ts_node_eq(node, field(parent, "object")))
             continue;
-        if ((kind_is(parent, "assignment") || kind_is(parent, "augmented_assignment")) &&
-            ts_node_eq(node, field(parent, "left")))
-            return false;
-        return !kind_is(parent, "delete_statement") && !kind_is(parent, "pattern_list") &&
-               !kind_is(parent, "as_pattern_target");
+        bool stored = ((kind_is(parent, "assignment") || kind_is(parent, "augmented_assignment")) &&
+                       ts_node_eq(node, field(parent, "left"))) ||
+                      kind_is(parent, "delete_statement") ||
+                      (kind_is(parent, "expression_list") &&
+                       kind_is(ts_node_parent(parent), "delete_statement")) ||
+                      kind_is(parent, "pattern_list") || kind_is(parent, "as_pattern_target");
+        if (!stored)
+            return PY_NS_READ;
+        *written = path;
+        return path ? PY_NS_WRITE : PY_NS_ANY;
     }
-    return false;
+    return PY_NS_ANY;
 }
-static int python_escape_compare(const void *left, const void *right) {
-    return strcmp(*(const char *const *)left, *(const char *const *)right);
+
+static int python_write_compare(const void *left, const void *right) {
+    return strcmp(((const python_write_t *)left)->name, ((const python_write_t *)right)->name);
 }
+
+/* `alias = pkg; alias.child = None` writes through pkg. Two rounds follow an alias of an alias;
+ * each is one search per alias statement. */
+static void python_follow_write_aliases(cbm_resolve_binding_index_t *index) {
+    for (unsigned round = 0; round < 2; round++) {
+        size_t sorted = index->python_write_count;
+        for (size_t a = 0; a < index->python_alias_count; a++) {
+            const python_alias_t alias = index->python_aliases[a];
+            size_t low = 0, high = sorted;
+            while (low < high) {
+                size_t middle = low + (high - low) / 2;
+                if (strcmp(index->python_writes[middle].name, alias.alias) < 0)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            for (; low < sorted && !strcmp(index->python_writes[low].name, alias.alias); low++) {
+                const char *member = index->python_writes[low].member;
+                python_write_t *writes =
+                    grow_array(index, index->python_writes, index->python_write_count,
+                               &index->python_write_capacity, sizeof(*writes));
+                if (!writes) {
+                    index->python_writes_unseen = true;
+                    return;
+                }
+                index->python_writes = writes;
+                writes[index->python_write_count++] =
+                    (python_write_t){.name = alias.of, .member = member};
+            }
+        }
+        if (index->python_write_count == sorted)
+            return;
+        qsort(index->python_writes, index->python_write_count, sizeof(*index->python_writes),
+              python_write_compare);
+    }
+}
+
 static void python_namespace_effects(cbm_resolve_binding_index_t *index, TSNode root) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     unsigned depth = 0;
@@ -4738,6 +5209,7 @@ static void python_namespace_effects(cbm_resolve_binding_index_t *index, TSNode 
         TSNode node = ts_tree_cursor_current_node(&cursor);
         if (++visited > BINDING_MAX_NODES || depth > BINDING_MAX_DEPTH) {
             index->python_effects_complete = false;
+            index->python_writes_unseen = true;
             break;
         }
         bool skip = kind_is(node, "import_statement") || kind_is(node, "import_from_statement");
@@ -4752,17 +5224,42 @@ static void python_namespace_effects(cbm_resolve_binding_index_t *index, TSNode 
                 python_namespace_call_writes(index, node, name))
                 index->python_effects_complete = false;
         }
-        if (kind_is(node, "identifier") && !python_namespace_read(index, node)) {
-            const char *name = node_text(index, node);
-            const char **names =
-                grow_array(index, index->python_escapes, index->python_escape_count,
-                           &index->python_escape_capacity, sizeof(*names));
-            if (!name || !names) {
+        if (kind_is(node, "identifier") && !member && kind_is(parent, "argument_list") &&
+            python_spells(index, node, "__name__"))
+            index->python_name_handed = true;
+        if (kind_is(node, "identifier") && !member) {
+            const char *written = NULL;
+            python_namespace_use_t use = python_namespace_use(index, node, &written);
+            const char *name = use != PY_NS_READ ? node_text(index, node) : NULL;
+            python_write_t *writes =
+                use != PY_NS_READ
+                    ? grow_array(index, index->python_writes, index->python_write_count,
+                                 &index->python_write_capacity, sizeof(*writes))
+                    : NULL;
+            if (use != PY_NS_READ && (!name || !writes)) {
                 index->python_effects_complete = false;
+                index->python_writes_unseen = true;
                 break;
             }
-            index->python_escapes = names;
-            names[index->python_escape_count++] = name;
+            if (use != PY_NS_READ) {
+                index->python_writes = writes;
+                writes[index->python_write_count++] =
+                    (python_write_t){.name = name, .member = use == PY_NS_WRITE ? written : NULL};
+            } else if (kind_is(parent, "assignment") && ts_node_eq(node, field(parent, "right")) &&
+                       kind_is(field(parent, "left"), "identifier")) {
+                python_alias_t *aliases =
+                    grow_array(index, index->python_aliases, index->python_alias_count,
+                               &index->python_alias_capacity, sizeof(*aliases));
+                const char *alias = node_text(index, field(parent, "left"));
+                const char *of = node_text(index, node);
+                if (!aliases || !alias || !of) {
+                    index->python_effects_complete = false;
+                    index->python_writes_unseen = true;
+                    break;
+                }
+                index->python_aliases = aliases;
+                aliases[index->python_alias_count++] = (python_alias_t){alias, of};
+            }
         }
         if (!skip && ts_tree_cursor_goto_first_child(&cursor)) {
             depth++;
@@ -4776,9 +5273,10 @@ static void python_namespace_effects(cbm_resolve_binding_index_t *index, TSNode 
     }
 finished:
     ts_tree_cursor_delete(&cursor);
-    if (index->python_escape_count > 1)
-        qsort(index->python_escapes, index->python_escape_count, sizeof(*index->python_escapes),
-              python_escape_compare);
+    if (index->python_write_count > 1)
+        qsort(index->python_writes, index->python_write_count, sizeof(*index->python_writes),
+              python_write_compare);
+    python_follow_write_aliases(index);
 }
 
 /* Symbol QNs omit a terminal index filename, while module QNs retain it.
@@ -4962,6 +5460,7 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
             walk_tree(index, ts_tree_root_node(tree));
             if (language == CBM_LANG_PYTHON) {
                 python_namespace_effects(index, ts_tree_root_node(tree));
+                python_finish_narrows(index);
             }
         }
         if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE && javascript_language(language) &&
@@ -5781,13 +6280,24 @@ bool cbm_resolve_binding_python_effects_complete(const cbm_resolve_binding_index
     return index && index->language == CBM_LANG_PYTHON && index->python_effects_complete;
 }
 
-bool cbm_resolve_binding_python_import_escaped(const cbm_resolve_binding_index_t *index,
-                                               const char *name) {
-    if (!index || !name || !index->python_effects_complete)
-        return true;
-    return index->python_escape_count &&
-           bsearch(&name, index->python_escapes, index->python_escape_count,
-                   sizeof(*index->python_escapes), python_escape_compare) != NULL;
+bool cbm_resolve_binding_python_import_write(const cbm_resolve_binding_index_t *index,
+                                             const char *name, size_t offset, const char **member) {
+    *member = NULL;
+    if (!index || !name || index->python_writes_unseen)
+        return offset == 0;
+    size_t low = 0, high = index->python_write_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (strcmp(index->python_writes[middle].name, name) < 0)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (offset >= index->python_write_count - low ||
+        strcmp(index->python_writes[low + offset].name, name))
+        return false;
+    *member = index->python_writes[low + offset].member;
+    return true;
 }
 
 /* A completed audit saw every statement that binds at module level, including
@@ -5800,7 +6310,14 @@ bool cbm_resolve_binding_python_namespace_closed(const cbm_resolve_binding_index
         index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE)
         return false;
     (void)find_scoped_name(index, "__getattr__", strlen("__getattr__"), 0, &present, JS_SPACE_ANY);
-    return !present;
+    return !present && !index->python_namespace_open;
+}
+/* Names this module binds nothing for can still be there at run time: __getattr__, a computed
+ * store into globals(), or handing its own __name__ on (celery's recreate_module,
+ * lazy_loader.attach). */
+bool cbm_resolve_binding_python_names_come_at_run_time(const cbm_resolve_binding_index_t *index) {
+    return index &&
+           (!cbm_resolve_binding_python_namespace_closed(index) || index->python_name_handed);
 }
 size_t cbm_resolve_binding_python_namespace_size(const cbm_resolve_binding_index_t *index) {
     return index && index->language == CBM_LANG_PYTHON ? index->name_count : 0;
@@ -5852,6 +6369,251 @@ const char *cbm_resolve_binding_python_method_owner(const cbm_resolve_binding_in
         return NULL;
     return index->scopes[index->scopes[scope].method_of - 1].qualified_name;
 }
+static int python_narrow_compare(const void *left, const void *right) {
+    const python_narrow_t *a = left, *b = right;
+    if (a->from != b->from)
+        return a->from < b->from ? -1 : 1;
+    return a->until == b->until ? 0 : a->until > b->until ? -1 : 1;
+}
+
+static int python_store_compare(const void *left, const void *right) {
+    const python_store_t *a = left, *b = right;
+    int order = strcmp(a->chain, b->chain);
+    if (order)
+        return order;
+    return a->at == b->at ? 0 : a->at < b->at ? -1 : 1;
+}
+
+/* Sorted once after the walk. Regions nest or are disjoint, so one pass with the chain of open
+ * regions finds each one's parent, and a site reaches its enclosing regions by those links. */
+static void python_finish_narrows(cbm_resolve_binding_index_t *index) {
+    if (index->python_narrow_count > 1)
+        qsort(index->python_narrows, index->python_narrow_count, sizeof(*index->python_narrows),
+              python_narrow_compare);
+    if (index->python_store_count > 1)
+        qsort(index->python_stores, index->python_store_count, sizeof(*index->python_stores),
+              python_store_compare);
+    uint32_t open = 0;
+    for (size_t i = 0; i < index->python_narrow_count; i++) {
+        python_narrow_t *narrow = &index->python_narrows[i];
+        while (open && index->python_narrows[open - 1].until < narrow->from)
+            open = index->python_narrows[open - 1].parent;
+        narrow->parent = open;
+        open = (uint32_t)i + 1;
+    }
+}
+
+/* Any store of exactly this attribute chain between two positions. */
+static bool python_attribute_stored(const cbm_resolve_binding_index_t *index, const char *chain,
+                                    uint32_t from, uint32_t to) {
+    size_t low = 0, high = index->python_store_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        int order = strcmp(index->python_stores[mid].chain, chain);
+        if (order < 0 || (!order && index->python_stores[mid].at < from))
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return low < index->python_store_count && !strcmp(index->python_stores[low].chain, chain) &&
+           index->python_stores[low].at <= to;
+}
+
+/* Any binder of this local between two positions. */
+static bool python_local_rebound(const cbm_resolve_binding_index_t *index, const char *name,
+                                 size_t length, uint32_t scope, uint32_t from, uint32_t to) {
+    size_t low = 0, high = index->name_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        int compare = strncmp(index->names[mid].name, name, length);
+        if (!compare && index->names[mid].name[length])
+            compare = 1;
+        if (!compare)
+            compare = (index->names[mid].scope > scope) - (index->names[mid].scope < scope);
+        if (compare < 0)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    for (size_t i = low;
+         i < index->name_count && index->names[i].scope == scope &&
+         strlen(index->names[i].name) == length && !strncmp(index->names[i].name, name, length);
+         i++)
+        if (index->names[i].at >= from && index->names[i].at <= to)
+            return true;
+    return false;
+}
+
+/* A store of this exact chain finished before the site, in the scope holding the site or one
+ * around it. Scopes nest as text does, so when the site's own scope has such a store the nearest
+ * store before the site lies in it or inside it: one search, two walks up the nesting. */
+static const python_store_t *python_stored_earlier(const cbm_resolve_binding_index_t *index,
+                                                   const char *chain, size_t length, uint32_t scope,
+                                                   uint32_t site) {
+    size_t low = 0, high = index->python_store_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        const python_store_t *store = &index->python_stores[mid];
+        int order = strncmp(store->chain, chain, length);
+        if (!order && store->chain[length])
+            order = 1;
+        if (order < 0 || (!order && store->at <= site))
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    if (!low)
+        return NULL;
+    const python_store_t *store = &index->python_stores[low - 1];
+    if (strncmp(store->chain, chain, length) || store->chain[length])
+        return NULL;
+    uint32_t inside = store->scope, around = scope;
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
+        if (inside == scope || around == store->scope)
+            return store;
+        if (!inside && !around)
+            return NULL;
+        inside = inside ? index->scopes[inside].parent : 0;
+        around = around ? index->scopes[around].parent : 0;
+    }
+    return NULL;
+}
+
+/* `t.x = make()` says what t.x holds from there on, whatever class t.x is declared in, for what
+ * is read through it: t.x itself stays the member it names. Stores through a method's own first
+ * parameter are read as the class's instance attributes, so only what lies past its first
+ * attribute counts for that root. The longest such prefix of the chain answers. */
+bool cbm_resolve_binding_python_store_precedes(const cbm_resolve_binding_index_t *index,
+                                               const char *chain, uint32_t scope, uint32_t site,
+                                               size_t *prefix, const char **value,
+                                               uint32_t *value_at, uint32_t *value_scope) {
+    if (!index || !index->python_store_count)
+        return false;
+    size_t at = strcspn(chain, ".([@");
+    cbm_resolve_python_root_kind_t root =
+        cbm_resolve_binding_python_root(index, chain, at, scope, site).kind;
+    bool own = root == CBM_PY_ROOT_SELF_PARAMETER || root == CBM_PY_ROOT_CLASS_PARAMETER;
+    bool found = false;
+    for (bool first = true; chain[at] == '.'; first = false) {
+        at += 1 + strcspn(chain + at + 1, ".([@");
+        const python_store_t *store = chain[at] && !(first && own)
+                                          ? python_stored_earlier(index, chain, at, scope, site)
+                                          : NULL;
+        if (store) {
+            found = true;
+            *prefix = at;
+            *value = store->value;
+            *value_at = store->value_at;
+            *value_scope = store->scope;
+        }
+    }
+    return found;
+}
+
+const char *cbm_resolve_binding_python_narrowed(const cbm_resolve_binding_index_t *index,
+                                                const char *chain, uint32_t scope, uint32_t site,
+                                                size_t *consumed) {
+    if (!index || !index->python_narrow_count)
+        return NULL;
+    size_t low = 0, high = index->python_narrow_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (index->python_narrows[mid].from <= site)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    for (uint32_t at = (uint32_t)low; at; at = index->python_narrows[at - 1].parent) {
+        const python_narrow_t *narrow = &index->python_narrows[at - 1];
+        size_t length = strlen(narrow->chain);
+        if (narrow->until < site || narrow->scope != scope ||
+            strncmp(chain, narrow->chain, length) ||
+            (chain[length] && !strchr(".([@", chain[length])))
+            continue;
+        size_t root = strcspn(narrow->chain, ".([@");
+        if (python_local_rebound(index, narrow->chain, root, scope, narrow->from, site) ||
+            (narrow->chain[root] &&
+             python_attribute_stored(index, narrow->chain, narrow->from, site)))
+            return NULL;
+        *consumed = length;
+        return narrow->type;
+    }
+    return NULL;
+}
+
+/* A later binder inside a loop that holds the site but began after this binder comes back
+ * round to the site without passing it. Nesting is what bounds the hops. */
+static bool python_loop_comes_back(const cbm_resolve_binding_index_t *index, uint32_t binder,
+                                   uint32_t site, uint32_t later) {
+    size_t low = 0, high = index->python_loop_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (index->python_loops[mid].start <= site)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    for (uint32_t at = (uint32_t)low; at;) {
+        const python_loop_t *loop = &index->python_loops[at - 1];
+        if (loop->start <= binder)
+            return false;
+        if (loop->end >= site && loop->end >= later)
+            return true;
+        at = loop->parent;
+    }
+    return false;
+}
+
+cbm_resolve_python_flow_t cbm_resolve_binding_python_reaching(
+    const cbm_resolve_binding_index_t *index, const char *name, size_t length, uint32_t scope,
+    uint32_t site, const char **chain, uint32_t *at, uint32_t *chain_scope, bool *typed) {
+    if (!index || index->language != CBM_LANG_PYTHON ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !scope || scope >= index->scope_count ||
+        index->scopes[scope].class_scope)
+        return CBM_PY_FLOW_NONE;
+    size_t low = 0, high = index->name_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        int compare = strncmp(index->names[mid].name, name, length);
+        if (!compare && index->names[mid].name[length])
+            compare = 1;
+        if (!compare)
+            compare = (index->names[mid].scope > scope) - (index->names[mid].scope < scope);
+        if (compare < 0)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    const binding_name_t *best = NULL, *later = NULL;
+    size_t count = 0;
+    for (; low + count < index->name_count && index->names[low + count].scope == scope &&
+           strlen(index->names[low + count].name) == length &&
+           !strncmp(index->names[low + count].name, name, length);
+         count++) {
+        const binding_name_t *binder = &index->names[low + count];
+        uint32_t from = binder->value_from ? binder->value_from : binder->at;
+        if (from <= site) {
+            if (!best || binder->at > best->at)
+                best = binder;
+        } else if (!later || binder->at < later->at) {
+            later = binder;
+        }
+        if (count > 64)
+            return CBM_PY_FLOW_NONE;
+    }
+    if (count < 2 || !best || best->value_until < site ||
+        (later && python_loop_comes_back(index, best->at, site, later->at)))
+        return CBM_PY_FLOW_NONE;
+    if (best->flags != BINDING_BLOCKED || best->value_none || !best->value_chain ||
+        (best->value_kind != CBM_PY_ROOT_ASSIGNED && best->value_kind != CBM_PY_ROOT_TYPED))
+        return CBM_PY_FLOW_UNKNOWN;
+    *chain = best->value_chain;
+    *at = best->at;
+    *chain_scope = best->value_scope;
+    *typed = best->value_kind == CBM_PY_ROOT_TYPED;
+    return CBM_PY_FLOW_VALUE;
+}
+
 /* A local rebound only by plain assignments: x = None, then x = Store(). A None
  * says nothing about the class a member read finds. Anything else that binds
  * the name leaves it unknown. */

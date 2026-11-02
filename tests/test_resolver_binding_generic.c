@@ -1119,13 +1119,13 @@ TEST(resolver_binding_python_formatting_keeps_module_escape_and_rebinding_guards
         cbm_resolve_result_t proof = cbm_resolve_binding_local(
             index, "target", start, start + strlen("target()"), CBM_SOURCE_ORIGIN_RAW);
         bool admitted = cbm_resolve_admit(&proof);
-        bool escaped = cbm_resolve_binding_python_import_escaped(index, "library");
+        const char *member = NULL;
+        bool written = cbm_resolve_binding_python_import_write(index, "library", 0, &member);
         cbm_arena_destroy(&arena);
         cbm_free_result(file);
-        /* The escape is recorded against library; target itself stays proven. */
+        /* Formatting a module reads it, and target itself stays proven. */
         ASSERT_EQ(admitted, i == 0);
-        if (i == 0)
-            ASSERT(escaped);
+        ASSERT(!written);
     }
     PASS();
 }
@@ -1999,7 +1999,8 @@ static bool python_physical_package_golden(const char *manifest, bool source_lay
     const char *library_path = source_layout ? "src/sample/utils.py" : "sample/utils.py";
     const char *decoy_path = source_layout ? "decoy/utils.py" : "src/sample/utils.py";
     const char *initializer = source_layout ? "src/sample/__init__.py" : "sample/__init__.py";
-    bool supported = !source_layout || explicit_src;
+    /* A manifest beside src/ states the layout; its [project].name says nothing. */
+    bool supported = !source_layout || explicit_src || manifest;
     char main[256];
     snprintf(main, sizeof(main),
              "from %ssample.utils import target\ndef caller():\n    return target()\n"
@@ -2029,7 +2030,7 @@ static bool python_physical_package_golden(const char *manifest, bool source_lay
                     .declaration_text =
                         "def target(value: Optional[str] = None) -> Tuple[str, str]:"}}};
     const RQ_Forbidden forbidden = {
-        .case_id = "distribution-name-does-not-authorize-src-layout",
+        .case_id = "no-manifest-states-a-src-layout",
         .site = {.file = "main.py", .caller = "caller", .needle = "target()"},
         .relation = "CALLS",
         .any_target = true};
@@ -2098,6 +2099,7 @@ TEST(resolver_binding_python_distribution_name_is_not_import_root) {
     static const char other_distribution[] = "[project]\nname = 'unrelated-dist'\n";
     for (int driver = 0; driver < 2; driver++) {
         ASSERT(python_physical_package_golden(NULL, false, false, driver));
+        ASSERT(python_physical_package_golden(NULL, true, false, driver));
         ASSERT(python_physical_package_golden(manifest, false, false, driver));
         ASSERT(python_physical_package_golden(other_distribution, false, false, driver));
         ASSERT(python_physical_package_golden(manifest, true, false, driver));

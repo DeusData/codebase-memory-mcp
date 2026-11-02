@@ -302,10 +302,11 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
         out->limitation =
-            "Imports, reexports and closed star imports; self, cls and super through C3 order; "
-            "receivers typed by construction or annotation; decorators proven to keep identity. "
-            "Untyped receivers, computed bases, class-body values a metaclass can replace and "
-            "unproven decorators abstain.";
+            "Imports, reexports and closed star imports, through source roots a manifest states; "
+            "self, cls and super through C3 order; receivers typed by construction, annotation, "
+            "isinstance, with or except; annotated containers; a decorator keeps the declaration "
+            "unless its source discards the function. Untyped receivers, computed bases, Enum "
+            "and NamedTuple members and classes reached by computed writes abstain.";
         break;
     case CBM_LANG_PHP:
         out->adapter = "php_source";

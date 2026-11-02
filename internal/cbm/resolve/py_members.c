@@ -2,12 +2,16 @@
 #include "foundation/hash_table.h"
 #include "foundation/mem_core.h"
 #include <stdlib.h>
+
 #include <string.h>
 
 /* Finite analysis per occurrence. Past either limit the receiver is unknown, the
  * same answer every run: local rebinding cycles and attributes that read each
  * other would otherwise branch without end. */
 enum { PY_MAX_DEPTH = 24, PY_MAX_MRO = 512, PY_MAX_REF_STEPS = 64, PY_MAX_EVAL_STEPS = 2048 };
+
+/* Where a chain's root name ends, and each step after it. */
+#define PY_CHAIN_STOPS ".([@"
 
 typedef enum {
     PY_REF_NONE = 0,
@@ -65,28 +69,31 @@ typedef struct py_class py_class_t;
 
 typedef struct {
     py_ref_t result;
-    unsigned shape;
-    py_ref_t delegate;
-    bool delegate_applied;
+    bool discards; /* as a decorator: returns a constant or nothing */
+    bool replaces; /* as a bare decorator: returns a value not built from its parameter */
     /* Unannotated: the class every return statement agrees on, settled at seal. */
     py_ref_t *returned;
     uint32_t returned_count;
     const py_class_t *inferred;
+    bool returns_class;      /* inferred is the class object itself, not an instance */
+    bool returns_receiver;   /* every return is self, or cls(...): the receiver's class */
     unsigned char inference; /* 0 pending, 1 in progress, 2 settled */
 } py_function_t;
 
 typedef struct {
     const char *name, *target;
     py_member_kind_t kind;
-    py_ref_t value;    /* return type, property type, or class attribute value */
-    bool none_default; /* `x = None` in the class body: instances store the real value */
-    bool annotated;    /* its value comes from an annotation */
+    py_ref_t value;         /* return type, property type, or class attribute value */
+    bool none_default;      /* `x = None` in the class body: instances store the real value */
+    bool spelled_decorator; /* `go = classmethod(go)`, with the builtin */
+    bool annotated;         /* its value comes from an annotation */
 } py_member_t;
 
 typedef struct {
     const char *name;
     py_ref_t value;
     bool none;
+    bool annotated; /* `self.x: T = ...` or `x: T` in the body */
 } py_attribute_t;
 
 struct py_class {
@@ -174,7 +181,7 @@ static py_ref_t py_ref_of_chain(const cbm_resolve_binding_index_t *index, CBMAre
     py_ref_t none = {PY_REF_NONE, NULL, NULL, NULL};
     if (!chain || depth > PY_MAX_DEPTH || ++*steps > PY_MAX_REF_STEPS)
         return none;
-    size_t length = strcspn(chain, ".(");
+    size_t length = strcspn(chain, PY_CHAIN_STOPS);
     const char *rest = chain + length;
     /* super and type are the builtins only while nothing in scope binds the name. */
     bool builtin = rest[0] == '(' &&
@@ -209,8 +216,19 @@ static py_ref_t py_ref_of_chain(const cbm_resolve_binding_index_t *index, CBMAre
     const char *open = strchr(chain, '(');
     if (open && open[1] != ')' && open > chain) {
         const char *spelled = cbm_arena_strndup(arena, chain, (size_t)(open - chain));
-        if (spelled && (!strcmp(spelled, "partial") || !strcmp(spelled, "functools.partial")) &&
-            cbm_resolve_binding_python_import_is(index, spelled, "functools.partial")) {
+        bool partial = spelled &&
+                       (!strcmp(spelled, "partial") || !strcmp(spelled, "functools.partial")) &&
+                       cbm_resolve_binding_python_import_is(index, spelled, "functools.partial");
+        /* list(x), sorted(x), reversed(x) hold what x holds, while they are the builtins. */
+        bool passing =
+            spelled &&
+            (!strcmp(spelled, "list") || !strcmp(spelled, "tuple") || !strcmp(spelled, "set") ||
+             !strcmp(spelled, "frozenset") || !strcmp(spelled, "sorted") ||
+             !strcmp(spelled, "reversed") || !strcmp(spelled, "iter") ||
+             !strcmp(spelled, "enumerate") || !strcmp(spelled, "zip")) &&
+            cbm_resolve_binding_python_root(index, spelled, strlen(spelled), scope, at).kind ==
+                CBM_PY_ROOT_UNBOUND;
+        if (partial || passing) {
             int nesting = 0;
             const char *close = open;
             for (; *close; close++) {
@@ -218,10 +236,13 @@ static py_ref_t py_ref_of_chain(const cbm_resolve_binding_index_t *index, CBMAre
                 if (!nesting)
                     break;
             }
-            if (!*close || close[1])
+            if (!*close || (partial && close[1]))
                 return none;
-            const char *wrapped = cbm_arena_strndup(arena, open + 1, (size_t)(close - open - 1));
-            return py_ref_of_chain(index, arena, imports, wrapped, scope, at, depth + 1, steps);
+            const char *wrapped =
+                cbm_arena_sprintf(arena, "%.*s%s", (int)(close - open - 1), open + 1, close + 1);
+            return wrapped ? py_ref_of_chain(index, arena, imports, wrapped, scope, at, depth + 1,
+                                             steps)
+                           : none;
         }
     }
     cbm_resolve_python_root_t root =
@@ -244,7 +265,8 @@ static py_ref_t py_ref_of_chain(const cbm_resolve_binding_index_t *index, CBMAre
             return none;
         for (uint32_t i = 0; i < root.chain_count; i++) {
             const char *arm = root.chains[i];
-            if (!strncmp(arm, chain, length) && (!arm[length] || strchr(".(", arm[length]))) {
+            if (!strncmp(arm, chain, length) &&
+                (!arm[length] || strchr(PY_CHAIN_STOPS, arm[length]))) {
                 tails[join->self_count++] = arm + length;
                 continue;
             }
@@ -296,10 +318,10 @@ static py_ref_t py_ref_of_type(const cbm_resolve_binding_index_t *index, CBMAren
     py_ref_t none = {PY_REF_NONE, NULL, NULL, NULL};
     if (!chain)
         return none;
-    size_t length = strcspn(chain, ".(");
+    size_t length = strcspn(chain, PY_CHAIN_STOPS);
     cbm_resolve_python_root_t root =
         cbm_resolve_binding_python_root(index, chain, length, scope, 0);
-    const char *typed = cbm_arena_sprintf(arena, "%s()%s", chain, rest ? rest : "");
+    const char *typed = cbm_resolve_python_typed_text(arena, chain, rest ? rest : "");
     if (!typed)
         return none;
     if (root.kind != CBM_PY_ROOT_ANNOTATION_IMPORT)
@@ -307,6 +329,82 @@ static py_ref_t py_ref_of_type(const cbm_resolve_binding_index_t *index, CBMAren
     const char *remainder = NULL;
     const char *key = imports->import_key(imports->context, arena, root.nested, typed, &remainder);
     return key ? (py_ref_t){PY_REF_KEY, key, remainder, NULL} : none;
+}
+
+static py_ref_t py_ref_of_site(const cbm_resolve_binding_index_t *index, CBMArena *arena,
+                               const cbm_py_import_lookup_t *imports, const char *chain,
+                               uint32_t scope, uint32_t site, unsigned depth, unsigned *steps);
+
+/* The chain reduced through the binder every path to the site passes last. The value was read
+ * where that binder stands, so `x = x.clone()` follows x to the binder before it. */
+static py_ref_t py_ref_of_reach(const cbm_resolve_binding_index_t *index, CBMArena *arena,
+                                const cbm_py_import_lookup_t *imports, const char *chain,
+                                uint32_t scope, uint32_t site, unsigned depth, unsigned *steps) {
+    py_ref_t none = {PY_REF_NONE, NULL, NULL, NULL};
+    size_t length = strcspn(chain, PY_CHAIN_STOPS);
+    const char *rest = chain + length, *value = NULL;
+    uint32_t at = 0, chain_scope = scope;
+    bool typed = false;
+    cbm_resolve_python_flow_t flow = cbm_resolve_binding_python_reaching(
+        index, chain, length, scope, site, &value, &at, &chain_scope, &typed);
+    if (flow == CBM_PY_FLOW_NONE)
+        return py_ref_of_chain(index, arena, imports, chain, scope, 0, depth, steps);
+    if (flow == CBM_PY_FLOW_UNKNOWN || depth > PY_MAX_DEPTH || ++*steps > PY_MAX_REF_STEPS)
+        return none;
+    if (typed)
+        return py_ref_of_type(index, arena, imports, value, rest, chain_scope, depth + 1, steps);
+    const char *joined = cbm_arena_sprintf(arena, "%s%s", value, rest);
+    return joined ? py_ref_of_site(index, arena, imports, joined, chain_scope, at, depth + 1, steps)
+                  : none;
+}
+
+/* What a store through a prefix of the chain leaves there, held against what that prefix is
+ * declared to hold. Reading on is sure only where the two agree. */
+static py_ref_t py_ref_past_store(const cbm_resolve_binding_index_t *index, CBMArena *arena,
+                                  const cbm_py_import_lookup_t *imports, const char *chain,
+                                  size_t prefix, const char *value, uint32_t value_at,
+                                  uint32_t value_scope, uint32_t scope, uint32_t site,
+                                  unsigned depth, unsigned *steps) {
+    py_ref_t none = {PY_REF_NONE, NULL, NULL, NULL};
+    if (!value || depth > PY_MAX_DEPTH || ++*steps > PY_MAX_REF_STEPS)
+        return none;
+    py_join_t *join = cbm_arena_calloc(arena, sizeof(*join));
+    py_ref_t *arms = cbm_arena_calloc(arena, 2 * sizeof(*arms));
+    const char **tails = cbm_arena_calloc(arena, sizeof(*tails));
+    const char *declared = cbm_arena_strndup(arena, chain, prefix);
+    if (!join || !arms || !tails || !declared)
+        return none;
+    arms[0] = py_ref_of_reach(index, arena, imports, declared, scope, site, depth + 1, steps);
+    arms[1] = py_ref_of_site(index, arena, imports, value, value_scope, value_at, depth + 1, steps);
+    if (arms[0].kind == PY_REF_NONE || arms[1].kind == PY_REF_NONE)
+        return none;
+    join->arms = arms;
+    join->arm_count = 2;
+    join->self_tails = tails;
+    return (py_ref_t){.kind = PY_REF_JOIN, .join = join, .tail = chain + prefix};
+}
+
+/* The chain at this site: what a narrowing says it is, what a store left there, or its binder. */
+static py_ref_t py_ref_of_site(const cbm_resolve_binding_index_t *index, CBMArena *arena,
+                               const cbm_py_import_lookup_t *imports, const char *chain,
+                               uint32_t scope, uint32_t site, unsigned depth, unsigned *steps) {
+    /* `if isinstance(x, C):` says what x is here, while isinstance is the builtin. */
+    size_t consumed = 0;
+    const char *narrowed =
+        cbm_resolve_binding_python_narrowed(index, chain, scope, site, &consumed);
+    if (narrowed &&
+        cbm_resolve_binding_python_root(index, "isinstance", strlen("isinstance"), scope, 0).kind ==
+            CBM_PY_ROOT_UNBOUND)
+        return py_ref_of_type(index, arena, imports, narrowed, chain + consumed, scope, depth + 1,
+                              steps);
+    size_t prefix = 0;
+    const char *stored = NULL;
+    uint32_t stored_at = 0, stored_scope = scope;
+    if (cbm_resolve_binding_python_store_precedes(index, chain, scope, site, &prefix, &stored,
+                                                  &stored_at, &stored_scope))
+        return py_ref_past_store(index, arena, imports, chain, prefix, stored, stored_at,
+                                 stored_scope, scope, site, depth, steps);
+    return py_ref_of_reach(index, arena, imports, chain, scope, site, depth, steps);
 }
 
 static py_ref_t py_keep_ref(cbm_py_members_t *members, py_ref_t ref) {
@@ -400,8 +498,9 @@ static py_class_t *py_class_for_scope(py_class_t **by_scope, size_t count, uint3
     return scope < count ? by_scope[scope] : NULL;
 }
 
-/* Sort a class's members and collapse duplicates: a getter with its setter stays
- * one property; any other repetition is not one provable declaration. */
+/* Sort a class's members and collapse duplicates: a getter with its setter stays one property,
+ * a def with `go = classmethod(go)` stays that def; any other repetition is not one provable
+ * declaration. */
 static void py_finish_members(py_class_t *entry) {
     if (entry->member_count > 1)
         qsort(entry->members, entry->member_count, sizeof(*entry->members), py_compare_member);
@@ -410,8 +509,13 @@ static void py_finish_members(py_class_t *entry) {
         py_member_t *member = &entry->members[i];
         if (used && !strcmp(entry->members[used - 1].name, member->name)) {
             py_member_t *prior = &entry->members[used - 1];
-            if (prior->kind != PY_MEMBER_PROPERTY || member->kind != PY_MEMBER_PROPERTY)
-                prior->kind = PY_MEMBER_OPAQUE;
+            if (prior->spelled_decorator && member->kind == PY_MEMBER_FUNCTION)
+                *prior = *member;
+            else if (!member->spelled_decorator || prior->kind != PY_MEMBER_FUNCTION)
+                prior->kind =
+                    prior->kind == PY_MEMBER_PROPERTY && member->kind == PY_MEMBER_PROPERTY
+                        ? PY_MEMBER_PROPERTY
+                        : PY_MEMBER_OPAQUE;
             continue;
         }
         entry->members[used++] = *member;
@@ -438,10 +542,8 @@ static bool py_note_function(cbm_py_members_t *members, const cbm_resolve_bindin
         return false;
     function->result = py_capture_type(members, index, scratch, imports, member->return_chain,
                                        member->chain_scope);
-    function->shape = member->shape;
-    function->delegate_applied = member->delegate_applied;
-    function->delegate =
-        py_capture(members, index, scratch, imports, member->delegate_chain, member->chain_scope);
+    function->discards = member->discards;
+    function->replaces = member->replaces;
     uint32_t count = 0;
     while (member->returned && member->returned[count])
         count++;
@@ -549,6 +651,7 @@ bool cbm_py_members_add_file(cbm_py_members_t *members, const cbm_resolve_bindin
             py_attribute_t *attribute = &entry->attributes[entry->attribute_count++];
             attribute->name = py_keep(members, member->name);
             attribute->none = member->none_value;
+            attribute->annotated = member->type_chain != NULL;
             attribute->value = member->type_chain
                                    ? py_capture_type(members, index, &scratch, imports,
                                                      member->type_chain, member->chain_scope)
@@ -561,6 +664,11 @@ bool cbm_py_members_add_file(cbm_py_members_t *members, const cbm_resolve_bindin
         slot->target = py_keep(members, member->target);
         slot->kind = py_member_kind(index, member);
         slot->none_default = member->kind == CBM_PY_MEMBER_VALUE && member->none_value;
+        slot->spelled_decorator = member->spelled_decorator &&
+                                  cbm_resolve_binding_python_root(index, member->spelled_decorator,
+                                                                  strlen(member->spelled_decorator),
+                                                                  member->owner_scope, 0)
+                                          .kind == CBM_PY_ROOT_UNBOUND;
         slot->annotated = member->type_chain != NULL;
         slot->value = member->kind == CBM_PY_MEMBER_FUNCTION
                           ? py_capture_type(members, index, &scratch, imports, member->return_chain,
@@ -574,7 +682,10 @@ bool cbm_py_members_add_file(cbm_py_members_t *members, const cbm_resolve_bindin
             ok = false;
             break;
         }
-        if (member->kind == CBM_PY_MEMBER_FUNCTION)
+        /* A def under a condition has no provable identity, and its returns still say whether
+         * a special method defers to the base. */
+        if (member->kind == CBM_PY_MEMBER_FUNCTION ||
+            (member->kind == CBM_PY_MEMBER_OPAQUE && member->returned))
             ok = py_note_function(members, index, &scratch, imports, member);
     }
     for (size_t c = 0; ok && c < classes; c++) {
@@ -656,7 +767,9 @@ typedef enum {
     PY_VALUE_INSTANCE,
     PY_VALUE_SUPER,
     PY_VALUE_FUNCTION,
-    PY_VALUE_EXTERNAL
+    PY_VALUE_EXTERNAL,
+    PY_VALUE_SEQ, /* holds and yields instances of cls */
+    PY_VALUE_MAP  /* holds instances of cls by key; what it yields is the keys */
 } py_value_kind_t;
 
 typedef struct {
@@ -666,6 +779,9 @@ typedef struct {
     const py_ref_t *result;  /* annotated return of a function */
     const char *declaration; /* the member read last, for a reference to it */
     const char *owner;
+    const py_class_t *receiver; /* the class a method was read through */
+    /* An instance, or class, standing for whatever self or cls is at run time. */
+    bool of_receiver;
 } py_value_t;
 
 typedef struct {
@@ -747,14 +863,46 @@ static const py_member_t *py_lookup(const py_class_t *cls, const char *name, uin
     return NULL;
 }
 
-/* What instances store under this name, across the certain linearization. All
+/* What instances store under this name: the nearest class in the certain linearization that
+ * stores it, up to the class that declares the member when one does. A store further along is
+ * another declaration of the name, and the nearer one selects, as it does for a method. A class's
  * typed stores must agree; a None store says nothing about the class. */
 static bool py_instance_attribute(const py_eval_t *eval, const py_class_t *cls, const char *name,
-                                  py_value_t *out, unsigned depth) {
+                                  const py_class_t *declarer, py_value_t *out, unsigned depth) {
     bool present = false, unknown = false;
     py_value_t agreed = {.kind = PY_VALUE_UNKNOWN};
+    /* An annotation is the attribute's declared type wherever it stands, and what a subclass
+     * stores without one is held to it. */
+    const py_attribute_t *declared = NULL;
+    for (uint32_t i = 0; i < cls->reliable && !declared; i++) {
+        const py_class_t *owner = cls->mro[i];
+        if (i && declarer && cls->mro[i - 1] == declarer)
+            break;
+        py_attribute_t key = {.name = name};
+        const py_attribute_t *found =
+            owner->attribute_count ? bsearch(&key, owner->attributes, owner->attribute_count,
+                                             sizeof(*owner->attributes), py_compare_attribute)
+                                   : NULL;
+        if (!found)
+            continue;
+        while (found > owner->attributes && !strcmp(found[-1].name, name))
+            found--;
+        for (; found < owner->attributes + owner->attribute_count && !strcmp(found->name, name);
+             found++)
+            if (found->annotated) {
+                declared = found;
+                break;
+            }
+    }
+    if (declared) {
+        *out = py_eval_ref(eval, &declared->value, depth + 1);
+        return true;
+    }
     for (uint32_t i = 0; i < cls->reliable && !unknown; i++) {
         const py_class_t *owner = cls->mro[i];
+        if (i && declarer && cls->mro[i - 1] == declarer)
+            break;
+
         py_attribute_t key = {.name = name};
         const py_attribute_t *found =
             owner->attribute_count ? bsearch(&key, owner->attributes, owner->attribute_count,
@@ -770,46 +918,60 @@ static bool py_instance_attribute(const py_eval_t *eval, const py_class_t *cls, 
             if (found->none)
                 continue;
             py_value_t value = py_eval_ref(eval, &found->value, depth + 1);
-            if (value.kind != PY_VALUE_INSTANCE ||
-                (agreed.kind != PY_VALUE_UNKNOWN && agreed.cls != value.cls)) {
+            bool holds = value.kind == PY_VALUE_INSTANCE || value.kind == PY_VALUE_SEQ ||
+                         value.kind == PY_VALUE_MAP;
+            if (!holds || (agreed.kind != PY_VALUE_UNKNOWN &&
+                           (agreed.cls != value.cls || agreed.kind != value.kind))) {
                 unknown = true;
                 break;
             }
             agreed = value;
         }
+        if (agreed.kind != PY_VALUE_UNKNOWN)
+            break;
     }
     *out = unknown ? (py_value_t){.kind = PY_VALUE_UNKNOWN} : agreed;
     return present;
 }
 
-/* A metaclass or __init_subclass__ can replace what a class body assigned: a Django field
- * reads as its column value, an Enum member as the enum. A base we cannot resolve at all
- * could be anything. An external class is taken to keep it, as unittest.TestCase keeps
- * rf = RequestFactory(); the known exceptions from the stdlib count as a metaclass. */
+/* What a class body assigned is the attribute's declared value, and a read selects that:
+ * what a metaclass does to it is not a static fact, and a method called on such a read has to
+ * exist on the declared class to resolve at all. Enum and NamedTuple are the exceptions the
+ * standard library states: a member reads as the enum. A base we cannot resolve at all could
+ * be anything. */
 static bool py_class_body_rewritable(const py_class_t *cls) {
     if (cls->uncertain)
         return true;
-    for (uint32_t i = 0; i < cls->mro_count; i++) {
-        const py_class_t *entry = cls->mro[i];
-        if (entry->metaclass || py_own_member(entry, "__init_subclass__"))
+    for (uint32_t i = 0; i < cls->mro_count; i++)
+        if (cls->mro[i]->metaclass)
             return true;
-    }
     return false;
 }
+
+static py_value_t py_function_returns(const py_eval_t *eval, const char *qualified_name,
+                                      const py_class_t *receiver, bool of_receiver, unsigned depth);
+
+static py_value_t py_special_step(const py_eval_t *eval, const py_value_t *value, const char *name,
+                                  unsigned depth);
 
 static py_value_t py_read_member(const py_eval_t *eval, const py_value_t *value, const char *name,
                                  unsigned depth) {
     py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
     const py_class_t *cls = value->cls;
     if (value->kind == PY_VALUE_INSTANCE && !strcmp(name, "__class__"))
-        return (py_value_t){.kind = PY_VALUE_CLASS, .cls = cls};
+        return (py_value_t){.kind = PY_VALUE_CLASS, .cls = cls, .of_receiver = value->of_receiver};
     if (value->kind == PY_VALUE_CLASS && !strcmp(name, "<super>"))
         return (py_value_t){.kind = PY_VALUE_SUPER, .cls = cls};
     const py_class_t *owner = NULL;
     const py_member_t *member = py_lookup(cls, name, value->kind == PY_VALUE_SUPER ? 1 : 0, &owner);
-    if (value->kind == PY_VALUE_INSTANCE) {
+    /* `cls.user = User()` in a classmethod is read back through the class, and only code that
+     * stored it that way can read it so. What the class declares is what its class answers:
+     * `self.go = make()` says nothing about `Child.go`. */
+    if (value->kind == PY_VALUE_INSTANCE ||
+        (value->kind == PY_VALUE_CLASS && (!member || member->none_default))) {
         py_value_t stored;
-        if (py_instance_attribute(eval, cls, name, &stored, depth)) {
+
+        if (py_instance_attribute(eval, cls, name, member ? owner : NULL, &stored, depth)) {
             if (member && member->kind != PY_MEMBER_PROPERTY && !member->none_default)
                 return unknown;
             if (!member || member->none_default)
@@ -828,17 +990,36 @@ static py_value_t py_read_member(const py_eval_t *eval, const py_value_t *value,
                             .qualified_name = member->target,
                             .result = &member->value,
                             .declaration = member->target,
-                            .owner = owner->qualified_name};
+                            .owner = owner->qualified_name,
+                            .receiver = cls,
+                            .of_receiver = value->of_receiver};
     case PY_MEMBER_PROPERTY: {
-        py_value_t read = value->kind == PY_VALUE_INSTANCE || value->kind == PY_VALUE_SUPER
-                              ? py_eval_ref(eval, &member->value, depth + 1)
-                              : unknown;
+        bool instance = value->kind == PY_VALUE_INSTANCE || value->kind == PY_VALUE_SUPER;
+        py_value_t read =
+            !instance ? unknown
+            : member->value.kind != PY_REF_NONE
+
+                ? py_eval_ref(eval, &member->value, depth + 1)
+                : py_function_returns(eval, member->target, cls, value->of_receiver, depth + 1);
         read.declaration = member->target;
         read.owner = owner->qualified_name;
         return read;
     }
     case PY_MEMBER_VALUE: {
+        /* A class declared in this class's body. */
+        if (member->value.kind == PY_REF_NONE) {
+            const py_class_t *nested =
+                py_class(eval->members,
+                         cbm_arena_sprintf(eval->arena, "%s.%s", owner->qualified_name, name));
+            if (nested)
+                return (py_value_t){.kind = PY_VALUE_CLASS, .cls = nested};
+        }
         py_value_t read = py_eval_ref(eval, &member->value, depth + 1);
+        /* A class-body value whose class has __get__ is a descriptor: a read runs that. */
+        const py_class_t *getter = NULL;
+        if (read.kind == PY_VALUE_INSTANCE && !member->annotated &&
+            py_lookup(read.cls, "__get__", 0, &getter))
+            return py_special_step(eval, &read, "__get__", depth + 1);
         /* An annotation states what a read yields, whatever the machinery does. */
         return read.kind == PY_VALUE_INSTANCE && !member->annotated && py_class_body_rewritable(cls)
                    ? unknown
@@ -858,14 +1039,39 @@ static py_value_t py_read_member(const py_eval_t *eval, const py_value_t *value,
 static void py_infer_returns(const py_eval_t *eval, py_function_t *function, unsigned depth) {
     function->inference = 1;
     const py_class_t *agreed = NULL;
-    bool known = function->returned_count > 0 && depth <= PY_MAX_DEPTH;
+    bool known = function->returned_count > 0 && depth <= PY_MAX_DEPTH, receiver = known;
+    py_value_kind_t kind = PY_VALUE_UNKNOWN;
     for (uint32_t i = 0; known && i < function->returned_count; i++) {
         py_value_t value = py_eval_ref(eval, &function->returned[i], depth + 1);
-        known = value.kind == PY_VALUE_INSTANCE && (!agreed || agreed == value.cls);
+        known = (value.kind == PY_VALUE_INSTANCE || value.kind == PY_VALUE_CLASS) &&
+                (!agreed || (agreed == value.cls && kind == value.kind));
         agreed = value.cls;
+        kind = value.kind;
+        receiver = receiver && value.of_receiver;
     }
     function->inferred = known ? agreed : NULL;
+    function->returns_class = known && kind == PY_VALUE_CLASS;
+    function->returns_receiver = known && receiver;
     function->inference = 2;
+}
+
+/* What an unannotated function returns. `return self` in an inherited method is the class it
+ * was read through, as a type checker reads an unannotated self: chord(...).set() is a chord
+ * although set is declared on Signature. */
+static py_value_t py_function_returns(const py_eval_t *eval, const char *qualified_name,
+                                      const py_class_t *receiver, bool of_receiver,
+                                      unsigned depth) {
+    py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
+    py_function_t *function = cbm_ht_get(eval->members->functions, qualified_name);
+    if (function && function->inference == 0)
+        py_infer_returns(eval, function, depth);
+    if (!function || !function->inferred)
+        return unknown;
+
+    return (py_value_t){.kind = function->returns_class ? PY_VALUE_CLASS : PY_VALUE_INSTANCE,
+                        .cls =
+                            function->returns_receiver && receiver ? receiver : function->inferred,
+                        .of_receiver = function->returns_receiver && of_receiver};
 }
 
 static py_value_t py_call(const py_eval_t *eval, const py_value_t *value, unsigned depth) {
@@ -874,16 +1080,14 @@ static py_value_t py_call(const py_eval_t *eval, const py_value_t *value, unsign
     case PY_VALUE_CLASS:
         /* __new__ can return anything. */
         return value->cls->custom_new ? unknown
-                                      : (py_value_t){.kind = PY_VALUE_INSTANCE, .cls = value->cls};
+                                      : (py_value_t){.kind = PY_VALUE_INSTANCE,
+                                                     .cls = value->cls,
+                                                     .of_receiver = value->of_receiver};
     case PY_VALUE_FUNCTION: {
         if (value->result && value->result->kind != PY_REF_NONE)
             return py_eval_ref(eval, value->result, depth + 1);
-        py_function_t *function = cbm_ht_get(eval->members->functions, value->qualified_name);
-        if (function && function->inference == 0)
-            py_infer_returns(eval, function, depth);
-        return function && function->inferred
-                   ? (py_value_t){.kind = PY_VALUE_INSTANCE, .cls = function->inferred}
-                   : unknown;
+        return py_function_returns(eval, value->qualified_name, value->receiver, value->of_receiver,
+                                   depth);
     }
     case PY_VALUE_INSTANCE: {
         const py_class_t *owner = NULL;
@@ -896,6 +1100,79 @@ static py_value_t py_call(const py_eval_t *eval, const py_value_t *value, unsign
     }
 }
 
+/* A special method of a project class answering a container step. */
+static py_value_t py_special_step(const py_eval_t *eval, const py_value_t *value, const char *name,
+                                  unsigned depth) {
+    py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
+    if (value->kind != PY_VALUE_INSTANCE)
+        return unknown;
+    const py_class_t *owner = NULL;
+    const py_member_t *member = py_lookup(value->cls, name, 0, &owner);
+    if (!member || member->kind != PY_MEMBER_FUNCTION)
+        return unknown;
+    py_value_t bound = {.kind = PY_VALUE_FUNCTION,
+                        .qualified_name = member->target,
+                        .result = &member->value,
+                        .receiver = value->cls,
+                        .of_receiver = value->of_receiver};
+    return py_call(eval, &bound, depth);
+}
+
+/* x[k], x[a:b], and iterating or wrapping x, as the annotation said. */
+static py_value_t py_container_step(const py_eval_t *eval, const py_value_t *value,
+                                    const char *step, size_t length, unsigned depth) {
+    py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
+    if (value->kind == PY_VALUE_EXTERNAL)
+        return *value;
+    bool seq = value->kind == PY_VALUE_SEQ, map = value->kind == PY_VALUE_MAP;
+    py_value_t element = {.kind = PY_VALUE_INSTANCE, .cls = value->cls};
+    if (length == 4 && !strncmp(step, "@seq", 4)) {
+        return value->kind == PY_VALUE_INSTANCE
+                   ? (py_value_t){.kind = PY_VALUE_SEQ, .cls = value->cls}
+                   : unknown;
+    }
+    if (length == 4 && !strncmp(step, "@map", 4)) {
+        return value->kind == PY_VALUE_INSTANCE
+                   ? (py_value_t){.kind = PY_VALUE_MAP, .cls = value->cls}
+                   : unknown;
+    }
+    /* d.items() against an annotated map: a class's own items() means what it says. */
+    if (length == 7 && !strncmp(step, "@values", 7))
+        return map ? (py_value_t){.kind = PY_VALUE_SEQ, .cls = value->cls} : unknown;
+    if (length == 5 && !strncmp(step, "@iter", 5)) {
+        if (seq)
+            return element;
+        if (map)
+            return unknown;
+        py_value_t iterator = py_special_step(eval, value, "__iter__", depth);
+        return iterator.kind == PY_VALUE_SEQ
+                   ? (py_value_t){.kind = PY_VALUE_INSTANCE, .cls = iterator.cls}
+                   : unknown;
+    }
+    if (length == 2 && !strncmp(step, "[]", 2)) {
+        if (seq || map)
+            return element;
+        return py_special_step(eval, value, "__getitem__", depth);
+    }
+    if (length == 3 && !strncmp(step, "[:]", 3))
+        return seq ? *value : py_special_step(eval, value, "__getitem__", depth);
+    return unknown;
+}
+
+/* The container methods that hand back what it holds. */
+static py_value_t py_container_method(const py_value_t *value, const char *name) {
+    py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
+    py_value_t element = {.kind = PY_VALUE_INSTANCE, .cls = value->cls};
+    if (!strcmp(name, "copy"))
+        return *value;
+    if (value->kind == PY_VALUE_SEQ)
+        return !strcmp(name, "pop") ? element : unknown;
+    if (!strcmp(name, "get") || !strcmp(name, "pop") || !strcmp(name, "setdefault"))
+        return element;
+    return !strcmp(name, "values") ? (py_value_t){.kind = PY_VALUE_SEQ, .cls = value->cls}
+                                   : unknown;
+}
+
 static py_value_t py_apply_tail(const py_eval_t *eval, py_value_t value, const char *tail,
                                 unsigned depth) {
     py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
@@ -905,14 +1182,33 @@ static py_value_t py_apply_tail(const py_eval_t *eval, py_value_t value, const c
             tail += 2;
             continue;
         }
+        if (tail[0] == '@' || tail[0] == '[') {
+            size_t step =
+                tail[0] == '[' ? strcspn(tail, "]") + 1 : 1 + strcspn(tail + 1, PY_CHAIN_STOPS);
+            value = py_container_step(eval, &value, tail, step, depth);
+            tail += step;
+            continue;
+        }
         if (tail[0] != '.')
             return unknown;
         tail++;
-        size_t length = strcspn(tail, ".(");
+        size_t length = strcspn(tail, PY_CHAIN_STOPS);
         const char *name = cbm_arena_strndup(eval->arena, tail, length);
         if (!name)
             return unknown;
         tail += length;
+        /* A with statement on what a contextmanager generator yields. */
+        if (value.kind == PY_VALUE_SEQ &&
+            (!strcmp(name, "__enter__") || !strcmp(name, "__aenter__")) && tail[0] == '(') {
+            value = (py_value_t){.kind = PY_VALUE_INSTANCE, .cls = value.cls};
+            tail += 2;
+            continue;
+        }
+        if ((value.kind == PY_VALUE_SEQ || value.kind == PY_VALUE_MAP) && tail[0] == '(') {
+            value = py_container_method(&value, name);
+            tail += 2;
+            continue;
+        }
         switch (value.kind) {
         case PY_VALUE_MODULE: {
             const char *target = NULL;
@@ -964,7 +1260,8 @@ static py_value_t py_eval_ref(const py_eval_t *eval, const py_ref_t *ref, unsign
         value = (py_value_t){.kind = ref->kind == PY_REF_SELF    ? PY_VALUE_INSTANCE
                                      : ref->kind == PY_REF_CLASS ? PY_VALUE_CLASS
                                                                  : PY_VALUE_SUPER,
-                             .cls = cls};
+                             .cls = cls,
+                             .of_receiver = true};
         break;
     }
     case PY_REF_JOIN: {
@@ -994,75 +1291,36 @@ static py_value_t py_eval_ref(const py_eval_t *eval, const py_ref_t *ref, unsign
 
 typedef enum { PY_KEEP_NONE = 0, PY_KEEP_IDENTITY, PY_KEEP_PROPERTY } py_keep_t;
 
-/* Standard library decorators whose result is the function or class itself, or a
- * thin wrapper that calls it. Facts about those modules, not about this project. */
-static bool py_stdlib_keeps_identity(const char *canonical, bool applied) {
-    static const char *const direct[] = {"abc.abstractmethod",
-                                         "typing.final",
-                                         "typing.override",
-                                         "typing.no_type_check",
-                                         "typing_extensions.final",
-                                         "typing_extensions.override",
-                                         "functools.lru_cache",
-                                         "functools.cache",
-                                         "functools.total_ordering",
-                                         "contextlib.contextmanager",
-                                         "contextlib.asynccontextmanager",
-                                         "dataclasses.dataclass",
-                                         "enum.unique",
-                                         "typing.runtime_checkable",
-                                         "atexit.register",
-                                         "typing_extensions.runtime_checkable",
-                                         NULL};
-    static const char *const called[] = {"functools.lru_cache", "functools.wraps",
-                                         "dataclasses.dataclass", NULL};
-    for (const char *const *name = applied ? called : direct; *name; name++)
-        if (!strcmp(*name, canonical))
-            return true;
-    return false;
+/* functools.cached_property, kombu's, werkzeug's, abc.abstractproperty: reading such a member
+ * runs the function, and what a site then calls is its value. Saying so only ever withholds
+ * a call. */
+static bool py_external_property(const char *canonical) {
+    const char *dot = strrchr(canonical, '.');
+    const char *name = dot ? dot + 1 : canonical;
+    size_t length = strlen(name);
+    return length >= 8 && !strcmp(name + length - 8, "property");
 }
 
-static bool py_stdlib_property(const char *canonical) {
-    return !strcmp(canonical, "functools.cached_property") ||
-           !strcmp(canonical, "abc.abstractproperty");
-}
-
-/* The source proves it keeps identity in this form, or hands the function on to a
- * decorator that does. */
-static bool py_function_keeps(const py_eval_t *eval, const char *qualified_name, bool applied,
-                              unsigned depth) {
-    const py_function_t *function = cbm_ht_get(eval->members->functions, qualified_name);
-    if (!function || depth > 4)
-        return false;
-    if (function->shape & (applied ? CBM_PY_SHAPE_FACTORY : CBM_PY_SHAPE_DIRECT))
-        return true;
-    if (applied || !(function->shape & CBM_PY_SHAPE_DELEGATES))
-        return false;
-    py_value_t next = py_eval_ref(eval, &function->delegate, depth + 1);
-    return next.kind == PY_VALUE_FUNCTION &&
-           py_function_keeps(eval, next.qualified_name, function->delegate_applied, depth + 1);
-}
-
+/* A decorator does not change which declaration a name selects. What runs when the name is
+ * called can differ, as it can behind any dispatch, and CALLS is not that. So every decorator
+ * keeps the declaration, the way a type checker reads one it cannot see through, unless the
+ * source proves it discards the function. */
 static py_keep_t py_decorator_verdict(const py_eval_t *eval, const py_decorator_t *decorator) {
     py_ref_t bare = decorator->ref;
-    if (bare.kind == PY_REF_UNBOUND && (!bare.tail || !bare.tail[0])) {
-        if (decorator->applied)
-            return PY_KEEP_NONE;
-        if (!strcmp(bare.name, "staticmethod") || !strcmp(bare.name, "classmethod"))
-            return PY_KEEP_IDENTITY;
-        return !strcmp(bare.name, "property") ? PY_KEEP_PROPERTY : PY_KEEP_NONE;
-    }
+    if (bare.kind == PY_REF_UNBOUND && (!bare.tail || !bare.tail[0]))
+        return !decorator->applied && !strcmp(bare.name, "property") ? PY_KEEP_PROPERTY
+                                                                     : PY_KEEP_IDENTITY;
     py_value_t value = py_eval_ref(eval, &bare, 0);
-    if (value.kind == PY_VALUE_EXTERNAL && decorator->canonical) {
-        if (py_stdlib_keeps_identity(decorator->canonical, decorator->applied))
-            return PY_KEEP_IDENTITY;
-        return !decorator->applied && py_stdlib_property(decorator->canonical) ? PY_KEEP_PROPERTY
-                                                                               : PY_KEEP_NONE;
+
+    if (value.kind == PY_VALUE_EXTERNAL && decorator->canonical)
+        return !decorator->applied && py_external_property(decorator->canonical) ? PY_KEEP_PROPERTY
+                                                                                 : PY_KEEP_IDENTITY;
+    if (value.kind == PY_VALUE_FUNCTION) {
+        const py_function_t *function = cbm_ht_get(eval->members->functions, value.qualified_name);
+        return function && (function->discards || (function->replaces && !decorator->applied))
+                   ? PY_KEEP_NONE
+                   : PY_KEEP_IDENTITY;
     }
-    if (value.kind == PY_VALUE_FUNCTION)
-        return py_function_keeps(eval, value.qualified_name, decorator->applied, 0)
-                   ? PY_KEEP_IDENTITY
-                   : PY_KEEP_NONE;
     /* A classmethod or staticmethod subclass binds the same function. */
     for (uint32_t i = 0;
          value.kind == PY_VALUE_CLASS && !decorator->applied && i < value.cls->base_count; i++) {
@@ -1074,7 +1332,7 @@ static py_keep_t py_decorator_verdict(const py_eval_t *eval, const py_decorator_
     /* A descriptor class: `@cached_property` reads run the function once. */
     if (value.kind == PY_VALUE_CLASS && !decorator->applied && py_own_member(value.cls, "__get__"))
         return PY_KEEP_PROPERTY;
-    return PY_KEEP_NONE;
+    return PY_KEEP_IDENTITY;
 }
 
 bool cbm_py_members_decide_decorated(cbm_py_members_t *members, const cbm_py_members_env_t *env,
@@ -1306,11 +1564,36 @@ static uint32_t py_single_chain(const py_class_t *cls, const py_class_t **mro, u
     return reliable;
 }
 
-/* Base[int] asks the class, and a __class_getitem__ can answer with anything. */
-static bool py_answers_subscript(const py_class_t *cls) {
-    for (uint32_t i = 0; i < cls->mro_count; i++)
-        if (py_own_member(cls->mro[i], "__class_getitem__"))
+/* This special method answers through the base on some path: `return super().__new__(cls)`,
+ * or django's __getattribute__ reading `super().__getattribute__(name)`. Then the declared
+ * members are still what a read finds, and a call of the class still makes an instance. */
+static bool py_defers_to_base(const cbm_py_members_t *members, const py_member_t *member,
+                              const char *tail) {
+    const py_function_t *function = cbm_ht_get(members->functions, member->target);
+    size_t tail_length = strlen(tail);
+
+    for (uint32_t i = 0; function && i < function->returned_count; i++) {
+        const py_ref_t *returned = &function->returned[i];
+        size_t length = returned->tail ? strlen(returned->tail) : 0;
+        bool base = returned->kind == PY_REF_SUPER ||
+                    (returned->kind == PY_REF_UNBOUND && !strcmp(returned->name, "object")) ||
+                    (length > tail_length &&
+                     !strncmp(returned->tail + length - tail_length - strlen(".<super>"),
+                              ".<super>", strlen(".<super>")));
+        if (base && length >= tail_length && !strcmp(returned->tail + length - tail_length, tail))
             return true;
+    }
+    return false;
+}
+
+/* Base[int] asks the class, and a __class_getitem__ can answer with anything. click's fills
+ * in a parameter and answers through super, so Base[int] is still Base. */
+static bool py_answers_subscript(const cbm_py_members_t *members, const py_class_t *cls) {
+    for (uint32_t i = 0; i < cls->mro_count; i++) {
+        const py_member_t *member = py_own_member(cls->mro[i], "__class_getitem__");
+        if (member && !py_defers_to_base(members, member, ".__class_getitem__()"))
+            return true;
+    }
     return false;
 }
 
@@ -1346,7 +1629,7 @@ static void py_seal_class(const py_eval_t *eval, cbm_py_members_t *members, py_c
         }
         py_seal_class(eval, members, (py_class_t *)base, depth + 1);
         if (!base->sealed ||
-            (b < 64 && ((cls->subscripted >> b) & 1) && py_answers_subscript(base))) {
+            (b < 64 && ((cls->subscripted >> b) & 1) && py_answers_subscript(members, base))) {
             unsealed = true;
             continue;
         }
@@ -1382,8 +1665,10 @@ static void py_seal_class(const py_eval_t *eval, cbm_py_members_t *members, py_c
         reliable = py_single_chain(cls, mro, mro_count);
     cls->reliable = reliable;
     for (uint32_t i = 0; i < reliable; i++) {
-        cls->intercepts |= py_own_member(mro[i], "__getattribute__") != NULL;
-        cls->custom_new |= py_own_member(mro[i], "__new__") != NULL;
+        const py_member_t *read = py_own_member(mro[i], "__getattribute__");
+        const py_member_t *made = py_own_member(mro[i], "__new__");
+        cls->intercepts |= read && !py_defers_to_base(members, read, ".__getattribute__()");
+        cls->custom_new |= made && !py_defers_to_base(members, made, ".__new__()");
     }
     cls->visiting = false;
     cls->sealed = true;
@@ -1495,7 +1780,7 @@ bool cbm_py_members_resolve(const cbm_py_members_t *members, const cbm_py_member
         !cbm_resolve_binding_python_site(index, name, start, end, origin, &chain, &scope))
         return false;
     unsigned ref_steps = 0, eval_steps = 0;
-    py_ref_t ref = py_ref_of_chain(index, arena, imports, chain, scope, 0, 0, &ref_steps);
+    py_ref_t ref = py_ref_of_site(index, arena, imports, chain, scope, start, 0, &ref_steps);
     if (ref.kind == PY_REF_NONE || ref.kind == PY_REF_UNBOUND)
         return false;
     py_eval_t eval = {.members = members, .env = env, .arena = arena, .steps = &eval_steps};

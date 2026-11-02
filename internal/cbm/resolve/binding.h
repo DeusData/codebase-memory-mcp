@@ -80,14 +80,6 @@ typedef enum {
     CBM_PY_MEMBER_OPAQUE        /* conditionally defined: the name stops lookup */
 } cbm_resolve_python_member_kind_t;
 
-/* What a function does when used as a decorator, proven from its source. */
-enum {
-    CBM_PY_SHAPE_DIRECT = 1u << 0,
-    CBM_PY_SHAPE_FACTORY = 1u << 1,
-    /* It hands the function to another decorator, named by delegate_chain. */
-    CBM_PY_SHAPE_DELEGATES = 1u << 2
-};
-
 typedef struct {
     uint32_t owner_scope, chain_scope, at;
     const char *owner, *name, *target;
@@ -95,9 +87,9 @@ typedef struct {
     const char *const *decorators;
     const char *return_chain, *value_chain, *type_chain;
     bool none_value;
-    unsigned shape;
-    const char *delegate_chain;
-    bool delegate_applied;
+    bool discards; /* as a decorator: returns a constant or nothing on every path */
+    bool replaces; /* as a decorator: returns a value it never built from its parameter */
+    const char *spelled_decorator; /* `go = classmethod(go)`: the callee */
     /* What the function returns, as access paths in its own scope. NULL when a
      * return is not followable or the function is a generator. */
     const char *const *returned;
@@ -129,6 +121,7 @@ typedef struct {
 typedef struct {
     const char *module_path;
     uint32_t at;
+    bool annotation_only; /* under `if TYPE_CHECKING:` */
 } cbm_resolve_python_star_t;
 
 /* Build once per source file. Borrows result/source until the arena is freed.
@@ -286,8 +279,38 @@ typedef struct {
  * non-module scopes; copy while the index is alive. */
 /* Dynamic execution/module registry access remains an unknown project effect. */
 bool cbm_resolve_binding_python_effects_complete(const cbm_resolve_binding_index_t *);
-/* Conservatively includes writes and unknown alias/callee escapes. */
-bool cbm_resolve_binding_python_import_escaped(const cbm_resolve_binding_index_t *, const char *);
+/* A type annotation's chain as a value chain: `X` is X(), `X@seq` is X()@seq, `X@type` is X. */
+const char *cbm_resolve_python_typed_text(CBMArena *arena, const char *type, const char *rest);
+
+/* The class an isinstance test makes the longest narrowed prefix of this chain at this site.
+ * *consumed is how much of the chain it covers. NULL when no test applies. */
+const char *cbm_resolve_binding_python_narrowed(const cbm_resolve_binding_index_t *index,
+                                                const char *chain, uint32_t scope, uint32_t site,
+                                                size_t *consumed);
+/* A store through a proper prefix of this chain earlier in the scope holding the site: that
+ * prefix's length, and the chain it stored (NULL when not followable) with where to read it. */
+bool cbm_resolve_binding_python_store_precedes(const cbm_resolve_binding_index_t *index,
+                                               const char *chain, uint32_t scope, uint32_t site,
+                                               size_t *prefix, const char **value,
+                                               uint32_t *value_at, uint32_t *value_scope);
+
+/* Which binder of a local every path to this site passes last. VALUE names its value, NONE
+ * means the flow does not decide it, UNKNOWN that it does and its value cannot be followed. */
+typedef enum {
+    CBM_PY_FLOW_NONE = 0,
+    CBM_PY_FLOW_VALUE,
+    CBM_PY_FLOW_UNKNOWN
+} cbm_resolve_python_flow_t;
+cbm_resolve_python_flow_t cbm_resolve_binding_python_reaching(
+    const cbm_resolve_binding_index_t *index, const char *name, size_t length, uint32_t scope,
+    uint32_t site, const char **chain, uint32_t *at, uint32_t *chain_scope, bool *typed);
+
+/* The offset-th write this file makes through a module it bound to name. *member is the
+ * dotted path written below that module, NULL when any name can change. False past the
+ * last one. A read, a call and a hand-off to a callee are not writes. */
+bool cbm_resolve_binding_python_import_write(const cbm_resolve_binding_index_t *, const char *name,
+                                             size_t offset, const char **member);
+bool cbm_resolve_binding_python_names_come_at_run_time(const cbm_resolve_binding_index_t *index);
 bool cbm_resolve_binding_python_namespace_closed(const cbm_resolve_binding_index_t *index);
 size_t cbm_resolve_binding_python_namespace_size(const cbm_resolve_binding_index_t *index);
 const char *cbm_resolve_binding_python_namespace_name(const cbm_resolve_binding_index_t *index,

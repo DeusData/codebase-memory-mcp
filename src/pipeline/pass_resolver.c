@@ -13,6 +13,7 @@
 #include "resolve/lookup.h"
 #include "resolve/policy.h"
 #include "resolve/py_members.h"
+
 #include "resolve/rust_names.h"
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
@@ -117,6 +118,8 @@ typedef struct {
     const char *module_qn;
     cbm_resolve_proof_source_t source;
     bool complete, ambiguous, python_mutated;
+    bool python_audited;       /* every statement was seen, whatever __getattr__ answers besides */
+    bool python_star_chosen;   /* a condition chooses among its stars: the binder stopped at one */
     const char **python_names; /* module-level binders, sorted, parallel to python_name_at */
     uint32_t *python_name_at;
     size_t python_name_count;
@@ -146,11 +149,14 @@ typedef struct {
 } python_nested_list_t;
 
 typedef struct python_pending_import {
-    const char *key, *slot, *parent_file, *child_file, *member, *escape_root, *escape_slot;
+    const char *key, *slot, *parent_file, *child_file, *member, *write_root, *write_slot;
     const cbm_resolve_proof_t *audit;
     const char *loaded_module;
     const cbm_resolve_proof_t *load_audit;
-    bool module, audited, escaped, escape_module;
+    const char *source_file;
+    const char **writes; /* dotted paths stored through this import, NULL for any name */
+    size_t write_count;
+    bool module, audited, write_module, in_parent;
     struct python_pending_import *next;
 } python_pending_import_t;
 
@@ -190,6 +196,8 @@ struct cbm_shared_resolver {
     bool python_unknown_namespace_escape;
     cbm_ecma_table_t *ecma;
     CBMHashTable *python_star_provided; /* "<module>.<name>" a closed star import binds */
+    CBMHashTable *python_written;       /* "<module>.<path>" a statement stores or deletes */
+    CBMHashTable *python_parent_loaded; /* a submodule its package's own __init__ loads */
     CBMHashTable *python_nested;        /* file -> python_nested_list_t */
     cbm_py_members_t *python_members;
     CBMHashTable *http_defaults, *http_sites, *http_unsafe;
@@ -387,10 +395,52 @@ static bool declarations_coexist(CBMLanguage language) {
     }
 }
 
+/* A typing.overload stub states a signature for the def that follows; with it, one declaration.
+ * The binding audit proves the decorator is the real one before anything resolves to the name. */
+static bool python_overload_stub_definition(const CBMDefinition *definition) {
+    for (const char *const *decorator = definition->decorators; decorator && *decorator;
+         decorator++) {
+        const char *dot = strrchr(*decorator, '.');
+        const char *name = dot ? dot + 1 : *decorator;
+        if (*name == '@')
+            name++;
+        if (!strcmp(name, "overload"))
+            return true;
+    }
+    return false;
+}
+
+/* `@x.setter def x`: the same property as the def it follows, and its one graph node keeps
+ * this span. */
+static bool python_accessor_definition(const CBMDefinition *definition) {
+    size_t length = definition->name ? strlen(definition->name) : 0;
+    for (const char *const *decorator = definition->decorators; length && decorator && *decorator;
+         decorator++) {
+        const char *text = **decorator == '@' ? *decorator + 1 : *decorator;
+        if (strncmp(text, definition->name, length) || text[length] != '.')
+            continue;
+        const char *member = text + length + 1;
+        if (!strcmp(member, "setter") || !strcmp(member, "getter") || !strcmp(member, "deleter"))
+            return true;
+    }
+    return false;
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
                        const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
         return true;
+    if (language == CBM_LANG_PYTHON && python_overload_stub_definition(definition))
+        return true;
+    if (language == CBM_LANG_PYTHON && python_accessor_definition(definition)) {
+        target_proof_t *property = cbm_ht_get(resolver->targets, definition->qualified_name);
+        if (property && !strcmp(property->file, file) &&
+            !strcmp(property->label, definition->label)) {
+            property->start_line = definition->start_line;
+            property->end_line = definition->end_line;
+            return true;
+        }
+    }
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
     if (prior && prior->rust && language == CBM_LANG_RUST) {
         prior->ambiguous |= strcmp(prior->file, file) != 0;
@@ -471,11 +521,16 @@ static bool owner_kind(TSNode node, const char *kind) {
 }
 
 static bool note_owner_branch(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
-                              const char *file, const char *source, size_t length, TSNode group,
-                              TSNode block, unsigned branch) {
-    uint32_t count = ts_node_named_child_count(block);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode function = ts_node_named_child(block, i);
+                              const char *file, const char *source, size_t length,
+                              const char *scope, TSNode group, TSNode block, unsigned branch) {
+    TSTreeCursor cursor = ts_tree_cursor_new(block);
+    bool ok = true;
+    for (bool more = ts_tree_cursor_goto_first_child(&cursor); ok && more;
+         more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode statement = ts_tree_cursor_current_node(&cursor);
+        TSNode function = owner_kind(statement, "decorated_definition")
+                              ? owner_field(statement, "definition")
+                              : statement;
         TSNode name = owner_field(function, "name"), body = owner_field(function, "body");
         if (!owner_kind(function, "function_definition") || !owner_kind(name, "identifier") ||
             !owner_kind(body, "block"))
@@ -483,54 +538,115 @@ static bool note_owner_branch(cbm_shared_resolver_t *resolver, const CBMFileResu
         uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
         if (end <= start || end > length || end - start > INT_MAX)
             continue;
-        const char *qn = cbm_arena_sprintf(&resolver->arena, "%s.%.*s", result->module_qn,
-                                           (int)(end - start), source + start);
-        if (!qn)
-            return false;
+        const char *qn = cbm_arena_sprintf(&resolver->arena, "%s.%.*s", scope, (int)(end - start),
+                                           source + start);
+        if (!qn) {
+            ok = false;
+            break;
+        }
         target_proof_t *target = cbm_ht_get(resolver->targets, qn);
         if (!target || !target->ambiguous || target->declarations != 2 ||
-            strcmp(target->file, file) || strcmp(target->label, "Function") ||
+            strcmp(target->file, file) ||
+            (strcmp(target->label, "Function") && strcmp(target->label, "Method")) ||
             target->start_line == target->second_start_line)
             continue;
         uint32_t first = ts_node_start_point(function).row + 1;
+        uint32_t outer = ts_node_start_point(statement).row + 1;
         uint32_t last = ts_node_end_point(function).row + 1;
         unsigned member;
-        if (first == target->start_line && last == target->end_line)
+        if ((first == target->start_line || outer == target->start_line) &&
+            last == target->end_line)
             member = 0;
-        else if (first == target->second_start_line && last == target->second_end_line)
+        else if ((first == target->second_start_line || outer == target->second_start_line) &&
+                 last == target->second_end_line)
             member = 1;
         else
             continue;
         if (!target->conditional) {
             conditional_owner_t *owner = cbm_arena_calloc(&resolver->arena, sizeof(*owner));
-            if (!owner)
-                return false;
+            if (!owner) {
+                ok = false;
+                break;
+            }
             owner->content = cbm_arena_strdup(&resolver->arena,
                                               result->source_content_id[CBM_SOURCE_ORIGIN_RAW]);
             owner->configuration =
                 cbm_arena_strdup(&resolver->arena, result->source_configuration_id);
-            if (!owner->content || !owner->configuration)
-                return false;
+            if (!owner->content || !owner->configuration) {
+                ok = false;
+                break;
+            }
             target->conditional = owner;
         }
         conditional_owner_t *owner = target->conditional;
         owner->invalid |= owner->members[member].branch != 0;
-        owner->members[member] = (owner_variant_t){.start_line = first,
-                                                   .end_line = last,
-                                                   .start_byte = ts_node_start_byte(function),
-                                                   .end_byte = ts_node_end_byte(function),
-                                                   .body_start = ts_node_start_byte(body),
-                                                   .body_end = ts_node_end_byte(body),
-                                                   .group_start = ts_node_start_byte(group),
-                                                   .group_end = ts_node_end_byte(group),
-                                                   .branch = branch};
+        owner->members[member] = (owner_variant_t){
+            .start_line =
+                first == target->start_line || first == target->second_start_line ? first : outer,
+            .end_line = last,
+            .start_byte = ts_node_start_byte(function),
+            .end_byte = ts_node_end_byte(function),
+            .body_start = ts_node_start_byte(body),
+            .body_end = ts_node_end_byte(body),
+            .group_start = ts_node_start_byte(group),
+            .group_end = ts_node_end_byte(group),
+            .branch = branch};
     }
-    return true;
+    ts_tree_cursor_delete(&cursor);
+    return ok;
 }
 
-/* Audit one raw syntax tree in linear time. This deliberately supports only
- * direct module-level if/else bodies. elif, nested groups, decorated functions,
- * other languages and cross-file build variants remain quality gaps. */
+/* An if/else whose two arms each declare a name: one declaration of it, whichever arm runs. */
+static bool note_owner_group(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
+                             const char *file, const char *source, size_t length, const char *scope,
+                             TSNode group) {
+    TSNode first = owner_field(group, "consequence");
+    TSNode alternative = owner_field(group, "alternative");
+    TSNode second = owner_field(alternative, "body");
+    if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
+        !owner_kind(second, "block"))
+        return true;
+    return note_owner_branch(resolver, result, file, source, length, scope, group, first, 1) &&
+           note_owner_branch(resolver, result, file, source, length, scope, group, second, 2);
+}
+
+/* Audit one raw syntax tree in linear time: each if/else directly in a scope's body, where the
+ * scope is the module or a def or class reached through bodies. elif, nested groups, other
+ * languages and cross-file build variants remain quality gaps. */
+static bool note_conditional_owners_in(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
+                                       const char *file, const char *source, size_t length,
+                                       const char *scope, TSNode body, unsigned depth) {
+    /* A cursor, not an index loop: a fetch by index walks from the first child. */
+    bool ok = depth < 32;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    for (bool more = ok && ts_tree_cursor_goto_first_child(&cursor); ok && more;
+         more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode statement = ts_tree_cursor_current_node(&cursor);
+        if (owner_kind(statement, "if_statement")) {
+            ok = note_owner_group(resolver, result, file, source, length, scope, statement);
+            continue;
+        }
+        TSNode definition = owner_kind(statement, "decorated_definition")
+                                ? owner_field(statement, "definition")
+                                : statement;
+        if (!owner_kind(definition, "function_definition") &&
+            !owner_kind(definition, "class_definition"))
+            continue;
+        TSNode name = owner_field(definition, "name"), inner = owner_field(definition, "body");
+        if (!owner_kind(name, "identifier") || !owner_kind(inner, "block"))
+            continue;
+        uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+        if (end <= start || end > length)
+            continue;
+        const char *child = cbm_arena_sprintf(&resolver->arena, "%s.%.*s", scope,
+                                              (int)(end - start), source + start);
+        ok = child && note_conditional_owners_in(resolver, result, file, source, length, child,
+                                                 inner, depth + 1);
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
 static bool note_conditional_owners(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
                                     const char *file, CBMLanguage language, const char *source,
                                     size_t length) {
@@ -541,26 +657,8 @@ static bool note_conditional_owners(cbm_shared_resolver_t *resolver, const CBMFi
     TSNode root = ts_tree_root_node(result->cached_tree);
     if (!owner_kind(root, "module") || ts_node_has_error(root))
         return true;
-    /* A cursor, not an index loop: a fetch by index walks from the first child. */
-    bool ok = true;
-    TSTreeCursor cursor = ts_tree_cursor_new(root);
-    if (ts_tree_cursor_goto_first_child(&cursor)) {
-        do {
-            TSNode group = ts_tree_cursor_current_node(&cursor);
-            if (!owner_kind(group, "if_statement"))
-                continue;
-            TSNode first = owner_field(group, "consequence");
-            TSNode alternative = owner_field(group, "alternative");
-            TSNode second = owner_field(alternative, "body");
-            if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
-                !owner_kind(second, "block"))
-                continue;
-            ok = note_owner_branch(resolver, result, file, source, length, group, first, 1) &&
-                 note_owner_branch(resolver, result, file, source, length, group, second, 2);
-        } while (ok && ts_tree_cursor_goto_next_sibling(&cursor));
-    }
-    ts_tree_cursor_delete(&cursor);
-    return ok;
+    return note_conditional_owners_in(resolver, result, file, source, length, result->module_qn,
+                                      root, 0);
 }
 
 static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_node_t *node) {
@@ -951,8 +1049,13 @@ static bool capture_python_stars(cbm_shared_resolver_t *resolver, const cbm_pipe
     entry->python_stars = cbm_arena_calloc(&resolver->arena, count * sizeof(*entry->python_stars));
     if (!entry->python_stars)
         return false;
+    size_t kept = 0;
     for (size_t i = 0; i < count; i++) {
         const cbm_resolve_python_star_t *star = cbm_resolve_binding_python_star_at(index, i);
+        /* Under TYPE_CHECKING it binds nothing at run time, and only some modules have another
+         * way to have those names. */
+        if (star->annotation_only && !cbm_resolve_binding_python_names_come_at_run_time(index))
+            continue;
         CBMImport path = {.local_name = star->module_path,
                           .module_path = star->module_path,
                           .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS};
@@ -964,9 +1067,9 @@ static bool capture_python_stars(cbm_shared_resolver_t *resolver, const cbm_pipe
         cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
         if (lost)
             return false;
-        entry->python_stars[i] = (python_star_source_t){.module = copy, .at = star->at};
+        entry->python_stars[kept++] = (python_star_source_t){.module = copy, .at = star->at};
     }
-    entry->python_star_count = count;
+    entry->python_star_count = kept;
     return true;
 }
 
@@ -995,6 +1098,12 @@ static bool capture_python_namespace(cbm_shared_resolver_t *resolver, const cbm_
     entry->source = context.source;
     entry->module_qn = module;
     entry->complete = cbm_resolve_binding_python_namespace_closed(index);
+    entry->python_audited =
+        cbm_resolve_binding_status(index) &&
+        !strcmp(cbm_resolve_binding_status(index), "binding_complete_supported_subset");
+    entry->python_star_chosen =
+        cbm_resolve_binding_status(index) &&
+        !strcmp(cbm_resolve_binding_status(index), "conditional_wildcard_import");
     size_t count = cbm_resolve_binding_python_namespace_size(index);
     if (count > SIZE_MAX / sizeof(*entry->python_names))
         return false;
@@ -1070,9 +1179,55 @@ static bool python_loaded_module(cbm_shared_resolver_t *resolver, const cbm_pipe
     return *out != NULL;
 }
 
+/* What this file writes through the module the import bound. */
+static bool python_note_import_writes(cbm_shared_resolver_t *resolver,
+                                      const cbm_pipeline_ctx_t *ctx,
+                                      const cbm_resolve_binding_index_t *index, const char *file,
+                                      const CBMImport *import, python_pending_import_t *entry) {
+    const char *member = NULL;
+    while (cbm_resolve_binding_python_import_write(index, import->local_name, entry->write_count,
+                                                   &member))
+        entry->write_count++;
+    if (!entry->write_count)
+        return true;
+    entry->writes = cbm_arena_alloc(&resolver->arena, entry->write_count * sizeof(*entry->writes));
+    if (!entry->writes)
+        return false;
+    for (size_t i = 0; i < entry->write_count; i++) {
+        cbm_resolve_binding_python_import_write(index, import->local_name, i, &member);
+        entry->writes[i] = member ? cbm_arena_strdup(&resolver->arena, member) : NULL;
+        if (member && !entry->writes[i])
+            return false;
+    }
+    char *effect = cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name, file, import,
+                                                   &entry->write_module);
+    if (effect) {
+        entry->write_slot = cbm_arena_strdup(&resolver->arena, effect);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, effect);
+        if (!entry->write_slot)
+            return false;
+    }
+    if (import->kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT && import->local_name) {
+        CBMImport root = *import;
+        root.module_path = import->local_name;
+        root.kind = CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS;
+        bool is_module = false;
+        char *bound =
+            cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name, file, &root, &is_module);
+        if (bound) {
+            entry->write_root = cbm_arena_strdup(&resolver->arena, bound);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, bound);
+            if (!entry->write_root)
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool defer_python_import(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
-                                const char *file, const CBMImport *import, const char *key,
-                                const char *slot, bool module, bool audited, bool escaped,
+                                const cbm_resolve_binding_index_t *index, const char *file,
+                                const CBMImport *import, const char *key, const char *slot,
+                                bool module, bool audited, bool runs,
                                 const cbm_resolve_proof_t *audit, const char *loaded_module,
                                 const cbm_resolve_proof_t *load_audit) {
     python_pending_import_t *entry = cbm_arena_calloc(&resolver->arena, sizeof(*entry));
@@ -1082,36 +1237,14 @@ static bool defer_python_import(cbm_shared_resolver_t *resolver, const cbm_pipel
     entry->slot = slot ? cbm_arena_strdup(&resolver->arena, slot) : NULL;
     entry->module = module;
     entry->audited = audited;
-    entry->escaped = escaped;
     entry->audit = audit;
     entry->loaded_module = loaded_module;
     entry->load_audit = load_audit;
-    if (!entry->key || (slot && !entry->slot))
+    entry->source_file = cbm_arena_strdup(&resolver->arena, file);
+    if (!entry->key || (slot && !entry->slot) || !entry->source_file)
         return false;
-    if (escaped) {
-        char *effect = cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name, file, import,
-                                                       &entry->escape_module);
-        if (effect) {
-            entry->escape_slot = cbm_arena_strdup(&resolver->arena, effect);
-            cbm_free(CBM_MEM_CLASS_SEMANTIC, effect);
-            if (!entry->escape_slot)
-                return false;
-        }
-    }
-    if (escaped && import->kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT && import->local_name) {
-        CBMImport root = *import;
-        root.module_path = import->local_name;
-        root.kind = CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS;
-        bool is_module = false;
-        char *bound =
-            cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name, file, &root, &is_module);
-        if (bound) {
-            entry->escape_root = cbm_arena_strdup(&resolver->arena, bound);
-            cbm_free(CBM_MEM_CLASS_SEMANTIC, bound);
-            if (!entry->escape_root)
-                return false;
-        }
-    }
+    if (runs && !python_note_import_writes(resolver, ctx, index, file, import, entry))
+        return false;
     const cbm_gbuf_node_t *parent, *child;
     if (audited && !module &&
         cbm_pipeline_python_submodule_candidate(ctx->gbuf, ctx->project_name, file, import, &parent,
@@ -1119,6 +1252,8 @@ static bool defer_python_import(cbm_shared_resolver_t *resolver, const cbm_pipel
         entry->parent_file = cbm_arena_strdup(&resolver->arena, parent->file_path);
         entry->child_file = cbm_arena_strdup(&resolver->arena, child->file_path);
         entry->member = cbm_arena_strdup(&resolver->arena, strrchr(import->module_path, '.') + 1);
+        entry->in_parent = !strcmp(parent->file_path, file) && import->local_name &&
+                           !strcmp(import->local_name, entry->member);
         if (!entry->parent_file || !entry->child_file || !entry->member)
             return false;
     }
@@ -1511,10 +1646,8 @@ static bool python_export_import(cbm_shared_resolver_t *resolver, const cbm_pipe
                            "python_explicit_module_load_barrier", import)
             : NULL;
     ok = ok && (!loaded || load_audit) &&
-         defer_python_import(
-             resolver, ctx, file, import, fact_key, slot, module, audited,
-             runs && cbm_resolve_binding_python_import_escaped(index, import->local_name), audit,
-             loaded, load_audit);
+         defer_python_import(resolver, ctx, index, file, import, fact_key, slot, module, audited,
+                             runs, audit, loaded, load_audit);
     /* A plain dotted import binds only a package root, not the loaded leaf
      * under that root's exported name. Exact module-path uses still retain
      * the private import fact above. */
@@ -1544,14 +1677,14 @@ static const char *python_member_import_key(void *context, CBMArena *arena,
                                             const cbm_resolve_python_nested_import_t *nested,
                                             const char *chain, const char **rest) {
     python_member_imports_t *lookup = context;
-    size_t dotted = strcspn(chain, "(");
+    size_t dotted = strcspn(chain, "([@");
     if (nested) {
         const char *base = nested->import.kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT
                                ? nested->import.module_path
                                : nested->import.local_name;
         size_t length = strlen(base);
         if (length > dotted || strncmp(chain, base, length) ||
-            (chain[length] && chain[length] != '.' && chain[length] != '('))
+            (chain[length] && !strchr(".([@", chain[length])))
             return NULL;
         *rest = chain + length;
         return python_nested_key(arena, lookup->file, nested->at, nested->import.local_name);
@@ -1692,8 +1825,9 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
         const CBMDefinition *definition = &result->defs.items[d];
         /* Indexing child.py does not execute it or overwrite an explicit child
          * value in __init__.py. Actual loads are separate effect observations. */
-        if (file->language == CBM_LANG_PYTHON && definition->label &&
-            !strcmp(definition->label, "Module"))
+        if (file->language == CBM_LANG_PYTHON &&
+            ((definition->label && !strcmp(definition->label, "Module")) ||
+             python_overload_stub_definition(definition) || python_accessor_definition(definition)))
             continue;
         const char *qn = definition->qualified_name;
         if (qn && qn[0]) {
@@ -1737,7 +1871,12 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
              python_export_import(
                  resolver, ctx, result, file->rel_path, &arena, index, &item->import, key,
                  cbm_resolve_binding_python_nested_audited(index, item),
-                 item->scope == 0 && !item->annotation_only, !item->annotation_only);
+                 /* A TYPE_CHECKING import runs nothing. In a module whose names can come at
+                  * run time it is what the module states that name to be: celery and every
+                  * PEP 562 lazy package rely on it. Any other module has no such name then. */
+                 item->scope == 0 && (!item->annotation_only ||
+                                      cbm_resolve_binding_python_names_come_at_run_time(index)),
+                 !item->annotation_only);
     }
     if (ok && file->language == CBM_LANG_PYTHON && cbm_resolve_binding_status(index) &&
         !strcmp(cbm_resolve_binding_status(index), "binding_complete_supported_subset")) {
@@ -1773,14 +1912,24 @@ static int compare_export(const void *left, const void *right) {
     return strcmp((*(export_proof_t *const *)left)->key, (*(export_proof_t *const *)right)->key);
 }
 
+/* `from pkg import child` finds the submodule when pkg's namespace has no such name. In
+ * pkg's own __init__ the statement is itself that name's binder, and it runs before the
+ * name exists, so a binder there of its own does not count. */
 static bool python_namespace_absent(cbm_shared_resolver_t *resolver,
-                                    const namespace_proof_t *parent, const char *name) {
-    if (!parent || !parent->complete || parent->ambiguous || parent->python_mutated || !name ||
+                                    const namespace_proof_t *parent, const char *name,
+                                    bool in_parent) {
+    if (!parent || parent->ambiguous || parent->python_mutated || !name ||
         parent->python_open_barrier)
         return false;
     /* A closed star import binds this name as a value, not the submodule. */
     const char *qualified = cbm_arena_sprintf(&resolver->arena, "%s.%s", parent->module_qn, name);
-    if (!qualified || cbm_ht_get(resolver->python_star_provided, qualified))
+    if (!qualified || cbm_ht_get(resolver->python_star_provided, qualified) ||
+        cbm_ht_get(resolver->python_written, qualified))
+        return false;
+    /* __getattr__ answers only for a name the module lacks. A child its own __init__ loads is
+     * set on it by that load, so it never gets to answer for this one. */
+    if (!parent->complete &&
+        !(parent->python_audited && cbm_ht_get(resolver->python_parent_loaded, qualified)))
         return false;
     size_t low = 0, high = parent->python_name_count;
     while (low < high) {
@@ -1790,7 +1939,11 @@ static bool python_namespace_absent(cbm_shared_resolver_t *resolver,
         else
             high = middle;
     }
-    return low == parent->python_name_count || strcmp(parent->python_names[low], name) != 0;
+    size_t binders = 0;
+    while (low + binders < parent->python_name_count &&
+           !strcmp(parent->python_names[low + binders], name))
+        binders++;
+    return binders == 0 || (in_parent && binders == 1);
 }
 
 static const cbm_resolve_proof_t *python_submodule_proof(cbm_shared_resolver_t *resolver,
@@ -1838,13 +1991,36 @@ static void invalidate_python_namespace(cbm_shared_resolver_t *resolver, const c
  * same-leaf files never invalidate one another. Work follows imported
  * namespace prefixes, using hash lookups rather than a files-by-import scan. */
 static bool collect_python_module_loads(cbm_shared_resolver_t *resolver) {
+    /* `from . import child` in the parent's own __init__ binds the very module a load installs
+     * there, so that load competes with nothing. */
+    CBMHashTable *own_children = cbm_ht_create(32);
+    if (!own_children)
+        return false;
+    for (const python_pending_import_t *import = resolver->python_imports; import;
+         import = import->next) {
+        /* A load by the parent's own __init__: a from-import of the child, or of something in it.
+         */
+        const namespace_proof_t *source = cbm_ht_get(resolver->namespaces, import->source_file);
+        const char *dot = import->loaded_module ? strrchr(import->loaded_module, '.') : NULL;
+        if (source && dot && strlen(source->module_qn) == (size_t)(dot - import->loaded_module) &&
+            !strncmp(source->module_qn, import->loaded_module,
+                     (size_t)(dot - import->loaded_module)))
+            cbm_ht_set(resolver->python_parent_loaded, import->loaded_module, resolver);
+        const char *key = import->in_parent && import->slot ? import->slot : NULL;
+        if (key) {
+            cbm_ht_set(own_children, key, resolver);
+            cbm_ht_set(resolver->python_parent_loaded, key, resolver);
+        }
+    }
     for (const python_pending_import_t *import = resolver->python_imports; import;
          import = import->next) {
         if (!import->loaded_module)
             continue;
         char *module = cbm_arena_strdup(&resolver->arena, import->loaded_module);
-        if (!module || !import->load_audit)
+        if (!module || !import->load_audit) {
+            cbm_ht_free(own_children);
             return false;
+        }
         for (;;) {
             const namespace_proof_t *loaded = cbm_ht_get(resolver->python_namespaces, module);
             target_proof_t *declaration = cbm_ht_get(resolver->targets, module);
@@ -1855,9 +2031,12 @@ static bool collect_python_module_loads(cbm_shared_resolver_t *resolver) {
             /* Keep actual load support beside any value it can overwrite. A
              * source namespace alone is never a competing value declaration. */
             if (loaded && cbm_ht_get(resolver->exports, module) &&
+                !cbm_ht_get(own_children, module) &&
                 !add_export(resolver, module, loaded->source.file, 0, false, NULL,
-                            import->load_audit))
+                            import->load_audit)) {
+                cbm_ht_free(own_children);
                 return false;
+            }
             /* The load installs this one child on its parent: the same module
              * identity a submodule import names, so it closes no other name. */
             char *dot = strrchr(module, '.');
@@ -1866,21 +2045,35 @@ static bool collect_python_module_loads(cbm_shared_resolver_t *resolver) {
             *dot = '\0';
         }
     }
+    cbm_ht_free(own_children);
     return true;
 }
 
-static void collect_python_namespace_effects(cbm_shared_resolver_t *resolver) {
+/* A statement that stores through an imported module changes the name it spells, and
+ * no other: `django.__file__ = None` in a test says nothing about django.forms. Only a
+ * write that can reach any name takes the module's whole absence proof. */
+static bool collect_python_namespace_effects(cbm_shared_resolver_t *resolver) {
     for (const python_pending_import_t *import = resolver->python_imports; import;
          import = import->next) {
-        if (!import->escaped)
-            continue;
-        /* A module object handed to unknown code can be written through, so
-         * its own namespace loses the absence proof. A value escaping does not
-         * reach any other module's namespace. */
-        invalidate_python_namespace(resolver, import->escape_root);
-        if (import->escape_module)
-            invalidate_python_namespace(resolver, import->escape_slot);
+        const char *base = import->write_root ? import->write_root : import->write_slot;
+        for (size_t i = 0; i < import->write_count; i++) {
+            if (!import->writes[i]) {
+                invalidate_python_namespace(resolver, import->write_root);
+                if (import->write_module)
+                    invalidate_python_namespace(resolver, import->write_slot);
+                continue;
+            }
+            if (!base)
+                continue;
+            const char *key = cbm_arena_sprintf(&resolver->arena, "%s.%s", base, import->writes[i]);
+            if (!key)
+                return false;
+            cbm_ht_set(resolver->python_written, key, resolver);
+            if (cbm_ht_get(resolver->python_written, key) != resolver)
+                return false;
+        }
     }
+    return true;
 }
 
 /* The names `from module import *` binds. Unknown when __all__ is not a static
@@ -1888,15 +2081,16 @@ static void collect_python_namespace_effects(cbm_shared_resolver_t *resolver) {
 static void python_star_interface(cbm_shared_resolver_t *resolver, namespace_proof_t *module) {
     if (module->python_visible_state == 2)
         return;
-    if (module->python_visible_state == 1 || !module->complete || module->ambiguous ||
-        module->python_all_unknown) {
+    /* A computed __all__ can only narrow what the module binds, and a file that asks a star for
+     * a name relies on it being there. So the public names stand in for it. */
+    if (module->python_visible_state == 1 || !module->complete || module->ambiguous) {
         module->python_visible_open = true;
         if (module->python_visible_state == 0)
             module->python_visible_state = 2;
         return;
     }
     module->python_visible_state = 1;
-    if (module->python_all_literal) {
+    if (module->python_all_literal && !module->python_all_unknown) {
         module->python_visible = module->python_all;
         module->python_visible_count = module->python_all_count;
         module->python_visible_state = 2;
@@ -1955,7 +2149,9 @@ static bool python_explicit_after(const namespace_proof_t *module, const char *n
 }
 
 /* Last star wins; a later explicit binder wins over any star. An unknown star
- * can rebind whatever precedes it, so that stops the walk. */
+ * can rebind whatever precedes it, so that stops the walk, and so does a star under a condition:
+ * the binder stops at the first of `if c: from .a import *  else: from .b import *` and never
+ * sees the other. */
 static bool python_expand_module_stars(cbm_shared_resolver_t *resolver, namespace_proof_t *module) {
     for (size_t s = module->python_star_count; s-- > 0;) {
         const python_star_source_t *star = &module->python_stars[s];
@@ -1963,7 +2159,7 @@ static bool python_expand_module_stars(cbm_shared_resolver_t *resolver, namespac
             star->module ? cbm_ht_get(resolver->python_namespaces, star->module) : NULL;
         if (source)
             python_star_interface(resolver, source);
-        if (!source || source->python_visible_open) {
+        if (!source || source->python_visible_open || (module->python_star_chosen)) {
             module->python_open_barrier = star->at;
             for (size_t n = 0; n < module->python_name_count; n++) {
                 if (module->python_name_at[n] >= star->at)
@@ -2178,8 +2374,7 @@ static bool decide_python_decorated(cbm_shared_resolver_t *resolver) {
 static bool settle_python_imports(cbm_shared_resolver_t *resolver) {
     if (!collect_python_module_loads(resolver))
         return false;
-    collect_python_namespace_effects(resolver);
-    if (!expand_python_stars(resolver))
+    if (!collect_python_namespace_effects(resolver) || !expand_python_stars(resolver))
         return false;
     for (python_pending_import_t *import = resolver->python_imports; import;
          import = import->next) {
@@ -2187,8 +2382,8 @@ static bool settle_python_imports(cbm_shared_resolver_t *resolver) {
             import->parent_file ? cbm_ht_get(resolver->namespaces, import->parent_file) : NULL;
         const namespace_proof_t *child =
             import->child_file ? cbm_ht_get(resolver->namespaces, import->child_file) : NULL;
-        if (child && !child->ambiguous && !child->python_mutated &&
-            python_namespace_absent(resolver, parent, import->member)) {
+        if (child && !child->ambiguous &&
+            python_namespace_absent(resolver, parent, import->member, import->in_parent)) {
             const cbm_resolve_proof_t *proof =
                 python_submodule_proof(resolver, import, parent, child);
             if (!proof)
@@ -2525,8 +2720,10 @@ static bool python_env_module_member(const void *context, CBMArena *arena, const
     /* An attribute no module-level binder provides reads the loaded submodule. */
     namespace_proof_t *parent = cbm_ht_get(resolver->python_namespaces, module);
     namespace_proof_t *child = cbm_ht_get(resolver->python_namespaces, member);
-    if (binding.proof || !child || child->ambiguous || !parent || !parent->complete ||
-        parent->ambiguous || parent->python_open_barrier)
+    if (binding.proof || !child || child->ambiguous || !parent || parent->ambiguous ||
+        parent->python_open_barrier ||
+        (!parent->complete &&
+         !(parent->python_audited && cbm_ht_get(resolver->python_parent_loaded, member))))
         return false;
     *target = child->module_qn;
     *is_module = true;
@@ -2704,6 +2901,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->python_queries = cbm_ht_create(128);
     resolver->python_namespaces = cbm_ht_create(128);
     resolver->python_star_provided = cbm_ht_create(128);
+    resolver->python_written = cbm_ht_create(128);
+    resolver->python_parent_loaded = cbm_ht_create(128);
     resolver->python_nested = cbm_ht_create(128);
     resolver->python_members = cbm_py_members_new();
     resolver->http_defaults = cbm_ht_create(128);
@@ -2724,7 +2923,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->complete = true;
     if (!resolver->exports || !resolver->targets || !resolver->namespaces ||
         !resolver->python_queries || !resolver->python_namespaces ||
-        !resolver->python_star_provided || !resolver->python_nested || !resolver->python_members ||
+        !resolver->python_star_provided || !resolver->python_written ||
+        !resolver->python_parent_loaded || !resolver->python_nested || !resolver->python_members ||
         !resolver->http_defaults || !resolver->http_sites || !resolver->http_unsafe ||
         !resolver->http_candidates || !resolver->http_veto || !resolver->project ||
         !resolver->solver || !resolver->go_types || !resolver->ecma || !resolver->source_table) {

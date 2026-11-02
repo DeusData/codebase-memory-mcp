@@ -15,6 +15,8 @@
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/resolver_ecma.h"
+#include "pipeline/py_layout.h"
+
 #include "resolve/capabilities.h"
 #include "resolve/policy.h"
 #include "resolve/rust_names.h"
@@ -1251,6 +1253,77 @@ static void parse_package_swift(const char *source, int source_len, const char *
     swift_scan_membership_only(source, end, rel_path, ".executableTarget(", "Sources", entries);
 }
 
+/* Python: the source roots a manifest states, one repository directory per line. The
+ * conventional `src` beside a manifest is a root for every build backend, as a flat
+ * layout is its own directory. A root that holds no such module answers nothing. */
+typedef struct {
+    const char *directory;
+    char roots[PKGMAP_PATH_BUF];
+    size_t used;
+    cbm_pkg_entries_t *entries;
+} python_roots_t;
+
+static void python_add_root(void *context, const char *root, size_t length) {
+    python_roots_t *roots = context;
+    char written[PKGMAP_PATH_BUF], path[PKGMAP_PATH_BUF];
+    if (length >= sizeof(written))
+        return;
+    memcpy(written, root, length);
+    written[length] = '\0';
+    if (strpbrk(written, "*?\\\n") || written[0] == '/' ||
+        !cbm_repo_rel_join(roots->directory, written, path, sizeof(path)) || !path[0])
+        return;
+    size_t size = strlen(path);
+    if (roots->used + size + 2 > sizeof(roots->roots))
+        return;
+    /* Only a root apart from the manifest makes everything below it a module: a file
+     * in a flat project's own directory can still be a script. */
+    if (strcmp(path, roots->directory) != 0)
+        node_collect(roots->entries, "py-root", path, NULL, "1");
+    memcpy(roots->roots + roots->used, path, size);
+    roots->used += size;
+    roots->roots[roots->used++] = '\n';
+    roots->roots[roots->used] = '\0';
+}
+
+typedef struct {
+    char text[PKGMAP_PATH_BUF];
+    size_t used, count;
+} python_members_t;
+
+static void python_add_member(void *context, const char *member, size_t length) {
+    python_members_t *members = context;
+    if (!length || memchr(member, '\n', length) ||
+        members->used + length + 2 > sizeof(members->text))
+        return;
+    memcpy(members->text + members->used, member, length);
+    members->used += length;
+    members->text[members->used++] = '\n';
+    members->text[members->used] = '\0';
+    members->count++;
+}
+
+static void parse_python_manifest(const char *basename, const char *source, int source_len,
+                                  const char *rel_path, cbm_pkg_entries_t *entries) {
+    char *directory = path_dirname(rel_path);
+    if (!directory) {
+        entries->incomplete = true;
+        return;
+    }
+    python_roots_t roots = {.directory = directory, .entries = entries};
+    python_add_root(&roots, "src", 3);
+    python_add_root(&roots, ".", 1);
+    cbm_py_layout_parse(basename, source, (size_t)source_len, python_add_root, &roots);
+    node_collect(entries, "py-project", directory, basename, roots.roots);
+    if (!strcmp(basename, "pyproject.toml")) {
+        python_members_t members = {.count = 0};
+        cbm_py_layout_workspace_members(source, (size_t)source_len, python_add_member, &members);
+        if (members.count)
+            node_collect(entries, "py-workspace", directory, NULL, members.text);
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+}
+
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
@@ -1273,11 +1346,11 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
         parse_cargo_toml(source, source_len, rel_path, entries);
         return true;
     }
-    if (strcmp(basename, "pyproject.toml") == 0) {
+    if (cbm_py_layout_is_manifest(basename)) {
         /* A distribution name is not an import path or a package directory.
-         * Do not invent competing root/src mappings from [project].name.
-         * Exact physical modules and explicitly supplied mappings retain
-         * their existing independent resolution paths. */
+         * Do not invent competing root/src mappings from [project].name: the
+         * manifest's layout is what says where modules live. */
+        parse_python_manifest(basename, source, source_len, rel_path, entries);
         return true;
     }
     if (strcmp(basename, "composer.json") == 0) {
@@ -1418,6 +1491,12 @@ static void node_parent_path(char *path) {
         *slash = '\0';
     else
         path[0] = '\0';
+}
+
+/* The directory of a private fact of this kind, without reading the map. */
+static bool python_fact_key(const cbm_pkg_entry_t *item, const char *kind, char *directory,
+                            size_t capacity) {
+    return item->node_fact && node_fact_directory(item->pkg_name, kind, directory, capacity);
 }
 
 static bool node_glob_covered(CBMHashTable *map, const char *directory) {
@@ -1709,16 +1788,19 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
                                       excluded_count);
             continue;
         }
-        if (!is_pkgmap_manifest_basename(name))
+        /* setup.cfg and setup.py only ever add a source root, so one that cannot
+         * be read withholds that and nothing else. */
+        bool optional = cbm_py_layout_is_manifest(name) && !is_pkgmap_manifest_basename(name);
+        if (!is_pkgmap_manifest_basename(name) && !optional)
             continue;
         if (!info.is_regular) {
-            entries->incomplete = true;
+            entries->incomplete = entries->incomplete || !optional;
             continue;
         }
         int source_len = 0;
         char *source = pkgmap_read_file(abs_path, &source_len);
         if (!source) {
-            entries->incomplete = true;
+            entries->incomplete = entries->incomplete || !optional;
             continue;
         }
         if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
@@ -1743,12 +1825,97 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
  * coverage, including symlinks / Windows reparse points inside the domain.
  * This is what lets bare workspace imports (e.g. "@org/pkg" declared in
  * an ignored package.json) resolve on Windows as well as POSIX. */
+/* One member root's top-level names, under the workspace that lists it. Two members providing a
+ * name collide in the map's merge, which leaves that name to no one. */
+static void python_note_member_root(const char *repo_path, const char *workspace, const char *root,
+                                    cbm_pkg_entries_t *entries) {
+    char absolute[PKGMAP_PATH_BUF];
+    int size = snprintf(absolute, sizeof(absolute), "%s%s%s", repo_path, root[0] ? "/" : "", root);
+    cbm_dir_t *dir = size > 0 && (size_t)size < sizeof(absolute) ? cbm_opendir(absolute) : NULL;
+    if (!dir)
+        return;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        char name[PKGMAP_PATH_BUF];
+        int length = snprintf(name, sizeof(name), "%s", entry->name);
+        if (length <= 0 || (size_t)length >= sizeof(name) || entry->name[0] == '.')
+            continue;
+        if (length > 3 && !strcmp(name + length - 3, ".py"))
+            name[length - 3] = '\0';
+        if (!strchr(name, '.'))
+            node_collect(entries, "py-member-head", workspace, name, root);
+    }
+    cbm_closedir(dir);
+}
+
+/* One project under one ancestor that declares a workspace, when that workspace lists it. */
+static void python_note_member(const char *repo_path, const char *workspace, const char *project,
+                               const char *patterns, const char *roots,
+                               cbm_pkg_entries_t *entries) {
+    size_t prefix = strlen(workspace);
+    const char *below = prefix ? project + prefix + 1 : project;
+    bool member = false;
+    for (const char *pattern = patterns; *pattern && !member;) {
+        size_t length = strcspn(pattern, "\n");
+        char one[PKGMAP_PATH_BUF];
+        if (length < sizeof(one)) {
+            memcpy(one, pattern, length);
+            one[length] = '\0';
+            member = cbm_py_layout_member_matches(one, below);
+        }
+        pattern += length + (pattern[length] != '\0');
+    }
+    for (const char *root = roots; member && *root;) {
+        size_t length = strcspn(root, "\n");
+        char one[PKGMAP_PATH_BUF];
+        if (length < sizeof(one)) {
+            memcpy(one, root, length);
+            one[length] = '\0';
+            python_note_member_root(repo_path, workspace, one, entries);
+        }
+        root += length + (root[length] != '\0');
+    }
+}
+
+/* A uv workspace's members are installed together. Each member project's roots are read once,
+ * after the walk has seen every manifest: one pass over the collected facts, one lookup per
+ * ancestor of each project, plus the size of the member directories. */
+static void python_finish_workspaces(const char *repo_path, cbm_pkg_entries_t *entries) {
+    int total = entries->count;
+    CBMHashTable *spaces = cbm_ht_create(8);
+    if (!spaces)
+        return;
+    for (int w = 0; w < total; w++) {
+        char workspace[PKGMAP_PATH_BUF];
+        if (python_fact_key(&entries->items[w], "py-workspace", workspace, sizeof(workspace)))
+            cbm_ht_set(spaces, entries->items[w].pkg_name, entries->items[w].entry_rel);
+    }
+    for (int p = 0; p < total && cbm_ht_count(spaces); p++) {
+        char project[PKGMAP_PATH_BUF], ancestor[PKGMAP_PATH_BUF], key[PKGMAP_PATH_BUF];
+        if (!python_fact_key(&entries->items[p], "py-project", project, sizeof(project)) ||
+            !project[0])
+            continue;
+        const char *roots = entries->items[p].entry_rel;
+        memcpy(ancestor, project, strlen(project) + 1);
+        do {
+            node_parent_path(ancestor);
+            const char *patterns = node_fact_key(key, sizeof(key), "py-workspace", ancestor, NULL)
+                                       ? cbm_ht_get(spaces, key)
+                                       : NULL;
+            if (patterns)
+                python_note_member(repo_path, ancestor, project, patterns, roots, entries);
+        } while (ancestor[0]);
+    }
+    cbm_ht_free(spaces);
+}
+
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count) {
     if (!repo_path || !entries) {
         return 0;
     }
     int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
+    python_finish_workspaces(repo_path, entries);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
 }
@@ -3707,13 +3874,16 @@ static const cbm_gbuf_node_t *python_configured_module(const cbm_pipeline_ctx_t 
 typedef struct {
     char base[PKGMAP_PATH_BUF]; /* empty at the repo root */
     char own[PKGMAP_PATH_BUF];  /* the file's top-level package, empty outside one */
+    /* A source root above base: the directories between are namespace packages. */
+    char root[PKGMAP_PATH_BUF];     /* empty when base itself is the search directory */
+    char root_own[PKGMAP_PATH_BUF]; /* the file's top-level name under that root */
 } python_search_t;
 
 /* Where a file's absolute imports look first. A file inside a package was loaded under
  * that package, so the directory above its topmost __init__.py is on sys.path. A file
  * outside any package is a script or a test, and its own directory is. */
-static bool python_search_path(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
-                               python_search_t *search) {
+static bool python_package_base(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                python_search_t *search) {
     search->own[0] = '\0';
     int length = snprintf(search->base, sizeof(search->base), "%s", source_rel);
     if (length <= 0 || (size_t)length >= sizeof(search->base))
@@ -3743,6 +3913,145 @@ static bool python_search_path(const cbm_pipeline_ctx_t *ctx, const char *source
     }
 }
 
+/* A package without __init__.py is still one under a stated source root: poetry keeps
+ * src/poetry so, to share the name with poetry-core. The nearest root above the package
+ * base decides what the file is, however many such directories lie between. */
+static bool python_search_path(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                               python_search_t *search) {
+    search->root[0] = '\0';
+    search->root_own[0] = '\0';
+    if (!python_package_base(ctx, source_rel, search))
+        return false;
+    CBMHashTable *map = cbm_pipeline_get_pkgmap();
+    if (!map || !search->base[0])
+        return true;
+
+    char directory[PKGMAP_PATH_BUF];
+    snprintf(directory, sizeof(directory), "%s", search->base);
+    if (node_fact(map, "py-root", directory, NULL))
+        return true;
+    for (node_parent_path(directory); directory[0]; node_parent_path(directory)) {
+        const char *fact = node_fact(map, "py-root", directory, NULL);
+        if (!fact || !strcmp(fact, ambiguous_pkgmap_value))
+            continue;
+        size_t size = strlen(directory);
+        const char *below = source_rel + size + 1;
+        int written = snprintf(search->root, sizeof(search->root), "%s", directory);
+        int own = snprintf(search->root_own, sizeof(search->root_own), "%.*s",
+                           (int)strcspn(below, "/"), below);
+        return written > 0 && (size_t)written < sizeof(search->root) && own > 0 &&
+               (size_t)own < sizeof(search->root_own);
+    }
+    return true;
+}
+
+/* What an import names under one search directory. A module of its first name that
+ * lacks the rest hides anything further along. */
+static const cbm_gbuf_node_t *python_under(const cbm_pipeline_ctx_t *ctx, const char *directory,
+                                           const char *normalized, int head, bool *hidden) {
+    char near_path[PKGMAP_PATH_BUF], head_path[PKGMAP_PATH_BUF];
+    int near_size = snprintf(near_path, sizeof(near_path), "%s%s%s", directory,
+                             directory[0] ? "/" : "", normalized);
+    int head_size = snprintf(head_path, sizeof(head_path), "%s%s%.*s", directory,
+                             directory[0] ? "/" : "", head, normalized);
+    if (near_size <= 0 || (size_t)near_size >= sizeof(near_path) || head_size <= 0 ||
+        (size_t)head_size >= sizeof(head_path)) {
+        *hidden = true;
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = python_module_at_path(ctx, near_path);
+    *hidden = !found && python_module_at_path(ctx, head_path);
+    return found;
+}
+
+/* A stated source root that is itself a package holds no top-level module. */
+static bool python_root_is_package(const cbm_pipeline_ctx_t *ctx, const char *root, size_t size) {
+    char init[PKGMAP_PATH_BUF];
+    int written = snprintf(init, sizeof(init), "%.*s/__init__.py", (int)size, root);
+    return written <= 0 || (size_t)written >= sizeof(init) || python_module_file(ctx, init);
+}
+
+/* The roots one directory's manifests state. Found is the module they agree on. */
+static bool python_project_roots(const cbm_pipeline_ctx_t *ctx, CBMHashTable *map,
+                                 const char *directory, const char *normalized, int head,
+                                 const cbm_gbuf_node_t **found, bool *hidden) {
+    const char *manifest;
+    for (size_t m = 0; (manifest = cbm_py_layout_manifest_at(m)) != NULL; m++) {
+        const char *roots = node_fact(map, "py-project", directory, manifest);
+        if (!roots || !strcmp(roots, ambiguous_pkgmap_value))
+            continue;
+        for (const char *root = roots; *root;) {
+            size_t size = strcspn(root, "\n");
+            char path[PKGMAP_PATH_BUF];
+            int written = snprintf(path, sizeof(path), "%.*s", (int)size, root);
+            root += size + (root[size] != '\0');
+            if (written <= 0 || (size_t)written >= sizeof(path) ||
+                python_root_is_package(ctx, path, size))
+                continue;
+
+            bool blocked = false;
+            const cbm_gbuf_node_t *module = python_under(ctx, path, normalized, head, &blocked);
+            if (module && *found && module != *found)
+                return false;
+            *found = module ? module : *found;
+            *hidden = *hidden || blocked;
+        }
+    }
+    return true;
+}
+
+/* Nothing nearer has the name, so it is what an installed project provides: the
+ * file's own project first, then each enclosing one, as an example inside a project
+ * depends on that project. Work is the path's depth times the fixed manifest names. */
+static const cbm_gbuf_node_t *python_installed(const cbm_pipeline_ctx_t *ctx,
+                                               const char *source_rel, const char *normalized,
+                                               int head, const cbm_gbuf_node_t *rooted) {
+    CBMHashTable *map = cbm_pipeline_get_pkgmap();
+    if (!map || cbm_py_layout_is_stdlib(normalized, (size_t)head))
+        return rooted;
+
+    char directory[PKGMAP_PATH_BUF];
+    int size = snprintf(directory, sizeof(directory), "%s", source_rel);
+    if (size <= 0 || (size_t)size >= sizeof(directory))
+        return rooted;
+    node_parent_path(directory);
+    const cbm_gbuf_node_t *found = NULL;
+    bool hidden = false;
+    for (;;) {
+        /* The repository root is searched first whatever the file: a module there stands
+         * before the root manifest's own roots, as it does for a type checker. */
+        if (!directory[0] && rooted)
+            return rooted;
+        if (!python_project_roots(ctx, map, directory, normalized, head, &found, &hidden))
+            return NULL;
+        if (found || hidden || !directory[0])
+            break;
+        node_parent_path(directory);
+    }
+    if (!found && !hidden && !rooted) {
+        /* A sibling member of a uv workspace enclosing the file. */
+        char head_name[PKGMAP_PATH_BUF];
+        int written = snprintf(head_name, sizeof(head_name), "%.*s", head, normalized);
+        if (written > 0 && (size_t)written < sizeof(head_name)) {
+            snprintf(directory, sizeof(directory), "%s", source_rel);
+            for (node_parent_path(directory);; node_parent_path(directory)) {
+                const char *root = node_fact(map, "py-workspace", directory, NULL)
+                                       ? node_fact(map, "py-member-head", directory, head_name)
+                                       : NULL;
+                if (root && strcmp(root, ambiguous_pkgmap_value)) {
+                    found = python_under(ctx, root, normalized, head, &hidden);
+                    break;
+                }
+                if (!directory[0])
+                    break;
+            }
+        }
+    }
+    if (!found)
+        return hidden ? NULL : rooted;
+    return !rooted || rooted == found ? found : NULL;
+}
+
 /* An absolute import, given what it names relative to the repo root. Python takes the first
  * match on sys.path, and only the file's own search directory is known. Two different
  * modules leave the choice to a path we cannot see, except for the file's own package,
@@ -3755,24 +4064,30 @@ static const cbm_gbuf_node_t *python_on_search_path(const cbm_pipeline_ctx_t *ct
         return rooted;
     if (!python_search_path(ctx, source_rel, &search))
         return NULL;
-    if (!search.base[0])
-        return rooted;
-    char near_path[PKGMAP_PATH_BUF], head_path[PKGMAP_PATH_BUF];
     int head = (int)strcspn(normalized, "/");
-    int near_size = snprintf(near_path, sizeof(near_path), "%s/%s", search.base, normalized);
-    int head_size =
-        snprintf(head_path, sizeof(head_path), "%s/%.*s", search.base, head, normalized);
-    if (near_size <= 0 || (size_t)near_size >= sizeof(near_path) || head_size <= 0 ||
-        (size_t)head_size >= sizeof(head_path))
-        return NULL;
-    const cbm_gbuf_node_t *found = python_module_at_path(ctx, near_path);
-    if (found) {
-        bool own =
-            (int)strlen(search.own) == head && !strncmp(search.own, normalized, (size_t)head);
-        return !rooted || own ? found : NULL;
+    bool hidden = false;
+    if (search.root[0]) {
+        const cbm_gbuf_node_t *found = python_under(ctx, search.root, normalized, head, &hidden);
+        bool own = (int)strlen(search.root_own) == head &&
+                   !strncmp(search.root_own, normalized, (size_t)head);
+        if (found)
+            return !rooted || own ? found : NULL;
+        if (hidden || own)
+            return NULL;
     }
-    /* A module of that first name here hides the one at the root, whatever it lacks. */
-    return python_module_at_path(ctx, head_path) ? NULL : rooted;
+    /* Inside a package below a source root, the package's parent is not on sys.path. */
+    if (search.base[0] && (!search.root[0] || !search.own[0])) {
+        const cbm_gbuf_node_t *found = python_under(ctx, search.base, normalized, head, &hidden);
+        if (found) {
+            bool own =
+                (int)strlen(search.own) == head && !strncmp(search.own, normalized, (size_t)head);
+            return !rooted || own ? found : NULL;
+        }
+        /* A module of that first name here hides the one at the root, whatever it lacks. */
+        if (hidden)
+            return NULL;
+    }
+    return python_installed(ctx, source_rel, normalized, head, rooted);
 }
 
 static const cbm_gbuf_node_t *python_exact_module(const cbm_pipeline_ctx_t *ctx,

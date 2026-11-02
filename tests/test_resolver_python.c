@@ -560,18 +560,6 @@ TEST(resolver_python_submodule_import_survives_a_working_package) {
             {"main.py", "from pkg import mod\ndef run():\n    return mod.real()\n"}};
         ASSERT(python_expect("star value", files, 4, "CALLS", "pkg/mod.py", "real", "Function", 0));
     }
-    /* A module object handed to unknown code can be written through, and so can
-     * a member path that stores. */
-    static const char *patchers[] = {"import pkg\ndef patch():\n    install(pkg)\n",
-                                     "import pkg\npkg.mod = None\n"};
-    for (size_t i = 0; i < sizeof(patchers) / sizeof(patchers[0]); i++) {
-        const python_proof_file_t files[] = {
-            {"pkg/__init__.py", ""},
-            child,
-            {"patcher.py", patchers[i]},
-            {"main.py", "from pkg import mod\ndef run():\n    return mod.real()\n"}};
-        ASSERT(python_expect(patchers[i], files, 4, "CALLS", "pkg/mod.py", "real", "Function", 0));
-    }
     PASS();
 }
 
@@ -1078,6 +1066,9 @@ TEST(resolver_python_receiver_types_need_a_fact) {
  * rebinds it, and every `self` that is not the method's own, abstains. */
 /* A class body's assignment says what a read yields only while nothing can replace it. In
  * django `self.title` on a model is a str, never the CharField the body assigned. */
+/* A class body's value is the attribute's declared value. django's objects = UserManager() reads
+ * as what it says under ModelBase; only the standard library's Enum and NamedTuple state that a
+ * member reads as something else. */
 TEST(resolver_python_class_body_values_can_be_replaced) {
     static const struct {
         const char *what;
@@ -1093,21 +1084,21 @@ TEST(resolver_python_class_body_values_can_be_replaced) {
         {"own metaclass",
          "class A(metaclass=Meta):\n    title = Field()\n    def run(self):\n"
          "        return self.title.clean()\n",
-         0},
+         1},
         {"metaclass on an ancestor",
          "class M(metaclass=Meta):\n    pass\nclass A(M):\n    title = Field()\n"
          "    def run(self):\n        return self.title.clean()\n",
-         0},
+         1},
         {"metaclass on the receiver's own class",
          "class P:\n    title = Field()\nclass A(P, metaclass=Meta):\n    def run(self):\n"
          "        return self.title.clean()\n",
-         0},
+         1},
         {"read from outside, metaclass",
-         "class A(metaclass=Meta):\n    title = Field()\ndef run():\n    return A.title.clean()\n", 0},
+         "class A(metaclass=Meta):\n    title = Field()\ndef run():\n    return A.title.clean()\n", 1},
         {"__init_subclass__",
          "class H:\n    def __init_subclass__(cls):\n        pass\nclass A(H):\n"
          "    title = Field()\n    def run(self):\n        return self.title.clean()\n",
-         0},
+         1},
         {"enum member",
          "from enum import Enum\nclass A(Enum):\n    RED = Field()\n    def run(self):\n"
          "        return self.RED.clean()\n",
@@ -1240,7 +1231,8 @@ TEST(resolver_python_rebound_receivers_abstain) {
         {"tuple target", "def run(pair):\n    s = Store()\n    s, t = pair\n    return s.get()\n", 0},
         {"star target", "def run(items):\n    s = Store()\n    *s, t = items\n    return s.get()\n", 0},
         {"deleted", "def run():\n    s = Store()\n    del s\n    return s.get()\n", 0},
-        {"parameter default", "def run(s=Store()):\n    return s.get()\n", 0},
+        /* What the signature says it holds unless told otherwise, as a checker reads it. */
+        {"parameter default", "def run(s=Store()):\n    return s.get()\n", 1},
         {"annotated then reassigned", "def run(other, s: Store):\n    s = other\n    return s.get()\n", 0},
         {"self rebound", "class A(Store):\n    def run(self, other):\n        self = other\n        return self.get()\n", 0},
         {"static parameter named self", "class A(Store):\n    @staticmethod\n    def run(self):\n        return self.get()\n", 0},
@@ -1385,6 +1377,11 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
         "    if not args:\n        return apply\n"
         "    return apply(*args)\n"
         "def replace(function):\n    return 42\n"
+        "def other():\n    return 2\n"
+        "def replaces(function):\n    return other\n"
+        "def factory(name):\n    def apply(function):\n        return function\n    return apply\n"
+        "def stubbed(function): ...\n"
+        "def raises(function):\n    raise NotImplementedError\n"
         "def nothing(function):\n    pass\n"
         "def opaque(function):\n    return make(function)\n"
         "def swallow(function):\n"
@@ -1402,19 +1399,25 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
         int expected;
     } cases[] = {
         {"@same", 1},          {"@logged", 1},         {"@tagged('x')", 1},    {"@either", 1},
-        {"@either(path='p')", 1}, {"@replace", 0},     {"@nothing", 0},        {"@opaque", 0},
-        {"@swallow", 0},       {"@conditional", 0},    {"@generated", 0},      {"@tagged", 0},
-        {"@same('x')", 0},     {"@external_deco", 0},  {"@same\n@replace", 0}, {"@same\n@logged", 1},
-        {"@wraps_called", 1},  {"@updates", 1},        {"@update_returned", 1},
-        {"@hands_on", 1},      {"@hands_on_direct", 1}, {"@hands_to_bad", 0},
-        {"@both_arms", 1},     {"@one_arm", 0},        {"@one_arm_wrapped", 0},
+        {"@either(path='p')", 1}, {"@same\n@logged", 1}, {"@wraps_called", 1},  {"@updates", 1},
+        {"@update_returned", 1}, {"@hands_on", 1},     {"@hands_on_direct", 1}, {"@both_arms", 1},
+        /* A decorator it cannot see through still leaves the name on this declaration:
+         * what runs is dispatch, and flask's @setupmethod and django's @register.filter
+         * are exactly this. */
+        {"@opaque", 1},        {"@swallow", 1},        {"@conditional", 1},
+        {"@same('x')", 1},     {"@external_deco", 1},  {"@one_arm", 1},        {"@one_arm_wrapped", 1},
+        /* The source proves the name stops holding the function. */
+        {"@replace", 0},       {"@replaces", 0},       {"@factory('x')", 1},  {"@tagged", 0},
+        {"@nothing", 0},        {"@generated", 0},      {"@same\n@replace", 0},
+        {"@hands_to_bad", 1},  {"@stubbed", 1},        {"@raises", 1},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char source[768];
         snprintf(source, sizeof(source),
                  "from lib.deco import same, logged, tagged, either, replace, nothing, opaque, "
                  "swallow, conditional, generated, wraps_called, updates, update_returned, "
-                 "hands_on, hands_on_direct, hands_to_bad, both_arms, one_arm, one_arm_wrapped\n"
+                 "hands_on, hands_on_direct, hands_to_bad, both_arms, one_arm, one_arm_wrapped, "
+                 "stubbed, raises, replaces, factory\n"
                  "from external import external_deco\n"
                  "%s\ndef target():\n    return 1\ndef run():\n    return target()\n",
                  cases[i].decorator);
@@ -1437,10 +1440,31 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
                 {"main.py", "from functools import total_ordering\n@total_ordering\nclass Base:\n"
                             "    def save(self):\n        return 1\n"
                             "class Child(Base):\n    def run(self):\n        return super().save()\n"});
-    EXPECT_CALL("base behind an unproven decorator", "main.py", "save", "Method", 0,
+    /* celery: @Thenable.register class AsyncResult(ResultBase). */
+    EXPECT_CALL("base behind an unproven decorator", "main.py", "save", "Method", 1,
                 {"main.py", "from external import wrap\n@wrap\nclass Base:\n"
                             "    def save(self):\n        return 1\n"
                             "class Child(Base):\n    def run(self):\n        return super().save()\n"});
+    EXPECT_CALL("a base the decorator discards", "main.py", "save", "Method", 0,
+                {"main.py", "from lib.deco import replace\n@replace\nclass Base:\n"
+                            "    def save(self):\n        return 1\n"
+                            "class Child(Base):\n    def run(self):\n        return super().save()\n"},
+                decorators);
+    /* flask: @setupmethod def add_url_rule, called on self from a subclass. */
+    EXPECT_CALL("a method behind a decorator it cannot see through", "main.py", "go", "Method", 1,
+                {"main.py", "from external import setup\nclass Base:\n    @setup\n"
+                            "    def go(self):\n        return 1\n"
+                            "class Child(Base):\n    def run(self):\n        return self.go()\n"});
+    EXPECT_CALL("a method the decorator discards", "main.py", "go", "Method", 0,
+                {"main.py", "from lib.deco import nothing\nclass Base:\n    @nothing\n"
+                            "    def go(self):\n        return 1\n"
+                            "    def run(self):\n        return self.go()\n"},
+                decorators);
+    /* celery: kombu's @cached_property, whose value is what the site calls. */
+    EXPECT_CALL("a property by its decorator's name is not called", "main.py", "go", "Method", 0,
+                {"main.py", "from elsewhere import cached_property\nclass A:\n"
+                            "    @cached_property\n    def go(self):\n        return make()\n"
+                            "    def run(self):\n        return self.go()\n"});
     EXPECT_CALL("classmethod subclass binds the function", "main.py", "go", "Method", 1,
                 {"main.py", "from lib.deco import only\nclass A:\n    @only\n    def go(cls):\n"
                             "        return 1\ndef run():\n    return A.go()\n"},
@@ -1463,17 +1487,13 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
                              "    def read(self):\n        return self.value\n";
         const python_proof_file_t files[] = {{"main.py", source}};
         ASSERT(python_expect("property read", files, 1, "USAGE", "main.py", "value", "Method", 1));
-        /* KNOWN GAP, not a contract: a getter and setter share one qualified name, so the
-         * graph holds one node with the setter's span while a read runs the getter. The
-         * occurrence abstains as target_declaration_identity_conflict. Tried: nothing in
-         * the resolver can fix it, since it needs one declaration identity per accessor
-         * in the definition pass. Flip this to 1 when that exists. */
+        /* A getter and setter are one property, and the one node stands for it. */
         const char *paired = "class A:\n    @property\n    def value(self):\n        return 1\n"
                              "    @value.setter\n    def value(self, item):\n        pass\n"
                              "    def read(self):\n        return self.value\n";
         const python_proof_file_t pair[] = {{"main.py", paired}};
         ASSERT(python_expect("getter and setter share one node", pair, 1, "USAGE", "main.py", "value",
-                             "Method", 0));
+                             "Method", 1));
         const char *argument = "class A:\n    @property\n    def value(self):\n        return 1\n"
                                "    def plain(self):\n        return 2\n"
                                "    def use(self, check):\n"
@@ -1496,15 +1516,1263 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
         ASSERT(python_expect("descriptor read", files, 2, "USAGE", "main.py", "value", "Method", 1));
         ASSERT(python_expect("descriptor call", files, 2, "CALLS", "main.py", "value", "Method", 0));
     }
-    /* Unknown decorators on a method stop its lookup too. */
-    EXPECT_CALL("unknown method decorator", "main.py", "go", "Method", 0,
+    /* A decorator whose source nothing shows keeps the declaration, as on a function. */
+    EXPECT_CALL("unknown method decorator", "main.py", "go", "Method", 1,
                 {"main.py", "from external import wrap\nclass A:\n    @wrap\n    def go(self):\n"
                             "        return 1\n    def run(self):\n        return self.go()\n"});
     PASS();
 }
 
-/* Three suites because each case indexes through both drivers: together they ran past the
+/* Five suites because each case indexes through both drivers: together they ran past the
  * 900 s per-suite cap on Windows, about 500 full indexes in all. */
+/* ── Stated source roots ──────────────────────────────────────────────────
+ * Forms from click, flask and poetry: a src layout reached from tests and examples, and a
+ * namespace package kept without __init__.py. Without a manifest nothing states the layout. */
+TEST(resolver_python_stated_source_root_reaches_the_module) {
+    static const char echo[] = "def echo():\n    return 1\n";
+    static const char caller[] = "import click\ndef run():\n    click.echo()\n";
+    {
+        const python_proof_file_t files[] = {
+            {"pyproject.toml", "[project]\nname = \"click\"\n"},
+            {"src/click/__init__.py", "from .utils import echo as echo\n"},
+            {"src/click/utils.py", echo},
+            {"tests/test_utils.py", caller},
+            {"examples/colors/colors.py", caller},
+            {"conftest.py", caller}};
+        ASSERT(python_expect_from("a test reaches src by name", files, 6, "tests/test_utils.py",
+                                  "CALLS", "src/click/utils.py", "echo", "Function", 1));
+        ASSERT(python_expect_from("an example reaches src by name", files, 6,
+                                  "examples/colors/colors.py", "CALLS", "src/click/utils.py",
+                                  "echo", "Function", 1));
+        ASSERT(python_expect_from("a root file reaches src by name", files, 6, "conftest.py",
+                                  "CALLS", "src/click/utils.py", "echo", "Function", 1));
+    }
+    {
+        const python_proof_file_t files[] = {{"src/click/__init__.py",
+                                              "from .utils import echo as echo\n"},
+                                             {"src/click/utils.py", echo},
+                                             {"tests/test_utils.py", caller}};
+        ASSERT(python_expect_from("no manifest states the layout", files, 3, "tests/test_utils.py",
+                                  "CALLS", "src/click/utils.py", "echo", "Function", 0));
+    }
+    {
+        /* flask/examples: a project of its own, depending on the enclosing one. */
+        const python_proof_file_t files[] = {
+            {"pyproject.toml", "[project]\nname = \"Flask\"\n"},
+            {"src/flask/__init__.py", "from .app import Flask as Flask\n"},
+            {"src/flask/app.py", "class Flask:\n    pass\n"},
+            {"examples/celery/pyproject.toml", "[project]\nname = \"flask-example-celery\"\n"},
+            {"examples/celery/src/task_app/__init__.py",
+             "from flask import Flask\nfrom .views import home\ndef create_app():\n"
+             "    home()\n    return Flask()\n"},
+            {"examples/celery/src/task_app/views.py", echo},
+            {"examples/celery/tests/test_app.py",
+             "from task_app.views import echo\ndef run():\n    echo()\n"}};
+        ASSERT(python_expect_from("an example reaches the enclosing project", files, 7,
+                                  "examples/celery/src/task_app/__init__.py", "CALLS",
+                                  "src/flask/app.py", "Flask", "Class", 1));
+        ASSERT(python_expect_from("an example's test reaches its own project", files, 7,
+                                  "examples/celery/tests/test_app.py", "CALLS",
+                                  "examples/celery/src/task_app/views.py", "echo", "Function", 1));
+    }
+    PASS();
+}
+
+TEST(resolver_python_namespace_package_under_a_source_root) {
+    /* poetry: src/poetry has no __init__.py and src/poetry/poetry.py shares its name. */
+    const python_proof_file_t files[] = {
+        {"pyproject.toml", "[project]\nname = \"poetry\"\n"},
+        {"src/poetry/poetry.py", "class Poetry:\n    pass\n"},
+        {"src/poetry/config/__init__.py", ""},
+        {"src/poetry/config/source.py", "def split_key():\n    return 1\n"},
+        {"src/poetry/config/config.py",
+         "from poetry.config.source import split_key\nfrom poetry.poetry import Poetry\n"
+         "from poetry.core.packages import Package\nfrom config.source import split_key as near\n"
+         "def merge():\n    split_key()\n    Poetry()\n    Package()\n"},
+        {"src/poetry/config/other.py",
+         "from config.source import split_key\ndef merge():\n    split_key()\n"},
+        {"src/poetry/__main__.py",
+         "from poetry.config.source import split_key\ndef main():\n    split_key()\n"},
+        {"tests/helpers.py", "def helper():\n    return 1\n"},
+        {"tests/test_config.py",
+         "from helpers import helper\nfrom poetry.config.source import split_key\n"
+         "def run():\n    helper()\n    split_key()\n"}};
+    ASSERT(python_expect_from("own namespace package", files, 9, "src/poetry/config/config.py",
+                              "CALLS", "src/poetry/config/source.py", "split_key", "Function", 1));
+    ASSERT(python_expect_from("own namespace package, the same-named module", files, 9,
+                              "src/poetry/config/config.py", "CALLS", "src/poetry/poetry.py",
+                              "Poetry", "Class", 1));
+    ASSERT(python_expect_from("a package's parent is not on sys.path below a root", files, 9,
+                              "src/poetry/config/other.py", "CALLS", "src/poetry/config/source.py",
+                              "split_key", "Function", 0));
+    ASSERT(python_expect_from("a module directly in the namespace package", files, 9,
+                              "src/poetry/__main__.py", "CALLS", "src/poetry/config/source.py",
+                              "split_key", "Function", 1));
+    ASSERT(python_expect_from("a test reaches the namespace package", files, 9,
+                              "tests/test_config.py", "CALLS", "src/poetry/config/source.py",
+                              "split_key", "Function", 1));
+    ASSERT(python_expect_from("a test's neighbour stays first", files, 9, "tests/test_config.py",
+                              "CALLS", "tests/helpers.py", "helper", "Function", 1));
+    PASS();
+}
+
+/* Each form a backend reads, and one decoy root it must not take from the file's other text. */
+TEST(resolver_python_manifests_state_their_roots) {
+    static const char go[] = "def go():\n    return 1\n";
+    static const char caller[] = "import pkg.inner\nfrom pkg.inner import go\ndef run():\n    go()\n";
+    static const struct {
+        const char *what, *manifest, *text, *module;
+        int expected;
+    } forms[] = {
+        {"setuptools where", "pyproject.toml",
+         "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\n", "lib/pkg/inner.py", 1},
+        {"setuptools package-dir", "pyproject.toml",
+         "[tool.setuptools]\npackage-dir = {\"\" = \"lib\"}\n", "lib/pkg/inner.py", 1},
+        {"setuptools package-dir table", "pyproject.toml",
+         "[tool.setuptools.package-dir]\n\"\" = \"lib\"\n", "lib/pkg/inner.py", 1},
+        {"poetry from", "pyproject.toml",
+         "[tool.poetry]\npackages = [\n  { include = \"pkg\", from = \"lib\" }, # \"nope\"\n]\n",
+         "lib/pkg/inner.py", 1},
+        {"poetry from as a table", "pyproject.toml",
+         "[[tool.poetry.packages]]\ninclude = \"pkg\"\nfrom = \"lib\"\n", "lib/pkg/inner.py", 1},
+        {"hatch packages", "pyproject.toml",
+         "[tool.hatch.build.targets.wheel]\npackages = [\"lib/pkg\"]\n", "lib/pkg/inner.py", 1},
+        {"pdm package-dir", "pyproject.toml", "[tool.pdm.build]\npackage-dir = \"lib\"\n",
+         "lib/pkg/inner.py", 1},
+        {"maturin python-source", "pyproject.toml", "[tool.maturin]\npython-source = \"lib\"\n",
+         "lib/pkg/inner.py", 1},
+        {"pytest pythonpath", "pyproject.toml",
+         "[tool.pytest.ini_options]\npythonpath = [\"lib\", \".\"]\n", "lib/pkg/inner.py", 1},
+        {"ruff src", "pyproject.toml", "[tool.ruff]\nsrc = [\"lib\"]\n", "lib/pkg/inner.py", 1},
+        {"pyright extraPaths", "pyproject.toml", "[tool.pyright]\nextraPaths = [\"lib\"]\n",
+         "lib/pkg/inner.py", 1},
+        {"pytest.ini pythonpath", "pytest.ini", "[pytest]\npythonpath = lib\n", "lib/pkg/inner.py",
+         1},
+        {"tox.ini pythonpath", "tox.ini", "[pytest]\npythonpath = lib\n", "lib/pkg/inner.py", 1},
+        {"setup.cfg package_dir", "setup.cfg", "[options]\npackage_dir =\n    = lib\n",
+         "lib/pkg/inner.py", 1},
+        {"setup.cfg where", "setup.cfg", "[options.packages.find]\nwhere = lib\n",
+         "lib/pkg/inner.py", 1},
+        {"setup.py package_dir", "setup.py", "setup(package_dir={\"\": \"lib\"})\n",
+         "lib/pkg/inner.py", 1},
+        {"setup.py find_packages", "setup.py", "setup(packages=find_packages(where='lib'))\n",
+         "lib/pkg/inner.py", 1},
+        {"convention beside setup.py", "setup.py", "setup()\n", "src/pkg/inner.py", 1},
+        {"a key elsewhere states nothing", "pyproject.toml",
+         "[tool.other]\nwhere = [\"lib\"]\n", "lib/pkg/inner.py", 0},
+        {"another package's mapping states nothing", "setup.cfg",
+         "[options]\npackage_dir =\n    other = lib\n", "lib/pkg/inner.py", 0},
+        {"a commented root states nothing", "pyproject.toml",
+         "[tool.setuptools.packages.find]\nwhere = [\n  # \"lib\"\n  \"elsewhere\",\n]\n",
+         "lib/pkg/inner.py", 0},
+    };
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char init[64];
+        snprintf(init, sizeof(init), "%.*s__init__.py",
+                 (int)(strrchr(forms[i].module, '/') - forms[i].module + 1), forms[i].module);
+        const python_proof_file_t files[] = {{forms[i].manifest, forms[i].text},
+                                             {init, ""},
+                                             {forms[i].module, go},
+                                             {"tests/test_a.py", caller}};
+        ASSERT(python_expect_from(forms[i].what, files, 4, "tests/test_a.py", "CALLS",
+                                  forms[i].module, "go", "Function", forms[i].expected));
+    }
+    PASS();
+}
+
+/* pydantic-ai's shape: members of one uv workspace import each other. */
+TEST(resolver_python_workspace_members_see_each_other) {
+    static const char caller[] = "from beta.inner import go\ndef run():\n    go()\n";
+    static const char go[] = "def go():\n    return 1\n";
+    static const char workspace[] = "[tool.uv.workspace]\nmembers = [\"packages/*\", \"extra\"]\n";
+    static const char member[] = "[project]\nname = \"member\"\n";
+    {
+        const python_proof_file_t files[] = {{"pyproject.toml", workspace},
+                                             {"packages/alpha/pyproject.toml", member},
+                                             {"packages/alpha/src/alpha/__init__.py", ""},
+                                             {"packages/alpha/src/alpha/user.py", caller},
+                                             {"packages/beta/pyproject.toml", member},
+                                             {"packages/beta/src/beta/__init__.py", ""},
+                                             {"packages/beta/src/beta/inner.py", go}};
+        ASSERT(python_expect_from("a sibling member's src layout", files, 7,
+                                  "packages/alpha/src/alpha/user.py", "CALLS",
+                                  "packages/beta/src/beta/inner.py", "go", "Function", 1));
+    }
+    {
+        const python_proof_file_t files[] = {{"pyproject.toml", workspace},
+                                             {"extra/pyproject.toml", member},
+                                             {"extra/beta/__init__.py", ""},
+                                             {"extra/beta/inner.py", go},
+                                             {"packages/alpha/pyproject.toml", member},
+                                             {"packages/alpha/alpha/__init__.py", ""},
+                                             {"packages/alpha/alpha/user.py", caller}};
+        ASSERT(python_expect_from("an exact member, flat", files, 7, "packages/alpha/alpha/user.py",
+                                  "CALLS", "extra/beta/inner.py", "go", "Function", 1));
+    }
+    {
+        /* Not listed: another project that happens to be in the tree. */
+        const python_proof_file_t files[] = {{"pyproject.toml", workspace},
+                                             {"packages/alpha/pyproject.toml", member},
+                                             {"packages/alpha/alpha/__init__.py", ""},
+                                             {"packages/alpha/alpha/user.py", caller},
+                                             {"examples/beta_demo/pyproject.toml", member},
+                                             {"examples/beta_demo/beta/__init__.py", ""},
+                                             {"examples/beta_demo/beta/inner.py", go}};
+        ASSERT(python_expect_from("a project outside the members", files, 7,
+                                  "packages/alpha/alpha/user.py", "CALLS",
+                                  "examples/beta_demo/beta/inner.py", "go", "Function", 0));
+    }
+    {
+        /* Two members provide the name: nothing says which. */
+        const python_proof_file_t files[] = {{"pyproject.toml", workspace},
+                                             {"packages/alpha/pyproject.toml", member},
+                                             {"packages/alpha/alpha/__init__.py", ""},
+                                             {"packages/alpha/alpha/user.py", caller},
+                                             {"packages/one/pyproject.toml", member},
+                                             {"packages/one/beta/__init__.py", ""},
+                                             {"packages/one/beta/inner.py", go},
+                                             {"packages/two/pyproject.toml", member},
+                                             {"packages/two/beta/__init__.py", ""},
+                                             {"packages/two/beta/inner.py", go}};
+        ASSERT(python_expect_from("two members of one name", files, 10,
+                                  "packages/alpha/alpha/user.py", "CALLS",
+                                  "packages/one/beta/inner.py", "go", "Function", 0));
+    }
+    {
+        /* No workspace declared: siblings stay out of reach. */
+        const python_proof_file_t files[] = {{"packages/alpha/pyproject.toml", member},
+                                             {"packages/alpha/alpha/__init__.py", ""},
+                                             {"packages/alpha/alpha/user.py", caller},
+                                             {"packages/beta/pyproject.toml", member},
+                                             {"packages/beta/beta/__init__.py", ""},
+                                             {"packages/beta/beta/inner.py", go}};
+        ASSERT(python_expect_from("siblings without a workspace", files, 6,
+                                  "packages/alpha/alpha/user.py", "CALLS",
+                                  "packages/beta/beta/inner.py", "go", "Function", 0));
+    }
+    PASS();
+}
+
+TEST(resolver_python_source_root_decoys_abstain) {
+    static const char go[] = "def go():\n    return 1\n";
+    static const char manifest[] = "[project]\nname = \"demo\"\n";
+    static const char caller[] = "import helper\ndef run():\n    helper.go()\n";
+    {
+        /* A src directory that is a package holds src.helper, not helper. */
+        const python_proof_file_t files[] = {{"pyproject.toml", manifest},
+                                             {"src/__init__.py", ""},
+                                             {"src/helper.py", go},
+                                             {"tests/test_a.py", caller}};
+        ASSERT(python_expect_from("src is itself a package", files, 4, "tests/test_a.py", "CALLS",
+                                  "src/helper.py", "go", "Function", 0));
+    }
+    {
+        /* The standard library comes before an installed distribution. */
+        const python_proof_file_t files[] = {
+            {"pyproject.toml", manifest},
+            {"src/logging.py", "def getLogger():\n    return 1\n"},
+            {"tests/test_a.py", "import logging\ndef run():\n    logging.getLogger()\n"}};
+        ASSERT(python_expect_from("a standard library name", files, 3, "tests/test_a.py", "CALLS",
+                                  "src/logging.py", "getLogger", "Function", 0));
+    }
+    {
+        const python_proof_file_t files[] = {{"pyproject.toml", manifest},
+                                             {"helper.py", go},
+                                             {"src/helper.py", go},
+                                             {"tests/test_a.py", caller}};
+        /* The repository root comes first, as it does for a type checker. */
+        ASSERT(python_expect_from("root and src both have it, root", files, 4, "tests/test_a.py",
+                                  "CALLS", "helper.py", "go", "Function", 1));
+        ASSERT(python_expect_from("root and src both have it, src", files, 4, "tests/test_a.py",
+                                  "CALLS", "src/helper.py", "go", "Function", 0));
+    }
+    {
+        const python_proof_file_t files[] = {{"sdk/pyproject.toml", manifest},
+                                             {"sdk/helper.py", go},
+                                             {"sdk/src/helper.py", go},
+                                             {"sdk/tests/test_a.py", caller}};
+        ASSERT(python_expect_from("flat and src both have it, flat", files, 4,
+                                  "sdk/tests/test_a.py", "CALLS", "sdk/helper.py", "go", "Function",
+                                  0));
+        ASSERT(python_expect_from("flat and src both have it, src", files, 4, "sdk/tests/test_a.py",
+                                  "CALLS", "sdk/src/helper.py", "go", "Function", 0));
+    }
+    {
+        /* A flat project in a subdirectory: its own directory is the root, and its scripts
+         * still see their neighbours first. */
+        const python_proof_file_t files[] = {
+            {"sdk/python/pyproject.toml", manifest},
+            {"sdk/python/mypkg/__init__.py", ""},
+            {"sdk/python/mypkg/inner.py", go},
+            {"sdk/python/tests/test_a.py", "from mypkg.inner import go\ndef run():\n    go()\n"},
+            {"sdk/python/scripts/helper.py", "def near():\n    return 1\n"},
+            {"sdk/python/scripts/run.py", "from helper import near\ndef run():\n    near()\n"},
+            {"docs/conf.py", "from mypkg.inner import go\ndef run():\n    go()\n"}};
+        ASSERT(python_expect_from("a flat project in a subdirectory", files, 7,
+                                  "sdk/python/tests/test_a.py", "CALLS",
+                                  "sdk/python/mypkg/inner.py", "go", "Function", 1));
+        ASSERT(python_expect_from("its script sees its neighbour", files, 7,
+                                  "sdk/python/scripts/run.py", "CALLS",
+                                  "sdk/python/scripts/helper.py", "near", "Function", 1));
+        ASSERT(python_expect_from("outside that project it is not on the path", files, 7,
+                                  "docs/conf.py", "CALLS", "sdk/python/mypkg/inner.py", "go",
+                                  "Function", 0));
+    }
+    {
+        /* A nearer project's module of that name hides the enclosing project's. */
+        const python_proof_file_t files[] = {
+            {"pyproject.toml", manifest},
+            {"src/shared/__init__.py", ""},
+            {"src/shared/inner.py", go},
+            {"sub/pyproject.toml", manifest},
+            {"sub/src/shared/__init__.py", ""},
+            {"sub/tests/test_a.py", "from shared.inner import go\ndef run():\n    go()\n"}};
+        ASSERT(python_expect_from("a nearer project hides the enclosing one", files, 6,
+                                  "sub/tests/test_a.py", "CALLS", "src/shared/inner.py", "go",
+                                  "Function", 0));
+    }
+    PASS();
+}
+
+/* ── What changes a module's namespace ────────────────────────────────────
+ * Forms from django: a test's `django.__file__ = None` beside `from django import forms`,
+ * and `from . import signals` in a package's own __init__. */
+TEST(resolver_python_only_a_store_of_that_name_blocks_a_submodule) {
+    static const python_proof_file_t child = {"pkg/mod.py", "def real():\n    return 1\n"};
+    static const char main_py[] = "from pkg import mod\ndef run():\n    return mod.real()\n";
+    static const struct {
+        const char *patcher;
+        int expected;
+    } cases[] = {
+        /* Handing a module on, and storing some other name, select no other declaration. */
+        {"import pkg\ndef patch():\n    install(pkg)\n", 1},
+        {"import pkg\nsaved = pkg\n", 1},
+        {"import pkg\nalias = pkg\nalias.__file__ = None\n", 1},
+        {"import pkg\npkg.__file__ = None\n", 1},
+        {"import pkg\ndel pkg.__file__\n", 1},
+        {"import pkg\nsetattr(pkg, '__file__', None)\n", 1},
+        {"import pkg\nwith patch.object(pkg, 'mod', None):\n    pass\n", 1},
+        {"import pkg.mod\nimport pkg.other\npkg.other.value = 1\n", 1},
+        /* The name itself. */
+        {"import pkg\npkg.mod = None\n", 0},
+        {"import pkg\ndel pkg.mod\n", 0},
+        {"import pkg\nsetattr(pkg, 'mod', None)\n", 0},
+        {"import pkg\ndelattr(pkg, 'mod')\n", 0},
+        {"import pkg\npkg.mod, other = 1, 2\n", 0},
+        {"import pkg\nalias = pkg\nalias.mod = None\n", 0},
+        {"import pkg\nfirst = pkg\nsecond = first\nsecond.mod = None\n", 0},
+        /* Anything could be the name. */
+        {"import pkg\nsetattr(pkg, choose(), None)\n", 0},
+        {"import pkg\npkg.__dict__['mod'] = None\n", 0},
+        {"import pkg\nvars(pkg)['mod'] = None\n", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const python_proof_file_t files[] = {{"pkg/__init__.py", ""},
+                                             child,
+                                             {"pkg/other.py", "value = 0\n"},
+                                             {"patcher.py", cases[i].patcher},
+                                             {"main.py", main_py}};
+        ASSERT(python_expect(cases[i].patcher, files, 5, "CALLS", "pkg/mod.py", "real", "Function",
+                             cases[i].expected));
+    }
+    PASS();
+}
+
+TEST(resolver_python_writes_through_the_submodule_leave_its_identity) {
+    /* tests/mail: `del django.conf.settings.X` and mock.patch.object(django.utils.timezone, ...)
+     * change members; neither changes which module `from django.utils import timezone` is. */
+    const python_proof_file_t files[] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/mod.py", "def real():\n    return 1\n"},
+        {"tests/patcher.py", "import pkg.mod\ndel pkg.mod.settings\npkg.mod.real = None\n"},
+        {"main.py", "from pkg import mod\ndef run():\n    return mod.real()\n"}};
+    ASSERT(python_expect("a store inside the child", files, 4, "CALLS", "pkg/mod.py", "real",
+                         "Function", 1));
+    PASS();
+}
+
+/* click/__init__.py has a __getattr__ for its deprecations, and `from .types import X` above it. */
+TEST(resolver_python_module_getattr_only_answers_what_is_missing) {
+    static const char go[] = "def real():\n    return 1\n";
+    static const char user[] = "from pkg import mod\ndef run():\n    return mod.real()\n";
+    static const char dotted[] = "import pkg\ndef run():\n    return pkg.mod.real()\n";
+    static const char lazy[] = "def __getattr__(name):\n    return load(name)\n";
+    {
+        char init[128];
+        snprintf(init, sizeof(init), "from .mod import real as real\n%s", lazy);
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", init}, {"pkg/mod.py", go}, {"user.py", user}, {"dotted.py", dotted}};
+        ASSERT(python_expect_from("a child __init__ loads, by from-import", files, 4, "user.py",
+                                  "CALLS", "pkg/mod.py", "real", "Function", 1));
+        ASSERT(python_expect_from("a child __init__ loads, by attribute", files, 4, "dotted.py",
+                                  "CALLS", "pkg/mod.py", "real", "Function", 1));
+    }
+    {
+        char init[128];
+        snprintf(init, sizeof(init), "from . import mod\n%s", lazy);
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", init}, {"pkg/mod.py", go}, {"user.py", user}, {"dotted.py", dotted}};
+        ASSERT(python_expect_from("a child __init__ binds by from-dot", files, 4, "user.py", "CALLS",
+                                  "pkg/mod.py", "real", "Function", 1));
+    }
+    {
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", lazy}, {"pkg/mod.py", go}, {"user.py", user}, {"dotted.py", dotted}};
+        ASSERT(python_expect_from("a child only __getattr__ could answer for", files, 4, "user.py",
+                                  "CALLS", "pkg/mod.py", "real", "Function", 0));
+    }
+    PASS();
+}
+
+TEST(resolver_python_package_importing_its_own_child) {
+    static const char go[] = "def go():\n    return 1\n";
+    static const char user[] = "from pkg import mod\ndef run():\n    return mod.go()\n";
+    static const char direct[] = "import pkg\ndef run():\n    return pkg.mod.go()\n";
+    static const struct {
+        const char *init;
+        int expected;
+    } cases[] = {
+        {"from . import mod\n", 1},
+        {"from pkg import mod\n", 1},
+        {"from . import mod, other\n", 1},
+        /* The statement is not the name's only binder. */
+        {"mod = None\nfrom . import mod\n", 0},
+        {"from . import mod\nmod = None\n", 0},
+        {"from .other import mod\n", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const python_proof_file_t files[] = {{"pkg/__init__.py", cases[i].init},
+                                             {"pkg/mod.py", go},
+                                             {"pkg/other.py", "mod = 1\n"},
+                                             {"user.py", user},
+                                             {"main.py", direct}};
+        ASSERT(python_expect_from(cases[i].init, files, 5, "user.py", "CALLS", "pkg/mod.py", "go",
+                                  "Function", cases[i].expected));
+        ASSERT(python_expect_from(cases[i].init, files, 5, "main.py", "CALLS", "pkg/mod.py", "go",
+                                  "Function", cases[i].expected));
+    }
+    PASS();
+}
+
+/* ── What a call of a class, and of an unannotated method, gives ──────────
+ * Forms from django and celery. */
+TEST(resolver_python_special_methods_that_read_through_the_base) {
+    /* django.utils.functional.LazyObject: answers through super, declared members stand. */
+    EXPECT_CALL("__getattribute__ reading through super", "main.py", "go", "Method", 1,
+                {"main.py",
+                 "class Lazy:\n    def __getattribute__(self, name):\n"
+                 "        if name == '_wrapped':\n"
+                 "            return super().__getattribute__(name)\n"
+                 "        value = super().__getattribute__(name)\n        return value\n"
+                 "    def go(self):\n        return 1\n"
+                 "    def run(self):\n        return self.go()\n"});
+    EXPECT_CALL("__getattribute__ answering by itself", "main.py", "go", "Method", 0,
+                {"main.py", "class Lazy:\n    def __getattribute__(self, name):\n"
+                            "        return name\n    def go(self):\n        return 1\n"
+                            "    def run(self):\n        return self.go()\n"});
+    /* django Operation.__new__ allocates; celery chain.__new__ allocates on one path. */
+    static const char *allocating[] = {
+        "        self = object.__new__(cls)\n        return self\n",
+        "        return super().__new__(cls)\n",
+        "        return super(Made, cls).__new__(cls)\n",
+        "        if args:\n            return reduce(args)\n        return super().__new__(cls)\n"};
+    for (size_t i = 0; i < sizeof(allocating) / sizeof(allocating[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source),
+                 "class Made:\n    def __new__(cls, *args):\n%s"
+                 "    def go(self):\n        return 1\n"
+                 "def run():\n    made = Made()\n    return made.go()\n",
+                 allocating[i]);
+        const python_proof_file_t file = {"main.py", source};
+        ASSERT(python_expect(allocating[i], &file, 1, "CALLS", "main.py", "go", "Method", 1));
+    }
+    EXPECT_CALL("__new__ that never allocates", "main.py", "go", "Method", 0,
+                {"main.py", "class Made:\n    def __new__(cls):\n        return other\n"
+                            "    def go(self):\n        return 1\n"
+                            "def run():\n    made = Made()\n    return made.go()\n"});
+    PASS();
+}
+
+TEST(resolver_python_returns_follow_the_receiver) {
+    static const char signature[] =
+        "class Signature:\n    def set(self, **options):\n        return self\n"
+        "    def clone(self):\n        return copy.copy(self)\n"
+        "    def apply(self):\n        return 1\n"
+        "    @classmethod\n    def make(cls):\n        return cls()\n"
+        "class Chord(Signature):\n    def apply(self):\n        return 2\n";
+    char source[768];
+    /* celery: chord(...).set(...) is a chord, although set is declared on Signature. */
+    snprintf(source, sizeof(source), "import copy\n%sdef run():\n    return Chord().set().apply()\n",
+             signature);
+    {
+        const python_proof_file_t file = {"main.py", source};
+        python_route_release(&python_routes[0]);
+        python_route_release(&python_routes[1]);
+        ASSERT(python_expect("return self gives the receiver", &file, 1, "CALLS", "main.py",
+                             "apply", "Method", 1));
+        ASSERT_EQ(python_route_edges(&file, 1, "main.py", "CALLS", "main.py", "set", "Method",
+                                     false),
+                  1);
+    }
+    {
+        /* Two files, so the two `apply`s can be told apart. */
+        const python_proof_file_t files[] = {
+            {"sig.py", "class Signature:\n    def set(self):\n        return self\n"
+                       "    def apply(self):\n        return 1\n"},
+            {"main.py", "from sig import Signature\nclass Chord(Signature):\n"
+                        "    def apply(self):\n        return 2\n"
+                        "def run():\n    return Chord().set().apply()\n"}};
+        ASSERT(python_expect("return self selects the subclass's method", files, 2, "CALLS",
+                             "main.py", "apply", "Method", 1));
+        ASSERT(python_expect("return self does not select the base's", files, 2, "CALLS", "sig.py",
+                             "apply", "Method", 0));
+    }
+    /* django: BaseExpression.copy returns copy.copy(self). */
+    EXPECT_CALL("copy.copy is its argument", "main.py", "only", "Method", 1,
+                {"main.py", "import copy\nclass A:\n    def clone(self):\n"
+                            "        return copy.copy(self)\n    def only(self):\n"
+                            "        return 1\n"
+                            "def run():\n    return A().clone().only()\n"});
+    EXPECT_CALL("a project copy is not the standard library's", "main.py", "only", "Method", 0,
+                {"main.py", "from lib import copy\nclass A:\n    def clone(self):\n"
+                            "        return copy(self)\n    def only(self):\n"
+                            "        return 1\n"
+                            "def run():\n    return A().clone().only()\n"},
+                {"lib.py", "def copy(value):\n    return 1\n"});
+    /* django: ModelAdmin.get_changelist returns the class, get_changelist_instance calls it. */
+    EXPECT_CALL("a method returning a class", "main.py", "filters", "Method", 1,
+                {"main.py", "class Listing:\n    def filters(self):\n        return 1\n"
+                            "class Admin:\n    def kind(self):\n        return Listing\n"
+                            "    def make(self):\n        kind = self.kind()\n"
+                            "        return kind()\n"
+                            "def run():\n    return Admin().make().filters()\n"});
+    /* django.contrib.sitemaps: an unannotated property's value is what it returns. */
+    EXPECT_CALL("an unannotated property", "main.py", "page", "Method", 1,
+                {"main.py", "class Paginator:\n    def page(self):\n        return 1\n"
+                            "class Sitemap:\n    @property\n    def paginator(self):\n"
+                            "        return Paginator()\n"
+                            "    def run(self):\n        return self.paginator.page()\n"});
+    EXPECT_CALL("a property whose returns disagree", "main.py", "page", "Method", 0,
+                {"main.py", "class Paginator:\n    def page(self):\n        return 1\n"
+                            "class Other:\n    def page(self):\n        return 2\n"
+                            "class Sitemap:\n    @property\n    def paginator(self):\n"
+                            "        if self:\n            return Paginator()\n"
+                            "        return Other()\n"
+                            "    def run(self):\n        return self.paginator.page()\n"});
+    PASS();
+}
+
+/* ── Which binder reaches a site ──────────────────────────────────────────
+ * Forms from django.utils.archive, django.db.models.base and contrib.postgres.constraints. */
+TEST(resolver_python_with_and_except_bind_what_they_say) {
+    static const char archive[] =
+        "class Archive:\n    def __enter__(self):\n        return self\n"
+        "    def __exit__(self, *args):\n        return None\n"
+        "    def extract(self):\n        return 1\n"
+        "class Other:\n    def extract(self):\n        return 2\n"
+        "class Shut:\n    def __enter__(self):\n        return Other()\n"
+        "    def __exit__(self, *args):\n        return None\n";
+    char source[1024];
+    snprintf(source, sizeof(source),
+             "%sdef run():\n    with Archive() as archive:\n        archive.extract()\n", archive);
+    {
+        const python_proof_file_t file = {"main.py", source};
+        ASSERT(python_expect("with-as is __enter__'s value", &file, 1, "CALLS", "main.py",
+                             "extract", "Method", 1));
+    }
+    {
+        /* Both defs of extract share a name: the query counts targets per class below. */
+        const python_proof_file_t files[] = {
+            {"lib.py", archive},
+            {"main.py",
+             "from lib import Shut\ndef run():\n    with Shut() as held:\n        held.extract()\n"}};
+        ASSERT_EQ(python_route_edges(files, 2, "main.py", "CALLS", "lib.py", "extract", "Method",
+                                     false),
+                  1);
+        ASSERT(python_expect("__enter__ returning another class", files, 2, "CALLS", "lib.py",
+                             "extract", "Method", 1));
+    }
+    EXPECT_CALL("with-as with no __enter__ of its own", "main.py", "extract", "Method", 0,
+                {"main.py", "from external import Base\nclass Archive(Base):\n"
+                            "    def extract(self):\n        return 1\n"
+                            "def run():\n    with Archive() as archive:\n        archive.extract()\n"});
+    static const char errors[] = "class Invalid(Exception):\n    def update(self):\n        return 1\n"
+                                 "class Other(Exception):\n    def update(self):\n        return 2\n";
+    {
+        char text[512];
+        snprintf(text, sizeof(text),
+                 "from errors import Invalid, Other\ndef run():\n    try:\n        pass\n"
+                 "    except Invalid as e:\n        e.update()\n");
+        const python_proof_file_t files[] = {{"errors.py", errors}, {"main.py", text}};
+        ASSERT(python_expect("except-as is the class", files, 2, "CALLS", "errors.py", "update",
+                             "Method", 1));
+    }
+    {
+        /* base.py: one name across two clauses; each clause sees its own class. */
+        const python_proof_file_t files[] = {
+            {"errors.py", "class Invalid(Exception):\n    def only(self):\n        return 1\n"
+                          "class Other(Exception):\n    def rest(self):\n        return 2\n"},
+            {"main.py",
+             "from errors import Invalid, Other\ndef run():\n    try:\n        pass\n"
+             "    except Invalid as e:\n        e.only()\n    except Other as e:\n        e.rest()\n"}};
+        ASSERT(python_expect("first clause", files, 2, "CALLS", "errors.py", "only", "Method", 1));
+        ASSERT(python_expect("second clause", files, 2, "CALLS", "errors.py", "rest", "Method", 1));
+    }
+    {
+        const python_proof_file_t files[] = {
+            {"errors.py", errors},
+            {"main.py", "from errors import Invalid, Other\ndef run():\n    try:\n        pass\n"
+                        "    except (Invalid, Other) as e:\n        e.update()\n"}};
+        ASSERT(python_expect("a tuple of classes says neither", files, 2, "CALLS", "errors.py",
+                             "update", "Method", 0));
+    }
+    PASS();
+}
+
+TEST(resolver_python_the_binder_every_path_passes_last) {
+    static const char classes[] = "class A:\n    def go(self):\n        return 1\n"
+                                  "    def clone(self):\n        return self\n"
+                                  "class B:\n    def go(self):\n        return 2\n";
+    static const struct {
+        const char *what, *body;
+        int a, b;
+    } cases[] = {
+        {"straight line", "    x = A()\n    x = B()\n    x.go()\n", 0, 1},
+        {"before the rebinding", "    x = A()\n    x.go()\n    x = B()\n", 1, 0},
+        /* contrib/postgres/constraints.py: the loop variable rebound by a real class. */
+        {"rebinding a loop variable",
+         "    for x in items:\n        x = A()\n        x.go()\n", 1, 0},
+        {"a nested use after the binder", "    x = A()\n    if c:\n        x.go()\n    x = B()\n", 1, 0},
+        {"inside an arm", "    x = B()\n    if c:\n        x = A()\n        x.go()\n", 1, 0},
+        {"after an arm, either could reach", "    x = B()\n    if c:\n        x = A()\n    x.go()\n",
+         0, 0},
+        {"the right side reads the earlier binder", "    x = A()\n    x = x.clone()\n    x.go()\n",
+         1, 0},
+        /* A later binder comes back round through the loop. */
+        {"a loop that rebinds later", "    x = A()\n    for i in items:\n        x.go()\n        x = B()\n",
+         0, 0},
+        {"a loop that rebinds elsewhere", "    x = A()\n    for i in items:\n        x.go()\n    x = B()\n",
+         1, 0},
+        {"a while that rebinds later", "    x = A()\n    while c:\n        x.go()\n        x = B()\n",
+         0, 0},
+        {"binder and use in one iteration", "    for i in items:\n        x = A()\n        x.go()\n        x = B()\n",
+         1, 0},
+        {"another binder form", "    x = A()\n    for x in items:\n        x.go()\n", 0, 0},
+        {"a None between", "    x = A()\n    x = None\n    x.go()\n", 0, 0},
+        {"something unfollowable between", "    x = A()\n    x = pick()\n    x.go()\n", 0, 0},
+        {"a parameter, rebound later", "    x.go()\n    x = A()\n", 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source), "from lib import A, B\ndef run(x, items, c):\n%s",
+                 cases[i].body);
+        const python_proof_file_t files[] = {{"lib.py", classes}, {"main.py", source}};
+        char label[96];
+        snprintf(label, sizeof(label), "%s, A", cases[i].what);
+        python_route_release(&python_routes[0]);
+        python_route_release(&python_routes[1]);
+        /* The two classes share go: their nodes differ by start line, so count by class. */
+        int a = python_route_edges(files, 2, "main.py", "CALLS", "lib.py", "go", "Method", false);
+        ASSERT_EQ(a, cases[i].a + cases[i].b);
+        ASSERT(python_expect(label, files, 2, "CALLS", "lib.py", "go", "Method",
+                             cases[i].a + cases[i].b));
+    }
+    /* Which class, for the cases where only one is right. */
+    EXPECT_CALL("straight line picks the last", "lib.py", "only_b", "Method", 1,
+                {"lib.py", "class A:\n    def only_a(self):\n        return 1\n"
+                           "class B:\n    def only_b(self):\n        return 2\n"},
+                {"main.py", "from lib import A, B\ndef run():\n    x = A()\n    x = B()\n"
+                            "    x.only_b()\n"});
+    EXPECT_CALL("and not the one before", "lib.py", "only_a", "Method", 0,
+                {"lib.py", "class A:\n    def only_a(self):\n        return 1\n"
+                           "class B:\n    def only_b(self):\n        return 2\n"},
+                {"main.py", "from lib import A, B\ndef run():\n    x = A()\n    x = B()\n"
+                            "    x.only_a()\n"});
+    PASS();
+}
+
+TEST(resolver_python_names_a_module_states_only_for_checkers) {
+    /* celery/__init__.py: lazy at run time, stated under TYPE_CHECKING. */
+    static const char canvas[] = "class chain:\n    def link(self):\n        return 1\n";
+    static const char user[] = "from pkg import chain\ndef run():\n    s = chain()\n    s.link()\n";
+    {
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n"
+                                "    from pkg.canvas import chain\n"
+                                "def __getattr__(name):\n    return load(name)\n"},
+            {"pkg/canvas.py", canvas},
+            {"main.py", user}};
+        ASSERT(python_expect("the class", files, 3, "CALLS", "pkg/canvas.py", "chain", "Class", 1));
+        ASSERT(python_expect("its method", files, 3, "CALLS", "pkg/canvas.py", "link", "Method", 1));
+    }
+    {
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n"
+                                "    from pkg.canvas import chain\nelse:\n    chain = None\n"},
+            {"pkg/canvas.py", canvas},
+            {"main.py", user}};
+        ASSERT(python_expect("a runtime binder competes", files, 3, "CALLS", "pkg/canvas.py",
+                             "chain", "Class", 0));
+    }
+    {
+        /* celery: `local.recreate_module(__name__, ...)` builds the module at run time. */
+        const python_proof_file_t handed[] = {
+            {"pkg/__init__.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n"
+                                "    from pkg.canvas import chain\n"
+                                "import local\nlocal.recreate_module(__name__, by={})\n"},
+            {"pkg/canvas.py", canvas},
+            {"main.py", user}};
+        ASSERT(python_expect("a module that hands on its own name", handed, 3, "CALLS",
+                             "pkg/canvas.py", "chain", "Class", 1));
+        /* Nothing provides the name at run time: no __getattr__, no binder. */
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n"
+                                "    from pkg.canvas import chain\n"},
+            {"pkg/canvas.py", canvas},
+            {"main.py", user}};
+        ASSERT(python_expect("a closed module's checker-only name", files, 3, "CALLS",
+                             "pkg/canvas.py", "chain", "Class", 0));
+    }
+    {
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n"
+                                "    from pkg.canvas import *\n"},
+            {"pkg/canvas.py", canvas},
+            {"main.py", user}};
+        ASSERT(python_expect("a closed module's checker-only star", files, 3, "CALLS",
+                             "pkg/canvas.py", "chain", "Class", 0));
+    }
+    {
+        /* A lazy package states a whole module's names by a star under TYPE_CHECKING. */
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "import typing\nif typing.TYPE_CHECKING:\n    from .canvas import *\n"
+                                "def __getattr__(name):\n    return load(name)\n"},
+            {"pkg/canvas.py", "__all__ = ['chain']\nclass chain:\n    def link(self):\n"
+                              "        return 1\nclass hidden:\n    pass\n"},
+            {"main.py", "from pkg import chain, hidden\ndef run():\n    hidden()\n    s = chain()\n"
+                        "    s.link()\n"}};
+        ASSERT(python_expect("a star under TYPE_CHECKING", files, 3, "CALLS", "pkg/canvas.py", "link",
+                             "Method", 1));
+        ASSERT(python_expect("what that star does not export", files, 3, "CALLS", "pkg/canvas.py",
+                             "hidden", "Class", 0));
+    }
+    {
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "import os\nif os.environ:\n    from .canvas import *\n"
+                                "else:\n    from .other import *\n"},
+            {"pkg/canvas.py", "__all__ = ['chain']\nclass chain:\n    pass\n"},
+            {"pkg/other.py", "__all__ = ['chain']\nclass chain:\n    pass\n"},
+            {"main.py", "from pkg import chain\ndef run():\n    chain()\n"}};
+        ASSERT(python_expect("two stars a condition chooses between", files, 4, "CALLS",
+                             "pkg/canvas.py", "chain", "Class", 0));
+        ASSERT(python_expect("the other of those stars", files, 4, "CALLS", "pkg/other.py", "chain",
+                             "Class", 0));
+    }
+    /* A class body's `X = X` reads X from outside: celery's ResultConsumer. */
+    EXPECT_CALL("a class attribute named as what it holds", "main.py", "go", "Method", 1,
+                {"main.py", "class Consumer:\n    def go(self):\n        return 1\n"
+                            "class Backend:\n    Consumer = Consumer\n    def make(self):\n"
+                            "        return self.Consumer()\n"
+                            "def run():\n    return Backend().make().go()\n"});
+    /* tests/migrations/test_writer.py: exec's assignments go to its third argument. */
+    EXPECT_CALL("exec with globals() and its own locals", "main.py", "local", "Function", 1,
+                {"main.py", "def local():\n    return 1\ndef safe(code):\n    d = {}\n"
+                            "    exec(code, globals(), d)\ndef run():\n    return local()\n"});
+    EXPECT_CALL("exec into globals() itself", "main.py", "local", "Function", 0,
+                {"main.py", "def local():\n    return 1\ndef safe(code):\n"
+                            "    exec(code, globals())\ndef run():\n    return local()\n"});
+    /* A computed key names no binding the audit saw. */
+    EXPECT_CALL("a computed globals() store", "main.py", "local", "Function", 1,
+                {"main.py", "def local():\n    return 1\nglobals()[key()] = None\n"
+                            "def run():\n    return local()\n"});
+    EXPECT_CALL("a literal globals() store", "main.py", "local", "Function", 0,
+                {"main.py", "def local():\n    return 1\nglobals()['local'] = None\n"
+                            "def run():\n    return local()\n"});
+    {
+        /* What the module lacks is unknowable after one, so a submodule is unproven. */
+        const python_proof_file_t files[] = {
+            {"pkg/__init__.py", "globals()[key()] = None\n"},
+            {"pkg/mod.py", "def real():\n    return 1\n"},
+            {"main.py", "from pkg import mod\ndef run():\n    return mod.real()\n"}};
+        ASSERT(python_expect("absence after a computed store", files, 3, "CALLS", "pkg/mod.py",
+                             "real", "Function", 0));
+    }
+    /* test_geos_mutation.py: a read-only method of the view. */
+    EXPECT_CALL("vars().items() reads", "main.py", "local", "Function", 1,
+                {"main.py", "def local():\n    return 1\nnames = list(vars().items())\n"
+                            "def run():\n    return local()\n"});
+    PASS();
+}
+
+/* click's @t.overload def prompt, and Command.main. */
+TEST(resolver_python_overload_stubs_are_one_declaration) {
+    static const char lib[] =
+        "import typing as t\nfrom typing import overload\ndef helper():\n    return 1\n"
+        "@t.overload\ndef prompt(text: str) -> str: ...\n"
+        "@t.overload\ndef prompt(text: int) -> int: ...\n"
+        "def prompt(text):\n    return helper()\n"
+        "class Command:\n    @overload\n    def main(self, a: str) -> str: ...\n"
+        "    @overload\n    def main(self, a: int) -> int: ...\n"
+        "    def main(self, a):\n        return self.invoke(a)\n"
+        "    def invoke(self, a):\n        return helper()\n";
+    static const char user[] = "from lib import prompt, Command\ndef run():\n    prompt('x')\n"
+                               "    Command().main('x')\n";
+    const python_proof_file_t files[] = {{"lib.py", lib}, {"main.py", user}};
+    ASSERT(python_expect("an overloaded function", files, 2, "CALLS", "lib.py", "prompt",
+                         "Function", 1));
+    ASSERT(python_expect("an overloaded method", files, 2, "CALLS", "lib.py", "main", "Method", 1));
+    ASSERT(python_expect_from("from an overloaded function's body", files, 2, "lib.py", "CALLS",
+                              "lib.py", "helper", "Function", 2));
+    ASSERT(python_expect_from("from an overloaded method's body", files, 2, "lib.py", "CALLS",
+                              "lib.py", "invoke", "Method", 1));
+    /* A project decorator of that name proves nothing: two defs, the later one rebinds. */
+    EXPECT_CALL("a project decorator named overload", "main.py", "go", "Function", 0,
+                {"main.py", "from project import overload\n@overload\ndef go():\n    return 1\n"
+                            "def go():\n    return 2\ndef run():\n    return go()\n"},
+                {"project.py", "def overload(function):\n    return function\n"});
+    PASS();
+}
+
+TEST(resolver_python_loading_a_child_the_parent_imported) {
+    /* django.db.models: `from django.db.models import signals` in its own __init__, and other
+     * files load django.db.models.signals. Both name the one module. */
+    const python_proof_file_t files[] = {
+        {"pkg/__init__.py", "from pkg import signals\n"},
+        {"pkg/signals.py", "class Signal:\n    def send(self):\n        return 1\n"
+                           "pre_delete = Signal()\n"},
+        {"loader.py", "from pkg.signals import pre_delete\n"},
+        {"main.py", "from pkg import signals\ndef run():\n    return signals.pre_delete.send()\n"}};
+    ASSERT(python_expect("through the parent", files, 4, "CALLS", "pkg/signals.py", "send",
+                         "Method", 1));
+    /* Under another name the parent's binding is not the module's own attribute. */
+    const python_proof_file_t renamed[] = {
+        {"pkg/__init__.py", "from pkg.other import value as signals\n"},
+        {"pkg/other.py", "value = 1\n"},
+        {"pkg/signals.py", "class Signal:\n    def send(self):\n        return 1\n"
+                           "pre_delete = Signal()\n"},
+        {"loader.py", "from pkg.signals import pre_delete\n"},
+        {"main.py", "from pkg import signals\ndef run():\n    return signals.pre_delete.send()\n"}};
+    ASSERT(python_expect("a value of that name competes", renamed, 5, "CALLS", "pkg/signals.py",
+                         "send", "Method", 0));
+    PASS();
+}
+
+/* ── What annotations and isinstance say ──────────────────────────────────
+ * Forms from click (dict[str, _Option], -> list[Parameter]), httpx (self: T -> T, async with),
+ * poetry (isinstance on a loop variable) and django (isinstance on self.rhs). */
+TEST(resolver_python_annotated_containers_hold_their_element) {
+    static const char lib[] =
+        "from __future__ import annotations\nimport typing as t\n"
+        "from typing import Iterator, Optional, Self, TypeVar\n"
+        "from contextlib import contextmanager\nT = TypeVar('T', bound='Client')\n"
+        "class Param:\n    def clean(self):\n        return 1\n"
+        "class Option:\n    def process(self):\n        return 1\n"
+        "class Response:\n    def read(self):\n        return 1\n"
+        "class Gen(t.Generic[T]):\n    def own(self):\n        return 1\n"
+        "class Client:\n    def __init__(self):\n        self._opts: dict[str, Option] = {}\n"
+        "        self._params: list[Param] = []\n"
+        "    def __enter__(self: T) -> T:\n        return self\n"
+        "    def chain(self) -> Self:\n        return self\n"
+        "    def only(self):\n        return 1\n"
+        "    def params(self) -> list[Param]:\n        return self._params\n"
+        "    def first(self) -> Optional[Param]:\n        return None\n"
+        "    @contextmanager\n    def stream(self) -> Iterator[Response]:\n"
+        "        yield Response()\n"
+        "class Sub(Client):\n    def only(self):\n        return 2\n";
+    static const struct {
+        const char *what, *body, *name;
+        int expected;
+    } cases[] = {
+        {"for over a returned list",
+         "def run(c: Client):\n    for p in c.params():\n        p.clean()\n", "clean", 1},
+        {"for over an annotated attribute",
+         "def run(c: Client):\n    for p in c._params:\n        p.clean()\n", "clean", 1},
+        {"a comprehension", "def run(c: Client):\n    return [p.clean() for p in c._params]\n",
+         "clean", 1},
+        {"sorted keeps what it was given",
+         "def run(c: Client):\n    for p in sorted(c._params, key=None):\n        p.clean()\n",
+         "clean", 1},
+        {"reversed keeps what it was given",
+         "def run(c: Client):\n    for p in reversed(c._params):\n        p.clean()\n", "clean", 1},
+        {"a project function named sorted says nothing",
+         "from other import sorted\ndef run(c: Client):\n    for p in sorted(c._params):\n"
+         "        p.clean()\n",
+         "clean", 0},
+        {"a subscript of a list annotation",
+         "def run(items: list[Param]):\n    return items[0].clean()\n", "clean", 1},
+        {"a slice stays a list",
+         "def run(items: list[Param]):\n    for p in items[1:]:\n        p.clean()\n", "clean", 1},
+        {"a dict value by key", "def run(c: Client, k):\n    c._opts[k].process()\n", "process", 1},
+        {"a dict value by get", "def run(c: Client, k):\n    c._opts.get(k).process()\n", "process",
+         1},
+        {"dict values", "def run(c: Client):\n    for o in c._opts.values():\n        o.process()\n",
+         "process", 1},
+        {"iterating a dict yields keys",
+         "def run(c: Client):\n    for o in c._opts:\n        o.process()\n", "process", 0},
+        {"items, the value",
+         "def run(c: Client):\n    for k, o in c._opts.items():\n        o.process()\n", "process",
+         1},
+        {"items of a class that has its own",
+         "class Mine:\n    def items(self):\n        return [(1, 2)]\n"
+         "    def values(self) -> list[Param]:\n        return []\n"
+         "def run(m: Mine):\n    for k, p in m.items():\n        p.clean()\n",
+         "clean", 0},
+        {"items, the key says nothing",
+         "def run(c: Client):\n    for o, k in c._opts.items():\n        o.process()\n", "process",
+         0},
+        {"enumerate, the element",
+         "def run(c: Client):\n    for i, p in enumerate(c._params):\n        p.clean()\n",
+         "clean", 1},
+        {"enumerate, the count says nothing",
+         "def run(c: Client):\n    for p, i in enumerate(c._params):\n        p.clean()\n",
+         "clean", 0},
+        {"zip, by position",
+         "def run(c: Client, xs):\n    for x, p in zip(xs, c._params):\n        p.clean()\n",
+         "clean", 1},
+        {"zip, the other position",
+         "def run(c: Client, xs):\n    for p, x in zip(xs, c._params):\n        p.clean()\n",
+         "clean", 0},
+        {"a project enumerate says nothing",
+         "from other import enumerate\ndef run(c: Client):\n"
+         "    for i, p in enumerate(c._params):\n        p.clean()\n",
+         "clean", 0},
+        {"a walrus", "def run(c: Client):\n    if (p := c.first()):\n        p.clean()\n", "clean",
+         1},
+        {"a typing alias",
+         "import typing as t\ndef run(items: t.Sequence[Param]):\n    for p in items:\n"
+         "        p.clean()\n",
+         "clean", 1},
+        {"typing.cast", "import typing as t\ndef run(v):\n    t.cast('Param', v).clean()\n", "clean",
+         1},
+        {"a project cast is not typing's",
+         "from other import cast\ndef run(v):\n    cast('Param', v).clean()\n", "clean", 0},
+        {"type[X] is the class",
+         "def run(kind: type[Param]):\n    return kind().clean()\n", "clean", 1},
+        {"a generic of the project's own",
+         "def run(g: Gen[int]):\n    return g.own()\n", "own", 1},
+        {"a contextmanager's yielded type",
+         "def run(c: Client):\n    with c.stream() as r:\n        r.read()\n", "read", 1},
+        /* Nothing here says which class holds the name. */
+        {"an unannotated parameter", "def run(items):\n    for p in items:\n        p.clean()\n",
+         "clean", 0},
+        {"nested containers are not carried",
+         "def run(items: list[list[Param]]):\n    for p in items:\n        p.clean()\n", "clean", 0},
+        {"a tuple of two types is not a sequence of one",
+         "def run(items: tuple[Param, Option]):\n    return items[0].clean()\n", "clean", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char source[640];
+        snprintf(source, sizeof(source), "from lib import Client, Param, Option, Gen\n%s",
+                 cases[i].body);
+        const python_proof_file_t files[] = {{"lib.py", lib},
+                                             {"other.py", "def sorted(x):\n    return 1\n"
+                                                          "def cast(x, y):\n    return 1\n"
+                                                          "def enumerate(x):\n    return 1\n"},
+                                             {"main.py", source}};
+        ASSERT(python_expect(cases[i].what, files, 3, "CALLS", "lib.py", cases[i].name, "Method",
+                             cases[i].expected));
+    }
+    /* A method annotated to return its receiver gives the receiver's class. */
+    {
+        const python_proof_file_t files[] = {
+            {"lib.py", lib},
+            {"main.py", "from lib import Sub\ndef run(c: Sub):\n    c.chain().only()\n"
+                        "    with c as held:\n        held.only()\n"}};
+        int found = python_route_edges(files, 2, "main.py", "CALLS", "lib.py", "only", "Method",
+                                       false);
+        ASSERT_EQ(found, 1);
+    }
+    PASS();
+}
+
+TEST(resolver_python_isinstance_narrows_where_it_holds) {
+    static const char classes[] = "class Stmt:\n    def rename(self):\n        return 1\n"
+                                  "class Other:\n    def rename(self):\n        return 2\n"
+                                  "def make():\n    return None\n";
+    static const struct {
+        const char *what, *body;
+        int expected;
+    } cases[] = {
+        {"a parameter", "def run(x):\n    if isinstance(x, Stmt):\n        x.rename()\n", 1},
+        {"a loop variable",
+         "def run(items):\n    for x in items:\n        if isinstance(x, Stmt):\n"
+         "            x.rename()\n",
+         1},
+        {"self's attribute",
+         "class H:\n    def run(self):\n        if isinstance(self.rhs, Stmt):\n"
+         "            self.rhs.rename()\n",
+         1},
+        {"an early exit", "def run(x):\n    if not isinstance(x, Stmt):\n        return None\n"
+                          "    x.rename()\n", 1},
+        {"an early raise", "def run(x):\n    if not isinstance(x, Stmt):\n        raise ValueError()\n"
+                           "    x.rename()\n", 1},
+        {"an assert", "def run(x):\n    assert isinstance(x, Stmt)\n    x.rename()\n", 1},
+        {"a conjunct", "def run(x, c):\n    if c and isinstance(x, Stmt):\n        x.rename()\n", 1},
+        {"after the other conjunct",
+         "def run(x, c):\n    if isinstance(x, Stmt) and x.rename():\n        pass\n", 1},
+        {"elif", "def run(x):\n    if x:\n        pass\n    elif isinstance(x, Stmt):\n"
+                 "        x.rename()\n", 1},
+        /* Where it does not hold. */
+        {"after the if", "def run(x):\n    if isinstance(x, Stmt):\n        pass\n    x.rename()\n",
+         0},
+        {"the else", "def run(x):\n    if isinstance(x, Stmt):\n        pass\n    else:\n"
+                     "        x.rename()\n", 0},
+        {"a not without the exit",
+         "def run(x):\n    if not isinstance(x, Stmt):\n        print(x)\n    x.rename()\n", 0},
+        {"a tuple of classes",
+         "def run(x):\n    if isinstance(x, (Stmt, Other)):\n        x.rename()\n", 0},
+        {"rebound inside", "def run(x):\n    if isinstance(x, Stmt):\n        x = make()\n"
+                           "        x.rename()\n", 0},
+        {"stored inside",
+         "class H:\n    def run(self):\n        if isinstance(self.rhs, Stmt):\n"
+         "            self.rhs = make()\n            self.rhs.rename()\n",
+         0},
+        {"in a nested function",
+         "def run(x):\n    if isinstance(x, Stmt):\n        def later():\n            x.rename()\n",
+         0},
+        {"a shadowed isinstance",
+         "def run(x, isinstance):\n    if isinstance(x, Stmt):\n        x.rename()\n", 0},
+        {"a computed value",
+         "def run(x):\n    if isinstance(x.pop(), Stmt):\n        x.pop().rename()\n", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source), "from lib import Stmt, Other, make\n%s", cases[i].body);
+        const python_proof_file_t files[] = {{"lib.py", classes}, {"main.py", source}};
+        ASSERT(python_expect(cases[i].what, files, 2, "CALLS", "lib.py", "rename", "Method",
+                             cases[i].expected));
+    }
+    PASS();
+}
+
+/* ── The smaller shapes django's tree has ───────────────────────────────── */
+TEST(resolver_python_class_and_module_shapes) {
+    /* A class stated inside a class, read through either. */
+    EXPECT_CALL("a nested class by its owner", "main.py", "go", "Method", 1,
+                {"main.py", "class Tests:\n    class Form:\n        def go(self):\n"
+                            "            return 1\n"
+                            "    def run(self):\n        form = Tests.Form()\n"
+                            "        return form.go()\n"});
+    EXPECT_CALL("a nested class by self", "main.py", "go", "Method", 1,
+                {"main.py", "class Tests:\n    class Form:\n        def go(self):\n"
+                            "            return 1\n"
+                            "    def run(self):\n        return self.Form().go()\n"});
+    /* geos: ListMixin stores self._get_single_internal only when no subclass declares it. */
+    EXPECT_CALL("a store in a base beyond the declaring class", "main.py", "go", "Method", 1,
+                {"main.py", "class Mixin:\n    def __init__(self):\n        self.go = make()\n"
+                            "class Child(Mixin):\n    def go(self):\n        return 1\n"
+                            "    def run(self):\n        return self.go()\n"});
+    EXPECT_CALL("a store in the declaring class", "main.py", "go", "Method", 0,
+                {"main.py", "class Child:\n    def __init__(self):\n        self.go = make()\n"
+                            "    def go(self):\n        return 1\n"
+                            "    def run(self):\n        return self.go()\n"});
+    /* point.py: a property's setter is the same property. */
+    {
+        const python_proof_file_t files[] = {
+            {"main.py", "def helper():\n    return 1\nclass P:\n    @property\n    def x(self):\n"
+                        "        return helper()\n    @x.setter\n    def x(self, value):\n"
+                        "        helper()\n"}};
+        ASSERT(python_expect_from("calls from a property with a setter", files, 1, "main.py", "CALLS",
+                                  "main.py", "helper", "Function", 1));
+    }
+    /* tests/backends: a subclass's store selects over its base's, as a method would. */
+    {
+        const python_proof_file_t files[] = {
+            {"lib.py", "class Table:\n    def only_table(self):\n        return 1\n"
+                       "class Columns:\n    def only_columns(self):\n        return 2\n"},
+            {"main.py", "from lib import Table, Columns\nclass Base:\n    def setUp(self):\n"
+                        "        self.reference = Table()\n"
+                        "class Sub(Base):\n    def setUp(self):\n"
+                        "        self.reference = Columns()\n"
+                        "    def run(self):\n        return self.reference.only_columns()\n"}};
+        ASSERT(python_expect("the nearer store selects", files, 2, "CALLS", "lib.py", "only_columns",
+                             "Method", 1));
+    }
+    /* click: self.type: ParamType = ... in Parameter, self.type = convert(...) in Option. */
+    EXPECT_CALL("an annotation holds what a subclass stores", "main.py", "go", "Method", 1,
+                {"main.py", "class Kind:\n    def go(self):\n        return 1\n"
+                            "class Base:\n    def __init__(self):\n"
+                            "        self.kind: Kind = make()\n"
+                            "class Sub(Base):\n    def set(self):\n        self.kind = other()\n"
+                            "    def run(self):\n        return self.kind.go()\n"});
+    /* tests: cls.a = Article() in setUpTestData, read back as cls.a. */
+    EXPECT_CALL("a store through cls read through cls", "main.py", "go", "Method", 1,
+                {"main.py", "class Article:\n    def go(self):\n        return 1\n"
+                            "class T:\n    @classmethod\n    def setup(cls):\n"
+                            "        cls.a = Article()\n        cls.a.go()\n"});
+    /* `self.go = make()` rebinds an instance's name, and the class keeps its own. */
+    EXPECT_CALL("a declared method through its class beside an instance store", "main.py", "go",
+                "Method", 1,
+                {"main.py", "class T:\n    def __init__(self):\n        self.go = make()\n"
+                            "    def go(self):\n        return 1\n"
+                            "def run(t):\n    return T.go(t)\n"});
+    EXPECT_CALL("a store through cls over the class's None", "main.py", "go", "Method", 1,
+                {"main.py", "class Article:\n    def go(self):\n        return 1\n"
+                            "class T:\n    a = None\n    @classmethod\n    def setup(cls):\n"
+                            "        cls.a = Article()\n        cls.a.go()\n"});
+    EXPECT_CALL("a store through cls beside a store of something else", "main.py", "go", "Method",
+                0,
+                {"main.py", "class Article:\n    def go(self):\n        return 1\n"
+                            "class T:\n    @classmethod\n    def setup(cls, other):\n"
+                            "        cls.a = Article()\n        cls.a = other\n"
+                            "        cls.a.go()\n"});
+    /* `app.conf = Mock()` says what app.conf holds from there on. */
+    EXPECT_CALL("a store through a receiver before the read", "main.py", "go", "Method", 0,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class T:\n    x = A()\n"
+                            "def run(t: T):\n    t.x = make()\n    t.x.go()\n"});
+    EXPECT_CALL("a store of what it was declared to hold", "main.py", "go", "Method", 1,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class T:\n    x = A()\n"
+                            "def run(t: T):\n    t.x = A()\n    t.x.go()\n"});
+    EXPECT_CALL("a store of something else", "main.py", "go", "Method", 0,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class B:\n    def go(self):\n        return 2\n"
+                            "class T:\n    x = A()\n"
+                            "def run(t: T):\n    t.x = B()\n    t.x.go()\n"});
+    {
+        /* The member itself is still the member: `r.content = x` then reading r.content. */
+        const python_proof_file_t files[] = {
+            {"main.py", "class R:\n    @property\n    def content(self):\n        return 1\n"
+                        "    @content.setter\n    def content(self, value):\n        pass\n"
+                        "def run(r: R):\n    r.content = 2\n    return r.content\n"}};
+        ASSERT(python_expect("a read of the member just stored", files, 1, "USAGE", "main.py",
+                             "content", "Method", 1));
+    }
+    /* A class-body value whose class has __get__: the read runs that. */
+    EXPECT_CALL("a descriptor's own method", "main.py", "go", "Method", 0,
+                {"main.py", "class D:\n    def __get__(self, i, o):\n        return make()\n"
+                            "    def go(self):\n        return 1\n"
+                            "class T:\n    x = D()\n"
+                            "    def run(self):\n        self.x.go()\n"});
+    EXPECT_CALL("what a descriptor's __get__ returns", "main.py", "go", "Method", 1,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class D:\n    def __get__(self, i, o):\n        return A()\n"
+                            "class T:\n    x = D()\n"
+                            "    def run(self):\n        self.x.go()\n"});
+    EXPECT_CALL("a store through a receiver after the read", "main.py", "go", "Method", 1,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class T:\n    x = A()\n"
+                            "def run(t: T):\n    t.x.go()\n    t.x = make()\n"});
+    EXPECT_CALL("a store through that spelling in another function", "main.py", "go", "Method", 1,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class T:\n    x = A()\n"
+                            "def other(t: T):\n    t.x = make()\n"
+                            "def run(t: T):\n    t.x.go()\n"});
+    EXPECT_CALL("a store at module level before the function", "main.py", "go", "Method", 0,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class T:\n    x = A()\n"
+                            "t = T()\nt.x = make()\n"
+                            "def run():\n    t.x.go()\n"});
+    EXPECT_CALL("a store past the first attribute of self", "main.py", "go", "Method", 0,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class H:\n    y = A()\n"
+                            "class T:\n    def __init__(self):\n        self.x = H()\n"
+                            "    def run(self):\n        self.x.y = make()\n"
+                            "        self.x.y.go()\n"});
+    EXPECT_CALL("the value of a store reads what was there", "main.py", "go", "Method", 1,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "class T:\n    x = A()\n"
+                            "def run(t: T):\n    t.x = t.x.go()\n"});
+    /* QuerySet.as_manager: `as_manager = classmethod(as_manager)`, the decorator spelled out. */
+    EXPECT_CALL("a classmethod spelled out", "main.py", "go", "Method", 1,
+                {"main.py", "class T:\n    def go(cls):\n        return 1\n"
+                            "    go = classmethod(go)\n"
+                            "class S(T):\n    pass\n"
+                            "def run():\n    return S.go()\n"});
+    EXPECT_CALL("a staticmethod spelled out", "main.py", "go", "Method", 1,
+                {"main.py", "class T:\n    def go():\n        return 1\n"
+                            "    go = staticmethod(go)\n"
+                            "    def run(self):\n        return self.go()\n"});
+    EXPECT_CALL("a project's own classmethod", "main.py", "go", "Method", 0,
+                {"main.py", "from other import classmethod\n"
+                            "class T:\n    def go(cls):\n        return 1\n"
+                            "    go = classmethod(go)\n"
+                            "def run():\n    return T.go()\n"},
+                {"other.py", "def classmethod(f):\n    return f\n"});
+    EXPECT_CALL("a classmethod of something else", "main.py", "go", "Method", 0,
+                {"main.py", "def other(cls):\n    return 1\n"
+                            "class T:\n    def go(cls):\n        return 1\n"
+                            "    go = classmethod(other)\n"
+                            "def run():\n    return T.go()\n"});
+    /* `def f(self, Request=Request)`: what the signature says it holds. */
+    EXPECT_CALL("a parameter defaulting to a class", "main.py", "go", "Method", 1,
+                {"main.py", "class Request:\n    def go(self):\n        return 1\n"
+                            "def run(Request=Request):\n    return Request().go()\n"});
+    EXPECT_CALL("a parameter defaulting to an instance", "main.py", "go", "Method", 1,
+                {"main.py", "class Apps:\n    def go(self):\n        return 1\nglobal_apps = Apps()\n"
+                            "def run(apps=global_apps):\n    return apps.go()\n"});
+    EXPECT_CALL("a parameter with no default says nothing", "main.py", "go", "Method", 0,
+                {"main.py", "class Request:\n    def go(self):\n        return 1\n"
+                            "def run(Request):\n    return Request().go()\n"});
+    /* `questioner or Questioner()` for a parameter defaulting to None. */
+    EXPECT_CALL("None or a class", "main.py", "go", "Method", 1,
+                {"main.py", "class Q:\n    def go(self):\n        return 1\n"
+                            "class A:\n    def __init__(self, q=None):\n"
+                            "        self.q = q or Q()\n"
+                            "    def run(self):\n        return self.q.go()\n"});
+    EXPECT_CALL("a required parameter or a class", "main.py", "go", "Method", 0,
+                {"main.py", "class Q:\n    def go(self):\n        return 1\n"
+                            "class A:\n    def __init__(self, q):\n"
+                            "        self.q = q or Q()\n"
+                            "    def run(self):\n        return self.q.go()\n"});
+    /* `A() if c else None`. */
+    EXPECT_CALL("a value or None", "main.py", "go", "Method", 1,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "def run(c):\n    x = A() if c else None\n    return x.go()\n"});
+    EXPECT_CALL("two values", "main.py", "go", "Method", 0,
+                {"main.py", "class A:\n    def go(self):\n        return 1\n"
+                            "def run(c, y):\n    x = A() if c else y\n    return x.go()\n"});
+    /* django.contrib.gis.db.models: a star of a module whose __all__ is computed. */
+    {
+        const python_proof_file_t files[] = {
+            {"base/__init__.py", "from base.parts import __all__ as parts_all\n"
+                                 "from base.parts import *\n"
+                                 "__all__ = parts_all\n__all__ += ['Q']\nclass Q:\n    pass\n"},
+            {"base/parts.py", "__all__ = ['Count']\nclass Count:\n    pass\n"},
+            {"gis/__init__.py", "from base import *\n"},
+            {"gis/functions.py", "class Area:\n    pass\n"},
+            {"main.py", "from gis import functions, Q, Count\ndef run():\n    functions.Area()\n"
+                        "    Q()\n    Count()\n"}};
+        ASSERT(python_expect("a submodule past that star", files, 5, "CALLS", "gis/functions.py",
+                             "Area", "Class", 1));
+        ASSERT(python_expect("a public name through that star", files, 5, "CALLS", "base/__init__.py",
+                             "Q", "Class", 1));
+        ASSERT(python_expect("a name that star itself got by a star", files, 5, "CALLS",
+                             "base/parts.py", "Count", "Class", 1));
+    }
+    {
+        /* A dynamic module stays open whatever its __all__ says. */
+        const python_proof_file_t files[] = {
+            {"base/__init__.py", "__all__ = ['Q']\ndef __getattr__(name):\n    return 1\n"},
+            {"gis/__init__.py", "from base import *\n"},
+            {"gis/functions.py", "class Area:\n    pass\n"},
+            {"main.py", "from gis import functions\ndef run():\n    functions.Area()\n"}};
+        ASSERT(python_expect("a star of a module with __getattr__", files, 4, "CALLS",
+                             "gis/functions.py", "Area", "Class", 0));
+    }
+    /* views/decorators: if/else twins of a nested def are one declaration. */
+    {
+        const python_proof_file_t files[] = {
+            {"main.py",
+             "from functools import wraps\ndef helper():\n    return 1\n"
+             "def deco(func, c):\n    if c:\n        async def inner(request):\n"
+             "            helper()\n    else:\n        def inner(request):\n"
+             "            helper()\n    return wraps(func)(inner)\n"}};
+        ASSERT(python_expect_from("calls from nested twin defs", files, 1, "main.py", "CALLS",
+                                  "main.py", "helper", "Function", 1));
+    }
+    {
+        const python_proof_file_t files[] = {
+            {"main.py",
+             "def helper():\n    return 1\ndef deco(c):\n    def inner():\n        helper()\n"
+             "    def inner():\n        return 2\n    return inner\n"}};
+        ASSERT(python_expect_from("two defs in a row are a rebinding", files, 1, "main.py", "CALLS",
+                                  "main.py", "helper", "Function", 0));
+    }
+    PASS();
+}
+
 SUITE(resolver_python) {
     RUN_TEST(resolver_python_ordinary_syntax_keeps_the_file);
     RUN_TEST(resolver_python_only_real_namespace_effects_are_dynamic);
@@ -1530,7 +2798,36 @@ SUITE(resolver_python_members) {
     python_route_release(&python_routes[1]);
 }
 
+SUITE(resolver_python_layout) {
+    RUN_TEST(resolver_python_stated_source_root_reaches_the_module);
+    RUN_TEST(resolver_python_namespace_package_under_a_source_root);
+    RUN_TEST(resolver_python_manifests_state_their_roots);
+    RUN_TEST(resolver_python_source_root_decoys_abstain);
+    RUN_TEST(resolver_python_workspace_members_see_each_other);
+    RUN_TEST(resolver_python_only_a_store_of_that_name_blocks_a_submodule);
+    RUN_TEST(resolver_python_writes_through_the_submodule_leave_its_identity);
+    RUN_TEST(resolver_python_module_getattr_only_answers_what_is_missing);
+    RUN_TEST(resolver_python_package_importing_its_own_child);
+    RUN_TEST(resolver_python_names_a_module_states_only_for_checkers);
+    RUN_TEST(resolver_python_overload_stubs_are_one_declaration);
+    RUN_TEST(resolver_python_loading_a_child_the_parent_imported);
+    python_route_release(&python_routes[0]);
+    python_route_release(&python_routes[1]);
+}
+
 SUITE(resolver_python_flow) {
+    RUN_TEST(resolver_python_special_methods_that_read_through_the_base);
+    RUN_TEST(resolver_python_returns_follow_the_receiver);
+    RUN_TEST(resolver_python_with_and_except_bind_what_they_say);
+    RUN_TEST(resolver_python_the_binder_every_path_passes_last);
+    RUN_TEST(resolver_python_annotated_containers_hold_their_element);
+    RUN_TEST(resolver_python_isinstance_narrows_where_it_holds);
+    python_route_release(&python_routes[0]);
+    python_route_release(&python_routes[1]);
+}
+
+SUITE(resolver_python_shapes) {
+    RUN_TEST(resolver_python_class_and_module_shapes);
     RUN_TEST(resolver_python_rebound_receivers_abstain);
     RUN_TEST(resolver_python_module_level_instance_has_its_class);
     RUN_TEST(resolver_python_decorators_keep_identity_only_when_proven);
