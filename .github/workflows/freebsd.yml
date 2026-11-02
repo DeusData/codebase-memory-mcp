@@ -1,0 +1,66 @@
+# FreeBSD build, INFORMATIONAL ONLY. Builds the UI-embedded binary (the one
+# every platform ships) inside a FreeBSD VM with the canonical scripts/build.sh,
+# then checks that the binary starts (--version).
+#
+# NON-GATING: workflow_dispatch only. This workflow is not part of the ci-ok
+# aggregate and is not called by release.yml or dry-run.yml, so a FreeBSD red
+# never blocks a pull request or a release. Nothing from it is uploaded or
+# published, and it runs with read-only permissions.
+name: FreeBSD build (informational)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-freebsd:
+    name: build (freebsd-${{ matrix.release }}, ${{ matrix.arch }}, clang)
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['15.1', '14.4']
+        arch: ['x86_64']
+        # arch: ['x86_64', 'aarch64']
+        # aarch64 is disabled for now: lightningcss (a native Rust dependency
+        # of the Vite/CSS build) publishes no prebuilt binary for freebsd-arm64,
+        # so `npm run build` fails with "Cannot find module
+        # '../lightningcss.freebsd-arm64.node'". That is a gap in the package's
+        # platform coverage, not something fixable on our side without
+        # vendoring a Rust build of it. Re-enable once lightningcss ships that
+        # target, or once the frontend build runs natively on a Linux host
+        # instead of inside the FreeBSD VM.
+        include:
+          - arch: x86_64
+            sync: rsync
+          # - arch: aarch64
+          #   sync: scp
+    # Must be an x86_64 host (ubuntu-latest). QEMU guest emulation on the arm
+    # runners (ubuntu-*-arm) degrades so badly that runs hit 3+ hour timeouts.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and run inside a FreeBSD ${{ matrix.release }} (${{ matrix.arch }}) VM
+        # https://github.com/vmactions/freebsd-vm
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: ${{ matrix.release }}
+          arch: ${{ matrix.arch }}
+          # Sync options: rsync, sshfs, nfs, scp
+          sync: ${{ matrix.sync }}
+          # Nothing from the VM is used after the run, so skip the copy back.
+          copyback: false
+          mem: 6144
+          cpu: 4
+          prepare: |
+            pkg update -f
+            pkg install -y gmake sqlite3 pkgconf node22 npm-node22 bash
+            which python3 >/dev/null 2>&1 || ln -sf $(which python3.15 python3.14 python3.13 python3.12 python3.11 python3.10 2>/dev/null | head -n 1) /usr/local/bin/python3
+          run: |
+            scripts/build.sh --with-ui CC=clang CXX=clang++
+            build/c/codebase-memory-mcp --version

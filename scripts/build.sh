@@ -193,17 +193,18 @@ else
     cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
 fi
 
-# Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
+# Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS;
+# $MAKE comes from env.sh: gmake on FreeBSD, make elsewhere)
 if [[ "$PHASE" == vendored ]]; then
-    make -j"$NPROC" -f Makefile.cbm cbm-third-party \
+    "$MAKE" -j"$NPROC" -f Makefile.cbm cbm-third-party \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
     echo "=== Third-party objects built in ${BUILD_DIR} (no binary) ==="
     exit 0
 elif $WITH_UI; then
-    make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
+    "$MAKE" -j"$NPROC" -f Makefile.cbm cbm-with-ui \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 else
-    make -j"$NPROC" -f Makefile.cbm cbm "${RETRACE_ARGS[@]+"${RETRACE_ARGS[@]}"}" \
+    "$MAKE" -j"$NPROC" -f Makefile.cbm cbm "${RETRACE_ARGS[@]+"${RETRACE_ARGS[@]}"}" \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
