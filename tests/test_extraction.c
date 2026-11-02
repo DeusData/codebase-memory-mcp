@@ -80,6 +80,28 @@ static int has_def_qn(CBMFileResult *r, const char *qn) {
     return 0;
 }
 
+/* Find a definition by its qualified name relative to the file's module QN
+ * (e.g. "Box.init" resolves to "<module_qn>.Box.init"). */
+static const CBMDefinition *find_def_in_module(CBMFileResult *r, const char *rel_qn) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", r->module_qn, rel_qn);
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+/* Find an in-body call by its raw callee text; returns the call or NULL. */
+static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            return &r->calls.items[i];
+        }
+    }
+    return NULL;
+}
+
 static int count_defs_with_label(CBMFileResult *r, const char *label) {
     int count = 0;
     for (int i = 0; i < r->defs.count; i++) {
@@ -3653,6 +3675,363 @@ TEST(swift_force_unwrap_scanner_shift) {
     PASS();
 }
 
+/* #2379: a struct's plain `init` is a callable, not a name-less hole -- a call
+ * inside it must source from the initializer, not fall back to the file's
+ * Module scope. */
+TEST(swift_init_struct_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "struct Box {\n"
+                               "    let value: Int\n"
+                               "    init() {\n"
+                               "        value = helper()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Box.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Box.init");
+    ASSERT_NOT_NULL(init_def);
+    ASSERT_STR_EQ(init_def->label, "Method");
+    ASSERT_STR_EQ(init_def->name, "init");
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a class's designated init takes parameters -- coverage that a
+ * parameterized init is extracted the same way as a bare one. */
+TEST(swift_init_class_designated_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "final class Holder {\n"
+                               "    let value: Int\n"
+                               "    init(seed: Int) {\n"
+                               "        value = helper() + seed\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Holder.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init");
+    ASSERT_NOT_NULL(init_def);
+    ASSERT_STR_EQ(init_def->label, "Method");
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a convenience init delegates via `self.init(...)`. Its call to
+ * `other()` (an argument of the delegating call) must source from the
+ * initializer, not from the file. */
+TEST(swift_init_convenience_delegates_issue2379) {
+    CBMFileResult *r = extract("func other() -> Int { 2 }\n"
+                               "final class Holder {\n"
+                               "    let value: Int\n"
+                               "    init(seed: Int) {\n"
+                               "        value = seed\n"
+                               "    }\n"
+                               "    convenience init() {\n"
+                               "        self.init(seed: other())\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Holder.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init");
+    ASSERT_NOT_NULL(init_def);
+
+    /* self.init(...) delegates to another overload of Holder.init, which
+     * shares this node (#2061): it forms no call, because the only edge it
+     * could produce is a self-loop. Its argument call stays. */
+    ASSERT_FALSE(has_call(r, "self.init"));
+    ASSERT_FALSE(has_call(r, "Holder.init"));
+
+    const CBMCall *call = find_call_by_callee(r, "other");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: two initializers in the same type calling the SAME callee must both
+ * attribute to the type's init, not to the file's Module scope. Both share
+ * the QN `Holder.init` -- codebase-memory-mcp already collapses overloaded
+ * Swift methods onto one node (DeusData/codebase-memory-mcp#2061), and an
+ * init is no exception; distinguishing overloads by signature is that
+ * issue's concern, not this one's. */
+TEST(swift_init_overloads_share_one_node_issue2379) {
+    CBMFileResult *r = extract("func shared() -> Int { 3 }\n"
+                               "final class Holder {\n"
+                               "    let value: Int\n"
+                               "    init(seed: Int) {\n"
+                               "        value = shared()\n"
+                               "    }\n"
+                               "    convenience init() {\n"
+                               "        self.init(seed: shared())\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Holder.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init");
+    ASSERT_NOT_NULL(init_def);
+
+    int from_init = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || strcmp(c->callee_name, "shared") != 0 || !c->enclosing_func_qn) {
+            continue;
+        }
+        ASSERT_STR_EQ(c->enclosing_func_qn, init_def->qualified_name);
+        ASSERT_STR_NEQ(c->enclosing_func_qn, r->module_qn);
+        from_init++;
+    }
+    ASSERT_EQ(from_init, 2);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a failable `init?` in an enum is still a callable initializer. */
+TEST(swift_init_failable_enum_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "enum Mode {\n"
+                               "    case on\n"
+                               "    init?(flag: Bool) {\n"
+                               "        if helper() > 0 { self = .on } else { return nil }\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Mode.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Mode.init");
+    ASSERT_NOT_NULL(init_def);
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: `extension X { }` is modeled by the vendored grammar as a
+ * class_declaration named X, so an init declared in an extension goes through
+ * the same class-method path as one declared in the primary type. */
+TEST(swift_init_extension_issue2379) {
+    CBMFileResult *r = extract("func other() -> Int { 2 }\n"
+                               "extension Box {\n"
+                               "    init(raw: Int) {\n"
+                               "        value = other()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Box+Raw.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Box.init");
+    ASSERT_NOT_NULL(init_def);
+
+    const CBMCall *call = find_call_by_callee(r, "other");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: regression guard -- an ordinary method in the same type keeps its own
+ * attribution unchanged (this already worked pre-fix; the initializer fix
+ * must not disturb it). */
+TEST(swift_method_still_attributed_issue2379) {
+    CBMFileResult *r = extract("func other() -> Int { 2 }\n"
+                               "struct Box {\n"
+                               "    init() {}\n"
+                               "    func read() -> Int {\n"
+                               "        other()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Box.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *read_def = find_def_in_module(r, "Box.read");
+    ASSERT_NOT_NULL(read_def);
+
+    const CBMCall *call = find_call_by_callee(r, "other");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, read_def->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a `deinit` has the same gap as `init` -- no source-level name, so a
+ * call inside its body attributed to the file's Module scope instead of the
+ * type. */
+TEST(swift_deinit_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "final class Deinitable {\n"
+                               "    deinit {\n"
+                               "        _ = helper()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Deinitable.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *deinit_def = find_def_in_module(r, "Deinitable.deinit");
+    ASSERT_NOT_NULL(deinit_def);
+    ASSERT_STR_EQ(deinit_def->name, "deinit");
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, deinit_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: `super.init(...)` names no type. Left as written, the registry binds it
+ * by short name to whichever project `init` is nearest (on Alamofire: a nested
+ * `Options.init`, a sibling decoder's). It is emitted as the superclass's
+ * initializer instead -- the first inheritance entry, generic arguments
+ * dropped -- and stays attributed to the calling initializer. */
+TEST(swift_super_init_names_superclass_issue2379) {
+    CBMFileResult *r = extract("final class Sub: Base<Int>, Sendable {\n"
+                               "    override init() {\n"
+                               "        super.init()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Sub.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Sub.init");
+    ASSERT_NOT_NULL(init_def);
+    ASSERT_FALSE(has_call(r, "super.init"));
+    const CBMCall *call = find_call_by_callee(r, "Base.init");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: without a superclass to name -- no inheritance clause, or a first entry
+ * that does not read as a type -- `super.init` forms no call at all. A
+ * lower-case root would pass the registry's receiver-chain check and bind by
+ * short name again. */
+TEST(swift_super_init_without_superclass_no_call_issue2379) {
+    CBMFileResult *r = extract("class Root {\n"
+                               "    init() {\n"
+                               "        super.init()\n"
+                               "    }\n"
+                               "}\n"
+                               "class Odd: base {\n"
+                               "    init() {\n"
+                               "        super.init()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Root.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def_in_module(r, "Root.init"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "Odd.init"));
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *callee = r->calls.items[i].callee_name;
+        ASSERT(!callee || !strstr(callee, "init"));
+    }
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: an initializer call `T.init(...)` is flagged so the resolvers'
+ * weak-member guard keeps a short-name guess from placing it (nearly every
+ * type has an `init`); every other Swift call stays unflagged and resolves
+ * exactly as before. */
+TEST(swift_initializer_calls_flagged_issue2379) {
+    CBMFileResult *r = extract("func run(obj: Worker) {\n"
+                               "    _ = UIAlertAction.init(title: nil)\n"
+                               "    helper()\n"
+                               "    obj.start()\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Run.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *init_call = find_call_by_callee(r, "UIAlertAction.init");
+    const CBMCall *bare = find_call_by_callee(r, "helper");
+    const CBMCall *member = find_call_by_callee(r, "obj.start");
+    ASSERT_NOT_NULL(init_call);
+    ASSERT_NOT_NULL(bare);
+    ASSERT_NOT_NULL(member);
+    ASSERT_TRUE(init_call->is_method);
+    ASSERT_FALSE(bare->is_method);
+    ASSERT_FALSE(member->is_method);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: `init` is a Swift keyword. A reference to one (`.init(...)`,
+ * `Box.init`) names the initializer of a type the bare name does not carry,
+ * so it is not recorded as a usage -- by name it could only be guessed among
+ * every type's initializer (on Alamofire, 26 references landed on one nested
+ * `Output.init`). The type in `Box.init` is still a usage. */
+TEST(swift_init_reference_is_not_a_usage_issue2379) {
+    CBMFileResult *r = extract("struct Box {\n"
+                               "    init(raw: Int) {}\n"
+                               "}\n"
+                               "func make() -> Box {\n"
+                               "    .init(raw: 1)\n"
+                               "}\n"
+                               "func maker() -> (Int) -> Box {\n"
+                               "    Box.init\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Make.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int init_usages = 0;
+    int box_usages = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const char *ref = r->usages.items[i].ref_name;
+        init_usages += ref && strcmp(ref, "init") == 0;
+        box_usages += ref && strcmp(ref, "Box") == 0;
+    }
+    ASSERT_EQ(init_usages, 0);
+    ASSERT_GT(box_usages, 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Objective-C --- */
 TEST(objc_interface) {
     CBMFileResult *r =
@@ -6906,16 +7285,6 @@ TEST(extract_ts_decorators_survive_interleaved_comment) {
     ASSERT(decorators_contain(m, "Post"));     /* above the comment — was dropped */
     cbm_free_result(r);
     PASS();
-}
-
-/* Find an in-body call by its raw callee text; returns the call or NULL. */
-static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
-    for (int i = 0; i < r->calls.count; i++) {
-        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
-            return &r->calls.items[i];
-        }
-    }
-    return NULL;
 }
 
 /* #1892: the Swift grammar declares no "arguments" field, so the generic field
@@ -14757,6 +15126,18 @@ SUITE(extraction) {
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);
+    RUN_TEST(swift_init_struct_issue2379);
+    RUN_TEST(swift_init_class_designated_issue2379);
+    RUN_TEST(swift_init_convenience_delegates_issue2379);
+    RUN_TEST(swift_init_overloads_share_one_node_issue2379);
+    RUN_TEST(swift_init_failable_enum_issue2379);
+    RUN_TEST(swift_init_extension_issue2379);
+    RUN_TEST(swift_method_still_attributed_issue2379);
+    RUN_TEST(swift_deinit_issue2379);
+    RUN_TEST(swift_super_init_names_superclass_issue2379);
+    RUN_TEST(swift_super_init_without_superclass_no_call_issue2379);
+    RUN_TEST(swift_initializer_calls_flagged_issue2379);
+    RUN_TEST(swift_init_reference_is_not_a_usage_issue2379);
     RUN_TEST(swift_call_string_arg_issue1892);
     RUN_TEST(swift_nested_url_constructor_issue1892);
     RUN_TEST(swift_nested_url_no_bang_issue1892);
