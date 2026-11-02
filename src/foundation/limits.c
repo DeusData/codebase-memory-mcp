@@ -2,6 +2,7 @@
  * limits.c — Env-configurable safety limits (Stage 2 / Track B4).
  */
 #include "foundation/limits.h"
+#include "foundation/platform.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -13,7 +14,7 @@ long cbm_max_file_bytes(void) {
      * instead of a silent drop or an unbounded read. */
     const long default_cap = 512L * 1024 * 1024;
 
-    const char *raw = getenv("CBM_MAX_FILE_BYTES");
+    const char *raw = cbm_runtime_getenv("CBM_MAX_FILE_BYTES");
     if (raw && raw[0]) {
         errno = 0;
         char *end = NULL;
@@ -30,7 +31,7 @@ long cbm_max_file_bytes(void) {
  * Read fresh each call (see cbm_max_file_bytes rationale — cheap, test-friendly,
  * no stale memoized copy across runs). */
 static int env_positive_int(const char *name, int fallback) {
-    const char *raw = getenv(name);
+    const char *raw = cbm_runtime_getenv(name);
     if (raw && raw[0]) {
         errno = 0;
         char *end = NULL;

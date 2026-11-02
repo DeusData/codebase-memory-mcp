@@ -1,0 +1,182 @@
+{
+  "serverStarted": true,
+  "port": 4220,
+  "leftoverProcesses": 0,
+  "resolvedQualifiedName": "codeatlasweb-w1b.src.services.userService.createUser",
+  "resolvedKind": "function",
+  "resolvedNodeId": "codeatlasweb-w1b.src.services.userService.createUser",
+  "resolvedRange": {
+    "start": {
+      "line": 22,
+      "character": 0
+    },
+    "end": {
+      "line": 35,
+      "character": 0
+    }
+  },
+  "resolvedEnclosing": [],
+  "caretLine": 24,
+  "calleesSymbol": "codeatlasweb-w1b.src.services.userService.createUser",
+  "callees": {
+    "state": "known",
+    "count": 6,
+    "first": {
+      "name": "validateUser",
+      "line": 24,
+      "targetLine": 19,
+      "file": "src/util/validate.ts",
+      "strategy": "direct-call"
+    },
+    "names": [
+      "validateUser",
+      "ValidationError",
+      "UserEntity",
+      "listUsers",
+      "insert",
+      "toUser"
+    ],
+    "constructions": 2,
+    "evidenceProviderIds": [
+      "cbm"
+    ],
+    "evidenceGenerations": [
+      1
+    ]
+  },
+  "throws": {
+    "state": "known",
+    "types": [
+      "ValidationError"
+    ],
+    "lines": [
+      23
+    ],
+    "relations": [
+      "raise"
+    ]
+  },
+  "envReads": {
+    "state": "known",
+    "names": [
+      "DB_URL"
+    ]
+  },
+  "typeRefs": {
+    "state": "known",
+    "names": [
+      "User"
+    ],
+    "qualifiedNames": [
+      "codeatlasweb-w1b.src.types.User"
+    ]
+  },
+  "createUserCallers": {
+    "state": "known",
+    "count": 2,
+    "names": [
+      "registerUserRoutes",
+      "create"
+    ],
+    "testCallers": 0
+  },
+  "createUserTestedBy": {
+    "state": "inferred",
+    "count": 0
+  },
+  "callersSymbol": "codeatlasweb-w1b.src.services.userService.listUsers",
+  "callers": {
+    "state": "known",
+    "count": 3,
+    "names": [
+      "test/userService.test.ts",
+      "registerUserRoutes",
+      "createUser"
+    ],
+    "lines": [
+      9,
+      10,
+      29
+    ],
+    "testCallers": 1
+  },
+  "testedBy": {
+    "state": "inferred",
+    "count": 1,
+    "first": "test/userService.test.ts",
+    "strategies": [
+      "is-test-caller"
+    ]
+  },
+  "snippetLength": 523,
+  "snippetSha256": "1318c12789733fa0db47affe71a03eda386a53c44c4e86493552a86e3406643f",
+  "snippetFirstLine": "export function createUser(input: unknown): User {",
+  "ir": {
+    "firstStep": "validateUser",
+    "stepCount": 6,
+    "stepLines": [
+      24,
+      27,
+      29,
+      29,
+      30,
+      35
+    ],
+    "missingTests": true,
+    "missingTestsState": "inferred",
+    "complexityState": "unsupported",
+    "writesState": "unsupported",
+    "externalEffectsState": "unsupported",
+    "purposeState": "inferred",
+    "purpose": "Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type.",
+    "snippetHash": "1318c12789733fa0db47affe71a03eda386a53c44c4e86493552a86e3406643f",
+    "checklistItems": 15,
+    "warnings": []
+  },
+  "irTested": {
+    "symbol": "codeatlasweb-w1b.src.services.userService.listUsers",
+    "firstStep": "query",
+    "missingTests": false,
+    "missingTestsState": "inferred",
+    "warnings": []
+  },
+  "extras": {
+    "architecture": {
+      "project": "codeatlasweb-w1b",
+      "totalSymbols": 76,
+      "totalRelations": 178,
+      "languages": [
+        "TypeScript"
+      ],
+      "groups": 7,
+      "files": 11,
+      "routes": 3,
+      "routeOrigins": [
+        "source"
+      ],
+      "entryPoints": 17
+    },
+    "moduleDependencies": {
+      "edges": 26,
+      "truncated": false
+    },
+    "trace": {
+      "status": "ok",
+      "firstLayer": 6
+    },
+    "search": {
+      "count": 1,
+      "first": "codeatlasweb-w1b.src.services.userService.createUser"
+    },
+    "indexWorkspaceRefusal": "EngineUnavailableError: index_repository: die Read-only-Allowlist des Servers bietet dieses Werkzeug auf /rpc nicht an. Schreibende Vorgaenge laufen ueber die CLI, nicht ueber diese Oberflaeche."
+  },
+  "project": "codeatlasweb-w1b",
+  "fixture": "fixtures/atlas-sample",
+  "timings": {
+    "indexMs": 8330,
+    "serverStartMs": 6913,
+    "totalMs": 16072
+  },
+  "generatedAt": "2026-08-28T17:00:48.445Z",
+  "error": null
+}

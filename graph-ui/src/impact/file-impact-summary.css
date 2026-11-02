@@ -1,0 +1,22 @@
+.file-impact-summary { flex: none; min-width: 0; padding: 7px 14px; border-bottom: 1px solid var(--atlas-line); background: var(--atlas-panel); color: var(--atlas-fg); font: 11px/1.5 var(--atlas-ui-font); }
+.file-impact-summary-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 12px; min-width: 0; }
+.file-impact-summary-label { font-weight: 600; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-impact-summary-metrics { display: flex; flex-wrap: wrap; gap: 2px 12px; color: var(--atlas-dim); }
+.file-impact-summary-muted, .file-impact-summary-note { color: var(--atlas-dim); }
+.file-impact-summary-warning { color: var(--atlas-alarm); }
+.file-impact-summary-note { margin: 2px 0 0; font-size: 10px; }
+.file-impact-summary button { color: var(--atlas-cyan); cursor: pointer; border: 0; border-radius: 3px; background: transparent; padding: 1px 3px; font: inherit; text-align: left; }
+.file-impact-summary button:hover { color: var(--atlas-fg); background: var(--atlas-select); }
+.file-impact-summary button:focus-visible { outline: 2px solid var(--atlas-cyan); outline-offset: 2px; }
+.file-impact-summary .file-impact-summary-toggle { margin-left: auto; white-space: nowrap; }
+.file-impact-summary-details { max-height: min(300px, 35vh); overflow: auto; padding-top: 10px; }
+.file-impact-summary-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.file-impact-summary h4 { margin: 0 0 4px; font-size: 11px; font-weight: 600; }
+.file-impact-summary h4 span { color: var(--atlas-dim); font-weight: 400; }
+.file-impact-summary-details p { margin: 4px 0; color: var(--atlas-dim); overflow-wrap: anywhere; }
+.file-impact-summary ul { margin: 0; padding: 0; list-style: none; }
+.file-impact-summary li { display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; padding: 3px 0; }
+.file-impact-summary li button { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-impact-summary li span { color: var(--atlas-dim); font-size: 10px; }
+.file-impact-summary footer { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--atlas-line); color: var(--atlas-dim); font-size: 10px; }
+@media (max-width: 700px) { .file-impact-summary-detail-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; } }

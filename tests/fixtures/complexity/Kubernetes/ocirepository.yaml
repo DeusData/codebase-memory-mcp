@@ -1,0 +1,9 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: web-chart
+spec:
+  interval: 15m
+  ref:
+    tag: 1.2.3
+  url: oci://ghcr.io/acme/charts/web-app

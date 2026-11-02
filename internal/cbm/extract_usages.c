@@ -617,19 +617,48 @@ static bool is_elixir_def_binding(CBMExtractCtx *ctx, TSNode node) {
         TSNode signature = ts_node_named_child_count(arguments) > 0
                                ? ts_node_named_child(arguments, 0)
                                : arguments;
+        /* A guard makes that signature the whole `when` operator, which spans the
+         * guard expression as well as the head. Unwrapped to the head, only the
+         * parameters being BOUND are excluded here; a parameter READ inside the
+         * guard stays a usage, as the same read in the body already is. */
+        signature = cbm_elixir_def_head_unwrap_guard(signature);
         return node_contains(head, node) || node_contains(signature, node);
     }
     return false;
 }
 
-static bool is_first_named_part_of(TSNode node, const char *container_kind) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+/* Climbs from `node` to its nearest `container_kind` ancestor and reports
+ * whether `node` sits in that ancestor's first named child. It runs for every
+ * named leaf of ReScript, Julia, Typst, Elm, PureScript and Nickel files, so it
+ * climbs the unified walk's cursor (O(1) per hop) whenever the walk is on
+ * `node`. ts_node_parent answers by descending from the ROOT and scanning the
+ * children at every level: on an error-heavy parse (a binary Godot `.res`
+ * resource yields a root with ~170k children per MB) each call is
+ * O(root children), and one climb per leaf made the file quadratic (#2176:
+ * 1 MB spent 46 s in this walk, 4.7 MB never finished). The node-based climb
+ * remains only for callers outside the walk. */
+static bool is_first_named_part_of(TSNode node, const char *container_kind, WalkState *state) {
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    TSNode current = node;
+    for (;;) {
+        TSNode parent;
+        if (cursor) {
+            if (!ts_tree_cursor_goto_parent(cursor)) {
+                return false;
+            }
+            parent = ts_tree_cursor_current_node(cursor);
+        } else {
+            usage_slow_parent_fallback_test_note(); /* one root descent per hop */
+            parent = ts_node_parent(current);
+            if (ts_node_is_null(parent)) {
+                return false;
+            }
+        }
         if (strcmp(ts_node_type(parent), container_kind) == 0) {
             return named_child_contains(parent, 0, node);
         }
+        current = parent;
     }
-    return false;
 }
 
 static bool is_wolfram_lhs(TSNode node) {
@@ -1032,8 +1061,8 @@ static bool is_pkl_declaration_binding(TSNode node) {
     return false;
 }
 
-static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
-                              const CBMOccurrenceSpec *occurrence) {
+static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node, const CBMOccurrenceSpec *occurrence,
+                              WalkState *state) {
     switch (occurrence->policy) {
     case CBM_OCCURRENCE_LISP_DEF:
         return is_lisp_def_binding(ctx, node);
@@ -1044,11 +1073,11 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
     case CBM_OCCURRENCE_ELIXIR_DEF:
         return is_elixir_def_binding(ctx, node);
     case CBM_OCCURRENCE_JULIA_FUNCTION:
-        return is_first_named_part_of(node, "function_definition");
+        return is_first_named_part_of(node, "function_definition", state);
     case CBM_OCCURRENCE_WOLFRAM_SET:
         return is_wolfram_lhs(node);
     case CBM_OCCURRENCE_TYPST_LET:
-        return is_first_named_part_of(node, "let");
+        return is_first_named_part_of(node, "let", state);
     case CBM_OCCURRENCE_AGDA_FUNCTION:
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {
@@ -1064,14 +1093,14 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
     case CBM_OCCURRENCE_HCL_ATTRIBUTE:
         return is_hcl_attribute_binding(node);
     case CBM_OCCURRENCE_ELM_VALUE:
-        return is_first_named_part_of(node, "value_declaration");
+        return is_first_named_part_of(node, "value_declaration", state);
     case CBM_OCCURRENCE_RESCRIPT_LET:
-        return is_first_named_part_of(node, "let_binding");
+        return is_first_named_part_of(node, "let_binding", state);
     case CBM_OCCURRENCE_PURESCRIPT_LHS:
-        return is_first_named_part_of(node, "function");
+        return is_first_named_part_of(node, "function", state);
     case CBM_OCCURRENCE_NICKEL_LET:
-        return is_first_named_part_of(node, "let_binding") ||
-               is_first_named_part_of(node, "pattern_fun");
+        return is_first_named_part_of(node, "let_binding", state) ||
+               is_first_named_part_of(node, "pattern_fun", state);
     case CBM_OCCURRENCE_ERLANG_CLAUSE:
         return is_erlang_clause_binding(node);
     case CBM_OCCURRENCE_NIX_FUNCTION:
@@ -1119,7 +1148,7 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
     if (is_exact_language_binding(ctx, node, state)) {
         return true;
     }
-    if (is_policy_binding(ctx, node, occurrence)) {
+    if (is_policy_binding(ctx, node, occurrence, state)) {
         return true;
     }
 
@@ -1322,37 +1351,47 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
 }
 
 static bool is_direct_argument_value(TSNode node) {
-    usage_slow_parent_fallback_test_note();
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) {
-        return false;
-    }
-    if (is_labeled_argument_kind(ts_node_type(parent))) {
-        TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
-        return !ts_node_is_null(value) && ts_node_eq(value, node) &&
-               is_direct_argument_value(parent);
-    }
-    TSNode direct_arguments = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
-    if (!ts_node_is_null(direct_arguments) && ts_node_eq(direct_arguments, node)) {
-        return true;
-    }
-    if (is_argument_container_kind(ts_node_type(parent))) {
-        return true;
-    }
-    const char *parent_kind = ts_node_type(parent);
-    if (strcmp(parent_kind, "list_expression") == 0) {
-        TSNode call = ts_node_parent(parent);
-        if (!ts_node_is_null(call)) {
-            TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
-            return !ts_node_is_null(arguments) && ts_node_eq(arguments, parent);
+    /* A labeled argument (keyword_argument and kin) is itself what the call
+     * site holds, so when `node` is its value the question moves one level up.
+     * That step used to recurse; the loop asks it in place and takes the
+     * slow-parent note once per level, as each recursive entry did. */
+    for (;;) {
+        usage_slow_parent_fallback_test_note();
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent)) {
+            return false;
         }
-        return false;
+        if (is_labeled_argument_kind(ts_node_type(parent))) {
+            TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
+            if (ts_node_is_null(value) || !ts_node_eq(value, node)) {
+                return false;
+            }
+            node = parent;
+            continue;
+        }
+        TSNode direct_arguments = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
+        if (!ts_node_is_null(direct_arguments) && ts_node_eq(direct_arguments, node)) {
+            return true;
+        }
+        if (is_argument_container_kind(ts_node_type(parent))) {
+            return true;
+        }
+        const char *parent_kind = ts_node_type(parent);
+        if (strcmp(parent_kind, "list_expression") == 0) {
+            TSNode call = ts_node_parent(parent);
+            if (!ts_node_is_null(call)) {
+                TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+                return !ts_node_is_null(arguments) && ts_node_eq(arguments, parent);
+            }
+            return false;
+        }
+        if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
+            return false;
+        }
+        TSNode grandparent = ts_node_parent(parent);
+        return !ts_node_is_null(grandparent) &&
+               is_argument_container_kind(ts_node_type(grandparent));
     }
-    if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
-        return false;
-    }
-    TSNode grandparent = ts_node_parent(parent);
-    return !ts_node_is_null(grandparent) && is_argument_container_kind(ts_node_type(grandparent));
 }
 
 /* The body of the walk above, entered one level in: for a caller that has
@@ -1755,9 +1794,25 @@ static uint32_t active_lexical_scope_id(const WalkState *state) {
 static uint32_t lexical_ancestor_of_kind(const WalkState *state, uint32_t start_id,
                                          bool want_function, bool want_block);
 
-static bool python_default_value_reference(TSNode node) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+/* One step up: on the occurrence cursor when there is one, else with
+ * ts_node_parent, which descends from the ROOT, so a climb costs O(depth^2). */
+static TSNode usage_parent_step(TSTreeCursor *cursor, TSNode current) {
+    if (cursor) {
+        return ts_tree_cursor_goto_parent(cursor) ? ts_tree_cursor_current_node(cursor)
+                                                  : (TSNode){0};
+    }
+    usage_slow_parent_fallback_test_note();
+    return ts_node_parent(current);
+}
+
+/* Asked for every Python usage, and a deep expression puts O(depth) parents
+ * above each one. A tree without errors climbs them on the walk cursor, like
+ * python_scope_directive_kind; a tree with errors keeps ts_node_parent. */
+static bool python_default_value_reference(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    TSTreeCursor *cursor =
+        ts_node_has_error(ctx->root) ? NULL : reset_occurrence_cursor(state, node);
+    for (TSNode parent = usage_parent_step(cursor, node); !ts_node_is_null(parent);
+         parent = usage_parent_step(cursor, parent)) {
         const char *kind = ts_node_type(parent);
         /* A nested executable scope inside the default owns its own lookups;
          * only a direct default expression is evaluated in the declaring
@@ -1778,10 +1833,10 @@ static bool python_default_value_reference(TSNode node) {
     return false;
 }
 
-static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, const WalkState *state,
-                                                TSNode node) {
+static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
     uint32_t scope_id = active_lexical_scope_id(state);
-    if (!ctx || ctx->language != CBM_LANG_PYTHON || !python_default_value_reference(node)) {
+    if (!ctx || ctx->language != CBM_LANG_PYTHON ||
+        !python_default_value_reference(ctx, state, node)) {
         return scope_id;
     }
     uint32_t function_id = lexical_ancestor_of_kind(state, scope_id, true, false);
@@ -1857,13 +1912,41 @@ static bool ensure_lexical_binding_capacity(WalkState *state) {
 }
 
 static bool lexical_ancestor_kind(TSNode node, const char *kind) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+    for (TSNode parent = usage_parent_step(NULL, node); !ts_node_is_null(parent);
+         parent = usage_parent_step(NULL, parent)) {
         if (strcmp(ts_node_type(parent), kind) == 0) {
             return true;
         }
     }
     return false;
+}
+
+/* Is `node` a name listed by a Python global/nonlocal statement? The grammar
+ * makes those names direct children of the statement, so in a tree without
+ * errors one parent step on the walk cursor answers it. The full climb above
+ * steps with ts_node_parent, which descends from the ROOT each time: O(depth^2)
+ * per identifier, asked for every Python identifier, so one deep arithmetic
+ * expression went cubic. Error recovery can put a name under an ERROR child of
+ * the statement, so a tree with errors keeps the full climb. */
+static CBMPythonDirectiveKind python_scope_directive_kind(CBMExtractCtx *ctx, WalkState *state,
+                                                          TSNode node) {
+    if (ts_node_has_error(ctx->root)) {
+        if (lexical_ancestor_kind(node, "global_statement")) {
+            return CBM_PYTHON_DIRECTIVE_GLOBAL;
+        }
+        return lexical_ancestor_kind(node, "nonlocal_statement") ? CBM_PYTHON_DIRECTIVE_NONLOCAL
+                                                                 : 0;
+    }
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(reset_occurrence_cursor(state, node), node, &parent, &field)) {
+        return 0;
+    }
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "global_statement") == 0) {
+        return CBM_PYTHON_DIRECTIVE_GLOBAL;
+    }
+    return strcmp(kind, "nonlocal_statement") == 0 ? CBM_PYTHON_DIRECTIVE_NONLOCAL : 0;
 }
 
 static TSNode declared_function_name_owner(TSNode node, const CBMLangSpec *spec) {
@@ -2212,13 +2295,11 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     TSNode function_declaration = declared_function_name_owner(node, spec);
     TSNode class_declaration = declared_class_name_owner(node, spec);
 
-    if (ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"))) {
+    CBMPythonDirectiveKind scope_directive =
+        ctx->language == CBM_LANG_PYTHON ? python_scope_directive_kind(ctx, state, node) : 0;
+    if (scope_directive) {
         uint32_t function_id = lexical_ancestor_of_kind(state, current_id, true, false);
-        CBMPythonDirectiveKind directive = lexical_ancestor_kind(node, "global_statement")
-                                               ? CBM_PYTHON_DIRECTIVE_GLOBAL
-                                               : CBM_PYTHON_DIRECTIVE_NONLOCAL;
-        record_python_directive(state, function_id, name, directive);
+        record_python_directive(state, function_id, name, scope_directive);
         return;
     }
 
@@ -2629,7 +2710,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     bool possible_binding_leaf =
         ts_node_is_named(node) && ts_node_named_child_count(node) == 0 &&
         (state->inside_import || is_exact_language_binding(ctx, node, state) ||
-         is_policy_binding(ctx, node, occurrence));
+         is_policy_binding(ctx, node, occurrence, state));
     if (!reference_node && !possible_binding_leaf) {
         return;
     }
@@ -2685,8 +2766,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     bool python_scope_directive =
-        ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"));
+        ctx->language == CBM_LANG_PYTHON && python_scope_directive_kind(ctx, state, node) != 0;
     if (python_scope_directive || is_binding_occurrence(ctx, node, spec, state)) {
         char *binding_name = reference_name(ctx, node);
         if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
