@@ -309,8 +309,6 @@ TEST(resolver_binding_js_script_globals_and_dynamic_effects_are_unproved) {
         "function caller() { return helper(); } function helper() {}",
         "export function caller() { eval(code); return helper(); } function "
         "helper() {}",
-        "export function caller() { const maker = Function(code); return "
-        "helper(); } function helper() {}",
     };
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         const char *source = sources[i];
@@ -328,6 +326,138 @@ TEST(resolver_binding_js_script_globals_and_dynamic_effects_are_unproved) {
         cbm_arena_destroy(&arena);
         cbm_free_result(result);
     }
+    PASS();
+}
+
+/* Vite's `expect.any(Function)` and `typeof Function`, and Vue's `import { Function } from
+ * '@babel/types'`, each used to void every proof in the file. The `Function` constructor
+ * compiles in the global scope, which sees no binding here; only a direct eval runs code
+ * in this scope. An indirect eval is global too, by the same rule. */
+TEST(resolver_binding_js_only_direct_eval_is_a_dynamic_effect) {
+    static const struct {
+        CBMLanguage language;
+        const char *path;
+        const char *source;
+    } cases[] = {
+        {CBM_LANG_JAVASCRIPT, "binding.js",
+         "export function caller() { const maker = Function(code); return helper(); } "
+         "function helper() {}"},
+        {CBM_LANG_JAVASCRIPT, "binding.js",
+         "export function caller() { const maker = new Function(code); return helper(); } "
+         "function helper() {}"},
+        {CBM_LANG_JAVASCRIPT, "binding.js",
+         "export function caller() { const run = eval; run(code); return helper(); } "
+         "function helper() {}"},
+        {CBM_LANG_TYPESCRIPT, "binding.ts",
+         "export function caller(x: any) { expect.any(Function); return helper(); } "
+         "function helper() {}"},
+        {CBM_LANG_TYPESCRIPT, "binding.ts",
+         "export const AsyncFunction = (async function () {}).constructor as typeof Function;\n"
+         "export function caller() { return helper(); } function helper() {}"},
+        {CBM_LANG_TYPESCRIPT, "binding.ts",
+         "import type { Function } from '@babel/types';\n"
+         "export function caller(node: Function) { return helper(); } function helper() {}"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *source = cases[i].source;
+        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), cases[i].language,
+                                                 "test", cases[i].path, 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, result, cases[i].language, source, strlen(source));
+        cbm_resolve_result_t resolved =
+            js_site(index, source, "helper", "helper()", js_local(&arena, result, "helper"));
+        ASSERT(cbm_resolve_admit(&resolved));
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
+    PASS();
+}
+
+/* Vite's node/index.ts, Vue's compiler-sfc/parse.ts and runtime-dom/jsx.ts: valid TypeScript
+ * the grammar cannot place, each of which used to void every proof in its file. A real
+ * error or a gap that could hide a binding keeps abstaining. */
+TEST(resolver_binding_js_parse_gaps_in_types_keep_the_file_proved) {
+    static const char *const inert[] = {
+        "export type * as HttpProxy from 'http-proxy-3';\n",
+        "export interface Block { scriptAst?: import('@babel/types').Statement[]; }\n",
+        "export interface Attrs { x?: Numberish | undefined; in2?: Numberish | undefined; }\n",
+    };
+    for (size_t i = 0; i < sizeof(inert) / sizeof(inert[0]); i++) {
+        char source[256];
+        snprintf(source, sizeof(source),
+                 "%sexport function caller() { return helper(); } function helper() {}\n",
+                 inert[i]);
+        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                                 "test", "binding.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, result, CBM_LANG_TYPESCRIPT, source, strlen(source));
+        cbm_resolve_result_t resolved =
+            js_site(index, source, "helper", "helper()", js_local(&arena, result, "helper"));
+        ASSERT(cbm_resolve_admit(&resolved));
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
+    /* A gap in an expression, or one that swallows a brace, can hide a declaration. */
+    static const char *const voiding[] = {
+        "const a = ((;\nexport function caller() { return helper(); } function helper() {}\n",
+        "export function caller() { return helper(); } function helper() {}\nconst = 1;\n",
+        "@((x)) export function caller() { return helper(); } function helper() {}\n",
+    };
+    for (size_t i = 0; i < sizeof(voiding) / sizeof(voiding[0]); i++) {
+        const char *source = voiding[i];
+        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                                 "test", "binding.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, result, CBM_LANG_TYPESCRIPT, source, strlen(source));
+        cbm_resolve_result_t resolved =
+            js_site(index, source, "helper", "helper()", js_local(&arena, result, "helper"));
+        ASSERT(!cbm_resolve_admit(&resolved));
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
+    PASS();
+}
+
+/* Vite's `;(resolved.build as Options) = v` and Vue's `;(next as string) += x`. The cast changes
+ * no target: the name is rewritten, so it no longer holds the function it was given. */
+static bool js_cast_write_case_admits(const char *source) {
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                             "test", "binding.ts", 0, NULL, NULL);
+    if (!result)
+        return false;
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_TYPESCRIPT, source, strlen(source));
+    cbm_resolve_result_t resolved =
+        js_site(index, source, "handler", "handler()", js_local(&arena, result, "handler"));
+    bool admitted = cbm_resolve_admit(&resolved);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    return admitted;
+}
+
+TEST(resolver_binding_js_cast_write_rebinds_its_name) {
+    /* The caller comes first: the site is found as the first `handler()` of the source. */
+    ASSERT(js_cast_write_case_admits("export function caller() { return handler(); }\n"
+                                     "function handler() {}\n"));
+    ASSERT(!js_cast_write_case_admits("export function caller() { return handler(); }\n"
+                                      "function handler() {}\n"
+                                      ";(handler as any) = second;\n"
+                                      "function second() {}\n"));
+    ASSERT(!js_cast_write_case_admits("export function caller() { return handler(); }\n"
+                                      "function handler() {}\n"
+                                      ";(handler satisfies any) = second;\n"
+                                      "function second() {}\n"));
     PASS();
 }
 
@@ -1264,10 +1394,19 @@ static int js_project_typescript_case(int padding) {
                         "export type Info = { a: string };\n"},
         {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@/*\":[\"./src/*\"]}}}\n"},
         {"src/aliased/index.ts", "export function viaAlias() { return 1; }\n"},
-        {"src/base.ts", "export class Base { inherited() { return 1; } }\n"},
+        {"src/base.ts", "export class Base { inherited() { return 1; } over() { return 1; } }\n"},
+        {"src/deflt.ts", "export default class Tokenizer { getPos() { return 1; } }\n"
+                         "class Hidden { getPos() { return 2; } }\n"
+                         "export { Hidden as Shown };\n"},
+        {"src/usedeflt.ts", "import Tokenizer, { Shown } from \"./deflt\";\n"
+                            "const tokenizer = new Tokenizer();\n"
+                            "export function defaultReceiver() { return tokenizer.getPos(); }\n"
+                            "export function renamedReceiver(s: Shown) { return s.getPos(); }\n"},
         {"src/child.ts", "import { Base } from \"./base\";\n"
                          "export class Child extends Base {\n"
                          "  run() { return this.inherited(); }\n"
+                         "  over() { return 2; }\n"
+                         "  callSuper() { return super.over(); }\n"
                          "}\n"},
         {"src/main.ts", "import { barrelHelper, barrelDefault, thingFn, Thing } from \"./barrel\";\n"
                         "import dflt, { publicName, Self, arrow, over } from \"./util\";\n"
@@ -1312,6 +1451,10 @@ static int js_project_typescript_case(int padding) {
     ASSERT_EQ(js_project_edges(&project, "USAGE", "run", "src.info.Info"), 1);
     /* Across files, through the import of the base class. */
     ASSERT_EQ(js_project_edges(&project, "CALLS", "run", "src.base.Base.inherited"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "callSuper", "src.base.Base.over"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "defaultReceiver", "src.deflt.Tokenizer.getPos"),
+              1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "callSuper", "src.child.Child.over"), 0);
     ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "run", "src.thing.Thing"), 1);
     ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "run", "src.util.Self"), 1);
     ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "run", "src.info.Info"), 1);
@@ -1329,6 +1472,941 @@ TEST(resolver_js_project_typescript_sequential) {
 }
 TEST(resolver_js_project_typescript_parallel) {
     return js_project_typescript_case(55);
+}
+
+/* Kilo's workspace: object-form `workspaces`, `workspace:*` and catalog dependencies, and
+ * exports patterns that map a subpath to a source file. The manifest says exactly which file
+ * each import is. */
+static int js_project_workspace_manifests_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"package.json",
+         "{\"name\":\"kilo\",\"private\":true,\"workspaces\":{\"packages\":"
+         "[\"packages/*\",\"packages/sdk/js\"],\"catalog\":{\"zod\":\"1.0.0\"}}}\n"},
+        {"packages/core/package.json",
+         "{\"name\":\"@k/core\",\"version\":\"1.2.3\",\"exports\":{"
+         "\"./effect/app\":\"./src/effect/app.ts\",\"./*\":\"./src/*.ts\","
+         "\"./deep/*\":\"./src/nested/*.ts\",\"./secret/*\":null}}\n"},
+        {"packages/core/src/effect/app.ts", "export function appFn() { return 1; }\n"},
+        {"packages/core/src/util.ts", "export function utilFn() { return 1; }\n"},
+        {"packages/core/src/deep/x.ts", "export function shadowedFn() { return 1; }\n"},
+        {"packages/core/src/nested/x.ts", "export function nestedFn() { return 1; }\n"},
+        {"packages/core/src/secret/s.ts", "export function secretFn() { return 1; }\n"},
+        {"packages/sdk/js/package.json",
+         "{\"name\":\"@k/sdk\",\"exports\":{\".\":\"./src/index.ts\"}}\n"},
+        {"packages/sdk/js/src/index.ts", "export function sdkFn() { return 1; }\n"},
+        {"packages/pinned/package.json",
+         "{\"name\":\"@k/pinned\",\"version\":\"1.4.0\",\"exports\":\"./src/index.ts\"}\n"},
+        {"packages/pinned/src/index.ts", "export function pinnedFn() { return 1; }\n"},
+        {"packages/missed/package.json",
+         "{\"name\":\"@k/missed\",\"version\":\"1.0.0\",\"exports\":\"./src/index.ts\"}\n"},
+        {"packages/missed/src/index.ts", "export function missedFn() { return 1; }\n"},
+        {"packages/aliased/package.json",
+         "{\"name\":\"@k/aliased\",\"version\":\"1.0.0\",\"exports\":\"./src/index.ts\"}\n"},
+        {"packages/aliased/src/index.ts", "export function aliasedFn() { return 1; }\n"},
+        {"packages/catalogued/package.json",
+         "{\"name\":\"@k/catalogued\",\"version\":\"1.0.0\",\"exports\":\"./src/index.ts\"}\n"},
+        {"packages/catalogued/src/index.ts", "export function cataloguedFn() { return 1; }\n"},
+        {"packages/app/package.json",
+         "{\"name\":\"@k/app\",\"dependencies\":{\"@k/core\":\"workspace:*\","
+         "\"@k/sdk\":\"workspace:^\",\"@k/pinned\":\"^1.0.0\",\"@k/missed\":\"^2.0.0\","
+         "\"@k/aliased\":\"npm:other@1.0.0\",\"@k/catalogued\":\"catalog:\"},"
+         "\"peerDependencies\":{\"@k/core\":\"^9.0.0\"}}\n"},
+        {"packages/app/src/use.ts",
+         "import { appFn } from '@k/core/effect/app'\n"
+         "import { utilFn } from '@k/core/util'\n"
+         "import { nestedFn } from '@k/core/deep/x'\n"
+         "import { secretFn } from '@k/core/secret/s'\n"
+         "import { sdkFn } from '@k/sdk'\n"
+         "import { pinnedFn } from '@k/pinned'\n"
+         "import { missedFn } from '@k/missed'\n"
+         "import { aliasedFn } from '@k/aliased'\n"
+         "import { cataloguedFn } from '@k/catalogued'\n"
+         "export function viaExact() { return appFn(); }\n"
+         "export function viaPattern() { return utilFn(); }\n"
+         "export function viaLongerPattern() { return nestedFn(); }\n"
+         "export function viaBlocked() { return secretFn(); }\n"
+         "export function viaNested() { return sdkFn(); }\n"
+         "export function viaRange() { return pinnedFn(); }\n"
+         "export function viaMissedRange() { return missedFn(); }\n"
+         "export function viaAlias() { return aliasedFn(); }\n"
+         "export function viaCatalog() { return cataloguedFn(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaExact", "core.src.effect.app.appFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaPattern", "core.src.util.utilFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLongerPattern", "core.src.nested.x.nestedFn"),
+              1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaBlocked", "core.src.secret.s.secretFn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaNested", "sdk.js.src.sdkFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaRange", "pinned.src.pinnedFn"), 1);
+    /* These can install another copy ahead of the workspace package. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaMissedRange", "missed.src.missedFn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaAlias", "aliased.src.aliasedFn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaCatalog", "catalogued.src.cataloguedFn"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_workspace_manifests_sequential) {
+    return js_project_workspace_manifests_case(0);
+}
+TEST(resolver_js_project_workspace_manifests_parallel) {
+    return js_project_workspace_manifests_case(55);
+}
+
+/* A base config is read through `extends`, so changing it changes how files far from it resolve.
+ * A later index over the same database must then match a fresh one. */
+TEST(resolver_js_project_extended_config_change_reresolves) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.base.json", "{\"compilerOptions\":{\"paths\":{\"@x/*\":[\"./one/*\"]}}}\n"},
+        {"tsconfig.json", "{\"extends\":\"./tsconfig.base.json\"}\n"},
+        {"one/thing.ts", "export function thing() { return 1; }\n"},
+        {"two/thing.ts", "export function thing() { return 2; }\n"},
+        {"src/use.ts", "import { thing } from '@x/thing'\n"
+                       "export function useThing() { return thing(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "one.thing.thing"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "two.thing.thing"), 0);
+    cbm_store_close(project.store);
+    project.store = NULL;
+    js_project_write(project.root, "tsconfig.base.json",
+                     "{\"compilerOptions\":{\"paths\":{\"@x/*\":[\"./two/*\"]}}}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/index.db", project.root);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(project.root, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    project.store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(project.store);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "one.thing.thing"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "two.thing.thing"), 1);
+    js_project_free(&project);
+    PASS();
+}
+
+/* The same, for a base with no telling name, in a directory the config does not govern, and for
+ * a package's own manifest, which any importer in the project resolves through. */
+TEST(resolver_js_project_far_config_change_reresolves) {
+    static const js_project_file_t files[] = {
+        {"configs/base.json", "{\"compilerOptions\":{\"paths\":{\"@x/*\":[\"../one/*\"]}}}\n"},
+        {"app/tsconfig.json", "{\"extends\":\"../configs/base.json\"}\n"},
+        {"one/thing.ts", "export function thing() { return 1; }\n"},
+        {"two/thing.ts", "export function thing() { return 2; }\n"},
+        {"package.json", "{\"private\":true,\"workspaces\":[\"pkg\"]}\n"},
+        {"pkg/package.json", "{\"name\":\"pkg\",\"version\":\"1.0.0\",\"exports\":\"./a.ts\"}\n"},
+        {"pkg/a.ts", "export function entry() { return 1; }\n"},
+        {"pkg/b.ts", "export function entry() { return 2; }\n"},
+        {"app/use.ts", "import { thing } from '@x/thing'\n"
+                       "import { entry } from 'pkg'\n"
+                       "export function useThing() { return thing(); }\n"
+                       "export function useEntry() { return entry(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "one.thing.thing"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useEntry", "pkg.a.entry"), 1);
+    cbm_store_close(project.store);
+    project.store = NULL;
+    js_project_write(project.root, "configs/base.json",
+                     "{\"compilerOptions\":{\"paths\":{\"@x/*\":[\"../two/*\"]}}}\n");
+    js_project_write(project.root, "pkg/package.json",
+                     "{\"name\":\"pkg\",\"version\":\"1.0.0\",\"exports\":\"./b.ts\"}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/index.db", project.root);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(project.root, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    project.store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(project.store);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "one.thing.thing"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "two.thing.thing"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useEntry", "pkg.a.entry"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useEntry", "pkg.b.entry"), 1);
+    js_project_free(&project);
+    PASS();
+}
+
+/* Express's `var self = this` in `res.render`: the closure's `self.send()` is `this.send()` of the
+ * method it closes over. A write or a second declaration ends that. */
+static int js_project_this_alias_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"lib/res.js", "var res = Object.create(null);\n"
+                       "module.exports = res;\n"
+                       "res.send = function send() { return 1; };\n"
+                       "res.render = function render() {\n"
+                       "  var self = this;\n"
+                       "  return function done() { return self.send(); };\n"
+                       "};\n"
+                       "res.rewritten = function rewritten(other) {\n"
+                       "  var self = this;\n"
+                       "  self = other;\n"
+                       "  return self.send();\n"
+                       "};\n"
+                       "res.twice = function twice(other) {\n"
+                       "  var self = this;\n"
+                       "  if (other) { var self = other; }\n"
+                       "  return self.send();\n"
+                       "};\n"
+                       "res.notThis = function notThis(other) {\n"
+                       "  var self = other;\n"
+                       "  return self.send();\n"
+                       "};\n"
+                       "function outer() {\n"
+                       "  function inner() {\n"
+                       "    var self = this;\n"
+                       "    return self.send();\n"
+                       "  }\n"
+                       "  return inner;\n"
+                       "}\n"
+                       "outer.send = function send2() { return 2; };\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "done", "lib.res.send"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "rewritten", "lib.res.send"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "twice", "lib.res.send"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "notThis", "lib.res.send"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "inner", "lib.res.send"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "inner", "lib.res.send2"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_this_alias_sequential) {
+    return js_project_this_alias_case(0);
+}
+
+TEST(resolver_js_project_this_alias_parallel) {
+    return js_project_this_alias_case(55);
+}
+
+/* A value narrowed below its declared class selects the narrower class's member, which a
+ * declaration does not tell. `instanceof` and a declared guard both do that, in any spelling. */
+static int js_project_narrowing_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.json", "{}\n"},
+        {"src/guards.ts", "import { Base, Sub } from './classes'\n"
+                          "export function isSub(a: Base): a is Sub { return a instanceof Sub; }\n"
+                          "export function notGuard(a: Base): boolean { return !!a; }\n"},
+        {"src/classes.ts", "export class Base { m() { return 1; } }\n"
+                           "export class Sub extends Base { m() { return 2; } }\n"},
+        {"src/use.ts",
+         "import { Base, Sub } from './classes'\n"
+         "import { isSub, notGuard } from './guards'\n"
+         "const localGuard = (a: Base): a is Sub => a instanceof Sub;\n"
+         "export function viaConst(a: Base) { if (a instanceof Sub) { const c = a; c.m(); } }\n"
+         "export function viaGuard(a: Base) { if (isSub(a)) { const c = a; c.m(); } }\n"
+         "export function viaDirectGuard(a: Base) { if (isSub(a)) { a.m(); } }\n"
+         "export function viaLocalGuard(a: Base) { if (localGuard(a)) { a.m(); } }\n"
+         "export function viaEarly(a: Base) { if (!(a instanceof Sub)) return; const c = a; c.m(); }\n"
+         "export function viaClosure(a: Base) { if (a instanceof Sub) { [1].map(() => a.m()); } }\n"
+         "export function viaOtherGuard(a: Base) { if (notGuard(a)) { a.m(); } }\n"
+         "export function viaPlainCall(a: Base) { notGuard(a); return a.m(); }\n"
+         "export function viaOtherName(a: Base, b: Base) { if (b instanceof Sub) { a.m(); } }\n"
+         "export function viaSibling(a: Base) { a.m(); }\n"
+         "export function viaAssigned() { let a: Base = new Sub(); a.m(); }\n"
+         "export function viaAnnotated() { const a = new Sub(); const b: Base = a; b.m(); }\n"
+         "export class Holder {\n"
+         "  held: Base = new Sub();\n"
+         "  isIt(a: Base): a is Sub { return a instanceof Sub; }\n"
+         "  viaMember() { if (this.held instanceof Sub) { this.held.m(); } }\n"
+         "  viaMemberConst() { if (this.held instanceof Sub) { const c = this.held; c.m(); } }\n"
+         "  viaThisGuard(a: Base) { if (this.isIt(a)) { a.m(); } }\n"
+         "  viaUnrelated() { return this.held.m(); }\n"
+         "}\n"
+         "export function viaPath(h: Holder) { if (h.held instanceof Sub) { h.held!.m(); } }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    const char *base = "src.classes.Base.m";
+    static const char *const narrowed[] = {"viaConst",      "viaGuard",     "viaDirectGuard",
+                                           "viaLocalGuard", "viaEarly",     "viaClosure",
+                                           "viaMember",     "viaMemberConst", "viaThisGuard",
+                                           "viaPath"};
+    for (size_t i = 0; i < sizeof(narrowed) / sizeof(narrowed[0]); i++)
+        ASSERT_EQ(js_project_edges(&project, "CALLS", narrowed[i], base), 0);
+    static const char *const declared[] = {"viaOtherGuard", "viaPlainCall", "viaOtherName",
+                                           "viaSibling",    "viaAssigned",  "viaAnnotated",
+                                           "viaUnrelated"};
+    for (size_t i = 0; i < sizeof(declared) / sizeof(declared[0]); i++)
+        ASSERT_EQ(js_project_edges(&project, "CALLS", declared[i], base), 1);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_narrowing_has_no_declared_answer_sequential) {
+    return js_project_narrowing_case(0);
+}
+
+TEST(resolver_js_project_narrowing_has_no_declared_answer_parallel) {
+    return js_project_narrowing_case(55);
+}
+
+/* `**` matches any number of directories, and a list of them backtracks only to the last one: a
+ * glob that cannot match a deep directory answers without trying every split of it. */
+TEST(resolver_js_project_workspace_glob_with_many_double_stars) {
+    char hostile[512] = "packages:\n  - '";
+    for (int i = 0; i < 24; i++)
+        strcat(hostile, "**/a/");
+    strcat(hostile, "nothing'\n  - '**/a/**/lib'\n  - '!**/skipped/**'\n");
+    js_project_file_t files[] = {
+        {"pnpm-workspace.yaml", hostile},
+        {"a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/lib/package.json",
+         "{\"name\":\"deep\",\"version\":\"1.0.0\",\"main\":\"index.ts\"}\n"},
+        {"a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/lib/index.ts",
+         "export function deepFn() { return 1; }\n"},
+        {"a/skipped/a/lib/package.json",
+         "{\"name\":\"hidden\",\"version\":\"1.0.0\",\"main\":\"index.ts\"}\n"},
+        {"a/skipped/a/lib/index.ts", "export function hiddenFn() { return 1; }\n"},
+        {"package.json", "{\"name\":\"root\",\"private\":true}\n"},
+        {"a/app/package.json", "{\"name\":\"app\",\"version\":\"1.0.0\","
+                               "\"dependencies\":{\"deep\":\"workspace:*\","
+                               "\"hidden\":\"workspace:*\"}}\n"},
+        {"a/app/use.ts", "import { deepFn } from 'deep'\n"
+                         "import { hiddenFn } from 'hidden'\n"
+                         "export function useDeep() { return deepFn(); }\n"
+                         "export function useHidden() { return hiddenFn(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useDeep",
+                               "a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.lib.deepFn"),
+              1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useHidden", "a.skipped.a.lib.hiddenFn"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+/* TypeScript tries baseUrl before any package, for a bare name too, and falls through when no
+ * file is there. */
+TEST(resolver_js_project_base_url_goes_before_a_package) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\"./src\"}}\n"},
+        {"package.json", "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"pkgs/*\"]}\n"},
+        {"pkgs/foo/package.json", "{\"name\":\"foo\",\"version\":\"1.0.0\",\"main\":\"index.ts\"}\n"},
+        {"pkgs/foo/index.ts", "export function fromPackage() { return 9; }\n"
+                              "export function thing() { return 9; }\n"},
+        {"pkgs/bar/package.json", "{\"name\":\"bar\",\"version\":\"1.0.0\",\"main\":\"index.ts\"}\n"},
+        {"pkgs/bar/index.ts", "export function barThing() { return 9; }\n"},
+        {"src/foo.ts", "export function thing() { return 1; }\n"},
+        {"src/use.ts", "import { thing } from 'foo'\n"
+                       "import { barThing } from 'bar'\n"
+                       "export function useThing() { return thing(); }\n"
+                       "export function useBar() { return barThing(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "src.foo.thing"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useThing", "pkgs.foo.thing"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useBar", "pkgs.bar.barThing"), 1);
+    js_project_free(&project);
+    PASS();
+}
+
+/* A member call through a type alias selects what every constituent selects: vite's
+ * `Environment` union of subclasses of one base, vue's `TypeResolveContext` of a class and a Pick
+ * of it. Two constituents reaching two declarations select neither. */
+static int js_project_alias_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.json", "{}\n"},
+        {"src/env.ts", "export class Base {\n"
+                       "  shared() { return 1; }\n"
+                       "  both() { return 1; }\n"
+                       "}\n"
+                       "export class Dev extends Base {\n"
+                       "  both() { return 2; }\n"
+                       "  onlyDev() { return 2; }\n"
+                       "}\n"
+                       "export class Build extends Base {\n"
+                       "  both() { return 3; }\n"
+                       "}\n"
+                       "export class Unknown extends Base {}\n"
+                       "export type Environment = Dev | Build | Unknown\n"
+                       "export type Maybe = Dev | null\n"
+                       "export type Plain = Dev\n"
+                       "export class One extends Base {}\n"
+                       "export class Two extends Base {}\n"
+                       "export class Three extends Base {}\n"
+                       "export class Four extends Base {}\n"
+                       "export class Five extends Base {}\n"
+                       "export class Six extends Base {}\n"
+                       "export class Seven extends Base {}\n"
+                       "export class Eight extends Base {}\n"
+                       "export class Nine extends Base {}\n"
+                       "export class Ten extends Base {}\n"
+                       "export type Long = One | Two | Three | Four | Five | Six | Seven | Eight |\n"
+                       "  Nine | Ten | Dev | Build | Unknown\n"},
+        {"src/ctx.ts", "export class Holder {\n"
+                       "  error() { return 1; }\n"
+                       "  helper() { return 2; }\n"
+                       "  hidden() { return 3; }\n"
+                       "  warn() { return 4; }\n"
+                       "  own() { return 5; }\n"
+                       "}\n"
+                       "export class Other {\n"
+                       "  option() { return 1; }\n"
+                       "}\n"},
+        {"src/alias.ts", "import type { Holder, Other } from './ctx'\n"
+                         "export type Simple = Pick<\n"
+                         "  Holder,\n"
+                         "  // utils\n"
+                         "  | 'error'\n"
+                         "  | 'helper'\n"
+                         "> & Partial<Pick<Other, 'option'>> & {\n"
+                         "    ast: string[]\n"
+                         "    own(): void\n"
+                         "  }\n"
+                         "export type Context = (Holder | Simple) & { silent?: boolean }\n"
+                         "export type Without = Omit<Holder, 'warn'>\n"
+                         "export type Mixed = Holder | Other\n"
+                         "type Local = Holder\n"
+                         "export function viaLocal(l: Local) { return l.helper(); }\n"},
+        {"src/use.ts", "import type { Environment, Long, Maybe, Plain } from './env'\n"
+                       "import type { Context, Simple, Without, Mixed } from './alias'\n"
+                       "export function sharedCall(e: Environment) { return e.shared(); }\n"
+                       "export function bothCall(e: Environment) { return e.both(); }\n"
+                       "export function maybeCall(e: Maybe) { return e!.onlyDev(); }\n"
+                       "export function longCall(e: Long) { return e.shared(); }\n"
+                       "export function plainCall(e: Plain) { return e.onlyDev(); }\n"
+                       "export function errorCall(c: Context) { return c.error(); }\n"
+                       "export function helperCall(c: Simple) { return c.helper(); }\n"
+                       "export function hiddenCall(c: Simple) { return c.hidden(); }\n"
+                       "export function ownCall(c: Simple) { return c.own(); }\n"
+                       "export function optionCall(c: Simple) { return c.option(); }\n"
+                       "export function kept(w: Without) { return w.helper(); }\n"
+                       "export function dropped(w: Without) { return w.warn(); }\n"
+                       "export function mixedCall(m: Mixed) { return m.error(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "sharedCall", "src.env.Base.shared"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "bothCall", "src.env.Base.both"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "bothCall", "src.env.Dev.both"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "bothCall", "src.env.Build.both"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "maybeCall", "src.env.Dev.onlyDev"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "longCall", "src.env.Base.shared"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "plainCall", "src.env.Dev.onlyDev"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "errorCall", "src.ctx.Holder.error"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "helperCall", "src.ctx.Holder.helper"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLocal", "src.ctx.Holder.helper"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "optionCall", "src.ctx.Other.option"), 1);
+    /* Pick left it out, so the checker rejects it; no edge claims otherwise. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "hiddenCall", "src.ctx.Holder.hidden"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "ownCall", "src.ctx.Holder.own"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "kept", "src.ctx.Holder.helper"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "dropped", "src.ctx.Holder.warn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "mixedCall", "src.ctx.Holder.error"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_alias_selection_sequential) {
+    return js_project_alias_case(0);
+}
+
+TEST(resolver_js_project_alias_selection_parallel) {
+    return js_project_alias_case(55);
+}
+
+/* vite's `class PluginContext extends MinimalPluginContext implements Omit<RollupPluginContext,
+ * 'cache'>`: what a class implements declares nothing for it, so an interface the index cannot see
+ * does not hide its base's method. A base it cannot see still does. */
+static int js_project_implements_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.json", "{}\n"},
+        {"src/ctx.ts", "import type { Rollup } from 'rollup'\n"
+                       "import { External } from 'external'\n"
+                       "export class Holder {\n"
+                       "  go() { return 1; }\n"
+                       "}\n"
+                       "export class Base {\n"
+                       "  debug() { return 1; }\n"
+                       "  held: Holder = new Holder()\n"
+                       "}\n"
+                       "export class Middle extends Base implements Omit<Rollup, 'cache'> {}\n"
+                       "export class Leaf extends Middle implements Rollup {\n"
+                       "  debugTwice() { super.debug(); return this.debug(); }\n"
+                       "}\n"
+                       "export class Foreign extends External implements Rollup {}\n"
+                       "export class Above extends Foreign {}\n"
+                       "export class Lonely implements Rollup {}\n"},
+        {"src/use.ts", "import { Leaf, Above, Lonely } from './ctx'\n"
+                       "export function viaLeaf() { return new Leaf().debug(); }\n"
+                       "export function memberLeaf(l: Leaf) { return l.held.go(); }\n"
+                       "export function viaAbove() { return new Above().debug(); }\n"
+                       "export function viaLonely(l: Lonely) { return l.debug(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLeaf", "src.ctx.Base.debug"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "debugTwice", "src.ctx.Base.debug"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "memberLeaf", "src.ctx.Holder.go"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaAbove", "src.ctx.Base.debug"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLonely", "src.ctx.Base.debug"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_implements_declares_nothing_sequential) {
+    return js_project_implements_case(0);
+}
+
+TEST(resolver_js_project_implements_declares_nothing_parallel) {
+    return js_project_implements_case(55);
+}
+
+/* vite's `environments: Record<'client' | 'ssr', DevEnvironment>`: any key holds the value type.
+ * immutable's Record is not that, and a member redeclared with a type no class names hides the
+ * base's. */
+static int js_project_record_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.json", "{}\n"},
+        {"src/env.ts", "export class Env {\n"
+                       "  go() { return 1; }\n"
+                       "}\n"
+                       "export class Graph {\n"
+                       "  walk() { return 1; }\n"
+                       "}\n"
+                       "export interface Server {\n"
+                       "  environments: Record<'client' | 'ssr', Env>\n"
+                       "  list: Env[]\n"
+                       "  named: Env\n"
+                       "}\n"
+                       "export class Base {\n"
+                       "  thing: Env = new Env()\n"
+                       "}\n"
+                       "export class Sub extends Base {\n"
+                       "  thing: string | Graph = ''\n"
+                       "}\n"},
+        {"src/foreign.ts", "import { Record } from 'immutable'\n"
+                           "import { Env } from './env'\n"
+                           "export interface Foreign {\n"
+                           "  envs: Record<string, Env>\n"
+                           "}\n"
+                           "export function foreignLocal(r: Record<string, Env>) {\n"
+                           "  return r.a.go();\n"
+                           "}\n"},
+        {"src/use.ts", "import type { Server } from './env'\n"
+                       "import { Env, Sub } from './env'\n"
+                       "import type { Foreign } from './foreign'\n"
+                       "export function dotted(s: Server) { return s.environments.ssr.go(); }\n"
+                       "export function indexed(s: Server, k: string) {\n"
+                       "  return s.environments[k].go();\n"
+                       "}\n"
+                       "export function localRecord(r: Record<string, Env>) { return r.a.go(); }\n"
+                       "export function localIndexed(r: Record<string, Env>) { return r['a'].go(); }\n"
+                       "export function listMethod(s: Server) { return s.list.go(); }\n"
+                       "export function namedChain(s: Server) { return s.named.go(); }\n"
+                       "export function viaForeign(f: Foreign) { return f.envs.a.go(); }\n"
+                       "export function hidden(s: Sub) { return s.thing.go(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "dotted", "src.env.Env.go"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "indexed", "src.env.Env.go"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "localRecord", "src.env.Env.go"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "localIndexed", "src.env.Env.go"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "namedChain", "src.env.Env.go"), 1);
+    /* An array is no Record: `.go` on one is not on its element. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "listMethod", "src.env.Env.go"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaForeign", "src.env.Env.go"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "foreignLocal", "src.env.Env.go"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "hidden", "src.env.Env.go"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_record_values_sequential) {
+    return js_project_record_case(0);
+}
+
+TEST(resolver_js_project_record_values_parallel) {
+    return js_project_record_case(55);
+}
+
+/* TanStack's shape: `exports` names built files, and a first condition the tsconfig turns on
+ * names the source. `!` and `**` come from the same pnpm-workspace.yaml. */
+TEST(resolver_js_project_custom_condition_and_workspace_globs) {
+    static const js_project_file_t files[] = {
+        {"package.json", "{\"name\":\"root\",\"private\":true}\n"},
+        {"pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n  - 'tools/**'\n"
+                                "  - '!packages/skipped*'\n"},
+        {"tsconfig.json", "{\"compilerOptions\":{\"customConditions\":[\"@t/src\"]}}\n"},
+        {"packages/core/package.json",
+         "{\"name\":\"@t/core\",\"exports\":{\".\":{\"@t/src\":\"./src/index.ts\","
+         "\"import\":\"./build/index.js\",\"require\":\"./build/index.cjs\"}}}\n"},
+        {"packages/core/src/index.ts", "export function coreFn() { return 1; }\n"},
+        /* Conditions run in object order, so a later one is not chosen by itself. */
+        {"packages/late/package.json",
+         "{\"name\":\"@t/late\",\"exports\":{\".\":{\"import\":\"./build/index.js\","
+         "\"@t/src\":\"./src/index.ts\"}}}\n"},
+        {"packages/late/src/index.ts", "export function lateFn() { return 1; }\n"},
+        {"packages/skippedOne/package.json",
+         "{\"name\":\"@t/skipped\",\"exports\":\"./src/index.ts\"}\n"},
+        {"packages/skippedOne/src/index.ts", "export function skippedFn() { return 1; }\n"},
+        {"tools/deep/nested/package.json",
+         "{\"name\":\"@t/deep\",\"exports\":\"./src/index.ts\"}\n"},
+        {"tools/deep/nested/src/index.ts", "export function deepFn() { return 1; }\n"},
+        {"packages/app/package.json",
+         "{\"name\":\"@t/app\",\"dependencies\":{\"@t/core\":\"workspace:*\","
+         "\"@t/late\":\"workspace:*\",\"@t/deep\":\"workspace:*\","
+         "\"@t/skipped\":\"workspace:*\"}}\n"},
+        {"packages/app/tsconfig.json", "{\"extends\":\"../../tsconfig.json\"}\n"},
+        {"packages/app/src/use.ts",
+         "import { coreFn } from '@t/core'\n"
+         "import { lateFn } from '@t/late'\n"
+         "import { deepFn } from '@t/deep'\n"
+         "import { skippedFn } from '@t/skipped'\n"
+         "export function viaCondition() { return coreFn(); }\n"
+         "export function viaLaterCondition() { return lateFn(); }\n"
+         "export function viaDeepGlob() { return deepFn(); }\n"
+         "export function viaNegated() { return skippedFn(); }\n"},
+        /* This config neither sets nor inherits the condition. */
+        {"packages/plain/package.json",
+         "{\"name\":\"@t/plain\",\"dependencies\":{\"@t/core\":\"workspace:*\"}}\n"},
+        {"packages/plain/tsconfig.json", "{\"compilerOptions\":{\"strict\":true}}\n"},
+        {"packages/plain/src/use.ts",
+         "import { coreFn } from '@t/core'\n"
+         "export function viaNoCondition() { return coreFn(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaCondition", "core.src.coreFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLaterCondition", "late.src.lateFn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaDeepGlob", "nested.src.deepFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaNegated", "skippedOne.src.skippedFn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaNoCondition", "core.src.coreFn"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+/* pnpm declares its workspace in pnpm-workspace.yaml, and links only `workspace:` by default. */
+TEST(resolver_js_project_pnpm_workspace_yaml) {
+    static const js_project_file_t files[] = {
+        {"package.json", "{\"name\":\"root\",\"private\":true}\n"},
+        {"pnpm-workspace.yaml", "# packages\npackages:\n  - 'packages/*'\n  - \"tools/one\"\n"
+                                "catalog:\n  zod: 1.0.0\n"},
+        {"packages/lib/package.json",
+         "{\"name\":\"@p/lib\",\"version\":\"1.0.0\",\"exports\":\"./src/index.ts\"}\n"},
+        {"packages/lib/src/index.ts", "export function libFn() { return 1; }\n"},
+        {"tools/one/package.json",
+         "{\"name\":\"@p/one\",\"version\":\"1.0.0\",\"exports\":\"./src/index.ts\"}\n"},
+        {"tools/one/src/index.ts", "export function oneFn() { return 1; }\n"},
+        {"packages/app/package.json",
+         "{\"name\":\"@p/app\",\"dependencies\":{\"@p/lib\":\"workspace:*\","
+         "\"@p/one\":\"^1.0.0\"}}\n"},
+        {"packages/app/src/use.ts",
+         "import { libFn } from '@p/lib'\n"
+         "import { oneFn } from '@p/one'\n"
+         "export function viaWorkspace() { return libFn(); }\n"
+         "export function viaPlainRange() { return oneFn(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaWorkspace", "lib.src.libFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaPlainRange", "one.src.oneFn"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+/* Vue core: a pnpm workspace whose manifests export only built dist/ files. TypeScript tries
+ * the governing tsconfig's `paths` before any package lookup, so `@vue/shared` is that source. */
+static int js_project_workspace_paths_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"tsconfig.json", "{\"compilerOptions\":{\"paths\":{\"@vue/*\":[\"./packages/*/src\"],"
+                          "\"@ghost/*\":[\"./ghost/*\"],\"vue\":[\"./packages/vue/src\"]}}}\n"},
+        {"package.json", "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n"},
+        {"packages/shared/package.json",
+         "{\"name\":\"@vue/shared\",\"main\":\"index.js\",\"exports\":{\".\":"
+         "{\"types\":\"./dist/shared.d.ts\",\"import\":\"./dist/shared.esm-bundler.js\","
+         "\"require\":\"./index.js\"}}}\n"},
+        {"packages/shared/src/index.ts", "export * from './makeMap'\n"},
+        {"packages/shared/src/makeMap.ts", "export function makeMap() { return 1; }\n"},
+        {"packages/vue/package.json", "{\"name\":\"vue\",\"main\":\"index.js\"}\n"},
+        {"packages/vue/src/index.ts", "export { makeMap as vueMap } from '@vue/shared'\n"},
+        {"packages/core/package.json",
+         "{\"name\":\"@vue/core\",\"dependencies\":{\"@vue/shared\":\"workspace:*\"}}\n"},
+        {"packages/core/src/use.ts",
+         "import { makeMap } from '@vue/shared'\n"
+         "import { vueMap } from 'vue'\n"
+         "import { ghostFn } from '@ghost/lib'\n"
+         "export function useShared() { return makeMap(); }\n"
+         "export function useVue() { return vueMap(); }\n"
+         "export function useGhost() { return ghostFn(); }\n"},
+        /* The manifest wins here: Node reads no tsconfig, and dist/ is not in the tree. */
+        /* Nest: `exports` names ./index.js and the tree holds only its source. A package a config
+         * without `paths` imports through the workspace, with no build output on disk. */
+        {"packages/lib/package.json",
+         "{\"name\":\"@wk/lib\",\"type\":\"module\",\"main\":\"./index.js\","
+         "\"exports\":{\".\":\"./index.js\",\"./sub\":\"./sub.js\"}}\n"},
+        {"packages/lib/index.ts", "export function libFn() { return 1; }\n"},
+        {"packages/lib/sub.ts", "export function subFn() { return 1; }\n"},
+        {"packages/app/package.json", "{\"name\":\"@wk/app\"}\n"},
+        {"packages/app/tsconfig.json", "{\"compilerOptions\":{\"strict\":true}}\n"},
+        {"packages/app/use.ts",
+         "import { libFn } from '@wk/lib'\n"
+         "import { subFn } from '@wk/lib/sub'\n"
+         "export function viaManifest() { return libFn(); }\n"
+         "export function viaSubpath() { return subFn(); }\n"},
+        /* Node reads no TypeScript: the same import from JavaScript has no file to bind. */
+        {"packages/app/plain.js",
+         "import { libFn } from '@wk/lib'\n"
+         "export function plainManifest() { return libFn(); }\n"},
+        /* A member of a sibling index.ts holds the QN of the module beside it. */
+        {"packages/core/src/server/index.ts",
+         "export function start() { const pluginContainer = () => 1; return pluginContainer(); }\n"},
+        {"packages/core/src/server/pluginContainer.ts",
+         "export function createContainer() { return 1; }\n"},
+        {"packages/core/src/server/environment.ts",
+         "import { createContainer } from './pluginContainer'\n"
+         "export function init() { return createContainer(); }\n"},
+        {"packages/core/src/plain.js",
+         "import { makeMap } from '@vue/shared'\n"
+         "export function usePlain() { return makeMap(); }\n"},
+        /* A config governs its directory and extends nothing, so root's `paths` do not apply. */
+        {"packages/solo/tsconfig.json", "{\"compilerOptions\":{\"strict\":true}}\n"},
+        {"packages/solo/src/use.ts",
+         "import { makeMap } from '@vue/shared'\n"
+         "export function useSolo() { return makeMap(); }\n"},
+        /* Nest's packages/core/tsconfig.json: `"files": []` and references compile nothing, so
+         * the file belongs to the project above it. */
+        {"packages/refs/tsconfig.json", "{\"files\":[],\"references\":[{\"path\":\"./b\"}]}\n"},
+        {"packages/refs/src/use.ts",
+         "import { makeMap } from '@vue/shared'\n"
+         "export function useRefs() { return makeMap(); }\n"},
+        /* Its base holds `paths`, whose targets are relative to the base's own directory. */
+        {"configs/tsconfig.base.json",
+         "{\"compilerOptions\":{\"paths\":{\"@base/*\":[\"../packages/shared/src/*\"]}}}\n"},
+        {"apps/web/tsconfig.json", "{\"extends\":\"../../configs/tsconfig.base.json\"}\n"},
+        {"apps/web/src/use.ts",
+         "import { makeMap } from '@base/makeMap'\n"
+         "export function useBase() { return makeMap(); }\n"},
+        /* With baseUrl, `paths` targets are relative to it and not to the config. */
+        {"apps/rooted/tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\"./src\",\"paths\":{\"~/*\":[\"lib/*\"]}}}\n"},
+        {"apps/rooted/lib/decoy.ts", "export function rooted() { return 2; }\n"},
+        {"apps/rooted/src/lib/real.ts", "export function rooted() { return 1; }\n"},
+        {"apps/rooted/src/use.ts",
+         "import { rooted } from '~/real'\n"
+         "import { rooted as other } from '~/decoy'\n"
+         "export function useRooted() { return rooted(); }\n"
+         "export function useRootedDecoy() { return other(); }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    const char *make_map = "packages.shared.src.makeMap.makeMap";
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useShared", make_map), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useVue", make_map), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useBase", make_map), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaManifest", "packages.lib.libFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaSubpath", "packages.lib.sub.subFn"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "plainManifest", "packages.lib.libFn"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "init",
+                               "packages.core.src.server.pluginContainer.createContainer"),
+              1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "usePlain", make_map), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useSolo", make_map), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useRefs", make_map), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useRooted", "apps.rooted.src.lib.real.rooted"),
+              1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useRootedDecoy", "apps.rooted.lib.decoy.rooted"),
+              0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_workspace_paths_sequential) {
+    return js_project_workspace_paths_case(0);
+}
+TEST(resolver_js_project_workspace_paths_parallel) {
+    return js_project_workspace_paths_case(55);
+}
+
+/* Vue's `runner.effect.stop()` and `instance.scope.on()`, Vite's `this.pluginContainer.close()`:
+ * a member's type is what its class declares, wherever that class lives, in the file that
+ * declares it. */
+static int js_project_member_types_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"src/effect.ts",
+         "export class Effect { stop() { return 1; } run() { return 2; } }\n"
+         "export class Other { stop() { return 3; } }\n"},
+        {"src/types.ts",
+         "import { Effect, Other } from './effect'\n"
+         "export interface Runner<T = any> { (): T; effect: Effect; opt?: Effect; both: Effect | Other }\n"
+         "export class Base { held: Effect = new Effect(); shadow: Other = new Other(); }\n"
+         "export class Kid extends Base {\n"
+         "  shadow: Effect = new Effect();\n"
+         "  made = new Effect();\n"
+         "  constructor(private readonly param: Effect, plain: Other) { super(); }\n"
+         "  get viaGetter(): Effect { return this.made; }\n"
+         "  static shared: Effect = new Effect();\n"
+         "  method(): Effect { return this.made; }\n"
+         "}\n"
+         "export class Generic<Effect> { item: Effect; list: Other; }\n"
+         "export class Unknown extends Missing { }\n"},
+        /* Nest's RouterExplorer: the value argument is read before the arrow beside it is
+         * walked, so one receiver is seen after a later site. That stale read ended every member
+         * proof for the rest of a 500-line class. */
+        {"src/order.ts",
+         "class R { handler() { return 1; } }\n"
+         "class S { run() { return 2; } }\n"
+         "export function reg(route: R, other: S) {\n"
+         "  const h = Object.assign((...args: unknown[]) => {\n"
+         "    return route.handler();\n"
+         "  }, route.handler);\n"
+         "  return [h, other];\n"
+         "}\n"
+         "export function laterProof(other: S) { return other.run(); }\n"},
+        {"src/use.ts",
+         "import { Runner, Kid, Generic, Unknown } from './types'\n"
+         "export function viaInterface(r: Runner) { r.effect.stop(); }\n"
+         "export function viaOptional(r: Runner) { r.opt?.stop(); }\n"
+         "export function viaUnion(r: Runner) { r.both.stop(); }\n"
+         "export function viaInherited(k: Kid) { k.held.stop(); }\n"
+         "export function viaShadow(k: Kid) { k.shadow.stop(); }\n"
+         "export function viaInitializer(k: Kid) { k.made.stop(); }\n"
+         "export function viaParameter(k: Kid) { k.param.stop(); }\n"
+         "export function viaGetter(k: Kid) { k.viaGetter.stop(); }\n"
+         "export function viaStatic(k: Kid) { k.shared.stop(); }\n"
+         "export function viaMethod(k: Kid) { k.method.stop(); }\n"
+         "export function viaTypeParam(g: Generic<any>) { g.item.stop(); }\n"
+         "export function viaSibling(g: Generic<any>) { g.list.stop(); }\n"
+         "export function viaUnknown(u: Unknown) { u.held.stop(); }\n"
+         "export function viaPlain(k: Kid) { k.plain.stop(); }\n"
+         "export class Local { kid: Kid; go() { this.kid.held.run(); } }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    const char *stop = "src.effect.Effect.stop";
+    const char *other = "src.effect.Other.stop";
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaInterface", stop), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaOptional", stop), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaUnion", stop), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaUnion", other), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaInherited", stop), 1);
+    /* The subclass's own declaration of a member beats its base's. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaShadow", stop), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaShadow", other), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaInitializer", stop), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaParameter", stop), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaGetter", stop), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaStatic", stop), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaMethod", stop), 0);
+    /* `Effect` is the class's own parameter here, not the imported class. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaTypeParam", stop), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaSibling", other), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaUnknown", stop), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaPlain", other), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "go", "src.effect.Effect.run"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "laterProof", "src.order.S.run"), 1);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_member_types_sequential) {
+    return js_project_member_types_case(0);
+}
+TEST(resolver_js_project_member_types_parallel) {
+    return js_project_member_types_case(55);
+}
+
+/* Nest's `const context = this.createContext(...); context.setType()`, Vite's
+ * `const server = await createServer(); server.close()` and Vue's `const { scope } = instance`:
+ * a const holds what its initializer is declared to yield. */
+static int js_project_initializers_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"src/core.ts",
+         "export class Made { go() { return 1; } }\n"
+         "export class Other { go() { return 2; } }\n"},
+        {"src/made.ts",
+         "import { Made, Other } from './core'\n"
+         "export function make(): Made { return new Made(); }\n"
+         "export async function makeLater(): Promise<Made> { return new Made(); }\n"
+         "export function either(): Made | Other { return new Made(); }\n"
+         "export function maybe(): Made | undefined { return new Made(); }\n"
+         "export function generic<Made>(x: Made): Made { return x; }\n"
+         "export function over(a: string): Made;\n"
+         "export function over(a: number): Other;\n"
+         "export function over(a: any): any { return a; }\n"
+         "export function inferred() { return new Made(); }\n"
+         "export class Factory {\n"
+         "  held: Made = new Made();\n"
+         "  create(): Made { return new Made(); }\n"
+         "  get made(): Made { return new Made(); }\n"
+         "  self(): Factory { return this; }\n"
+         "}\n"
+         "export class Box<Made> { open(): Made { return null as any; } }\n"},
+        {"src/usemade.ts",
+         "import { make, makeLater, either, maybe, generic, over, inferred, Factory, Box } from "
+         "'./made'\n"
+         "import { Made, Other } from './core'\n"
+         "function pick(): any { return 1; }\n"
+         "function local(): Other { return new Other(); }\n"
+         "export function viaCall() { const m = make(); m.go(); }\n"
+         "export function viaDirect() { make().go(); }\n"
+         "export async function viaAwait() { const m = await makeLater(); m.go(); }\n"
+         "export function viaPromise() { const m = makeLater(); m.go(); }\n"
+         "export function viaEither() { const m = either(); m.go(); }\n"
+         "export function viaMaybe() { const m = maybe(); m!.go(); }\n"
+         "export function viaGeneric() { const m = generic(new Other()); m.go(); }\n"
+         "export function viaOver() { const m = over('a'); m.go(); }\n"
+         "export function viaInferred() { const m = inferred(); m.go(); }\n"
+         "export function viaLocal() { const m = local(); m.go(); }\n"
+         "export function viaMethod(f: Factory) { const m = f.create(); m.go(); }\n"
+         "export function viaChain(f: Factory) { f.self().create().go(); }\n"
+         "export function viaAlias(f: Factory) { const g = f; const m = g.made; m.go(); }\n"
+         "export function viaShorthand(f: Factory) { const { held } = f; held.go(); }\n"
+         "export function viaRenamed(f: Factory) { const { held: h } = f; h.go(); }\n"
+         "export function viaRewritten() { let m = make(); m = pick(); m.go(); }\n"
+         "export function viaTypeParam(b: Box<any>) { const m = b.open(); m.go(); }\n"
+         "export function viaCycle() { const a = c.x; const c = a.y; a.go(); }\n"
+         "export function viaIndex(list: Made[]) { list[0].go(); }\n"
+         "export function viaOf(list: ReadonlyArray<Made>) { for (const m of list) { m.go(); } }\n"
+         "export function viaSet(list: Set<Made>) { for (const m of list) { m.go(); } }\n"
+         "export function viaIn(list: Made[]) { for (const k in list) { k.go(); } }\n"
+         "export function viaMap(list: Map<string, Made>) { for (const m of list) { m.go(); } }\n"
+         "export function viaSetIndex(list: Promise<Made>[]) { list[0].go(); }\n"
+         "export class Holder {\n"
+         "  items: Made[] = [];\n"
+         "  others?: Other[];\n"
+         "  viaField() { this.items[0].go(); }\n"
+         "  viaFieldOf() { for (const o of this.others!) { o.go(); } }\n"
+         "}\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    const char *made = "src.core.Made.go";
+    const char *other = "src.core.Other.go";
+    static const char *const proved[] = {"viaCall",   "viaDirect", "viaAwait",     "viaMaybe",
+                                         "viaMethod", "viaChain",  "viaAlias",     "viaShorthand",
+                                         "viaRenamed", "viaIndex", "viaOf", "viaSet", "viaField"};
+    for (size_t i = 0; i < sizeof(proved) / sizeof(proved[0]); i++)
+        ASSERT_EQ(js_project_edges(&project, "CALLS", proved[i], made), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLocal", other), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaFieldOf", other), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaIn", made), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaMap", made), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaSetIndex", made), 0);
+    static const char *const abstained[] = {"viaPromise", "viaEither",  "viaGeneric",  "viaOver",
+                                            "viaInferred", "viaRewritten", "viaTypeParam", "viaCycle"};
+    for (size_t i = 0; i < sizeof(abstained) / sizeof(abstained[0]); i++) {
+        ASSERT_EQ(js_project_edges(&project, "CALLS", abstained[i], made), 0);
+        ASSERT_EQ(js_project_edges(&project, "CALLS", abstained[i], other), 0);
+    }
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_initializers_sequential) {
+    return js_project_initializers_case(0);
+}
+TEST(resolver_js_project_initializers_parallel) {
+    return js_project_initializers_case(55);
 }
 
 /* Known gaps, each pinned at the case with why it abstains and what was tried. A
@@ -1367,13 +2445,6 @@ TEST(resolver_js_project_known_gaps_abstain_with_a_reason) {
                            "class Sub extends Plain { subRun() { return this.m(); } }\n"
                            "function viaLocal() { const p = new Plain(); return p.m(); }\n"
                            "module.exports = { Plain, Sub, viaLocal };\n"},
-        /* `super.m()` has no receiver form in ts_proof. `this.m()` selects the override,
-         * so super needs its own rule; reading it as `this` would pick the wrong method. */
-        {"src/sup.ts", "export class Base { over() { return 1; } }\n"
-                       "export class Kid extends Base {\n"
-                       "  over() { return 2; }\n"
-                       "  callSuper() { return super.over(); }\n"
-                       "}\n"},
         /* A member assigned in a block may not run, so one assignment cannot stand for the
          * member. Tried: only a module-level statement counts as defining it. */
         {"lib/block.js", "const Owner = {};\n"
@@ -1395,7 +2466,6 @@ TEST(resolver_js_project_known_gaps_abstain_with_a_reason) {
     ASSERT_EQ(js_project_edges(&project, "CALLS", "dynamicCaller", "lib.view.View"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLocal", "lib.jsclass.Plain.m"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "subRun", "lib.jsclass.Plain.m"), 0);
-    ASSERT_EQ(js_project_edges(&project, "CALLS", "callSuper", "src.sup.Base.over"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "blockCaller", "lib.block.blockM"), 0);
     ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "genericCaller", "src.generic.Cbaz"), 0);
     js_project_free(&project);
@@ -1426,8 +2496,101 @@ TEST(resolver_js_project_same_named_nested_functions_settle_by_span) {
     ASSERT_EQ(js_project_edges(&project, "CALLS", "second", "src.a.handle"), 1);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "first", "src.a.handle"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "handle", "src.a.helper"), 1);
+    /* The first `handle` has no node of its own, so its body belongs to `first`. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "first", "src.a.helper"), 1);
+    /* `second` calls helper only through the `handle` the node shows. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "second", "src.a.helper"), 0);
     js_project_free(&project);
     PASS();
+}
+
+/* Vite's four nested `const handler` and Vue's `render: () => h(x)` test fixtures. Each
+ * twin the node does not show gives its calls to the declaration around it, or the file. */
+static int js_project_twins_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"src/h.ts", "export function h() { return 1; }\n"
+                     "export function inject() { return 1; }\n"},
+        {"src/wrap.ts",
+         "import { h, inject } from './h'\n"
+         "export function wrapResolve(hook: any) {\n"
+         "  const handler = function (id: string) {\n"
+         "    return inject();\n"
+         "  };\n"
+         "  return handler;\n"
+         "}\n"
+         "export function wrapLoad(hook: any) {\n"
+         "  const handler = function (id: string) {\n"
+         "    return h();\n"
+         "  };\n"
+         "  return handler;\n"
+         "}\n"},
+        {"src/spec.ts",
+         "import { h, inject } from './h'\n"
+         "export const a = { render: () => h() };\n"
+         "export const b = {\n"
+         "  render: () => inject(),\n"
+         "};\n"
+         "export const c = {\n"
+         "  render: () => {\n"
+         "    return 1;\n"
+         "  },\n"
+         "};\n"},
+        /* A one-line declaration cannot prove what shares its line. */
+        {"src/oneline.ts",
+         "import { h } from './h'\n"
+         "export function near() { return 1; } export const d = { go: () => h() };\n"
+         "export const e = { go: () => {\n"
+         "  return 2;\n"
+         "} };\n"},
+        /* Accessors of one name: the node shows one, the other's calls go to the file. */
+        {"src/accessor.ts",
+         "import { h, inject } from './h'\n"
+         "export class Dep { track() { return 1; } }\n"
+         "export class Box {\n"
+         "  dep = new Dep();\n"
+         "  get value() {\n"
+         "    this.dep.track();\n"
+         "    return h();\n"
+         "  }\n"
+         "  set value(v: any) {\n"
+         "    this.dep.track();\n"
+         "    inject();\n"
+         "  }\n"
+         "}\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "handler", "src.h.h"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "wrapResolve", "src.h.inject"), 1);
+    /* Nothing crosses to the sibling wrapper or into the shown twin. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "wrapLoad", "src.h.inject"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "handler", "src.h.inject"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "wrapResolve", "src.h.h"), 0);
+    /* The shown `render` calls nothing, so both twins go to the module. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "render", "src.h.h"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "render", "src.h.inject"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "src/spec.ts", "src.h.h"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "src/spec.ts", "src.h.inject"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "near", "src.h.h"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "src/oneline.ts", "src.h.h"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "src/accessor.ts", "src.h.h") +
+                  js_project_edges(&project, "CALLS", "src/accessor.ts", "src.h.inject"),
+              1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "value", "src.h.h") +
+                  js_project_edges(&project, "CALLS", "value", "src.h.inject"),
+              1);
+    /* The proof of a typed member call moves with its occurrence. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "value", "src.accessor.Dep.track"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "src/accessor.ts", "src.accessor.Dep.track"), 1);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_twins_sequential) {
+    return js_project_twins_case(0);
+}
+TEST(resolver_js_project_twins_parallel) {
+    return js_project_twins_case(55);
 }
 
 /* lib/response.js and lib/view.js of Express: members the file itself assigns. */
@@ -1454,6 +2617,36 @@ static int js_project_members_case(int padding) {
                         "View.prototype.anon = function () { return this.lookup(); };\n"
                         "function NotProto() { this.lookup(); }\n"
                         "module.exports = View;\n"},
+        /* lib/application.js: `app[method] = fn` for every HTTP verb beside `app.set`. A computed
+         * key declares nothing, and a literal key writes the member it spells. */
+        {"lib/app.js", "var app = exports = module.exports = {};\n"
+                       "app.init = function init() {\n"
+                       "  Object.defineProperty(this, 'router', { get() { return 1; } });\n"
+                       "  this.defaultConfiguration();\n"
+                       "};\n"
+                       "app.defaultConfiguration = function defaultConfiguration() {\n"
+                       "  this.set('x');\n"
+                       "};\n"
+                       "app.set = function set(k) { return k; };\n"
+                       "methods.forEach(function (method) {\n"
+                       "  app[method] = function (path) { return this.set(path); };\n"
+                       "});\n"
+                       "app.replaced = function replaced() { return 1; };\n"
+                       "app['replaced'] = other;\n"
+                       "app.useReplaced = function useReplaced() { return this.replaced(); };\n"
+                       "function other() { return 1; }\n"},
+        /* lib/view.js: `var resolve = path.resolve` beside `View.prototype.resolve`, one QN. The
+         * member names the function the node shows; the variable is not that function. */
+        {"lib/mixed.js", "var resolve = require('path').resolve;\n"
+                         "function View() {}\n"
+                         "View.prototype.resolve = function resolve(d) {\n"
+                         "  return d;\n"
+                         "};\n"
+                         "View.prototype.lookup = function lookup() {\n"
+                         "  return this.resolve(1);\n"
+                         "};\n"
+                         "function plainCaller() { return resolve(1); }\n"
+                         "module.exports = View;\n"},
         {"src/api.ts", "const api = {\n"
                        "  run() { return this.helper(); },\n"
                        "  helper: () => 1,\n"
@@ -1525,6 +2718,11 @@ static int js_project_members_case(int padding) {
     /* An assignment in a function can replace it; nothing assigns `missing`. */
     ASSERT_EQ(js_project_edges(&project, "CALLS", "send", "lib.res.replaced"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "direct", "lib.res.send"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "lookup", "lib.mixed.resolve"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "plainCaller", "lib.mixed.resolve"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "init", "lib.app.defaultConfiguration"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "defaultConfiguration", "lib.app.set"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useReplaced", "lib.app.replaced"), 0);
     /* A plain nested function's `this` is not the owner's. */
     ASSERT_EQ(js_project_edges(&project, "CALLS", "plain", "lib.res.header"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "View", "lib.view.lookup"), 1);
@@ -1652,11 +2850,37 @@ SUITE(resolver_binding_js) {
     RUN_TEST(resolver_js_project_commonjs_parallel);
     RUN_TEST(resolver_js_project_typescript_sequential);
     RUN_TEST(resolver_js_project_typescript_parallel);
+    RUN_TEST(resolver_js_project_workspace_paths_sequential);
+    RUN_TEST(resolver_js_project_workspace_manifests_sequential);
+    RUN_TEST(resolver_js_project_workspace_manifests_parallel);
+    RUN_TEST(resolver_js_project_pnpm_workspace_yaml);
+    RUN_TEST(resolver_js_project_custom_condition_and_workspace_globs);
+    RUN_TEST(resolver_js_project_this_alias_sequential);
+    RUN_TEST(resolver_js_project_this_alias_parallel);
+    RUN_TEST(resolver_js_project_narrowing_has_no_declared_answer_sequential);
+    RUN_TEST(resolver_js_project_narrowing_has_no_declared_answer_parallel);
+    RUN_TEST(resolver_js_project_workspace_glob_with_many_double_stars);
+    RUN_TEST(resolver_js_project_base_url_goes_before_a_package);
+    RUN_TEST(resolver_js_project_alias_selection_sequential);
+    RUN_TEST(resolver_js_project_alias_selection_parallel);
+    RUN_TEST(resolver_js_project_implements_declares_nothing_sequential);
+    RUN_TEST(resolver_js_project_implements_declares_nothing_parallel);
+    RUN_TEST(resolver_js_project_record_values_sequential);
+    RUN_TEST(resolver_js_project_record_values_parallel);
+    RUN_TEST(resolver_js_project_extended_config_change_reresolves);
+    RUN_TEST(resolver_js_project_far_config_change_reresolves);
+    RUN_TEST(resolver_js_project_member_types_sequential);
+    RUN_TEST(resolver_js_project_member_types_parallel);
+    RUN_TEST(resolver_js_project_initializers_sequential);
+    RUN_TEST(resolver_js_project_initializers_parallel);
+    RUN_TEST(resolver_js_project_workspace_paths_parallel);
     RUN_TEST(resolver_js_project_manifest_type_decides_a_plain_file);
     RUN_TEST(resolver_js_project_type_names_are_uses_type_never_usage);
     RUN_TEST(resolver_js_project_members_sequential);
     RUN_TEST(resolver_js_project_members_parallel);
     RUN_TEST(resolver_js_project_same_named_nested_functions_settle_by_span);
+    RUN_TEST(resolver_js_project_twins_sequential);
+    RUN_TEST(resolver_js_project_twins_parallel);
     RUN_TEST(resolver_js_project_known_gaps_abstain_with_a_reason);
     RUN_TEST(resolver_binding_js_index_exports_use_exact_source_identity);
     RUN_TEST(resolver_binding_js_index_scope_requires_captured_identity);
@@ -1672,6 +2896,9 @@ SUITE(resolver_binding_js) {
     RUN_TEST(resolver_binding_js_exports_come_from_syntax);
     RUN_TEST(resolver_binding_js_local_export_clause_and_typed_declarations);
     RUN_TEST(resolver_binding_js_script_globals_and_dynamic_effects_are_unproved);
+    RUN_TEST(resolver_binding_js_only_direct_eval_is_a_dynamic_effect);
+    RUN_TEST(resolver_binding_js_parse_gaps_in_types_keep_the_file_proved);
+    RUN_TEST(resolver_binding_js_cast_write_rebinds_its_name);
     RUN_TEST(resolver_binding_js_value_reference_initializer_preserves_import_binding);
     RUN_TEST(resolver_binding_tsx_jsx_keeps_exact_function_binding);
 }

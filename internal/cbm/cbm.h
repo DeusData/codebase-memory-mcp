@@ -1169,6 +1169,9 @@ typedef struct {
     /* C#: the parse of the file itself when `root` reads it through a view that hid a branch of
      * a conditional (cbm_parse_source_repairing_ex); null otherwise. Alive for this call only. */
     TSNode unrepaired_root;
+    /* TypeScript: 0 not asked yet, 1 the file leaves the global utility types alone, 2 it declares
+     * or imports one of them under its own meaning. */
+    signed char ts_global_types;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */

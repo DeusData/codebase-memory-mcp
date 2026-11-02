@@ -12,6 +12,20 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
 // Extract text of a node from source. Returns arena-allocated string.
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 
+/* TypeScript: the one type name a type spells, `Foo`, `Foo<T>` or `Foo | undefined`, as a
+ * type_identifier node. A null node for anything else, a union of classes among them. */
+TSNode cbm_ts_single_type_name(TSNode type);
+
+/* TypeScript: the element type of `Foo[]`, `readonly Foo[]`, `Array<Foo>`, `ReadonlyArray<Foo>`,
+ * `Set<Foo>` or `ReadonlySet<Foo>`, each optionally `| undefined`. A null node otherwise. */
+TSNode cbm_ts_element_type(TSNode type, const char *source);
+
+/* `Record<K, V>`, also behind `| null`: the V every key of it holds, or a null node. */
+TSNode cbm_ts_record_value_type(TSNode type, const char *source);
+
+/* `null` or `undefined` as a type. */
+bool cbm_ts_nullish_type(TSNode node);
+
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 

@@ -56,6 +56,121 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
 
 // --- Node text extraction ---
 
+bool cbm_ts_nullish_type(TSNode node) {
+    if (strcmp(ts_node_type(node), "literal_type") || !ts_node_named_child_count(node))
+        return false;
+    const char *value = ts_node_type(ts_node_named_child(node, 0));
+    return !strcmp(value, "undefined") || !strcmp(value, "null");
+}
+
+/* The one member of a union that is not null or undefined, or a null node. A longer union nests
+ * on the left, so `A | B | null` answers with `A | B`, which the caller then refuses. */
+static TSNode ts_sole_union_member(TSNode type) {
+    TSNode found = {0};
+    TSTreeCursor cursor = ts_tree_cursor_new(type);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (; more; more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode member = ts_tree_cursor_current_node(&cursor);
+        if (!ts_node_is_named(member) || !strcmp(ts_node_type(member), "comment") ||
+            cbm_ts_nullish_type(member))
+            continue;
+        if (!ts_node_is_null(found)) {
+            found = (TSNode){0};
+            break;
+        }
+        found = member;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+/* `x: Foo<T>` is a Foo whatever T is, and a member call on `Foo | null` only checks as Foo's. */
+TSNode cbm_ts_single_type_name(TSNode type) {
+    TSNode none = {0};
+    while (!ts_node_is_null(type)) {
+        const char *kind = ts_node_type(type);
+        if (!strcmp(kind, "type_annotation")) {
+            if (!ts_node_named_child_count(type))
+                return none;
+            type = ts_node_named_child(type, 0);
+        } else if (!strcmp(kind, "generic_type")) {
+            type = ts_node_child_by_field_name(type, "name", 4);
+        } else if (!strcmp(kind, "union_type")) {
+            type = ts_sole_union_member(type);
+        } else {
+            return strcmp(kind, "type_identifier") ? none : type;
+        }
+    }
+    return none;
+}
+
+TSNode cbm_ts_record_value_type(TSNode type, const char *source) {
+    TSNode none = {0};
+    if (!source)
+        return none;
+    for (;;) {
+        if (ts_node_is_null(type))
+            return none;
+        const char *kind = ts_node_type(type);
+        if (!strcmp(kind, "type_annotation") || !strcmp(kind, "readonly_type")) {
+            if (!ts_node_named_child_count(type))
+                return none;
+            type = ts_node_named_child(type, 0);
+        } else if (!strcmp(kind, "union_type")) {
+            type = ts_sole_union_member(type);
+        } else if (strcmp(kind, "generic_type")) {
+            return none;
+        } else {
+            break;
+        }
+    }
+    TSNode name = ts_node_child_by_field_name(type, "name", 4);
+    TSNode arguments = ts_node_child_by_field_name(type, "type_arguments", 14);
+    if (ts_node_is_null(name) || ts_node_is_null(arguments) ||
+        ts_node_named_child_count(arguments) != 2 ||
+        ts_node_end_byte(name) - ts_node_start_byte(name) != 6 ||
+        memcmp(source + ts_node_start_byte(name), "Record", 6))
+        return none;
+    return ts_node_named_child(arguments, 1);
+}
+
+TSNode cbm_ts_element_type(TSNode type, const char *source) {
+    TSNode none = {0};
+    for (;;) {
+        if (ts_node_is_null(type))
+            return none;
+        const char *kind = ts_node_type(type);
+        if (!strcmp(kind, "array_type"))
+            return ts_node_named_child_count(type) ? ts_node_named_child(type, 0) : none;
+        if (!strcmp(kind, "type_annotation") || !strcmp(kind, "readonly_type")) {
+            if (!ts_node_named_child_count(type))
+                return none;
+            type = ts_node_named_child(type, 0);
+        } else if (!strcmp(kind, "union_type")) {
+            type = ts_sole_union_member(type);
+        } else if (strcmp(kind, "generic_type") || !source) {
+            return none;
+        } else {
+            break;
+        }
+    }
+    TSNode value = cbm_ts_record_value_type(type, source);
+    if (!ts_node_is_null(value))
+        return value;
+    TSNode name = ts_node_child_by_field_name(type, "name", 4);
+    TSNode arguments = ts_node_child_by_field_name(type, "type_arguments", 14);
+    if (ts_node_is_null(name) || ts_node_is_null(arguments) ||
+        ts_node_named_child_count(arguments) != 1)
+        return none;
+    static const char *const containers[] = {"Array", "ReadonlyArray", "Set", "ReadonlySet"};
+    const char *text = source + ts_node_start_byte(name);
+    size_t length = ts_node_end_byte(name) - ts_node_start_byte(name);
+    for (size_t i = 0; i < sizeof(containers) / sizeof(containers[0]); i++)
+        if (strlen(containers[i]) == length && !memcmp(text, containers[i], length))
+            return ts_node_named_child(arguments, 0);
+    return none;
+}
+
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source) {
     uint32_t start = ts_node_start_byte(node);
     uint32_t end = ts_node_end_byte(node);

@@ -73,6 +73,9 @@ typedef struct {
      * no such stretch. */
     uint32_t value_from, value_until;
     bool import_root;
+    /* JavaScript `var self = this`: the object that `this` is there. */
+    const char *js_this_owner;
+    bool js_this_prototype;
 } binding_name_t;
 
 typedef struct binding_pending_declaration {
@@ -2939,13 +2942,21 @@ static const char *js_member_owner(cbm_resolve_binding_index_t *index, TSNode ob
     return NULL;
 }
 
-/* `owner[key] = v` and `owner.prototype[key] = v` can replace any member. */
+/* `owner['m'] = v` writes that member as plainly as `owner.m = v`, so it answers for nothing.
+ * Express's `app[method] = fn` declares no member at all: which key it writes is runtime
+ * dispatch, and the declaration `this.set()` selects by static rules is still `app.set`. */
 static void note_javascript_computed_write(cbm_resolve_binding_index_t *index, TSNode left,
                                            const binding_walk_t *state) {
+    TSNode key = field(left, "index");
+    if (!kind_is(key, "string"))
+        return;
     bool prototype = false;
     const char *owner = js_member_owner(index, field(left, "object"), state, &prototype);
-    if (owner)
-        (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+    const char *member = owner ? http_module_literal(index, key) : NULL;
+    js_member_t *row =
+        owner ? js_member_row(index, owner, member ? member : JS_MEMBER_COMPUTED, prototype) : NULL;
+    if (row)
+        row->conflict = true;
 }
 
 /* A call that names its first argument the object it copies members into. */
@@ -2965,16 +2976,22 @@ static bool js_mutator_name(const char *name) {
     return false;
 }
 
-/* `Object.assign(owner, ...)`, `mixin(owner.prototype, ...)` and `delete owner.m` can
- * replace members no assignment names. `Reflect.set` is the one receiver-sensitive
- * name: a plain `map.set(owner, v)` mutates `map`, so `set` needs that receiver. */
+/* `Object.assign(owner, ...)` and `mixin(owner.prototype, ...)` can replace members no
+ * assignment names. `Reflect.set` is the one receiver-sensitive name: a plain
+ * `map.set(owner, v)` mutates `map`, so `set` needs that receiver. `delete owner.m` and
+ * `Object.defineProperty(owner, 'm', d)` spell the one member they touch, as Express's
+ * `Object.defineProperty(this, 'router', ...)` does beside every other member of `app`. */
 static void note_javascript_member_mutation(cbm_resolve_binding_index_t *index, TSNode node,
                                             const binding_walk_t *state) {
     TSNode object = (TSNode){0};
+    const char *spelled = NULL;
     if (kind_is(node, "unary_expression") && child_token(node, "delete")) {
         TSNode target = field(node, "argument");
         if (kind_is(target, "member_expression") || kind_is(target, "subscript_expression"))
             object = field(target, "object");
+        if (kind_is(target, "member_expression") &&
+            kind_is(field(target, "property"), "property_identifier"))
+            spelled = node_text(index, field(target, "property"));
     } else if (kind_is(node, "call_expression")) {
         TSNode callee = field(node, "function");
         bool member = kind_is(callee, "member_expression");
@@ -2989,13 +3006,20 @@ static void note_javascript_member_mutation(cbm_resolve_binding_index_t *index, 
         TSNode arguments = field(node, "arguments");
         if (kind_is(arguments, "arguments") && ts_node_named_child_count(arguments) > 0)
             object = ts_node_named_child(arguments, 0);
+        if (!strcmp(name, "defineProperty") && !ts_node_is_null(object) &&
+            ts_node_named_child_count(arguments) > 1)
+            spelled = http_module_literal(index, ts_node_named_child(arguments, 1));
     }
     if (ts_node_is_null(object))
         return;
     bool prototype = false;
     const char *owner = js_member_owner(index, object, state, &prototype);
-    if (owner)
-        (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+    if (!owner)
+        return;
+    js_member_t *row =
+        js_member_row(index, owner, spelled ? spelled : JS_MEMBER_COMPUTED, prototype);
+    if (row && spelled)
+        row->conflict = true;
 }
 
 /* Writes that define or replace a member. Only a module-level assignment defines
@@ -3295,8 +3319,10 @@ static binding_walk_t javascript_child_context(const char *parent, const char *f
     } else if (!strcmp(parent, "object_pattern") || !strcmp(parent, "array_pattern") ||
                !strcmp(parent, "rest_pattern")) {
         binder = inherited;
-    } else if (inherited == JS_BINDER_WRITE && (!strcmp(parent, "parenthesized_expression") ||
-                                                !strcmp(parent, "non_null_expression"))) {
+    } else if (inherited == JS_BINDER_WRITE &&
+               (!strcmp(parent, "parenthesized_expression") ||
+                !strcmp(parent, "non_null_expression") || !strcmp(parent, "as_expression") ||
+                !strcmp(parent, "satisfies_expression"))) {
         binder = inherited;
     }
     if (type)
@@ -3334,6 +3360,61 @@ static bool javascript_type_level_kind(const char *kind) {
                                         "template_type",
                                         NULL};
     return listed(kind, kinds);
+}
+
+/* One token the grammar cannot place, in a position that only names types. */
+static bool js_parse_gap_inert(TSNode gap, const char *source, bool in_type) {
+    if (ts_node_is_missing(gap) || ts_node_start_point(gap).row != ts_node_end_point(gap).row)
+        return false;
+    uint32_t start = ts_node_start_byte(gap), end = ts_node_end_byte(gap);
+    if (memchr(source + start, '{', end - start) || memchr(source + start, '}', end - start))
+        return false;
+    /* `export type * as Name from 'x'` keeps its whole export but the word `type`. */
+    TSNode parent = ts_node_parent(gap);
+    if (kind_is(parent, "export_statement"))
+        return end - start == 4 && !memcmp(source + start, "type", 4);
+    return in_type;
+}
+
+/* `field?: import('x').Y`, `in2?: number` in an interface and `export type * as N from 'x'`
+ * are valid TypeScript this grammar cannot parse. A type has no runtime binding and these
+ * gaps open or close no block, so the rest of the tree still says what the file binds.
+ * Any other parse error can hide a declaration or move a scope, and voids the file. */
+bool cbm_resolve_binding_js_parse_gaps_inert(TSNode root, const char *source) {
+    if (ts_node_is_null(root) || !source || !ts_node_has_error(root))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool inert = true;
+    bool walking = ts_tree_cursor_goto_first_child(&cursor);
+    unsigned depth = 1, type_depth = 0;
+    while (walking && inert) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool descend = false;
+        if (ts_node_is_missing(node) || kind_is(node, "ERROR")) {
+            inert = js_parse_gap_inert(node, source, type_depth != 0);
+        } else if (ts_node_has_error(node)) {
+            descend = true;
+            if (!type_depth && javascript_type_level_kind(ts_node_type(node)))
+                type_depth = depth;
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (depth == 1 || !ts_tree_cursor_goto_parent(&cursor)) {
+                walking = false;
+                break;
+            }
+            depth--;
+            if (type_depth > depth)
+                type_depth = 0;
+        }
+        if (type_depth == depth)
+            type_depth = 0;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return inert;
 }
 
 static void js_set_lines(cbm_resolve_binding_index_t *index, size_t row, TSNode node) {
@@ -3425,6 +3506,10 @@ static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode no
             index->names[row].at_start = ts_node_start_byte(declarator);
     } else {
         add_name(index, name, 0, BINDING_BLOCKED);
+        if (direct && kind_is(value, "this") && state->js_this_owner && index->name_count > row) {
+            index->names[row].js_this_owner = state->js_this_owner;
+            index->names[row].js_this_prototype = state->js_this_prototype;
+        }
     }
     if (direct && js_chain_writes_module_exports(index, value))
         js_export_alias(index, name);
@@ -3461,6 +3546,13 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
     index->current_this_owner = state.js_this_owner;
     index->current_this_prototype = state.js_this_prototype;
     if (!ts_node_is_named(node)) {
+        return state;
+    }
+    /* Only an inert parse gap reaches this walk: see cbm_resolve_binding_js_parse_gaps_inert. */
+    if (kind_is(node, "ERROR")) {
+        state.js_no_site = true;
+        state.js_binder = JS_BINDER_NONE;
+        state.js_type_level = true;
         return state;
     }
     if (!supported_javascript_node(kind)) {
@@ -3617,7 +3709,11 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
     if (strcmp(kind, "identifier") == 0 || strcmp(kind, "shorthand_property_identifier") == 0 ||
         strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
         const char *name = node_text(index, node);
-        if (name && (strcmp(name, "eval") == 0 || strcmp(name, "Function") == 0)) {
+        /* Only a direct `eval(code)` runs code in this scope. `Function(code)` and an
+         * indirect eval compile in the global scope, which sees no module or function
+         * binding, and a bare mention such as `typeof Function` runs nothing. */
+        if (name && !strcmp(name, "eval") && parent_kind && field_name &&
+            !strcmp(parent_kind, "call_expression") && !strcmp(field_name, "function")) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "dynamic_namespace_effect");
         }
         if (!state.import && !declaration_name && !state.js_no_site) {
@@ -4964,6 +5060,20 @@ bool cbm_resolve_binding_js_exports_complete(const cbm_resolve_binding_index_t *
            index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE && !index->js_exports_open;
 }
 
+const char *cbm_resolve_binding_js_default_target(const cbm_resolve_binding_index_t *index) {
+    size_t count = cbm_resolve_binding_js_export_count(index);
+    const char *found = NULL;
+    for (size_t i = 0; i < count; i++) {
+        const cbm_resolve_js_export_t *item = &index->js_exports[i];
+        if (!item->name || strcmp(item->name, "default"))
+            continue;
+        if (found || !item->known || item->source || !item->target)
+            return NULL;
+        found = item->target;
+    }
+    return found;
+}
+
 bool cbm_resolve_binding_js_commonjs(const cbm_resolve_binding_index_t *index) {
     return index && index->js_commonjs;
 }
@@ -5388,7 +5498,8 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
         return index;
     }
     if (!result || !source || !result->module_qn || source_len > UINT32_MAX || result->has_error ||
-        result->parse_incomplete || result->parse_unusable || result->lsp_skipped) {
+        (result->parse_incomplete && !javascript_language(language)) || result->parse_unusable ||
+        result->lsp_skipped) {
         index->reason = "incomplete_binding_source";
         return index;
     }
@@ -5403,6 +5514,14 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
             ts_parser_delete(parser);
         }
         tree = owned_tree;
+    }
+    bool inert_gaps = tree && javascript_language(language) &&
+                      cbm_resolve_binding_js_parse_gaps_inert(ts_tree_root_node(tree), source);
+    if (result->parse_incomplete && !component && !inert_gaps) {
+        index->reason = "incomplete_binding_source";
+        if (owned_tree)
+            ts_tree_delete(owned_tree);
+        return index;
     }
     uint32_t tree_end = (uint32_t)source_len;
     if (component && tree) {
@@ -5424,7 +5543,7 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
             index->javascript_module = true;
         }
     }
-    if (!tree || ts_node_has_error(ts_tree_root_node(tree)) ||
+    if (!tree || (ts_node_has_error(ts_tree_root_node(tree)) && !inert_gaps) ||
         ts_node_end_byte(ts_tree_root_node(tree)) != tree_end) {
         index->reason = "incomplete_binding_tree";
     } else {
@@ -5856,17 +5975,29 @@ const cbm_resolve_js_import_t *cbm_resolve_binding_js_import(
     return (binding->flags & BINDING_BLOCKED) && !type_import ? NULL : binding->js_import;
 }
 
+static const js_member_t *js_site_member(const cbm_resolve_binding_index_t *index, const char *name,
+                                         const binding_site_t *site, cbm_resolve_lookup_t *query);
+
 bool cbm_resolve_binding_js_declaration_lines(const cbm_resolve_binding_index_t *index,
                                               const char *name, uint32_t start, uint32_t end,
                                               CBMSourceOrigin origin, uint32_t *start_line,
                                               uint32_t *end_line) {
     if (!index || !javascript_language(index->language) ||
-        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name || strchr(name, '.') ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name ||
         origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !index->sites || !index->site_count)
         return false;
     binding_site_t key = {.name = name, .start = start, .end = end};
     const binding_site_t *site =
         bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    /* `this.resolve()`: the member's own function, beside a `var resolve` of the same QN. */
+    if (site && strchr(name, '.')) {
+        const js_member_t *row = js_site_member(index, name, site, NULL);
+        if (!row || !row->function_name || !row->start_line)
+            return false;
+        *start_line = row->start_line;
+        *end_line = row->end_line;
+        return true;
+    }
     if (!site || site->member_path)
         return false;
     const binding_name_t *binding =
@@ -6085,6 +6216,73 @@ bool cbm_resolve_binding_js_type_occurrence(const cbm_resolve_binding_index_t *i
     return site && (site->type_position || site->type_path_root);
 }
 
+/* The name is `this` at every declaration of it in its scope, and nothing writes it. */
+static bool js_name_is_this(const cbm_resolve_binding_index_t *index, const char *name,
+                            size_t length, const binding_name_t *binding) {
+    size_t high = 0;
+    size_t low = js_name_range(index, name, length, binding->scope, &high);
+    for (size_t r = low; r < high; r++) {
+        const binding_name_t *row = &index->names[r];
+        if (js_row_in_space(row, JS_SPACE_VALUE) &&
+            (!row->js_this_owner || strcmp(row->js_this_owner, binding->js_this_owner) ||
+             (row->flags & BINDING_WRITTEN)))
+            return false;
+    }
+    return true;
+}
+
+/* The module-level object `this.m` or `owner.m` names at this site, or NULL. */
+static const char *js_site_member_owner(const cbm_resolve_binding_index_t *index, const char *name,
+                                        const binding_site_t *site, cbm_resolve_lookup_t *query,
+                                        bool *prototype) {
+    const char *dot = strchr(name, '.');
+    size_t root = (size_t)(dot - name);
+    const char *owner = NULL;
+    if (prototype)
+        *prototype = false;
+    if (root == 4 && !strncmp(name, "this", 4)) {
+        owner = site->this_owner;
+        if (prototype)
+            *prototype = site->this_prototype;
+    } else {
+        const binding_name_t *binding =
+            find_lexical_name(index, name, root, site->scope, query, JS_SPACE_VALUE);
+        if (binding && binding->js_this_owner && js_name_is_this(index, name, root, binding)) {
+            owner = binding->js_this_owner;
+            if (prototype)
+                *prototype = binding->js_this_prototype;
+        } else if (binding && binding->scope == 0 && !binding->js_import) {
+            owner = binding->name;
+        }
+    }
+    if (!owner)
+        return NULL;
+    bool conflict = false;
+    const binding_name_t *holder = js_module_row(index, owner, JS_SPACE_VALUE, &conflict);
+    if (!holder || conflict || (holder->flags & (BINDING_BLOCKED | BINDING_WRITTEN)) ||
+        holder->js_import)
+        return NULL;
+    return owner;
+}
+
+/* That object's member row, when nothing could have replaced every member. */
+static const js_member_t *js_site_member(const cbm_resolve_binding_index_t *index, const char *name,
+                                         const binding_site_t *site, cbm_resolve_lookup_t *query) {
+    bool prototype = false;
+    const char *owner = js_site_member_owner(index, name, site, query, &prototype);
+    const char *dot = strchr(name, '.');
+    if (!owner || !index->js_member_count || strchr(dot + 1, '.'))
+        return NULL;
+    js_member_t probe = {.owner = owner, .member = dot + 1, .prototype = prototype};
+    const js_member_t *row = bsearch(&probe, index->js_members, index->js_member_count,
+                                     sizeof(*index->js_members), js_compare_member);
+    js_member_t computed = {.owner = owner, .member = JS_MEMBER_COMPUTED, .prototype = prototype};
+    if (row && bsearch(&computed, index->js_members, index->js_member_count,
+                       sizeof(*index->js_members), js_compare_member))
+        return NULL;
+    return row;
+}
+
 cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_index_t *index,
                                                    const char *name, uint32_t start, uint32_t end,
                                                    CBMSourceOrigin origin) {
@@ -6101,35 +6299,10 @@ cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_ind
         bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
     if (!site || !site->invocation)
         return binding_query_finish(index, &query, result);
-    size_t root = (size_t)(dot - name);
-    const char *owner = NULL;
-    bool prototype = false;
-    if (root == 4 && !strncmp(name, "this", 4)) {
-        owner = site->this_owner;
-        prototype = site->this_prototype;
-    } else {
-        const binding_name_t *binding =
-            find_lexical_name(index, name, root, site->scope, &query, JS_SPACE_VALUE);
-        if (binding && binding->scope == 0 && !binding->js_import)
-            owner = binding->name;
-    }
+    const char *owner = js_site_member_owner(index, name, site, &query, NULL);
     if (!owner)
         return binding_query_finish(index, &query, result);
-    bool conflict = false;
-    const binding_name_t *holder = js_module_row(index, owner, JS_SPACE_VALUE, &conflict);
-    if (!holder || conflict || (holder->flags & (BINDING_BLOCKED | BINDING_WRITTEN)) ||
-        holder->js_import)
-        return binding_query_finish(index, &query, result);
-    js_member_t probe = {.owner = owner, .member = dot + 1, .prototype = prototype};
-    const js_member_t *row = index->js_member_count
-                                 ? bsearch(&probe, index->js_members, index->js_member_count,
-                                           sizeof(*index->js_members), js_compare_member)
-                                 : NULL;
-    js_member_t computed = {.owner = owner, .member = JS_MEMBER_COMPUTED, .prototype = prototype};
-    if (row && index->js_member_count &&
-        bsearch(&computed, index->js_members, index->js_member_count, sizeof(*index->js_members),
-                js_compare_member))
-        row = NULL;
+    const js_member_t *row = js_site_member(index, name, site, NULL);
     (void)cbm_resolve_lookup_observe(
         &query, owner, dot + 1, row ? row->target : NULL,
         row && row->target ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,

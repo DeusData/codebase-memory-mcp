@@ -42,7 +42,8 @@ enum {
     CBM_PATH_ALIAS_MAX_ENTRIES = 256, /* per single config file       */
     CBM_PATH_ALIAS_MAX_FILES = 256,   /* config files per repo walk   */
     CBM_PATH_ALIAS_MAX_FILE_BYTES = 64 * 1024,
-    CBM_PATH_ALIAS_MAX_DEPTH = 32, /* directory recursion depth    */
+    CBM_PATH_ALIAS_MAX_DEPTH = 32,   /* directory recursion depth    */
+    CBM_PATH_ALIAS_MAX_EXTENDS = 16, /* `extends` links of one config, against a cycle */
 };
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -167,11 +168,20 @@ static int cmp_scope_by_specificity(const void *a, const void *b) {
 
 /* ── tsconfig.json / jsconfig.json loader ──────────────────────── */
 
-/* Parse compilerOptions.paths and compilerOptions.baseUrl into an alias map.
- * dir_prefix is the directory of the config file relative to the repo root
- * (e.g. "apps/manager", or "" for repo root). Returns NULL if the file is
- * missing, malformed, or has neither a usable paths block nor a baseUrl. */
-static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix) {
+/* What a config and the configs it extends say. TypeScript merges compilerOptions down the
+ * chain, so the nearest config setting `paths` answers for it, and likewise `baseUrl`. */
+typedef struct {
+    yyjson_doc *paths_doc; /* owns paths */
+    yyjson_val *paths;
+    char *paths_dir;            /* repo-relative directory of the config holding paths */
+    char *base_root;            /* repo-relative baseUrl; NULL when no config sets one */
+    yyjson_doc *conditions_doc; /* owns conditions */
+    yyjson_val *conditions;
+    cbm_path_alias_collection_t *collection;
+    int bases_read;
+} tsconfig_options_t;
+
+static yyjson_doc *read_tsconfig_doc(const char *abs_path) {
     FILE *f = cbm_fopen(abs_path, "r");
     if (!f) {
         return NULL;
@@ -195,37 +205,194 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
     yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_TRAILING_COMMAS;
     yyjson_doc *doc = yyjson_read(buf, nread, flg);
     free(buf);
+    return doc;
+}
+
+/* The repo-relative file an `extends` value names, or false for anything else: a package
+ * name is a dependency's config, and a path climbing out of the repo is not ours to read. */
+static bool extends_rel_path(const char *dir_prefix, const char *value, char *out, size_t cap) {
+    if (!value || (strncmp(value, "./", 2) && strncmp(value, "../", 3))) {
+        return false;
+    }
+    int depth = dir_prefix && dir_prefix[0] ? 1 : 0;
+    for (const char *c = dir_prefix; c && *c; c++) {
+        depth += *c == '/';
+    }
+    for (const char *at = value; *at;) {
+        const char *slash = strchr(at, '/');
+        size_t length = slash ? (size_t)(slash - at) : strlen(at);
+        if (length == 2 && !strncmp(at, "..", 2)) {
+            if (--depth < 0) {
+                return false;
+            }
+        } else if (length && !(length == 1 && at[0] == '.')) {
+            depth++;
+        }
+        at += length + (slash ? 1 : 0);
+    }
+    char *joined = resolve_target_relative(dir_prefix, value);
+    if (!joined) {
+        return false;
+    }
+    size_t length = strlen(joined);
+    /* `"extends": "./base"` reads ./base.json, like TypeScript. */
+    bool suffixed = length > 5 && !strcmp(joined + length - 5, ".json");
+    int n = snprintf(out, cap, "%s%s", joined, suffixed ? "" : ".json");
+    free(joined);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool tsconfig_read_chain(const char *repo_path, const char *abs_path, const char *dir_prefix,
+                                int depth, tsconfig_options_t *out);
+
+static void tsconfig_note_base(cbm_path_alias_collection_t *coll, const char *rel) {
+    if (!coll) {
+        return;
+    }
+    char **grown = realloc(coll->bases, ((size_t)coll->base_count + 1) * sizeof(*grown));
+    char *copy = grown ? strdup(rel) : NULL;
+    if (grown) {
+        coll->bases = grown;
+    }
+    if (copy) {
+        coll->bases[coll->base_count++] = copy;
+    }
+}
+
+/* One relative `extends` entry. A missing or linked base supplies nothing. */
+static void tsconfig_follow(const char *repo_path, const char *dir_prefix, const char *value,
+                            int depth, tsconfig_options_t *out) {
+    char rel[CBM_SZ_512];
+    char abs[CBM_SZ_1K];
+    if (!extends_rel_path(dir_prefix, value, rel, sizeof(rel))) {
+        return;
+    }
+    tsconfig_note_base(out->collection, rel);
+    /* `extends` arrays in a cycle would branch at every level. No real config reads this many. */
+    enum { TSCONFIG_MAX_BASES_READ = 64 };
+    if (++out->bases_read > TSCONFIG_MAX_BASES_READ) {
+        return;
+    }
+    int n = snprintf(abs, sizeof(abs), "%s/%s", repo_path, rel);
+    cbm_path_info_t info;
+    if (n <= 0 || (size_t)n >= sizeof(abs) || cbm_path_info_utf8(abs, &info) != CBM_PATH_INFO_OK ||
+        info.is_symlink) {
+        return;
+    }
+    char *slash = strrchr(rel, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        rel[0] = '\0';
+    }
+    (void)tsconfig_read_chain(repo_path, abs, rel, depth + 1, out);
+}
+
+/* False when this config itself cannot be read, which says nothing about its scope. */
+static bool tsconfig_read_chain(const char *repo_path, const char *abs_path, const char *dir_prefix,
+                                int depth, tsconfig_options_t *out) {
+    yyjson_doc *doc = read_tsconfig_doc(abs_path);
     if (!doc) {
-        return NULL;
+        return false;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *compiler_opts = yyjson_obj_get(root, "compilerOptions");
-    if (!compiler_opts) {
-        yyjson_doc_free(doc);
-        return NULL;
+    yyjson_val *options = yyjson_obj_get(root, "compilerOptions");
+    bool keep = false;
+    yyjson_val *conditions = yyjson_obj_get(options, "customConditions");
+    bool keep_conditions = false;
+    if (!out->conditions && yyjson_is_arr(conditions)) {
+        out->conditions = conditions;
+        out->conditions_doc = doc;
+        keep_conditions = true;
     }
-    yyjson_val *base_url_val = yyjson_obj_get(compiler_opts, "baseUrl");
-    const char *base_url_str = base_url_val ? yyjson_get_str(base_url_val) : NULL;
-    yyjson_val *paths_obj = yyjson_obj_get(compiler_opts, "paths");
-    if (!paths_obj && !base_url_str) {
-        yyjson_doc_free(doc);
-        return NULL;
+    yyjson_val *paths = yyjson_obj_get(options, "paths");
+    if (!out->paths && yyjson_is_obj(paths)) {
+        out->paths = paths;
+        out->paths_doc = doc;
+        out->paths_dir = strdup(dir_prefix);
+        keep = true;
     }
+    const char *base_url = yyjson_get_str(yyjson_obj_get(options, "baseUrl"));
+    if (!out->base_root && base_url && base_url[0]) {
+        out->base_root = resolve_target_relative(dir_prefix, base_url);
+        size_t length = out->base_root ? strlen(out->base_root) : 0;
+        if (length && out->base_root[length - 1] == '/') {
+            out->base_root[length - 1] = '\0';
+        }
+    }
+    yyjson_val *extends = yyjson_obj_get(root, "extends");
+    if ((!out->paths || !out->base_root || !out->conditions) && extends &&
+        depth < CBM_PATH_ALIAS_MAX_EXTENDS) {
+        if (yyjson_is_str(extends)) {
+            tsconfig_follow(repo_path, dir_prefix, yyjson_get_str(extends), depth, out);
+        } else if (yyjson_is_arr(extends)) {
+            /* A later entry of the array overrides an earlier one. */
+            for (size_t i = yyjson_arr_size(extends); i > 0; i--) {
+                tsconfig_follow(repo_path, dir_prefix,
+                                yyjson_get_str(yyjson_arr_get(extends, i - 1)), depth, out);
+            }
+        }
+    }
+    /* The same document can hold both, so it is freed once, through paths_doc. */
+    if (keep && keep_conditions) {
+        out->conditions_doc = NULL;
+    } else if (!keep && !keep_conditions) {
+        yyjson_doc_free(doc);
+    }
+    return true;
+}
 
+/* `"files": []` with no `include`, the shape of a solution config that only lists references,
+ * compiles nothing itself. It governs no file, so it does not stop an ancestor's scope. */
+static bool tsconfig_owns_no_file(const char *abs_path) {
+    yyjson_doc *doc = read_tsconfig_doc(abs_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *files = yyjson_obj_get(root, "files");
+    yyjson_val *include = yyjson_obj_get(root, "include");
+    bool none = yyjson_is_arr(files) && yyjson_arr_size(files) == 0 &&
+                (!include || (yyjson_is_arr(include) && yyjson_arr_size(include) == 0));
+    yyjson_doc_free(doc);
+    return none;
+}
+
+/* Parse compilerOptions.paths and compilerOptions.baseUrl, through relative `extends`, into
+ * an alias map. A config that sets neither still governs its directory, so it yields an
+ * empty map: TypeScript never reads an ancestor config it was not told to extend. Returns
+ * NULL only when the config cannot be read, which says nothing about its directory. */
+static cbm_path_alias_map_t *load_tsconfig_file(const char *repo_path, const char *abs_path,
+                                                const char *dir_prefix,
+                                                cbm_path_alias_collection_t *collection) {
+    tsconfig_options_t options = {.collection = collection};
+    if (tsconfig_owns_no_file(abs_path) ||
+        !tsconfig_read_chain(repo_path, abs_path, dir_prefix, 0, &options)) {
+        return NULL;
+    }
     cbm_path_alias_map_t *map = calloc(1, sizeof(*map));
     if (!map) {
-        yyjson_doc_free(doc);
+        yyjson_doc_free(options.paths_doc);
+        yyjson_doc_free(options.conditions_doc);
+        free(options.paths_dir);
+        free(options.base_root);
         return NULL;
     }
-
-    if (base_url_str && base_url_str[0] != '\0' && strcmp(base_url_str, ".") != 0) {
-        map->base_url = resolve_target_relative(dir_prefix, base_url_str);
-    } else if (base_url_str && strcmp(base_url_str, ".") == 0 && dir_prefix &&
-               dir_prefix[0] != '\0') {
-        map->base_url = strdup(dir_prefix);
+    if (options.base_root && options.base_root[0]) {
+        map->base_url = strdup(options.base_root);
     }
+    size_t conditions = options.conditions ? yyjson_arr_size(options.conditions) : 0;
+    map->custom_conditions = conditions ? calloc(conditions, sizeof(char *)) : NULL;
+    for (size_t i = 0; map->custom_conditions && i < conditions; i++) {
+        const char *condition = yyjson_get_str(yyjson_arr_get(options.conditions, i));
+        if (condition) {
+            map->custom_conditions[map->custom_condition_count++] = strdup(condition);
+        }
+    }
+    yyjson_doc_free(options.conditions_doc);
+    options.conditions_doc = NULL;
+    /* A target is relative to baseUrl when one is set, else to the config declaring it. */
+    const char *target_root = options.base_root ? options.base_root : options.paths_dir;
 
-    if (paths_obj && yyjson_is_obj(paths_obj)) {
+    if (options.paths) {
+        yyjson_val *paths_obj = options.paths;
         size_t obj_size = yyjson_obj_size(paths_obj);
         bool capped = obj_size > CBM_PATH_ALIAS_MAX_ENTRIES;
         int capacity = (int)(capped ? (size_t)CBM_PATH_ALIAS_MAX_ENTRIES : obj_size);
@@ -234,7 +401,9 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
             if (!map->entries) {
                 free(map->base_url);
                 free(map);
-                yyjson_doc_free(doc);
+                yyjson_doc_free(options.paths_doc);
+                free(options.paths_dir);
+                free(options.base_root);
                 return NULL;
             }
             yyjson_val *key;
@@ -264,11 +433,11 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
                 const char *tstar = strchr(target_pattern, '*');
                 if (tstar) {
                     char *pre = cbm_strndup(target_pattern, (size_t)(tstar - target_pattern));
-                    entry->target_prefix = resolve_target_relative(dir_prefix, pre);
+                    entry->target_prefix = resolve_target_relative(target_root, pre);
                     free(pre);
                     entry->target_suffix = strdup(tstar + 1);
                 } else {
-                    entry->target_prefix = resolve_target_relative(dir_prefix, target_pattern);
+                    entry->target_prefix = resolve_target_relative(target_root, target_pattern);
                     entry->target_suffix = strdup("");
                 }
                 map->count++;
@@ -283,7 +452,9 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         }
     }
 
-    yyjson_doc_free(doc);
+    yyjson_doc_free(options.paths_doc);
+    free(options.paths_dir);
+    free(options.base_root);
     return map;
 }
 
@@ -301,6 +472,10 @@ static void free_alias_map(cbm_path_alias_map_t *map) {
     }
     free(map->entries);
     free(map->base_url);
+    for (int j = 0; j < map->custom_condition_count; j++) {
+        free(map->custom_conditions[j]);
+    }
+    free(map->custom_conditions);
     free(map);
 }
 
@@ -313,6 +488,10 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
         free(coll->scopes[i].source_rel_path);
         free_alias_map(coll->scopes[i].map);
     }
+    for (int i = 0; i < coll->base_count; i++) {
+        free(coll->bases[i]);
+    }
+    free(coll->bases);
     free(coll->scopes);
     free(coll);
 }
@@ -444,6 +623,19 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
     cbm_closedir(d);
 }
 
+static int cmp_base_path(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+bool cbm_path_alias_is_extended_base(const cbm_path_alias_collection_t *coll,
+                                     const char *rel_path) {
+    if (!coll || !rel_path || !coll->base_count) {
+        return false;
+    }
+    return bsearch(&rel_path, coll->bases, (size_t)coll->base_count, sizeof(*coll->bases),
+                   cmp_base_path) != NULL;
+}
+
 cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
                                                             char **excluded_dirs,
                                                             int excluded_count) {
@@ -478,7 +670,7 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     }
 
     for (int i = 0; i < count; i++) {
-        cbm_path_alias_map_t *map = load_tsconfig_file(hits[i].abs, hits[i].rel);
+        cbm_path_alias_map_t *map = load_tsconfig_file(repo_path, hits[i].abs, hits[i].rel, coll);
         if (!map) {
             continue;
         }
@@ -505,10 +697,19 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     }
     free(hits);
 
-    if (coll->count == 0) {
-        free(coll->scopes);
-        free(coll);
+    /* Configs that alias nothing leave no scope worth a collection, unless a base config could
+     * start to: the planner must still recognize a change to it. */
+    bool any_alias = coll->base_count > 0;
+    for (int i = 0; i < coll->count && !any_alias; i++) {
+        any_alias = coll->scopes[i].map->count > 0 || coll->scopes[i].map->base_url ||
+                    coll->scopes[i].map->custom_condition_count > 0;
+    }
+    if (!any_alias) {
+        cbm_path_alias_collection_free(coll);
         return NULL;
+    }
+    if (coll->base_count) {
+        qsort(coll->bases, (size_t)coll->base_count, sizeof(*coll->bases), cmp_base_path);
     }
 
     qsort(coll->scopes, (size_t)coll->count, sizeof(cbm_path_alias_scope_t),

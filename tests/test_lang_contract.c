@@ -2207,10 +2207,10 @@ static const RQ_Expected LANG_CONTRACT_ECMA_REQUIRED = {
                .declaration_text = "export function target() { return 1; }"},
     .mode = RQ_REQUIRED};
 
-/* #408: retain the intended workspace dependency and call as quality debt.
- * Matching names/versions do not certify which installation satisfies b's
- * dependency. The source manifests, exact entry, and both genuine occurrences
- * remain independently authored inputs; no emitted edge creates the oracle. */
+/* #408: the root's `workspaces` makes packages/a a member, and b's "1.0.0" admits its version, so
+ * the package manager links that member and no other installation satisfies b's dependency. The
+ * source manifests, exact entry, and both genuine occurrences remain independently authored
+ * inputs; no emitted edge creates the oracle. */
 TEST(contract_edge_workspaces_imports_issue408) {
     static const LangFile f[] = {
         {"package.json", "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n"},
@@ -2234,20 +2234,14 @@ TEST(contract_edge_workspaces_imports_issue408) {
         {.case_id = "workspace-dependency-import",
          .site = {.file = "packages/b/index.js",
                   .caller = "packages.b.index.js.__file__",
-                  .needle = "import { fromA } from '@org/a';"},
+                  .needle = "fromA"},
          .relation = "IMPORTS",
          .target = {.file = "packages/a/index.js",
                     .suffix = "packages.a.index.js.__file__",
                     .label = "File",
                     .declaration_line = 1,
                     .declaration_text = "export function fromA() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "node_workspace_dependency_binding_unproven",
-         .why = "The nearer dependency needs an installation/workspace binding witness; "
-                "co-located equal package names and versions are insufficient.",
-         .tried = "Preserved all three package manifests and the exact entry file. "
-                  "The audited dependency barrier abstains before enclosing-workspace lookup; "
-                  "the source import span also remains required for future recovery."},
+         .mode = RQ_REQUIRED},
         {.case_id = "workspace-dependency-call",
          .site = {.file = "packages/b/index.js", .caller = "packages.b.useA", .needle = "fromA()"},
          .relation = "CALLS",
@@ -2256,11 +2250,7 @@ TEST(contract_edge_workspaces_imports_issue408) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "export function fromA() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "node_workspace_dependency_callable_binding_unproven",
-         .why = "The genuine useA call depends on the same unproved package binding.",
-         .tried = "Kept the named import and full fromA() occurrence. The unresolved import "
-                  "blocks a same-name fallback rather than borrowing the indexed sibling."},
+         .mode = RQ_REQUIRED},
         LANG_CONTRACT_ECMA_REQUIRED};
     LangProj lp;
     cbm_store_t *store = lang_index_files(&lp, files, 6);
@@ -2272,8 +2262,8 @@ TEST(contract_edge_workspaces_imports_issue408) {
     lang_cleanup(&lp, store);
     ASSERT(accepted);
     ASSERT_EQ(report.genuine, 3); /* import + original call + required control */
-    ASSERT_EQ(report.found, 1);
-    ASSERT_EQ(report.missing, 2);
+    ASSERT_EQ(report.found, 3);
+    ASSERT_EQ(report.missing, 0);
     PASS();
 }
 

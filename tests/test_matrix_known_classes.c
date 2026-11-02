@@ -257,7 +257,7 @@ static const MKC_Golden mkc_goldens[] = {
     {"mkc_c8_typescript_constructor_samefile", "run", "this.make(name)", "make",
      "    make(name: string): Widget { return new Widget(name); }", "Method", 7, 0, true},
     {"mkc_c8_typescript_constructor_samefile", "run", "this.make(name).label()", "label",
-     "    label(): string { return this.name; }", "Method", 3, 0, false},
+     "    label(): string { return this.name; }", "Method", 3, 0, true},
     {"mkc_c8_kotlin_constructor_samefile", "make", "Widget(name)", "Widget",
      "class Widget(val name: String) {", "Class", 1, 0, true},
     {"mkc_c8_kotlin_constructor_samefile", "run", "make(name)", "make",

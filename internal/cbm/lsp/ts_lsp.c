@@ -3979,6 +3979,17 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
                 }
             }
         }
+        /* A default value runs in this function's scope: `modules = this.getModules()`. */
+        TSTreeCursor defaults = ts_tree_cursor_new(params);
+        if (ts_tree_cursor_goto_first_child(&defaults)) {
+            do {
+                TSNode value = ts_node_child_by_field_name(ts_tree_cursor_current_node(&defaults),
+                                                           "value", TS_LSP_FIELD_LEN("value"));
+                if (!ts_node_is_null(value))
+                    process_node(ctx, value);
+            } while (ts_tree_cursor_goto_next_sibling(&defaults));
+        }
+        ts_tree_cursor_delete(&defaults);
     }
 
     TSNode body = ts_node_child_by_field_name(func_node, "body", TS_LSP_FIELD_LEN("body"));
@@ -6005,6 +6016,7 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 rt.qualified_name = qn;
                 rt.short_name = nm;
                 rt.alias_of = alias_qn;
+                rt.alias_view = true;
                 cbm_registry_add_type(reg, rt);
             }
             continue;
@@ -6195,6 +6207,36 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 // ── Cross-file entry point (Phase 3) ──────────────────────────────────────────
 
+/* A def's "():QN" and "await():QN". Two answers for one name, from overloads that disagree on
+ * what they return, are no answer. */
+static void ts_return_classes(CBMArena *arena, CBMRegisteredFunc *rf, const char *field_defs) {
+    if (!field_defs)
+        return;
+    bool plain_conflict = false, await_conflict = false;
+    for (const char *start = field_defs; *start;) {
+        const char *end = strchr(start, '|');
+        size_t length = end ? (size_t)(end - start) : strlen(start);
+        if (length >= 5 && !strncmp(start, "is():", 5))
+            rf->type_guard = true;
+        bool plain = length > 3 && !strncmp(start, "():", 3);
+        bool awaited = length > 8 && !strncmp(start, "await():", 8);
+        if (plain || awaited) {
+            size_t skip = plain ? 3 : 8;
+            const char *qn = cbm_arena_strndup(arena, start + skip, length - skip);
+            const char **slot = plain ? &rf->return_class_qn : &rf->await_class_qn;
+            bool *conflict = plain ? &plain_conflict : &await_conflict;
+            if (*slot && qn && strcmp(*slot, qn))
+                *conflict = true;
+            *slot = qn;
+        }
+        start += length + (end ? 1 : 0);
+    }
+    if (plain_conflict)
+        rf->return_class_qn = NULL;
+    if (await_conflict)
+        rf->await_class_qn = NULL;
+}
+
 /* Register a batch of CBMLSPDef[] into a registry. Mirrors the inline
  * loop in cbm_run_ts_lsp_cross — KEEP IN SYNC. Shared by the Tier 2
  * pre-built registry builder + per-file overlay builder. Def-driven
@@ -6206,7 +6248,9 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
-        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
+        /* A type alias is a type only for what its rows say; no other type reads it. */
+        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
+            (strcmp(d->label, "Type") == 0 && d->field_defs && d->field_defs[0])) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -6244,9 +6288,9 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
                         n++;
                 const char **fn_arr =
                     (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                const CBMType **ft_arr = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                if (fn_arr && ft_arr) {
+                const char **fq_arr =
+                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
+                if (fn_arr && fq_arr) {
                     int idx = 0;
                     const char *start = d->field_defs;
                     for (const char *s = d->field_defs;; s++) {
@@ -6256,8 +6300,7 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
                             if (pair && colon) {
                                 *colon = '\0';
                                 fn_arr[idx] = pair;
-                                ft_arr[idx] =
-                                    parse_ts_type_text(arena, colon + 1, d->def_module_qn);
+                                fq_arr[idx] = colon + 1;
                                 idx++;
                             }
                             if (*s == '\0')
@@ -6266,9 +6309,9 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
                         }
                     }
                     fn_arr[idx] = NULL;
-                    ft_arr[idx] = NULL;
-                    rt.field_names = fn_arr;
-                    rt.field_types = ft_arr;
+                    fq_arr[idx] = NULL;
+                    rt.member_names = fn_arr;
+                    rt.member_class_qns = fq_arr;
                 }
             }
             cbm_registry_add_type(reg, rt);
@@ -6312,6 +6355,7 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
             rf.declaration_identity = d->declaration_identity;
             rf.sig = d->sig;
+            ts_return_classes(arena, &rf, d->field_defs);
             rf.min_params = -1;
             const CBMType **rets = NULL;
             if (d->return_types && d->return_types[0]) {
@@ -6501,7 +6545,9 @@ void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int s
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
-        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
+        /* A type alias is a type only for what its rows say; no other type reads it. */
+        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
+            (strcmp(d->label, "Type") == 0 && d->field_defs && d->field_defs[0])) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -6541,9 +6587,9 @@ void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int s
                         n++;
                 const char **fn_arr =
                     (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                const CBMType **ft_arr = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                if (fn_arr && ft_arr) {
+                const char **fq_arr =
+                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
+                if (fn_arr && fq_arr) {
                     int idx = 0;
                     const char *start = d->field_defs;
                     for (const char *s = d->field_defs;; s++) {
@@ -6553,8 +6599,7 @@ void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int s
                             if (pair && colon) {
                                 *colon = '\0';
                                 fn_arr[idx] = pair;
-                                ft_arr[idx] =
-                                    parse_ts_type_text(arena, colon + 1, d->def_module_qn);
+                                fq_arr[idx] = colon + 1;
                                 idx++;
                             }
                             if (*s == '\0')
@@ -6563,9 +6608,9 @@ void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int s
                         }
                     }
                     fn_arr[idx] = NULL;
-                    ft_arr[idx] = NULL;
-                    rt.field_names = fn_arr;
-                    rt.field_types = ft_arr;
+                    fq_arr[idx] = NULL;
+                    rt.member_names = fn_arr;
+                    rt.member_class_qns = fq_arr;
                 }
             }
             cbm_registry_add_type(&reg, rt);
@@ -6611,6 +6656,7 @@ void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int s
             rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
             rf.declaration_identity = d->declaration_identity;
             rf.sig = d->sig;
+            ts_return_classes(arena, &rf, d->field_defs);
             rf.min_params = -1;
             // Return types from pipe-separated return_types text.
             const CBMType **rets = NULL;

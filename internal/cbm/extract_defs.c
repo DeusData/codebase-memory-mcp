@@ -213,6 +213,7 @@ enum { RT_PAIR_SIZE = 2 };
 
 // Forward declarations
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
+static void extract_ts_return_type(CBMExtractCtx *ctx, TSNode func_node, const char *func_qn);
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                            const char *kind, char *name);
@@ -7135,6 +7136,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             a, params, ctx->source, ctx->language, false, &def.signature_param_count);
     }
 
+    extract_ts_return_type(ctx, func_node, def.qualified_name);
+
     // Return type — use func_node (inner function for templates)
     static const char *rt_fields[] = {"result", "return_type", "type", NULL};
     for (const char **f = rt_fields; *f && !(configured && ctx->language == CBM_LANG_C); f++) {
@@ -8414,6 +8417,515 @@ static void py_extract_init_fields(CBMExtractCtx *ctx, const char *class_qn, TSN
     }
 }
 
+/* ── TypeScript declared member types ─────────────────────────────
+ * Exported as result->field_types (never graph nodes), like Python's, so a proof can type
+ * `obj.field.method()` when obj's class lives in another file. Only what the class spells
+ * counts: an annotated field or parameter property, a getter's return annotation, a field
+ * given `new C()`. The checker keeps every write within that type. A class's own type
+ * parameter names no class, and a static member is not an instance's. */
+static bool ts_has_token(TSNode node, const char *token) {
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool found = false;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            found = !strcmp(ts_node_type(ts_tree_cursor_current_node(&cursor)), token);
+        } while (!found && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+static bool ts_type_parameter_named(CBMExtractCtx *ctx, TSNode owner, const char *name) {
+    TSNode parameters = ts_node_child_by_field_name(owner, TS_FIELD("type_parameters"));
+    if (ts_node_is_null(parameters))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(parameters);
+    bool found = false;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode parameter = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(parameter), "type_parameter"))
+                continue;
+            TSNode own = ts_node_child_by_field_name(parameter, TS_FIELD("name"));
+            const char *text =
+                ts_node_is_null(own) ? NULL : cbm_node_text(ctx->arena, own, ctx->source);
+            found = text && !strcmp(text, name);
+        } while (!found && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+static void ts_push_member_named(CBMExtractCtx *ctx, TSNode owner, const char *class_qn,
+                                 const char *member, TSNode type_name) {
+    const char *type =
+        ts_node_is_null(type_name) ? NULL : cbm_node_text(ctx->arena, type_name, ctx->source);
+    if (!member || !member[0] || !type || ts_type_parameter_named(ctx, owner, type))
+        return;
+    CBMFieldType ft = {.class_qn = class_qn, .field_name = member, .type_text = type};
+    cbm_fieldtype_push(&ctx->result->field_types, ctx->arena, ft);
+}
+
+static bool ts_global_type_name(const char *name) {
+    static const char *const names[] = {"Array",    "ReadonlyArray", "Set",  "ReadonlySet",
+                                        "Record",   "Pick",          "Omit", "Partial",
+                                        "Required", "Readonly"};
+    for (size_t i = 0; name && i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(name, names[i]))
+            return true;
+    return false;
+}
+
+/* Any name an import statement binds that is one of those. */
+static bool ts_import_binds_global_type(CBMExtractCtx *ctx, TSNode node) {
+    if (!strcmp(ts_node_type(node), "identifier"))
+        return ts_global_type_name(cbm_node_text(ctx->arena, node, ctx->source));
+    if (!strcmp(ts_node_type(node), "string"))
+        return false;
+    bool found = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            found = ts_import_binds_global_type(ctx, ts_tree_cursor_current_node(&cursor));
+        } while (!found && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+/* `import { Record } from 'immutable'` is not the utility type. Settled once per file. */
+static bool ts_global_types_shadowed(CBMExtractCtx *ctx) {
+    if (ctx->ts_global_types)
+        return ctx->ts_global_types == 2;
+    bool shadowed = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode statement = ts_tree_cursor_current_node(&cursor);
+            if (!strcmp(ts_node_type(statement), "import_statement")) {
+                shadowed = ts_import_binds_global_type(ctx, statement);
+                continue;
+            }
+            if (!strcmp(ts_node_type(statement), "export_statement")) {
+                TSNode declaration =
+                    ts_node_child_by_field_name(statement, TS_FIELD("declaration"));
+                if (!ts_node_is_null(declaration))
+                    statement = declaration;
+            }
+            const char *kind = ts_node_type(statement);
+            if (strcmp(kind, "class_declaration") && strcmp(kind, "abstract_class_declaration") &&
+                strcmp(kind, "interface_declaration") && strcmp(kind, "type_alias_declaration") &&
+                strcmp(kind, "enum_declaration"))
+                continue;
+            TSNode name = ts_node_child_by_field_name(statement, TS_FIELD("name"));
+            shadowed = !ts_node_is_null(name) &&
+                       ts_global_type_name(cbm_node_text(ctx->arena, name, ctx->source));
+        } while (!shadowed && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    ctx->ts_global_types = shadowed ? 2 : 1;
+    return shadowed;
+}
+
+/* The class a member holds, as `name[]` the class its array, set or Record holds, and as `name{}`
+ * what a Record holds under a key spelled `.key`. A member whose type names no class still gets
+ * a row: it hides a base class's member of the same name. */
+static void ts_push_member_type(CBMExtractCtx *ctx, TSNode owner, const char *class_qn,
+                                TSNode name_node, TSNode type) {
+    if (ts_node_is_null(name_node) || ts_node_is_null(type))
+        return;
+    const char *kind = ts_node_type(name_node);
+    if (strcmp(kind, "property_identifier") && strcmp(kind, "identifier"))
+        return;
+    const char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name)
+        return;
+    TSNode single = cbm_ts_single_type_name(type);
+    if (ts_node_is_null(single)) {
+        CBMFieldType unnamed = {.class_qn = class_qn, .field_name = name, .type_text = "?"};
+        cbm_fieldtype_push(&ctx->result->field_types, ctx->arena, unnamed);
+    } else {
+        ts_push_member_named(ctx, owner, class_qn, name, single);
+    }
+    if (ts_global_types_shadowed(ctx))
+        return;
+    TSNode element = cbm_ts_element_type(type, ctx->source);
+    if (!ts_node_is_null(element))
+        ts_push_member_named(ctx, owner, class_qn, cbm_arena_sprintf(ctx->arena, "%s[]", name),
+                             cbm_ts_single_type_name(element));
+    TSNode value = cbm_ts_record_value_type(type, ctx->source);
+    if (!ts_node_is_null(value))
+        ts_push_member_named(ctx, owner, class_qn, cbm_arena_sprintf(ctx->arena, "%s{}", name),
+                             cbm_ts_single_type_name(value));
+}
+
+/* What `type X = ...` is made of, for selecting a member through it, as rows on the alias. A path
+ * names a constituent: `~1` the second of a union, `^0` the first of an intersection, nested as
+ * `^0~1`. Rows, in source order:
+ *   `<path>~#n`, `<path>^#n`  that many constituents follow     `<path>` the class it names
+ *   `<path>+key`, `<path>-key`  Pick or Omit of a key           `<path>?` a shape nothing reads
+ *   `<path>%`, `<path>=key`  an object type and its members
+ * The fold joins rows with `|` and `:`, so a key holding either is a shape nothing reads. Rows
+ * other than `<path>` name the alias itself as their type, which always resolves. */
+enum { TS_ALIAS_MAX_DEPTH = 8 };
+
+typedef struct {
+    CBMExtractCtx *ctx;
+    TSNode alias;
+    TSNode self;
+    const char *qn;
+} ts_alias_rows_t;
+
+static void ts_alias_row(const ts_alias_rows_t *rows, const char *row) {
+    ts_push_member_named(rows->ctx, rows->alias, rows->qn, row, rows->self);
+}
+
+static void ts_alias_shape(const ts_alias_rows_t *rows, const char *path, TSNode type, int depth);
+
+/* The first named child that is no comment: a type argument list can hold comments. */
+static TSNode ts_first_named_child(TSNode node, int skip) {
+    TSNode none = {0};
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    TSNode found = none;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && strcmp(ts_node_type(child), "comment") && skip-- == 0) {
+                found = child;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+/* `A | B | C` parses nested on the left. Walk its members flat, without recursion, since a long
+ * union nests as deep as it is long. Counts them, and with `emit` writes each one's rows. */
+static int ts_alias_members(const ts_alias_rows_t *rows, const char *path, TSNode type, char op,
+                            int depth, bool emit) {
+    const char *kind = ts_node_type(type);
+    int index = 0;
+    for (TSNode node = type; !ts_node_is_null(node);) {
+        TSNode nested = {0};
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        for (bool more = ts_tree_cursor_goto_first_child(&cursor); more;
+             more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+            TSNode member = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(member) || !strcmp(ts_node_type(member), "comment") ||
+                cbm_ts_nullish_type(member))
+                continue;
+            if (!strcmp(ts_node_type(member), kind)) {
+                nested = member;
+                continue;
+            }
+            if (emit)
+                ts_alias_shape(rows, cbm_arena_sprintf(rows->ctx->arena, "%s%c%d", path, op, index),
+                               member, depth + 1);
+            index++;
+        }
+        ts_tree_cursor_delete(&cursor);
+        node = nested;
+    }
+    return index;
+}
+
+static void ts_alias_level(const ts_alias_rows_t *rows, const char *path, TSNode type, char op,
+                           int depth) {
+    int count = ts_alias_members(rows, path, type, op, depth, false);
+    ts_alias_row(rows, cbm_arena_sprintf(rows->ctx->arena, "%s%c#%d", path, op, count));
+    (void)ts_alias_members(rows, path, type, op, depth, true);
+}
+
+/* One `'a'` of Pick or Omit keys. False for any other spelling. */
+static bool ts_alias_key(const ts_alias_rows_t *rows, const char *path, char sign, TSNode keys) {
+    if (strcmp(ts_node_type(keys), "literal_type"))
+        return false;
+    TSNode literal = ts_first_named_child(keys, 0);
+    if (ts_node_is_null(literal) || strcmp(ts_node_type(literal), "string"))
+        return false;
+    TSNode fragment = ts_first_named_child(literal, 0);
+    const char *key = ts_node_is_null(fragment)
+                          ? NULL
+                          : cbm_node_text(rows->ctx->arena, fragment, rows->ctx->source);
+    if (!key || !key[0] || strpbrk(key, "|:"))
+        return false;
+    ts_alias_row(rows, cbm_arena_sprintf(rows->ctx->arena, "%s%c%s", path, sign, key));
+    return true;
+}
+
+/* `'a' | 'b'` as Pick or Omit keys, nested on the left like any union. */
+static bool ts_alias_keys(const ts_alias_rows_t *rows, const char *path, char sign, TSNode keys) {
+    bool all = true;
+    for (TSNode node = keys; all && !ts_node_is_null(node);) {
+        if (strcmp(ts_node_type(node), "union_type"))
+            return ts_alias_key(rows, path, sign, node);
+        TSNode nested = {0};
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        for (bool more = ts_tree_cursor_goto_first_child(&cursor); more && all;
+             more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+            TSNode member = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(member) || !strcmp(ts_node_type(member), "comment"))
+                continue;
+            if (!strcmp(ts_node_type(member), "union_type"))
+                nested = member;
+            else
+                all = ts_alias_key(rows, path, sign, member);
+        }
+        ts_tree_cursor_delete(&cursor);
+        node = nested;
+    }
+    return all;
+}
+
+static void ts_alias_object(const ts_alias_rows_t *rows, const char *path, TSNode object) {
+    CBMArena *arena = rows->ctx->arena;
+    ts_alias_row(rows, cbm_arena_sprintf(arena, "%s%%", path));
+    TSTreeCursor cursor = ts_tree_cursor_new(object);
+    for (bool more = ts_tree_cursor_goto_first_child(&cursor); more;
+         more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode member = ts_tree_cursor_current_node(&cursor);
+        if (!ts_node_is_named(member) || !strcmp(ts_node_type(member), "comment"))
+            continue;
+        TSNode name = ts_node_child_by_field_name(member, TS_FIELD("name"));
+        const char *text =
+            !ts_node_is_null(name) && !strcmp(ts_node_type(name), "property_identifier")
+                ? cbm_node_text(arena, name, rows->ctx->source)
+                : NULL;
+        ts_alias_row(rows, text ? cbm_arena_sprintf(arena, "%s=%s", path, text)
+                                : cbm_arena_sprintf(arena, "%s?", path));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
+static void ts_alias_shape(const ts_alias_rows_t *rows, const char *path, TSNode type, int depth) {
+    CBMExtractCtx *ctx = rows->ctx;
+    const char *kind = ts_node_is_null(type) ? "" : ts_node_type(type);
+    if (depth <= TS_ALIAS_MAX_DEPTH) {
+        if (!strcmp(kind, "parenthesized_type")) {
+            ts_alias_shape(rows, path, ts_first_named_child(type, 0), depth + 1);
+            return;
+        }
+        if (!strcmp(kind, "union_type")) {
+            ts_alias_level(rows, path, type, '~', depth);
+            return;
+        }
+        if (!strcmp(kind, "intersection_type")) {
+            ts_alias_level(rows, path, type, '^', depth);
+            return;
+        }
+        if (!strcmp(kind, "object_type")) {
+            ts_alias_object(rows, path, type);
+            return;
+        }
+        if (!strcmp(kind, "type_identifier")) {
+            ts_push_member_named(ctx, rows->alias, rows->qn, path, type);
+            return;
+        }
+        TSNode name = !strcmp(kind, "generic_type")
+                          ? ts_node_child_by_field_name(type, TS_FIELD("name"))
+                          : (TSNode){0};
+        if (!ts_node_is_null(name) && !strcmp(ts_node_type(name), "type_identifier")) {
+            const char *generic = cbm_node_text(ctx->arena, name, ctx->source);
+            TSNode arguments = ts_node_child_by_field_name(type, TS_FIELD("type_arguments"));
+            bool utility = ts_global_type_name(generic) && !ts_global_types_shadowed(ctx);
+            if (!utility) {
+                ts_push_member_named(ctx, rows->alias, rows->qn, path, name);
+                return;
+            }
+            TSNode first =
+                ts_node_is_null(arguments) ? (TSNode){0} : ts_first_named_child(arguments, 0);
+            TSNode second =
+                ts_node_is_null(arguments) ? (TSNode){0} : ts_first_named_child(arguments, 1);
+            bool picks = !strcmp(generic, "Pick");
+            bool omits = !strcmp(generic, "Omit");
+            bool same = !strcmp(generic, "Partial") || !strcmp(generic, "Required") ||
+                        !strcmp(generic, "Readonly");
+            if (!ts_node_is_null(first) &&
+                ((same && ts_node_is_null(second)) ||
+                 ((picks || omits) && !ts_node_is_null(second) &&
+                  ts_alias_keys(rows, path, picks ? '+' : '-', second)))) {
+                ts_alias_shape(rows, path, first, depth + 1);
+                return;
+            }
+        }
+    }
+    ts_alias_row(rows, cbm_arena_sprintf(ctx->arena, "%s?", path));
+}
+
+static void extract_ts_alias_shape(CBMExtractCtx *ctx, TSNode alias, const char *qn) {
+    TSNode self = ts_node_child_by_field_name(alias, TS_FIELD("name"));
+    TSNode value = ts_node_child_by_field_name(alias, TS_FIELD("value"));
+    if (ts_node_is_null(self) || ts_node_is_null(value))
+        return;
+    ts_alias_rows_t rows = {.ctx = ctx, .alias = alias, .self = self, .qn = qn};
+    const char *kind = ts_node_type(value);
+    if (!strcmp(kind, "union_type")) {
+        ts_alias_level(&rows, "", value, '~', 0);
+    } else if (!strcmp(kind, "intersection_type")) {
+        ts_alias_level(&rows, "", value, '^', 0);
+    } else {
+        ts_alias_row(&rows, "~#1");
+        ts_alias_shape(&rows, "~0", value, 0);
+    }
+}
+
+static void ts_parameter_properties(CBMExtractCtx *ctx, TSNode owner, const char *class_qn,
+                                    TSNode constructor) {
+    TSNode parameters = ts_node_child_by_field_name(constructor, TS_FIELD("parameters"));
+    if (ts_node_is_null(parameters))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(parameters);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode parameter = ts_tree_cursor_current_node(&cursor);
+            const char *kind = ts_node_type(parameter);
+            if (strcmp(kind, "required_parameter") && strcmp(kind, "optional_parameter"))
+                continue;
+            if (!ts_has_token(parameter, "accessibility_modifier") &&
+                !ts_has_token(parameter, "override_modifier") &&
+                !ts_has_token(parameter, "readonly"))
+                continue;
+            ts_push_member_type(ctx, owner, class_qn,
+                                ts_node_child_by_field_name(parameter, TS_FIELD("pattern")),
+                                ts_node_child_by_field_name(parameter, TS_FIELD("type")));
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* What calling a function yields, as it declares: `()` for the class it returns, `await()` for
+ * the class its Promise resolves to. A name the function or its class binds as a type
+ * parameter is no class. The owner of a method is two parents up, past its class body. */
+static void extract_ts_return_type(CBMExtractCtx *ctx, TSNode func_node, const char *func_qn) {
+    if (!func_qn || (ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX))
+        return;
+    TSNode annotation = ts_node_child_by_field_name(func_node, TS_FIELD("return_type"));
+    if (ts_node_is_null(annotation) || !ts_node_named_child_count(annotation))
+        return;
+    /* `x is T` and `asserts x`: a call narrows its argument, whatever class that names. */
+    if (!strcmp(ts_node_type(annotation), "type_predicate_annotation") ||
+        !strcmp(ts_node_type(annotation), "asserts_annotation")) {
+        CBMFieldType guard = {.class_qn = func_qn, .field_name = "is()", .type_text = "?"};
+        cbm_fieldtype_push(&ctx->result->field_types, ctx->arena, guard);
+        return;
+    }
+    TSNode type = strcmp(ts_node_type(annotation), "type_annotation")
+                      ? annotation
+                      : ts_node_named_child(annotation, 0);
+    const char *call = "()";
+    if (!strcmp(ts_node_type(type), "generic_type")) {
+        TSNode name = ts_node_child_by_field_name(type, TS_FIELD("name"));
+        TSNode arguments = ts_node_child_by_field_name(type, TS_FIELD("type_arguments"));
+        const char *generic =
+            ts_node_is_null(name) ? NULL : cbm_node_text(ctx->arena, name, ctx->source);
+        if (generic && !strcmp(generic, "Promise")) {
+            if (ts_node_is_null(arguments) || ts_node_named_child_count(arguments) != 1)
+                return;
+            type = ts_node_named_child(arguments, 0);
+            call = "await()";
+        }
+    }
+    TSNode type_name = cbm_ts_single_type_name(type);
+    const char *text =
+        ts_node_is_null(type_name) ? NULL : cbm_node_text(ctx->arena, type_name, ctx->source);
+    if (!text || ts_type_parameter_named(ctx, func_node, text))
+        return;
+    TSNode body = ts_node_parent(func_node);
+    if (!ts_node_is_null(body) && !strcmp(ts_node_type(body), "class_body") &&
+        ts_type_parameter_named(ctx, ts_node_parent(body), text))
+        return;
+    CBMFieldType ft = {.class_qn = func_qn, .field_name = call, .type_text = text};
+    cbm_fieldtype_push(&ctx->result->field_types, ctx->arena, ft);
+}
+
+/* `<extends>`: the one class a class inherits members from, kept apart from its `implements`,
+ * which declare nothing. It names the class itself when there is none, and no resolvable name
+ * for anything but a plain identifier. First row of the class, for a cheap read. */
+static void ts_push_class_base(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn) {
+    TSNode value = {0};
+    bool extends = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(class_node);
+    for (bool more = ts_tree_cursor_goto_first_child(&cursor); more && !extends;
+         more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode heritage = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(heritage), "class_heritage"))
+            continue;
+        TSTreeCursor inner = ts_tree_cursor_new(heritage);
+        for (bool step = ts_tree_cursor_goto_first_child(&inner); step && !extends;
+             step = ts_tree_cursor_goto_next_sibling(&inner)) {
+            TSNode clause = ts_tree_cursor_current_node(&inner);
+            if (!strcmp(ts_node_type(clause), "extends_clause")) {
+                extends = true;
+                value = ts_node_child_by_field_name(clause, TS_FIELD("value"));
+            }
+        }
+        ts_tree_cursor_delete(&inner);
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (!extends) {
+        ts_push_member_named(ctx, class_node, class_qn, "<extends>",
+                             ts_node_child_by_field_name(class_node, TS_FIELD("name")));
+    } else if (!ts_node_is_null(value) && !strcmp(ts_node_type(value), "identifier")) {
+        ts_push_member_named(ctx, class_node, class_qn, "<extends>", value);
+    } else {
+        CBMFieldType unnamed = {.class_qn = class_qn, .field_name = "<extends>", .type_text = "?"};
+        cbm_fieldtype_push(&ctx->result->field_types, ctx->arena, unnamed);
+    }
+}
+
+static void extract_ts_field_types(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn) {
+    if (!strcmp(ts_node_type(class_node), "type_alias_declaration")) {
+        extract_ts_alias_shape(ctx, class_node, class_qn);
+        return;
+    }
+    if (!strcmp(ts_node_type(class_node), "class_declaration") ||
+        !strcmp(ts_node_type(class_node), "abstract_class_declaration"))
+        ts_push_class_base(ctx, class_node, class_qn);
+    TSNode body = ts_node_child_by_field_name(class_node, TS_FIELD("body"));
+    if (ts_node_is_null(body))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode member = ts_tree_cursor_current_node(&cursor);
+            const char *kind = ts_node_type(member);
+            TSNode name = ts_node_child_by_field_name(member, TS_FIELD("name"));
+            if (!strcmp(kind, "public_field_definition") || !strcmp(kind, "property_signature")) {
+                if (ts_has_token(member, "static"))
+                    continue;
+                TSNode type = ts_node_child_by_field_name(member, TS_FIELD("type"));
+                if (!ts_node_is_null(type)) {
+                    ts_push_member_type(ctx, class_node, class_qn, name, type);
+                    continue;
+                }
+                TSNode value = ts_node_child_by_field_name(member, TS_FIELD("value"));
+                TSNode constructor =
+                    !ts_node_is_null(value) && !strcmp(ts_node_type(value), "new_expression")
+                        ? ts_node_child_by_field_name(value, TS_FIELD("constructor"))
+                        : (TSNode){0};
+                /* `new C()` names a value's class in the value namespace, as an identifier. */
+                if (!ts_node_is_null(constructor) && !ts_node_is_null(name) &&
+                    !strcmp(ts_node_type(constructor), "identifier") &&
+                    !strcmp(ts_node_type(name), "property_identifier")) {
+                    py_push_field_type(ctx, class_qn, name,
+                                       cbm_node_text(ctx->arena, constructor, ctx->source));
+                }
+            } else if (!strcmp(kind, "method_definition") && !ts_node_is_null(name)) {
+                const char *method = cbm_node_text(ctx->arena, name, ctx->source);
+                if (method && !strcmp(method, "constructor")) {
+                    ts_parameter_properties(ctx, class_node, class_qn, member);
+                } else if (ts_has_token(member, "get") && !ts_has_token(member, "static")) {
+                    ts_push_member_type(
+                        ctx, class_node, class_qn, name,
+                        ts_node_child_by_field_name(member, TS_FIELD("return_type")));
+                }
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
 static void extract_py_field_types(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn) {
     TSNode body = ts_node_child_by_field_name(class_node, TS_FIELD("body"));
     if (ts_node_is_null(body)) {
@@ -8957,6 +9469,8 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
 
     if (ctx->language == CBM_LANG_PYTHON) {
         extract_py_field_types(ctx, node, class_qn);
+    } else if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) {
+        extract_ts_field_types(ctx, node, class_qn);
     }
 
     // C# 12 primary-constructor parameters: declared on the class line
@@ -9406,6 +9920,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         def.signature_param_types = extract_signature_param_types(
             a, params, ctx->source, ctx->language, true, &def.signature_param_count);
     }
+
+    extract_ts_return_type(ctx, child, method_qn);
 
     // Return type (same fields as extract_func_def)
     {

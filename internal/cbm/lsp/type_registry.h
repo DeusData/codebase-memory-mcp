@@ -74,6 +74,11 @@ typedef struct {
     /* Callable identity (#2061): this overload's signature suffix; its graph
      * QN is qualified_name + sig. NULL = none (always, until enabled). */
     const char *sig;
+    /* TS: the class this function declares it returns, and the class its Promise resolves to,
+     * resolved in the declaring file. For proofs only; NULL when it declares no one class. */
+    const char *return_class_qn;
+    const char *await_class_qn;
+    bool type_guard; // TS: declares `x is T` or `asserts x`, so a call narrows its argument
     /* Opaque identity of the original source declaration within this resolver
      * generation. Overlay copies retain it; separately extracted declarations
      * never share it merely because their qualified names match. */
@@ -97,9 +102,14 @@ typedef struct {
     const char **field_names;      // NULL-terminated
     const CBMType **field_types;   // NULL-terminated (parallel to field_names)
     const char **method_names;     // NULL-terminated (short names)
+    /* TS: the class each declared member holds, resolved in the declaring file, for proofs
+     * only. Set by the cross-file builders; NULL on a per-file overlay. */
+    const char **member_names;     // NULL-terminated
+    const char **member_class_qns; // NULL-terminated (parallel to member_names)
     const char **method_qns;       // NULL-terminated (qualified names, parallel)
     const char **embedded_types;   // NULL-terminated (embedded/anonymous field type QNs)
     const char *alias_of;          // QN of aliased type (type Foo = Bar), NULL if not alias
+    bool alias_view; // TS: a file's own note of its alias; the shared entry is the type
     const char **type_param_names; // NULL-terminated, e.g., ["T", "K", NULL] for template classes
     bool is_interface;
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)

@@ -169,6 +169,10 @@ bool cbm_resolve_binding_js_declaration_lines(const cbm_resolve_binding_index_t 
 bool cbm_resolve_binding_js_exports_complete(const cbm_resolve_binding_index_t *);
 /* True when CommonJS syntax makes `require()` of this file yield module.exports. */
 bool cbm_resolve_binding_js_commonjs(const cbm_resolve_binding_index_t *);
+/* The declaration a module's `export default` names, or NULL. */
+const char *cbm_resolve_binding_js_default_target(const cbm_resolve_binding_index_t *);
+/* Every parse error of this ECMAScript tree is a grammar gap in a type position. */
+bool cbm_resolve_binding_js_parse_gaps_inert(TSNode root, const char *source);
 size_t cbm_resolve_binding_js_export_count(const cbm_resolve_binding_index_t *);
 const cbm_resolve_js_export_t *cbm_resolve_binding_js_export_at(const cbm_resolve_binding_index_t *,
                                                                 size_t);

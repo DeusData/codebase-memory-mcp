@@ -130,7 +130,9 @@ TEST(resolver_ts_javascript_member_write_withdraws_only_that_method) {
     const char *source = "class A {\n"
                          "  kept() {}\n"
                          "  replaced() {}\n"
-                         "  use() { this.kept(); this.replaced(); }\n"
+                         "  literal() {}\n"
+                         "  use(key) { this[key] = 1; this['literal'] = 2; this.kept(); "
+                         "this.replaced(); this.literal(); }\n"
                          "}\n"
                          "A.prototype.replaced = other;\n"
                          "module.exports.count = 1;\n"
@@ -140,9 +142,11 @@ TEST(resolver_ts_javascript_member_write_withdraws_only_that_method) {
     ASSERT_NOT_NULL(file);
     int kept = ts_proved_count(&file->resolved_calls, "test.main.A.kept");
     int replaced = ts_proved_count(&file->resolved_calls, "test.main.A.replaced");
+    int literal = ts_proved_count(&file->resolved_calls, "test.main.A.literal");
     cbm_free_result(file);
     ASSERT_EQ(kept, 1);
     ASSERT_EQ(replaced, 0);
+    ASSERT_EQ(literal, 0);
     PASS();
 }
 
@@ -266,8 +270,8 @@ TEST(resolver_ts_unknown_union_and_later_shadow_abstain) {
         "class A { run() {} } function use(a) { a.run(); }",
         "class A { run() {} } class B { run() {} } function use(a: A | B) { a.run(); }",
         "class A { run() {} } function use(a: A) { { a.run(); let a; } }",
-        "class A { run() {} } function use(a: A) { a.run(); a = unknownValue; }",
-        ("class A { run() {} } function use(a: A) { mutate(); a.run(); "
+        "class A { run() {} } function use() { let a = new A(); a.run(); a = unknownValue; }",
+        ("class A { run() {} } function use() { let a = new A(); mutate(); a.run(); "
          "function mutate() { a = unknownValue; } }")};
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         CBMFileResult *file =
@@ -278,6 +282,281 @@ TEST(resolver_ts_unknown_union_and_later_shadow_abstain) {
         cbm_free_result(file);
         ASSERT_EQ(count, 0);
     }
+    PASS();
+}
+
+/* Vue's reactivity/effect.ts: `e = next` in endBatch rebinds that function's own `e`. It used
+ * to withdraw `const e = new ReactiveEffect(fn); e.run()` in every other function. */
+TEST(resolver_ts_rebinding_changes_only_the_declaration_it_resolves_to) {
+    const char *source = "class Sub { next() {} notify() {} }\n"
+                         "class Eff { run() {} stop() {} }\n"
+                         "function endBatch(start: Sub) {\n"
+                         "  let e: Sub = start;\n"
+                         "  while (e) { e.notify(); e = pick(); }\n"
+                         "}\n"
+                         "function effect(fn: any) {\n"
+                         "  const e = new Eff();\n"
+                         "  e.run();\n"
+                         "  e.stop();\n"
+                         "}\n"
+                         "function pick(): any { return null; }\n";
+    CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT, "test",
+                                           "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int run = ts_proved_count(&file->resolved_calls, "test.main.Eff.run");
+    int stop = ts_proved_count(&file->resolved_calls, "test.main.Eff.stop");
+    cbm_free_result(file);
+    ASSERT_EQ(run, 1);
+    ASSERT_EQ(stop, 1);
+    PASS();
+}
+
+/* Each write here reaches the declaration the call reads, by a closure, a hoisted `var`, a
+ * module-level name or a pattern, and a same-named type or inner scope must not absorb it. */
+TEST(resolver_ts_rebinding_through_scopes_still_abstains) {
+    static const char *const sources[] = {
+        "class A { run() {} } function f() { let r = new A(); function w() { r = pick(); } "
+        "w(); r.run(); } function pick(): any { return 1; }",
+        "class A { run() {} } function f() { r = pick(); var r = new A(); r.run(); } "
+        "function pick(): any { return 1; }",
+        "class A { run() {} } let m = new A(); function w() { m = pick(); } "
+        "function f() { m.run(); } function pick(): any { return 1; }",
+        "class A { run() {} } function f() { let r = new A(); [r] = pick(); r.run(); } "
+        "function pick(): any { return 1; }",
+        "class A { run() {} } function f() { let r = new A(); ({ r } = pick()); r.run(); } "
+        "function pick(): any { return 1; }",
+        "class A { run() {} } function f() { let r = new A(); for (r of pick()) {} r.run(); } "
+        "function pick(): any { return 1; }",
+        "class A { run() {} } let m = new A(); function f() { type m = number; m = pick(); } "
+        "function g() { m.run(); } function pick(): any { return 1; }",
+        "class A { run() {} } A = pick(); function f(a: A) { a.run(); } "
+        "function pick(): any { return 1; }",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        CBMFileResult *file =
+            cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_TYPESCRIPT, "test",
+                             "main.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        int count = ts_proved_count(&file->resolved_calls, "test.main.A.run");
+        cbm_free_result(file);
+        ASSERT_EQ(count, 0);
+    }
+    /* The write stays in the inner block, so the outer `r` keeps its construction. */
+    const char *inner = "class A { run() {} } function f() { let r = new A(); "
+                        "{ let r = pick(); r = pick(); } r.run(); } "
+                        "function pick(): any { return 1; }";
+    CBMFileResult *file = cbm_extract_file(inner, (int)strlen(inner), CBM_LANG_TYPESCRIPT, "test",
+                                           "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int count = ts_proved_count(&file->resolved_calls, "test.main.A.run");
+    cbm_free_result(file);
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+
+/* `Function(code)` and an indirect eval compile in the global scope and see no binding of
+ * this file. Only a direct `eval(code)` can run code here. */
+TEST(resolver_ts_only_direct_eval_withdraws_the_proofs_of_a_file) {
+    static const char *const kept[] = {
+        "const make = Function('return 1');",
+        "const make = new Function('return 1');",
+        "export const AsyncFunction = (async function () {}).constructor as typeof Function;",
+        "const indirect = eval; indirect('1');",
+        "const box = { eval: 1 }; const seen = box.eval;",
+        "function isFn(x: any) { return x instanceof Function; }",
+    };
+    for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source), "class A { run() {} } function use(a: A) { a.run(); } %s",
+                 kept[i]);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                               "test", "main.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        int count = ts_proved_count(&file->resolved_calls, "test.main.A.run");
+        cbm_free_result(file);
+        ASSERT_EQ(count, 1);
+    }
+    const char *direct = "class A { run() {} } function use(a: A) { eval('a = 1'); a.run(); }";
+    CBMFileResult *file = cbm_extract_file(direct, (int)strlen(direct), CBM_LANG_TYPESCRIPT, "test",
+                                           "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int count = ts_proved_count(&file->resolved_calls, "test.main.A.run");
+    cbm_free_result(file);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* Vite's build.ts, config.ts and shortcuts.ts each hold one cast write such as
+ * `;(resolved.build as Options) = v`, which used to withdraw every proof of the file. */
+TEST(resolver_ts_cast_writes_keep_the_proofs_of_a_file) {
+    static const char *const kept[] = {
+        "function other(box: any) { ;(box.field as number) = 1; }",
+        "function other(box: any) { ;(box.field as unknown as number) = 1; }",
+        "function other(box: any) { ;(box.field satisfies number) = 1; }",
+        "function other(next: any) { ;(next as string) += 'x'; }",
+    };
+    for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source), "class A { run() {} } function use(a: A) { a.run(); } %s",
+                 kept[i]);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                               "test", "main.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        int count = ts_proved_count(&file->resolved_calls, "test.main.A.run");
+        cbm_free_result(file);
+        ASSERT_EQ(count, 1);
+    }
+    /* The cast writes the receiver itself, so its initializer no longer says what it holds. */
+    const char *rewritten = "class A { run() {} } "
+                            "function use() { let a = new A(); ;(a as any) = pick(); a.run(); } "
+                            "function pick(): any { return 1; }";
+    CBMFileResult *file = cbm_extract_file(rewritten, (int)strlen(rewritten), CBM_LANG_TYPESCRIPT,
+                                           "test", "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int count = ts_proved_count(&file->resolved_calls, "test.main.A.run");
+    cbm_free_result(file);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* Receiver forms from Nest's `wrapper: InstanceWrapper<T>`, Vite's `moduleGraph?: Graph`, Vue's
+ * `(e as ReactiveEffect).trigger()` and `let effect: ReactiveEffect`, each a declaration the
+ * checker selects from what the file spells. */
+TEST(resolver_ts_written_receiver_forms_are_proved) {
+    static const char *const kept[] = {
+        "function use(a: Box<number>) { a.run(); }",
+        "function use(a: A | undefined) { a?.run(); }",
+        "function use(a: A | null | undefined) { a!.run(); }",
+        "function use(a: undefined | A) { a!.run(); }",
+        "function use(a?: A) { a?.run(); }",
+        "function use(a: A) { (a).run(); }",
+        "function use(a: any) { (a as A).run(); }",
+        "function use(a: any) { (a as unknown as A).run(); }",
+        "function use(a: any) { (a as A | undefined)?.run(); }",
+        "function use(a: any) { (a as Box<number>).run(); }",
+        "class H { item?: A; use() { this.item?.run(); } }",
+        "class H { item!: Box<number>; use() { this.item!.run(); } }",
+        "class H { constructor(private readonly item: Box<number>) {} use() { this.item.run(); } }",
+        "class H { item: A | null = null; use() { this.item!.run(); } }",
+        "function use() { let a: A; a = new A(); a.run(); }",
+        /* A write must fit the annotation, so an annotated name keeps its declared type. */
+        "function use(a: A) { a.run(); a = unknownValue; }",
+        "function use(a: A) { mutate(); a.run(); function mutate() { a = unknownValue; } }",
+        "class H { go() { return 1; } use(x = this.go(), a: A) { a.run(); } }",
+    };
+    for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source),
+                 "class A { run() {} } class Box<T> { run() {} } class C { run() {} } %s", kept[i]);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                               "test", "main.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        int count = ts_proved_count(&file->resolved_calls, "test.main.A.run") +
+                    ts_proved_count(&file->resolved_calls, "test.main.Box.run");
+        int decoy = ts_proved_count(&file->resolved_calls, "test.main.C.run");
+        /* Nest's `modules: Module[] = this.getModules(options)`: a default value's `this`. */
+        if (strstr(kept[i], "this.go()"))
+            ASSERT_EQ(ts_proved_count(&file->resolved_calls, "test.main.H.go"), 1);
+        cbm_free_result(file);
+        ASSERT_EQ(count, 1);
+        ASSERT_EQ(decoy, 0);
+    }
+    static const char *const unproved[] = {
+        "function use(a: A | C) { a.run(); }",
+        "function use(a: A | C | undefined) { a?.run(); }",
+        "function use<A>(a: A) { a.run(); }",
+        "function use<A>(a: A | undefined) { a?.run(); }",
+        "function use(a: Promise<A>) { a.run(); }",
+        "function use(a: A[]) { a.run(); }",
+        "function use(a: any) { (a as any).run(); }",
+        "function use(a: any) { (a as A | C).run(); }",
+        "function use(a: any) { (a satisfies A).run(); }",
+        "function use() { let a = new A(); a = pick(); a.run(); }",
+        "function use(a: C) { if (a instanceof D) { a.run(); } } class D extends C { run() {} }",
+    };
+    for (size_t i = 0; i < sizeof(unproved) / sizeof(unproved[0]); i++) {
+        char source[512];
+        snprintf(source, sizeof(source),
+                 "class A { run() {} } class C { run() {} } function pick(): any { return 1; } %s",
+                 unproved[i]);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                               "test", "main.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        int count = ts_proved_count(&file->resolved_calls, "test.main.A.run") +
+                    ts_proved_count(&file->resolved_calls, "test.main.C.run");
+        cbm_free_result(file);
+        ASSERT_EQ(count, 0);
+    }
+    PASS();
+}
+
+/* `super.m()` selects from the class this one extends, past its own override, the nearest
+ * declaration up that chain. */
+TEST(resolver_ts_super_selects_from_the_base_class) {
+    const char *source = "class Base { over() {} top() {} }\n"
+                         "class Mid extends Base { over() {} }\n"
+                         "class Kid extends Mid {\n"
+                         "  over() { super.over(); }\n"
+                         "  deep() { super.top(); }\n"
+                         "  arrow() { const go = () => super.over(); return go; }\n"
+                         "}\n"
+                         "interface Mark { over(): void; }\n"
+                         "class Marked extends Base implements Mark { go() { super.over(); } }\n"
+                         "class Alone { over() {} go() { super.over(); } }\n";
+    CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT, "test",
+                                           "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int mid = ts_proved_count(&file->resolved_calls, "test.main.Mid.over");
+    int top = ts_proved_count(&file->resolved_calls, "test.main.Base.top");
+    int base = ts_proved_count(&file->resolved_calls, "test.main.Base.over");
+    int own = ts_proved_count(&file->resolved_calls, "test.main.Kid.over");
+    int alone = ts_proved_count(&file->resolved_calls, "test.main.Alone.over");
+    int mark = ts_proved_count(&file->resolved_calls, "test.main.Mark.over");
+    cbm_free_result(file);
+    ASSERT_EQ(mid, 2);
+    ASSERT_EQ(top, 1);
+    ASSERT_EQ(base, 1);
+    ASSERT_EQ(own, 0);
+    ASSERT_EQ(alone, 0);
+    ASSERT_EQ(mark, 0);
+    PASS();
+}
+
+/* `this` is the literal in a method of an object literal, and the instance of a class expression
+ * in its methods. Only an arrow keeps the enclosing class's. */
+TEST(resolver_ts_this_of_a_literal_method_is_not_the_class) {
+    const char *decoys = "class C {\n"
+                         "  h() { return 1; }\n"
+                         "  inObject() { return { g() { return this.h(); } }; }\n"
+                         "  inGetter() { return { get g() { return this.h(); } }; }\n"
+                         "  inClassExpr() { return class { g() { return this.h(); } }; }\n"
+                         "  inFunction() { return function () { return this.h(); }; }\n"
+                         "  onOther(o: object) {\n"
+                         "    Object.defineProperty(o, 'k', { get() { return this.h(); } });\n"
+                         "  }\n"
+                         "  otherCall() { define(this, 'k', { get() { return this.h(); } }); }\n"
+                         "}\n";
+    CBMFileResult *file = cbm_extract_file(decoys, (int)strlen(decoys), CBM_LANG_TYPESCRIPT, "test",
+                                           "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int literal = ts_proved_count(&file->resolved_calls, "test.main.C.h");
+    cbm_free_result(file);
+    ASSERT_EQ(literal, 0);
+    const char *arrows = "class C {\n"
+                         "  h() { return 1; }\n"
+                         "  arrowKeeps() { return () => this.h(); }\n"
+                         "  arrowProp() { return { g: () => this.h() }; }\n"
+                         "  own() { return this.h(); }\n"
+                         "  onThis() {\n"
+                         "    Object.defineProperty(this, 'k', { get() { return this.h(); } });\n"
+                         "  }\n"
+                         "}\n";
+    file = cbm_extract_file(arrows, (int)strlen(arrows), CBM_LANG_TYPESCRIPT, "test", "main.ts", 0,
+                            NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int kept = ts_proved_count(&file->resolved_calls, "test.main.C.h");
+    cbm_free_result(file);
+    ASSERT_EQ(kept, 4);
     PASS();
 }
 
@@ -389,6 +668,12 @@ TEST(resolver_ts_duplicate_method_declarations_abstain) {
 SUITE(resolver_ts) {
     RUN_TEST(resolver_ts_declared_receiver_selects_exact_occurrence);
     RUN_TEST(resolver_ts_unknown_union_and_later_shadow_abstain);
+    RUN_TEST(resolver_ts_rebinding_changes_only_the_declaration_it_resolves_to);
+    RUN_TEST(resolver_ts_rebinding_through_scopes_still_abstains);
+    RUN_TEST(resolver_ts_only_direct_eval_withdraws_the_proofs_of_a_file);
+    RUN_TEST(resolver_ts_cast_writes_keep_the_proofs_of_a_file);
+    RUN_TEST(resolver_ts_written_receiver_forms_are_proved);
+    RUN_TEST(resolver_ts_super_selects_from_the_base_class);
     RUN_TEST(resolver_ts_ordinary_syntax_keeps_method_proofs);
     RUN_TEST(resolver_ts_large_class_keeps_every_method_proof);
     RUN_TEST(resolver_ts_field_initializer_this_is_proved);
@@ -397,6 +682,7 @@ SUITE(resolver_ts) {
     RUN_TEST(resolver_ts_own_method_of_a_subclass_is_proved);
     RUN_TEST(resolver_ts_javascript_member_write_withdraws_only_that_method);
     RUN_TEST(resolver_ts_annotation_type_refs_are_exact_occurrences);
+    RUN_TEST(resolver_ts_this_of_a_literal_method_is_not_the_class);
     RUN_TEST(resolver_ts_imported_type_requires_export_binding);
     RUN_TEST(resolver_ts_overlay_copies_coalesce_only_same_declaration);
     RUN_TEST(resolver_ts_duplicate_method_declarations_abstain);

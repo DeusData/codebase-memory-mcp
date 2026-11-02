@@ -223,6 +223,23 @@ typedef struct {
     bool ambiguous;
 } semantic_site_t;
 
+/* A declaration of one ECMAScript file that its graph node really shows. */
+typedef struct {
+    int start_line, end_line;
+    int parent; /* The nearest shown declaration around this one, or -1. */
+    const cbm_gbuf_node_t *node;
+} ecma_owner_t;
+
+/* Lines and shown declarations of one file, built at its first same-named twin. Lookups are
+ * a binary search plus the nesting depth, so a file full of twins stays near linear. */
+typedef struct {
+    uint32_t *line_starts;
+    size_t line_count;
+    ecma_owner_t *owners;
+    int owner_count;
+    bool built;
+} ecma_spans_t;
+
 typedef struct {
     const cbm_shared_resolver_t *shared;
     const cbm_resolver_file_t *file;
@@ -240,6 +257,7 @@ typedef struct {
     bool source_matches;
     const char *source;
     size_t source_length;
+    ecma_spans_t *ecma_spans;
     const cbm_rust_file_analysis_t *rust;
     /* One node per distinct site fact, so its size is the file's own: only the
      * memory core can refuse it, never a cap that would drop edges from a big file. */
@@ -704,20 +722,123 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
             proof->end_line == (uint32_t)node->end_line);
 }
 
+static int ecma_owner_compare(const void *left, const void *right) {
+    const ecma_owner_t *a = left, *b = right;
+    if (a->start_line != b->start_line)
+        return a->start_line < b->start_line ? -1 : 1;
+    return a->end_line == b->end_line ? 0 : (a->end_line > b->end_line ? -1 : 1);
+}
+
+/* One pass over the bytes and one over the definitions, with a stack of the open spans. */
+static bool ecma_spans_build(const file_resolver_t *resolver) {
+    ecma_spans_t *spans = resolver->ecma_spans;
+    if (spans->built)
+        return true;
+    size_t lines = 1;
+    for (size_t at = 0; at < resolver->source_length; at++)
+        lines += resolver->source[at] == '\n';
+    const CBMFileResult *result = resolver->file->result;
+    size_t capacity = result->defs.count > 0 ? (size_t)result->defs.count : 0;
+    spans->line_starts = cbm_arena_alloc(resolver->arena, lines * sizeof(*spans->line_starts));
+    spans->owners =
+        capacity ? cbm_arena_alloc(resolver->arena, capacity * sizeof(*spans->owners)) : NULL;
+    int *open = capacity ? cbm_arena_alloc(resolver->arena, capacity * sizeof(*open)) : NULL;
+    if (!spans->line_starts || (capacity && (!spans->owners || !open)))
+        return false;
+    spans->line_starts[spans->line_count++] = 0;
+    for (size_t at = 0; at < resolver->source_length; at++)
+        if (resolver->source[at] == '\n')
+            spans->line_starts[spans->line_count++] = (uint32_t)at + 1;
+    for (int d = 0; d < result->defs.count; d++) {
+        const CBMDefinition *def = &result->defs.items[d];
+        if (!def->label || (strcmp(def->label, "Function") && strcmp(def->label, "Method")))
+            continue;
+        const cbm_gbuf_node_t *node =
+            cbm_gbuf_find_by_qn(resolver->file->graph, def->qualified_name);
+        if (!node || !node->file_path || strcmp(node->file_path, resolver->file->rel_path) ||
+            node->start_line != (int)def->start_line || node->end_line != (int)def->end_line)
+            continue;
+        spans->owners[spans->owner_count++] = (ecma_owner_t){
+            .start_line = node->start_line, .end_line = node->end_line, .node = node};
+    }
+    if (spans->owner_count > 1)
+        qsort(spans->owners, (size_t)spans->owner_count, sizeof(*spans->owners),
+              ecma_owner_compare);
+    int depth = 0;
+    for (int i = 0; i < spans->owner_count; i++) {
+        ecma_owner_t *owner = &spans->owners[i];
+        while (depth && spans->owners[open[depth - 1]].end_line < owner->end_line)
+            depth--;
+        owner->parent = depth ? open[depth - 1] : -1;
+        open[depth++] = i;
+    }
+    spans->built = true;
+    return true;
+}
+
+static int ecma_line_at(const ecma_spans_t *spans, uint32_t start) {
+    size_t low = 0, high = spans->line_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (spans->line_starts[mid] <= start)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return (int)low;
+}
+
 /* JavaScript nests functions freely and extraction names them flat, so two
  * `const handle` of one file share a QN and one graph node, showing the last. That
  * node is still exactly right for an occurrence inside its own span. */
 static bool ecma_source_span_settles(const file_resolver_t *resolver, const cbm_gbuf_node_t *node,
-                                     uint32_t start, const char *source, size_t length) {
+                                     uint32_t start) {
     const target_proof_t *proof =
         resolver->shared ? cbm_ht_get(resolver->shared->targets, node->qualified_name) : NULL;
-    if (!proof || !proof->ambiguous || proof->cross_file || !source || start > length ||
-        node->start_line <= 0 || !ecma_language(resolver->file->language))
+    if (!proof || !proof->ambiguous || proof->cross_file || !resolver->source ||
+        start > resolver->source_length || node->start_line <= 0 || !resolver->ecma_spans ||
+        !ecma_spans_build(resolver))
         return false;
-    int line = 1;
-    for (uint32_t at = 0; at < start; at++)
-        line += source[at] == '\n';
+    int line = ecma_line_at(resolver->ecma_spans, start);
     return line >= node->start_line && line <= node->end_line;
+}
+
+/* An occurrence in a twin the node does not show. That twin has no node of its own, so it
+ * is as nameless to the graph as an anonymous callable, and its body belongs to the nearest
+ * declaration around it that the graph does show, else the file. A line only proves it is
+ * inside a span it falls strictly within; an outer owner is coarser and still true. */
+static const cbm_gbuf_node_t *ecma_shown_owner(const file_resolver_t *resolver,
+                                               const cbm_gbuf_node_t *twin, uint32_t start) {
+    const target_proof_t *proof =
+        resolver->shared ? cbm_ht_get(resolver->shared->targets, twin->qualified_name) : NULL;
+    if (!proof || !proof->ambiguous || proof->cross_file || !resolver->source ||
+        start > resolver->source_length || !resolver->ecma_spans || !resolver->file_node ||
+        !ecma_spans_build(resolver))
+        return NULL;
+    const ecma_spans_t *spans = resolver->ecma_spans;
+    int line = ecma_line_at(spans, start);
+    int low = 0, high = spans->owner_count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (spans->owners[mid].start_line <= line)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    for (int at = low - 1; at >= 0; at = spans->owners[at].parent) {
+        const ecma_owner_t *owner = &spans->owners[at];
+        if (owner->node != twin && owner->start_line < line && line < owner->end_line)
+            return owner->node;
+    }
+    /* The node a module-level occurrence of this file uses. */
+    const char *module_qn = resolver->file->result->module_qn;
+    const cbm_gbuf_node_t *module =
+        module_qn ? cbm_gbuf_find_by_qn(resolver->file->graph, module_qn) : NULL;
+    /* `message-part.tsx` and `message-part.css` share a module QN; its node may show the other. */
+    return module && module->label && !strcmp(module->label, "Module") && module->file_path &&
+                   !strcmp(module->file_path, resolver->file->rel_path)
+               ? module
+               : resolver->file_node;
 }
 
 /* The lexical declaration this occurrence names is the one the node shows. */
@@ -4267,13 +4388,20 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     }
     const owner_variant_t *conditional =
         conditional_source_owner(resolver, source, start, end, origin);
-    if (source && !source_identity_holds(resolver, source, conditional != NULL) &&
-        !(source->file_path && !strcmp(source->file_path, resolver->file->rel_path) &&
-          ecma_source_span_settles(resolver, source, start, resolver->source,
-                                   resolver->source_length))) {
-        result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
-        if (result.binding == CBM_RESOLVE_BINDING_UNIQUE)
-            result.reason = "source_declaration_identity_conflict";
+    bool moved = false;
+    if (source && !source_identity_holds(resolver, source, conditional != NULL)) {
+        bool here = source->file_path && !strcmp(source->file_path, resolver->file->rel_path);
+        if (!here || !ecma_source_span_settles(resolver, source, start)) {
+            const cbm_gbuf_node_t *owner = here ? ecma_shown_owner(resolver, source, start) : NULL;
+            if (owner) {
+                source = owner;
+                moved = true;
+            } else {
+                result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
+                if (result.binding == CBM_RESOLVE_BINDING_UNIQUE)
+                    result.reason = "source_declaration_identity_conflict";
+            }
+        }
     }
     if (target && !target_materialized(resolver, target) &&
         !ecma_target_span_settles(resolver, target, name, start, end, origin)) {
@@ -4310,7 +4438,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     const cbm_resolve_proof_t *binding =
         local_occurrence_proof(resolver, source ? source->qualified_name : scope, name, relation,
                                start, end, origin, &result);
-    if (!binding && source && carrier_needs_site_proof(resolver, source, scope, &result))
+    if (!binding && source &&
+        ((moved && result.proof && cbm_resolve_admit(&result)) ||
+         carrier_needs_site_proof(resolver, source, scope, &result)))
         binding = carrier_occurrence_proof(resolver, source->qualified_name, name, relation, start,
                                            end, origin, &result);
     if (conditional && result.proof && cbm_resolve_admit(&result)) {
@@ -4598,11 +4728,13 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     source_file.result =
         owner_source_view(file->result, file->language, source, length, &source_view, &owner_tree);
     file = &source_file;
+    ecma_spans_t ecma_spans = {0};
     file_resolver_t resolver = {.shared = shared,
                                 .file = file,
                                 .arena = &arena,
                                 .source = source,
                                 .source_length = length,
+                                .ecma_spans = ecma_language(file->language) ? &ecma_spans : NULL,
                                 .source_matches = cbm_result_source_matches(
                                     file->result, source, length, CBM_SOURCE_ORIGIN_RAW)};
     resolver.file_node =

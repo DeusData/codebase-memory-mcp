@@ -10,6 +10,7 @@
 #include "../src/pipeline/path_alias.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "test_helpers.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -395,6 +396,104 @@ TEST(path_alias_loader_honors_discovery_exclusions) {
 
 /* ── Loader returns NULL when no configs found ─────────────────── */
 
+/* A config governs its own directory: a nested one with nothing to say hides the root's aliases,
+ * `extends` is followed by relative path, and `paths` targets are relative to baseUrl. */
+TEST(path_alias_loader_extends_and_closed_scope) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_alias_extends_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512], sub[512];
+    static const char *const dirs[] = {"app", "closed", "solution", "configs", "based"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(sub, sizeof(sub), "%s/%s", tmp, dirs[i]);
+        cbm_mkdir(sub);
+    }
+    snprintf(path, sizeof(path), "%s/tsconfig.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"compilerOptions\":{\"paths\":{\"@root/*\":[\"./src/*\"]}}}"), 0);
+    snprintf(path, sizeof(path), "%s/configs/base.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"compilerOptions\":{\"paths\":{\"@base/*\":[\"../lib/*\"]},"
+                               "\"customConditions\":[\"source\"]}}"),
+              0);
+    snprintf(path, sizeof(path), "%s/app/tsconfig.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"extends\":\"../configs/base\"}"), 0);
+    snprintf(path, sizeof(path), "%s/closed/tsconfig.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"compilerOptions\":{}}"), 0);
+    snprintf(path, sizeof(path), "%s/solution/tsconfig.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"files\":[],\"references\":[]}"), 0);
+    snprintf(path, sizeof(path), "%s/based/tsconfig.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"compilerOptions\":{\"baseUrl\":\"./src\","
+                               "\"paths\":{\"@b/*\":[\"./inner/*\"]}}}"),
+              0);
+
+    cbm_path_alias_collection_t *coll = cbm_load_path_aliases(tmp);
+    ASSERT_NOT_NULL(coll);
+    char *hit;
+
+    const cbm_path_alias_map_t *app = cbm_path_alias_find_for_file(coll, "app/a.ts");
+    ASSERT_NOT_NULL(app);
+    hit = cbm_path_alias_resolve(app, "@base/x");
+    ASSERT_NOT_NULL(hit);
+    ASSERT_STR_EQ(hit, "lib/x");
+    free(hit);
+    ASSERT_NULL(cbm_path_alias_resolve(app, "@root/x"));
+    ASSERT_EQ(app->custom_condition_count, 1);
+    ASSERT_STR_EQ(app->custom_conditions[0], "source");
+    ASSERT_TRUE(cbm_path_alias_is_extended_base(coll, "configs/base.json"));
+    ASSERT_FALSE(cbm_path_alias_is_extended_base(coll, "tsconfig.json"));
+    ASSERT_FALSE(cbm_path_alias_is_extended_base(coll, "configs/other.json"));
+
+    /* Its own scope, with no alias: the root's @root does not reach it. */
+    const cbm_path_alias_map_t *closed = cbm_path_alias_find_for_file(coll, "closed/a.ts");
+    ASSERT_NOT_NULL(closed);
+    ASSERT_NULL(cbm_path_alias_resolve(closed, "@root/x"));
+
+    /* A solution config compiles nothing, so the root still governs its directory. */
+    const cbm_path_alias_map_t *solution = cbm_path_alias_find_for_file(coll, "solution/a.ts");
+    ASSERT_NOT_NULL(solution);
+    hit = cbm_path_alias_resolve(solution, "@root/x");
+    ASSERT_NOT_NULL(hit);
+    ASSERT_STR_EQ(hit, "src/x");
+    free(hit);
+
+    const cbm_path_alias_map_t *based = cbm_path_alias_find_for_file(coll, "based/a.ts");
+    ASSERT_NOT_NULL(based);
+    hit = cbm_path_alias_resolve(based, "@b/x");
+    ASSERT_NOT_NULL(hit);
+    ASSERT_STR_EQ(hit, "based/src/inner/x");
+    free(hit);
+
+    cbm_path_alias_collection_free(coll);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A cycle of `extends` arrays branches at each level; it ends, and still reads what it found. */
+TEST(path_alias_loader_extends_cycle_ends) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_alias_cycle_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/tsconfig.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"extends\":[\"./a.json\",\"./a.json\"],"
+                               "\"compilerOptions\":{\"paths\":{\"@x/*\":[\"./src/*\"]}}}"),
+              0);
+    snprintf(path, sizeof(path), "%s/a.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"extends\":[\"./b.json\",\"./b.json\"]}"), 0);
+    snprintf(path, sizeof(path), "%s/b.json", tmp);
+    ASSERT_EQ(write_file(path, "{\"extends\":[\"./a.json\",\"./a.json\"]}"), 0);
+    cbm_path_alias_collection_t *coll = cbm_load_path_aliases(tmp);
+    ASSERT_NOT_NULL(coll);
+    const cbm_path_alias_map_t *map = cbm_path_alias_find_for_file(coll, "src/a.ts");
+    ASSERT_NOT_NULL(map);
+    char *hit = cbm_path_alias_resolve(map, "@x/y");
+    ASSERT_NOT_NULL(hit);
+    ASSERT_STR_EQ(hit, "src/y");
+    free(hit);
+    cbm_path_alias_collection_free(coll);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(path_alias_loader_no_configs) {
     char tmpl[256];
     snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_empty_XXXXXX");
@@ -563,6 +662,8 @@ void suite_path_alias(void) {
     RUN_TEST(path_alias_loader_monorepo);
     RUN_TEST(path_alias_loader_monorepo_dotdot_climb);
     RUN_TEST(path_alias_loader_honors_discovery_exclusions);
+    RUN_TEST(path_alias_loader_extends_and_closed_scope);
+    RUN_TEST(path_alias_loader_extends_cycle_ends);
     RUN_TEST(path_alias_loader_no_configs);
     RUN_TEST(path_alias_loader_skips_linked_directory);
 #ifdef _WIN32

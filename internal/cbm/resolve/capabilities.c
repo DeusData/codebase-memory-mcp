@@ -40,14 +40,16 @@ static const edge_row_t edge_rows[] = {
      "Literal include paths and configured search roots only; no semantic proof bridge "
      "advertised."},
     {CBM_LANG_JAVASCRIPT, SOURCE_EDGES | EDGE(WRITES),
-     "Exact relative modules, directory entries and configured package roots, ES and CommonJS "
-     "export surfaces; runtime module paths and classic browser scripts abstain."},
+     "Exact relative modules, directory entries, workspace manifests and their exports, ES and "
+     "CommonJS export surfaces; runtime module paths and classic browser scripts abstain."},
     {CBM_LANG_TYPESCRIPT, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
-     "Exact relative modules, directory entries and configured package roots, ES and CommonJS "
-     "export surfaces; runtime module paths abstain."},
+     "Exact relative modules, directory entries, tsconfig paths, workspace manifests and their "
+     "exports, ES and CommonJS export surfaces; runtime module paths and built-only package "
+     "entries abstain."},
     {CBM_LANG_TSX, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
-     "Exact relative modules, directory entries and configured package roots, ES and CommonJS "
-     "export surfaces; runtime module paths abstain."},
+     "Exact relative modules, directory entries, tsconfig paths, workspace manifests and their "
+     "exports, ES and CommonJS export surfaces; runtime module paths and built-only package "
+     "entries abstain."},
     {CBM_LANG_ARKTS, SOURCE_EDGES,
      "Source JavaScript-style imports only; containing-language typed dispatch is unsupported."},
     {CBM_LANG_VUE, CALLABLE_EDGES,
@@ -292,8 +294,10 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = "Source-audited lexical scopes, annotations, constructions and declared "
-                          "fields; unproved inherited or dynamic lookup and classic browser "
+        out->limitation = "Source-audited lexical scopes, annotations, casts, constructions, "
+                          "declared members, declared return types and type aliases that select "
+                          "one declaration; receivers with two declarations, narrowed receivers, "
+                          "inferred returns, callback parameters, direct eval and classic browser "
                           "scripts abstain.";
         break;
     case CBM_LANG_PYTHON:

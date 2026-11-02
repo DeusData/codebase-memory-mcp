@@ -429,9 +429,44 @@ static bool node_workspace_path(const char *value, const char *directory, char *
            cbm_repo_rel_join(directory, relative, path, capacity);
 }
 
+enum { NODE_WORKSPACE_PATTERNS = 256 };
+
+/* Every pattern of one workspace root, one per line. More than this reader holds, or a pattern
+ * it cannot state, leaves the root with no members, which is the safe side. */
+static void node_workspace_pattern_list(cbm_pkg_entries_t *entries, const char *directory,
+                                        const char *const *patterns, int count) {
+    if (count <= 0 || count > NODE_WORKSPACE_PATTERNS)
+        return;
+    size_t total = 1;
+    for (int i = 0; i < count; i++) {
+        if (!patterns[i] || !patterns[i][0] || strchr(patterns[i], '\n') ||
+            strpbrk(patterns[i], "{}[]?"))
+            return;
+        total += strlen(patterns[i]) + 1;
+    }
+    char *list = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, total);
+    if (!list) {
+        entries->incomplete = true;
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        size_t length = strlen(patterns[i]);
+        memcpy(list + used, patterns[i], length);
+        used += length;
+        list[used++] = '\n';
+    }
+    list[used] = '\0';
+    node_collect(entries, "workspace-patterns", directory, NULL, list);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, list);
+}
+
+/* Yarn and Bun also spell it `"workspaces": {"packages": [...]}`. */
 static void node_workspace_paths(yyjson_val *root, const char *directory,
                                  cbm_pkg_entries_t *entries) {
     yyjson_val *workspaces = yyjson_obj_get(root, "workspaces");
+    if (yyjson_is_obj(workspaces))
+        workspaces = yyjson_obj_get(workspaces, "packages");
     if (!yyjson_is_arr(workspaces))
         return;
     node_collect(entries, "root", directory, NULL, "1");
@@ -439,11 +474,22 @@ static void node_workspace_paths(yyjson_val *root, const char *directory,
     yyjson_val *item;
     char path[PKGMAP_PATH_BUF];
     bool glob;
-    /* Unknown glob/exclusion semantics cannot preserve only the convenient
-     * positive half of a workspace declaration. */
+    /* A form the exact facts cannot state goes through the pattern list whole, so a negation
+     * can never be dropped and leave only the convenient positive half. */
     yyjson_arr_foreach(workspaces, i, count, item) {
-        if (!node_workspace_path(yyjson_get_str(item), directory, path, sizeof(path), &glob))
+        if (!node_workspace_path(yyjson_get_str(item), directory, path, sizeof(path), &glob)) {
+            const char *patterns[NODE_WORKSPACE_PATTERNS];
+            int listed = 0;
+            size_t at, total;
+            yyjson_val *pattern;
+            yyjson_arr_foreach(workspaces, at, total, pattern) {
+                if (listed < NODE_WORKSPACE_PATTERNS)
+                    patterns[listed] = yyjson_get_str(pattern);
+                listed++;
+            }
+            node_workspace_pattern_list(entries, directory, patterns, listed);
             return;
+        }
     }
     yyjson_arr_foreach(workspaces, i, count, item) {
         if (node_workspace_path(yyjson_get_str(item), directory, path, sizeof(path), &glob))
@@ -489,12 +535,89 @@ static bool node_manifest_unique(yyjson_val *value, unsigned depth) {
     return true;
 }
 
-/* A nearer dependency declaration may install a different version or npm
- * alias ahead of the root workspace link. Without dependency solving it is
- * a blocking fact, even when a same-named workspace package exists. */
+/* major.minor.patch with each of the last two optional, x or * meaning any. False for a tag, a
+ * prerelease, or anything else this reader cannot compare. */
+static bool node_version_parts(const char *text, long parts[3], int *given) {
+    *given = 0;
+    parts[0] = parts[1] = parts[2] = 0;
+    for (const char *at = text; *given < 3;) {
+        if (*at == 'x' || *at == 'X' || *at == '*') {
+            at++;
+            if (*at)
+                return false;
+            break;
+        }
+        if (!isdigit((unsigned char)*at))
+            return false;
+        char *end = NULL;
+        parts[*given] = strtol(at, &end, 10);
+        (*given)++;
+        at = end;
+        if (!*at)
+            break;
+        if (*at != '.' || *given == 3)
+            return false;
+        at++;
+    }
+    return true;
+}
+
+/* Whether this range admits this exact version, for the forms package managers write. */
+static bool node_version_satisfies(const char *range, const char *version) {
+    long have[3], want[3];
+    int have_count = 0, want_count = 0;
+    if (!version || !node_version_parts(version, have, &have_count) || have_count != 3)
+        return false;
+    char op = range[0] == '^' || range[0] == '~' ? range[0] : 0;
+    bool at_least = !strncmp(range, ">=", 2);
+    const char *text = op ? range + 1 : at_least ? range + 2 : range;
+    if (!node_version_parts(text, want, &want_count))
+        return false;
+    bool not_below = have[0] != want[0]   ? have[0] > want[0]
+                     : have[1] != want[1] ? have[1] > want[1]
+                                          : have[2] >= want[2];
+    if (at_least)
+        return not_below;
+    if (op == '^') {
+        if (!not_below || have[0] != want[0])
+            return false;
+        /* The leftmost nonzero part is held: `^0.2.1` stays in 0.2, `^0.0.3` is 0.0.3 alone. */
+        if (want[0] != 0 || want_count < 2)
+            return true;
+        if (have[1] != want[1])
+            return false;
+        return want[1] != 0 || want_count < 3 || have[2] == want[2];
+    }
+    if (op == '~')
+        return not_below && have[0] == want[0] && (want_count < 2 || have[1] == want[1]);
+    /* A bare version is itself; a partial one, like `1.x`, admits what it leaves open. */
+    for (int i = 0; i < want_count; i++)
+        if (have[i] != want[i])
+            return false;
+    return true;
+}
+
+/* Could this spelling ever be satisfied by a version in the tree? */
+static bool node_range_shape(const char *range) {
+    long parts[3];
+    int given = 0;
+    if (!strcmp(range, "*") || !strcmp(range, ""))
+        return true;
+    const char *text = range[0] == '^' || range[0] == '~' ? range + 1
+                       : !strncmp(range, ">=", 2)         ? range + 2
+                                                          : range;
+    return node_version_parts(text, parts, &given);
+}
+
+/* A nearer dependency can install another version or an npm alias ahead of the root workspace
+ * link, so it blocks, unless its own spelling rules that out. `workspace:*` names the
+ * workspace package by definition. A plain range is checked against that package's version
+ * at the lookup: npm, Yarn and Bun link a local package the range admits. A peer installs
+ * nothing of its own beside another declaration of the same package. */
 static void node_dependencies(yyjson_val *root, const char *directory, cbm_pkg_entries_t *entries) {
     static const char *const kinds[] = {"dependencies", "devDependencies", "optionalDependencies",
                                         "peerDependencies"};
+    enum { NODE_PEER_KIND = 3 };
     for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
         yyjson_val *dependencies = yyjson_obj_get(root, kinds[k]);
         if (!dependencies)
@@ -503,11 +626,24 @@ static void node_dependencies(yyjson_val *root, const char *directory, cbm_pkg_e
             node_collect(entries, "dependency", directory, NULL, "1");
             continue;
         }
-        yyjson_obj_iter keys = yyjson_obj_iter_with(dependencies);
-        yyjson_val *key;
-        while ((key = yyjson_obj_iter_next(&keys))) {
+        size_t at, count;
+        yyjson_val *key, *value;
+        yyjson_obj_foreach(dependencies, at, count, key, value) {
             const char *name = yyjson_get_str(key);
-            if (node_package_name(name))
+            const char *spec = yyjson_get_str(value);
+            if (!node_package_name(name))
+                continue;
+            if (spec && !strncmp(spec, "workspace:", 10))
+                continue;
+            bool declared_elsewhere = false;
+            for (size_t other = 0; k == NODE_PEER_KIND && other < NODE_PEER_KIND; other++)
+                declared_elsewhere |=
+                    yyjson_obj_get(yyjson_obj_get(root, kinds[other]), name) != NULL;
+            if (declared_elsewhere)
+                continue;
+            if (spec && node_range_shape(spec))
+                node_collect(entries, "dep-range", directory, name, spec);
+            else
                 node_collect(entries, "dependency", directory, name, "1");
         }
     }
@@ -520,6 +656,82 @@ static void node_entry(cbm_pkg_entries_t *entries, const char *directory, const 
                             ? path
                             : ambiguous_pkgmap_value;
     node_collect(entries, "entry", directory, subpath, value);
+}
+
+/* A subpath pattern: one star in a key, any number in a target, the rest a clean export path. */
+static bool node_export_pattern(const char *path, bool target) {
+    if (!path || !strchr(path, '*'))
+        return false;
+    char filled[PKGMAP_PATH_BUF];
+    size_t length = strlen(path), stars = 0;
+    if (length >= sizeof(filled))
+        return false;
+    for (size_t i = 0; i <= length; i++) {
+        stars += path[i] == '*';
+        filled[i] = path[i] == '*' ? 'x' : path[i];
+    }
+    return (target || stars == 1) && package_export_path(filled);
+}
+
+/* One fact per pattern, found by filling a subpath's possible star spans in node_pattern_entry. */
+static void node_pattern(cbm_pkg_entries_t *entries, const char *directory, const char *key,
+                         const char *target) {
+    char path[PKGMAP_PATH_BUF];
+    const char *value = target && cbm_repo_rel_join(directory, target, path, sizeof(path))
+                            ? path
+                            : ambiguous_pkgmap_value;
+    node_collect(entries, "entry-pattern", directory, key, value);
+}
+
+/* An `exports` branch's first condition, when it names a file itself. Conditions are tried in
+ * object order, so only the first can be chosen by a condition alone: TanStack's
+ * `{"@tanstack/custom-condition": "./src/index.ts", "import": ...}`. */
+static void node_first_condition(cbm_pkg_entries_t *entries, const char *directory,
+                                 const char *subpath, yyjson_val *branch) {
+    if (!yyjson_is_obj(branch))
+        return;
+    yyjson_obj_iter keys = yyjson_obj_iter_with(branch);
+    yyjson_val *key = yyjson_obj_iter_next(&keys);
+    const char *condition = key ? yyjson_get_str(key) : NULL;
+    const char *target = key ? yyjson_get_str(yyjson_obj_iter_get_val(key)) : NULL;
+    char path[PKGMAP_PATH_BUF], value[PKGMAP_PATH_BUF];
+    if (!condition || !*condition || condition[0] == '.' || strchr(condition, '\n') ||
+        !package_export_path(target) || !cbm_repo_rel_join(directory, target, path, sizeof(path)))
+        return;
+    int n = snprintf(value, sizeof(value), "%s\n%s", condition, path);
+    if (n > 0 && (size_t)n < sizeof(value))
+        node_collect(entries, "entry-first", directory, subpath, value);
+}
+
+/* The package's pattern keys, one per line, for the one scan a lookup makes. */
+static void node_pattern_list(cbm_pkg_entries_t *entries, const char *directory,
+                              yyjson_val *exports) {
+    size_t total = 1, at, count;
+    yyjson_val *key, *branch;
+    yyjson_obj_foreach(exports, at, count, key, branch) {
+        if (node_export_pattern(yyjson_get_str(key), false))
+            total += strlen(yyjson_get_str(key)) + 1;
+    }
+    if (total == 1)
+        return;
+    char *list = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, total);
+    if (!list) {
+        entries->incomplete = true;
+        return;
+    }
+    size_t used = 0;
+    yyjson_obj_foreach(exports, at, count, key, branch) {
+        const char *path = yyjson_get_str(key);
+        if (!node_export_pattern(path, false))
+            continue;
+        size_t length = strlen(path);
+        memcpy(list + used, path, length);
+        used += length;
+        list[used++] = '\n';
+    }
+    list[used] = '\0';
+    node_collect(entries, "patterns", directory, NULL, list);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, list);
 }
 
 /* JS/TS package manifests declare exact entries, never a guessed src/index. */
@@ -557,6 +769,9 @@ static void parse_package_json(const char *source, int source_len, const char *r
     node_dependencies(root, directory, entries);
     if (!node_package_name(name))
         goto done;
+    const char *version = yyjson_get_str(yyjson_obj_get(root, "version"));
+    if (version)
+        node_collect(entries, "version", directory, NULL, version);
     /* Legacy consumers may recognize ownership, but cannot convert this
      * bare name into a global module or directory prefix. */
     char *owned_name = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
@@ -573,6 +788,9 @@ static void parse_package_json(const char *source, int source_len, const char *r
         node_collect(entries, "self", directory, NULL, "1");
     node_entry(entries, directory, ".", resolve_pkg_entry(root));
     if (yyjson_is_obj(exports)) {
+        /* Condition keys at the top level are the `.` branch itself. */
+        yyjson_val *dot = yyjson_obj_get(exports, ".");
+        node_first_condition(entries, directory, ".", dot ? dot : exports);
         bool subpaths = true;
         yyjson_val *key;
         yyjson_obj_iter keys = yyjson_obj_iter_with(exports);
@@ -585,15 +803,98 @@ static void parse_package_json(const char *source, int source_len, const char *r
             yyjson_val *branch;
             yyjson_obj_foreach(exports, i, count, key, branch) {
                 const char *path = yyjson_get_str(key);
+                const char *target = resolve_exports_dot(branch, 0);
+                if (node_export_pattern(path, false)) {
+                    node_pattern(entries, directory, path,
+                                 node_export_pattern(target, true) ? target : NULL);
+                    continue;
+                }
                 if (!package_export_path(path))
                     continue;
-                const char *target = resolve_exports_dot(branch, 0);
                 node_entry(entries, directory, path, package_export_path(target) ? target : NULL);
+                node_first_condition(entries, directory, path, branch);
             }
+            node_pattern_list(entries, directory, exports);
         }
     }
 done:
     yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+}
+
+/* pnpm-workspace.yaml: the `packages:` block sequence, which is all this reads. A form it cannot
+ * read fails closed, the same as an unknown `workspaces` entry. */
+static void parse_pnpm_workspace(const char *source, int source_len, const char *rel_path,
+                                 cbm_pkg_entries_t *entries) {
+    char *directory = path_dirname(rel_path);
+    char *text = directory ? cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)source_len + 1) : NULL;
+    if (!text) {
+        entries->incomplete = true;
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+        return;
+    }
+    memcpy(text, source, (size_t)source_len);
+    text[source_len] = '\0';
+    node_collect(entries, "root", directory, NULL, "1");
+    enum { NODE_PNPM_PATTERNS = 256 };
+    const char *patterns[NODE_PNPM_PATTERNS];
+    int count = 0;
+    bool in_packages = false, readable = true, links_ranges = false;
+    for (char *line = text; line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        char *cursor = line;
+        while (*cursor == ' ' || *cursor == '\t')
+            cursor++;
+        size_t length = strlen(cursor);
+        while (length && isspace((unsigned char)cursor[length - 1]))
+            cursor[--length] = '\0';
+        if (!length || cursor[0] == '#') {
+            line = next;
+            continue;
+        }
+        if (cursor == line) {
+            in_packages = !strcmp(line, "packages:");
+            links_ranges |= !strcmp(line, "linkWorkspacePackages: true");
+        } else if (in_packages && cursor[0] == '-' && cursor[1] == ' ') {
+            cursor += 2;
+            while (*cursor == ' ')
+                cursor++;
+            /* A space then `#` starts a YAML comment. */
+            char *comment = strstr(cursor, " #");
+            if (comment)
+                *comment = '\0';
+            length = strlen(cursor);
+            while (length && cursor[length - 1] == ' ')
+                cursor[--length] = '\0';
+            if (length >= 2 && (cursor[0] == '\'' || cursor[0] == '"') &&
+                cursor[length - 1] == cursor[0]) {
+                cursor[length - 1] = '\0';
+                cursor++;
+            }
+            if (count < NODE_PNPM_PATTERNS)
+                patterns[count++] = cursor;
+            else
+                readable = false;
+        }
+        line = next;
+    }
+    /* pnpm links a plain range to a workspace package only when told to. */
+    if (!links_ranges)
+        node_collect(entries, "pnpm", directory, NULL, "1");
+    char path[PKGMAP_PATH_BUF];
+    bool glob = false;
+    bool exact = readable;
+    for (int i = 0; i < count; i++)
+        exact = exact && node_workspace_path(patterns[i], directory, path, sizeof(path), &glob);
+    for (int i = 0; exact && i < count; i++) {
+        if (node_workspace_path(patterns[i], directory, path, sizeof(path), &glob))
+            node_collect(entries, glob ? "glob" : "workspace", path, NULL, directory);
+    }
+    if (readable && !exact)
+        node_workspace_pattern_list(entries, directory, patterns, count);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, text);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
 }
 
@@ -1338,6 +1639,10 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
         parse_package_json(source, source_len, rel_path, entries);
         return true;
     }
+    if (strcmp(basename, "pnpm-workspace.yaml") == 0) {
+        parse_pnpm_workspace(source, source_len, rel_path, entries);
+        return true;
+    }
     if (strcmp(basename, "go.mod") == 0) {
         parse_go_mod(source, source_len, rel_path, entries);
         return true;
@@ -1401,10 +1706,107 @@ static const char *node_fact(CBMHashTable *map, const char *kind, const char *di
                                                                   : ambiguous_pkgmap_value;
 }
 
+static void node_parent_path(char *path);
+
+/* One path segment against one with `*` in it. */
+static bool node_segment_matches(const char *pattern, size_t pattern_length, const char *text,
+                                 size_t text_length) {
+    const char *star = memchr(pattern, '*', pattern_length);
+    if (!star)
+        return pattern_length == text_length && !memcmp(pattern, text, text_length);
+    size_t prefix = (size_t)(star - pattern), suffix = pattern_length - prefix - 1;
+    if (memchr(star + 1, '*', suffix))
+        return false; /* Two stars in a segment are outside this reader. */
+    return text_length >= prefix + suffix && !memcmp(text, pattern, prefix) &&
+           !memcmp(text + text_length - suffix, star + 1, suffix);
+}
+
+/* A workspace glob against a repo-relative directory: `*` within one segment, `**` for any
+ * number of them. A mismatch only returns to the last `**`, which takes one more segment: an
+ * earlier `**` could not do better, so the work is at most the product of the two lengths. */
+static bool node_glob_matches(const char *pattern, size_t pattern_length, const char *path) {
+    const char *at = pattern, *stop = pattern + pattern_length;
+    const char *resume_pattern = NULL, *resume_path = NULL;
+    for (;;) {
+        if (at < stop) {
+            const char *slash = memchr(at, '/', (size_t)(stop - at));
+            size_t segment = slash ? (size_t)(slash - at) : (size_t)(stop - at);
+            const char *next = slash ? slash + 1 : stop;
+            if (segment == 2 && !memcmp(at, "**", 2)) {
+                resume_pattern = next;
+                resume_path = path;
+                at = next;
+                continue;
+            }
+            if (*path) {
+                const char *end = strchr(path, '/');
+                size_t length = end ? (size_t)(end - path) : strlen(path);
+                if (node_segment_matches(at, segment, path, length)) {
+                    at = next;
+                    path = end ? end + 1 : "";
+                    continue;
+                }
+            }
+        } else if (!*path) {
+            return true;
+        }
+        if (!resume_pattern || !*resume_path)
+            return false;
+        const char *after = strchr(resume_path, '/');
+        resume_path = after ? after + 1 : "";
+        path = resume_path;
+        at = resume_pattern;
+    }
+}
+
+/* Listed by a positive pattern and by no negative one, whatever their order. */
+static bool node_workspace_listed(const char *list, const char *relative) {
+    bool listed = false;
+    for (const char *line = list; *line;) {
+        const char *end = strchr(line, '\n');
+        size_t length = end ? (size_t)(end - line) : strlen(line);
+        bool negative = line[0] == '!';
+        const char *pattern = line + (negative ? 1 : 0);
+        size_t pattern_length = length - (negative ? 1 : 0);
+        if (pattern_length >= 2 && !memcmp(pattern, "./", 2)) {
+            pattern += 2;
+            pattern_length -= 2;
+        }
+        if (node_glob_matches(pattern, pattern_length, relative)) {
+            if (negative)
+                return false;
+            listed = true;
+        }
+        line += length + (end ? 1 : 0);
+    }
+    return listed;
+}
+
+/* The workspace root whose pattern list holds this directory, walking its ancestors once. */
+static const char *node_pattern_owner(CBMHashTable *map, const char *directory, char *owner,
+                                      size_t capacity) {
+    int n = snprintf(owner, capacity, "%s", directory);
+    if (n < 0 || (size_t)n >= capacity)
+        return NULL;
+    while (owner[0]) {
+        node_parent_path(owner);
+        const char *list = node_fact(map, "workspace-patterns", owner, NULL);
+        if (!list || !strcmp(list, ambiguous_pkgmap_value))
+            continue;
+        size_t length = strlen(owner);
+        const char *relative = length ? directory + length + 1 : directory;
+        return node_workspace_listed(list, relative) ? owner : NULL;
+    }
+    return NULL;
+}
+
 static bool node_bind_workspace(CBMHashTable *map, const char *directory, const char *name) {
     if (!directory[0] || !node_package_name(name))
         return true;
     const char *owner = node_fact(map, "workspace", directory, NULL);
+    char pattern_owner[PKGMAP_PATH_BUF];
+    if (!owner)
+        owner = node_pattern_owner(map, directory, pattern_owner, sizeof(pattern_owner));
     char parent[PKGMAP_PATH_BUF];
     int length = snprintf(parent, sizeof(parent), "%s", directory);
     if (length < 0 || (size_t)length >= sizeof(parent))
@@ -1541,7 +1943,9 @@ static bool node_workspace_coverage(CBMHashTable *map, cbm_pkg_entries_t *worker
                 const char *scope = node_fact(map, "scope", directory, NULL);
                 node_parent_path(directory);
                 owner = node_fact(map, "glob", directory, NULL);
-                incomplete = !scope || !scope[0] || !strcmp(scope, ambiguous_pkgmap_value);
+                /* Every package manager globs `<pattern>/package.json`, so a directory with no
+                 * manifest is simply no member, like Kilo's packages/sdk beside packages/sdk/js. */
+                incomplete = scope && (!scope[0] || !strcmp(scope, ambiguous_pkgmap_value));
             }
             if (incomplete && !node_block_workspace(map, owner))
                 return false;
@@ -1690,12 +2094,12 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
     if (!basename) {
         return false;
     }
-    if (strcmp(basename, "package.json") == 0 || strcmp(basename, "go.mod") == 0 ||
-        strcmp(basename, "Cargo.toml") == 0 || strcmp(basename, "pyproject.toml") == 0 ||
-        strcmp(basename, "composer.json") == 0 || strcmp(basename, "pubspec.yaml") == 0 ||
-        strcmp(basename, "pom.xml") == 0 || strcmp(basename, "build.gradle") == 0 ||
-        strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0 ||
-        strcmp(basename, "Package.swift") == 0) {
+    if (strcmp(basename, "package.json") == 0 || strcmp(basename, "pnpm-workspace.yaml") == 0 ||
+        strcmp(basename, "go.mod") == 0 || strcmp(basename, "Cargo.toml") == 0 ||
+        strcmp(basename, "pyproject.toml") == 0 || strcmp(basename, "composer.json") == 0 ||
+        strcmp(basename, "pubspec.yaml") == 0 || strcmp(basename, "pom.xml") == 0 ||
+        strcmp(basename, "build.gradle") == 0 || strcmp(basename, "build.gradle.kts") == 0 ||
+        strcmp(basename, "mix.exs") == 0 || strcmp(basename, "Package.swift") == 0) {
         return true;
     }
     return ends_with(basename, ".gemspec");
@@ -4421,6 +4825,85 @@ failed:
 /* Node bare package lookup uses the nearest manifest for self-reference,
  * then an enclosing declared workspace. Entry paths stay exact through File
  * materialization; dotted filenames cannot lose a second extension. */
+static bool node_range_admits(const char *range, const char *version) {
+    return !strcmp(range, "*") || !range[0] || node_version_satisfies(range, version);
+}
+
+/* Node's PACKAGE_EXPORTS_RESOLVE for a subpath no exact key names: the matching pattern with
+ * the longest prefix, then the longest key, with its star filled in. A pattern with no usable
+ * target blocks the subpath. One scan of this package's own patterns. */
+static bool node_pattern_entry(CBMHashTable *map, const char *owner, const char *subpath, char *out,
+                               size_t capacity) {
+    const char *list = node_fact(map, "patterns", owner, NULL);
+    if (!list || !strcmp(list, ambiguous_pkgmap_value))
+        return false;
+    size_t length = strlen(subpath);
+    const char *best = NULL;
+    size_t best_prefix = 0, best_key = 0, best_star = 0;
+    for (const char *key = list; *key;) {
+        const char *end = strchr(key, '\n');
+        size_t key_length = end ? (size_t)(end - key) : strlen(key);
+        const char *star = memchr(key, '*', key_length);
+        size_t prefix = star ? (size_t)(star - key) : 0;
+        size_t suffix = star ? key_length - prefix - 1 : 0;
+        if (star && length > prefix + suffix && !strncmp(subpath, key, prefix) &&
+            !strncmp(subpath + length - suffix, star + 1, suffix) &&
+            (prefix > best_prefix || (prefix == best_prefix && key_length > best_key))) {
+            best = key;
+            best_prefix = prefix;
+            best_key = key_length;
+            best_star = length - prefix - suffix;
+        }
+        key += key_length + (end ? 1 : 0);
+    }
+    char name[PKGMAP_PATH_BUF];
+    if (!best || best_key >= sizeof(name))
+        return false;
+    memcpy(name, best, best_key);
+    name[best_key] = '\0';
+    const char *target = node_fact(map, "entry-pattern", owner, name);
+    if (!target || !strcmp(target, ambiguous_pkgmap_value))
+        return false;
+    size_t used = 0;
+    for (const char *c = target; *c; c++) {
+        size_t add = *c == '*' ? best_star : 1;
+        if (used + add + 1 > capacity)
+            return false;
+        if (*c == '*')
+            memcpy(out + used, subpath + best_prefix, best_star);
+        else
+            out[used] = *c;
+        used += add;
+    }
+    out[used] = '\0';
+    return true;
+}
+
+/* TypeScript reads an output path's own source: a package entry `./index.js` beside index.ts,
+ * in a tree with no build output, is that index.ts. */
+static const cbm_gbuf_node_t *typescript_source_of_output(const cbm_pipeline_ctx_t *ctx,
+                                                          const char *entry) {
+    static const struct {
+        const char *output, *source;
+    } maps[] = {
+        {".js", ".ts"}, {".js", ".tsx"}, {".jsx", ".tsx"}, {".mjs", ".mts"}, {".cjs", ".cts"}};
+    const char *dot = strrchr(entry, '.');
+    char candidate[PKGMAP_PATH_BUF];
+    for (size_t i = 0; dot && i < sizeof(maps) / sizeof(maps[0]); i++) {
+        if (strcmp(dot, maps[i].output))
+            continue;
+        int n = snprintf(candidate, sizeof(candidate), "%.*s%s", (int)(dot - entry), entry,
+                         maps[i].source);
+        const cbm_gbuf_node_t *file =
+            n > 0 && (size_t)n < sizeof(candidate)
+                ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate)
+                : NULL;
+        if (file)
+            return file;
+    }
+    return NULL;
+}
+
 static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx, const char *source,
                                                   const char *specifier, CBMLanguage language,
                                                   bool *covered) {
@@ -4462,6 +4945,7 @@ static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx,
     else
         directory[0] = '\0';
     const char *owner = NULL;
+    const char *range = NULL;
     bool scope_seen = false;
     for (;;) {
         const char *scope = node_fact(map, "scope", directory, NULL);
@@ -4482,9 +4966,17 @@ static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx,
             *covered = true;
             break;
         }
+        if (scope && !range)
+            range = node_fact(map, "dep-range", directory, package);
         if (node_fact(map, "root", directory, NULL)) {
             owner = node_fact(map, "bound", directory, package);
             *covered = *covered || owner != NULL;
+            /* A plain range links only the version it admits, and pnpm links none by default. */
+            if (owner && range && strcmp(owner, ambiguous_pkgmap_value) &&
+                (node_fact(map, "pnpm", directory, NULL) ||
+                 !strcmp(range, ambiguous_pkgmap_value) ||
+                 !node_range_admits(range, node_fact(map, "version", owner, NULL))))
+                owner = NULL;
             break;
         }
         if (!*directory)
@@ -4498,10 +4990,36 @@ static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx,
     const char *entry = owner && strcmp(owner, ambiguous_pkgmap_value)
                             ? node_fact(map, "entry", owner, subpath)
                             : NULL;
+    char patterned[PKGMAP_PATH_BUF];
+    if (!entry && owner && strcmp(owner, ambiguous_pkgmap_value) &&
+        node_pattern_entry(map, owner, subpath, patterned, sizeof(patterned)))
+        entry = patterned;
+    /* TypeScript matches the governing config's customConditions before the rest. */
+    const char *first =
+        owner && strcmp(owner, ambiguous_pkgmap_value) && language != CBM_LANG_JAVASCRIPT
+            ? node_fact(map, "entry-first", owner, subpath)
+            : NULL;
+    const char *split = first ? strchr(first, '\n') : NULL;
+    const cbm_path_alias_map_t *config =
+        split && ctx->path_aliases ? cbm_path_alias_find_for_file(ctx->path_aliases, source) : NULL;
+    for (int i = 0; config && i < config->custom_condition_count; i++) {
+        size_t length = strlen(config->custom_conditions[i]);
+        if (length == (size_t)(split - first) &&
+            !memcmp(config->custom_conditions[i], first, length)) {
+            entry = split + 1;
+            break;
+        }
+    }
     const cbm_gbuf_node_t *target =
         entry && strcmp(entry, ambiguous_pkgmap_value)
             ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, entry)
             : NULL;
+    if (!target && entry && strcmp(entry, ambiguous_pkgmap_value) &&
+        language != CBM_LANG_JAVASCRIPT) {
+        const cbm_gbuf_node_t *from_source = typescript_source_of_output(ctx, entry);
+        if (from_source && import_language_matches(language, from_source))
+            return from_source;
+    }
     return target && target->file_path && !strcmp(target->file_path, entry) &&
                    import_language_matches(language, target)
                ? target
@@ -4549,8 +5067,21 @@ static const cbm_gbuf_node_t *ecma_directory_entry(const cbm_pipeline_ctx_t *ctx
     if (!cbm_repo_rel_join(source_dir, module_path, directory, sizeof(directory)))
         return NULL;
     size_t length = strlen(directory);
+    bool spelled_directory = length && directory[length - 1] == '/';
     while (length && directory[length - 1] == '/')
         directory[--length] = '\0';
+    /* `./pluginContainer` is pluginContainer.ts before any directory of that name, even where
+     * a member of a sibling index.ts holds the same QN and hid the module from a QN lookup. */
+    for (const char *const *ext = language == CBM_LANG_JAVASCRIPT ? javascript : typescript;
+         !spelled_directory && length && *ext; ext++) {
+        int n = snprintf(candidate, sizeof(candidate), "%s%s", directory, *ext);
+        const cbm_gbuf_node_t *file =
+            n > 0 && (size_t)n < sizeof(candidate)
+                ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate)
+                : NULL;
+        if (file && import_language_matches(language, file))
+            return file;
+    }
     CBMHashTable *map = cbm_pipeline_get_pkgmap();
     const char *entry = map ? node_fact(map, "main", directory, NULL) : NULL;
     if (entry) {
@@ -4582,6 +5113,38 @@ static const cbm_gbuf_node_t *ecma_directory_entry(const cbm_pipeline_ctx_t *ctx
     return NULL;
 }
 
+/* TypeScript tries the governing config's `paths` before any package lookup, so a wildcard
+ * mapping `@vue/` onto `packages/<name>/src` binds a workspace import to that source and never
+ * to the manifest's built entry. A pattern whose target does not exist falls through. */
+static const cbm_gbuf_node_t *typescript_paths_target(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel,
+                                                      const char *module_path,
+                                                      CBMLanguage language) {
+    const cbm_path_alias_map_t *aliases =
+        ctx->path_aliases && source_rel
+            ? cbm_path_alias_find_for_file(ctx->path_aliases, source_rel)
+            : NULL;
+    char aliased[CBM_PATH_ALIAS_RESULT_MAX];
+    if (!aliases)
+        return NULL;
+    if (!cbm_path_alias_resolve_into(aliases, module_path, aliased, sizeof(aliased))) {
+        /* baseUrl covers a bare name too. Only a file that exists there stands in for a package. */
+        int n = aliases->base_url && module_path[0] != '.'
+                    ? snprintf(aliased, sizeof(aliased), "%s/%s", aliases->base_url, module_path)
+                    : -1;
+        if (n <= 0 || (size_t)n >= sizeof(aliased))
+            return NULL;
+    }
+    char *qn = cbm_pipeline_fqn_module(ctx->project_name, aliased);
+    const cbm_gbuf_node_t *target = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    free(qn);
+    if (target && target->label &&
+        (!strcmp(target->label, "Module") || !strcmp(target->label, "File")) &&
+        import_language_matches(language, target))
+        return target;
+    return ecma_directory_entry(ctx, "", aliased, language);
+}
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const CBMImport *imp,
     CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only, bool *ambiguous) {
@@ -4597,6 +5160,12 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
 
     if (src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
         src_lang == CBM_LANG_TSX || src_lang == CBM_LANG_ARKTS) {
+        if (src_lang != CBM_LANG_JAVASCRIPT && !slash_relative) {
+            const cbm_gbuf_node_t *aliased =
+                typescript_paths_target(ctx, source_rel, imp->module_path, src_lang);
+            if (aliased)
+                return aliased;
+        }
         bool covered = false;
         const cbm_gbuf_node_t *package =
             node_package_target(ctx, source_rel, imp->module_path, src_lang, &covered);

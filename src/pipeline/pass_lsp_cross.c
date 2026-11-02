@@ -854,7 +854,13 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
     memset(lens, 0, (size_t)(end - start) * sizeof(size_t));
     memset(used, 0, (size_t)(end - start) * sizeof(size_t));
     for (int si = start; si < end; si++) {
-        if (defs[si].label && strcmp(defs[si].label, "Class") == 0 && defs[si].qualified_name) {
+        /* A TypeScript interface declares typed members just as a class does. */
+        if (defs[si].label && defs[si].qualified_name &&
+            (strcmp(defs[si].label, "Class") == 0 ||
+             (bs->lang != CBM_LANG_PYTHON &&
+              (strcmp(defs[si].label, "Interface") == 0 || strcmp(defs[si].label, "Type") == 0 ||
+               strcmp(defs[si].label, "Function") == 0 ||
+               strcmp(defs[si].label, "Method") == 0)))) {
             cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
         }
     }
@@ -865,6 +871,10 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
         CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
         const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
         const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn, NULL) : NULL;
+        /* TypeScript keeps the row with no class: the member is declared, and hides a base's. */
+        if (owner && !qn && bs->lang != CBM_LANG_PYTHON) {
+            qn = "";
+        }
         if (!qn || !ft->field_name || !ft->field_name[0]) {
             continue;
         }
@@ -1347,6 +1357,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         const char *source_file_qn =
             source_file_owned ? cbm_arena_strdup(arena, source_file_owned) : NULL;
         free(source_file_owned);
+        const char *default_export = cbm_resolve_binding_js_default_target(export_bindings);
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
                                   files[fi].language, &defs[idx], bs.reg ? &bs : NULL) == 0) {
@@ -1361,7 +1372,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 defs[idx].export_binding_proven =
                     (cbm_resolve_binding_export_kind(export_bindings,
                                                      fr->defs.items[di].qualified_name) &
-                     CBM_RESOLVE_EXPORT_TYPE) != 0;
+                     CBM_RESOLVE_EXPORT_TYPE) != 0 ||
+                    (default_export && !strcmp(default_export, fr->defs.items[di].qualified_name));
                 idx++;
             }
         }
@@ -1406,6 +1418,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         cbm_arena_destroy(&binding_arena);
         cbm_free(CBM_MEM_CLASS_EXTRACT, export_source_owned);
+        if (files[fi].language == CBM_LANG_TYPESCRIPT || files[fi].language == CBM_LANG_TSX)
+            pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
         if (files[fi].language == CBM_LANG_PYTHON) {
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
             /* Package namespace records (re-exports), reserved in the bound

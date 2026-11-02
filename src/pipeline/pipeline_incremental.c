@@ -513,12 +513,25 @@ static void semantic_manifest_git_digest(const cbm_git_context_t *git_ctx,
     out[CBM_SHA256_HEX_LEN] = '\0';
 }
 
+/* A config another one can extend, a package manifest, or a pnpm workspace declaration. It decides
+ * how imports resolve in files far from it, so a change to it re-resolves the whole project.
+ * tsconfig.json itself governs by directory instead, unless named through `extends`. */
+static bool semantic_manifest_shared_config(const char *name) {
+    size_t len = name ? strlen(name) : 0;
+    if (!len)
+        return false;
+    if (strcmp(name, "pnpm-workspace.yaml") == 0 || strcmp(name, "package.json") == 0)
+        return true;
+    bool config = len > 13 && (!strncmp(name, "tsconfig.", 9) || !strncmp(name, "jsconfig.", 9));
+    return config && strcmp(name + len - 5, ".json") == 0;
+}
+
 static bool semantic_manifest_package_control(const char *name) {
     if (!name) {
         return false;
     }
     size_t len = strlen(name);
-    return strcmp(name, "package.json") == 0 || strcmp(name, "go.mod") == 0 ||
+    return semantic_manifest_shared_config(name) || strcmp(name, "go.mod") == 0 ||
            strcmp(name, "Cargo.toml") == 0 || strcmp(name, "pyproject.toml") == 0 ||
            strcmp(name, "composer.json") == 0 || strcmp(name, "pubspec.yaml") == 0 ||
            strcmp(name, "pom.xml") == 0 || strcmp(name, "build.gradle") == 0 ||
@@ -3137,6 +3150,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             decline = "semantic_input_changed";
             goto done;
         }
+        const char *leaf = strrchr(fresh[i].rel_path, '/');
+        if (semantic_manifest_shared_config(leaf ? leaf + 1 : fresh[i].rel_path) ||
+            cbm_path_alias_is_extended_base(plan_aliases, fresh[i].rel_path)) {
+            decline = "control_file_changed";
+            goto done;
+        }
         if (discovered) {
             if (!old_row) {
                 decline = "new_file";
@@ -3158,6 +3177,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     for (int i = 0; i < stored_count; i++) {
         if (!cbm_ht_get(fresh_by_path, stored[i].rel_path)) {
+            const char *leaf = strrchr(stored[i].rel_path, '/');
+            if (semantic_manifest_shared_config(leaf ? leaf + 1 : stored[i].rel_path) ||
+                cbm_path_alias_is_extended_base(plan_aliases, stored[i].rel_path)) {
+                decline = "control_file_changed";
+                goto done;
+            }
             if (!cbm_ht_get(files_by_path, stored[i].rel_path) &&
                 closure_is_alias_config(plan_aliases, stored[i].rel_path)) {
                 /* Removed alias config: its governed files resolve without

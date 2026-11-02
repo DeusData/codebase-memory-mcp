@@ -48,6 +48,9 @@ typedef struct {
     cbm_path_alias_t *entries;
     int count;
     char *base_url; /* compilerOptions.baseUrl or equivalent; NULL if unset */
+    /* compilerOptions.customConditions, the extra `exports` conditions TypeScript matches. */
+    char **custom_conditions;
+    int custom_condition_count;
 } cbm_path_alias_map_t;
 
 /* A directory-scoped alias map. dir_prefix is the path of the config file
@@ -65,6 +68,8 @@ typedef struct {
 typedef struct {
     cbm_path_alias_scope_t *scopes;
     int count;
+    char **bases; /* sorted: repo-relative files a config names through `extends` */
+    int base_count;
 } cbm_path_alias_collection_t;
 
 /* Walk repo_path for known build-config files and build a collection of
@@ -76,6 +81,10 @@ cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path);
 cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
                                                             char **excluded_dirs,
                                                             int excluded_count);
+
+/* True when a config of this collection names rel_path through `extends`, even if the file is
+ * gone. Its effect reaches past its own directory. */
+bool cbm_path_alias_is_extended_base(const cbm_path_alias_collection_t *coll, const char *rel_path);
 
 /* Free a collection produced by cbm_load_path_aliases. NULL-safe. */
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);
