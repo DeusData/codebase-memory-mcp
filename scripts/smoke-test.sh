@@ -1367,6 +1367,118 @@ fi
 echo ""
 echo "=== Phase 8: agent config install E2E ==="
 
+# Keep Codex skill placement independent from the broad multi-client fixture:
+# Warp and OpenHands share the canonical root and could otherwise mask a Codex
+# regression by creating the expected file themselves.
+CODEX_ONLY_HOME=$(smoke_mktemp_dir)
+CODEX_ONLY_CONFIG="$CODEX_ONLY_HOME/vendor-codex"
+CODEX_ONLY_INSTALL="$CODEX_ONLY_HOME/bin"
+CODEX_ONLY_SKILL="$CODEX_ONLY_HOME/.agents/skills/codebase-memory/SKILL.md"
+CODEX_ONLY_LEGACY="$CODEX_ONLY_CONFIG/skills/codebase-memory/SKILL.md"
+mkdir -p "$CODEX_ONLY_CONFIG" "$CODEX_ONLY_INSTALL"
+if [[ "$BINARY" == *.exe ]]; then
+  CODEX_ONLY_BIN="$CODEX_ONLY_INSTALL/codebase-memory-mcp.exe"
+else
+  CODEX_ONLY_BIN="$CODEX_ONLY_INSTALL/codebase-memory-mcp"
+fi
+CODEX_ONLY_LOG=$(smoke_mktemp_file)
+run_codex_only() {
+  local executable="$1"
+  shift
+  HOME="$CODEX_ONLY_HOME" \
+    XDG_CONFIG_HOME="$CODEX_ONLY_HOME/.config" \
+    APPDATA="$CODEX_ONLY_HOME/AppData/Roaming" \
+    LOCALAPPDATA="$CODEX_ONLY_HOME/AppData/Local" \
+    CODEX_HOME="$CODEX_ONLY_CONFIG" \
+    "$executable" "$@" > "$CODEX_ONLY_LOG" 2>&1
+}
+if ! run_codex_only "$BINARY" install -y --clients=codex --dir="$CODEX_ONLY_INSTALL"; then
+  echo "FAIL 8-codex-1: isolated Codex install failed"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+if ! grep -q '^name: codebase-memory$' "$CODEX_ONLY_SKILL" 2>/dev/null ||
+   ! grep -q 'trace_path' "$CODEX_ONLY_SKILL" 2>/dev/null ||
+   [ -e "$CODEX_ONLY_LEGACY" ]; then
+  echo "FAIL 8-codex-1: Codex skill was not installed exclusively at the canonical path"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+
+CODEX_ONLY_HASH=$(smoke_file_sha256 "$CODEX_ONLY_SKILL")
+if ! run_codex_only "$CODEX_ONLY_BIN" install --plan --clients=codex \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   [ "$(smoke_file_sha256 "$CODEX_ONLY_SKILL")" != "$CODEX_ONLY_HASH" ]; then
+  echo "FAIL 8-codex-2: Codex install plan mutated the canonical skill"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+if ! run_codex_only "$CODEX_ONLY_BIN" install --dry-run -y --clients=codex \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   [ "$(smoke_file_sha256 "$CODEX_ONLY_SKILL")" != "$CODEX_ONLY_HASH" ]; then
+  echo "FAIL 8-codex-2: Codex dry-run mutated the canonical skill"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+
+mkdir -p "$(dirname "$CODEX_ONLY_LEGACY")"
+mv "$CODEX_ONLY_SKILL" "$CODEX_ONLY_LEGACY"
+if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex \
+     --dir="$CODEX_ONLY_INSTALL"; then
+  echo "FAIL 8-codex-3: isolated Codex legacy migration failed"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+if ! grep -q '^name: codebase-memory$' "$CODEX_ONLY_SKILL" 2>/dev/null ||
+   [ -e "$CODEX_ONLY_LEGACY" ]; then
+  echo "FAIL 8-codex-3: Codex legacy skill was not migrated to the canonical path"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+
+rm -f "$CODEX_ONLY_SKILL"
+mkdir -p "$(dirname "$CODEX_ONLY_LEGACY")"
+printf '%s\n' '---' 'name: codebase-memory' '---' 'User-owned legacy skill.' \
+  > "$CODEX_ONLY_LEGACY"
+CODEX_ONLY_FOREIGN_HASH=$(smoke_file_sha256 "$CODEX_ONLY_LEGACY")
+if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   [ -e "$CODEX_ONLY_SKILL" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_ONLY_LEGACY")" != "$CODEX_ONLY_FOREIGN_HASH" ]; then
+  echo "FAIL 8-codex-4: non-force install did not preserve a foreign legacy skill"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+mkdir -p "$CODEX_ONLY_HOME/.openhands"
+if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex,openhands \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   ! grep -q '^name: codebase-memory$' "$CODEX_ONLY_SKILL" 2>/dev/null ||
+   [ "$(smoke_file_sha256 "$CODEX_ONLY_LEGACY")" != "$CODEX_ONLY_FOREIGN_HASH" ]; then
+  echo "FAIL 8-codex-5: a foreign Codex legacy skill blocked a shared-client install"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+rm -f "$CODEX_ONLY_SKILL"
+if ! run_codex_only "$CODEX_ONLY_BIN" install --force -y --clients=codex \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   ! grep -q '^name: codebase-memory$' "$CODEX_ONLY_SKILL" 2>/dev/null ||
+   [ -e "$CODEX_ONLY_LEGACY" ]; then
+  echo "FAIL 8-codex-6: force did not converge a foreign legacy skill"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+CODEX_ONLY_HASH=$(smoke_file_sha256 "$CODEX_ONLY_SKILL")
+if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   [ "$(smoke_file_sha256 "$CODEX_ONLY_SKILL")" != "$CODEX_ONLY_HASH" ]; then
+  echo "FAIL 8-codex-7: repeated Codex install was not idempotent"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+echo "OK: Codex skill placement, previews, migration, force, and idempotence"
+smoke_rmtree "$CODEX_ONLY_HOME"
+rm -f "$CODEX_ONLY_LOG"
+
 # Set up an isolated HOME. Directory-only agents get only the root required for
 # detection; CLI-detected agents use stubs below so install must create their
 # config parents from scratch.
@@ -1697,7 +1809,8 @@ echo "OK 8c-i: Claude exact-tool graph subagent"
 
 # 8d: Claude Code hooks keep search augmentation and read-coverage reporting
 # separate: PreToolUse matches exactly Grep|Glob|Bash, while PostToolUse matches
-# exactly Read. Neither hook may grow a Search or catch-all matcher.
+# exactly Read plus the graph tools, whose calls reset the drift note. Neither
+# hook may grow a Search or catch-all matcher.
 if ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -1705,14 +1818,15 @@ all_hooks = d.get('hooks', {})
 pre = all_hooks.get('PreToolUse', [])
 post = all_hooks.get('PostToolUse', [])
 ok = (any(h.get('matcher') == 'Grep|Glob|Bash' for h in pre) and
-      any(h.get('matcher') == 'Read' for h in post))
-bad = any('Search' in str(h.get('matcher', '')) for h in pre + post)
+      any(h.get('matcher') == 'Read|mcp__.*codebase-memory-mcp__.*' for h in post))
+bad = any('Search' in str(h.get('matcher', '')) or h.get('matcher', '') in ('', '*')
+          for h in pre + post)
 sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
   echo "FAIL 8d: Claude search/read hook matchers are not exact"
   exit 1
 fi
-echo "OK 8d: Claude Code PreToolUse Grep|Glob|Bash + PostToolUse Read"
+echo "OK 8d: Claude Code PreToolUse Grep|Glob|Bash + PostToolUse Read and graph tools"
 
 # 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
 # #929: Windows installs a .cmd script (extensionless bash shims triggered the
@@ -1778,6 +1892,8 @@ fi
 CODEX_LIFECYCLE_HOME=$(smoke_mktemp_dir)
 CODEX_LIFECYCLE_ROOT="$CODEX_LIFECYCLE_HOME/.codex"
 CODEX_INSTRUCTIONS="$CODEX_LIFECYCLE_ROOT/AGENTS.md"
+CODEX_LIFECYCLE_SKILL="$CODEX_LIFECYCLE_HOME/.agents/skills/codebase-memory/SKILL.md"
+CODEX_LIFECYCLE_LEGACY_SKILL="$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md"
 mkdir -p "$CODEX_LIFECYCLE_ROOT"
 
 CODEX_FRESH_LOG=$(smoke_mktemp_file)
@@ -1791,7 +1907,8 @@ if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
    [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
      "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
    ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
-   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_SKILL" ||
+   [ -e "$CODEX_LIFECYCLE_LEGACY_SKILL" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
@@ -1888,8 +2005,10 @@ if ! HOME="$CODEX_LIFECYCLE_HOME" \
 fi
 if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
    [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
-     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ]; then
-  echo "FAIL 8i: Codex uninstall did not remove only the activation pointer"
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ] ||
+   [ -e "$CODEX_LIFECYCLE_SKILL" ] ||
+   [ -e "$CODEX_LIFECYCLE_LEGACY_SKILL" ]; then
+  echo "FAIL 8i: Codex uninstall did not remove only installer-owned surfaces"
   exit 1
 fi
 echo "OK 8i: isolated Codex activation-pointer lifecycle"
@@ -3994,6 +4113,18 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   smoke_rmtree "$PS1_TEST_HOME" "$PS1_TEST_DIR"
 else
   echo "SKIP Phase 13: no install script available for this platform"
+fi
+
+# ── Phase 13w: package-wrapper install E2E ──
+# The npm, PyPI and Go wrappers install the same release archive as above,
+# from this checkout, the way a user's package manager runs them (#2657: a
+# wrapper cap refused every shipped binary). SMOKE_REQUIRE_WRAPPERS=1 (CI)
+# makes a missing node/python/go toolchain a failure, not a skip.
+echo ""
+echo "--- Phase 13w: package-wrapper install E2E ---"
+if ! bash "$REPO_ROOT/scripts/smoke-wrappers.sh" "$SMOKE_DOWNLOAD_URL"; then
+  echo "FAIL 13w: a package wrapper could not install the release binary"
+  exit 1
 fi
 
 else

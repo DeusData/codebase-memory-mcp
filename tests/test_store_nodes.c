@@ -402,6 +402,122 @@ TEST(store_node_find_by_label) {
     PASS();
 }
 
+static bool scan_str_same(const char *a, const char *b) {
+    return (!a && !b) || (a && b && strcmp(a, b) == 0);
+}
+
+static bool scan_node_same(const cbm_node_t *a, const cbm_node_t *b) {
+    return a->id == b->id && scan_str_same(a->project, b->project) &&
+           scan_str_same(a->label, b->label) && scan_str_same(a->name, b->name) &&
+           scan_str_same(a->qualified_name, b->qualified_name) &&
+           scan_str_same(a->file_path, b->file_path) && a->start_line == b->start_line &&
+           a->end_line == b->end_line && scan_str_same(a->properties_json, b->properties_json);
+}
+
+/* The streamed scan gives the eager scan's rows, field for field and in the
+ * same order, at any batch size, while other lookups (including the eager
+ * scans' own cached statements) run between batches. Returns the row count,
+ * or -1 on the first difference; *paged tells whether the scan paged. */
+static int scan_matches_eager(cbm_store_t *s, const char *project, const char *label, int batch,
+                              bool *paged) {
+    cbm_node_t *eager = NULL;
+    int n = 0;
+    int rc = label ? cbm_store_find_nodes_by_label(s, project, label, &eager, &n)
+                   : cbm_store_find_nodes(s, project, &eager, &n);
+    if (rc != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_node_scan_t *scan = cbm_store_node_scan_open(s, project, label);
+    *paged = cbm_store_node_scan_paged(scan);
+    cbm_node_t buf[64];
+    int seen = 0;
+    bool same = scan != NULL && batch <= 64;
+    int got = 0;
+    while (same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got > 0) {
+        for (int i = 0; i < got; i++, seen++) {
+            same = same && seen < n && scan_node_same(&buf[i], &eager[seen]);
+            cbm_node_free_fields(&buf[i]);
+        }
+        cbm_node_t *other = NULL;
+        int other_n = 0;
+        (void)cbm_store_find_nodes(s, project, &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+        (void)cbm_store_find_nodes_by_label(s, project, "Class", &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+    }
+    /* An exhausted scan stays exhausted. */
+    same = same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got == 0;
+    cbm_store_node_scan_close(scan);
+    cbm_store_free_nodes(eager, n);
+    return same && seen == n ? n : -1;
+}
+
+/* Pages of 1, 3 and 64 rows end inside files, at file boundaries and inside
+ * the NULL file_path rows, which the eager all-nodes order puts first. The
+ * upsert API stores "" for a missing path; other writers may store NULL. */
+TEST(store_node_scan_streams_eager_scan_order) {
+    enum { SCAN_NODES = 60 };
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_project(s, "other", "/tmp/other");
+    static const char *const labels[] = {"Function", "Class", "Method"};
+    static const char *const files[] = {"b.c", "a.c", "", "c.c"};
+    int in_test = 0;
+    int test_functions = 0;
+    int other_methods = 0;
+    for (int i = 0; i < SCAN_NODES; i++) {
+        bool other = i % 4 == 3;
+        char name[32];
+        char qn[64];
+        char props[64];
+        snprintf(name, sizeof(name), "n%d", (i * 17) % 40);
+        snprintf(qn, sizeof(qn), "%s.n%d", other ? "other" : "test", i);
+        snprintf(props, sizeof(props), "{\"complexity\":%d}", i);
+        cbm_node_t n = {.project = other ? "other" : "test",
+                        .label = labels[i % 3],
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = files[(i / 2) % 4],
+                        .start_line = i,
+                        .end_line = i + 5,
+                        .properties_json = i % 5 ? props : NULL};
+        ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
+        in_test += other ? 0 : 1;
+        test_functions += !other && i % 3 == 0 ? 1 : 0;
+        other_methods += other && i % 3 == 2 ? 1 : 0;
+    }
+    ASSERT_EQ(cbm_store_exec(s, "UPDATE nodes SET file_path = NULL WHERE start_line % 7 = 0;"), 0);
+    cbm_node_t *eager = NULL;
+    int eager_n = 0;
+    ASSERT_EQ(cbm_store_find_nodes(s, "test", &eager, &eager_n), CBM_STORE_OK);
+    ASSERT_TRUE(eager_n > 0 && eager[0].file_path == NULL); /* NULL rows come first */
+    cbm_store_free_nodes(eager, eager_n);
+
+    static const int batches[] = {1, 3, 64};
+    bool paged = false;
+    for (size_t b = 0; b < sizeof(batches) / sizeof(batches[0]); b++) {
+        ASSERT_EQ(scan_matches_eager(s, "test", NULL, batches[b], &paged), in_test);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "test", "Function", batches[b], &paged), test_functions);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "other", NULL, batches[b], &paged),
+                  SCAN_NODES - in_test); /* project filter */
+        ASSERT_EQ(scan_matches_eager(s, "other", "Method", batches[b], &paged), other_methods);
+        ASSERT_EQ(scan_matches_eager(s, "test", "NoSuchLabel", batches[b], &paged), 0);
+        ASSERT_EQ(scan_matches_eager(s, "missing", NULL, batches[b], &paged), 0);
+    }
+
+    /* Without the node indexes the eager queries take other plans, which the
+     * pages would not reproduce: the scan hands out the eager rows instead. */
+    ASSERT_EQ(cbm_store_drop_indexes(s), 0);
+    ASSERT_EQ(scan_matches_eager(s, "test", NULL, 3, &paged), in_test);
+    ASSERT_FALSE(paged);
+    ASSERT_EQ(scan_matches_eager(s, "test", "Function", 3, &paged), test_functions);
+    ASSERT_FALSE(paged);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_node_find_by_file) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -2487,6 +2603,109 @@ TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
     PASS();
 }
 
+/* Copy store_meta's shadow fingerprint for `project` into `out` ("" if absent). */
+static void coverage_shadow_fp(cbm_store_t *s, const char *project, char *out, size_t cap) {
+    out[0] = '\0';
+    char key[256];
+    snprintf(key, sizeof(key), "coverage_shadow_fp:%s", project);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT v FROM store_meta WHERE k = ?1;", -1, &stmt,
+                           NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0)) {
+        snprintf(out, cap, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* #2265: unresolved_calls rows describe files that WERE indexed, so they stay
+ * out of the "<project>::missed" graph like by-design not_indexed_* rows:
+ * (a) a project whose only rows are unresolved_calls gets no shadow graph,
+ * (b) a file with parse_partial AND unresolved_calls keeps its parse_partial
+ *     File node (the later unresolved_calls row used to replace it), and
+ * (c) the shadow fingerprint ignores unresolved_calls rows, so the skip gate
+ *     and store_meta match a project without them. */
+TEST(store_coverage_shadow_excludes_unresolved_calls) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *only = "cov-unres-only";
+    const char *mixed = "cov-unres-mixed";
+    const char *plain = "cov-unres-plain";
+    ASSERT_EQ(cbm_store_upsert_project(s, only, "/tmp/cov-unres-only"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, mixed, "/tmp/cov-unres-mixed"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, plain, "/tmp/cov-unres-plain"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, only, "src/a.go", "", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, only, "src/b.go", "", 2, 2), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, mixed, "src/both.go", "", 3, 3), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, mixed, "lib/calls.go", "", 4, 4), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, plain, "src/both.go", "", 3, 3), CBM_STORE_OK);
+
+    /* (a) Only unresolved_calls (plus a by-design row): no shadow project. */
+    cbm_coverage_row_t only_rows[] = {
+        {.rel_path = "src/a.go", .kind = "unresolved_calls", .detail = "[{\"candidate\":\"a.f\"}]"},
+        {.rel_path = "src/b.go", .kind = "unresolved_calls", .detail = "[{\"candidate\":\"b.g\"}]"},
+        {.rel_path = "vendor", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, only, only_rows, 3), CBM_STORE_OK);
+    cbm_coverage_row_t *got = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, only, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 3); /* the table keeps the evidence; only the view skips it */
+    cbm_store_free_coverage(got, n);
+    ASSERT_EQ(cbm_store_count_nodes(s, "cov-unres-only::missed"), 0);
+    cbm_project_t shadow = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "cov-unres-only::missed", &shadow), CBM_STORE_NOT_FOUND);
+    cbm_project_free_fields(&shadow);
+
+    /* (b) parse_partial + unresolved_calls on one path, and a second file
+     * with unresolved_calls only: the shadow holds exactly the parse_partial
+     * File node under src/. */
+    cbm_coverage_row_t mixed_rows[] = {
+        {.rel_path = "src/both.go", .kind = "parse_partial", .detail = "3-4"},
+        {.rel_path = "src/both.go",
+         .kind = "unresolved_calls",
+         .detail = "[{\"candidate\":\"both.h\"}]"},
+        {.rel_path = "lib/calls.go",
+         .kind = "unresolved_calls",
+         .detail = "[{\"candidate\":\"calls.k\"}]"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, mixed, mixed_rows, 3), CBM_STORE_OK);
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "cov-unres-mixed::missed", "File", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].file_path, "src/both.go");
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"kind\":\"parse_partial\""));
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"detail\":\"3-4\""));
+    ASSERT_NULL(strstr(nodes[0].properties_json, "unresolved_calls"));
+    cbm_store_free_nodes(nodes, nc);
+    nodes = NULL;
+    nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "cov-unres-mixed::missed", "Folder", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].name, "src");
+    cbm_store_free_nodes(nodes, nc);
+
+    /* (c) Same failure rows without the unresolved_calls evidence: the stored
+     * fingerprints match. */
+    cbm_coverage_row_t plain_row = {
+        .rel_path = "src/both.go", .kind = "parse_partial", .detail = "3-4"};
+    ASSERT_EQ(cbm_store_coverage_replace(s, plain, &plain_row, 1), CBM_STORE_OK);
+    char fp_mixed[128];
+    char fp_plain[128];
+    coverage_shadow_fp(s, mixed, fp_mixed, sizeof(fp_mixed));
+    coverage_shadow_fp(s, plain, fp_plain, sizeof(fp_plain));
+    ASSERT_TRUE(fp_plain[0] != '\0');
+    ASSERT_STR_EQ(fp_mixed, fp_plain);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_qn_suffix_is_literal);
     RUN_TEST(store_qn_suffix_is_unbounded);
@@ -2496,6 +2715,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(store_coverage_shadow_excludes_unresolved_calls);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);
@@ -2516,6 +2736,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
+    RUN_TEST(store_node_scan_streams_eager_scan_order);
     RUN_TEST(store_node_find_by_file);
     RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
     RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);

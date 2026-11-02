@@ -242,6 +242,66 @@ TEST(watcher_null_safety) {
     PASS();
 }
 
+TEST(watcher_project_status_tracks_registration) {
+    cbm_watcher_project_status_t status = cbm_watcher_project_status(NULL, "project-a");
+    ASSERT_FALSE(status.registered);
+    ASSERT_FALSE(status.running);
+
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_TRUE(cbm_watcher_watch(w, "project-a", "/unused/project-a"));
+    status = cbm_watcher_project_status(w, "project-a");
+    ASSERT_TRUE(status.registered);
+    ASSERT_FALSE(status.running);
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-b").registered);
+    ASSERT_FALSE(cbm_watcher_project_status(w, NULL).registered);
+
+    cbm_watcher_unwatch(w, "project-a");
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-a").registered);
+    ASSERT_TRUE(cbm_watcher_watch(w, "project-a", "/unused/project-a"));
+    cbm_watcher_stop(w);
+    status = cbm_watcher_project_status(w, "project-a");
+    ASSERT_TRUE(status.registered);
+    ASSERT_FALSE(status.running);
+    ASSERT_EQ(cbm_watcher_run(w, 10), 0);
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-a").running);
+    cbm_watcher_free(w);
+    PASS();
+}
+
+static void *watcher_status_run_thread(void *opaque) {
+    (void)cbm_watcher_run(opaque, 10);
+    return NULL;
+}
+
+TEST(watcher_project_status_tracks_run_loop) {
+    /* An empty watcher executes no Git commands. Once entered, running is a
+     * stable state until this test explicitly stops it, not a timing window. */
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_FALSE(cbm_watcher_project_status(w, NULL).running);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, watcher_status_run_thread, w), 0);
+    uint64_t deadline = cbm_now_ms() + 5000;
+    bool running = false;
+    do {
+        running = cbm_watcher_project_status(w, NULL).running;
+        if (!running)
+            cbm_usleep(1000);
+    } while (!running && cbm_now_ms() < deadline);
+
+    cbm_watcher_stop(w);
+    bool running_after_stop = cbm_watcher_project_status(w, NULL).running;
+    int joined = cbm_thread_join(&thread);
+    bool running_after_join = cbm_watcher_project_status(w, NULL).running;
+    cbm_watcher_free(w);
+    ASSERT_TRUE(running);
+    ASSERT_FALSE(running_after_stop);
+    ASSERT_EQ(joined, 0);
+    ASSERT_FALSE(running_after_join);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL WITH REAL GIT REPO
  * ══════════════════════════════════════════════════════════════════ */
@@ -254,6 +314,40 @@ static int index_callback(const char *name, const char *path, void *ud) {
     (void)ud;
     index_call_count++;
     return 0;
+}
+
+/* Self-diagnosing count check: this suite's flake family blocked two
+ * releases because a bare count assert cannot say WHY — print the
+ * committed/pending dirty signatures on mismatch, so the next occurrence
+ * names its cause (sigs equal = detection miss; different = reindex path).
+ * Use at any index_call_count assertion site. */
+static void wt_diagnose_count(cbm_watcher_t *w, const char *project, int got, int expected) {
+    if (got == expected) {
+        return;
+    }
+    uint64_t last = 0, pending = 0;
+    if (cbm_watcher_test_dirty_sigs(w, project, &last, &pending) == 0) {
+        printf("  watcher diagnose: count=%d expected=%d last_sig=%016llx pending_sig=%016llx "
+               "(%s)\n",
+               got, expected, (unsigned long long)last, (unsigned long long)pending,
+               last == pending ? "sigs EQUAL — the poll saw no new dirty state"
+                               : "sigs differ — detection fired, reindex path suspect");
+    } else {
+        printf("  watcher diagnose: count=%d expected=%d (project not watched?)\n", got, expected);
+    }
+}
+
+/* Wait-for-the-asserted-state (bounded) for REACH assertions only: reaching
+ * a count is safe to wait for, because #937 guarantees an unchanged dirty
+ * tree never increments — extra polls cannot overshoot a correct
+ * implementation. NEVER use this for must-stay-quiet assertions; those are
+ * genuinely about a fixed number of polls. */
+static int wt_poll_until_count(cbm_watcher_t *w, const char *project, int expected, int max_polls) {
+    for (int i = 0; i < max_polls && index_call_count < expected; i++) {
+        cbm_watcher_touch(w, project);
+        cbm_watcher_poll_once(w);
+    }
+    return index_call_count;
 }
 
 TEST(watcher_poll_no_projects) {
@@ -1009,8 +1103,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     watcher_windows_image_identity_t expected_git;
     ASSERT_TRUE(watcher_windows_capture_image_identity(fake_git, &expected_git));
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? cbm_strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? cbm_strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -1144,8 +1238,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_TRUE(watcher_test_self_image(self));
     ASSERT_EQ(symlink(self, fake_git), 0);
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -2181,6 +2275,44 @@ TEST(watcher_index_failure_count_unknown_project) {
     PASS();
 }
 
+/* #2167: index_status reads the watch state through cbm_watcher_project_info.
+ * A registered project starts "pending" at the base cadence with no scan;
+ * the first poll completes its baseline and publishes the strategy plus a
+ * wall-clock scan time. Unwatched projects report false with *out zeroed. */
+TEST(watcher_project_info_publishes_scan_issue2167) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s/cbm_watcher_info_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    cbm_watcher_project_info_t info;
+    ASSERT_FALSE(cbm_watcher_project_info(w, "never-watched", &info));
+    ASSERT_EQ(info.poll_interval_ms, 0);
+    ASSERT_FALSE(cbm_watcher_project_info(NULL, "x", &info));
+
+    ASSERT_TRUE(cbm_watcher_watch(w, "info-proj", root));
+    ASSERT_TRUE(cbm_watcher_project_info(w, "info-proj", &info));
+    ASSERT_EQ(info.strategy, CBM_WATCHER_STRATEGY_PENDING);
+    ASSERT_EQ(info.poll_interval_ms, cbm_watcher_poll_interval_ms(0));
+    ASSERT_EQ(info.last_scan_unix_s, 0);
+
+    /* A plain directory (no git): the baseline decides it is never polled. */
+    int64_t before = (int64_t)time(NULL);
+    (void)cbm_watcher_poll_once(w);
+    ASSERT_TRUE(cbm_watcher_project_info(w, "info-proj", &info));
+    ASSERT_EQ(info.strategy, CBM_WATCHER_STRATEGY_NONE);
+    ASSERT_TRUE(info.last_scan_unix_s >= before);
+
+    cbm_watcher_unwatch(w, "info-proj");
+    ASSERT_FALSE(cbm_watcher_project_info(w, "info-proj", &info));
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    (void)cbm_rmdir(root);
+    PASS();
+}
+
 TEST(watcher_multiple_projects) {
     /* Create two temporary git repos */
     char tmpdirA[256];
@@ -2670,25 +2802,32 @@ TEST(watcher_continued_dirty) {
         th_append_file(_p, "dirty\n");
     }
 
-    /* First detection */
+    /* First detection — a REACH assert: wait for the state, bounded. */
+    {
+        int got = wt_poll_until_count(w, "cont-repo", 1, 5);
+        wt_diagnose_count(w, "cont-repo", got, 1);
+        ASSERT_EQ(got, 1);
+    }
+
+    /* Still dirty but UNCHANGED — must stay quiet (#937): fixed polls. */
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty but UNCHANGED — must stay quiet (#937) */
-    cbm_watcher_touch(w, "cont-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
-
-    /* A further edit is a NEW dirty state — detect again */
+    /* A further edit is a NEW dirty state — detect again. This exact site
+     * failed on the Windows leg (1 vs 2): stat()'s second-granularity
+     * st_mtime made two same-second edits hash identically. The signature
+     * now reads FILETIME precision; the reach-wait covers scheduling. */
     {
         char _p[1024];
         snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
         th_append_file(_p, "dirtier\n");
     }
-    cbm_watcher_touch(w, "cont-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 2);
+    {
+        int got = wt_poll_until_count(w, "cont-repo", 2, 5);
+        wt_diagnose_count(w, "cont-repo", got, 2);
+        ASSERT_EQ(got, 2);
+    }
 
     /* Commit to clean up, then poll — should not trigger */
     wt_git(tmpdir, "add file.txt");
@@ -3856,7 +3995,41 @@ TEST(watcher_null_watch_count) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+TEST(watcher_unicode_root_is_not_pruned_as_missing) {
+    char *parent = th_mktempdir("cbm_watch_utf8");
+    ASSERT_NOT_NULL(parent);
+    char root[CBM_SZ_4K];
+    snprintf(root, sizeof(root), "%s/\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E", parent);
+    ASSERT_EQ(th_mkdir_p(root), 0);
+    const char *saved = cbm_runtime_getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1);
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_store_upsert_project(store, "unicode-root", root);
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    cbm_watcher_watch(watcher, "unicode-root", root);
+    for (int i = 0; i < 8; i++) {
+        cbm_watcher_poll_once(watcher);
+    }
+    cbm_project_t info = {0};
+    bool kept = cbm_watcher_watch_count(watcher) == 1 &&
+                cbm_store_get_project(store, "unicode-root", &info) == CBM_STORE_OK;
+    cbm_project_free_fields(&info);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    if (saved_copy) {
+        cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_WATCHER_PRUNE_GRACE_S");
+    }
+    free(saved_copy);
+    ASSERT_EQ(th_rmtree(parent), 0);
+    ASSERT_TRUE(kept);
+    PASS();
+}
+
 SUITE(watcher) {
+    RUN_TEST(watcher_unicode_root_is_not_pruned_as_missing);
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
     RUN_TEST(poll_interval_scaling);
@@ -3872,6 +4045,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_index_failure_backoff_gates_repolling_issue2015);
     RUN_TEST(watcher_sustained_failure_logs_once_issue2015);
     RUN_TEST(watcher_index_failure_count_unknown_project);
+    RUN_TEST(watcher_project_info_publishes_scan_issue2167);
 
     /* Lifecycle */
     RUN_TEST(watcher_create_free);
@@ -3880,6 +4054,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_stopped_rejects_new_registration);
     RUN_TEST(watcher_null_safety);
+    RUN_TEST(watcher_project_status_tracks_registration);
+    RUN_TEST(watcher_project_status_tracks_run_loop);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);

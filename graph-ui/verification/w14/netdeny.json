@@ -1,0 +1,81 @@
+{
+  "command": "env W14_OUT_DIR=/private/tmp/codeatlasweb-w14-proof.cNXwHU node tools/smoke-w14.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 132,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 80486,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4680",
+      "seen": 9
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4681",
+      "seen": 14
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55135",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55137",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55138",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55140",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55142",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55144",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55625",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:57353",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:57355",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:57359",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:57362",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:57363",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:57370",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:58684",
+      "seen": 1
+    }
+  ],
+  "generatedAt": "2026-08-31T12:49:16.501Z"
+}

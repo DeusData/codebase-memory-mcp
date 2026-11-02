@@ -3,9 +3,10 @@
 
 #include "type_rep.h"
 #include "../arena.h"
+#include "../../../src/foundation/platform.h"
 #include <stdatomic.h> /* relaxed cache for cbm_lsp_max_walk_depth */
-#include <stdlib.h>     /* getenv, atoi (cbm_lsp_max_walk_depth) */
-#include <string.h>     /* strcmp (cbm_scope_lookup_binding) */
+#include <stdlib.h>    /* atoi (cbm_lsp_max_walk_depth) */
+#include <string.h>    /* strcmp (cbm_scope_lookup_binding) */
 
 typedef struct {
     const char* name;
@@ -25,27 +26,48 @@ typedef struct CBMScopeChunk {
     struct CBMScopeChunk* next;
 } CBMScopeChunk;
 
+/* Name index for one frame (#1527). A frame that outgrows one chunk (a module
+ * scope binding thousands of classes and functions) is looked up through an
+ * open-addressing table of binding pointers instead of a linear chunk scan --
+ * the scan made every identifier lookup O(frame size) and a whole file
+ * O(n^2). Bindings never move (chunks are arena-allocated and only
+ * prepended) and a name is bound at most once per frame (rebinding updates
+ * in place), so the table maps each name to exactly the binding the linear
+ * scan would have found. The table is an accelerator only: when it cannot be
+ * allocated or grown the frame drops it and every lookup falls back to the
+ * scan, which is always correct. */
+typedef struct {
+    CBMVarBinding **slots; // arena-owned; NULL = empty
+    int cap;               // power of two, or 0 = no index (linear scan)
+    int count;
+} CBMScopeIndex;
+
 typedef struct CBMScope {
     struct CBMScope* parent;
     CBMScopeChunk* chunks;
     CBMArena* arena;        // owning arena, propagated to children at push time
+    int binding_count;      // bindings recorded in THIS frame
+    CBMScopeIndex index;    // built once binding_count exceeds one chunk
 } CBMScope;
+
+/* The binding of name in THIS frame only (no parent walk), or NULL. */
+const CBMVarBinding *cbm_scope_lookup_local(const CBMScope *scope, const char *name);
 
 /* Return the complete nearest binding in one scope-chain walk, or NULL when
  * unbound. Keep this internal hot-path primitive inline: all language
  * resolvers use cbm_scope_lookup(), while Python also consumes the complete
- * record to avoid repeating the same linear scan. */
+ * record to avoid repeating the same walk. Each frame is probed through
+ * cbm_scope_lookup_local(), which uses the frame's hashed name index once the
+ * frame outgrows one chunk (#1527), so a lookup costs one probe per frame
+ * rather than a scan of every binding in scope. */
 static inline const CBMVarBinding *cbm_scope_lookup_binding(const CBMScope *scope,
                                                             const char *name) {
     if (!name)
         return NULL;
     for (const CBMScope *s = scope; s != NULL; s = s->parent) {
-        for (const CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0)
-                    return &c->bindings[i];
-            }
-        }
+        const CBMVarBinding *b = cbm_scope_lookup_local(s, name);
+        if (b)
+            return b;
     }
     return NULL;
 }
@@ -76,7 +98,7 @@ static inline int cbm_lsp_max_walk_depth(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (value < 0) {
-        const char* e = getenv("CBM_LSP_MAX_WALK_DEPTH");
+        const char* e = cbm_runtime_getenv("CBM_LSP_MAX_WALK_DEPTH");
         int v = (e && *e) ? atoi(e) : 0;
         value = (v > 0) ? v : CBM_LSP_MAX_WALK_DEPTH;
         atomic_store_explicit(&cached, value, memory_order_relaxed);

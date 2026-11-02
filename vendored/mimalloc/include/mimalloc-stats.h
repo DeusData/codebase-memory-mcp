@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2024-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2024-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -22,7 +22,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #elif __cplusplus >= 201103L
 #define mi_decl_align(a)        alignas(a)
 #else
-#define mi_decl_align(a)
+#define mi_decl_align(a)        _Alignas(a)
 #endif
 
 
@@ -49,7 +49,7 @@ typedef struct mi_stat_counter_s {
   MI_STAT_COUNT(threads)                    /* number of threads */ \
   MI_STAT_COUNT(malloc_normal)              /* allocated bytes <= MI_LARGE_OBJ_SIZE_MAX */ \
   MI_STAT_COUNT(malloc_huge)                /* allocated bytes in huge pages */ \
-  MI_STAT_COUNT(malloc_requested)           /* malloc requested bytes */ \
+  MI_STAT_COUNTER(malloc_requested)         /* malloc requested bytes */ \
   \
   MI_STAT_COUNTER(mmap_calls) \
   MI_STAT_COUNTER(commit_calls) \
@@ -75,11 +75,16 @@ typedef struct mi_stat_counter_s {
   /* only on v3 */ \
   MI_STAT_COUNT(heaps) \
   MI_STAT_COUNT(theaps) \
+  MI_STAT_COUNT(pages_os_abandoned)        /* pages in the os abandoned list (bad) */ \
+  MI_STAT_COUNT(pages_os_allocated)        /* pages allocated outside arenas (bad) */ \
   MI_STAT_COUNTER(pages_reclaim_on_alloc) \
   MI_STAT_COUNTER(pages_reclaim_on_free) \
   MI_STAT_COUNTER(pages_reabandon_full) \
   MI_STAT_COUNTER(pages_unabandon_busy_wait) \
-  MI_STAT_COUNTER(heaps_delete_wait)
+  MI_STAT_COUNTER(heaps_delete_wait) \
+  MI_STAT_COUNTER(pages_stat_updates)      /* calls to successful page_stat_update */ \
+  MI_STAT_COUNTER(pages_stat_update_count) /* total free/allocs */ \
+  MI_STAT_COUNTER(profile_samples)         /* total sampled profiled allocations */ \
 
 // Size bins for chunks
 typedef enum mi_chunkbin_e {
@@ -160,6 +165,12 @@ mi_decl_export bool    mi_subproc_stats_get_exclusive(mi_subproc_id_t subproc_id
 
 mi_decl_export char*   mi_stats_as_json(mi_stats_t* stats, size_t buf_size, char* buf) mi_attr_noexcept;      // use mi_free to free the result if the input buf == NULL
 mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
+
+// get theap stats (only thread safe on theaps belonging to the calling thread)
+mi_decl_export bool    mi_theap_stats_get(mi_theap_t* theap, mi_stats_t* stats) mi_attr_noexcept;
+
+// add the theap stats to the stats of the parent heap and clear the theap stats
+mi_decl_export void    mi_theap_stats_merge_to_heap(mi_theap_t* theap) mi_attr_noexcept;
 
 #ifdef __cplusplus
 }

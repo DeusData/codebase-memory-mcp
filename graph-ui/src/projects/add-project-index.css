@@ -1,0 +1,45 @@
+.add-index-backdrop { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; padding: 20px; background: #040a07b8; backdrop-filter: blur(8px); }
+.add-index-dialog { display: flex; flex-direction: column; width: min(580px, 100%); max-height: min(760px, calc(100dvh - 40px)); min-height: 0; overflow: hidden; color: #d9e5dc; background: #101a15f7; border: 1px solid #b3d2c037; border-radius: 14px; box-shadow: 0 24px 80px #0007; font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.add-index-dialog * { box-sizing: border-box; }
+.add-index-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px 16px; border-bottom: 1px solid #adc9b723; }
+.add-index-dialog > header p { margin: 0 0 4px; color: #91aa9b; font-size: 11px; }
+.add-index-dialog h2 { margin: 0; font-size: 20px; font-weight: 550; letter-spacing: -.035em; }
+.add-index-dialog button, .add-index-dialog input { font: inherit; color: inherit; }
+.add-index-dialog button { border: 1px solid #accbb532; border-radius: 6px; background: #a3c3ae09; padding: 7px 11px; cursor: pointer; }
+.add-index-dialog button:hover:not(:disabled) { background: #a3c3ae1b; border-color: #accbb563; }
+.add-index-dialog button:disabled { opacity: .42; cursor: default; }
+.add-index-dialog .add-index-primary { background: #91b7a125; border-color: #acd0b856; color: #d7eee0; }
+.add-index-dialog .add-index-close { padding: 0; width: 30px; height: 30px; font-size: 20px; color: #a4bbac; background: transparent; border-color: transparent; }
+.add-index-dialog :is(button, input):focus-visible { outline: 2px solid #a4ceb3; outline-offset: 3px; }
+.add-index-dialog input { width: 100%; min-width: 0; border: 1px solid #a3c3ae35; border-radius: 6px; padding: 9px 10px; background: #080f0b; }
+.add-index-path { padding: 16px 22px 10px; }
+.add-index-path label, .add-index-confirm label { display: block; margin-bottom: 6px; color: #bbcebf; font-size: 12px; }
+.add-index-path > div { display: flex; align-items: center; gap: 8px; }
+.add-index-folder-tools { display: flex; flex-wrap: wrap; gap: 6px; min-height: 32px; padding: 0 22px 8px; }
+.add-index-folder-tools button { padding: 4px 8px; font-size: 11px; }
+.add-index-folders { min-height: 120px; max-height: 350px; flex: 1; overflow: auto; margin: 0 12px; padding: 3px 10px; overscroll-behavior: contain; }
+.add-index-folders > p { padding: 16px 4px; margin: 0; color: #97ae9f; }
+.add-index-folders ul { list-style: none; margin: 0; padding: 0; }
+.add-index-folders li button { display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; border-color: transparent; padding: 9px 10px; background: transparent; overflow-wrap: anywhere; }
+.add-index-folders li button > span:first-child { color: #8cad98; }
+.add-index-folders li button > span:last-child { margin-left: auto; color: #789583; }
+.add-index-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; padding: 14px 22px; border-top: 1px solid #adc9b723; }
+.add-index-dialog footer > span { max-width: 29ch; color: #91aa9b; font-size: 11px; }
+.add-index-dialog footer button { flex-shrink: 0; }
+.add-index-confirm { overflow: auto; padding: 20px 22px 0; }
+.add-index-confirm footer { margin-left: -22px; margin-right: -22px; }
+.add-index-chosen-path { color: #9db4a5; overflow-wrap: anywhere; font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.add-index-confirm > .add-index-chosen-path { margin: 0 0 20px; }
+.add-index-hint { color: #8fa598; font-size: 11px; }
+.add-index-warning { padding: 10px 12px; border: 1px solid #ceb78f3d; border-radius: 6px; background: #ba9e7010; color: #d0c6b3; }
+.add-index-warning p { margin: 0 0 8px; }
+.add-index-warning p:last-child { margin-bottom: 0; }
+.add-index-progress { padding: 28px 28px 24px; text-align: center; overflow: auto; }
+.add-index-progress-icon { display: block; font-size: 30px; color: #a6cbb3; }
+.add-index-progress h3 { font-size: 20px; font-weight: 500; letter-spacing: -.03em; margin: 12px 0; }
+.add-index-progress > strong { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+.add-index-progress > p { margin: 12px auto; max-width: 48ch; }
+.add-index-progress[data-status="error"] .add-index-progress-icon { color: #d4b89d; }
+.add-index-progress progress { display: block; width: min(260px, 100%); height: 4px; margin: 24px auto 18px; accent-color: #8fb5a0; }
+.add-index-progress-actions { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-top: 22px; }
+@media (max-width: 520px) { .add-index-backdrop { padding: 12px; } .add-index-dialog { max-height: calc(100dvh - 24px); } .add-index-dialog footer { flex-wrap: wrap; } .add-index-dialog footer > span { max-width: none; } }

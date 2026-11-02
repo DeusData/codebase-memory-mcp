@@ -345,7 +345,75 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
     PASS();
 }
 
+/* A read tool's statements share one read batch instead of taking the file
+ * lock once per statement. The batch reads one snapshot until it renews
+ * (every 100 ms, forced here through the seam), then sees later commits. */
+static char *read_batch_name(cbm_store_t *s) {
+    cbm_node_t found = {0};
+    if (cbm_store_find_node_by_qn(s, "p", "p.a", &found) != CBM_STORE_OK) {
+        return NULL;
+    }
+    char *name = found.name ? strdup(found.name) : NULL;
+    cbm_node_free_fields(&found);
+    return name;
+}
+
+static bool read_batch_rename(cbm_store_t *writer, const char *name) {
+    cbm_node_t node = {
+        .project = "p", .label = "Function", .name = name, .qualified_name = "p.a", .file_path = "a.c"};
+    return cbm_store_upsert_node(writer, &node) > 0;
+}
+
+TEST(store_read_batch_snapshot_renews) {
+    char *td = th_mktempdir("cbm_read_batch");
+    ASSERT_NOT_NULL(td);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/batch.db", td);
+    cbm_store_t *writer = cbm_store_open_path(db_path); /* WAL: commits beside a reader */
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, "p", td), CBM_STORE_OK);
+    ASSERT_TRUE(read_batch_rename(writer, "before"));
+    cbm_store_t *reader = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(reader);
+
+    ASSERT_TRUE(cbm_store_read_batch_begin(reader));
+    ASSERT_FALSE(cbm_store_read_batch_begin(reader)); /* one batch at a time */
+    char *name = read_batch_name(reader);
+    ASSERT_STR_EQ(name, "before");
+    free(name);
+
+    /* Inside the batch the reader keeps its snapshot... */
+    ASSERT_TRUE(read_batch_rename(writer, "after"));
+    name = read_batch_name(reader);
+    ASSERT_STR_EQ(name, "before");
+    free(name);
+
+    /* ...until the batch renews at its next statement. */
+    cbm_store_read_batch_expire_for_test(reader);
+    name = read_batch_name(reader);
+    ASSERT_STR_EQ(name, "after");
+    free(name);
+
+    /* Ended, every statement reads the latest commit again. */
+    cbm_store_read_batch_end(reader);
+    ASSERT_TRUE(read_batch_rename(writer, "latest"));
+    name = read_batch_name(reader);
+    ASSERT_STR_EQ(name, "latest");
+    free(name);
+
+    /* Begin refuses while another transaction is open; close ends a batch. */
+    ASSERT_EQ(cbm_store_begin(writer), CBM_STORE_OK);
+    ASSERT_FALSE(cbm_store_read_batch_begin(writer));
+    ASSERT_EQ(cbm_store_rollback(writer), CBM_STORE_OK);
+    ASSERT_TRUE(cbm_store_read_batch_begin(reader));
+    cbm_store_close(reader);
+    cbm_store_close(writer);
+    th_rmtree(td);
+    PASS();
+}
+
 SUITE(store_pragmas) {
+    RUN_TEST(store_read_batch_snapshot_renews);
     RUN_TEST(journal_size_limit_bounds_wal_issue1083);
     RUN_TEST(store_role_pragmas_issue1419);
     RUN_TEST(store_generation_tracks_mutations);

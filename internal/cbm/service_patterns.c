@@ -46,6 +46,25 @@ static const lib_pattern_t http_libraries[] = {
      * case-sensitive, so without this entry `Axios.get(url)` fell through to
      * the `.get` route-suffix fallback and became a route registration. */
     {"Axios", CBM_SVC_HTTP, NULL},
+    /* Angular HttpClient (#2768). The receiver rows end in a dot, like "gin.":
+     * a bare "this.http" / "$http" would also match this.httpAdapter.get
+     * (NestJS route registration) and $httpBackend.expectGET (an AngularJS test
+     * double), because an uppercase letter after an id counts as CamelCase
+     * glue. A chain wrapped before the verb keeps its line break in the callee
+     * text ("this.http\n      .post", prettier's style), so each receiver also
+     * has a line-break twin: LF, and CR for CRLF files. Java/C# HttpClient is
+     * already listed below. */
+    {"@angular/common/http", CBM_SVC_HTTP, NULL},
+    {"angular.common.http", CBM_SVC_HTTP, NULL},
+    {"this.http.", CBM_SVC_HTTP, NULL},
+    {"this.http\n", CBM_SVC_HTTP, NULL},
+    {"this.http\r", CBM_SVC_HTTP, NULL},
+    {"httpClient.", CBM_SVC_HTTP, NULL},
+    {"httpClient\n", CBM_SVC_HTTP, NULL},
+    {"httpClient\r", CBM_SVC_HTTP, NULL},
+    {"$http.", CBM_SVC_HTTP, NULL},
+    {"$http\n", CBM_SVC_HTTP, NULL},
+    {"$http\r", CBM_SVC_HTTP, NULL},
     {"superagent", CBM_SVC_HTTP, NULL},
     {"needle", CBM_SVC_HTTP, NULL},
     {"node-fetch", CBM_SVC_HTTP, NULL},
@@ -577,6 +596,11 @@ static const method_suffix_t route_reg_suffixes[] = {
     {".add_route", "ANY"},
     {".add_api_route", "ANY"},
     {".add_api_websocket_route", "ANY"},
+    /* FastAPI/Starlette WebSocket decorators (`@router.websocket('/ws')`,
+     * `@app.websocket_route('/events')`): not an HTTP verb, so ANY — mirrors
+     * .add_api_websocket_route above (#1245). */
+    {".websocket", "ANY"},
+    {".websocket_route", "ANY"},
     {NULL, NULL},
 };
 
@@ -757,9 +781,9 @@ static bool has_filesystem_extension(const char *path) {
     ext[ext_len] = '\0';
 
     static const char *const hard_file_exts[] = {
-        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
-        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",  ".env",        ".ini", ".key",
+        ".log",  ".md",     ".pdf",         ".pem",  ".pid", ".properties", ".rst", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", ".txt", NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
@@ -795,6 +819,62 @@ static bool callee_is_delimiter_or_filesystem_builder(const char *callee_name) {
         return true;
     }
     return strstr(callee_name, "os.path.join") != NULL || strstr(callee_name, "path.join") != NULL;
+}
+
+/* Case-insensitive "text ends with suffix" over [text, text + len). */
+static bool span_ends_with_ci(const char *text, size_t len, const char *suffix) {
+    size_t sl = strlen(suffix);
+    if (len < sl) {
+        return false;
+    }
+    const char *tail = text + (len - sl);
+    for (size_t i = 0; i < sl; i++) {
+        char a = tail[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (a != suffix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cbm_service_pattern_is_client_navigation(bool js_family, const char *callee_name) {
+    if (!js_family || !callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *last_dot = strrchr(callee_name, '.');
+    const char *method = last_dot ? last_dot + 1 : callee_name;
+    size_t recv_len = last_dot ? (size_t)(last_dot - callee_name) : 0;
+    /* Angular Router.navigate/navigateByUrl, Ionic NavController.navigateForward/
+     * Back/Root, Nuxt navigateTo, react-router/Gatsby navigate — any receiver. */
+    if (strcmp(method, "navigate") == 0 || strcmp(method, "navigateByUrl") == 0 ||
+        strcmp(method, "navigateTo") == 0 || strcmp(method, "navigateForward") == 0 ||
+        strcmp(method, "navigateBack") == 0 || strcmp(method, "navigateRoot") == 0) {
+        return true;
+    }
+    /* History API: the URL is the third argument of pushState/replaceState. */
+    if (strcmp(method, "pushState") == 0 || strcmp(method, "replaceState") == 0) {
+        return true;
+    }
+    /* Bare SvelteKit goto, Next.js/Remix redirect helpers. */
+    if (!last_dot && (strcmp(method, "goto") == 0 || strcmp(method, "redirect") == 0 ||
+                      strcmp(method, "permanentRedirect") == 0)) {
+        return true;
+    }
+    /* Next.js / Vue router and react-router history objects: router.push,
+     * this.$router.push, props.history.push, Router.prefetch. */
+    if ((strcmp(method, "push") == 0 || strcmp(method, "replace") == 0 ||
+         strcmp(method, "prefetch") == 0) &&
+        (span_ends_with_ci(callee_name, recv_len, "router") ||
+         span_ends_with_ci(callee_name, recv_len, "history"))) {
+        return true;
+    }
+    /* Angular Location.go, window.location.assign / replace. */
+    return (strcmp(method, "go") == 0 || strcmp(method, "assign") == 0 ||
+            strcmp(method, "replace") == 0) &&
+           span_ends_with_ci(callee_name, recv_len, "location");
 }
 
 static const char *strip_string_delimiters(const char *literal, char *buf, size_t buf_sz) {
@@ -1117,6 +1197,65 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
         size_t slen = strlen(route_reg_suffixes[i].suffix);
         if (clen >= slen && strcmp(callee_name + clen - slen, route_reg_suffixes[i].suffix) == 0) {
             return route_reg_suffixes[i].method;
+        }
+    }
+    return NULL;
+}
+
+static bool mux_is_blank(char ch) {
+    return ch == ' ' || ch == '\t';
+}
+
+const char *cbm_service_pattern_mux_split(const char *pattern, char *method, size_t method_sz) {
+    if (method && method_sz > 0) {
+        method[0] = '\0';
+    }
+    if (!pattern || pattern[0] == '/') {
+        return NULL;
+    }
+    /* METHOD: Go cuts it at the first space or tab and trims the rest. */
+    const char *rest = pattern;
+    size_t method_len = 0;
+    while (pattern[method_len] >= 'A' && pattern[method_len] <= 'Z') {
+        method_len++;
+    }
+    if (method_len > 0 && mux_is_blank(pattern[method_len])) {
+        rest = pattern + method_len;
+        while (mux_is_blank(*rest)) {
+            rest++;
+        }
+    } else {
+        method_len = 0;
+    }
+    /* HOST: everything before the path's slash, with no blank or line break. */
+    const char *slash = rest;
+    while (*slash && *slash != '/' && !mux_is_blank(*slash) && *slash != '\n' && *slash != '\r') {
+        slash++;
+    }
+    if (*slash != '/' || (method_len == 0 && slash == rest)) {
+        return NULL;
+    }
+    if (method_len > 0 && method) {
+        if (method_len >= method_sz) {
+            method[0] = '\0';
+            return NULL;
+        }
+        memcpy(method, pattern, method_len);
+        method[method_len] = '\0';
+    }
+    return slash;
+}
+
+const char *cbm_service_pattern_mux_route_path(const char *callee_name, const char *pattern) {
+    static const char *const mux_callees[] = {".Handle", ".HandleFunc"};
+    if (!callee_name || !pattern || strstr(pattern, "://") != NULL) {
+        return NULL;
+    }
+    size_t clen = strlen(callee_name);
+    for (size_t i = 0; i < sizeof(mux_callees) / sizeof(mux_callees[0]); i++) {
+        size_t slen = strlen(mux_callees[i]);
+        if (clen >= slen && strcmp(callee_name + clen - slen, mux_callees[i]) == 0) {
+            return cbm_service_pattern_mux_split(pattern, NULL, 0);
         }
     }
     return NULL;

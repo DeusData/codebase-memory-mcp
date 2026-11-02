@@ -16,6 +16,22 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Content-Security-Policy directives for the served UI (the value only; the
+ * server prepends the header name). External connections are limited to the
+ * pinned opt-in browser model on Hugging Face and its verified download host.
+ * Agent activity and logs use this same daemon origin. The optional local
+ * inference sidecar remains on 127.0.0.1:4141. The other
+ * allowances cover the bundled app's own needs (inline styles, three.js
+ * textures, Monaco workers, WASM). */
+#define CBM_UI_CSP_VALUE                                                 \
+    "default-src 'self'; "                                               \
+    "connect-src 'self' http://127.0.0.1:4141 "                          \
+    "https://huggingface.co https://us.aws.cdn.hf.co; "                  \
+    "img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; " \
+    "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
+    "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; "      \
+    "frame-ancestors 'none'"
+
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
 
@@ -85,8 +101,17 @@ void cbm_http_server_set_readiness_secret(cbm_http_server_t *srv,
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);
 
-/* Append a log line to the UI ring buffer (called from log hook). */
+/* Persist a daemon log line in SQLite and the emergency memory ring. */
 void cbm_ui_log_append(const char *line);
+
+/* Release the current activity database. A later append can reopen it;
+ * final shutdown must first quiesce log producers. The mutex remains valid. */
+void cbm_ui_log_close(void);
+
+/* Frontend compatibility export: <cache_dir>/logs/ui.log, one JSON line
+ * per accepted entry. Both HTTP log readers use the SQLite journal.
+ * Returns false when the path does not fit in out. */
+bool cbm_ui_log_file_path(char *out, size_t outsz);
 
 /* Set the binary path for subprocess spawning (call from main). */
 void cbm_http_server_set_binary_path(const char *path);
@@ -98,7 +123,8 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
 
 /* Normalize a git remote (scp-style / ssh:// / https://) to a canonical
  * "https://host/org/repo" web base, with trailing ".git" and any embedded
- * credentials removed. malloc'd or NULL. Caller frees. */
+ * credentials removed. OTHER-owned or NULL; release with
+ * cbm_free(CBM_MEM_CLASS_OTHER, result). */
 char *cbm_ui_git_web_base(const char *url);
 
 /* Copy `url` with any "user[:password]@" userinfo stripped from a

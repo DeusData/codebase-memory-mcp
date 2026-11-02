@@ -10,6 +10,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
 #include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
+#include "../src/foundation/sha256.h"
 #include "../src/foundation/str_util.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
@@ -1189,7 +1190,7 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "\"prompts\":{\"listChanged\":false}"));
     ASSERT_NOT_NULL(strstr(json, "\"instructions\":"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
-    ASSERT_NOT_NULL(strstr(json, "auto-refresh"));
+    ASSERT_NOT_NULL(strstr(json, "refreshes automatically"));
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
     free(json);
 
@@ -1365,15 +1366,21 @@ TEST(mcp_metadata_byte_budget) {
      * review when a schema or new tool grows the model-visible baseline. */
     char *init = cbm_mcp_initialize_response(NULL);
     ASSERT_NOT_NULL(init);
-    ASSERT_LT((int)strlen(init), 512);
+    /* 1.5 KiB (raised from 512 B): under tool search the server instructions
+     * and the tool names are all a client loads before the model decides how
+     * to answer, so they now say which structural questions the graph answers
+     * (Claude Code cuts instructions at 4,096 characters). */
+    ASSERT_LT((int)strlen(init), 1536);
     free(init);
 
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* 15 KiB covered the lean surface at the branch point; get_file_outline,
-     * compare_graphs, manage_adr set_sections, and the search_code debug and
-     * list_projects include_details parameters landed on main since. */
-    ASSERT_LT((int)strlen(json), 18 * 1024);
+    /* Seed discovery and independent pagination have a reviewed budget:
+     * 21 KiB overall (raised from 20 KiB for the infra filters and the
+     * topology/deploy/run trace modes: one usage hint per mode keeps them
+     * findable); only detect_changes may exceed the 3200-byte per-tool
+     * ceiling, with its own 4096-byte bound. */
+    ASSERT_LT((int)strlen(json), 21 * 1024);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
@@ -1386,11 +1393,86 @@ TEST(mcp_metadata_byte_budget) {
     yyjson_arr_foreach(tools, idx, max, tool) {
         char *serialized = yyjson_val_write(tool, 0, NULL);
         ASSERT_NOT_NULL(serialized);
-        ASSERT_LT((int)strlen(serialized), 3200);
+        const char *name = yyjson_get_str(yyjson_obj_get(tool, "name"));
+        ASSERT_LT((int)strlen(serialized),
+                  name && strcmp(name, "detect_changes") == 0 ? 4096 : 3200);
         free(serialized);
     }
     yyjson_doc_free(doc);
     free(json);
+    PASS();
+}
+
+static bool mcp_tool_loads_upfront(const char *name) {
+    return strcmp(name, "search_graph") == 0 || strcmp(name, "trace_path") == 0 ||
+           strcmp(name, "get_code_snippet") == 0;
+}
+
+TEST(mcp_tools_list_loads_structural_path_upfront) {
+    /* Claude Code defers MCP tools behind ToolSearch; exactly the structural
+     * discovery path carries _meta["anthropic/alwaysLoad"], in every profile
+     * that lists it, and no other tool grows a _meta object. */
+    static const cbm_mcp_tool_profile_t profiles[] = {
+        CBM_MCP_TOOL_PROFILE_ALL,
+        CBM_MCP_TOOL_PROFILE_ANALYSIS,
+        CBM_MCP_TOOL_PROFILE_SCOUT,
+    };
+    for (size_t p = 0U; p < sizeof(profiles) / sizeof(profiles[0]); p++) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_mcp_server_set_tool_profile(srv, profiles[p]);
+        char *resp =
+            cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+        ASSERT_NOT_NULL(resp);
+        yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *result = yyjson_obj_get(yyjson_doc_get_root(doc), "result");
+        yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+        ASSERT_TRUE(yyjson_is_arr(tools));
+        int upfront = 0;
+        size_t idx;
+        size_t max;
+        yyjson_val *tool;
+        yyjson_arr_foreach(tools, idx, max, tool) {
+            const char *name = yyjson_get_str(yyjson_obj_get(tool, "name"));
+            ASSERT_NOT_NULL(name);
+            yyjson_val *meta = yyjson_obj_get(tool, "_meta");
+            if (mcp_tool_loads_upfront(name)) {
+                ASSERT_TRUE(yyjson_is_obj(meta));
+                ASSERT_TRUE(yyjson_is_true(yyjson_obj_get(meta, "anthropic/alwaysLoad")));
+                ASSERT_EQ((int)yyjson_obj_size(meta), 1);
+                upfront++;
+            } else {
+                ASSERT_NULL(meta);
+            }
+        }
+        ASSERT_EQ(upfront, 3);
+        yyjson_doc_free(doc);
+        free(resp);
+        cbm_mcp_server_free(srv);
+    }
+    PASS();
+}
+
+TEST(mcp_server_instructions_name_structural_questions) {
+    /* With tool search the instructions are what a client shows before the
+     * model searches (Codex also uses them as the namespace description), so
+     * they must say which questions the graph answers and where grep fits. */
+    char *init = cbm_mcp_initialize_response(NULL);
+    ASSERT_NOT_NULL(init);
+    yyjson_doc *doc = yyjson_read(init, strlen(init), 0);
+    ASSERT_NOT_NULL(doc);
+    const char *instructions =
+        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "instructions"));
+    ASSERT_NOT_NULL(instructions);
+    ASSERT_LTE((int)strlen(instructions), 4096);
+    ASSERT_NOT_NULL(strstr(instructions, "code knowledge graph"));
+    ASSERT_NOT_NULL(strstr(instructions, "who calls a function"));
+    ASSERT_NOT_NULL(strstr(instructions, "call chains"));
+    ASSERT_NOT_NULL(strstr(instructions, "which code a change affects"));
+    ASSERT_NOT_NULL(strstr(instructions, "Grep and file reads fit literal text"));
+    yyjson_doc_free(doc);
+    free(init);
     PASS();
 }
 
@@ -1425,10 +1507,9 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
-        /* ingest_traces only validates and counts its input; it writes
-         * nothing, so it is read-only and idempotent until edge creation
-         * actually lands (#2118). */
-        {"ingest_traces", true, false, true, false},
+        /* Observation counts accumulate on retries, and ingestion can evict
+         * old runs to enforce retention. Both effects change stored data. */
+        {"ingest_traces", false, true, false, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -1511,10 +1592,12 @@ static bool tool_in_list(const char *name, const char *const *list, size_t count
 TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118) {
     /* Handlers that write user-visible state: index_repository (builds the
      * index), manage_adr (writes/overwrites ADR sections), delete_project
-     * (removes the index). Everything else must be read-only. */
-    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project"};
+     * (removes the index), ingest_traces (accumulates observations and evicts
+     * old runs). Everything else must be read-only. */
+    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project",
+                                           "ingest_traces"};
     /* Of those, only the ones that can remove/overwrite existing data. */
-    static const char *const destructive[] = {"manage_adr", "delete_project"};
+    static const char *const destructive[] = {"manage_adr", "delete_project", "ingest_traces"};
     const size_t n_mut = sizeof(mutating) / sizeof(mutating[0]);
     const size_t n_des = sizeof(destructive) / sizeof(destructive[0]);
 
@@ -1694,10 +1777,10 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
     ASSERT_TRUE(yyjson_is_arr(enum_arr));
 
     /* The enum must be exactly the valid-token set — no more, no less. */
-    static const char *expected[] = {"all",      "overview",   "structure", "dependencies",
-                                     "routes",   "languages",  "packages",  "entry_points",
-                                     "hotspots", "boundaries", "layers",    "file_tree",
-                                     "clusters", "cycles"};
+    static const char *expected[] = {"all",      "overview",   "structure",       "dependencies",
+                                     "routes",   "languages",  "packages",        "entry_points",
+                                     "hotspots", "boundaries", "layers",          "file_tree",
+                                     "clusters", "cycles",     "system_structure"};
     size_t expected_count = sizeof(expected) / sizeof(expected[0]);
     ASSERT_EQ(yyjson_arr_size(enum_arr), expected_count);
     for (size_t i = 0; i < expected_count; i++) {
@@ -1716,6 +1799,28 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
 
     yyjson_doc_free(doc);
     free(json);
+    PASS();
+}
+
+TEST(mcp_get_architecture_behavior_evidence_schema) {
+    const char *schema = cbm_mcp_tool_input_schema("get_architecture");
+    ASSERT_NOT_NULL(schema);
+    yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *properties = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+    yyjson_val *flag = yyjson_obj_get(properties, "include_behavior_evidence");
+    ASSERT_NOT_NULL(flag);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(flag, "type")), "boolean");
+    ASSERT_TRUE(yyjson_is_false(yyjson_obj_get(flag, "default")));
+    const char *description = cbm_mcp_tool_description("get_architecture");
+    ASSERT_NOT_NULL(description);
+    ASSERT_NOT_NULL(strstr(description, "include_behavior_evidence=true"));
+    ASSERT_NOT_NULL(strstr(description, "indexed"));
+    ASSERT_NOT_NULL(strstr(description, "call arguments"));
+    ASSERT_NOT_NULL(strstr(description, "parameter declarations"));
+    ASSERT_NOT_NULL(strstr(description, "return types"));
+    ASSERT_NOT_NULL(strstr(description, "not full dataflow"));
+    yyjson_doc_free(doc);
     PASS();
 }
 
@@ -1859,6 +1964,23 @@ TEST(mcp_get_int_arg) {
     ASSERT_EQ(val, 5);
     val = cbm_mcp_get_int_arg(args, "missing", 42);
     ASSERT_EQ(val, 42);
+    /* Out-of-int-range integers return the default instead of truncating:
+     * 2^32 + 1 used to read back as 1 through yyjson_get_int's int cast. */
+    val = cbm_mcp_get_int_arg("{\"limit\":4294967297}", "limit", 17);
+    ASSERT_EQ(val, 17);
+    val = cbm_mcp_get_int_arg("{\"limit\":-4294967297}", "limit", 19);
+    ASSERT_EQ(val, 19);
+    val = cbm_mcp_get_int_arg("{\"limit\":2147483648}", "limit", 23);
+    ASSERT_EQ(val, 23);
+    val = cbm_mcp_get_int_arg("{\"limit\":-9223372036854775808}", "limit", 29);
+    ASSERT_EQ(val, 29);
+    /* Boundary values and a negative in-range value still pass through. */
+    val = cbm_mcp_get_int_arg("{\"limit\":2147483647}", "limit", 0);
+    ASSERT_EQ(val, 2147483647);
+    val = cbm_mcp_get_int_arg("{\"limit\":-2147483648}", "limit", 0);
+    ASSERT_EQ(val, -2147483648);
+    val = cbm_mcp_get_int_arg("{\"limit\":-7}", "limit", 0);
+    ASSERT_EQ(val, -7);
     PASS();
 }
 
@@ -1924,7 +2046,7 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
     char err[1024];
     bool approved =
         !approve_sensitive || cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root,
-                                                      true, err, sizeof(err));
+                                                      true, false, err, sizeof(err));
     cbm_config_t *cfg = approved ? cbm_config_open(cache) : NULL;
     cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
     int calls = -2;
@@ -1963,8 +2085,14 @@ TEST(mcp_issue403_sensitive_root_stops_before_discovery_count) {
 }
 
 TEST(mcp_issue403_explicit_approval_preserves_auto_index) {
-    char *sensitive_home = th_mktempdir("cbm_mcp_403_home");
-    ASSERT_NOT_NULL(sensitive_home);
+    char *created = th_mktempdir("cbm_mcp_403_home");
+    ASSERT_NOT_NULL(created);
+    /* The session root is presented in its resolved form, as the daemon does,
+     * because the home helper hands out the resolved home: with the raw
+     * spelling the two differ on macOS (/tmp is a firmlink) and the root
+     * would pass as an ordinary one, never reaching the approval path. */
+    char sensitive_home[4096];
+    ASSERT_TRUE(cbm_canonical_path(created, sensitive_home, sizeof(sensitive_home)));
     const char *saved_home = getenv("HOME");
     char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
     cbm_setenv("HOME", sensitive_home, 1);
@@ -2068,6 +2196,9 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     ASSERT_NOT_NULL(strstr(resp, "analysis tool profile"));
     ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
     ASSERT_NULL(strstr(resp, "index_repository"));
+    /* Profile instructions name the structural questions, like the default. */
+    ASSERT_NOT_NULL(strstr(resp, "who calls a function"));
+    ASSERT_NOT_NULL(strstr(resp, "which code a change affects"));
     free(resp);
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
@@ -2110,6 +2241,7 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
     ASSERT_NOT_NULL(strstr(resp, "scout tool profile"));
     ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
     ASSERT_NULL(strstr(resp, "index_repository"));
+    ASSERT_NOT_NULL(strstr(resp, "who calls a function"));
     ASSERT_FALSE(mcp_saw_autoindex_log);
     free(resp);
 
@@ -2313,6 +2445,10 @@ TEST(server_handle_logs_request_without_params) {
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));
     PASS();
@@ -2329,6 +2465,59 @@ TEST(server_handle_unknown_method) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Issue #2433: a modern client probes server/discover before initialize.
+ * The -32601 stays so it falls back; only that probe is logged as info. */
+TEST(server_handle_discover_probe_logs_info) {
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel prev_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32601"));
+    ASSERT_NOT_NULL(strstr(resp, "Method not found"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=server/discover"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "level=info"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NULL(strstr(mcp_log_buf, "level=warn"));
+    ASSERT_NULL(strstr(mcp_log_buf, "status=error"));
+    free(resp);
+
+    mcp_log_buf[0] = '\0';
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"unknown/method\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "-32601"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=unknown/method"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "level=warn"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=error"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"initialize\","
+                                      "\"params\":{\"protocolVersion\":\"2026-07-28\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "2025-11-25"));
+    ASSERT_NULL(strstr(resp, "2026-07-28"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"resources\":[]"));
+    ASSERT_NULL(strstr(resp, "-32601"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(prev_level);
     PASS();
 }
 
@@ -2357,6 +2546,53 @@ TEST(tool_list_projects_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* A cache directory that exists but holds no project is the first-run state.
+ * list_projects must answer it with a well-formed empty page in both
+ * encodings: zero rows, zero totals, no further page, and the indexing hint.
+ *
+ * This is also the one input on which the record array is never allocated.
+ * The assertions are the behavioural half and hold on every platform; that the
+ * sort is not handed a null base is visible only where the C library declares
+ * it nonnull and the sanitizer halts on the report (see the same note on
+ * pass_similarity_empty_graph_no_entries). Do not read a green run on a
+ * recovering lane as proof that the guard is still in place. */
+TEST(tool_list_projects_empty_cache_returns_wellformed_empty_page) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-list-empty"));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *json_response =
+        srv ? cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}") : NULL;
+    char *json_text = json_response ? extract_text_content(json_response) : NULL;
+    bool json_empty_page =
+        json_text && strstr(json_text, "\"projects\":[]") && strstr(json_text, "\"total\":0") &&
+        strstr(json_text, "\"returned\":0") && strstr(json_text, "\"has_more\":false") &&
+        !strstr(json_text, "next_offset") && strstr(json_text, "No projects indexed");
+    bool json_not_error = json_response && !strstr(json_response, "\"isError\":true");
+
+    char *tree_response = srv ? cbm_mcp_handle_tool(srv, "list_projects", "{}") : NULL;
+    char *tree_text = tree_response ? extract_text_content(tree_response) : NULL;
+    bool tree_empty_page =
+        tree_text && strstr(tree_text, "projects: 0 ") && strstr(tree_text, "total: 0\n") &&
+        strstr(tree_text, "returned: 0\n") && strstr(tree_text, "has_more: false\n") &&
+        !strstr(tree_text, "next_offset") && strstr(tree_text, "No projects indexed");
+    bool tree_not_error = tree_response && !strstr(tree_response, "\"isError\":true");
+
+    free(json_text);
+    free(json_response);
+    free(tree_text);
+    free(tree_response);
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(json_not_error);
+    ASSERT_TRUE(json_empty_page);
+    ASSERT_TRUE(tree_not_error);
+    ASSERT_TRUE(tree_empty_page);
     PASS();
 }
 
@@ -2469,6 +2705,98 @@ TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469) {
     ASSERT_NOT_NULL(strstr(response, "has_more: true"));
     ASSERT_NULL(strstr(response, "unknown tool"));
     free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* get_file_outline shows the sections possibly about the file as a whole or
+ * about a folder holding it (highest p first, kind shown), in both formats,
+ * on the first page only; a candidate for a function in the file is not one
+ * of them. */
+TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "doc-outline", "/tmp/doc-outline"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "doc-outline");
+    const struct {
+        const char *label, *qn, *path;
+        int start;
+    } nodes[] = {{"File", "doc-outline.pkg.mail.parse.__file__", "pkg/mail/parse.py", 0},
+                 {"Function", "doc-outline.pkg.mail.parse.parse_mail", "pkg/mail/parse.py", 3},
+                 {"Folder", "doc-outline.pkg.mail", "pkg/mail", 0},
+                 {"Section", "doc-outline.pkg.mail.README.Mail", "pkg/mail/README.md", 1},
+                 {"Section", "doc-outline.docs.parsing.Parsing", "docs/parsing.md", 5}};
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        cbm_node_t node = {.project = "doc-outline",
+                           .label = nodes[i].label,
+                           .name = nodes[i].qn,
+                           .qualified_name = nodes[i].qn,
+                           .file_path = nodes[i].path,
+                           .start_line = nodes[i].start,
+                           .end_line = nodes[i].start + 2};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "doc-outline.docs.parsing.Parsing",
+         .target_qn = "doc-outline.pkg.mail.parse.__file__",
+         .rank = 1,
+         .score = 0.41,
+         .p = 0.5,
+         .evidence = "{\"shared_terms\":4,\"name_tokens\":0,\"kind\":\"file\","
+                     "\"position\":\"global\"}"},
+        {.section_qn = "doc-outline.pkg.mail.README.Mail",
+         .target_qn = "doc-outline.pkg.mail",
+         .rank = 1,
+         .p = 0.8,
+         .evidence = "{\"shared_terms\":0,\"name_tokens\":0,\"kind\":\"folder\","
+                     "\"position\":\"local\"}"},
+        {.section_qn = "doc-outline.docs.parsing.Parsing",
+         .target_qn = "doc-outline.pkg.mail.parse.parse_mail",
+         .rank = 1,
+         .score = 0.5,
+         .p = 0.9,
+         .evidence = "{\"shared_terms\":5,\"name_tokens\":1,\"kind\":\"function\","
+                     "\"position\":\"global\"}"},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(store, "doc-outline", rows, 3), CBM_STORE_OK);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_file_outline",
+                            "{\"project\":\"doc-outline\",\"file_path\":\"pkg/mail/parse.py\","
+                            "\"format\":\"json\"}");
+    char *text = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *in = yyjson_obj_get(yyjson_doc_get_root(doc), "possibly_described_in");
+    ASSERT_EQ((int)yyjson_arr_size(in), 2);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "section")),
+                  "doc-outline.pkg.mail.README.Mail");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "kind")), "folder");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 1), "kind")), "file");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 1), "file_path")),
+                  "docs/parsing.md");
+    ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "candidates_note"));
+    yyjson_doc_free(doc);
+    free(text);
+
+    raw = cbm_mcp_handle_tool(srv, "get_file_outline",
+                              "{\"project\":\"doc-outline\",\"file_path\":\"pkg/mail/parse.py\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "possibly_described_in"));
+    ASSERT_NOT_NULL(strstr(raw, "doc-outline.pkg.mail.README.Mail"));
+    ASSERT_NOT_NULL(strstr(raw, "folder"));
+    free(raw);
+
+    raw = cbm_mcp_handle_tool(srv, "get_file_outline",
+                              "{\"project\":\"doc-outline\",\"file_path\":\"pkg/mail/parse.py\","
+                              "\"offset\":1}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "possibly_described_in"));
+    free(raw);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -4184,6 +4512,431 @@ TEST(tool_search_graph_bm25_applies_label_filter) {
     PASS();
 }
 
+/* #2386: the label filter must choose the BM25 candidate window, not trim it
+ * afterwards. 2001 Functions fill the window ahead of 3 Classes that rank
+ * strictly lower (longer file_path), so a post-window filter returns 0 Classes
+ * while reporting a saturated window. */
+static char *bm25_label_window_search(cbm_mcp_server_t *srv, const char *label_json) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2386,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-label-window\",\"query\":\"windowneedle\","
+             "\"label\":%s,\"limit\":10,\"format\":\"json\"}}}",
+             label_json);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_label_filter_selects_candidate_window) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-label-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-label-window"), CBM_STORE_OK);
+
+    for (int i = 0; i < 2001; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.fn_%04d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "many.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.cls_%d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Class",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "deeply/nested/package/layout/registry.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    /* The rare label comes back in full, and the window is not saturated. */
+    char *inner = bm25_label_window_search(srv, "\"Class\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_0\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_2\""));
+    ASSERT_NULL(strstr(inner, "\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+    free(inner);
+
+    /* The common label still overflows its own window and says so. */
+    inner = bm25_label_window_search(srv, "\"Function\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    /* A label carrying FTS5 syntax is never spliced into MATCH: the query
+     * stays in BM25 mode and the exact label check matches nothing. */
+    inner = bm25_label_window_search(srv, "\"Class\\\" OR windowneedle\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Scoping the MATCH to a label must not reorder that label's rows: a
+ * label-filtered query lists its rows in the same order as the unfiltered
+ * query does. The fixture's four `table` Methods differ in row length, which
+ * is exactly what a scored label phrase would re-weight. */
+TEST(tool_search_graph_bm25_label_scope_keeps_rank_order) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-find");
+    bm25_findability_fixture(store, "bm25-find");
+
+    char *all_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2387,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"limit\":20,\"format\":\"json\"}}}");
+    char *methods_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2388,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"label\":\"Method\","
+             "\"limit\":20,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(all_resp);
+    ASSERT_NOT_NULL(methods_resp);
+    char *all = extract_text_content(all_resp);
+    char *methods = extract_text_content(methods_resp);
+    free(all_resp);
+    free(methods_resp);
+    ASSERT_NOT_NULL(all);
+    ASSERT_NOT_NULL(methods);
+    ASSERT_NOT_NULL(strstr(methods, "\"total\":4"));
+
+    static const char *const qns[] = {
+        "\"bm25-find.core.Table.Table.unquoted\"",
+        "\"bm25-find.core.Table.Table.describe\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql\"",
+    };
+    enum { QN_COUNT = sizeof(qns) / sizeof(qns[0]) };
+    for (int i = 0; i < QN_COUNT; i++) {
+        for (int j = 0; j < QN_COUNT; j++) {
+            if (i == j) {
+                continue;
+            }
+            const char *ai = strstr(all, qns[i]);
+            const char *aj = strstr(all, qns[j]);
+            const char *mi = strstr(methods, qns[i]);
+            const char *mj = strstr(methods, qns[j]);
+            ASSERT_NOT_NULL(ai);
+            ASSERT_NOT_NULL(aj);
+            ASSERT_NOT_NULL(mi);
+            ASSERT_NOT_NULL(mj);
+            ASSERT_EQ(ai < aj, mi < mj);
+        }
+    }
+    free(all);
+    free(methods);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled BM25 query never ranks File, Folder, Variable or Project nodes
+ * (they match almost any token through their path), but an explicit label
+ * naming one of them must be served: those nodes are in nodes_fts, and
+ * excluding them there too answered `query=config label=Folder` with 0 rows
+ * and an exact "eq" total. One node per label shares the query tokens with a
+ * Function. */
+static void bm25_unranked_labels_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-noise");
+    struct {
+        const char *label, *name, *qn, *file;
+    } rows[] = {
+        {"Function", "loadconfig", "bm25-noise.app.loadconfig", "app/config.py"},
+        {"File", "__file__", "bm25-noise.app.config.py", "app/config.py"},
+        {"Folder", "config", "bm25-noise.app.config", "app/config"},
+        {"Variable", "CONFIG_PATH", "bm25-noise.app.config.CONFIG_PATH", "app/config.py"},
+        {"Project", "bm25-noise", "bm25-noise", ""},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        cbm_node_t node = {.project = project,
+                           .label = rows[i].label,
+                           .name = rows[i].name,
+                           .qualified_name = rows[i].qn,
+                           .file_path = rows[i].file,
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 1};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_noise_search(cbm_mcp_server_t *srv, const char *query, const char *label) {
+    char req[512];
+    char label_arg[128] = "";
+    if (label) {
+        snprintf(label_arg, sizeof(label_arg), ",\"label\":\"%s\"", label);
+    }
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2423,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-noise\",\"query\":\"%s\"%s,\"limit\":10,\"format\":\"json\"}}}",
+             query, label_arg);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_serves_unranked_labels_when_named) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-noise");
+    bm25_unranked_labels_fixture(store, "bm25-noise");
+
+    static const struct {
+        const char *label, *qn;
+    } named[] = {
+        {"File", "\"bm25-noise.app.config.py\",\"File\""},
+        {"Folder", "\"bm25-noise.app.config\",\"Folder\""},
+        {"Variable", "\"bm25-noise.app.config.CONFIG_PATH\",\"Variable\""},
+        {"Project", "\"bm25-noise\",\"Project\""},
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        char *inner = bm25_noise_search(srv, "noise config", named[i].label);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, named[i].qn));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "\"hint\""));
+        free(inner);
+    }
+
+    /* Without a label the four stay out of the ranking: only the Function. */
+    char *inner = bm25_noise_search(srv, "noise config", NULL);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-noise.app.loadconfig\",\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NULL(strstr(inner, "\"File\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NULL(strstr(inner, "\"Variable\""));
+    ASSERT_NULL(strstr(inner, "\"Project\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Labels are case-sensitive. A BM25 query whose label no node carries as
+ * spelled answers 0 rows like the structural path does, but never silently:
+ * the hint names the stored spelling, or get_graph_schema when the label is
+ * unknown. An existing label with no matching row is a true zero: no hint. */
+TEST(tool_search_graph_bm25_zero_hint_names_the_label) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-noise");
+    bm25_unranked_labels_fixture(store, "bm25-noise");
+
+    char *inner = bm25_noise_search(srv, "config", "folder");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"hint\":"));
+    ASSERT_NOT_NULL(strstr(inner, "retry with label=\\\"Folder\\\""));
+    free(inner);
+
+    inner = bm25_noise_search(srv, "config", "Widget");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NOT_NULL(strstr(inner, "get_graph_schema"));
+    free(inner);
+
+    inner = bm25_noise_search(srv, "zzznomatch", "Function");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NULL(strstr(inner, "\"hint\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* file_pattern, kind and namespace filter after the BM25 candidate window
+ * (they cannot be put into the MATCH like the label). 2001 same-label nodes
+ * with a short path fill the window ahead of 3 that rank strictly lower (long
+ * path) and are the only ones passing each filter, so a windowed search
+ * answered 0 rows. A saturated window under such a filter is ranked over
+ * every candidate: all 3 rows, an exact total, consistent offset pages. */
+static void bm25_post_window_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-post-window");
+    for (int i = 0; i < 2004; i++) {
+        bool rare = i >= 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-post-window.%s_%04d", rare ? "rare" : "fn", i);
+        cbm_node_t node = {
+            .project = project,
+            .label = "Function",
+            .name = "postneedle",
+            .qualified_name = qn,
+            .file_path = rare ? "deeply/nested/package/layout/registry.c" : "many.c",
+            .start_line = i + 1,
+            .end_line = i + 1,
+            .properties_json =
+                rare ? "{\"kind\":\"Deployment\",\"obj_key\":\"apps/Deployment/prod/web\"}" : NULL};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_post_window_search(cbm_mcp_server_t *srv, const char *filter_json, int limit,
+                                     int offset) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2424,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-post-window\",\"query\":\"postneedle\"%s,"
+             "\"limit\":%d,\"offset\":%d,\"format\":\"json\"}}}",
+             filter_json, limit, offset);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-post-window");
+    bm25_post_window_fixture(store, "bm25-post-window");
+
+    static const char *const filters[] = {
+        ",\"file_pattern\":\"deeply/nested\"",
+        ",\"kind\":\"Deployment\"",
+        ",\"namespace\":\"prod\"",
+    };
+    for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
+        char *inner = bm25_post_window_search(srv, filters[i], 10, 0);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2001\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2003\""));
+        ASSERT_NULL(strstr(inner, "\"bm25-post-window.fn_"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":3,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+        free(inner);
+    }
+
+    /* Offset pages over the exhaustive ranking are disjoint and complete. */
+    char *page1 = bm25_post_window_search(srv, filters[0], 2, 0);
+    char *page2 = bm25_post_window_search(srv, filters[0], 2, 2);
+    ASSERT_NOT_NULL(page1);
+    ASSERT_NOT_NULL(page2);
+    ASSERT_NOT_NULL(strstr(page1, "\"returned\":2,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"returned\":1,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"total\":3,"));
+    for (int i = 2001; i < 2004; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "\"bm25-post-window.rare_%04d\"", i);
+        ASSERT_TRUE((strstr(page1, qn) != NULL) != (strstr(page2, qn) != NULL));
+    }
+    free(page1);
+    free(page2);
+
+    /* Without a post-window filter the window stays and says so. */
+    char *inner = bm25_post_window_search(srv, "", 10, 0);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled query whose whole candidate window is File/Folder/Variable/
+ * Project rows (excluded from unlabelled ranking) found no row at all, while
+ * a matching definition sat just beyond the window: 2001 short Folder rows
+ * outrank one Function with a long path. A window with no row passing the
+ * filters is ranked over every candidate instead. */
+TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-empty-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-empty-window"), CBM_STORE_OK);
+    for (int i = 0; i < 2002; i++) {
+        bool def = i == 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-empty-window.%s_%04d", def ? "def" : "dir", i);
+        cbm_node_t node = {.project = project,
+                           .label = def ? "Function" : "Folder",
+                           .name = "foldneedle",
+                           .qualified_name = qn,
+                           .file_path = def ? "deeply/nested/package/layout/registry.c" : "d",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2425,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-empty-window\",\"query\":\"foldneedle\",\"limit\":10,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-empty-window.def_2001\",\"Function\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* The definition whose NAME is the query ranks first: the `Table` class above
  * its own methods and above test methods that repeat "table" three times; the
  * `get_object_or_404` function above the test methods that contain it. */
@@ -5742,6 +6495,104 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     PASS();
 }
 
+/* #1115: with more indexed projects than were resident at once, the
+ * least-recently-used one answered "project not found or not indexed" from
+ * index_status, and list_projects and index_status disagreed in the same
+ * session. The server keeps one project store open and switches it whenever a
+ * call names another project, so twelve projects visited one after another
+ * force a switch on every step and each visit is the first touch of a project
+ * that is not resident. Every project must resolve through index_status and a
+ * query, and list_projects must report all twelve before and after the
+ * switches. */
+TEST(tool_project_discovery_agrees_across_store_switches_issue1115) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-switch-1115-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    enum { PROJECTS = 12 };
+    for (int i = 0; i < PROJECTS; i++) {
+        char project[32];
+        char db_path[512];
+        char root_path[512];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        snprintf(root_path, sizeof(root_path),
+                 "/workspaces/organization/shared/services/lean-project-%02d", i);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, root_path), CBM_STORE_OK);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "entry",
+                           .qualified_name = "shared.module.entry",
+                           .file_path = "src/main.c",
+                           .start_line = 1,
+                           .end_line = 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+        cbm_store_close(store);
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *pre_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *pre_switch = extract_text_content(pre_switch_response);
+    bool list_complete_before_switches = pre_switch && strstr(pre_switch, "total: 12") &&
+                                         strstr(pre_switch, "lean-project-00") &&
+                                         strstr(pre_switch, "lean-project-11");
+    free(pre_switch);
+    free(pre_switch_response);
+
+    bool projects_resolve_after_switches = true;
+    for (int i = PROJECTS - 1; i >= 0; i--) {
+        char project[32];
+        char args[96];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+
+        char *status_response = cbm_mcp_handle_tool(srv, "index_status", args);
+        char *status = extract_text_content(status_response);
+        if (!status || !strstr(status, "ready")) {
+            projects_resolve_after_switches = false;
+        }
+        free(status);
+        free(status_response);
+
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"entry\"}", project);
+        char *search_response = cbm_mcp_handle_tool(srv, "search_graph", args);
+        char *search = extract_text_content(search_response);
+        if (!search || !strstr(search, "entry")) {
+            projects_resolve_after_switches = false;
+        }
+        free(search);
+        free(search_response);
+    }
+    char *post_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *post_switch = extract_text_content(post_switch_response);
+    bool list_complete_after_switches = post_switch && strstr(post_switch, "total: 12") &&
+                                        strstr(post_switch, "lean-project-00") &&
+                                        strstr(post_switch, "lean-project-11");
+    free(post_switch);
+    free(post_switch_response);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    for (int i = 0; i < PROJECTS; i++) {
+        char project[32];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        cleanup_project_db(cache, project);
+    }
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(list_complete_before_switches);
+    ASSERT_TRUE(projects_resolve_after_switches);
+    ASSERT_TRUE(list_complete_after_switches);
+    PASS();
+}
+
 /* The stored project root is dynamic identity, not a display-sized field.
  * Keep a syntactically valid segmented path beyond 1 KiB intact in both wire
  * encodings; the default detail also routes that same value through branch
@@ -5836,6 +6687,312 @@ TEST(tool_index_status_no_project) {
     ASSERT_NOT_NULL(resp);
     /* Should return error or empty status */
     ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static const char *const mcp_ingest_guard_request =
+    "{\"project\":\"guard-traces\",\"label\":\"guarded\",\"traces\":["
+    "{\"path\":[\"guard-traces::alpha\",\"guard-traces::beta\"]}]}";
+
+static cbm_mcp_server_t *mcp_ingest_guard_server(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    if (!store ||
+        cbm_store_upsert_project(store, "guard-traces", "/tmp/guard-traces") != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_mcp_server_set_project(srv, "guard-traces");
+    static const char *const names[] = {"alpha", "beta"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "guard-traces::%s", names[i]);
+        cbm_node_t node = {.project = "guard-traces",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "trace.c",
+                           .start_line = 1,
+                           .end_line = 2};
+        if (cbm_store_upsert_node(store, &node) <= 0) {
+            cbm_mcp_server_free(srv);
+            return NULL;
+        }
+    }
+    return srv;
+}
+
+static long long mcp_ingest_guard_observed_count(cbm_mcp_server_t *srv) {
+    long long count = -1;
+    if (cbm_store_observed_lookup(cbm_mcp_server_store(srv), "guard-traces", "guard-traces::alpha",
+                                  "guard-traces::beta", &count, NULL, 0, NULL, 0) != CBM_STORE_OK) {
+        return -1;
+    }
+    return count;
+}
+
+TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool blocked = resp && strstr(resp, "\"isError\":true") && strstr(resp, "blocked");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(blocked);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    bool stored = true;
+    for (int i = 0; i < 2; i++) {
+        char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+        char *inner = resp ? extract_text_content(resp) : NULL;
+        stored = stored && inner && strstr(inner, "\"status\":\"stored\"") &&
+                 strstr(inner, "\"pairs_stored\":1") && strstr(inner, "\"paths_stored\":1");
+        free(inner);
+        free(resp);
+    }
+    long long count = mcp_ingest_guard_observed_count(srv);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(stored);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(probe.begin_count, 2);
+    ASSERT_EQ(probe.end_count, 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_STR_EQ(probe.begin_projects[i], "guard-traces");
+        ASSERT_STR_EQ(probe.end_projects[i], "guard-traces");
+    }
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.cancel_on_begin_call = 1, .cancel_server = srv};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool cancelled = resp && strstr(resp, "\"isError\":true") && strstr(resp, "cancelled");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(probe.cancel_attempted);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+TEST(tool_ingest_traces_mutation_guard_missing_store_releases) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-traces-guard-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    bool missing = resp && strstr(resp, "\"isError\":true") &&
+                   (strstr(resp, "not found") || strstr(resp, "not indexed"));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/guard-traces.db", cache);
+    bool created = cbm_file_exists(path);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, "guard-traces");
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(missing);
+    ASSERT_FALSE(created);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+/* Reject exactly the endpoint lookup at prepare time; this exercises the
+ * handler's query failure exit without corrupting a database or timing a lock. */
+static int mcp_ingest_guard_deny_nodes(void *context, int action, const char *table,
+                                       const char *column, const char *database,
+                                       const char *trigger) {
+    (void)context;
+    (void)column;
+    (void)database;
+    (void)trigger;
+    return action == SQLITE_READ && table && strcmp(table, "nodes") == 0 ? SQLITE_DENY : SQLITE_OK;
+}
+
+TEST(tool_ingest_traces_mutation_guard_query_failure_releases) {
+    cbm_mcp_server_t *srv = mcp_ingest_guard_server();
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    sqlite3 *db = cbm_store_get_db(cbm_mcp_server_store(srv));
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_set_authorizer(db, mcp_ingest_guard_deny_nodes, NULL), SQLITE_OK);
+    char *resp = cbm_mcp_handle_tool(srv, "ingest_traces", mcp_ingest_guard_request);
+    int reset_result = sqlite3_set_authorizer(db, NULL, NULL);
+    bool failed = resp && strstr(resp, "\"isError\":true") && strstr(resp, "not queryable");
+    long long count = mcp_ingest_guard_observed_count(srv);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_EQ(reset_result, SQLITE_OK);
+    ASSERT_TRUE(failed);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], "guard-traces");
+    ASSERT_STR_EQ(probe.end_projects[0], "guard-traces");
+    PASS();
+}
+
+/* ingest_traces stores observed runtime calls qn-keyed (reindex-proof):
+ * paths decompose into pairs, counts accumulate per run label, unresolved
+ * names are reported (not silently dropped), whole runs evict together. */
+TEST(tool_ingest_traces_stores_observed_calls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "traces-test";
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/traces-test"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    static const char *const names[3] = {"alpha", "beta", "gamma"};
+    for (int i = 0; i < 3; i++) {
+        cbm_node_t node;
+        memset(&node, 0, sizeof(node));
+        node.project = project;
+        node.label = "Function";
+        node.name = names[i];
+        char qn[64];
+        snprintf(qn, sizeof(qn), "traces-test::%s", names[i]);
+        node.qualified_name = qn;
+        node.file_path = "src/t.c";
+        node.start_line = 1;
+        node.end_line = 3;
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+
+    /* One 3-hop path, one bare pair with a count, one path with an
+     * unindexed hop (skipped, reported), one malformed 1-hop path. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "ingest_traces",
+        "{\"project\":\"traces-test\",\"label\":\"run1\",\"traces\":["
+        "{\"path\":[\"traces-test::alpha\",\"traces-test::beta\",\"traces-test::gamma\"]},"
+        "{\"caller\":\"traces-test::alpha\",\"callee\":\"traces-test::gamma\",\"count\":5},"
+        "{\"path\":[\"traces-test::alpha\",\"traces-test::missing\"]},"
+        "{\"path\":[\"traces-test::alpha\"]}]}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"stored\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"pairs_stored\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"paths_stored\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"pairs_unmatched\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "traces-test::missing"));
+    ASSERT_NOT_NULL(strstr(inner, "\"malformed\":1"));
+    free(inner);
+    free(resp);
+
+    long long count = -1;
+    char label[64], seen[64];
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::beta",
+                                        &count, label, sizeof(label), seen, sizeof(seen)),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 1);
+    ASSERT_STR_EQ(label, "run1");
+    ASSERT_TRUE(seen[0] != '\0');
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::gamma",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 5);
+    /* Never observed: zero count, not an error. */
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::beta", "traces-test::alpha",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 0);
+
+    /* Same pair again under the same label accumulates; a second label
+     * aggregates in the lookup and reports as the newest run. */
+    resp = cbm_mcp_handle_tool(
+        srv, "ingest_traces",
+        "{\"project\":\"traces-test\",\"label\":\"run1\",\"traces\":[{\"caller\":"
+        "\"traces-test::alpha\",\"callee\":\"traces-test::gamma\",\"count\":2}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::gamma",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 7);
+    resp = cbm_mcp_handle_tool(
+        srv, "ingest_traces",
+        "{\"project\":\"traces-test\",\"label\":\"run2\",\"traces\":[{\"caller\":"
+        "\"traces-test::alpha\",\"callee\":\"traces-test::beta\"}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::beta",
+                                        &count, label, sizeof(label), NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 2);
+    ASSERT_STR_EQ(label, "run2");
+
+    /* Whole-run eviction: run1's newest observation is older, so run1 goes
+     * first and run2 survives intact. */
+    char *evicted = NULL;
+    ASSERT_EQ(cbm_store_observed_evict_oldest_label(st, project, &evicted), CBM_STORE_OK);
+    ASSERT_NOT_NULL(evicted);
+    ASSERT_STR_EQ(evicted, "run1");
+    free(evicted);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::gamma",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 0);
+    ASSERT_EQ(cbm_store_observed_lookup(st, project, "traces-test::alpha", "traces-test::beta",
+                                        &count, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ((int)count, 1);
+
+    /* Empty traces is a tool error, not a silent accept. */
+    resp = cbm_mcp_handle_tool(srv, "ingest_traces", "{\"project\":\"traces-test\",\"traces\":[]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -6177,7 +7334,16 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
      * metadata_match contract below would fail. */
     cbm_path_info_t path_info;
     ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+    /* The real content hash, as the indexer records it: a path counts as
+     * current only when its bytes are verified (#2585). */
+    char content[4096];
+    FILE *source = fopen(source_path, "rb");
+    ASSERT_NOT_NULL(source);
+    size_t content_len = fread(content, 1, sizeof(content), source);
+    fclose(source);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(content, content_len, sha);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", sha, path_info.mtime_ns,
                                          path_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
@@ -6240,9 +7406,9 @@ TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
     ASSERT_EQ(cbm_path_info_utf8(source_path, &info), 0);
 
     /* The hash exactly as the indexer writes it: same source, ns precision. */
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns,
-                                         info.size),
-              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns, info.size),
+        CBM_STORE_OK);
 
     /* format=json, like every other coverage test here: the DEFAULT response is
      * the compact table, in which a field name never appears. Keeping the
@@ -6259,11 +7425,11 @@ TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
     /* A hash stored at seconds precision — what a stat-based reader previously
      * compared against — must NOT match an unchanged file: the comparison must
      * stay nanosecond-exact, or part of mtime resolution is silently dropped. */
-    int64_t seconds_mtime_ns = (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) *
-                               (int64_t)CBM_NSEC_PER_SEC;
+    int64_t seconds_mtime_ns =
+        (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) * (int64_t)CBM_NSEC_PER_SEC;
     if (seconds_mtime_ns != info.mtime_ns) {
-        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
-                                             seconds_mtime_ns, info.size),
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", seconds_mtime_ns,
+                                             info.size),
                   CBM_STORE_OK);
         response = cbm_mcp_handle_tool(srv, "check_index_coverage",
                                        "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
@@ -6333,6 +7499,286 @@ TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed) {
     PASS();
 }
 
+/* #2585 fixtures: record main.go's hash row with its real size and either its
+ * real or a shifted mtime, and either its real content hash or another
+ * file's. This reaches each freshness state without touching file times, which
+ * some platforms cannot set precisely. */
+static int record_main_go_hash(cbm_store_t *store, const char *tmp, bool real_content,
+                               bool real_mtime) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != 0) {
+        return CBM_STORE_ERR;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return CBM_STORE_ERR;
+    }
+    char bytes[4096];
+    size_t len = fread(bytes, 1, sizeof(bytes), fp);
+    fclose(fp);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    if (real_content) {
+        cbm_sha256_hex(bytes, len, sha);
+    } else {
+        cbm_sha256_hex("other bytes", strlen("other bytes"), sha);
+    }
+    int64_t mtime_ns = real_mtime ? info.mtime_ns : info.mtime_ns - (int64_t)CBM_NSEC_PER_SEC;
+    return cbm_store_upsert_file_hash(store, "test-project", "main.go", sha, mtime_ns, info.size);
+}
+
+static yyjson_val *coverage_first_path(cbm_mcp_server_t *srv, yyjson_doc **doc, char **inner) {
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                         "\"format\":\"json\"}");
+    *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = *inner ? yyjson_read(*inner, strlen(*inner), 0) : NULL;
+    return *doc ? yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(*doc), "paths"), 0) : NULL;
+}
+
+/* #2585: freshness judged by mtime and size passed a same-size edit whose
+ * timestamp was preserved, and stayed stale after identical bytes were
+ * rewritten. With a recorded content hash it now reports the bytes. */
+TEST(tool_check_index_coverage_freshness_verifies_content_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    ASSERT_EQ(write_coverage_meta(store, project.indexed_at, "complete"), CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+
+    static const struct {
+        bool real_content;
+        bool real_mtime;
+        const char *freshness;
+        const char *action;
+    } cases[] = {
+        /* Same metadata, different bytes: previously metadata_match. */
+        {false, true, "content_changed", "read_source_and_reindex"},
+        {true, true, "metadata_match", "use_graph_with_best_effort_caveat"},
+        /* Stale metadata, identical bytes: previously metadata_changed. */
+        {true, false, "content_match", "use_graph_with_best_effort_caveat"},
+        {false, false, "metadata_changed", "read_source_and_reindex"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(record_main_go_hash(store, tmp, cases[i].real_content, cases[i].real_mtime),
+                  CBM_STORE_OK);
+        yyjson_doc *doc = NULL;
+        char *inner = NULL;
+        yyjson_val *path = coverage_first_path(srv, &doc, &inner);
+        ASSERT_NOT_NULL(path);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), cases[i].freshness);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")), cases[i].action);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* A row without a usable content hash keeps the metadata verdict and says
+     * the content was not verified. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", 0, 0),
+              CBM_STORE_OK);
+    yyjson_doc *doc = NULL;
+    char *inner = NULL;
+    yyjson_val *path = coverage_first_path(srv, &doc, &inner);
+    ASSERT_NOT_NULL(path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_changed");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* Matching metadata alone is not evidence the bytes are current: without
+     * a usable hash, the path must not be recommended as if it were. */
+    char main_go[512];
+    snprintf(main_go, sizeof(main_go), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(main_go, &info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", info.mtime_ns,
+                                         info.size),
+              CBM_STORE_OK);
+    path = coverage_first_path(srv, &doc, &inner);
+    ASSERT_NOT_NULL(path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_match");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")),
+                  "read_source_and_reindex");
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+static char *snippet_process_order(cbm_mcp_server_t *srv, yyjson_doc **doc) {
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.ProcessOrder\",\"format\":\"json\"}");
+    char *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    return inner;
+}
+
+/* #2585 (and #1750): the snippet's line range is the indexed range. When the
+ * file's bytes are not the indexed bytes, the same range can hold another
+ * symbol's code, so the source is withheld rather than misattributed. */
+TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    /* Same metadata, different bytes: mtime/size cannot see this, and the
+     * indexed range would be sliced from bytes that were never indexed. */
+    ASSERT_EQ(record_main_go_hash(store, tmp, false, true), CBM_STORE_OK);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "freshness")), "content_changed");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "recommended_action")), "reindex_then_retry");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* The indexed bytes, with current or stale metadata, are served. */
+    for (int real_mtime = 1; real_mtime >= 0; real_mtime--) {
+        ASSERT_EQ(record_main_go_hash(store, tmp, true, real_mtime == 1), CBM_STORE_OK);
+        inner = snippet_process_order(srv, &doc);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_NOT_NULL(
+            strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func ProcessOrder"));
+        ASSERT_NULL(yyjson_obj_get(root, "source_drift"));
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* Without a usable hash the previous behavior holds, marked unverified. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", 0, 0), CBM_STORE_OK);
+    inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func ProcessOrder"));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Rewrites main.go so that the indexed ProcessOrder range holds other code. */
+static void snippet_capture_rewrite(void *context, const char *rel_path) {
+    (void)rel_path;
+    FILE *fp = fopen((const char *)context, "w");
+    if (fp) {
+        fputs("package main\n\n// a\n// b\n// c\n// d\nfunc Intruder() {\n}\n", fp);
+        fclose(fp);
+    }
+}
+
+/* #2585: the bytes get_code_snippet serves must be the bytes it verified. A
+ * write landing after the hash check and before the slice must not produce a
+ * content_verified snippet holding code that was never indexed. */
+TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+    char main_go[512];
+    snprintf(main_go, sizeof(main_go), "%s/project/main.go", tmp);
+
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, snippet_capture_rewrite, main_go);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_process_order(srv, &doc);
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    const char *source = yyjson_get_str(yyjson_obj_get(root, "source"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    ASSERT_NULL(strstr(source, "Intruder"));
+    ASSERT_NOT_NULL(strstr(source, "func ProcessOrder"));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* The write did land: the next call sees it and withholds the source. */
+    inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+#endif
+
+/* #2585: metadata.generation names the coverage-recording run and does not
+ * change on incremental re-index, so it cannot tell two publications apart.
+ * store_generation does, and every response that carries it agrees. */
+TEST(tool_responses_carry_store_generation_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(write_coverage_meta(store, "coverage-run-1", "complete"), CBM_STORE_OK);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+
+    char before[96];
+    ASSERT_EQ(cbm_store_generation(store, before, sizeof(before)), CBM_STORE_OK);
+    yyjson_doc *cdoc = NULL;
+    char *cinner = NULL;
+    ASSERT_NOT_NULL(coverage_first_path(srv, &cdoc, &cinner));
+    yyjson_val *meta = yyjson_obj_get(yyjson_doc_get_root(cdoc), "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "store_generation")), before);
+    yyjson_doc *sdoc = NULL;
+    char *sinner = snippet_process_order(srv, &sdoc);
+    ASSERT_NOT_NULL(sdoc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(sdoc), "store_generation")),
+                  before);
+    yyjson_doc_free(cdoc);
+    free(cinner);
+    yyjson_doc_free(sdoc);
+    free(sinner);
+
+    /* An index run advances the store generation, not the coverage one. */
+    char project_dir[512];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", tmp);
+    ASSERT_EQ(cbm_store_upsert_project(store, "test-project", project_dir), CBM_STORE_OK);
+    char after[96];
+    ASSERT_EQ(cbm_store_generation(store, after, sizeof(after)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(after, before);
+    ASSERT_NOT_NULL(coverage_first_path(srv, &cdoc, &cinner));
+    meta = yyjson_obj_get(yyjson_doc_get_root(cdoc), "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "store_generation")), after);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "generation")), "coverage-run-1");
+    yyjson_doc_free(cdoc);
+    free(cinner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(tool_check_index_coverage_surfaces_lookup_errors) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -6396,6 +7842,200 @@ TEST(tool_index_status_includes_git_metadata) {
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
+
+/* #2816: stored recursion must remain visible even when the CALLS graph has
+ * no self-edges. Removing metadata emission must fail these assertions. */
+TEST(tool_trace_path_recursion_metadata_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion"), CBM_STORE_OK);
+    const struct {
+        const char *name;
+        const char *props;
+        const char *self;
+        const char *recursive;
+    } cases[] = {
+        {"countdown", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"visit", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"mutual", "{\"self_recursive\":false,\"recursive\":true}", "false", "true"},
+        {"leaf", "{\"self_recursive\":false,\"recursive\":false}", "false", "false"},
+        {"legacy", "{}", "null", "null"},
+        {"partial", "{\"self_recursive\":true}", "true", "null"},
+        {"invalid", "{\"self_recursive\":\"true\",\"recursive\":1}", "null", "null"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "%s.%s", proj, cases[i].name);
+        cbm_node_t n = {.project = proj,
+                        .label = i == 1 ? "Method" : "Function",
+                        .name = cases[i].name,
+                        .qualified_name = qn,
+                        .file_path = "recursion.ts",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = cases[i].props};
+        ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+        for (int json = 0; json < 2; json++) {
+            for (int inbound = 0; inbound < 2; inbound++) {
+                char args[512];
+                snprintf(args, sizeof(args),
+                         "{\"project\":\"%s\",\"function_name\":\"%s\","
+                         "\"direction\":\"%s\",\"format\":\"%s\"}",
+                         proj, cases[i].name, inbound ? "inbound" : "outbound",
+                         json ? "json" : "tree");
+                char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                char *inner = extract_text_content(response);
+                ASSERT_NOT_NULL(inner);
+                char expected[128];
+                snprintf(expected, sizeof(expected),
+                         json ? "\"self_recursive\":%s" : "self_recursive: %s\n", cases[i].self);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                         cases[i].recursive);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                                   : "self_call_policy: omitted\n"));
+                snprintf(expected, sizeof(expected), json ? "\"%s_total\":0" : "%s_total: 0\n",
+                         inbound ? "callers" : "callees");
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                free(inner);
+                free(response);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_union_and_edges_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-union";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-union"), CBM_STORE_OK);
+    cbm_node_t def = {.project = proj,
+                      .label = "Function",
+                      .name = "countdown",
+                      .qualified_name = "recursion-union.impl.countdown",
+                      .file_path = "impl.ts",
+                      .start_line = 1,
+                      .end_line = 10,
+                      .properties_json = "{\"self_recursive\":false,\"recursive\":false}"};
+    int64_t def_id = cbm_store_upsert_node(st, &def);
+    ASSERT_GT(def_id, 0);
+    cbm_node_t stub = def;
+    stub.qualified_name = "recursion-union.stub.countdown";
+    stub.file_path = "stub.d.ts";
+    stub.end_line = 1;
+    stub.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+    cbm_node_t leaf = def;
+    leaf.name = "leaf";
+    leaf.qualified_name = "recursion-union.impl.leaf";
+    leaf.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    int64_t leaf_id = cbm_store_upsert_node(st, &leaf);
+    ASSERT_GT(leaf_id, 0);
+    cbm_edge_t edge = {.project = proj, .source_id = def_id, .target_id = leaf_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    const char *expected_flags[] = {"true", "null", "false", "true"};
+    for (int state = 0; state < 4; state++) {
+        def.properties_json = state == 3 ? "{\"self_recursive\":true,\"recursive\":true}"
+                                         : "{\"self_recursive\":false,\"recursive\":false}";
+        stub.properties_json = state == 0   ? "{\"self_recursive\":true,\"recursive\":true}"
+                               : state == 2 ? "{\"self_recursive\":false,\"recursive\":false}"
+                                            : "{}";
+        ASSERT_GT(cbm_store_upsert_node(st, &def), 0);
+        ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+        for (int json = 0; json < 2; json++) {
+            char args[512];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                     "\"direction\":\"outbound\",\"format\":\"%s\"}",
+                     proj, json ? "json" : "tree");
+            char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"callees_total\":1" : "callees_total: 1\n"));
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"leaf\"" : ".leaf"));
+            char expected[128];
+            snprintf(expected, sizeof(expected),
+                     json ? "\"self_recursive\":%s" : "self_recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            free(inner);
+            free(response);
+        }
+    }
+    /* Recursion is root metadata, but the omission policy concerns CALLS only. */
+    char *response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"recursion-union\",\"function_name\":\"countdown\","
+                            "\"edge_types\":[\"IMPORTS\"],\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NULL(strstr(inner, "self_call_policy"));
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_survives_budget_floor_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-budget";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-budget"), CBM_STORE_OK);
+    char huge[4096];
+    memset(huge, 'x', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = '\0';
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "countdown",
+                    .qualified_name = "recursion-budget.countdown",
+                    .file_path = "recursion.ts",
+                    .start_line = 1,
+                    .end_line = 10,
+                    .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    int64_t root_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(root_id, 0);
+    n.name = huge;
+    n.qualified_name = huge;
+    int64_t callee_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {
+        .project = proj, .source_id = root_id, .target_id = callee_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    for (int json = 0; json < 2; json++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                 "\"direction\":\"outbound\",\"format\":\"%s\",\"max_output_tokens\":128}",
+                 proj, json ? "json" : "tree");
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "output_budget"));
+        ASSERT_NULL(strstr(inner, huge));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_recursive\":true" : "self_recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"recursive\":true" : "recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                           : "self_call_policy: omitted\n"));
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
 
 TEST(tool_trace_call_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -6511,6 +8151,50 @@ TEST(tool_trace_call_path_ambiguous) {
     ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
     ASSERT_NOT_NULL(strstr(inner, "suggestions"));
     ASSERT_NULL(strstr(inner, "\"callees\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Tie rule for the C-macro namespace (PR C1): a typedef and its rename macro
+ * (`typedef struct state_s\n    state_t;` + `#define state_t NS(state_t)`) are
+ * two nodes with one name, `<module>.state_t` and `<module>.state_t#macro`, and
+ * here the same line span. The name resolves to the definition: without the
+ * macro ranking below it, the two tie and trace_path answers "ambiguous". */
+TEST(tool_trace_path_definition_beats_c_macro_c1) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "tie-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/tie");
+    cbm_node_t type = {.project = proj,
+                       .label = "Type",
+                       .name = "state_t",
+                       .qualified_name = "tie-proj.xxhash.state_t",
+                       .file_path = "xxhash.h",
+                       .start_line = 653,
+                       .end_line = 654};
+    cbm_node_t macro = {.project = proj,
+                        .label = "Macro",
+                        .name = "state_t",
+                        .qualified_name = "tie-proj.xxhash.state_t#macro",
+                        .file_path = "xxhash.h",
+                        .start_line = 429,
+                        .end_line = 430}; /* equal span: a tie without the rule */
+    ASSERT_GT(cbm_store_upsert_node(st, &type), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &macro), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"state_t\",\"project\":\"tie-proj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NULL(strstr(inner, "function not found"));
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -6907,6 +8591,14 @@ TEST(tool_trace_budget_never_slices_identifiers) {
     const char *project = "trace-byte-budget";
     cbm_mcp_server_set_project(srv, project);
     ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/trace-byte-budget"), CBM_STORE_OK);
+    cbm_coverage_meta_t coverage_meta = {.generation = "fixture",
+                                         .index_mode = "full",
+                                         .recorded_at = "2026-09-24T00:00:00Z",
+                                         .recording_status = "complete",
+                                         .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                         .unresolved_calls_complete = true,
+                                         .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &coverage_meta), CBM_STORE_OK);
 
     cbm_node_t hub = {.project = project,
                       .label = "Function",
@@ -7042,7 +8734,8 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                       .qualified_name = "trace-budget-cursor.hub",
                       .file_path = "src/hub.c",
                       .start_line = 1,
-                      .end_line = 2};
+                      .end_line = 2,
+                      .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
     cbm_node_t short_node = {.project = project,
                              .label = "Function",
                              .name = "short_row",
@@ -7082,6 +8775,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                             "\"format\":\"json\"}");
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NOT_NULL(strstr(inner, "short_row"));
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
@@ -7102,6 +8798,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, long_qn));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -7121,6 +8820,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, "short_row"));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -7252,6 +8954,14 @@ TEST(tool_trace_reports_engine_saturation_as_lower_bound) {
     const char *project = "trace-engine-cap";
     cbm_mcp_server_set_project(srv, project);
     ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/trace-engine-cap"), CBM_STORE_OK);
+    cbm_coverage_meta_t coverage_meta = {.generation = "fixture",
+                                         .index_mode = "full",
+                                         .recorded_at = "2026-09-24T00:00:00Z",
+                                         .recording_status = "complete",
+                                         .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                         .unresolved_calls_complete = true,
+                                         .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &coverage_meta), CBM_STORE_OK);
     cbm_node_t hub = {.project = project,
                       .label = "Function",
                       .name = "hub",
@@ -7502,9 +9212,10 @@ TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
     cbm_store_free_nodes(by_name, by_name_count);
 
     char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
-             "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
+        "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -7739,6 +9450,344 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     free(ev_json_txt);
     free(ev_json);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Unrelated file evidence must not poison a clean caller's exact outbound
+ * count. Inbound checks use their materialized candidate index, so corrupting
+ * an unrelated JSON payload after publication must not trigger a full scan. */
+TEST(tool_trace_path_reads_only_relevant_unresolved_evidence) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "bounded-trace";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bounded-trace"), CBM_STORE_OK);
+    cbm_node_t root = {.project = project,
+                       .label = "Function",
+                       .name = "run",
+                       .qualified_name = "bounded-trace.run",
+                       .file_path = "clean.js",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(store, &root), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "unrelated.js", "fixture", 0, 0),
+              CBM_STORE_OK);
+    cbm_coverage_row_t row = {.rel_path = "unrelated.js",
+                              .kind = "unresolved_calls",
+                              .detail = "[{\"caller\":\"bounded-trace.other\",\"leaf\":\"other\","
+                                        "\"candidate\":\"bounded-trace.other\"}]"};
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, &row, 1, &meta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "UPDATE index_coverage SET detail='broken json' "
+                                    "WHERE project='bounded-trace';"),
+              CBM_STORE_OK);
+    const char *directions[] = {"outbound", "inbound"};
+    const char *fields[] = {"callees_total_relation", "callers_total_relation"};
+    for (int i = 0; i < 2; i++) {
+        char args[256], expected[80];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"run\","
+                 "\"direction\":\"%s\",\"format\":\"json\"}",
+                 project, directions[i]);
+        char *out = cbm_mcp_handle_tool(srv, "trace_path", args);
+        ASSERT_NOT_NULL(out);
+        snprintf(expected, sizeof(expected), "\"%s\":\"eq\"", fields[i]);
+        ASSERT(response_contains_json_fragment(out, expected));
+        free(out);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_truncated_evidence_is_conservative) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "truncated-trace";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/truncated-trace"), CBM_STORE_OK);
+    cbm_node_t root = {.project = project, .label = "Function", .name = "run",
+                      .qualified_name = "truncated-trace.run", .file_path = "clean.js",
+                      .start_line = 1, .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(store, &root), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "unrelated.js", "fixture", 0, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "clean.js", "fixture", 0, 0), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "fixture", .index_mode = "full",
+        .recording_status = "complete", .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+        .unresolved_calls_complete = true, .hash_records_complete = true};
+    const char *details[] = {"[{\"truncated\":true}]", "[null]", "broken json"};
+    const char *directions[] = {"outbound", "inbound"};
+    const char *fields[] = {"callees_total_relation", "callers_total_relation"};
+    for (size_t detail = 0; detail < sizeof(details) / sizeof(details[0]); detail++) {
+        for (int relevant = 0; relevant < 2; relevant++) {
+            cbm_coverage_row_t row = {.rel_path = relevant ? "clean.js" : "unrelated.js",
+                                     .kind = "unresolved_calls", .detail = details[detail]};
+            ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, &row, 1, &meta), CBM_STORE_OK);
+            for (int direction = 0; direction < 2; direction++) {
+                char args[256], expected[80];
+                snprintf(args, sizeof(args), "{\"project\":\"%s\",\"function_name\":\"run\","
+                                             "\"direction\":\"%s\",\"format\":\"json\"}", project, directions[direction]);
+                char *out = cbm_mcp_handle_tool(srv, "trace_path", args);
+                ASSERT_NOT_NULL(out);
+                snprintf(expected, sizeof(expected), "\"%s\":\"%s\"", fields[direction],
+                         relevant || direction == 1 ? "unknown" : "eq");
+                ASSERT(response_contains_json_fragment(out, expected));
+                free(out);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "unresolved-trace";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/unresolved-trace");
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "unresolved-trace.service.run",
+                         .file_path = "service.js",
+                         .start_line = 1,
+                         .end_line = 4};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "buscar",
+                         .qualified_name = "unresolved-trace.client.buscar",
+                         .file_path = "client.js",
+                         .start_line = 1,
+                         .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &caller), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &callee), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, proj, "service.js", "fixture", 0, 0), CBM_STORE_OK);
+    char *out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"run\",\"direction\":\"outbound\","
+             "\"format\":\"json\"}}}");
+    char *txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callees_total_relation\":\"unknown\""));
+    free(txt);
+    free(out);
+    cbm_coverage_row_t row = {
+        .rel_path = "service.js",
+        .kind = "unresolved_calls",
+        .detail = "[{\"caller\":\"unresolved-trace.service.run\",\"leaf\":\"buscar\","
+                  "\"start_byte\":42,\"end_byte\":59,\"line\":3,"
+                  "\"candidate\":\"unresolved-trace.client.buscar\","
+                  "\"reason\":\"method_not_in_registry\"}]"};
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recorded_at = "2026-09-24T00:00:00Z",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, &row, 1, &meta), CBM_STORE_OK);
+
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"run\",\"direction\":\"outbound\","
+             "\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callees_total_relation\":\"unknown\""));
+    free(txt);
+    free(out);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"buscar\",\"direction\":\"inbound\","
+             "\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callers_total_relation\":\"unknown\""));
+    free(txt);
+    free(out);
+    /* The same leaf in an unrelated module was never a resolver candidate. */
+    cbm_node_t unrelated = callee;
+    unrelated.qualified_name = "unresolved-trace.other.buscar";
+    unrelated.file_path = "other.js";
+    ASSERT_GT(cbm_store_upsert_node(st, &unrelated), 0);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"unresolved-trace.other.buscar\","
+             "\"direction\":\"inbound\",\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callers_total_relation\":\"eq\""));
+    free(txt);
+    free(out);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"check_index_coverage\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"paths\":[\"service.js\"],\"diagnostics\":\"full\","
+             "\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"status\":\"unresolved_calls\""));
+    ASSERT_NOT_NULL(strstr(txt, "method_not_in_registry"));
+    free(txt);
+    free(out);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"run\",\"direction\":\"outbound\","
+             "\"edge_types\":[\"IMPORTS\"],\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callees_total_relation\":\"eq\""));
+    free(txt);
+    free(out);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_outbound_requires_project_symbol) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "project-symbol-trace";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/project-symbol-trace"), CBM_STORE_OK);
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "project-symbol-trace.service.run",
+                         .file_path = "service.js",
+                         .start_line = 1,
+                         .end_line = 4};
+    cbm_node_t local = {.project = proj,
+                        .label = "Function",
+                        .name = "buscar",
+                        .qualified_name = "project-symbol-trace.client.buscar",
+                        .file_path = "client.js"};
+    cbm_node_t constructor = {.project = proj,
+                              .label = "Class",
+                              .name = "Cliente",
+                              .qualified_name = "project-symbol-trace.client.Cliente",
+                              .file_path = "client.js"};
+    cbm_node_t foreign = {.project = "other-project",
+                          .label = "Function",
+                          .name = "foreignOnly",
+                          .qualified_name = "other-project.client.foreignOnly",
+                          .file_path = "client.js"};
+    ASSERT_GT(cbm_store_upsert_node(st, &caller), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &local), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &constructor), 0);
+    ASSERT_EQ(cbm_store_upsert_project(st, foreign.project, "/tmp/other-project"), CBM_STORE_OK);
+    ASSERT_GT(cbm_store_upsert_node(st, &foreign), 0);
+    const char *containers[] = {"File", "Folder", "Project", "Module", "Package", "Section"};
+    for (size_t i = 0; i < sizeof(containers) / sizeof(containers[0]); i++) {
+        char name[64], qn[128];
+        snprintf(name, sizeof(name), "external%s", containers[i]);
+        snprintf(qn, sizeof(qn), "%s.%s", proj, name);
+        cbm_node_t container = {
+            .project = proj, .label = containers[i], .name = name, .qualified_name = qn};
+        ASSERT_GT(cbm_store_upsert_node(st, &container), 0);
+    }
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, proj, "service.js", "fixture", 0, 0), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recorded_at = "2026-09-29T00:00:00Z",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    const struct {
+        const char *leaf;
+        const char *relation;
+    } cases[] = {{"printf", "eq"},         {"foreignOnly", "eq"},     {"Buscar", "eq"},
+                 {"externalFile", "eq"},   {"externalFolder", "eq"},  {"externalProject", "eq"},
+                 {"externalModule", "eq"}, {"externalPackage", "eq"}, {"externalSection", "eq"},
+                 {"buscar", "unknown"},    {"Cliente", "unknown"}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char detail[512];
+        snprintf(detail, sizeof(detail),
+                 "[{\"caller\":\"project-symbol-trace.service.run\",\"leaf\":\"%s\","
+                 "\"start_byte\":42,\"end_byte\":59,\"line\":3,"
+                 "\"reason\":\"method_not_in_registry\"}]",
+                 cases[i].leaf);
+        cbm_coverage_row_t row = {
+            .rel_path = "service.js", .kind = "unresolved_calls", .detail = detail};
+        ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, &row, 1, &meta), CBM_STORE_OK);
+        char *out = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+                 "\"project-symbol-trace\",\"function_name\":\"run\","
+                 "\"direction\":\"outbound\",\"format\":\"json\"}}}");
+        char *txt = extract_text_content(out);
+        char expected[80];
+        snprintf(expected, sizeof(expected), "\"callees_total_relation\":\"%s\"",
+                 cases[i].relation);
+        ASSERT_NOT_NULL(strstr(txt, expected));
+        ASSERT_NOT_NULL(strstr(txt, "\"callees_total\":0"));
+        free(txt);
+        free(out);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_unresolved_nested_functions_are_indexed) {
+    char tmp[256] = "/tmp/cbm-mcp-unresolved-XXXXXX";
+    char cache[256] = "/tmp/cbm-mcp-unresolved-cache-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/service.js", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export class Client { buscar(id) { return id; } }\n"
+          "export function factory({ client }) {\n"
+          "  function inner(id) {\n"
+          "    return client.buscar(id);\n"
+          "  }\n  return { inner };\n}\n",
+          f);
+    fclose(f);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", tmp);
+    char *out = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"status\":\"indexed\""));
+    ASSERT(response_contains_json_fragment(out, "\"skipped_count\":0"));
+    free(out);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"inner\","
+             "\"direction\":\"outbound\",\"format\":\"json\"}",
+             project);
+    out = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"callees_total_relation\":\"unknown\""));
+    free(out);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"factory\","
+             "\"direction\":\"outbound\",\"format\":\"json\"}",
+             project);
+    out = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"callees_total_relation\":\"eq\""));
+    free(out);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(path);
+    cbm_rmdir(tmp);
+    cbm_rmdir(cache);
     PASS();
 }
 
@@ -8382,6 +10431,57 @@ TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
     PASS();
 }
 
+/* delete_project removes the ADR sidecar with the project, and a re-index of a
+ * same-named project afterwards starts with no ADR (round-2 review item 7c). */
+TEST(tool_delete_project_removes_adr_sidecar) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-adr-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "adr-delete-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, "/tmp/adr-delete-project"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(setup, project, "# Decision\nkeep it"), CBM_STORE_OK);
+    cbm_store_close(setup);
+
+    char adr_path[CBM_SZ_1K];
+    snprintf(adr_path, sizeof(adr_path), "%s.adr.db", db_path);
+    ASSERT_TRUE(cbm_file_exists(adr_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"adr-delete-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    free(resp);
+
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    ASSERT_FALSE(cbm_file_exists(adr_path)); /* sidecar removed with the project */
+
+    /* A fresh store of the same name starts with no ADR. */
+    cbm_store_t *fresh = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(fresh);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(fresh, project, &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(fresh);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
 TEST(tool_index_repository_mutation_guard_blocks_before_local_worker) {
     char root[CBM_SZ_1K];
     (void)snprintf(root, sizeof(root), "%s/cbm-index-guard-XXXXXX", cbm_tmpdir());
@@ -8428,6 +10528,143 @@ TEST(tool_get_architecture_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_behavior_evidence_validation) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "arch-flag");
+    ASSERT_EQ(cbm_store_upsert_project(store, "arch-flag", "/tmp/arch-flag"), CBM_STORE_OK);
+
+    const char *invalid[] = {"\"true\"", "1", "0", "null", "[]", "{}"};
+    const char *aspects[] = {"", ",\"aspects\":[\"system_structure\"]"};
+    for (size_t a = 0; a < sizeof(aspects) / sizeof(aspects[0]); a++) {
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            char args[256];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"arch-flag\"%s,\"include_behavior_evidence\":%s}", aspects[a],
+                     invalid[i]);
+            char *response = cbm_mcp_handle_tool(srv, "get_architecture", args);
+            ASSERT_NOT_NULL(response);
+            ASSERT_TRUE(response_contains_json_fragment(response, "\"isError\":true"));
+            ASSERT_NOT_NULL(strstr(response, "include_behavior_evidence must be a boolean"));
+            free(response);
+        }
+    }
+    char *wrong_scope = cbm_mcp_handle_tool(
+        srv, "get_architecture", "{\"project\":\"arch-flag\",\"include_behavior_evidence\":true}");
+    ASSERT_NOT_NULL(wrong_scope);
+    ASSERT_TRUE(response_contains_json_fragment(wrong_scope, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(wrong_scope, "requires aspects"));
+    free(wrong_scope);
+
+    char *implicit = cbm_mcp_handle_tool(srv, "get_architecture", "{\"project\":\"arch-flag\"}");
+    char *explicit_false = cbm_mcp_handle_tool(
+        srv, "get_architecture", "{\"project\":\"arch-flag\",\"include_behavior_evidence\":false}");
+    ASSERT_NOT_NULL(implicit);
+    ASSERT_NOT_NULL(explicit_false);
+    ASSERT_STR_EQ(implicit, explicit_false);
+    free(implicit);
+    free(explicit_false);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Wait for the stable terminal job state, without asserting a transient pending
+ * window or a particular number of worker polls. */
+static char *architecture_wait_for_result(cbm_mcp_server_t *srv, const char *args) {
+    uint64_t deadline = cbm_now_ms() + 10000;
+    for (;;) {
+        char *response = cbm_mcp_handle_tool(srv, "get_architecture", args);
+        char *text = extract_text_content(response);
+        free(response);
+        yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+        yyjson_val *status = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "status") : NULL;
+        const char *value = yyjson_get_str(status);
+        bool pending = value && strcmp(value, "pending") == 0;
+        yyjson_doc_free(doc);
+        if (!pending || cbm_now_ms() >= deadline) {
+            return text;
+        }
+        free(text);
+        sqlite3_sleep(1);
+    }
+}
+
+TEST(tool_get_architecture_behavior_evidence_cache_isolation) {
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cbm-arch-flag-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "arch-evidence-cache";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
+    cbm_node_t entry = {.project = project,
+                        .label = "Function",
+                        .name = "entry",
+                        .qualified_name = "arch-evidence-cache.entry",
+                        .file_path = "src/entry.c",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = "{\"return_type\":\"EvidenceCacheSentinel\"}"};
+    int64_t entry_id = cbm_store_upsert_node(store, &entry);
+    ASSERT_GT(entry_id, 0);
+    cbm_node_t target = {.project = project,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "arch-evidence-cache.target",
+                         .file_path = "src/target.c",
+                         .start_line = 1,
+                         .end_line = 3,
+                         .properties_json = "{\"return_type\":\"EvidenceCacheSentinel\"}"};
+    int64_t target_id = cbm_store_upsert_node(store, &target);
+    ASSERT_GT(target_id, 0);
+    cbm_edge_t edge = {.project = project,
+                       .source_id = entry_id,
+                       .target_id = target_id,
+                       .type = "CALLS",
+                       .properties_json = "{\"line\":2}"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char args[512];
+    const char *flags[] = {"", ",\"include_behavior_evidence\":true",
+                           ",\"include_behavior_evidence\":false",
+                           ",\"include_behavior_evidence\":true"};
+    char *results[4] = {0};
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"aspects\":[\"system_structure\"],"
+                 "\"entry_node_id\":%lld%s}",
+                 project, (long long)entry_id, flags[i]);
+        results[i] = architecture_wait_for_result(srv, args);
+        ASSERT_NOT_NULL(results[i]);
+        ASSERT_TRUE(response_contains_json_fragment(results[i], "\"status\":\"ready\""));
+        if (i % 2 == 0) {
+            ASSERT_NULL(strstr(results[i], "EvidenceCacheSentinel"));
+            ASSERT_NULL(strstr(results[i], "\"return_type\""));
+        } else {
+            ASSERT_NOT_NULL(strstr(results[i], "EvidenceCacheSentinel"));
+            ASSERT_NOT_NULL(strstr(results[i], "\"return_type\""));
+        }
+    }
+    ASSERT_STR_EQ(results[0], results[2]);
+    ASSERT_STR_EQ(results[1], results[3]);
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+        free(results[i]);
+    }
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
     PASS();
 }
 
@@ -9836,6 +12073,88 @@ TEST(search_code_scoped_file_pattern_is_busybox_portable) {
     ASSERT_TRUE(portable_success);
     PASS();
 #endif
+}
+
+/* issue #2836: a file_pattern with '/' matched only the basename, so every
+ * directory-scoped glob silently returned 0 results. */
+TEST(search_code_file_pattern_matches_repo_relative_path_issue2836) {
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-fp-path-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char src_dir[CBM_SZ_1K];
+    char cli_dir[CBM_SZ_1K];
+    char main_path[CBM_SZ_1K];
+    char watcher_path[CBM_SZ_1K];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", tmp);
+    snprintf(cli_dir, sizeof(cli_dir), "%s/src/cli", tmp);
+    snprintf(main_path, sizeof(main_path), "%s/src/main.c", tmp);
+    snprintf(watcher_path, sizeof(watcher_path), "%s/src/cli/watcher.c", tmp);
+    ASSERT_EQ(cbm_mkdir(src_dir), 0);
+    ASSERT_EQ(cbm_mkdir(cli_dir), 0);
+    ASSERT_EQ(th_write_file(main_path, "int FP_PATH_NEEDLE = 1;\n"), 0);
+    ASSERT_EQ(th_write_file(watcher_path, "int FP_PATH_NEEDLE = 2;\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-fp-path";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+    cbm_node_t main_file = {.project = project,
+                            .label = "File",
+                            .name = "main.c",
+                            .qualified_name = "search-fp-path.src.main.c",
+                            .file_path = "src/main.c"};
+    cbm_node_t watcher_file = {.project = project,
+                               .label = "File",
+                               .name = "watcher.c",
+                               .qualified_name = "search-fp-path.src.cli.watcher.c",
+                               .file_path = "src/cli/watcher.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &main_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &watcher_file), 0);
+
+    static const struct {
+        const char *file_pattern;
+        const char *expect;
+        bool hint;
+    } cases[] = {
+        {"src/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/**/*.c", "\"total_grep_matches\":2", false}, /* ** spans zero dirs */
+        {"**/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/cli/", "\"total_grep_matches\":1", false},  /* no wildcard: substring */
+        {"watcher.c", "\"total_grep_matches\":1", false}, /* basename unchanged */
+        {"*.c", "\"total_grep_matches\":2", false},
+        {"lib/*.c", "\"total_grep_matches\":0", true},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args),
+                 "{\"pattern\":\"FP_PATH_NEEDLE\",\"project\":\"search-fp-path\","
+                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                 cases[i].file_pattern);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        char *inner = extract_text_content(response);
+        bool case_ok = inner && strstr(inner, cases[i].expect) &&
+                       (strstr(inner, "use path_filter") != NULL) == cases[i].hint;
+        if (!case_ok) {
+            fprintf(stderr, "file_pattern %s: %s\n", cases[i].file_pattern,
+                    inner ? inner : "(null)");
+            ok = false;
+        }
+        free(inner);
+        free(response);
+    }
+
+    cbm_mcp_server_free(srv);
+    cbm_unlink(watcher_path);
+    cbm_unlink(main_path);
+    cbm_rmdir(cli_dir);
+    cbm_rmdir(src_dir);
+    cbm_rmdir(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
 }
 
 TEST(search_code_recursive_fallback_propagates_discovery_failures) {
@@ -11402,6 +13721,87 @@ TEST(search_code_path_filter_matches_nothing) {
     PASS();
 }
 
+/* An over-budget regex is refused by the wrapper before the platform compiler
+ * expands it. search_code reports that as a tool error naming the argument and
+ * the reason, for path_filter and for a regex=true pattern alike, and keeps
+ * answering afterwards. The pattern is 14^4 = 38,416 expanded atoms: over the
+ * 32,768-unit budget, and tens of MB to hold even when unguarded. */
+TEST(search_code_oversized_path_filter_is_tool_error) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"((((a){14}){14}){14}){14}\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "path_filter"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"((((a){14}){14}){14}){14}\",\"regex\":true,"
+             "\"project\":\"prefilter-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    ASSERT_NOT_NULL(strstr(resp, "regex=true"));
+    free(resp);
+
+    /* The server still answers an ordinary filtered call. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"^src/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "src/handler.go"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* search_graph compiles name_pattern inside SQLite's REGEXP function. An
+ * over-budget pattern is refused there, the row scan aborts, and the tool
+ * reports the reason as a tool error instead of an empty result. The next call
+ * answers normally. */
+TEST(search_graph_oversized_name_pattern_is_tool_error) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"prefilter-search\",\"name_pattern\":\"((((a){14}){14}){14}){14}\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"prefilter-search\",\"name_pattern\":\"^HandleRequest$\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
 TEST(search_code_file_pattern_prefilter_boundaries) {
     ASSERT_TRUE(cbm_search_code_file_pattern_can_prefilter("*.pas"));
     ASSERT_TRUE(cbm_search_code_file_pattern_can_prefilter("*.PAS"));
@@ -11447,6 +13847,16 @@ TEST(search_code_windows_scope_prefilter_removes_pipeline_filter) {
 #endif
 }
 
+/* An indexed project's scan runs in process; the supervised runner now serves
+ * the unindexed recursive fallback and a Windows file_pattern it cannot
+ * prefilter. The supervision tests below pin that runner through the command
+ * override, with a command that does nothing: their probes act at spawn. */
+#ifdef _WIN32
+static const char MCP_SUPERVISED_SCAN_NOOP[] = "cd .";
+#else
+static const char MCP_SUPERVISED_SCAN_NOOP[] = ":";
+#endif
+
 TEST(search_code_cancel_cleans_supervised_scan) {
     mcp_search_cache_t cache;
     ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-cancel"));
@@ -11455,20 +13865,34 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
                                                    vendor_path, sizeof(vendor_path));
     ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, MCP_SUPERVISED_SCAN_NOOP);
     mcp_search_command_probe_t probe = {
         .server = srv,
         .cancel_on_call = true,
     };
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_code",
-                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
-                            "\"file_pattern\":\"*.go\"}");
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\",\"file_pattern\":"
+             "\"*.go\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(probe.cancel_accepted);
     ASSERT_NOT_NULL(strstr(response, "cancelled"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "tool=search_code"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
 
     char logs[640];
     snprintf(logs, sizeof(logs), "%s/logs", cache.path);
@@ -11478,6 +13902,39 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(server_handle_logs_timeout_without_query) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=timeout"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -11732,6 +14189,7 @@ TEST(search_code_scan_deadline_precedes_output_limit) {
     cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
                                                    vendor_path, sizeof(vendor_path));
     ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, MCP_SUPERVISED_SCAN_NOOP);
     mcp_search_command_probe_t probe = {.fill_output_directory = logs, .delay_ms = 1100};
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
     cbm_mcp_server_set_search_scan_timeout_for_test(srv, 1000, true);
@@ -11763,6 +14221,7 @@ TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up) {
                                                    vendor_path, sizeof(vendor_path));
     ASSERT_NOT_NULL(srv);
     cbm_mcp_server_set_search_scratch_dir_for_test(srv, cache.path);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, MCP_SUPERVISED_SCAN_NOOP);
     mcp_search_command_probe_t probe = {.reject = true, .scratch_directory = cache.path};
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
@@ -13093,8 +15552,17 @@ TEST(tool_outer_request_scope_preserves_predispatch_cancel) {
                                  strstr(cancelled_response, "\"isError\":true");
     cbm_mcp_server_request_scope_end(srv);
 
-    char *next_response = srv ? cbm_mcp_handle_tool(srv, "ingest_traces", "{\"traces\":[]}") : NULL;
-    bool next_response_clean = next_response && strstr(next_response, "accepted") &&
+    /* Clean-token probe: a valid ingest (unresolved names store nothing)
+     * must succeed normally — the cancel must not leak into it. The old
+     * probe sent traces:[] and expected the stub's "accepted"; empty
+     * traces are a tool error under the real contract. */
+    char *next_response =
+        srv ? cbm_mcp_handle_tool(
+                  srv, "ingest_traces",
+                  "{\"project\":\"outer-scope-cancel-adr\",\"traces\":"
+                  "[{\"caller\":\"never-indexed-a\",\"callee\":\"never-indexed-b\"}]}")
+            : NULL;
+    bool next_response_clean = next_response && strstr(next_response, "\"status\":\"stored\"") &&
                                !strstr(next_response, "cancelled") &&
                                !strstr(next_response, "\"isError\":true");
 
@@ -13154,9 +15622,12 @@ TEST(tool_index_repository_early_raw_cancel_survives_index_entry) {
     snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing-project");
     bool no_project_published = !cbm_file_exists(db_path);
 
-    char *next_response = srv ? cbm_mcp_handle_tool(srv, "ingest_traces", "{\"traces\":[]}") : NULL;
-    bool next_response_clean = next_response && strstr(next_response, "accepted") &&
-                               !strstr(next_response, "cancelled") &&
+    /* Clean-token probe: no project exists here by design (the index was
+     * cancelled), so probe with the project-free list_projects — the next
+     * request must simply run clean, unpoisoned by the cancel. The old
+     * probe leaned on the ingest_traces stub, which accepted anything. */
+    char *next_response = srv ? cbm_mcp_handle_tool(srv, "list_projects", "{}") : NULL;
+    bool next_response_clean = next_response && !strstr(next_response, "cancelled") &&
                                !strstr(next_response, "\"isError\":true");
 
     free(cancelled_response);
@@ -13649,6 +16120,102 @@ TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting) {
     ASSERT_TRUE(counted_once);
     ASSERT_EQ(source_cross_edges, 1);
     ASSERT_EQ(target_cross_edges, 1);
+    PASS();
+}
+
+/* A store written before the #768 edges.local_name_gen column: readable, but
+ * refused by every read-write open until a reindex. */
+static bool mcp_cross_repo_create_pre768_store(const char *cache, const char *project) {
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    char sql[CBM_SZ_1K];
+    snprintf(sql, sizeof(sql),
+             "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT NOT NULL,"
+             " root_path TEXT NOT NULL);"
+             "CREATE TABLE nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " label TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL,"
+             " file_path TEXT DEFAULT '', start_line INTEGER DEFAULT 0,"
+             " end_line INTEGER DEFAULT 0, properties TEXT DEFAULT '{}',"
+             " UNIQUE(project, qualified_name));"
+             "CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, type TEXT NOT NULL,"
+             " properties TEXT DEFAULT '{}', UNIQUE(source_id, target_id, type));"
+             "INSERT INTO projects VALUES('%s', '2026-06-01T00:00:00Z', '/pre768');",
+             project);
+    bool ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+/* #2133 follow-up, both user-visible halves: index_status tells "never run"
+ * from "ran" via a `cross_repo` object, and a ["*"] run names the legacy
+ * store it skipped (with the reindex hint) instead of silently linking fewer
+ * projects. */
+TEST(tool_cross_repo_status_and_wildcard_skipped_projects) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-status-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *source_project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(source_project);
+    const char *target_project = "cross-status-target";
+    const char *legacy_project = "cross-status-pre768";
+    ASSERT_TRUE(mcp_cross_repo_seed_http_match(cache, source_project, target_project, cache));
+    ASSERT_TRUE(mcp_cross_repo_create_pre768_store(cache, legacy_project));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    char status_args[CBM_SZ_1K];
+    snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\",\"format\":\"json\"}",
+             source_project);
+    char *before = cbm_mcp_handle_tool(srv, "index_status", status_args);
+    bool before_never =
+        response_contains_json_fragment(before, "\"cross_repo\":{\"status\":\"never_run\"}");
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"*\"]}",
+             cache);
+    char *run = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool run_ok = run && strstr(run, "\"isError\":true") == NULL &&
+                  response_contains_json_fragment(run, "\"total_cross_edges\":1");
+    bool skipped_named = response_contains_json_fragment(
+        run, "\"skipped_projects\":[{\"name\":\"cross-status-pre768\","
+             "\"reason\":\"pre_768_schema\",\"hint\":\"reindex this project\"}]");
+
+    char *after = cbm_mcp_handle_tool(srv, "index_status", status_args);
+    bool after_ran = response_contains_json_fragment(after, "\"status\":\"ran\"") &&
+                     response_contains_json_fragment(after, "\"total_cross_edges\":1") &&
+                     response_contains_json_fragment(after, "\"skipped_projects\":1");
+
+    free(before);
+    free(run);
+    free(after);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, source_project);
+    cleanup_project_db(cache, target_project);
+    cleanup_project_db(cache, legacy_project);
+    free(source_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(before_never);
+    ASSERT_TRUE(run_ok);
+    ASSERT_TRUE(skipped_named);
+    ASSERT_TRUE(after_ran);
     PASS();
 }
 
@@ -14390,6 +16957,314 @@ TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211) {
     remove(src_path);
     cbm_rmdir(cache);
     cbm_rmdir(tmp_dir);
+    PASS();
+}
+
+/* A Go config family per subject (parse / load / validate) and a README
+ * section about the Mail one: enough for doc -> code candidates. */
+static void doccand_fixture(const char *repo) {
+    static const char *const subjects[] = {"User", "Server", "Cache", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        const char *s = subjects[i];
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s_config.go", repo, s);
+        char body[2048];
+        snprintf(body, sizeof(body),
+                 "package main\n\n"
+                 "// Parse%sConfig reads the %s config file and returns the parsed %s config.\n"
+                 "func Parse%sConfig(path string) (*%sConfig, error) {\n"
+                 "\treturn Load%sConfig(path)\n}\n\n"
+                 "// Load%sConfig loads the %s config from disk and validates it.\n"
+                 "func Load%sConfig(path string) (*%sConfig, error) {\n"
+                 "\tcfg := &%sConfig{}\n\tValidate%sConfig(cfg)\n\treturn cfg, nil\n}\n\n"
+                 "// Validate%sConfig checks the %s config for missing fields.\n"
+                 "func Validate%sConfig(cfg *%sConfig) bool {\n\treturn cfg != nil\n}\n\n"
+                 "type %sConfig struct{ Name string }\n",
+                 s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
+        th_write_file(path, body);
+    }
+    char readme[512];
+    snprintf(readme, sizeof(readme), "%s/README.md", repo);
+    th_write_file(readme, "# Mail configuration\n\n"
+                          "The mail config file is parsed by ParseMailConfig, which loads the mail "
+                          "config from disk and validates the mail config fields before anything "
+                          "reads them. Missing fields fail the validation, and the parsed mail "
+                          "config can be written back to disk afterwards.\n");
+}
+
+/* The one project DB in a private cache (not _config.db or activity.db), so
+ * the test does not depend on how the server canonicalized the repo path. */
+static bool doccand_project_db(const char *cache, char *out, size_t out_size) {
+    cbm_dir_t *d = cbm_opendir(cache);
+    if (!d) {
+        return false;
+    }
+    bool found = false;
+    cbm_dirent_t *e;
+    while (!found && (e = cbm_readdir(d)) != NULL) {
+        size_t len = strlen(e->name);
+        if (!e->is_dir && len > 3 && strcmp(e->name + len - 3, ".db") == 0 &&
+            strcmp(e->name, "_config.db") != 0 && strcmp(e->name, "activity.db") != 0) {
+            snprintf(out, out_size, "%s/%s", cache, e->name);
+            found = true;
+        }
+    }
+    cbm_closedir(d);
+    return found;
+}
+
+/* Remove the project DB (and its WAL/SHM) so the next index is a full one. */
+static void doccand_clear(const char *cache) {
+    char path[CBM_SZ_4K];
+    if (!doccand_project_db(cache, path, sizeof(path))) {
+        return;
+    }
+    char side[CBM_SZ_4K + 8];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    cbm_unlink(side);
+    cbm_unlink(path);
+}
+
+/* The project's doc_link_candidates rows (0 without the table); -1 on an
+ * error. */
+static int doccand_rows(const char *cache) {
+    char path[CBM_SZ_4K];
+    if (!doccand_project_db(cache, path, sizeof(path))) {
+        return -1;
+    }
+    cbm_store_t *s = cbm_store_open_path(path);
+    if (!s) {
+        return -1;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT count(*) FROM sqlite_master WHERE type='table' AND "
+                           "name='doc_link_candidates'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        bool has_table = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) > 0;
+        sqlite3_finalize(st);
+        st = NULL;
+        n = 0;
+        if (has_table && sqlite3_prepare_v2(db, "SELECT count(*) FROM doc_link_candidates", -1,
+                                            &st, NULL) == SQLITE_OK) {
+            n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+            sqlite3_finalize(st);
+        }
+    }
+    cbm_store_close(s);
+    return n;
+}
+
+/* One fresh full index (the project DB removed first, so no incremental route
+ * can keep earlier rows); returns the candidate rows, -1 on an index error. */
+static int doccand_index(cbm_mcp_server_t *srv, const char *cache, const char *repo,
+                         const char *extra) {
+    doccand_clear(cache);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo, extra);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool ok = resp && response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+    free(resp);
+    return ok ? doccand_rows(cache) : -1;
+}
+
+/* index_repository doc_candidates (full mode): an explicit false stores no
+ * candidate rows; without the argument a set doc_candidates setting decides
+ * (unset: the mode decides, on in full; off stores none); an explicit true
+ * wins over the setting. */
+TEST(tool_index_repository_doc_candidates_switch) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-repo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-doccand-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    doccand_fixture(repo);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    int explicit_off = doccand_index(srv, cache, repo, ",\"doc_candidates\":false");
+    int setting_default = doccand_index(srv, cache, repo, "");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "false");
+    int setting_off = doccand_index(srv, cache, repo, "");
+    int explicit_on = doccand_index(srv, cache, repo, ",\"doc_candidates\":true");
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_EQ(explicit_off, 0);
+    ASSERT_GT(setting_default, 0);
+    ASSERT_EQ(setting_off, 0);
+    ASSERT_GT(explicit_on, 0);
+    PASS();
+}
+
+/* Moderate mode: without an argument or a set doc_candidates setting the
+ * mode decides (off: no rows); an explicit true and a setting set to true
+ * each turn it on; an unparseable setting is not a choice and leaves the
+ * mode default. */
+TEST(tool_index_repository_doc_candidates_follow_mode) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-mrepo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-doccand-mcache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    doccand_fixture(repo);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    int moderate_default = doccand_index(srv, cache, repo, ",\"mode\":\"moderate\"");
+    int moderate_on =
+        doccand_index(srv, cache, repo, ",\"mode\":\"moderate\",\"doc_candidates\":true");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "true");
+    int moderate_setting_on = doccand_index(srv, cache, repo, ",\"mode\":\"moderate\"");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "maybe");
+    int moderate_setting_garbage = doccand_index(srv, cache, repo, ",\"mode\":\"moderate\"");
+    int full_setting_garbage = doccand_index(srv, cache, repo, "");
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_EQ(moderate_default, 0);
+    ASSERT_GT(moderate_on, 0);
+    ASSERT_GT(moderate_setting_on, 0);
+    ASSERT_EQ(moderate_setting_garbage, 0);
+    ASSERT_GT(full_setting_garbage, 0);
+    PASS();
+}
+
+/* The worker arguments a daemon session hands its index executor. */
+typedef struct {
+    char *args;
+    int calls;
+} doccand_executor_capture_t;
+
+static char *doccand_capture_executor(void *context, const char *repo_path, const char *args_json,
+                                      bool async) {
+    (void)repo_path;
+    (void)async;
+    doccand_executor_capture_t *capture = context;
+    free(capture->args);
+    capture->args = args_json ? strdup(args_json) : NULL;
+    capture->calls++;
+    return cbm_mcp_text_result("{\"status\":\"indexed\"}", false);
+}
+
+/* The doc_candidates key of captured worker args: 1 true, 0 false, -1 absent,
+ * -2 not a single boolean (or unparseable args). */
+static int doccand_forwarded(const doccand_executor_capture_t *capture) {
+    yyjson_doc *doc = capture->args ? yyjson_read(capture->args, strlen(capture->args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return -2;
+    }
+    int keys = 0;
+    int value = -1;
+    size_t idx;
+    size_t max;
+    yyjson_val *key;
+    yyjson_val *val;
+    yyjson_obj_foreach(root, idx, max, key, val) {
+        if (strcmp(yyjson_get_str(key), "doc_candidates") == 0) {
+            keys++;
+            value = yyjson_is_bool(val) ? (yyjson_get_bool(val) ? 1 : 0) : -2;
+        }
+    }
+    yyjson_doc_free(doc);
+    return keys > 1 ? -2 : value;
+}
+
+static int doccand_forward_call(cbm_mcp_server_t *srv, doccand_executor_capture_t *capture,
+                                const char *repo, const char *extra) {
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo, extra);
+    free(capture->args);
+    capture->args = NULL;
+    int before = capture->calls;
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    free(resp);
+    return capture->calls == before + 1 ? doccand_forwarded(capture) : -3;
+}
+
+/* A daemon session forwards doc_candidates only when it is explicit: an
+ * argument (caller duplicates replaced by the one resolved value) or a
+ * setting the user set to a boolean. Otherwise no key reaches the worker and
+ * the worker's pipeline lets the index mode decide. */
+TEST(tool_index_repository_doc_candidates_forwarded_only_when_explicit) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-doccand-frepo-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-doccand-fcache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    doccand_executor_capture_t capture = {0};
+    cbm_mcp_server_set_index_executor(srv, doccand_capture_executor, &capture);
+
+    int unset = doccand_forward_call(srv, &capture, repo, "");
+    int unset_moderate = doccand_forward_call(srv, &capture, repo, ",\"mode\":\"moderate\"");
+    int arg_off = doccand_forward_call(srv, &capture, repo, ",\"doc_candidates\":false");
+    int arg_on_fast =
+        doccand_forward_call(srv, &capture, repo, ",\"mode\":\"fast\",\"doc_candidates\":true");
+    int arg_not_bool = doccand_forward_call(srv, &capture, repo, ",\"doc_candidates\":\"yes\"");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "true");
+    int setting_on = doccand_forward_call(srv, &capture, repo, ",\"mode\":\"fast\"");
+    int arg_over_setting = doccand_forward_call(srv, &capture, repo, ",\"doc_candidates\":false");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "off");
+    int setting_off = doccand_forward_call(srv, &capture, repo, "");
+    cbm_config_set(cfg, CBM_CONFIG_DOC_CANDIDATES, "maybe");
+    int setting_garbage = doccand_forward_call(srv, &capture, repo, "");
+    cbm_config_delete(cfg, CBM_CONFIG_DOC_CANDIDATES);
+    int setting_reset = doccand_forward_call(srv, &capture, repo, "");
+
+    cbm_mcp_server_free(srv);
+    free(capture.args);
+    cbm_config_close(cfg);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_EQ(unset, -1);
+    ASSERT_EQ(unset_moderate, -1);
+    ASSERT_EQ(arg_off, 0);
+    ASSERT_EQ(arg_on_fast, 1);
+    ASSERT_EQ(arg_not_bool, -1);
+    ASSERT_EQ(setting_on, 1);
+    ASSERT_EQ(arg_over_setting, 0);
+    ASSERT_EQ(setting_off, 0);
+    ASSERT_EQ(setting_garbage, -1);
+    ASSERT_EQ(setting_reset, -1);
     PASS();
 }
 
@@ -16268,6 +19143,785 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
     PASS();
 }
 
+/* ── detect_changes: opt-in impact walk (edge_types / fixpoint / via) ──
+ *
+ * One git fixture for the tests below. `leaf` is the changed function; a call
+ * chain four deep sits on top of it, and `holder` only names it. */
+typedef struct {
+    char repo[512];
+    cbm_mcp_server_t *srv;
+    char *project;
+} dc_walk_fixture_t;
+
+#define DC_WALK_SRC_HEAD "def leaf():\n"
+#define DC_WALK_SRC_TAIL  \
+    "    return x\n"      \
+    "\n"                  \
+    "\n"                  \
+    "def mid1():\n"       \
+    "    return leaf()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def mid2():\n"       \
+    "    return mid1()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def mid3():\n"       \
+    "    return mid2()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def top():\n"        \
+    "    return mid3()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def holder():\n"     \
+    "    f = leaf\n"      \
+    "    return f\n"
+
+static bool dc_walk_fixture_open(dc_walk_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    snprintf(fx->repo, sizeof(fx->repo), "%s/cbm-detect-walk-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(fx->repo)) {
+        return false;
+    }
+    char src[600];
+    snprintf(src, sizeof(src), "%s/mod.py", fx->repo);
+    if (th_write_file(src, DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL) != 0) {
+        return false;
+    }
+    /* Same git invocation rules as the #1363 fixture above. */
+    char cmd[1200];
+    const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
+    for (size_t s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+        snprintf(cmd, sizeof(cmd),
+                 "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=main "
+                 "-c commit.gpgsign=false %s",
+                 fx->repo, steps[s]);
+        if (system(cmd) != 0) {
+            return false;
+        }
+    }
+    fx->srv = cbm_mcp_server_new(NULL);
+    if (!fx->srv) {
+        return false;
+    }
+    char idx_args[700];
+    snprintf(idx_args, sizeof(idx_args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", fx->repo);
+    char *idx_resp = cbm_mcp_handle_tool(fx->srv, "index_repository", idx_args);
+    free(idx_resp);
+    /* The change: one line inside leaf(), line count unchanged. */
+    if (th_write_file(src, DC_WALK_SRC_HEAD "    x = 11\n" DC_WALK_SRC_TAIL) != 0) {
+        return false;
+    }
+    fx->project = cbm_project_name_from_path(fx->repo);
+    return fx->project != NULL;
+}
+
+static void dc_walk_fixture_close(dc_walk_fixture_t *fx) {
+    free(fx->project);
+    if (fx->srv) {
+        cbm_mcp_server_free(fx->srv);
+    }
+    if (fx->repo[0]) {
+        th_rmtree(fx->repo);
+    }
+}
+
+/* detect_changes on the fixture; `extra` is appended to the argument object
+ * (start it with a comma). Returns the tool's text content. */
+static char *dc_walk_call(dc_walk_fixture_t *fx, const char *extra) {
+    char args[900];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", fx->project, extra ? extra : "");
+    char *resp = cbm_mcp_handle_tool(fx->srv, "detect_changes", args);
+    char *text = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return text;
+}
+
+/* The impacted row whose qualified name ends in `.name`, from a format:"json"
+ * answer. NULL when the row is absent. */
+static yyjson_val *dc_walk_row(yyjson_doc *doc, const char *name) {
+    yyjson_val *rows = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "impacted") : NULL;
+    size_t want = strlen(name);
+    size_t idx;
+    size_t max;
+    yyjson_val *row;
+    yyjson_arr_foreach(rows, idx, max, row) {
+        const char *qn = yyjson_get_str(yyjson_obj_get(row, "qn"));
+        size_t len = qn ? strlen(qn) : 0;
+        if (len > want && qn[len - want - 1U] == '.' && strcmp(qn + len - want, name) == 0) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+static int dc_walk_total(yyjson_doc *doc) {
+    return doc ? (int)yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "impacted_total"))
+               : -1;
+}
+
+/* The default answer stops at `depth` (2). fixpoint:true walks until nothing
+ * new is reached, and spelling the new parameters out as false changes not one
+ * byte of the default answer. */
+/* Seed rows describe the actual walk inputs and page independently. */
+TEST(detect_changes_seed_list_reports_hunk_without_walk) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char *text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"files\",\"seeds\":\"list\"");
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_total")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_symbols")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_returned")), 1);
+    ASSERT_EQ(dc_walk_total(doc), 0);
+    yyjson_val *row = yyjson_arr_get_first(yyjson_obj_get(root, "seeds"));
+    ASSERT_NOT_NULL(row);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "seed_reason")), "hunk");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "file")), "mod.py");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "label")), "Function");
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "qn")), ".leaf"));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(row, "start")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(row, "end")), 3);
+    yyjson_doc_free(doc);
+    free(text);
+    const char *formats[] = {"json", "tree"};
+    for (int i = 0; i < 2; i++) {
+        char extra[200];
+        snprintf(extra, sizeof(extra), ",\"format\":\"%s\"", formats[i]);
+        char *normal = dc_walk_call(&fx, extra);
+        snprintf(extra, sizeof(extra),
+                 ",\"format\":\"%s\",\"seeds\":\"none\",\"seed_filter\":\"all\"", formats[i]);
+        char *explicit_defaults = dc_walk_call(&fx, extra);
+        ASSERT_STR_EQ(normal, explicit_defaults);
+        free(normal);
+        free(explicit_defaults);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_seed_pages_bind_semantics_and_snapshot) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char path[600];
+    snprintf(path, sizeof(path), "%s/mod.py", fx.repo);
+    /* No definition overlaps this insertion: whole-file fallback. */
+    ASSERT_EQ(th_write_file(path, "import os\n" DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL),
+              0);
+    /* Move indexed definitions past the import so this is truly zero overlap. */
+    cbm_store_t *store = cbm_store_open(fx.project);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_file(store, fx.project, "mod.py", &nodes, &count),
+              CBM_STORE_OK);
+    for (int i = 0; i < count; i++) {
+        nodes[i].start_line += 1;
+        nodes[i].end_line += 1;
+        ASSERT_GT(cbm_store_upsert_node(store, &nodes[i]), 0);
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    const char *base = ",\"format\":\"json\",\"scope\":\"files\",\"seeds\":\"list\"";
+    char extra[500];
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":2", base);
+    char *first = dc_walk_call(&fx, extra);
+    yyjson_doc *doc = yyjson_read(first, strlen(first), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_total")), 6);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_returned")), 2);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "seed_has_more")));
+    const char *cursor = yyjson_get_str(yyjson_obj_get(root, "seed_next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+    yyjson_val *rows = yyjson_obj_get(root, "seeds");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get_first(rows), "seed_reason")),
+                  "whole_file");
+    const char *last = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(rows, 1), "qn"));
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":3,\"seed_cursor\":\"%s\"", base, cursor);
+    char *next = dc_walk_call(&fx, extra);
+    yyjson_doc *ndoc = yyjson_read(next, strlen(next), 0);
+    ASSERT_NOT_NULL(ndoc);
+    yyjson_val *nroot = yyjson_doc_get_root(ndoc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(nroot, "seed_returned")), 3);
+    const char *next_qn =
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get_first(yyjson_obj_get(nroot, "seeds")), "qn"));
+    ASSERT_LT(strcmp(last, next_qn), 0);
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":3,\"seed_offset\":2", base);
+    char *offset = dc_walk_call(&fx, extra);
+    ASSERT_STR_EQ(next, offset);
+    free(offset);
+    yyjson_doc_free(ndoc);
+    free(next);
+    const char *mismatches[] = {",\"seed_filter\":\"product\"", ",\"seed_offset\":1",
+                                ",\"depth\":3"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(extra, sizeof(extra), "%s%s,\"seed_cursor\":\"%s\"", base, mismatches[i], cursor);
+        char *bad = dc_walk_call(&fx, extra);
+        ASSERT_NOT_NULL(strstr(bad, "cursor_params_mismatch"));
+        free(bad);
+    }
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":0", base);
+    char *zero = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(strstr(zero, "seed_continuation_requires_positive_limit"));
+    free(zero);
+
+    int token_budget = (int)((strlen(first) + 3) / 4);
+    snprintf(extra, sizeof(extra), "%s,\"max_output_tokens\":%d", base, token_budget);
+    char *budget = dc_walk_call(&fx, extra);
+    ASSERT_LTE(strlen(budget), (size_t)token_budget * 4);
+    yyjson_doc *bdoc = yyjson_read(budget, strlen(budget), 0);
+    ASSERT_NOT_NULL(bdoc);
+    yyjson_val *broot = yyjson_doc_get_root(bdoc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(broot, "seed_total")), 6);
+    int returned = (int)yyjson_get_int(yyjson_obj_get(broot, "seed_returned"));
+    ASSERT_LT(returned, 6);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(broot, "seed_has_more")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(broot, "truncation_reason")), "output_budget");
+    ASSERT_NOT_NULL(yyjson_obj_get(broot, returned ? "seed_next_cursor"
+                                                   : "seed_continuation_requires_higher_budget"));
+    yyjson_doc_free(bdoc);
+    free(budget);
+    char *tree = dc_walk_call(
+        &fx, ",\"format\":\"tree\",\"scope\":\"files\",\"seeds\":\"list\",\"seed_limit\":1");
+    ASSERT_NOT_NULL(strstr(tree, "seed_total: 6"));
+    ASSERT_NOT_NULL(strstr(tree, "seed_returned: 1"));
+    ASSERT_NOT_NULL(strstr(tree, "seed_next_cursor:"));
+    ASSERT_NOT_NULL(strstr(tree, "whole_file"));
+    free(tree);
+    ASSERT_EQ(th_write_file(path, "import sys\n" DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL),
+              0);
+    snprintf(extra, sizeof(extra), "%s,\"seed_cursor\":\"%s\"", base, cursor);
+    char *stale = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(strstr(stale, "snapshot_changed"));
+    free(stale);
+    yyjson_doc_free(doc);
+    free(first);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_product_filter_does_not_inflate_fallback) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    cbm_store_t *store = cbm_store_open(fx.project);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_file(store, fx.project, "mod.py", &nodes, &count),
+              CBM_STORE_OK);
+    int leaf = -1;
+    for (int i = 0; i < count; i++)
+        if (strcmp(nodes[i].name, "leaf") == 0)
+            leaf = i;
+    ASSERT_GTE(leaf, 0);
+    const char *props[] = {"{\"is_test\":true}", "{\"test_role\":\"case\"}",
+                           "{\"test_role\":\"suite\"}", "{\"test_role\":\"helper\"}"};
+    const char *saved = nodes[leaf].properties_json;
+    for (int i = 0; i < 4; i++) {
+        nodes[leaf].properties_json = props[i];
+        ASSERT_GT(cbm_store_upsert_node(store, &nodes[leaf]), 0);
+        char *text = dc_walk_call(
+            &fx, ",\"format\":\"json\",\"seeds\":\"list\",\"seed_filter\":\"product\"");
+        yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_NOT_NULL(yyjson_obj_get(root, "seed_total"));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_total")), 0);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_symbols")), 0);
+        ASSERT_EQ(dc_walk_total(doc), 0);
+        yyjson_doc_free(doc);
+        free(text);
+    }
+    nodes[leaf].properties_json = saved;
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_seed_params_reject_misuse) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    const char *extras[] = {
+        ",\"seeds\":\"yes\"",          ",\"seeds\":1",         ",\"seed_filter\":\"tests\"",
+        ",\"seed_limit\":-1",          ",\"seed_limit\":1001", ",\"seed_limit\":1.5",
+        ",\"seed_offset\":2147483648", ",\"seed_cursor\":7",   ",\"seed_cursor\":\"invalid\""};
+    for (size_t i = 0; i < sizeof(extras) / sizeof(extras[0]); i++) {
+        char args[900];
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"seeds\":\"list\"%s}", fx.project,
+                 extras[i]);
+        /* Avoid duplicate seeds keys in the enum/type cases. */
+        if (i < 2)
+            snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", fx.project, extras[i]);
+        char *response = cbm_mcp_handle_tool(fx.srv, "detect_changes", args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        free(response);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_product_filter_uses_project_config_and_override) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char path[600];
+    snprintf(path, sizeof(path), "%s/.codebase-memory.json", fx.repo);
+    ASSERT_EQ(
+        th_write_file(path,
+                      "{\"test_impact\":{\"version\":1,\"tests\":{\"test_globs\":[\"mod.py\"]}}}"),
+        0);
+    char *text =
+        dc_walk_call(&fx, ",\"format\":\"json\",\"seeds\":\"list\",\"seed_filter\":\"product\"");
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "seed_total")), 0);
+    yyjson_doc_free(doc);
+    free(text);
+    snprintf(path, sizeof(path), "%s/selection.json", fx.repo);
+    ASSERT_EQ(
+        th_write_file(path,
+                      "{\"test_impact\":{\"version\":1,\"tests\":{\"test_globs\":[\"spec/**\"]}}}"),
+        0);
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"seeds\":\"list\",\"seed_filter\":\"product\","
+                             "\"config_path\":\"selection.json\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "seed_total")), 1);
+    yyjson_doc_free(doc);
+    free(text);
+    const char *invalid[] = {
+        ",\"config_path\":\"missing.json\"",
+        ",\"config_path\":7",
+        ",\"config_path\":\"\"",
+        ",\"config_path\":\"selection.json\\u0000ignored\"",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        char args[1200];
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"seed_filter\":\"product\"%s}",
+                 fx.project, invalid[i]);
+        char *response = cbm_mcp_handle_tool(fx.srv, "detect_changes", args);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        free(response);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* scope:"tests" answers with the test_impact object (mcp/test_impact_engine.h).
+ * The selection reads committed changes only: the fixture's edit is in the
+ * worktree, so against main nothing changed. A config_path that does not
+ * exist is evidence missing, never a narrower answer: everything runs. */
+TEST(detect_changes_scope_tests_answers_test_impact) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char *text = dc_walk_call(&fx, ",\"scope\":\"tests\"");
+    ASSERT_NOT_NULL(text);
+    if (!strstr(text, "\"decision\":\"nothing\"")) {
+        printf("  %.400s\n", text);
+    }
+    ASSERT_TRUE(strncmp(text, "{\"test_impact\":{", 16) == 0);
+    ASSERT_NOT_NULL(strstr(text, "\"decision\":\"nothing\""));
+    free(text);
+    text = dc_walk_call(&fx, ",\"scope\":\"tests\",\"config_path\":\"missing/config.json\"");
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"decision\":\"run_all\""));
+    ASSERT_NOT_NULL(strstr(text, "CONFIG_INVALID"));
+    free(text);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_fixpoint_walks_past_depth) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *plain = dc_walk_call(&fx, ",\"format\":\"json\"");
+    char *spelled = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":false,\"via\":false");
+    char *fixed = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":true");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_NOT_NULL(spelled);
+    ASSERT_NOT_NULL(fixed);
+    ASSERT_STR_EQ(plain, spelled);
+
+    yyjson_doc *pdoc = yyjson_read(plain, strlen(plain), 0);
+    ASSERT_NOT_NULL(pdoc);
+    ASSERT_EQ(dc_walk_total(pdoc), 2);
+    ASSERT_NOT_NULL(dc_walk_row(pdoc, "mid2"));
+    ASSERT_NULL(dc_walk_row(pdoc, "mid3"));
+    ASSERT_NULL(yyjson_obj_get(yyjson_doc_get_root(pdoc), "fixpoint"));
+    ASSERT_NULL(yyjson_obj_get(yyjson_doc_get_root(pdoc), "edge_types"));
+
+    yyjson_doc *fdoc = yyjson_read(fixed, strlen(fixed), 0);
+    ASSERT_NOT_NULL(fdoc);
+    yyjson_val *froot = yyjson_doc_get_root(fdoc);
+    ASSERT_EQ(dc_walk_total(fdoc), 4);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(froot, "impacted_total_relation")), "eq");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(froot, "fixpoint")));
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(froot, "edge_types")), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get_first(yyjson_obj_get(froot, "edge_types"))),
+                  "CALLS");
+    yyjson_val *top = dc_walk_row(fdoc, "top");
+    ASSERT_NOT_NULL(top);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(top, "hop")), 4);
+    /* The changed function is the seed, never its own impact; a name is not a
+     * call. */
+    ASSERT_NULL(dc_walk_row(fdoc, "leaf"));
+    ASSERT_NULL(dc_walk_row(fdoc, "holder"));
+    /* Without `via` the rows keep their four columns. */
+    ASSERT_NULL(yyjson_obj_get(top, "via_qn"));
+
+    /* fixpoint ignores depth: the fixpoint holds every bounded answer. */
+    char *deep = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":true,\"depth\":1");
+    ASSERT_NOT_NULL(deep);
+    yyjson_doc *ddoc = yyjson_read(deep, strlen(deep), 0);
+    ASSERT_EQ(dc_walk_total(ddoc), 4);
+    yyjson_doc_free(ddoc);
+    free(deep);
+
+    /* A bounded walk through the same engine gives the bounded answer. */
+    char *bounded = dc_walk_call(&fx, ",\"format\":\"json\",\"edge_types\":[\"CALLS\"],"
+                                      "\"depth\":3");
+    ASSERT_NOT_NULL(bounded);
+    yyjson_doc *bdoc = yyjson_read(bounded, strlen(bounded), 0);
+    ASSERT_EQ(dc_walk_total(bdoc), 3);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(bdoc), "fixpoint")));
+    ASSERT_NOT_NULL(dc_walk_row(bdoc, "mid3"));
+    ASSERT_NULL(dc_walk_row(bdoc, "top"));
+
+    yyjson_doc_free(bdoc);
+    yyjson_doc_free(fdoc);
+    yyjson_doc_free(pdoc);
+    free(bounded);
+    free(fixed);
+    free(spelled);
+    free(plain);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* edge_types widens what counts as "depends on": a function that only names
+ * the changed one is reached over CALL_REFERENCE, never over CALLS. */
+TEST(detect_changes_edge_types_reach_references) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *calls = dc_walk_call(&fx, ",\"format\":\"json\",\"edge_types\":[\"CALLS\"]");
+    char *both =
+        dc_walk_call(&fx, ",\"format\":\"json\",\"edge_types\":[\"CALLS\",\"CALL_REFERENCE\"]");
+    ASSERT_NOT_NULL(calls);
+    ASSERT_NOT_NULL(both);
+    yyjson_doc *cdoc = yyjson_read(calls, strlen(calls), 0);
+    yyjson_doc *bdoc = yyjson_read(both, strlen(both), 0);
+    ASSERT_NOT_NULL(cdoc);
+    ASSERT_NOT_NULL(bdoc);
+    ASSERT_NULL(dc_walk_row(cdoc, "holder"));
+    yyjson_val *holder = dc_walk_row(bdoc, "holder");
+    ASSERT_NOT_NULL(holder);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(holder, "hop")), 1);
+    ASSERT_NOT_NULL(dc_walk_row(bdoc, "mid1"));
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(bdoc), "edge_types")), 2);
+
+    yyjson_doc_free(bdoc);
+    yyjson_doc_free(cdoc);
+    free(both);
+    free(calls);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* via:true says how each row was reached: the parent one hop closer and the
+ * edge type that led there. Both encodings carry it. */
+TEST(detect_changes_via_names_the_parent) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *json = dc_walk_call(&fx, ",\"format\":\"json\",\"via\":true,\"fixpoint\":true,"
+                                   "\"edge_types\":[\"CALLS\",\"CALL_REFERENCE\"]");
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *mid1 = dc_walk_row(doc, "mid1");
+    yyjson_val *mid2 = dc_walk_row(doc, "mid2");
+    yyjson_val *holder = dc_walk_row(doc, "holder");
+    ASSERT_NOT_NULL(mid1);
+    ASSERT_NOT_NULL(mid2);
+    ASSERT_NOT_NULL(holder);
+    /* A row one hop out names the seed, though seeds are not rows. */
+    const char *leaf_qn = yyjson_get_str(yyjson_obj_get(mid1, "via_qn"));
+    ASSERT_NOT_NULL(leaf_qn);
+    ASSERT_NOT_NULL(strstr(leaf_qn, ".leaf"));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mid1, "via_edge")), "CALLS");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mid2, "via_qn")),
+                  yyjson_get_str(yyjson_obj_get(mid1, "qn")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mid2, "via_edge")), "CALLS");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(holder, "via_qn")), leaf_qn);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(holder, "via_edge")), "CALL_REFERENCE");
+
+    char *tree = dc_walk_call(&fx, ",\"via\":true");
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "via_qn"));
+    ASSERT_NOT_NULL(strstr(tree, "via_edge"));
+    char *plain_tree = dc_walk_call(&fx, "");
+    ASSERT_NOT_NULL(plain_tree);
+    ASSERT_NULL(strstr(plain_tree, "via_qn"));
+
+    free(plain_tree);
+    free(tree);
+    yyjson_doc_free(doc);
+    free(json);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* Every misuse is a teaching error; none of them is corrected silently, because
+ * a walk over the wrong edges reads as "nothing depends on this". */
+TEST(detect_changes_walk_params_teach_on_misuse) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    static const struct {
+        const char *extra;
+        const char *expect;
+    } cases[] = {
+        {",\"edge_types\":[\"CALL\"]", "unknown edge type \"CALL\""},
+        {",\"edge_types\":[\"CALL\"]", "CALLS"}, /* the error lists what the index has */
+        {",\"edge_types\":[]", "edge_types must be"},
+        {",\"edge_types\":\"CALLS\"", "edge_types must be"},
+        {",\"edge_types\":[\"CALLS\",7]", "edge_types must be"},
+        {",\"edge_types\":[\"CALLS\",\"CALLS\"]", "listed twice"},
+        {",\"fixpoint\":\"yes\"", "fixpoint must be true or false"},
+        {",\"via\":1", "via must be true or false"},
+        {",\"fixpoint\":true,\"direction\":\"outbound\"", "direction \"inbound\""},
+        {",\"via\":true,\"direction\":\"both\"", "direction \"inbound\""},
+        {",\"edge_types\":[\"CALLS\"],\"direction\":\"outbound\"", "direction \"inbound\""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[900];
+        snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", fx.project, cases[i].extra);
+        char *resp = cbm_mcp_handle_tool(fx.srv, "detect_changes", args);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+        char *text = extract_text_content(resp);
+        ASSERT_NOT_NULL(text);
+        if (!strstr(text, cases[i].expect)) {
+            printf("  case %zu: expected \"%s\" in: %s\n", i, cases[i].expect, text);
+        }
+        ASSERT_NOT_NULL(strstr(text, cases[i].expect));
+        free(text);
+        free(resp);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* A cursor continues the question it was minted for. The walk parameters are
+ * part of that question. */
+TEST(detect_changes_cursor_bound_to_walk_params) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *first = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":true,\"limit\":1");
+    ASSERT_NOT_NULL(first);
+    yyjson_doc *doc = yyjson_read(first, strlen(first), 0);
+    ASSERT_NOT_NULL(doc);
+    const char *cursor =
+        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "impacted_next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+
+    char extra[400];
+    snprintf(extra, sizeof(extra),
+             ",\"format\":\"json\",\"fixpoint\":true,\"limit\":1,\"impact_cursor\":\"%s\"", cursor);
+    char *second = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(second);
+    yyjson_doc *sdoc = yyjson_read(second, strlen(second), 0);
+    ASSERT_NOT_NULL(sdoc);
+    /* Rows come in (hop, qualified name) order: the second page is hop 2. */
+    ASSERT_EQ(dc_walk_total(sdoc), 4);
+    yyjson_val *mid2 = dc_walk_row(sdoc, "mid2");
+    ASSERT_NOT_NULL(mid2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(mid2, "hop")), 2);
+
+    static const char *const other_questions[] = {
+        ",\"format\":\"json\",\"limit\":1",
+        ",\"format\":\"json\",\"fixpoint\":true,\"via\":true,\"limit\":1",
+        ",\"format\":\"json\",\"fixpoint\":true,\"limit\":1,\"edge_types\":[\"CALL_REFERENCE\"]",
+    };
+    for (size_t i = 0; i < sizeof(other_questions) / sizeof(other_questions[0]); i++) {
+        snprintf(extra, sizeof(extra), "%s,\"impact_cursor\":\"%s\"", other_questions[i], cursor);
+        char *refused = dc_walk_call(&fx, extra);
+        ASSERT_NOT_NULL(refused);
+        ASSERT_NOT_NULL(strstr(refused, "cursor_params_mismatch"));
+        free(refused);
+    }
+
+    yyjson_doc_free(sdoc);
+    free(second);
+    yyjson_doc_free(doc);
+    free(first);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* Golden: a request that names none of the walk parameters gets the answer it
+ * got before they existed, byte for byte, in both encodings. The project name
+ * and every qualified name are fixed, so the only varying bytes are the commit
+ * id of the fixture, which is replaced before comparing. */
+static void dc_golden_blank_oids(char *text) {
+    for (char *p = text; *p;) {
+        size_t run = 0;
+        while (isxdigit((unsigned char)p[run])) {
+            run++;
+        }
+        if (run == 40) {
+            memset(p, '#', run);
+        }
+        p += run ? run : 1;
+    }
+}
+
+TEST(detect_changes_default_output_is_byte_identical_golden) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-golden-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-golden-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char src[CBM_SZ_4K];
+    snprintf(src, sizeof(src), "%s/mod.py", repo);
+    ASSERT_EQ(th_write_file(src, DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL), 0);
+
+    const char *const init_args[] = {"-c", "init.defaultBranch=main", "init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+    ASSERT_EQ(th_write_file(src, DC_WALK_SRC_HEAD "    x = 11\n" DC_WALK_SRC_TAIL), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-golden";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    /* The graph of DC_WALK_SRC: leaf <- mid1 <- mid2 <- mid3 <- top. */
+    static const struct {
+        const char *name;
+        int start;
+        int end;
+    } defs[] = {
+        {"leaf", 1, 3}, {"mid1", 6, 7}, {"mid2", 10, 11}, {"mid3", 14, 15}, {"top", 18, 19}};
+    int64_t ids[5];
+    for (int i = 0; i < 5; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "detect-golden.mod.%s", defs[i].name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = defs[i].name,
+                           .qualified_name = qn,
+                           .file_path = "mod.py",
+                           .start_line = defs[i].start,
+                           .end_line = defs[i].end};
+        ids[i] = cbm_store_upsert_node(store, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    for (int i = 1; i < 5; i++) {
+        cbm_edge_t edge = {
+            .project = project, .source_id = ids[i], .target_id = ids[i - 1], .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    }
+
+    char *tree_response = cbm_mcp_handle_tool(
+        srv, "detect_changes", "{\"project\":\"detect-golden\",\"base_branch\":\"HEAD\"}");
+    char *tree = extract_text_content(tree_response);
+    char *json_response = cbm_mcp_handle_tool(
+        srv, "detect_changes",
+        "{\"project\":\"detect-golden\",\"base_branch\":\"HEAD\",\"format\":\"json\"}");
+    char *json = extract_text_content(json_response);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(json);
+    dc_golden_blank_oids(tree);
+    dc_golden_blank_oids(json);
+    if (getenv("CBM_PRINT_DETECT_GOLDEN")) {
+        printf("GOLDEN-TREE<<%s>>\nGOLDEN-JSON<<%s>>\n", tree, json);
+    }
+    static const char *const golden_tree = "base: HEAD\n"
+                                           "merge_base: ########################################\n"
+                                           "direction: inbound\n"
+                                           "changed_total: 1\n"
+                                           "changed_returned: 1\n"
+                                           "changed_has_more: false\n"
+                                           "changed_files: 1  (cols: path)\n"
+                                           "  mod.py\n"
+                                           "seed_symbols: 1\n"
+                                           "impacted_total: 2\n"
+                                           "impacted_total_relation: eq\n"
+                                           "impacted_shown: 2\n"
+                                           "impacted: 2  (cols: qn label file hop)\n"
+                                           "  detect-golden.mod.mid1 Function mod.py 1\n"
+                                           "  detect-golden.mod.mid2 Function mod.py 2\n"
+                                           "impacted_has_more: false\n"
+                                           "module_total: 1\n"
+                                           "module_total_relation: eq\n"
+                                           "module_returned: 1\n"
+                                           "module_has_more: false\n"
+                                           "impacted_modules: 1  (cols: module count)\n"
+                                           "  mod.py 2\n";
+    static const char *const golden_json =
+        "{\"base\":\"HEAD\",\"merge_base\":\"########################################\",\"dir"
+        "ection\":\"inbound\",\"changed_total\":1,\"changed_returned\":1,\"changed_has_more\""
+        ":false,\"changed_files\":[\"mod.py\"],\"seed_symbols\":1,\"impacted_total\":2,\"impa"
+        "cted_total_relation\":\"eq\",\"impacted_shown\":2,\"impacted\":[{\"qn\":\"detect-gol"
+        "den.mod.mid1\",\"label\":\"Function\",\"file\":\"mod.py\",\"hop\":1},{\"qn\":\"detec"
+        "t-golden.mod.mid2\",\"label\":\"Function\",\"file\":\"mod.py\",\"hop\":2}],\"impacte"
+        "d_has_more\":false,\"module_total\":1,\"module_total_relation\":\"eq\",\"module_retu"
+        "rned\":1,\"module_has_more\":false,\"impacted_modules\":[{\"module\":\"mod.py\",\"co"
+        "unt\":2}],\"truncated\":false}";
+    ASSERT_STR_EQ(tree, golden_tree);
+    ASSERT_STR_EQ(json, golden_json);
+
+    free(json);
+    free(json_response);
+    free(tree);
+    free(tree_response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
+/* ingest_traces stores for real now (the stub answered "accepted" and
+ * discarded). Without a resolvable project there is nothing to store
+ * against — a tool error, not a polite lie. */
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -16276,8 +19930,8 @@ TEST(tool_ingest_traces_basic) {
              "\"params\":{\"name\":\"ingest_traces\","
              "\"arguments\":{\"traces\":[{\"caller\":\"a\",\"callee\":\"b\"}]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
-    ASSERT_NOT_NULL(strstr(resp, "traces_received"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NULL(strstr(resp, "accepted"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -16292,7 +19946,7 @@ TEST(tool_ingest_traces_empty) {
                                    "\"params\":{\"name\":\"ingest_traces\","
                                    "\"arguments\":{\"traces\":[]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -17439,6 +21093,93 @@ TEST(snippet_exact_qn) {
     PASS();
 }
 
+/* Doc -> code candidates on get_code_snippet: a Section lists the functions
+ * it is possibly about (highest p first, evidence included), a function the
+ * sections that possibly describe it; a row whose other end no longer exists
+ * is skipped, and a node without rows gets no candidate keys at all. */
+TEST(snippet_doc_candidates_both_directions) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_node_t sec = {.project = "test-project",
+                      .label = "Section",
+                      .name = "Orders",
+                      .qualified_name = "test-project.README.Orders",
+                      .file_path = "README.md",
+                      .start_line = 1,
+                      .end_line = 4};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &sec) > 0);
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "test-project.README.Orders",
+         .target_qn = "test-project.cmd.server.main.HandleRequest",
+         .rank = 2,
+         .score = 0.25,
+         .p = 0.36,
+         .evidence = "{\"shared_terms\":2,\"name_tokens\":0}"},
+        {.section_qn = "test-project.README.Orders",
+         .target_qn = "test-project.cmd.server.main.ProcessOrder",
+         .rank = 1,
+         .score = 0.45,
+         .p = 0.548,
+         .evidence = "{\"shared_terms\":5,\"name_tokens\":2,\"kind\":\"function\","
+                     "\"position\":\"local\"}"},
+        {.section_qn = "test-project.README.Orders",
+         .target_qn = "test-project.gone.Missing",
+         .rank = 3,
+         .score = 0.31,
+         .p = 0.42,
+         .evidence = "{\"shared_terms\":1,\"name_tokens\":0}"},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(st, "test-project", rows, 3), CBM_STORE_OK);
+
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"test-project.README.Orders\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *about = yyjson_obj_get(yyjson_doc_get_root(doc), "possibly_about");
+    ASSERT_EQ((int)yyjson_arr_size(about), 2);
+    yyjson_val *first = yyjson_arr_get(about, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "qualified_name")),
+                  "test-project.cmd.server.main.ProcessOrder");
+    ASSERT_FLOAT_EQ(yyjson_get_num(yyjson_obj_get(first, "p")), 0.548, 1e-9);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(first, "shared_terms")), 5);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(first, "start_line")), 7);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "label")), "Function");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "kind")), "function");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "position")), "local");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(about, 1), "qualified_name")),
+                  "test-project.cmd.server.main.HandleRequest");
+    ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "candidates_note"));
+    yyjson_doc_free(doc);
+    free(resp);
+
+    resp = call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.ProcessOrder\","
+                             "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *in = yyjson_obj_get(yyjson_doc_get_root(doc), "possibly_described_in");
+    ASSERT_EQ((int)yyjson_arr_size(in), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "section")),
+                  "test-project.README.Orders");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "file_path")), "README.md");
+    yyjson_doc_free(doc);
+    free(resp);
+
+    resp = call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.Run\","
+                             "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "possibly_"));
+    ASSERT_NULL(strstr(resp, "candidates_note"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ── TestSnippet_QNSuffix ─────────────────────────────────────── */
 
 TEST(snippet_qn_suffix) {
@@ -17474,6 +21215,79 @@ TEST(snippet_unique_short_name) {
     ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── C-macro namespace (PR C1) ────────────────────────────────── */
+
+/* A C macro's QN ends in "#macro", which no caller spells. get_code_snippet
+ * still returns the macro for its short name, for a dotted suffix and for the
+ * QN it had before the fence (`<module>.<NAME>`); when a definition owns that
+ * QN or that name, the definition is the answer. */
+TEST(snippet_c_macro_namespace_c1) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+
+    cbm_node_t only_macro = {.project = "test-project",
+                             .label = "Macro",
+                             .name = "MAX_LEN",
+                             .qualified_name = "test-project.lib.cfg.MAX_LEN#macro",
+                             .file_path = "main.go",
+                             .start_line = 7,
+                             .end_line = 8};
+    cbm_node_t type = {.project = "test-project",
+                       .label = "Type",
+                       .name = "state_t",
+                       .qualified_name = "test-project.lib.xx.state_t",
+                       .file_path = "main.go",
+                       .start_line = 3,
+                       .end_line = 3};
+    cbm_node_t shadowed_macro = {.project = "test-project",
+                                 .label = "Macro",
+                                 .name = "state_t",
+                                 .qualified_name = "test-project.lib.xx.state_t#macro",
+                                 .file_path = "main.go",
+                                 .start_line = 11,
+                                 .end_line = 12};
+    ASSERT_GT(cbm_store_upsert_node(st, &only_macro), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &type), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &shadowed_macro), 0);
+
+    static const char *const macro_inputs[] = {
+        "{\"qualified_name\":\"MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"cfg.MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"test-project.lib.cfg.MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\",\"project\":\"test-project\"}"};
+    for (size_t i = 0; i < sizeof(macro_inputs) / sizeof(macro_inputs[0]); i++) {
+        char *resp = call_snippet(srv, macro_inputs[i]);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, "\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\"")) {
+            fprintf(stderr, "  [c1-snippet] %s -> %.300s\n", macro_inputs[i], resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"label\":\"Macro\""));
+        free(resp);
+    }
+
+    static const char *const definition_inputs[] = {
+        "{\"qualified_name\":\"test-project.lib.xx.state_t\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"xx.state_t\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"state_t\",\"project\":\"test-project\"}"};
+    for (size_t i = 0; i < sizeof(definition_inputs) / sizeof(definition_inputs[0]); i++) {
+        char *resp = call_snippet(srv, definition_inputs[i]);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, "\"label\":\"Type\"")) {
+            fprintf(stderr, "  [c1-snippet] %s -> %.300s\n", definition_inputs[i], resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.lib.xx.state_t\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"label\":\"Type\""));
+        free(resp);
+    }
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
@@ -20826,6 +24640,161 @@ TEST(autoindex_limit_guards_git_root_issue713) {
     PASS();
 }
 
+/* A servable project row is a committed index. user_version stays 0, so a
+ * later run cannot take the incremental no-op and skip recording workers. */
+static bool mcp_publish_committed_index(const char *root) {
+    char *project = root ? cbm_project_name_from_path(root) : NULL;
+    cbm_store_t *store = project ? cbm_store_open(project) : NULL;
+    bool published = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    free(project);
+    return published;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    const char *root;
+    bool published;
+} mcp_committed_seed_t;
+
+/* maybe_auto_index returns before the thread when <project>.db already
+ * exists. Publish the committed index from the count hook, which runs after
+ * that check and before autoindex_thread chooses a width. */
+static void mcp_autoindex_publish_committed(void *context) {
+    mcp_committed_seed_t *seed = context;
+    if (seed) {
+        seed->published = mcp_publish_committed_index(seed->root);
+    }
+}
+#endif
+
+/* First index, including one started automatically, uses every core. Headroom
+ * applies only once a servable project database already exists.
+ * automatic: in-process auto-index (initialize → autoindex_thread).
+ * Otherwise index_repository with _cbm_background, the daemon/watcher path. */
+static int mcp_assert_inprocess_worker_policy(bool committed, bool automatic) {
+    char cache[256];
+    char repo[512];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-worker-policy-%d%d-XXXXXX", cbm_tmpdir(),
+                   committed ? 1 : 0, automatic ? 1 : 0);
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    (void)snprintf(repo, sizeof(repo), "%s/repo", cache);
+    char source[640];
+    (void)snprintf(source, sizeof(source), "%s/main.py", repo);
+    bool repo_ready = cache_ready && th_mkdir_p(repo) == 0 &&
+                      th_write_file(source, "def background_index():\n    return True\n") == 0;
+
+    mcp_test_env_backup_t environment[] = {
+        {.name = "CBM_CACHE_DIR"},
+        {.name = "CBM_WORKERS"},
+        {.name = "CBM_INDEX_SINGLE_THREAD"},
+    };
+    bool environment_saved = true;
+    for (size_t i = 0; i < sizeof(environment) / sizeof(environment[0]); i++) {
+        const char *value = getenv(environment[i].name);
+        environment[i].present = value != NULL;
+        environment[i].value = value ? strdup(value) : NULL;
+        environment_saved = environment_saved && (!value || environment[i].value);
+    }
+    bool environment_ready = environment_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                             cbm_unsetenv("CBM_WORKERS") == 0 &&
+                             cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") == 0;
+
+    bool seeded = !committed;
+    char old_cwd[CBM_SZ_4K] = {0};
+    bool cwd_ready = true;
+    cbm_config_t *config = NULL;
+    bool config_ready = true;
+    cbm_mcp_server_t *server = NULL;
+    char *response = NULL;
+    if (automatic) {
+        cwd_ready = repo_ready && environment_ready && cbm_getcwd(old_cwd, sizeof(old_cwd)) &&
+                    cbm_chdir(repo) == 0;
+        config = cwd_ready ? cbm_config_open(cache) : NULL;
+        config_ready = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                       cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+        cbm_pipeline_worker_count_test_reset();
+        server = config_ready ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            cbm_mcp_server_set_config(server, config);
+#ifdef CBM_ENABLE_TEST_SEAMS
+            mcp_committed_seed_t seed = {.root = repo, .published = !committed};
+            if (committed) {
+                cbm_mcp_server_set_auto_index_count_test_hook(
+                    server, mcp_autoindex_publish_committed, &seed);
+            }
+#endif
+            response = cbm_mcp_server_handle(
+                server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+#ifdef CBM_ENABLE_TEST_SEAMS
+            seeded = seed.published;
+#endif
+            cbm_mcp_server_free(server); /* joins the automatic index thread */
+        }
+    } else {
+        if (committed && repo_ready && environment_ready) {
+            seeded = mcp_publish_committed_index(repo);
+        }
+        cbm_pipeline_worker_count_test_reset();
+        server = repo_ready && environment_ready && seeded ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            char repo_json[512];
+            char args[CBM_SZ_1K];
+            (void)snprintf(repo_json, sizeof(repo_json), "%s", repo);
+            cbm_normalize_path_sep(repo_json);
+            (void)snprintf(args, sizeof(args), "{\"_cbm_background\":true,\"repo_path\":\"%s\"}",
+                           repo_json);
+            response = cbm_mcp_handle_tool(server, "index_repository", args);
+            cbm_mcp_server_free(server);
+        }
+    }
+    int selected_workers = cbm_pipeline_worker_count_test_last();
+    bool server_ready = server != NULL;
+    bool response_ready = response != NULL;
+
+    free(response);
+    cbm_config_close(config);
+    if (automatic && cwd_ready) {
+        (void)cbm_chdir(old_cwd);
+    }
+    /* Capture while CBM_WORKERS is still unset. Restoring first makes the
+     * expected count follow the lane override instead of this policy. */
+    int expected = committed ? cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                                    cbm_default_worker_count(false))
+                             : cbm_default_worker_count(true);
+    mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
+    bool cleaned = !cache_ready || th_rmtree(cache) == 0;
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(repo_ready);
+    ASSERT_TRUE(environment_saved);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(cwd_ready);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(response_ready);
+    ASSERT_EQ(selected_workers, expected);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+TEST(mcp_auto_index_in_process_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, true);
+}
+
+TEST(mcp_auto_index_in_process_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, true);
+}
+
+TEST(mcp_background_flag_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, false);
+}
+
+TEST(mcp_background_flag_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, false);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
@@ -21803,7 +25772,940 @@ TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
     PASS();
 }
 
+/* ── Integer argument bounds ────────────────────────────────────────
+ * Sizing arguments are clamped on both sides at the handler. The fixture
+ * file is much longer than the `context` bound so the window is observable. */
+
+enum { CTX_FIXTURE_LINES = 1000, CTX_FIXTURE_NEEDLE_LINE = 500, CTX_BOUND = 200 };
+
+static bool write_context_fixture(const char *tmp, char *path, size_t path_sz) {
+    snprintf(path, path_sz, "%s/project/long.md", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp) {
+        return false;
+    }
+    for (int line = 1; line <= CTX_FIXTURE_LINES; line++) {
+        if (line == CTX_FIXTURE_NEEDLE_LINE) {
+            fprintf(fp, "needle-context-window\n");
+        } else {
+            fprintf(fp, "line %04d\n", line);
+        }
+    }
+    return fclose(fp) == 0;
+}
+
+static bool upsert_context_fixture_node(cbm_mcp_server_t *srv) {
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        return false;
+    }
+    cbm_node_t node = {.project = "test-project",
+                       .label = "Section",
+                       .name = "long",
+                       .qualified_name = "test-project.long",
+                       .file_path = "long.md",
+                       .start_line = 1,
+                       .end_line = CTX_FIXTURE_LINES};
+    return cbm_store_upsert_node(st, &node) > 0;
+}
+
+static char *search_code_with_context(cbm_mcp_server_t *srv, const char *context_value) {
+    char req[256];
+    snprintf(req, sizeof(req),
+             "{\"project\":\"test-project\",\"pattern\":\"needle-context-window\","
+             "\"format\":\"json\",\"context\":%s,\"limit\":5}",
+             context_value);
+    char *resp = cbm_mcp_handle_tool(srv, "search_code", req);
+    if (!resp) {
+        return NULL;
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    return inner;
+}
+
+/* Row-0 context object of a json-format search_code answer, or NULL when the
+ * answer carries no context column. *doc_out owns the memory either way. */
+static yyjson_val *search_code_context_object(const char *inner, yyjson_doc **doc_out) {
+    *doc_out = yyjson_read(inner, strlen(inner), 0);
+    if (!*doc_out) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(*doc_out);
+    yyjson_val *cols = yyjson_obj_get(root, "cols");
+    yyjson_val *rows = yyjson_obj_get(root, "rows");
+    if (!cols || !rows || yyjson_arr_size(rows) == 0) {
+        return NULL;
+    }
+    size_t col_count = yyjson_arr_size(cols);
+    for (size_t i = 0; i < col_count; i++) {
+        const char *col = yyjson_get_str(yyjson_arr_get(cols, i));
+        if (col && strcmp(col, "context") == 0) {
+            return yyjson_arr_get(yyjson_arr_get(rows, 0), i);
+        }
+    }
+    return NULL;
+}
+
+static int count_newlines(const char *s) {
+    int n = 0;
+    for (; *s; s++) {
+        n += *s == '\n';
+    }
+    return n;
+}
+
+TEST(search_code_context_window_is_bounded) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char fixture[512];
+    ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
+    ASSERT_TRUE(upsert_context_fixture_node(srv));
+
+    /* Far above the bound: the window is match ± 200, not the whole file. */
+    char *inner = search_code_with_context(srv, "100000");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = NULL;
+    yyjson_val *ctx = search_code_context_object(inner, &doc);
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+              CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
+    const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
+    ASSERT_EQ(strncmp(text, "line 0300\n", 10), 0);
+    ASSERT_NOT_NULL(strstr(text, "\nneedle-context-window\n"));
+    ASSERT_NOT_NULL(strstr(text, "\nline 0700\n"));
+    ASSERT_NULL(strstr(text, "line 0701"));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* Inside the bound the window is unchanged. */
+    inner = search_code_with_context(srv, "3");
+    ASSERT_NOT_NULL(inner);
+    ctx = search_code_context_object(inner, &doc);
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")), CTX_FIXTURE_NEEDLE_LINE - 3);
+    text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(count_newlines(text), 7);
+    ASSERT_EQ(strncmp(text, "line 0497\n", 10), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    unlink(fixture);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(search_code_context_extreme_values_answer_normally) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char fixture[512];
+    ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
+    ASSERT_TRUE(upsert_context_fixture_node(srv));
+
+    /* The largest value the argument can carry behaves exactly like the bound. */
+    char *inner = search_code_with_context(srv, "2147483647");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = NULL;
+    yyjson_val *ctx = search_code_context_object(inner, &doc);
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+              CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
+    const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* A negative value means no context, exactly like 0: a normal answer. */
+    inner = search_code_with_context(srv, "-5");
+    ASSERT_NOT_NULL(inner);
+    ctx = search_code_context_object(inner, &doc);
+    ASSERT_NULL(ctx);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+    ASSERT_NOT_NULL(rows);
+    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    unlink(fixture);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_query_graph_max_rows_above_ceiling_is_capped) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "row-ceiling";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/row-ceiling"), CBM_STORE_OK);
+    /* One row more than the visible ceiling (99998), so the cap is observable. */
+    enum { ROW_CEILING = 99998, ROWS = ROW_CEILING + 1 };
+    ASSERT_EQ(cbm_store_begin_bulk(store), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+    for (int i = 0; i < ROWS; i++) {
+        char name[32];
+        char qualified_name[64];
+        snprintf(name, sizeof(name), "row_%05d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "row-ceiling.rows.%s", name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "rows.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_end_bulk(store), CBM_STORE_OK);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"project\":\"row-ceiling\",\"query\":\"MATCH (n) RETURN n.name\","
+        "\"format\":\"json\",\"max_rows\":2147483647,\"max_output_tokens\":1000000}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), ROW_CEILING);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), ROWS);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_limit_above_ceiling_is_capped) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "limit-ceiling";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/limit-ceiling"), CBM_STORE_OK);
+    enum { LIMIT_CEILING = 500, NODES = 600 };
+    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+    for (int i = 0; i < NODES; i++) {
+        char name[32];
+        char qualified_name[64];
+        snprintf(name, sizeof(name), "fn_%03d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "limit-ceiling.m.%s", name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "m.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"limit-ceiling\",\"label\":\"Function\",\"limit\":9999,"
+                            "\"format\":\"json\",\"max_output_tokens\":1000000}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), LIMIT_CEILING);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), NODES);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_cursor_truncated_after_leg_is_rejected) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "cursor-leg";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/cursor-leg"), CBM_STORE_OK);
+    cbm_node_t hub = {.project = proj,
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "cursor-leg.h.hub",
+                      .file_path = "h.c",
+                      .start_line = 1,
+                      .end_line = 9};
+    int64_t hid = cbm_store_upsert_node(st, &hub);
+    ASSERT_GT(hid, 0);
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "leaf",
+                         .qualified_name = "cursor-leg.m.leaf",
+                         .file_path = "m.c",
+                         .start_line = 1,
+                         .end_line = 3};
+    int64_t lid = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(lid, 0);
+    cbm_edge_t e = {.project = proj, .source_id = hid, .target_id = lid, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    /* A token that ends right after the leg character has no generation,
+     * hash, hop or node fields to read; it is rejected like any other
+     * malformed token. */
+    static const char *const tokens[] = {"c1.o", "c1.i"};
+    for (size_t t = 0; t < sizeof(tokens) / sizeof(tokens[0]); t++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "{\"project\":\"cursor-leg\",\"function_name\":\"hub\","
+                 "\"direction\":\"outbound\",\"limit\":5,\"cursor\":\"%s\"}",
+                 tokens[t]);
+        char *response = cbm_mcp_handle_tool(srv, "trace_call_path", req);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "invalid_cursor"));
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_code_rejects_quote_in_file_pattern) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Both quote characters are rejected before any file is scanned. */
+    static const char *const patterns[] = {"*.go\\\"", "*.go'"};
+    for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "{\"project\":\"test-project\",\"pattern\":\"HandleRequest\","
+                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                 patterns[p]);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", req);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "path or file_pattern contains invalid characters"));
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "coverage-priority";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/coverage-priority"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "mixed.js", "fixture", 0, 0),
+              CBM_STORE_OK);
+    const char *kinds[] = {"parse_partial", "parse_unusable", "oversized", "not_indexed_file"};
+    const char *statuses[] = {"partial", "unusable", "skipped", "excluded"};
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        cbm_coverage_row_t rows[] = {
+            {.rel_path = "mixed.js", .kind = "unresolved_calls", .detail = "[]"},
+            {.rel_path = "mixed.js", .kind = kinds[i], .detail = "1-2"},
+        };
+        ASSERT_EQ(cbm_store_coverage_replace(store, project, rows, 2), CBM_STORE_OK);
+        char *response = cbm_mcp_handle_tool(
+            srv, "check_index_coverage",
+            "{\"project\":\"coverage-priority\",\"paths\":[\"mixed.js\"],\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *path = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "paths"), 0);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), statuses[i]);
+        ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(path, "coverage")), 2);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ── search_code: every match resolves inside the project root ─────────
+ * search_code returns the lines its scan opened. The scoped file list is
+ * built from the index, and an indexed path that now passes through a
+ * directory link still looks like a regular file to lstat, so grep opens
+ * and reports the link target. Reading a result's source already goes
+ * through cbm_path_within_root (attach_result_source); the match itself
+ * must pass the same check in every output mode.
+ *
+ * POSIX only: the fixture needs symbolic links. Windows: creating a link
+ * or junction from a test needs CreateSymbolicLinkW (a privilege unless
+ * developer mode is on) or a junction helper the test tree does not have,
+ * and a Windows run of these cases was not attempted in this change, so
+ * they skip with that reason rather than sit as an unexplained red. */
+#ifndef _WIN32
+typedef struct {
+    char root[CBM_SZ_512];
+    char outside[CBM_SZ_512];
+} search_root_fixture_t;
+
+/* Layout (every line that matters carries ROOTCHECK_NEEDLE):
+ *   <root>/main.c                      ordinary file, Variable INSIDE_SYMBOL
+ *   <root>/inner/same.c                ordinary file, reached via the links
+ *   <root>/alias -> inner              directory link that stays inside
+ *   <root>/mirror.c -> inner/same.c    file link that stays inside
+ *   <root>/link.c -> <outside>/far.c   file link that leaves the root
+ *   <root>/lib -> <outside>/dir        directory link that leaves the root
+ *   <outside>/dir/deep.c               raw hit through the directory link
+ *   <outside>/dir/sym.c                graph hit (Variable FAR_DIR_SYMBOL) */
+static bool search_root_fixture_create(search_root_fixture_t *fx) {
+    snprintf(fx->root, sizeof(fx->root), "%s/cbm_srch_root_XXXXXX", cbm_tmpdir());
+    snprintf(fx->outside, sizeof(fx->outside), "%s/cbm_srch_outside_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(fx->root) || !cbm_mkdtemp(fx->outside)) {
+        return false;
+    }
+    char path[CBM_SZ_1K];
+    char target[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/main.c", fx->root);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_INSIDE = 1;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/inner/same.c", fx->root);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_INNER = 4;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/alias", fx->root);
+    if (symlink("inner", path) != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/mirror.c", fx->root);
+    if (symlink("inner/same.c", path) != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/far.c", fx->outside);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_FILE = 2;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/dir/deep.c", fx->outside);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_DIR = 3;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/dir/sym.c", fx->outside);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_SYM = 5;\n") != 0) {
+        return false;
+    }
+    snprintf(target, sizeof(target), "%s/far.c", fx->outside);
+    snprintf(path, sizeof(path), "%s/link.c", fx->root);
+    if (symlink(target, path) != 0) {
+        return false;
+    }
+    snprintf(target, sizeof(target), "%s/dir", fx->outside);
+    snprintf(path, sizeof(path), "%s/lib", fx->root);
+    return symlink(target, path) == 0;
+}
+
+static void search_root_fixture_destroy(search_root_fixture_t *fx) {
+    /* Unlink the links first so the tree removal never descends through one. */
+    static const char *const links[] = {"alias", "mirror.c", "link.c", "lib"};
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%s/%s", fx->root, links[i]);
+        (void)unlink(path);
+    }
+    (void)th_rmtree(fx->root);
+    (void)th_rmtree(fx->outside);
+}
+
+/* File nodes as a stale index holds them: the link targets were ordinary
+ * directories and files when they were indexed (discovery itself never
+ * follows a link). inner/same.c is deliberately absent so its line can only
+ * be reached through alias/ or mirror.c. */
+static bool search_root_fixture_index(cbm_store_t *store, const char *project) {
+    static const char *const files[] = {"main.c", "alias/same.c", "mirror.c",
+                                        "link.c", "lib/deep.c",   "lib/sym.c"};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        const char *base = strrchr(files[i], '/');
+        base = base ? base + 1 : files[i];
+        char qualified_name[CBM_SZ_256];
+        snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, files[i]);
+        cbm_node_t file = {.project = project,
+                           .label = "File",
+                           .name = base,
+                           .qualified_name = qualified_name,
+                           .file_path = files[i]};
+        if (cbm_store_upsert_node(store, &file) <= 0) {
+            return false;
+        }
+    }
+    cbm_node_t inside = {.project = project,
+                         .label = "Variable",
+                         .name = "INSIDE_SYMBOL",
+                         .qualified_name = "search-root.INSIDE_SYMBOL",
+                         .file_path = "main.c",
+                         .start_line = 1,
+                         .end_line = 1};
+    cbm_node_t far_symbol = {.project = project,
+                             .label = "Variable",
+                             .name = "FAR_DIR_SYMBOL",
+                             .qualified_name = "search-root.lib.FAR_DIR_SYMBOL",
+                             .file_path = "lib/sym.c",
+                             .start_line = 1,
+                             .end_line = 1};
+    return cbm_store_upsert_node(store, &inside) > 0 &&
+           cbm_store_upsert_node(store, &far_symbol) > 0;
+}
+
+typedef struct {
+    bool ok;               /* a non-error response with text content */
+    bool inside_file;      /* main.c reported */
+    bool inside_dir_link;  /* alias/same.c reported (directory link inside) */
+    bool inside_file_link; /* mirror.c reported (file link inside) */
+    bool outside;          /* any line or path from beyond the root */
+} search_root_probe_t;
+
+static search_root_probe_t search_root_probe(cbm_mcp_server_t *srv, const char *args) {
+    search_root_probe_t probe = {0};
+    char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+    char *inner = response ? extract_text_content(response) : NULL;
+    probe.ok = response && !strstr(response, "\"isError\":true") && inner;
+    if (probe.ok) {
+        probe.inside_file = strstr(inner, "main.c") != NULL;
+        probe.inside_dir_link = strstr(inner, "alias/same.c") != NULL;
+        probe.inside_file_link = strstr(inner, "mirror.c") != NULL;
+        static const char *const outside_markers[] = {"ROOTCHECK_NEEDLE_FAR", "FAR_DIR_SYMBOL",
+                                                      "deep.c", "sym.c", "link.c"};
+        for (size_t i = 0; i < sizeof(outside_markers) / sizeof(outside_markers[0]); i++) {
+            if (strstr(inner, outside_markers[i])) {
+                probe.outside = true;
+            }
+        }
+    }
+    free(inner);
+    free(response);
+    return probe;
+}
+
+#define SEARCH_ROOT_ARGS(extra) \
+    "{\"pattern\":\"ROOTCHECK_NEEDLE\",\"project\":\"search-root\"" extra "}"
+#endif
+
+/* Scoped route, real scan command: the index lists lib/deep.c and lib/sym.c,
+ * lstat follows the lib -> <outside>/dir link and calls both regular, grep
+ * reads the targets. Every output mode must leave those lines out while
+ * main.c and alias/same.c (a directory link that stays inside) stay in.
+ * mirror.c and link.c are links as their last path component; the scoped
+ * list writer already leaves those out (lstat reports the link itself) —
+ * pinned here as the existing behaviour, not changed. */
+TEST(search_code_matches_stay_inside_project_root) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
+#else
+    search_root_fixture_t fx;
+    bool fixture_ok = search_root_fixture_create(&fx);
+    if (!fixture_ok) {
+        search_root_fixture_destroy(&fx);
+    }
+    ASSERT_TRUE(fixture_ok);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-root";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
+    ASSERT_TRUE(search_root_fixture_index(store, project));
+
+    static const char *const args[] = {
+        SEARCH_ROOT_ARGS(""),
+        SEARCH_ROOT_ARGS(",\"format\":\"json\""),
+        SEARCH_ROOT_ARGS(",\"mode\":\"full\""),
+        SEARCH_ROOT_ARGS(",\"mode\":\"full\",\"format\":\"json\""),
+        SEARCH_ROOT_ARGS(",\"mode\":\"files\""),
+        SEARCH_ROOT_ARGS(",\"context\":2"),
+        "{\"pattern\":\"ROOTCHECK_NEEDLE_[A-Z]+\",\"project\":\"search-root\",\"regex\":true}",
+    };
+    enum { PROBES = sizeof(args) / sizeof(args[0]) };
+    search_root_probe_t probes[PROBES];
+    for (size_t i = 0; i < PROBES; i++) {
+        probes[i] = search_root_probe(srv, args[i]);
+    }
+    /* Dropped files are not counted either: the exact total is the two
+     * lines inside the root, as it would be after a fresh index. */
+    char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
+    char *json_inner = json_response ? extract_text_content(json_response) : NULL;
+    bool total_counts_inside_only = json_inner && strstr(json_inner, "\"total_grep_matches\":2");
+    free(json_inner);
+    free(json_response);
+
+    cbm_mcp_server_free(srv);
+    search_root_fixture_destroy(&fx);
+
+    for (size_t i = 0; i < PROBES; i++) {
+        ASSERT_TRUE(probes[i].ok);
+        ASSERT_FALSE(probes[i].outside);
+        ASSERT_TRUE(probes[i].inside_file);
+        ASSERT_TRUE(probes[i].inside_dir_link);
+        ASSERT_FALSE(probes[i].inside_file_link);
+    }
+    ASSERT_TRUE(total_counts_inside_only);
+    PASS();
+#endif
+}
+
+/* Recursive route: with no indexed files the scan walks the tree. On POSIX
+ * that walker is `find -type f`, which never hands grep a link, so the scan
+ * command is replaced by one that does — the hits a walker that follows
+ * links (Get-ChildItem on Windows is one) would deliver. Lines from
+ * link.c and lib/ resolve outside the root and must be dropped; mirror.c
+ * and alias/same.c resolve inside and must be kept. */
+TEST(search_code_drops_walker_hits_that_resolve_outside_root) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
+#else
+    search_root_fixture_t fx;
+    bool fixture_ok = search_root_fixture_create(&fx);
+    if (!fixture_ok) {
+        search_root_fixture_destroy(&fx);
+    }
+    ASSERT_TRUE(fixture_ok);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-root";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
+
+    char scan_command[CBM_SZ_4K];
+    int command_length =
+        snprintf(scan_command, sizeof(scan_command),
+                 "grep -Hn -F ROOTCHECK_NEEDLE -- '%s/main.c' '%s/mirror.c' '%s/link.c' "
+                 "'%s/lib/deep.c' '%s/lib/sym.c' '%s/alias/same.c'",
+                 fx.root, fx.root, fx.root, fx.root, fx.root, fx.root);
+    ASSERT_TRUE(command_length > 0 && (size_t)command_length < sizeof(scan_command));
+    cbm_mcp_server_set_search_scan_command_for_test(srv, scan_command);
+
+    static const char *const args[] = {
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10"),
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"format\":\"json\""),
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"full\""),
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"files\""),
+    };
+    enum { PROBES = sizeof(args) / sizeof(args[0]) };
+    search_root_probe_t probes[PROBES];
+    for (size_t i = 0; i < PROBES; i++) {
+        probes[i] = search_root_probe(srv, args[i]);
+    }
+    char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, NULL);
+    char *json_inner = json_response ? extract_text_content(json_response) : NULL;
+    bool total_counts_inside_only = json_inner && strstr(json_inner, "\"total_grep_matches\":3");
+    free(json_inner);
+    free(json_response);
+
+    cbm_mcp_server_free(srv);
+    search_root_fixture_destroy(&fx);
+
+    for (size_t i = 0; i < PROBES; i++) {
+        ASSERT_TRUE(probes[i].ok);
+        ASSERT_FALSE(probes[i].outside);
+        ASSERT_TRUE(probes[i].inside_file);
+        ASSERT_TRUE(probes[i].inside_dir_link);
+        ASSERT_TRUE(probes[i].inside_file_link);
+    }
+    ASSERT_TRUE(total_counts_inside_only);
+    PASS();
+#endif
+}
+
+/* ── In-process search_code scan ───────────────────────────────────
+ * The scoped scan used to shell out to grep (POSIX) or Select-String
+ * (Windows) and now runs in process. These cases pin its records to the
+ * `grep -Hn` shape the subprocess wrote: path:line:content on POSIX, the
+ * same fields TAB-separated on Windows. */
+
+#ifdef _WIN32
+#define SCAN_FS "\t"
+#define SCAN_RS '\n'
+#else
+#define SCAN_FS ":"
+#define SCAN_RS '\0'
+#endif
+
+typedef struct {
+    char dir[256];
+    char list[512];
+    char out[512];
+    char files[4][512];
+    int count;
+} scan_fixture_t;
+
+static bool scan_fixture_open(scan_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    const char *tmp = th_mktempdir("cbm_scan");
+    if (!tmp) {
+        return false;
+    }
+    snprintf(fx->dir, sizeof(fx->dir), "%s", tmp);
+    snprintf(fx->list, sizeof(fx->list), "%s/list", tmp);
+    snprintf(fx->out, sizeof(fx->out), "%s/out", tmp);
+    return true;
+}
+
+/* Add a file holding exactly `length` bytes (NUL bytes allowed). */
+static bool scan_fixture_add(scan_fixture_t *fx, const char *name, const char *data,
+                             size_t length) {
+    if (fx->count >= 4) {
+        return false;
+    }
+    /* Format from a copy: GCC's -Werror=restrict rejects a source and a
+     * destination inside the same struct. */
+    char dir[sizeof(fx->dir)];
+    memcpy(dir, fx->dir, sizeof(dir));
+    char *path = fx->files[fx->count];
+    snprintf(path, sizeof(fx->files[0]), "%s/%s", dir, name);
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = fwrite(data, 1, length, fp) == length;
+    ok = fclose(fp) == 0 && ok;
+    fx->count += ok ? 1 : 0;
+    return ok;
+}
+
+/* Write the scoped file list as search_code does (NUL records on POSIX,
+ * lines on Windows); `extra` names one more path that need not exist. */
+static bool scan_fixture_list(const scan_fixture_t *fx, const char *extra) {
+    FILE *fp = cbm_fopen(fx->list, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < fx->count; i++) {
+        ok = ok && fputs(fx->files[i], fp) != EOF && fputc(SCAN_RS, fp) != EOF;
+    }
+    if (extra) {
+        ok = ok && fputs(extra, fp) != EOF && fputc(SCAN_RS, fp) != EOF;
+    }
+    return fclose(fp) == 0 && ok;
+}
+
+/* Run the scan; returns the records it wrote (caller frees), CRs kept. */
+static char *scan_fixture_run(const scan_fixture_t *fx, const char *pattern, bool use_regex,
+                              size_t output_limit, int *cause) {
+    *cause = cbm_mcp_search_scan_for_test(NULL, fx->list, pattern, use_regex, fx->out,
+                                          output_limit, UINT64_MAX);
+    FILE *fp = cbm_fopen(fx->out, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    char *text = calloc(CBM_SZ_64K, 1);
+    size_t length = text ? fread(text, 1, CBM_SZ_64K - 1, fp) : 0;
+    (void)fclose(fp);
+    if (text) {
+        text[length] = '\0';
+    }
+    return text;
+}
+
+/* Append one expected record to `buf`. */
+static void scan_expect(char *buf, size_t cap, const char *path, int line, const char *content) {
+    size_t used = strlen(buf);
+    snprintf(buf + used, cap - used, "%s" SCAN_FS "%d" SCAN_FS "%s\n", path, line, content);
+}
+
+TEST(search_code_scan_in_process_writes_grep_records) {
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    /* The last line has no newline and line 3 is empty. */
+    static const char a[] = "alpha\nbeta gamma\n\nalpha beta\nlast alpha";
+    static const char b[] = "nothing\nalpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "a.txt", a, sizeof(a) - 1));
+    ASSERT_TRUE(scan_fixture_add(&fx, "b.txt", b, sizeof(b) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    const char *pa = fx.files[0];
+    const char *pb = fx.files[1];
+    char want[4096];
+    int cause = -1;
+
+    /* Literal: every matching line, file order, then line order. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    char *got = scan_fixture_run(&fx, "alpha", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* A multi-line pattern is one pattern per line, as with grep -f. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    got = scan_fixture_run(&fx, "gamma\nbeta", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* An empty pattern matches every line, the empty one included. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    scan_expect(want, sizeof(want), pa, 3, "");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 1, "nothing");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    got = scan_fixture_run(&fx, "", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* Extended regex, anchored per line. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    got = scan_fixture_run(&fx, "^(alpha|last)", true, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* No match: success with no records. */
+    got = scan_fixture_run(&fx, "zzqqxx", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+}
+
+TEST(search_code_scan_in_process_binary_and_crlf) {
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    /* A NUL in the first 32 KiB marks the whole file binary: no records. */
+    static const char bin[] = "alpha\n\0alpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "bin.dat", bin, sizeof(bin) - 1));
+    /* A later NUL ends the text at the last complete line before it. */
+    enum { FILLER_LINES = 4000 }; /* 10 bytes each: past the 32 KiB probe */
+    size_t late_cap = (size_t)FILLER_LINES * 10 + 64;
+    char *late = malloc(late_cap);
+    ASSERT_NOT_NULL(late);
+    size_t used = 0;
+    for (int i = 0; i < FILLER_LINES; i++) {
+        memcpy(late + used, "xxxxxxxxx\n", 10);
+        used += 10;
+    }
+    static const char tail[] = "alpha one\nalpha two\0\nalpha three\n";
+    memcpy(late + used, tail, sizeof(tail) - 1);
+    used += sizeof(tail) - 1;
+    ASSERT_TRUE(scan_fixture_add(&fx, "late.txt", late, used));
+    free(late);
+    static const char crlf[] = "alpha\r\nbeta\r\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "crlf.txt", crlf, sizeof(crlf) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    char want[4096];
+    int cause = -1;
+
+    /* The record keeps the line's CR; the result parser trims it. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), fx.files[1], FILLER_LINES + 1, "alpha one");
+    scan_expect(want, sizeof(want), fx.files[2], 1, "alpha\r");
+    char *got = scan_fixture_run(&fx, "alpha", false, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* `$` before a CR: grep on POSIX sees the CR and does not match;
+     * Select-String's Line on Windows had no CR and did. */
+    want[0] = '\0';
+#ifdef _WIN32
+    scan_expect(want, sizeof(want), fx.files[2], 2, "beta\r");
+#endif
+    got = scan_fixture_run(&fx, "^beta$", true, 0, &cause);
+    ASSERT_NOT_NULL(got);
+    ASSERT_EQ(cause, 0);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+}
+
+TEST(search_code_scan_in_process_limits_and_failures) {
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    static const char a[] = "alpha\nalpha\nalpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "a.txt", a, sizeof(a) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    int cause = -1;
+
+    /* Past the output limit: the output-limit cause (3), not a failure. */
+    char *got = scan_fixture_run(&fx, "alpha", false, 8, &cause);
+    free(got);
+    ASSERT_EQ(cause, 3);
+
+    /* An invalid regex is a command failure (1), as grep's exit 2 was. */
+    got = scan_fixture_run(&fx, "(", true, 0, &cause);
+    free(got);
+    ASSERT_EQ(cause, 1);
+
+    /* A passed deadline stops the scan before the next file (4); a request
+     * cancelled under the server stops it too, and takes precedence (5). */
+    ASSERT_EQ(cbm_mcp_search_scan_for_test(NULL, fx.list, "alpha", false, fx.out, 0, 0), 4);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_request_scope_begin(srv));
+    ASSERT_TRUE(cbm_mcp_server_cancel_active(srv));
+    cause = cbm_mcp_search_scan_for_test(srv, fx.list, "alpha", false, fx.out, 0, 0);
+    cbm_mcp_server_request_scope_end(srv);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(cause, 5);
+
+    /* A listed file that cannot be read is a command failure (1) as well. */
+    char missing[600];
+    snprintf(missing, sizeof(missing), "%s/missing.txt", fx.dir);
+    ASSERT_TRUE(scan_fixture_list(&fx, missing));
+    got = scan_fixture_run(&fx, "alpha", false, 0, &cause);
+    free(got);
+    ASSERT_EQ(cause, 1);
+    th_rmtree(fx.dir);
+    PASS();
+}
+
+#undef SCAN_FS
+#undef SCAN_RS
+
 SUITE(mcp) {
+    RUN_TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls);
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
     RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
@@ -21854,12 +26756,15 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_discovery_defaults_match_runtime_contract);
     RUN_TEST(mcp_metadata_byte_budget);
+    RUN_TEST(mcp_tools_list_loads_structural_path_upfront);
+    RUN_TEST(mcp_server_instructions_name_structural_questions);
     RUN_TEST(mcp_tools_have_behavior_annotations);
     RUN_TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
+    RUN_TEST(mcp_get_architecture_behavior_evidence_schema);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_omits_structured_content_for_plain_text);
     RUN_TEST(mcp_text_result_reversibly_encodes_invalid_utf8_as_standard_json);
@@ -21907,6 +26812,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_prompts_get_validates_arguments);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
+    RUN_TEST(server_handle_discover_probe_logs_info);
 
     /* Server handle — edge cases */
     RUN_TEST(server_handle_invalid_json);
@@ -21915,6 +26821,7 @@ SUITE(mcp) {
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
+    RUN_TEST(tool_list_projects_empty_cache_returns_wellformed_empty_page);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_compare_graphs_registered_issue525);
@@ -21928,6 +26835,7 @@ SUITE(mcp) {
     RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
     RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
     RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
+    RUN_TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders);
     RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
@@ -21949,6 +26857,12 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
     RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_label_filter_selects_candidate_window);
+    RUN_TEST(tool_search_graph_bm25_label_scope_keeps_rank_order);
+    RUN_TEST(tool_search_graph_bm25_serves_unranked_labels_when_named);
+    RUN_TEST(tool_search_graph_bm25_zero_hint_names_the_label);
+    RUN_TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate);
+    RUN_TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
@@ -21964,8 +26878,10 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
+    RUN_TEST(tool_project_discovery_agrees_across_store_switches_issue1115);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
+    RUN_TEST(tool_ingest_traces_stores_observed_calls);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
@@ -21975,14 +26891,24 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
+    RUN_TEST(tool_check_index_coverage_freshness_verifies_content_issue2585);
+    RUN_TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585);
+#endif
+    RUN_TEST(tool_responses_carry_store_generation_issue2585);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
+    RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
+    RUN_TEST(tool_trace_path_recursion_union_and_edges_issue2816);
+    RUN_TEST(tool_trace_path_recursion_survives_budget_floor_issue2816);
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
@@ -21995,6 +26921,11 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+    RUN_TEST(tool_trace_path_reads_only_relevant_unresolved_evidence);
+    RUN_TEST(tool_trace_path_truncated_evidence_is_conservative);
+    RUN_TEST(tool_trace_path_marks_unresolved_call_totals_unknown);
+    RUN_TEST(tool_trace_path_outbound_requires_project_symbol);
+    RUN_TEST(tool_index_unresolved_nested_functions_are_indexed);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
     RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
     RUN_TEST(tool_trace_path_edge_details_use_canonical_predecessor);
@@ -22004,6 +26935,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
+    RUN_TEST(tool_get_architecture_behavior_evidence_validation);
+    RUN_TEST(tool_get_architecture_behavior_evidence_cache_isolation);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
@@ -22036,6 +26969,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_fails_closed_when_complete_scan_is_impossible);
     RUN_TEST(search_code_scoped_scan_uses_canonical_file_nodes);
     RUN_TEST(search_code_scoped_file_pattern_is_busybox_portable);
+    RUN_TEST(search_code_file_pattern_matches_repo_relative_path_issue2836);
     RUN_TEST(search_code_recursive_fallback_propagates_discovery_failures);
     RUN_TEST(search_code_default_budget_limits_raw_rows_before_graph_results);
     RUN_TEST(search_code_raw_and_directory_remainders_are_independently_pageable);
@@ -22053,14 +26987,20 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_long_line_does_not_invent_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
+    RUN_TEST(search_code_oversized_path_filter_is_tool_error);
+    RUN_TEST(search_graph_oversized_name_pattern_is_tool_error);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);
     RUN_TEST(search_code_scan_setup_failures_respect_cause_precedence);
     RUN_TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed);
+    RUN_TEST(search_code_scan_in_process_writes_grep_records);
+    RUN_TEST(search_code_scan_in_process_binary_and_crlf);
+    RUN_TEST(search_code_scan_in_process_limits_and_failures);
     RUN_TEST(search_code_scan_cancellation_precedes_zero_deadline);
     RUN_TEST(search_code_scan_deadline_precedes_output_limit);
     RUN_TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up);
@@ -22093,6 +27033,9 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_set_sections_is_advertised);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
+    RUN_TEST(tool_index_repository_doc_candidates_switch);
+    RUN_TEST(tool_index_repository_doc_candidates_follow_mode);
+    RUN_TEST(tool_index_repository_doc_candidates_forwarded_only_when_explicit);
     RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
@@ -22129,6 +27072,18 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
     RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
     RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
+    RUN_TEST(detect_changes_seed_list_reports_hunk_without_walk);
+    RUN_TEST(detect_changes_seed_pages_bind_semantics_and_snapshot);
+    RUN_TEST(detect_changes_product_filter_does_not_inflate_fallback);
+    RUN_TEST(detect_changes_seed_params_reject_misuse);
+    RUN_TEST(detect_changes_product_filter_uses_project_config_and_override);
+    RUN_TEST(detect_changes_scope_tests_answers_test_impact);
+    RUN_TEST(detect_changes_fixpoint_walks_past_depth);
+    RUN_TEST(detect_changes_edge_types_reach_references);
+    RUN_TEST(detect_changes_via_names_the_parent);
+    RUN_TEST(detect_changes_walk_params_teach_on_misuse);
+    RUN_TEST(detect_changes_cursor_bound_to_walk_params);
+    RUN_TEST(detect_changes_default_output_is_byte_identical_golden);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 
@@ -22164,8 +27119,10 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_doc_candidates_both_directions);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
+    RUN_TEST(snippet_c_macro_namespace_c1);
     RUN_TEST(snippet_name_tier);
     RUN_TEST(snippet_ambiguous_short_name);
     RUN_TEST(snippet_not_found);
@@ -22192,12 +27149,32 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    RUN_TEST(mcp_auto_index_in_process_fresh_project_uses_full_width);
+    RUN_TEST(mcp_auto_index_in_process_existing_index_keeps_headroom);
+    RUN_TEST(mcp_background_flag_fresh_project_uses_full_width);
+    RUN_TEST(mcp_background_flag_existing_index_keeps_headroom);
+    RUN_TEST(search_code_context_window_is_bounded);
+    RUN_TEST(search_code_context_extreme_values_answer_normally);
+    RUN_TEST(tool_query_graph_max_rows_above_ceiling_is_capped);
+    RUN_TEST(tool_search_graph_limit_above_ceiling_is_capped);
+    RUN_TEST(tool_trace_cursor_truncated_after_leg_is_rejected);
+    RUN_TEST(search_code_rejects_quote_in_file_pattern);
+
+    /* search_code: every match resolves inside the project root */
+    RUN_TEST(search_code_matches_stay_inside_project_root);
+    RUN_TEST(search_code_drops_walker_hits_that_resolve_outside_root);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
  * running the much larger MCP behavior suite. */
 SUITE(mcp_mutation_guard) {
+    RUN_TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes);
+    RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
+    RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+    RUN_TEST(tool_delete_project_removes_adr_sidecar);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
     RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);
@@ -22212,6 +27189,7 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_cross_repo_checks_cancellation_after_acquiring_leases);
     RUN_TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases);
     RUN_TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting);
+    RUN_TEST(tool_cross_repo_status_and_wildcard_skipped_projects);
     RUN_TEST(tool_cross_repo_honors_source_name_override);
     RUN_TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested);
     RUN_TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal);
