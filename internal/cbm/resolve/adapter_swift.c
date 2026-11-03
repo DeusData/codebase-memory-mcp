@@ -41,6 +41,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "stats.h"
 #include "syntax_index.h"
 
 #define SWIFT_TYPE_RECORD "&type"
@@ -1221,8 +1222,8 @@ static swift_lookup_t swift_find_member(swift_ctx_t *ctx, const char *type_key, 
     }
     /* Only extensions here: what the extension spells is declared elsewhere, or outside. */
     bool extension_only = true;
-    for (const cbm_source_decl_t *record = records; record; record = record->next)
-        extension_only &= (record->flags & CBM_SOURCE_DECL_F_ADAPTED) != 0;
+    for (const cbm_source_decl_t *record = records; record && extension_only; record = record->next)
+        extension_only = (record->flags & CBM_SOURCE_DECL_F_ADAPTED) != 0;
     bool declared = false;
     if (extension_only && !bases_only) {
         const char *hash = strchr(type_key, '#');
@@ -1255,8 +1256,12 @@ static swift_lookup_t swift_find_member(swift_ctx_t *ctx, const char *type_key, 
     /* An extension of a type outside the project has no declaration here. */
     const char *base_owner = type_key;
     for (const cbm_source_decl_t *record = records; record; record = record->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         declared |= !(record->flags & CBM_SOURCE_DECL_F_ADAPTED);
         open |= (record->flags & CBM_SOURCE_DECL_F_OPEN) != 0;
+        /* Past the chain's bound every further base answers open, and the answer is open now. */
+        if (open && chain->overflow)
+            break;
         for (const char *const *base = record->bases; base && *base; base++) {
             const char *parent = swift_lookup_type(ctx, base_owner, *base);
             if (!parent) {

@@ -3263,6 +3263,16 @@ TEST(complexity_source_same_named_definitions_are_near_linear) {
     PASS();
 }
 
+/* `extension A: P` many times over: a name found in none of A's bases asks each of them. */
+CX_LINE3(cx_line_swift_extension_base,
+         "protocol P%d {}\nextension A: P%d {\n  func m_%d() { base() }\n}\n")
+TEST(complexity_swift_type_bases_are_near_linear) {
+    ASSERT_TRUE(cx_source_shape_is_near_linear(CBM_LANG_SWIFT, "bases.swift",
+                                               "class A { func base() {} }\n",
+                                               cx_line_swift_extension_base, ""));
+    PASS();
+}
+
 /* A barrel library re-exports the project, and every library that imports it read its whole
  * export list again. */
 static uint64_t cx_dart_barrel_work(int libraries) {
@@ -3457,6 +3467,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does);
     RUN_TEST(complexity_prev_sibling_walk_is_linear);
     RUN_TEST(complexity_source_same_named_definitions_are_near_linear);
+    RUN_TEST(complexity_swift_type_bases_are_near_linear);
     RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
     RUN_TEST(complexity_flat_preceding_label_is_linear);
