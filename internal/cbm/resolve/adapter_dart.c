@@ -814,6 +814,8 @@ static bool dart_walk_up(dart_ctx_t *ctx, const char *library, const char *key, 
     return false;
 }
 
+/* The walk's other callback writes through user, so the type cannot be const. */
+// cppcheck-suppress constParameterCallback
 static bool dart_is_library(const char *library, void *user) {
     return !strcmp(library, user);
 }
