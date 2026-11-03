@@ -1040,6 +1040,25 @@ static void worker_publish_fence_remove(cbm_index_worker_handle_t *handle) {
     }
 }
 
+/* Create the private files of one attempt. NULL on success; otherwise the name
+ * of the artifact that could not be created, with errno as that step left it
+ * and every earlier artifact still in place for the caller to remove. */
+static const char *worker_artifacts_create(cbm_index_worker_handle_t *handle) {
+    if (!worker_unique_file(handle->response_path, sizeof(handle->response_path), "response")) {
+        return "response";
+    }
+    if (!worker_unique_file(handle->log_path, sizeof(handle->log_path), "log")) {
+        return "log";
+    }
+    /* Opt-in: only an enabled worker limit can stop a worker, so only then is
+     * there a publication to coordinate. */
+    if (cbm_index_policy_worker_enabled(&handle->resource_policy) &&
+        !worker_publish_fence_create(handle)) {
+        return "publish_fence";
+    }
+    return NULL;
+}
+
 /* Settle who held the fence once the attempt is terminal. Claiming an unowned
  * fence now also bars any later claim, so a stray member of an unquiesced tree
  * can never publish after this report. */
@@ -1109,25 +1128,12 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
     handle->log_callback = log_callback;
     handle->log_context = log_context;
     worker_result_init(&handle->result);
-    if (!worker_unique_file(handle->response_path, sizeof(handle->response_path), "response") ||
-        !worker_unique_file(handle->log_path, sizeof(handle->log_path), "log")) {
+    const char *failed_artifact = worker_artifacts_create(handle);
+    if (failed_artifact) {
         int saved_errno = errno;
         char error_text[CBM_SZ_32];
         (void)snprintf(error_text, sizeof(error_text), "%d", saved_errno);
-        cbm_log_error("index.supervisor.artifact_create_failed", "artifact",
-                      handle->response_path[0] ? "log" : "response", "errno", error_text);
-        (void)cbm_unlink(handle->response_path);
-        (void)cbm_unlink(handle->log_path);
-        free(handle);
-        return -1;
-    }
-    /* Opt-in: only an enabled worker limit can stop a worker, so only then is
-     * there a publication to coordinate. */
-    if (cbm_index_policy_worker_enabled(&handle->resource_policy) &&
-        !worker_publish_fence_create(handle)) {
-        char error_text[CBM_SZ_32];
-        (void)snprintf(error_text, sizeof(error_text), "%d", errno);
-        cbm_log_error("index.supervisor.artifact_create_failed", "artifact", "publish_fence",
+        cbm_log_error("index.supervisor.artifact_create_failed", "artifact", failed_artifact,
                       "errno", error_text);
         (void)cbm_unlink(handle->response_path);
         (void)cbm_unlink(handle->log_path);

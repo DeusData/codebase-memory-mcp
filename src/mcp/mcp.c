@@ -11952,15 +11952,23 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
 
 static bool project_db_is_servable(const char *project, const char *db_path);
 
+/* The heap strings that name the project of an internal worker request
+ * (repo_path and name from cbm_mcp_get_string_arg, the project name derived from
+ * them). One release point for every helper that reads them; free(NULL) is a
+ * no-op, so any of them may be NULL. */
+static void index_request_names_free(char *repo_path, char *name_override, char *project_name) {
+    free(repo_path);
+    free(name_override);
+    free(project_name);
+}
+
 /* Serialize a worker JSON document and release the heap strings it borrowed.
- * Extra arguments may be NULL; free(NULL) is a no-op. */
+ * Extra arguments may be NULL. */
 static char *index_worker_json_result(yyjson_mut_doc *doc, char *repo_path, char *name_override,
                                       char *project_name) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    free(repo_path);
-    free(name_override);
-    free(project_name);
+    index_request_names_free(repo_path, name_override, project_name);
     char *result = cbm_mcp_text_result(json, true);
     free(json);
     return result;
@@ -12034,9 +12042,7 @@ static bool index_args_serving_index_servable(const char *args) {
         project_db_path(project_name, db_path, sizeof(db_path));
         servable = project_db_is_servable(project_name, db_path);
     }
-    free(repo_path);
-    free(name_override);
-    free(project_name);
+    index_request_names_free(repo_path, name_override, project_name);
     return servable;
 }
 

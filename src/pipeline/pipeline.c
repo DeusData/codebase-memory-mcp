@@ -5240,19 +5240,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_userconfig_t *fresh_config = cbm_userconfig_load_with_source(p->repo_path);
     bool source_matches = cbm_pipeline_project_source_matches(p, fresh_config);
     cbm_userconfig_free(fresh_config);
+    bool publish_allowed = source_matches;
     if (!source_matches) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_source_changed");
-        cleanup_staging_db(staging_path);
-        free(staging_path);
-        free(final_path);
-        pipeline_release_test_config(p);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-
-    /* Last point at which the serving database is still untouched: the
-     * destination preparation below may already move it aside. */
-    if (p->publish_gate && !p->publish_gate(p->publish_gate_ctx)) {
+    } else if (p->publish_gate && !p->publish_gate(p->publish_gate_ctx)) {
+        /* Last point at which the serving database is still untouched: the
+         * destination preparation below may already move it aside. */
         cbm_log_warn("pipeline.publish_refused", "path", final_path);
+        publish_allowed = false;
+    }
+    if (!publish_allowed) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
