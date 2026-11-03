@@ -217,6 +217,12 @@ typedef struct {
     const char *alias, *of;
 } python_alias_t;
 
+/* `__go(locals())` at module level: the callee, and where the call starts. */
+typedef struct {
+    const char *callee;
+    uint32_t at;
+} python_handoff_t;
+
 struct cbm_resolve_binding_index {
     CBMArena *arena;
     binding_observation_t *observation;
@@ -247,9 +253,11 @@ struct cbm_resolve_binding_index {
     size_t python_alias_count, python_alias_capacity;
     size_t python_write_count, python_write_capacity;
     bool python_effects_complete;
-    bool python_writes_unseen;       /* the audit stopped before the end of the file */
-    bool python_name_handed;         /* __name__ goes to a call: that may build the module */
-    bool python_namespace_open;      /* a computed globals() store can add any name */
+    bool python_writes_unseen;         /* the audit stopped before the end of the file */
+    bool python_name_handed;           /* __name__ goes to a call: that may build the module */
+    bool python_namespace_open;        /* a computed globals() store can add any name */
+    python_handoff_t *python_handoffs; /* checked once every binder is known */
+    size_t python_handoff_count, python_handoff_capacity;
     python_narrow_t *python_narrows; /* sorted by from, outermost first, once the walk ends */
     size_t python_narrow_count, python_narrow_capacity;
     python_store_t *python_stores; /* attribute stores, sorted by chain then position */
@@ -1025,6 +1033,125 @@ static bool python_name_shadowed(cbm_resolve_binding_index_t *index, const char 
     return true;
 }
 
+/* `eval('__IPYTHON__')`, pydantic's in_ipython: code that is one literal name only reads it.
+ * The argument list holds that string alone, with no escapes, interpolation or prefix. */
+static bool python_code_reads_one_name(cbm_resolve_binding_index_t *index, TSNode args) {
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) != 1)
+        return false;
+    TSNode code = ts_node_named_child(args, 0);
+    if (!kind_is(code, "string") || ts_node_named_child_count(code) != 3)
+        return false;
+    TSNode start = ts_node_named_child(code, 0), content = ts_node_named_child(code, 1);
+    if (!kind_is(start, "string_start") || !kind_is(content, "string_content") ||
+        ts_node_named_child_count(content) != 0 ||
+        ts_node_end_byte(start) - ts_node_start_byte(start) != 1)
+        return false;
+    uint32_t from = ts_node_start_byte(content), to = ts_node_end_byte(content);
+    if (to <= from || to > index->source_len ||
+        (index->source[from] >= '0' && index->source[from] <= '9'))
+        return false;
+    for (uint32_t at = from; at < to; at++) {
+        char c = index->source[at];
+        if (!(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9')))
+            return false;
+    }
+    return true;
+}
+
+static bool python_spells(const cbm_resolve_binding_index_t *index, TSNode node, const char *word);
+
+/* Names through which code can reach a namespace it was handed by another name. */
+static const char *const python_namespace_reach[] = {"locals",       "vars",         "eval",
+                                                     "exec",         "f_locals",     "_getframe",
+                                                     "currentframe", "getargvalues", NULL};
+
+/* One use of a namespace alias only reads: a membership test, an item read, or a read-only
+ * method. An item that is an assignment, del, for or with target writes. */
+static bool python_alias_use_reads(cbm_resolve_binding_index_t *index, TSNode use) {
+    TSNode parent = ts_node_parent(use);
+    if (kind_is(parent, "comparison_operator"))
+        return true;
+    if (kind_is(parent, "attribute") && ts_node_eq(field(parent, "object"), use)) {
+        const char *member = node_text(index, field(parent, "attribute"));
+        TSNode call = ts_node_parent(parent);
+        return member && kind_is(call, "call") && ts_node_eq(field(call, "function"), parent) &&
+               (!strcmp(member, "get") || !strcmp(member, "keys") || !strcmp(member, "items") ||
+                !strcmp(member, "values") || !strcmp(member, "copy"));
+    }
+    if (!kind_is(parent, "subscript") || !ts_node_eq(field(parent, "value"), use))
+        return false;
+    TSNode target = parent, user = ts_node_parent(parent);
+    static const char *const wrappers[] = {"pattern_list",
+                                           "tuple_pattern",
+                                           "list_pattern",
+                                           "expression_list",
+                                           "parenthesized_expression",
+                                           "tuple",
+                                           "list",
+                                           "list_splat_pattern",
+                                           NULL};
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH && listed(ts_node_type(user), wrappers);
+         depth++) {
+        target = user;
+        user = ts_node_parent(user);
+    }
+    if (kind_is(user, "delete_statement") || kind_is(user, "as_pattern_target"))
+        return false;
+    return !((kind_is(user, "assignment") || kind_is(user, "augmented_assignment") ||
+              kind_is(user, "for_statement") || kind_is(user, "for_in_clause")) &&
+             ts_node_eq(field(user, "left"), target));
+}
+
+/* `glob = globals()` in a function, as sqlalchemy's exc.py and automap.py do. The alias writes
+ * nothing if every other use of it in the function only reads and nothing there can reach it
+ * by another name. A module-level alias is a module attribute another file can write through,
+ * so it stays an effect. One cursor pass over the function per alias. */
+static bool python_view_alias_reads(cbm_resolve_binding_index_t *index, TSNode call) {
+    TSNode assignment = ts_node_parent(call), left = field(assignment, "left");
+    if (!kind_is(assignment, "assignment") || !ts_node_eq(field(assignment, "right"), call) ||
+        !kind_is(left, "identifier") ||
+        !kind_is(ts_node_parent(assignment), "expression_statement"))
+        return false;
+    const char *alias = node_text(index, left);
+    TSNode scope = ts_node_parent(assignment);
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH && !ts_node_is_null(scope) &&
+                             !kind_is(scope, "function_definition") && !kind_is(scope, "module");
+         depth++) {
+        if (kind_is(scope, "class_definition") || kind_is(scope, "lambda"))
+            return false;
+        scope = ts_node_parent(scope);
+    }
+    if (!alias || !kind_is(scope, "function_definition"))
+        return false;
+    TSNode own = field(call, "function");
+    bool reads = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(scope);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    unsigned depth = 1;
+    while (more && reads) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (kind_is(node, "identifier") && !ts_node_eq(node, own)) {
+            for (size_t i = 0; reads && python_namespace_reach[i]; i++)
+                reads = !python_spells(index, node, python_namespace_reach[i]);
+            if (reads && !ts_node_eq(node, left) && python_spells(index, node, alias))
+                reads = python_alias_use_reads(index, node);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (--depth == 0 || !ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return reads;
+}
+
 /* exec and eval write the namespace they run in, which an explicit globals
  * argument replaces. globals() is a write only if it can be written through: a
  * membership test, an item read, a read-only method or a splat into a new dict
@@ -1040,7 +1167,7 @@ static bool python_namespace_call_writes(cbm_resolve_binding_index_t *index, TSN
         for (uint32_t i = 0; !ts_node_is_null(args) && i < ts_node_named_child_count(args); i++)
             positional += !kind_is(ts_node_named_child(args, i), "keyword_argument") &&
                           !kind_is(ts_node_named_child(args, i), "comment");
-        return positional < 2;
+        return positional < 2 && !python_code_reads_one_name(index, args);
     }
     TSNode parent = ts_node_parent(call);
     if (kind_is(parent, "comparison_operator") || kind_is(parent, "dictionary_splat"))
@@ -1072,6 +1199,29 @@ static bool python_namespace_call_writes(cbm_resolve_binding_index_t *index, TSN
                (strcmp(member, "get") && strcmp(member, "keys") && strcmp(member, "items") &&
                 strcmp(member, "values") && strcmp(member, "copy"));
     }
+    return !python_view_alias_reads(index, call);
+}
+
+/* `__go(locals())` at module level hands the namespace to the callee's first parameter, as
+ * sqlalchemy's package inits do. The callee is known only once every binder is seen, so the
+ * call is noted here and python_settle_handoffs decides it. */
+static bool python_note_handoff(cbm_resolve_binding_index_t *index, TSNode view) {
+    TSNode arguments = ts_node_parent(view);
+    TSNode call = ts_node_parent(arguments);
+    if (index->current_scope != 0 || !kind_is(arguments, "argument_list") ||
+        !kind_is(call, "call") || !ts_node_eq(ts_node_named_child(arguments, 0), view))
+        return false;
+    TSNode callee = field(call, "function");
+    const char *name = kind_is(callee, "identifier") ? node_text(index, callee) : NULL;
+    python_handoff_t *rows =
+        name ? grow_array(index, index->python_handoffs, index->python_handoff_count,
+                          &index->python_handoff_capacity, sizeof(*rows))
+             : NULL;
+    if (!rows)
+        return false;
+    index->python_handoffs = rows;
+    rows[index->python_handoff_count++] =
+        (python_handoff_t){.callee = name, .at = ts_node_start_byte(call)};
     return true;
 }
 
@@ -1098,7 +1248,10 @@ static bool python_namespace_view(cbm_resolve_binding_index_t *index, TSNode nod
     bool in_function = index->current_scope && index->current_scope < index->scope_count &&
                        !index->scopes[index->current_scope].class_scope;
     TSNode args = field(call, "arguments");
-    return !in_function && (ts_node_is_null(args) || ts_node_named_child_count(args) == 0);
+    if (in_function || (!ts_node_is_null(args) && ts_node_named_child_count(args) != 0) ||
+        python_name_shadowed(index, name))
+        return false;
+    return !python_note_handoff(index, call);
 }
 
 /* A name bound by `if TYPE_CHECKING:` exists only for annotations; the
@@ -5857,6 +6010,72 @@ static bool javascript_module_by_source(const CBMFileResult *result, CBMLanguage
            (!strcmp(extension, ".mjs") || !strcmp(extension, ".cjs") || !strcmp(extension, ".jsx"));
 }
 
+/* The callee's body never spells the parameter that receives the namespace, nor a way to
+ * reach it by another name: locals, vars, eval, exec, or a frame's locals. One cursor pass. */
+static bool python_handoff_body_inert(cbm_resolve_binding_index_t *index, TSNode function) {
+    const char *parameter = python_first_parameter(index, function);
+    TSNode body = field(function, "body");
+    if (!parameter || ts_node_is_null(body))
+        return false;
+    bool mentioned = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    unsigned depth = 1;
+    while (more && !mentioned) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (kind_is(node, "identifier")) {
+            mentioned = python_spells(index, node, parameter);
+            for (size_t i = 0; !mentioned && python_namespace_reach[i]; i++)
+                mentioned = python_spells(index, node, python_namespace_reach[i]);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (--depth == 0 || !ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return !mentioned;
+}
+
+/* A hand-off writes nothing when the callee is this module's one undecorated def, bound before
+ * the call, whose body cannot reach the namespace it was given. What the body does by other
+ * means (global, imports, writes through a module) the walk has already seen. Anything else
+ * stays a whole-namespace effect. One lookup per hand-off; a body is scanned once per def. */
+static void python_settle_handoffs(cbm_resolve_binding_index_t *index, TSNode root) {
+    uint32_t verified = UINT32_MAX;
+    for (size_t i = 0;
+         i < index->python_handoff_count && index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE; i++) {
+        const python_handoff_t *handoff = &index->python_handoffs[i];
+        bool present = false;
+        const binding_name_t *row = find_scoped_name(
+            index, handoff->callee, strlen(handoff->callee), 0, &present, JS_SPACE_ANY);
+        bool inert = row && row->at < handoff->at && (row->flags & BINDING_DECLARATION) &&
+                     !(row->flags &
+                       (BINDING_BLOCKED | BINDING_DECORATED | BINDING_WRITTEN | BINDING_IMPORT));
+        if (inert && row->at != verified) {
+            TSNode function = ts_node_descendant_for_byte_range(root, row->at, row->at);
+            for (unsigned depth = 0; depth < BINDING_MAX_DEPTH && !ts_node_is_null(function) &&
+                                     !(kind_is(function, "function_definition") &&
+                                       ts_node_start_byte(function) == row->at);
+                 depth++)
+                function = ts_node_parent(function);
+            inert = kind_is(function, "function_definition") &&
+                    ts_node_start_byte(function) == row->at &&
+                    python_handoff_body_inert(index, function);
+            if (inert)
+                verified = row->at;
+        }
+        if (!inert)
+            fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "dynamic_namespace_effect");
+    }
+}
+
 static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFileResult *result,
                                                   CBMLanguage language, const char *source,
                                                   size_t source_len, bool declared_module,
@@ -6014,6 +6233,8 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
         if (language == CBM_LANG_PYTHON)
             python_refuse_class_comprehension_reads(index);
     }
+    if (language == CBM_LANG_PYTHON && tree && index->python_handoff_count)
+        python_settle_handoffs(index, ts_tree_root_node(tree));
     if (javascript_language(language)) {
         js_note_markup_writes(index);
         js_apply_writes(index);

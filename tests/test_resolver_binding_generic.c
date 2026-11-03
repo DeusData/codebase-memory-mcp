@@ -1407,7 +1407,10 @@ TEST(resolver_binding_python_annotation_scope_and_effects) {
         {"callback: object = other\ndef caller():\n    callback()\n", false, false, true},
         /* An annotation expression is a read, as on an assignment: the import stands. */
         {"callback: factory()\ndef caller():\n    callback()\n", true, true, true},
-        {"callback: eval('object')\ndef caller():\n    callback()\n", false, false, false},
+        /* eval of one literal name only reads it; eval of other code can rebind callback. */
+        {"callback: eval('object')\ndef caller():\n    callback()\n", true, true, true},
+        {"callback: eval(code)\ndef caller():\n    callback()\n", false, false, false},
+        {"callback: eval('(callback := 1)')\ndef caller():\n    callback()\n", false, false, false},
         {"__annotations__ = box\ncallback: object\ndef caller():\n    callback()\n", false, false,
          true},
     };

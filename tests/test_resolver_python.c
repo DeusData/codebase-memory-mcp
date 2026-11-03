@@ -306,7 +306,14 @@ TEST(resolver_python_only_real_namespace_effects_are_dynamic) {
         "def known(code):\n    return eval(code, {}, {'x': 1})\n",
         "import sys\ndef seen():\n    return hasattr(sys.modules[__name__], 'apps')\n",
         "def where():\n    return '__file__' in globals()\n",
-        "def merged():\n    return {**globals(), 'x': 1}\n"};
+        "def merged():\n    return {**globals(), 'x': 1}\n",
+        /* pydantic/v1/utils.py in_ipython: one literal name is only read */
+        "def in_ipython():\n    try:\n        eval('__IPYTHON__')\n    except NameError:\n"
+        "        return False\n    return True\n",
+        "seen = eval(\"local\")\n",
+        /* lib/sqlalchemy/exc.py: an alias of the namespace that is only read */
+        "def translate(name):\n    glob = globals()\n    if name in glob and callable(glob[name]):\n"
+        "        return glob[name]\n    return glob.get(name)\n"};
     for (size_t i = 0; i < sizeof(inert) / sizeof(inert[0]); i++) {
         char source[512];
         snprintf(source, sizeof(source),
@@ -315,6 +322,26 @@ TEST(resolver_python_only_real_namespace_effects_are_dynamic) {
         ASSERT(python_expect(inert[i], &file, 1, "CALLS", "main.py", "local", "Function", 1));
     }
     static const char *effects[] = {"exec('local = None')\n", "eval('1')\n",
+                                    "eval('(local := None)')\n", "eval(name)\n",
+                                    "eval('local' + suffix)\n", "eval(u'local = None')\n",
+                                    "glob = globals()\nglob['local'] = None\n",
+                                    "__locals = locals()\n__locals['local'] = None\n",
+                                    /* httpx/__init__.py: read here, but a module attribute
+                                     * another file can write through */
+                                    "__locals = locals()\nfor __name in []:\n"
+                                    "    setattr(__locals[__name], '__module__', 'x')\n",
+                                    "def f():\n    glob = globals()\n    glob.update(local=None)\n",
+                                    "def f():\n    glob = globals()\n    del glob['local']\n",
+                                    "def f():\n    glob = globals()\n    keep(glob)\n",
+                                    "def f():\n    glob = globals()\n    return glob\n",
+                                    "def f():\n    glob = globals()\n"
+                                    "    for glob['local'] in [None]:\n        pass\n",
+                                    "def f():\n    glob = globals()\n    a, glob['local'] = 1, None\n",
+                                    "def f():\n    glob = globals()\n    glob['local'] += 1\n",
+                                    "def f():\n    glob = globals()\n"
+                                    "    locals()['glob']['local'] = None\n",
+                                    "def f():\n    glob = globals()\n"
+                                    "    def g():\n        glob['local'] = None\n    g()\n",
                                     "globals()['local'] = None\n", "locals()['local'] = None\n",
                                     "vars()['local'] = None\n",
                                     "setattr(sys.modules[__name__], 'local', None)\n"};
@@ -1954,6 +1981,72 @@ TEST(resolver_python_package_importing_its_own_child) {
     PASS();
 }
 
+/* sqlalchemy's package inits end with `__go(locals())`. Handing the namespace to the module's
+ * own def writes nothing when that def never spells the parameter, nor reaches it another way;
+ * what the body does by other means is seen as anywhere else. */
+TEST(resolver_python_package_init_hands_its_namespace_on) {
+    static const char make[] = "def make():\n    return 1\n";
+    static const char user[] = "from pkg import make\ndef run():\n    return make()\n";
+    static const char direct[] = "import pkg\ndef run():\n    return pkg.make()\n";
+    static const struct {
+        const char *tail;
+        int expected;
+    } cases[] = {
+        /* lib/sqlalchemy/orm/__init__.py */
+        {"from typing import Any\nfrom . import other as _sa_util\n\n\n"
+         "def __go(lcls: Any) -> None:\n    _sa_util.preloaded.import_prefix(\"pkg\")\n\n\n"
+         "__go(locals())\n",
+         1},
+        /* lib/sqlalchemy/__init__.py */
+        {"def __go(lcls):\n    from . import other\n\n    other._token = \"\".join([])\n\n\n"
+         "__go(locals())\n",
+         1},
+        /* lib/sqlalchemy/orm/collections.py: globals the body rebinds are its own names */
+        {"def __go(lcls):\n    global keyfunc\n    from .other import keyfunc\n\n\n"
+         "__go(locals())\n",
+         1},
+        {"def __go(lcls):\n    pass\n\n\nresult = __go(vars())\n", 1},
+        /* The body reaches the namespace it was given. */
+        {"def __go(lcls):\n    lcls['make'] = None\n\n\n__go(locals())\n", 0},
+        {"def __go(lcls):\n    helper(lcls)\n\n\ndef helper(d):\n    pass\n\n\n__go(locals())\n",
+         0},
+        {"def __go(lcls):\n    locals()['lcls']['make'] = None\n\n\n__go(locals())\n", 0},
+        {"def __go(lcls):\n    eval(\"lcls.clear()\")\n\n\n__go(locals())\n", 0},
+        {"import sys\n\n\ndef __go(lcls):\n    sys._getframe().f_locals['lcls'].clear()\n\n\n"
+         "__go(locals())\n",
+         0},
+        {"def __go(lcls):\n    def inner():\n        lcls.clear()\n    inner()\n\n\n"
+         "__go(locals())\n",
+         0},
+        {"def __go(first, lcls=None):\n    first['make'] = None\n\n\n__go(locals())\n", 0},
+        {"def __go(*args):\n    args[0]['make'] = None\n\n\n__go(locals())\n", 0},
+        {"def __go(lcls):\n    global make\n    make = None\n\n\n__go(locals())\n", 0},
+        /* The callee is not provably this module's one plain def at the call. */
+        {"from .other import __go\n__go(locals())\n", 0},
+        {"def __go(lcls):\n    pass\n\n\n__go = print\n__go(locals())\n", 0},
+        {"__go(locals())\n\n\ndef __go(lcls):\n    pass\n", 0},
+        {"def wrap(f):\n    return f\n\n\n@wrap\ndef __go(lcls):\n    pass\n\n\n__go(locals())\n",
+         0},
+        {"def __go(lcls):\n    pass\n\n\nfrom .other import *\n__go(locals())\n", 0},
+        {"def __go(other, lcls):\n    pass\n\n\n__go(1, locals())\n", 0},
+        {"__go = lambda lcls: None\n__go(locals())\n", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char init[640];
+        snprintf(init, sizeof(init), "from .impl import make\n%s", cases[i].tail);
+        const python_proof_file_t files[] = {{"pkg/__init__.py", init},
+                                             {"pkg/impl.py", make},
+                                             {"pkg/other.py", "keyfunc = 1\n__all__ = []\n"},
+                                             {"user.py", user},
+                                             {"main.py", direct}};
+        ASSERT(python_expect_from(cases[i].tail, files, 5, "user.py", "CALLS", "pkg/impl.py",
+                                  "make", "Function", cases[i].expected));
+        ASSERT(python_expect_from(cases[i].tail, files, 5, "main.py", "CALLS", "pkg/impl.py",
+                                  "make", "Function", cases[i].expected));
+    }
+    PASS();
+}
+
 /* ── What a call of a class, and of an unannotated method, gives ──────────
  * Forms from django and celery. */
 TEST(resolver_python_special_methods_that_read_through_the_base) {
@@ -2811,6 +2904,7 @@ SUITE(resolver_python_layout) {
     RUN_TEST(resolver_python_names_a_module_states_only_for_checkers);
     RUN_TEST(resolver_python_overload_stubs_are_one_declaration);
     RUN_TEST(resolver_python_loading_a_child_the_parent_imported);
+    RUN_TEST(resolver_python_package_init_hands_its_namespace_on);
     python_route_release(&python_routes[0]);
     python_route_release(&python_routes[1]);
 }

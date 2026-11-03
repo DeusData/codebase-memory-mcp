@@ -24004,12 +24004,8 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Thing:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.go_reexport",
-     .why = "Package initialization through __go(locals()) lacks a closed interprocedural "
-            "namespace-effect proof.",
-     .tried = "The helper passes Thing to the fixture prepare function, which returns it "
-              "unchanged; generic locals and calls remain proof barriers."},
+     /* __go never spells lcls: handing it the namespace writes nothing. */
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.excl_barrier",
      .site = {.file = "app/main.py",
               .caller = "app.main.excl_barrier",
@@ -24045,13 +24041,9 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Function",
                 .declaration_line = 5,
                 .declaration_text = "def base():"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.excl_go_submodule",
-     .why = "The helper import requires existing-package-attribute precedence and a closed "
-            "namespace-effect proof.",
-     .tried =
-         "from . import base first finds the existing function attribute imported from .impl, so "
-         "base.py is not loaded by that statement; the generic helper-effect barrier remains."},
+     /* from . import base inside __go finds the function attribute imported from .impl, so
+      * base.py is not loaded and gop.base stays that function. */
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.compat_runtime",
      .site = {.file = "app/main.py",
               .caller = "app.main.excl_compat",
