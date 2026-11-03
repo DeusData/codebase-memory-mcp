@@ -379,10 +379,37 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
                                            const char *rel_dir, int depth, char **excluded_dirs,
                                            int excluded_count);
 
+/* Control files are the only regular files the walk records. */
+static bool semantic_manifest_control_name(const char *rel_dir, const char *name) {
+    bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
+                                                      strcmp(name, ".codebase-memory.json") == 0);
+    /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
+     * shapes which files an image holds (pass_docker.c image_ignore), and
+     * discovery indexes neither. */
+    static const char DOCKERIGNORE[] = ".dockerignore";
+    size_t nl = strlen(name);
+    bool dockerignore = nl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
+                        strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
+    return strcmp(name, ".gitignore") == 0 || root_control ||
+           semantic_manifest_package_control(name) || dockerignore;
+}
+
+/* True when the directory listing alone shows that the entry is not a
+ * directory. A Windows listing always carries the attributes; on POSIX a
+ * d_type of DT_UNKNOWN (0), which readdir could not resolve, proves nothing. */
+static bool semantic_manifest_listed_non_directory(const cbm_dirent_t *entry) {
+#ifdef _WIN32
+    return !entry->is_dir;
+#else
+    return entry->d_type != 0 && !entry->is_dir;
+#endif
+}
+
 static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
                                            const char *project, const char *abs_dir,
                                            const char *rel_dir, int depth, char **excluded_dirs,
-                                           int excluded_count, const char *name) {
+                                           int excluded_count, const cbm_dirent_t *entry) {
+    const char *name = entry->name;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
         return 0;
     char abs_path[CBM_SZ_4K], rel_path[CBM_SZ_4K];
@@ -392,6 +419,15 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
     if (abs_n < 0 || (size_t)abs_n >= sizeof(abs_path) || rel_n < 0 ||
         (size_t)rel_n >= sizeof(rel_path))
         return CBM_NOT_FOUND;
+    /* Only directories and control files contribute, so an entry the listing
+     * already shows to be neither is skipped without reading its metadata.
+     * That read can fail on such an entry: on Windows the plain path of a file
+     * named nul names the NUL device (#2646), and the plain path of a name
+     * ending in a dot or a space does not reach the file. */
+    bool control = semantic_manifest_control_name(rel_dir, name);
+    if (!control && semantic_manifest_listed_non_directory(entry)) {
+        return 0;
+    }
     cbm_path_info_t info;
     if (cbm_path_info_utf8(abs_path, &info) != 0)
         return CBM_NOT_FOUND;
@@ -404,17 +440,6 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
         return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
                                                excluded_dirs, excluded_count);
     }
-    bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
-                                                      strcmp(name, ".codebase-memory.json") == 0);
-    /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
-     * shapes which files an image holds (pass_docker.c image_ignore), and
-     * discovery indexes neither. */
-    static const char DOCKERIGNORE[] = ".dockerignore";
-    size_t nl = strlen(name);
-    bool dockerignore = nl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
-                        strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
-    bool control = strcmp(name, ".gitignore") == 0 || root_control ||
-                   semantic_manifest_package_control(name) || dockerignore;
     return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
                                       : 0;
 }
@@ -439,7 +464,7 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
         rc = cbm_pipeline_frozen_checkpoint(builder->frozen);
         if (rc == 0)
             rc = semantic_manifest_control_entry(builder, project, abs_dir, rel_dir, depth,
-                                                 excluded_dirs, excluded_count, entry->name);
+                                                 excluded_dirs, excluded_count, entry);
     }
     cbm_closedir(dir);
     return rc;
