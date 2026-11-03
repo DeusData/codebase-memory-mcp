@@ -60,6 +60,29 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
  * must remove any untrusted field with the same name before invoking this. */
 bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy);
+bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
+                                             char *error, size_t error_size);
+
+/* Request-scoped facts a worker resource failure is reported against. One
+ * supervised request can run several worker attempts (crash/hang recovery), and
+ * serving_index_preserved describes the request, not only its last attempt:
+ * it is true only when a servable index served the project when the request
+ * began AND no attempt of the request committed to replacing it (the
+ * publication fence, index_supervisor.h) AND that index is still servable. */
+typedef struct {
+    bool serving_index_existed;
+    bool publication_committed;
+} cbm_mcp_index_request_facts_t;
+
+/* Capture the facts at the start of a request, before its first worker. */
+void cbm_mcp_index_request_facts_begin(const char *args, cbm_mcp_index_request_facts_t *facts);
+/* Fold one finished attempt into the request facts. */
+void cbm_mcp_index_request_facts_record(cbm_mcp_index_request_facts_t *facts,
+                                        const cbm_index_worker_result_t *worker_result);
+/* NULL facts claim nothing: serving_index_preserved is then false. */
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result,
+                                             const cbm_mcp_index_request_facts_t *facts);
 
 /* Encode a doc_candidates setting the user set to a boolean on an internal
  * worker request (the worker reads no config). Unset or unparseable adds no
