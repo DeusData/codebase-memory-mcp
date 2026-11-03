@@ -20,6 +20,14 @@
 #define INLINE_PYTHON_DIRECTIVES 16
 #define INLINE_PY_PARAM_SLOTS 64
 #define INLINE_PY_PARAM_STACK 64
+#define FLAT_LOOKBACK_LEVELS 4
+
+/* Under parent, the search from sibling `asked` found this label, or none. */
+typedef struct {
+    const void *parent;
+    const void *asked;
+    TSNode found;
+} CBMFlatLookback;
 
 // ObjectScript type map: variable name → class name (for instance_method_call
 // resolution). Stack-allocated, per-method scope. Overflow is silent (no crash).
@@ -171,6 +179,8 @@ typedef struct {
     uint32_t flat_anchor_start_byte;
     uint32_t flat_anchor_end_byte;
     const char *flat_function_qn;
+    /* What the last flat label search found, one per ancestor level it looked at. */
+    CBMFlatLookback flat_lookback[FLAT_LOOKBACK_LEVELS];
 
     CBMLexicalBinding *lexical_bindings;
     CBMLexicalBinding inline_lexical_bindings[INLINE_LEXICAL_BINDINGS];

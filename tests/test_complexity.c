@@ -3285,6 +3285,26 @@ TEST(complexity_go_route_bindings_are_near_linear) {
     PASS();
 }
 
+/* Flat assembly and routines: each statement looks back for the label above it. */
+CX_LINE(cx_line_nasm_instruction, "    mov eax, %d\n")
+CX_LINE(cx_line_objectscript_statement, "    Set x = %d\n")
+static bool cx_flat_shape_is_linear(CBMLanguage language, const char *path, const char *head,
+                                    CxLineFn line) {
+    uint64_t base = 0;
+    double ratio =
+        cx_extract_ratio(language, path, head, line, "", false, CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    return base >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_flat_preceding_label_is_linear) {
+    bool ok = cx_flat_shape_is_linear(CBM_LANG_NASM, "flat.nasm", "global start\nstart:\n",
+                                      cx_line_nasm_instruction);
+    ok = cx_flat_shape_is_linear(CBM_LANG_OBJECTSCRIPT_ROUTINE, "Flat.mac", "Main()\n",
+                                 cx_line_objectscript_statement) &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Every node of sources that parse, that do not, and that hold zero-width MISSING tokens: the
  * routed calls answer exactly as tree-sitter does. */
 TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does) {
@@ -3399,6 +3419,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_prev_sibling_walk_is_linear);
     RUN_TEST(complexity_source_same_named_definitions_are_near_linear);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
+    RUN_TEST(complexity_flat_preceding_label_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
     RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
     RUN_TEST(complexity_parse_memo_lasts_one_file);
