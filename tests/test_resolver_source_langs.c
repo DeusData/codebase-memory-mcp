@@ -4277,8 +4277,14 @@ TEST(resolver_source_swift_a_closure_of_no_parameters) {
                        "struct Dog { func bark() {} }"),
         SW_NOARGS_CALL("the-function-given-an-optional-one", "optional", "maybe { Dog().bark() }", 0,
                        "NoArgs.maybe", "Function", 3, "func maybe(_ body: (() -> Void)?) {}"),
-        SW_NOARGS_CALL("a-call-in-that-body", "optional", "Dog().bark()", 0, "Dog.bark", "Method", 1,
+        SW_NOARGS_CALL("a-call-in-that-body", "optional", "Dog().bark()", 1, "Dog.bark", "Method", 1,
                        "struct Dog { func bark() {} }"),
+        SW_NOARGS_CALL("the-value-in-its-body", "plain", "Dog()", 0, "NoArgs.Dog", "Struct", 1,
+                       "struct Dog { func bark() {} }"),
+        SW_NOARGS_CALL("the-value-in-that-body", "optional", "Dog()", 1, "NoArgs.Dog", "Struct", 1,
+                       "struct Dog { func bark() {} }"),
+        SW_NOARGS_CALL("the-function-given-one-with-a-shorthand", "noFirst", "noArgs { $0.bark() }", 0,
+                       "NoArgs.noArgs", "Function", 2, "func noArgs(_ body: () -> Void) {}"),
     };
     static const RQ_Forbidden forbidden[] = {
         SL_DENY_AT("no-parameters-no-first-shorthand", SW_NOARGS_FILE, "Flow.noFirst", "$0.bark()", 0),
