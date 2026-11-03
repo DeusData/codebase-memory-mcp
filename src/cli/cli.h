@@ -336,7 +336,11 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
                                                        const char *forced_event);
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
-const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+const char *cbm_hook_no_project_index_guidance_for_testing(const char *event,
+                                                           bool worktree_ignored);
+/* Counts lifecycle calls that reached the ignore_worktrees resolution (cwd
+ * canonicalization and the linked-worktree probe). NULL stops counting. */
+void cbm_hook_set_worktree_gate_counter_for_testing(int *counter);
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
 /* include_posttool false renders the previous lifecycle-only manifest. Release
  * the result with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
@@ -526,6 +530,7 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
+#define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_DOC_CANDIDATES "doc_candidates"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
