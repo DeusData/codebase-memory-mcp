@@ -39,6 +39,22 @@ static void test_charge_parent(TSNode node) {
         cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, steps);
     }
 }
+/* The steps ts_node_prev_sibling takes: the children before node, under its parent. */
+static void test_charge_siblings_before(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent))
+        return;
+    uint64_t steps = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            steps++;
+        } while (ts_tree_cursor_current_node(&cursor).id != node.id &&
+                 ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, steps);
+}
 #endif
 
 void cbm_syntax_index_begin(cbm_syntax_index_t *index, const TSTree *tree) {
@@ -190,6 +206,42 @@ TSNode cbm_syntax_previous_child(TSNode node) {
     ts_tree_cursor_delete(&cursor);
     cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, steps);
     return found ? before : (TSNode){0};
+}
+
+/* Whether the table can say what comes before node, and if so the entry that does. */
+static bool prev_from_table(cbm_syntax_index_t *index, TSNode node, uint32_t *before) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&test_plain)) {
+        if (index && node.tree == index->tree)
+            test_charge_siblings_before(node);
+        return false;
+    }
+#endif
+    if (!node.id || ts_node_start_byte(node) == ts_node_end_byte(node))
+        return false;
+    uint32_t at = table_position(index, node);
+    if (at == SYNTAX_NO_PARENT)
+        return false;
+    *before = index->before[at];
+    return true;
+}
+
+TSNode cbm_syntax_prev_sibling(TSNode node) {
+    cbm_syntax_index_t *index = current_index;
+    uint32_t before;
+    if (!prev_from_table(index, node, &before))
+        return ts_node_prev_sibling(node);
+    return before == SYNTAX_NO_PARENT ? (TSNode){0} : index->nodes[before];
+}
+
+TSNode cbm_syntax_prev_named_sibling(TSNode node) {
+    cbm_syntax_index_t *index = current_index;
+    uint32_t before;
+    if (!prev_from_table(index, node, &before))
+        return ts_node_prev_named_sibling(node);
+    while (before != SYNTAX_NO_PARENT && !ts_node_is_named(index->nodes[before]))
+        before = index->before[before];
+    return before == SYNTAX_NO_PARENT ? (TSNode){0} : index->nodes[before];
 }
 
 static cbm_syntax_wide_t *wide_slot(const cbm_syntax_index_t *index, const void *id) {

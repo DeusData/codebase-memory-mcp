@@ -775,6 +775,37 @@ static void elixir_extra_end(elixir_ctx_t *ctx) {
     ctx->walk->extra_scope = NULL;
     ctx->walk->extra_name = NULL;
     ctx->walk->extra_line = 0;
+    ctx->walk->extra_composite = false;
+}
+
+/* `if f, do: &a/1, else: &b/1` and `f || &a/1` hand over one of several values, so a capture there
+ * only mentions its function. Anything else above it makes it one value again: a call's argument,
+ * a binding, a list, a closure's body. */
+static bool elixir_capture_in_composite(elixir_ctx_t *ctx, TSNode capture) {
+    static const char *const branching[] = {"if",   "unless", "case",    "cond",
+                                            "with", "try",    "receive", NULL};
+    static const char *const within[] = {
+        "arguments",    "keywords",    "pair",        "block",       "do_block", "else_block",
+        "rescue_block", "catch_block", "after_block", "stab_clause", "body",     NULL};
+    for (TSNode parent = ts_node_parent(capture); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (cbm_source_is(parent, "binary_operator"))
+            return cbm_source_token(parent, "&&") || cbm_source_token(parent, "||") ||
+                   cbm_source_token(parent, "and") || cbm_source_token(parent, "or");
+        if (cbm_source_is(parent, "call")) {
+            const char *target = cbm_source_text(ctx->walk, cbm_source_field(parent, "target"));
+            for (size_t i = 0; target && branching[i]; i++)
+                if (!strcmp(target, branching[i]))
+                    return true;
+            return false;
+        }
+        bool passes = false;
+        for (size_t i = 0; !passes && within[i]; i++)
+            passes = cbm_source_is(parent, within[i]);
+        if (!passes)
+            return false;
+    }
+    return false;
 }
 
 /* A module's name, read anywhere other than its own declaration. */
@@ -815,6 +846,7 @@ static void elixir_visit_capture(elixir_ctx_t *ctx, TSNode site, TSNode left, in
     if (!target)
         return;
     elixir_extra_begin(ctx, site, name);
+    ctx->walk->extra_composite = elixir_capture_in_composite(ctx, site);
     cbm_source_emit_node(ctx->walk, site, CBM_SOURCE_SITE_REFERENCE, target,
                          CBM_RESOLVE_RULE_LANGUAGE_BINDING, domain, "elixir_function_capture");
     elixir_extra_end(ctx);

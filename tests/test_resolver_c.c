@@ -5546,6 +5546,48 @@ TEST(resolver_c_lone_tag_is_no_occurrence) {
     PASS();
 }
 
+/* An active branch is read twice, raw and preprocessed: one row each. */
+static int c_raw_usage_rows_named(const CBMFileResult *result, const char *name) {
+    int count = 0;
+    for (int i = 0; i < result->usages.count; i++)
+        count += result->usages.items[i].ref_name && !strcmp(result->usages.items[i].ref_name, name) &&
+                 result->usages.items[i].source_origin == CBM_SOURCE_ORIGIN_RAW;
+    return count;
+}
+
+/* A lone tag directly under a conditional has no declaration-shaped node around it, and the only
+ * node that says "declares" is the translation unit, above the directive. The directive's own name
+ * climbs to the root first and settles that path, so this climb must not stop at it. */
+TEST(resolver_c_lone_tag_under_a_directive_is_no_occurrence) {
+    static const char source[] = "#ifdef FEATURE\n"
+                                 "struct lone_under_ifdef;\n"
+                                 "struct used_under_ifdef *a;\n"
+                                 "#endif\n"
+                                 "#ifndef OTHER\n"
+                                 "union lone_under_ifndef;\n"
+                                 "union used_under_ifndef *b;\n"
+                                 "#endif\n";
+    CBMFileResult *c_file =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_C, "p", "tag.c", 0, NULL, NULL);
+    ASSERT(c_file != NULL);
+    ASSERT_EQ(c_usage_rows_named(c_file, "lone_under_ifdef"), 0);
+    ASSERT_EQ(c_usage_rows_named(c_file, "lone_under_ifndef"), 0);
+    ASSERT_EQ(c_raw_usage_rows_named(c_file, "used_under_ifdef"), 1);
+    ASSERT_EQ(c_raw_usage_rows_named(c_file, "used_under_ifndef"), 1);
+    cbm_free_result(c_file);
+    static const char cxx_source[] = "#ifdef FEATURE\n"
+                                     "class lone_class_under_ifdef;\n"
+                                     "class used_class_under_ifdef *d;\n"
+                                     "#endif\n";
+    CBMFileResult *cxx_file = cbm_extract_file(cxx_source, (int)strlen(cxx_source), CBM_LANG_CPP, "p",
+                                               "tag.cpp", 0, NULL, NULL);
+    ASSERT(cxx_file != NULL);
+    ASSERT_EQ(c_usage_rows_named(cxx_file, "lone_class_under_ifdef"), 0);
+    ASSERT_EQ(c_raw_usage_rows_named(cxx_file, "used_class_under_ifdef"), 1);
+    cbm_free_result(cxx_file);
+    PASS();
+}
+
 /* C++ looks a tag up as it looks up anything: a class in a block hides the outer one from there on, and
  * one in a namespace is out of reach of code outside it. `struct Name` needs no earlier declaration, so
  * it compiles where a plain `Name` would not, and it means a new type there. */
@@ -6692,6 +6734,7 @@ SUITE(resolver_c) {
     RUN_TEST(resolver_c_struct_tag_is_a_use_unless_it_declares);
     RUN_TEST(resolver_c_lone_tag_is_no_occurrence);
     RUN_TEST(resolver_cpp_opaque_enum_in_a_block_does_not_crash_and_hides_the_outer_one);
+    RUN_TEST(resolver_c_lone_tag_under_a_directive_is_no_occurrence);
     RUN_TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module);
     RUN_TEST(resolver_c_a_static_left_in_an_error_stays_static);
     RUN_TEST(resolver_c_text_defines_macro_reads_to_the_end_of_the_text);

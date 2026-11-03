@@ -1729,6 +1729,144 @@ TEST(resolver_source_elixir_captures_mentions_protocols_and_erlang_atoms) {
     PASS();
 }
 
+/* A capture among branches or under a logical operator is one of several values, so it only
+ * mentions its function. Where it is the one value of a call's argument, a binding, a return, a
+ * list entry or a closure's body, it stays a reference. */
+static const char EX3_PICK[] =
+    "defmodule Plug.Pick do\n"
+    "  def own(x), do: x\n"
+    "  def also(x), do: x\n"
+    "  defp run(fun), do: fun\n"
+    "  def either(flag), do: run(if flag, do: &own/1, else: &also/1)\n"
+    "  def blocks(flag) do\n"
+    "    run(if flag do\n"
+    "      &own/1\n"
+    "    else\n"
+    "      &also/1\n"
+    "    end)\n"
+    "  end\n"
+    "  def negated(flag), do: run(unless flag, do: &own/1, else: &also/1)\n"
+    "  def falls_back(f), do: f || &also/1\n"
+    "  def guarded(flag), do: flag && &own/1\n"
+    "  def word_or(f), do: f or &also/1\n"
+    "  def word_and(flag), do: flag and &own/1\n"
+    "  def cased(flag) do\n"
+    "    case flag do\n"
+    "      true -> &own/1\n"
+    "      _ -> &also/1\n"
+    "    end\n"
+    "  end\n"
+    "  def conded(flag) do\n"
+    "    cond do\n"
+    "      flag -> &own/1\n"
+    "      true -> &also/1\n"
+    "    end\n"
+    "  end\n"
+    "  def within(flag) do\n"
+    "    with true <- flag do\n"
+    "      &own/1\n"
+    "    else\n"
+    "      _ -> &also/1\n"
+    "    end\n"
+    "  end\n"
+    "  def in_parens(flag), do: flag && (&own/1)\n"
+    "  def direct, do: run(&own/1)\n"
+    "  def returned, do: &own/1\n"
+    "  def bound do\n"
+    "    f = &own/1\n"
+    "    run(f)\n"
+    "  end\n"
+    "  def branch_argument(flag) do\n"
+    "    if flag do\n"
+    "      run(&own/1)\n"
+    "    else\n"
+    "      run(&also/1)\n"
+    "    end\n"
+    "  end\n"
+    "  def branch_bound(flag) do\n"
+    "    if flag do\n"
+    "      f = &own/1\n"
+    "      run(f)\n"
+    "    end\n"
+    "  end\n"
+    "  def listed, do: run([&own/1, &also/1])\n"
+    "  def keyed, do: run(a: &own/1)\n"
+    "  def closure, do: fn -> &own/1 end\n"
+    "end\n";
+
+#define EX3_FILE "lib/plug/pick.ex"
+#define EX3_OWN(id, caller, at)                                                                \
+    SL_USE_AT(id, EX3_FILE, "pick." caller, "&own/1", at, EX3_FILE, "pick.own", "Function", 2, \
+              "  def own(x), do: x")
+#define EX3_ALSO(id, caller, at)                                                                 \
+    SL_USE_AT(id, EX3_FILE, "pick." caller, "&also/1", at, EX3_FILE, "pick.also", "Function", 3, \
+              "  def also(x), do: x")
+#define EX3_OWN_REF(id, caller, at)                                                            \
+    SL_REF_AT(id, EX3_FILE, "pick." caller, "&own/1", at, EX3_FILE, "pick.own", "Function", 2, \
+              "  def own(x), do: x")
+#define EX3_ALSO_REF(id, caller, at)                                                             \
+    SL_REF_AT(id, EX3_FILE, "pick." caller, "&also/1", at, EX3_FILE, "pick.also", "Function", 3, \
+              "  def also(x), do: x")
+#define EX3_NO_OWN(id, caller, at) SL_NO_REF_AT(id, EX3_FILE, "pick." caller, "&own/1", at)
+#define EX3_NO_ALSO(id, caller, at) SL_NO_REF_AT(id, EX3_FILE, "pick." caller, "&also/1", at)
+
+TEST(resolver_source_elixir_composite_capture_is_a_mention) {
+    static const RQ_Source sources[] = {{.path = EX3_FILE, .text = EX3_PICK}};
+    static const RQ_Expected expected[] = {
+        EX3_OWN("if-keyword-branch", "either", 0),
+        EX3_ALSO("if-keyword-else", "either", 0),
+        EX3_OWN("if-block-branch", "blocks", 1),
+        EX3_ALSO("if-block-else", "blocks", 1),
+        EX3_OWN("unless-branch", "negated", 2),
+        EX3_ALSO("unless-else", "negated", 2),
+        EX3_ALSO("or-operand", "falls_back", 3),
+        EX3_OWN("and-operand", "guarded", 3),
+        EX3_ALSO("or-word-operand", "word_or", 4),
+        EX3_OWN("and-word-operand", "word_and", 4),
+        EX3_OWN("case-clause", "cased", 5),
+        EX3_ALSO("other-case-clause", "cased", 5),
+        EX3_OWN("cond-clause", "conded", 6),
+        EX3_ALSO("other-cond-clause", "conded", 6),
+        EX3_OWN("with-body", "within", 7),
+        EX3_ALSO("with-else", "within", 7),
+        EX3_OWN("parentheses-change-nothing", "in_parens", 8),
+        EX3_OWN_REF("direct-argument", "direct", 9),
+        EX3_OWN_REF("return-value", "returned", 10),
+        EX3_OWN_REF("bound-to-a-name", "bound", 11),
+        EX3_OWN_REF("argument-inside-a-branch", "branch_argument", 12),
+        EX3_ALSO_REF("argument-inside-an-else", "branch_argument", 8),
+        EX3_OWN_REF("bound-inside-a-branch", "branch_bound", 13),
+        EX3_OWN_REF("list-entry", "listed", 14),
+        EX3_ALSO_REF("other-list-entry", "listed", 9),
+        EX3_OWN_REF("keyword-entry", "keyed", 15),
+        EX3_OWN_REF("closure-body", "closure", 16),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        EX3_NO_OWN("if-keyword-branch-is-no-reference", "either", 0),
+        EX3_NO_ALSO("if-keyword-else-is-no-reference", "either", 0),
+        EX3_NO_OWN("if-block-branch-is-no-reference", "blocks", 1),
+        EX3_NO_ALSO("if-block-else-is-no-reference", "blocks", 1),
+        EX3_NO_OWN("unless-branch-is-no-reference", "negated", 2),
+        EX3_NO_ALSO("unless-else-is-no-reference", "negated", 2),
+        EX3_NO_ALSO("or-operand-is-no-reference", "falls_back", 3),
+        EX3_NO_OWN("and-operand-is-no-reference", "guarded", 3),
+        EX3_NO_ALSO("or-word-operand-is-no-reference", "word_or", 4),
+        EX3_NO_OWN("and-word-operand-is-no-reference", "word_and", 4),
+        EX3_NO_OWN("case-clause-is-no-reference", "cased", 5),
+        EX3_NO_ALSO("other-case-clause-is-no-reference", "cased", 5),
+        EX3_NO_OWN("cond-clause-is-no-reference", "conded", 6),
+        EX3_NO_ALSO("other-cond-clause-is-no-reference", "conded", 6),
+        EX3_NO_OWN("with-body-is-no-reference", "within", 7),
+        EX3_NO_ALSO("with-else-is-no-reference", "within", 7),
+        EX3_NO_OWN("parentheses-are-no-reference", "in_parens", 8),
+    };
+    ASSERT(sl_check("elixir-composite", ".ex", "defmodule Filler do\n  def f, do: 1\nend\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 /* ── Elixir: what `use` is known to bring ──────────────────────────── */
 
 static const char EX3_CONN[] = "defmodule My.Conn do\n"
@@ -1897,6 +2035,106 @@ TEST(resolver_source_erlang_fun_references) {
         SL_NO_REF_AT("fun-through-a-variable-module", "src/refs.erl", "refs.no_variable", "fun M:pub/1", 0),
     };
     ASSERT(sl_check("erlang-references", ".erl", "-module(filler).\nf() -> 1.\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* As for Elixir's captures: `fun f/1` among clauses or under andalso/orelse is one of several. */
+static const char ERL3_PICK[] =
+    "-module(pick).\n"
+    "-export([own/1, also/1]).\n"
+    "own(X) -> X.\n"
+    "also(X) -> X.\n"
+    "run(F) -> F.\n"
+    "either(Flag) -> run(case Flag of true -> fun own/1; false -> fun also/1 end).\n"
+    "branches(Flag) -> if Flag -> fun own/1; true -> fun also/1 end.\n"
+    "guarded(Flag) -> Flag andalso fun own/1.\n"
+    "falls_back(F) -> F orelse fun also/1.\n"
+    "in_parens(Flag) -> Flag andalso (fun own/1).\n"
+    "in_block(Flag) -> begin case Flag of true -> fun own/1; false -> fun also/1 end end.\n"
+    "protected(Flag) -> try Flag of true -> fun own/1 catch _:_ -> fun also/1 end.\n"
+    "waiting() -> receive go -> fun own/1 after 0 -> fun also/1 end.\n"
+    "remote(Flag) -> case Flag of true -> fun pick:own/1; false -> fun pick:also/1 end.\n"
+    "direct() -> run(fun own/1).\n"
+    "returned() -> fun own/1.\n"
+    "bound() -> F = fun own/1, run(F).\n"
+    "branch_argument(Flag) -> case Flag of true -> run(fun own/1); false -> run(fun also/1) end.\n"
+    "branch_bound(Flag) -> case Flag of true -> F = fun own/1, run(F); false -> ok end.\n"
+    "listed() -> run([fun own/1, fun also/1]).\n"
+    "tupled() -> {fun own/1, 1}.\n"
+    "closure() -> fun() -> fun own/1 end.\n"
+    "sent(Pid) -> Pid ! fun own/1.\n";
+
+#define ERL3_FILE "src/pick.erl"
+#define ERL3_OWN(id, caller, at)                                                               \
+    SL_USE_AT(id, ERL3_FILE, "pick." caller, "fun own/1", at, ERL3_FILE, "pick.own", "Function", \
+              3, "own(X) -> X.")
+#define ERL3_ALSO(id, caller, at)                                                                \
+    SL_USE_AT(id, ERL3_FILE, "pick." caller, "fun also/1", at, ERL3_FILE, "pick.also", "Function", \
+              4, "also(X) -> X.")
+#define ERL3_OWN_REF(id, caller, at)                                                           \
+    SL_REF_AT(id, ERL3_FILE, "pick." caller, "fun own/1", at, ERL3_FILE, "pick.own", "Function", \
+              3, "own(X) -> X.")
+#define ERL3_ALSO_REF(id, caller, at)                                                            \
+    SL_REF_AT(id, ERL3_FILE, "pick." caller, "fun also/1", at, ERL3_FILE, "pick.also", "Function", \
+              4, "also(X) -> X.")
+#define ERL3_NO_OWN(id, caller, at) SL_NO_REF_AT(id, ERL3_FILE, "pick." caller, "fun own/1", at)
+#define ERL3_NO_ALSO(id, caller, at) SL_NO_REF_AT(id, ERL3_FILE, "pick." caller, "fun also/1", at)
+
+TEST(resolver_source_erlang_composite_fun_is_a_mention) {
+    static const RQ_Source sources[] = {{.path = ERL3_FILE, .text = ERL3_PICK}};
+    static const RQ_Expected expected[] = {
+        ERL3_OWN("case-clause", "either", 0),
+        ERL3_ALSO("other-case-clause", "either", 0),
+        ERL3_OWN("if-clause", "branches", 1),
+        ERL3_ALSO("other-if-clause", "branches", 1),
+        ERL3_OWN("andalso-operand", "guarded", 2),
+        ERL3_ALSO("orelse-operand", "falls_back", 2),
+        ERL3_OWN("parentheses-change-nothing", "in_parens", 3),
+        ERL3_OWN("clause-in-a-block", "in_block", 4),
+        ERL3_ALSO("other-clause-in-a-block", "in_block", 3),
+        ERL3_OWN("try-of-clause", "protected", 5),
+        ERL3_ALSO("catch-clause", "protected", 4),
+        ERL3_OWN("receive-clause", "waiting", 6),
+        ERL3_ALSO("receive-after", "waiting", 5),
+        SL_USE_AT("remote-case-clause", ERL3_FILE, "pick.remote", "fun pick:own/1", 0, ERL3_FILE,
+                  "pick.own", "Function", 3, "own(X) -> X."),
+        SL_USE_AT("other-remote-case-clause", ERL3_FILE, "pick.remote", "fun pick:also/1", 0,
+                  ERL3_FILE, "pick.also", "Function", 4, "also(X) -> X."),
+        ERL3_OWN_REF("direct-argument", "direct", 7),
+        ERL3_OWN_REF("return-value", "returned", 8),
+        ERL3_OWN_REF("bound-to-a-name", "bound", 9),
+        ERL3_OWN_REF("argument-inside-a-clause", "branch_argument", 10),
+        ERL3_ALSO_REF("argument-inside-another-clause", "branch_argument", 6),
+        ERL3_OWN_REF("bound-inside-a-clause", "branch_bound", 11),
+        ERL3_OWN_REF("list-entry", "listed", 12),
+        ERL3_ALSO_REF("other-list-entry", "listed", 7),
+        ERL3_OWN_REF("tuple-entry", "tupled", 13),
+        ERL3_OWN_REF("closure-body", "closure", 14),
+        ERL3_OWN_REF("message-sent", "sent", 15),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        ERL3_NO_OWN("case-clause-is-no-reference", "either", 0),
+        ERL3_NO_ALSO("other-case-clause-is-no-reference", "either", 0),
+        ERL3_NO_OWN("if-clause-is-no-reference", "branches", 1),
+        ERL3_NO_ALSO("other-if-clause-is-no-reference", "branches", 1),
+        ERL3_NO_OWN("andalso-operand-is-no-reference", "guarded", 2),
+        ERL3_NO_ALSO("orelse-operand-is-no-reference", "falls_back", 2),
+        ERL3_NO_OWN("parentheses-are-no-reference", "in_parens", 3),
+        ERL3_NO_OWN("clause-in-a-block-is-no-reference", "in_block", 4),
+        ERL3_NO_ALSO("other-clause-in-a-block-is-no-reference", "in_block", 3),
+        ERL3_NO_OWN("try-of-clause-is-no-reference", "protected", 5),
+        ERL3_NO_ALSO("catch-clause-is-no-reference", "protected", 4),
+        ERL3_NO_OWN("receive-clause-is-no-reference", "waiting", 6),
+        ERL3_NO_ALSO("receive-after-is-no-reference", "waiting", 5),
+        SL_NO_REF_AT("remote-case-clause-is-no-reference", ERL3_FILE, "pick.remote",
+                     "fun pick:own/1", 0),
+        SL_NO_REF_AT("other-remote-case-clause-is-no-reference", ERL3_FILE, "pick.remote",
+                     "fun pick:also/1", 0),
+    };
+    ASSERT(sl_check("erlang-composite", ".erl", "-module(filler).\nf() -> 1.\n", sources,
                     sizeof(sources) / sizeof(sources[0]), expected,
                     sizeof(expected) / sizeof(expected[0]), forbidden,
                     sizeof(forbidden) / sizeof(forbidden[0])));
@@ -6450,6 +6688,8 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_elixir_captures_mentions_protocols_and_erlang_atoms);
     RUN_TEST(resolver_source_elixir_use_brings_what_using_returns);
     RUN_TEST(resolver_source_erlang_fun_references);
+    RUN_TEST(resolver_source_elixir_composite_capture_is_a_mention);
+    RUN_TEST(resolver_source_erlang_composite_fun_is_a_mention);
     RUN_TEST(resolver_source_perl_invocant_reexports_and_code_references);
     RUN_TEST(resolver_source_perl_list_shift_and_overload);
     RUN_TEST(resolver_source_ocaml_dune_libraries_includes_and_scoped_opens);

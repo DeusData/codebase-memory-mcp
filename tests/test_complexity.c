@@ -67,6 +67,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "resolve/binding.h"
 #include "resolve/rust_names.h"
+#include "resolve/source_adapter.h"
 #include "lsp/lsp_work.h"
 #include "lsp/lsp_name_rows.h"
 #define CBM_SYNTAX_INDEX_IMPLEMENTATION /* the seam only: this file asks tree-sitter directly */
@@ -3097,6 +3098,209 @@ TEST(complexity_import_map_keeps_conflicts_and_repeats) {
     PASS();
 }
 
+/* The last dot ends a local name, so every `source ./a.sh` is named sh and each row conflicts with
+ * the rest. Each row used to clear all the name's edge entries again. */
+static uint64_t cx_same_named_import_probes(int lines, int *mapped, int *blank) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM + CX_BINDING_LINE_ROOM;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    for (int i = 0; i < lines; i++)
+        length += (size_t)snprintf(source + length, room - length, "source ./l%d.sh\n", i);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_BASH, "test", "main.sh", 0, NULL, NULL);
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("test", "/tmp/test");
+    char *file_qn = cbm_pipeline_fqn_compute("test", "main.sh", "__file__");
+    int64_t file =
+        gbuf && file_qn
+            ? cbm_gbuf_upsert_node(gbuf, "File", "main.sh", file_qn, "main.sh", 1, 1, "{}")
+            : 0;
+    uint64_t work = 0;
+    for (int i = 0; file > 0 && i < lines; i++) {
+        char qn[CX_BINDING_LINE_ROOM];
+        snprintf(qn, sizeof(qn), "test.l%d.sh", i);
+        int64_t target = cbm_gbuf_upsert_node(gbuf, "Module", qn, qn, qn, 1, 1, "{}");
+        cbm_gbuf_insert_edge(gbuf, file, target, "IMPORTS", "{\"local_name\":\"sh\"}");
+    }
+    if (result && file > 0) {
+        cbm_pipeline_ctx_t ctx = {.project_name = "test", .gbuf = gbuf};
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        const char **keys = NULL, **values = NULL;
+        int count = 0;
+        int rc = cbm_pxc_build_import_map_ex(&ctx, "main.sh", CBM_LANG_BASH, result, false, &keys,
+                                             &values, &count);
+        cbm_resolve_stats_bind(previous);
+        if (rc == 0)
+            work = cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+        *mapped = count;
+        *blank = 0;
+        for (int i = 0; i < count; i++)
+            *blank += !strcmp(keys[i], "sh") && !strcmp(values[i], "");
+        cbm_pxc_free_import_map(keys, values, count);
+    }
+    free(file_qn);
+    cbm_gbuf_free(gbuf);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+TEST(complexity_import_map_same_local_name_is_linear) {
+    int mapped_first = 0, mapped_second = 0, blank_first = 0, blank_second = 0;
+    uint64_t first = cx_same_named_import_probes(CX_BINDING_LINES, &mapped_first, &blank_first);
+    uint64_t second =
+        cx_same_named_import_probes(CX_BINDING_LINES * 2, &mapped_second, &blank_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    same-named imports lookup_probes %llu -> %llu (ratio %.2f)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    /* An entry per edge and one per row, and no name keeps an endpoint. */
+    ASSERT_EQ(mapped_first, CX_BINDING_LINES * 2);
+    ASSERT_EQ(blank_first, mapped_first);
+    ASSERT_EQ(mapped_second, CX_BINDING_LINES * 4);
+    ASSERT_EQ(blank_second, mapped_second);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Every call's spawn check read every import row of its file. */
+enum { CX_SPAWN_NAME = 32 };
+static const char *cx_line_tcl_source_call(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "source");
+    return out;
+}
+static const char *cx_line_py_member_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "mod_%d.call", i);
+    return out;
+}
+static const char *cx_line_js_spawn_call(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "spawn");
+    return out;
+}
+static uint64_t cx_spawn_match_probes(CBMLanguage language, CxLineFn line, const char *last_module,
+                                      int count, int *matched) {
+    CBMImport *rows = calloc((size_t)count, sizeof(*rows));
+    char *text = malloc((size_t)count * 2 * CX_SPAWN_NAME);
+    if (!rows || !text) {
+        free(rows);
+        free(text);
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        char *local = text + (size_t)i * 2 * CX_SPAWN_NAME;
+        char *path = local + CX_SPAWN_NAME;
+        snprintf(local, CX_SPAWN_NAME, "mod_%d", i);
+        snprintf(path, CX_SPAWN_NAME, "pkg/mod_%d", i);
+        rows[i].local_name = local;
+        rows[i].module_path = i == count - 1 && last_module ? last_module : path;
+    }
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    cbm_spawn_file_begin(rows, count);
+    *matched = 0;
+    for (int i = 0; i < count; i++) {
+        char callee[CX_SPAWN_NAME];
+        *matched += cbm_spawn_match(language, line(callee, sizeof(callee), i), rows, count) != NULL;
+    }
+    cbm_spawn_file_end();
+    cbm_resolve_stats_bind(previous);
+    free(rows);
+    free(text);
+    return cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+}
+static bool cx_spawn_shape_is_linear(const char *label, CBMLanguage language, CxLineFn line,
+                                     const char *last_module, int matches_per_call) {
+    int matched_first = 0, matched_second = 0;
+    uint64_t first =
+        cx_spawn_match_probes(language, line, last_module, CX_BINDING_LINES, &matched_first);
+    uint64_t second =
+        cx_spawn_match_probes(language, line, last_module, CX_BINDING_LINES * 2, &matched_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s lookup_probes %llu -> %llu (ratio %.2f, matched %d, %d)\n", label,
+           (unsigned long long)first, (unsigned long long)second, ratio, matched_first,
+           matched_second);
+    return matched_first == CX_BINDING_LINES * matches_per_call &&
+           matched_second == CX_BINDING_LINES * 2 * matches_per_call &&
+           first >= (uint64_t)CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_spawn_match_is_linear_in_a_files_imports) {
+    bool ok = cx_spawn_shape_is_linear("tcl source", CBM_LANG_TCL, cx_line_tcl_source_call, NULL, 0);
+    ok = cx_spawn_shape_is_linear("py member", CBM_LANG_PYTHON, cx_line_py_member_call, NULL, 0) && ok;
+    ok = cx_spawn_shape_is_linear("js spawn", CBM_LANG_JAVASCRIPT, cx_line_js_spawn_call,
+                                  "child_process", 1) &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* The first row with a path answers for a name, whatever its later rows say, and rows the file did
+ * not name are read. Every call asks twice, since the second answer comes from what the first left. */
+TEST(complexity_spawn_file_index_answers_as_the_rows_do) {
+    static const CBMImport rows[] = {
+        {.local_name = NULL, .module_path = "subprocess"},
+        {.local_name = "sp", .module_path = NULL},
+        {.local_name = "sp", .module_path = "subprocess"},
+        {.local_name = "sp", .module_path = "os"},
+        {.local_name = "run", .module_path = "subprocess.run"},
+        {.local_name = "cp", .module_path = "node:child_process"},
+        {.local_name = "spawn", .module_path = "child_process"},
+        {.local_name = "exec", .module_path = "os/exec"},
+        {.local_name = "os", .module_path = "os"},
+        {.local_name = "open3", .module_path = "open3"},
+        {.local_name = "", .module_path = "empty"},
+        {.local_name = "System.Process", .module_path = "System.Process"},
+    };
+    static const CBMImport others[] = {{.local_name = "sp", .module_path = "os"},
+                                       {.local_name = "spawn", .module_path = "fs"}};
+    static const CBMLanguage languages[] = {
+        CBM_LANG_PYTHON, CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_GO,
+        CBM_LANG_C,      CBM_LANG_RUBY,       CBM_LANG_HASKELL,    CBM_LANG_TCL,
+        CBM_LANG_BASH,
+    };
+    char long_name[CBM_SZ_1K];
+    memset(long_name, 'n', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    const char *const callees[] = {
+        "sp.run",    "sp.check_output", "sp",           "run",     "cp.spawn",  "cp.exec",
+        "spawn",     "exec",            "exec.Command", "os.exec", "os.system", "system",
+        "source",    "missing",         "missing.run",  "a::b",    ".run",      "",
+        "callProcess", "Open3.popen3",  long_name,
+    };
+    int rows_count = (int)(sizeof(rows) / sizeof(rows[0]));
+    int others_count = (int)(sizeof(others) / sizeof(others[0]));
+    int spawns = 0;
+    for (size_t l = 0; l < sizeof(languages) / sizeof(languages[0]); l++) {
+        cbm_spawn_file_begin(rows, rows_count);
+        for (size_t c = 0; c < sizeof(callees) / sizeof(callees[0]); c++) {
+            cbm_spawn_file_end();
+            const cbm_spawn_api_t *read = cbm_spawn_match(languages[l], callees[c], rows, rows_count);
+            const cbm_spawn_api_t *read_other =
+                cbm_spawn_match(languages[l], callees[c], others, others_count);
+            cbm_spawn_file_begin(rows, rows_count);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], rows, rows_count) == read);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], rows, rows_count) == read);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], others, others_count) ==
+                        read_other);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], NULL, 0) ==
+                        cbm_spawn_match(languages[l], callees[c], others, 0));
+            spawns += read != NULL;
+        }
+        cbm_spawn_file_end();
+    }
+    /* Both rule families answered, so the comparison is not of NULL with NULL. */
+    ASSERT_GTE(spawns, 8);
+    ASSERT_NOT_NULL(cbm_spawn_match(CBM_LANG_PYTHON, "sp.run", rows, rows_count));
+    ASSERT_NOT_NULL(cbm_spawn_match(CBM_LANG_JAVASCRIPT, "spawn", rows, rows_count));
+    ASSERT_TRUE(cbm_spawn_match(CBM_LANG_JAVASCRIPT, "spawn", others, others_count) == NULL);
+    PASS();
+}
+
 /* A worker's passes over one file share one parse, and a later file gets its own. */
 TEST(complexity_parse_memo_lasts_one_file) {
     static const char first[] = "x = 1\n";
@@ -3145,9 +3349,338 @@ TEST(complexity_parse_memo_lasts_one_file) {
     PASS();
 }
 
+/* ── A language adapter's two phases ────────────────────────────────
+ * Over files already extracted, so what is counted is what the adapter itself walks: a
+ * name's definitions in a file, a library's directives, a type's bases. */
+#define CX_LINE(fn, format)                             \
+    static const char *fn(char *out, size_t cap, int i) { \
+        snprintf(out, cap, format, i);                  \
+        return out;                                     \
+    }
+#define CX_LINE3(fn, format)                            \
+    static const char *fn(char *out, size_t cap, int i) { \
+        snprintf(out, cap, format, i, i, i);            \
+        return out;                                     \
+    }
+
+typedef struct {
+    char path[64];
+    char *text;
+} CxSourceFile;
+
+static char *cx_lines_text(const char *head, CxLineFn line, const char *tail, int lines) {
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return NULL;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    (void)snprintf(source + length, room - length, "%s", tail);
+    return source;
+}
+
+static uint64_t cx_source_work(CBMLanguage language, const CxSourceFile *files, int count) {
+    CBMFileResult **results = calloc((size_t)count, sizeof(*results));
+    cbm_source_table_t *table = cbm_source_table_new();
+    bool ok = results && table;
+    for (int f = 0; ok && f < count; f++)
+        results[f] = cbm_extract_file(files[f].text, (int)strlen(files[f].text), language, "test",
+                                      files[f].path, 0, NULL, NULL);
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    for (int f = 0; ok && f < count; f++)
+        ok = results[f] && cbm_source_collect(table, results[f], language, files[f].path,
+                                              files[f].text, strlen(files[f].text));
+    for (int f = 0; ok && f < count; f++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        ok = cbm_source_unit_build(&arena, table, results[f], language, files[f].path,
+                                   files[f].text, strlen(files[f].text)) != NULL;
+        cbm_arena_destroy(&arena);
+    }
+    cbm_resolve_stats_bind(previous);
+    uint64_t work = ok ? cx_stat_work(&stats, CBM_RESOLVE_STAT_LOOKUP_PROBES) : 0;
+    for (int f = 0; results && f < count; f++)
+        if (results[f])
+            cbm_free_result(results[f]);
+    free(results);
+    if (table)
+        cbm_source_table_free(table);
+    return work;
+}
+
+/* One generated file, at CX_BINDING_LINES lines and at twice that. */
+static bool cx_source_shape_is_near_linear(CBMLanguage language, const char *path, const char *head,
+                                           CxLineFn line, const char *tail) {
+    uint64_t work[2] = {0, 0};
+    for (int round = 0; round < 2; round++) {
+        CxSourceFile file = {.text = cx_lines_text(head, line, tail, CX_BINDING_LINES << round)};
+        snprintf(file.path, sizeof(file.path), "%s", path);
+        if (file.text)
+            work[round] = cx_source_work(language, &file, 1);
+        free(file.text);
+    }
+    double ratio = cx_ratio((double)work[1], (double)work[0]);
+    printf("    %s source probes %llu -> %llu (ratio %.2f)\n", path, (unsigned long long)work[0],
+           (unsigned long long)work[1], ratio);
+    return work[0] >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+
+/* A name can repeat all through one file: a script's variable, a chunk's `local ok`, `init` in
+ * a generated file. Each declaration asks which definition is its own. */
+CX_LINE(cx_line_lua_same_function, "local function helper() return %d end\n")
+CX_LINE(cx_line_lua_same_local, "local x = f(%d)\n")
+CX_LINE(cx_line_shell_same_variable, "x=%d\n")
+CX_LINE(cx_line_vim_same_function, "function! Foo()\n  return %d\nendfunction\n")
+CX_LINE(cx_line_tcl_same_proc, "proc f {} { return %d }\n")
+CX_LINE(cx_line_swift_same_function, "func f(a%d: Int) {}\n")
+CX_LINE(cx_line_dart_same_method, "class C_%d { void go() {} }\n")
+CX_LINE(cx_line_haskell_same_clause, "f %d = 1\n")
+
+TEST(complexity_source_same_named_definitions_are_near_linear) {
+    /* Every shape runs and prints, so a failure shows all of them. */
+    bool ok = cx_source_shape_is_near_linear(CBM_LANG_LUA, "same.lua", "",
+                                             cx_line_lua_same_function, "");
+    ok = cx_source_shape_is_near_linear(CBM_LANG_LUA, "same.lua", "", cx_line_lua_same_local, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_BASH, "same.sh", "", cx_line_shell_same_variable,
+                                        "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_VIMSCRIPT, "same.vim", "",
+                                        cx_line_vim_same_function, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_TCL, "same.tcl", "", cx_line_tcl_same_proc, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_SWIFT, "same.swift", "",
+                                        cx_line_swift_same_function, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_DART, "same.dart", "", cx_line_dart_same_method,
+                                        "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_HASKELL, "Same.hs", "module Same where\n",
+                                        cx_line_haskell_same_clause, "") &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* `extension A: P` many times over: a name found in none of A's bases asks each of them. */
+CX_LINE3(cx_line_swift_extension_base,
+         "protocol P%d {}\nextension A: P%d {\n  func m_%d() { base() }\n}\n")
+TEST(complexity_swift_type_bases_are_near_linear) {
+    ASSERT_TRUE(cx_source_shape_is_near_linear(CBM_LANG_SWIFT, "bases.swift",
+                                               "class A { func base() {} }\n",
+                                               cx_line_swift_extension_base, ""));
+    PASS();
+}
+
+/* A barrel library re-exports the project, and every library that imports it read its whole
+ * export list again. */
+static uint64_t cx_dart_barrel_work(int libraries) {
+    CxSourceFile *files = calloc((size_t)libraries + 1, sizeof(*files));
+    if (!files)
+        return 0;
+    size_t room = (size_t)libraries * 32 + 1;
+    char *barrel = malloc(room);
+    size_t used = 0;
+    bool ok = barrel != NULL;
+    for (int i = 0; ok && i < libraries; i++) {
+        used += (size_t)snprintf(barrel + used, room - used, "export 'a%d.dart';\n", i);
+        snprintf(files[i].path, sizeof(files[i].path), "lib/a%d.dart", i);
+        files[i].text = malloc(96);
+        ok = files[i].text != NULL;
+        if (ok)
+            snprintf(files[i].text, 96, "import 'all.dart';\nint f%d() => f%d();\n", i,
+                     (i + 1) % libraries);
+    }
+    snprintf(files[libraries].path, sizeof(files[libraries].path), "lib/all.dart");
+    files[libraries].text = barrel;
+    uint64_t work = ok ? cx_source_work(CBM_LANG_DART, files, libraries + 1) : 0;
+    for (int i = 0; i <= libraries; i++)
+        free(files[i].text);
+    free(files);
+    return work;
+}
+TEST(complexity_dart_barrel_exports_are_near_linear) {
+    enum { BARREL_LIBRARIES = 500 };
+    uint64_t first = cx_dart_barrel_work(BARREL_LIBRARIES);
+    uint64_t second = cx_dart_barrel_work(BARREL_LIBRARIES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    barrel source probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)BARREL_LIBRARIES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A function of route registrations asks, for each, what its receiver was bound to. */
+CX_LINE(cx_line_go_route, "  r.GET(\"/p%d\", h)\n")
+CX_LINE3(cx_line_go_group, "  g%d := r.Group(\"/g%d\")\n  g%d.GET(\"/x\", h)\n")
+static bool cx_go_route_shape_is_near_linear(const char *head, CxLineFn line) {
+    uint64_t base = 0;
+    double ratio = cx_extract_ratio(CBM_LANG_GO, "routes.go", head, line, "}\n", false,
+                                    CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    return base >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_go_route_bindings_are_near_linear) {
+    bool ok = cx_go_route_shape_is_near_linear("package main\nfunc Register(r Router) {\n",
+                                               cx_line_go_route);
+    ok = cx_go_route_shape_is_near_linear("package main\nfunc Register() {\n  r := New()\n",
+                                          cx_line_go_route) &&
+         ok;
+    ok = cx_go_route_shape_is_near_linear("package main\nfunc Register(r Router) {\n",
+                                          cx_line_go_group) &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Flat assembly and routines: each statement looks back for the label above it. */
+CX_LINE(cx_line_nasm_instruction, "    mov eax, %d\n")
+CX_LINE(cx_line_objectscript_statement, "    Set x = %d\n")
+static bool cx_flat_shape_is_linear(CBMLanguage language, const char *path, const char *head,
+                                    CxLineFn line) {
+    uint64_t base = 0;
+    double ratio =
+        cx_extract_ratio(language, path, head, line, "", false, CBM_RESOLVE_STAT_LOOKUP_PROBES, &base);
+    return base >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_flat_preceding_label_is_linear) {
+    bool ok = cx_flat_shape_is_linear(CBM_LANG_NASM, "flat.nasm", "global start\nstart:\n",
+                                      cx_line_nasm_instruction);
+    ok = cx_flat_shape_is_linear(CBM_LANG_OBJECTSCRIPT_ROUTINE, "Flat.mac", "Main()\n",
+                                 cx_line_objectscript_statement) &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Every node of sources that parse, that do not, and that hold zero-width MISSING tokens: the
+ * routed calls answer exactly as tree-sitter does. */
+TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does) {
+    static const struct {
+        CBMLanguage language;
+        const char *source;
+    } cases[] = {
+        {CBM_LANG_PYTHON, "def f(a, b=1):\n    return [a, (b), {'k': a}]\n\nclass C:\n    x = 1\n"},
+        {CBM_LANG_TYPESCRIPT,
+         "@D() class A { @G('/x') m(a: number) { return a; } /* c */ n() {} }\nexport { A };\n"},
+        {CBM_LANG_GO, "package p\nfunc f() {\n  r := g()\n  r.GET(\"/x\", h)\n  // c\n  if r != nil "
+                      "{ return }\n}\n"},
+        {CBM_LANG_C, "int f(void { return 1 }\nstruct S { int a };\nint g(void) { x = ; }\n"},
+        {CBM_LANG_DART, "int f() { return 1; }\nclass C { void m() {} }\nint g( { }\n"},
+        {CBM_LANG_JAVASCRIPT, "class { m( }\nfunction f(a { return a\n"},
+        {CBM_LANG_NASM, "global s\ns:\n  mov eax, 1\n  ret\n"},
+        {CBM_LANG_ELIXIR, "defmodule M do\n  def f(a), do: a &&\nend\n"},
+    };
+    size_t visited = 0, zero_width = 0;
+    bool same = true;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        TSParser *parser = ts_parser_new();
+        ASSERT_NOT_NULL(parser);
+        ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(cases[c].language)));
+        TSTree *tree =
+            ts_parser_parse_string(parser, NULL, cases[c].source, (uint32_t)strlen(cases[c].source));
+        ts_parser_delete(parser);
+        ASSERT_NOT_NULL(tree);
+        cbm_syntax_index_t index;
+        cbm_syntax_index_begin(&index, tree);
+        TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+        for (bool more = true; more;) {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            visited++;
+            zero_width += ts_node_start_byte(node) == ts_node_end_byte(node);
+            same = same && ts_node_eq(cbm_syntax_prev_sibling(node), ts_node_prev_sibling(node));
+            same = same &&
+                   ts_node_eq(cbm_syntax_prev_named_sibling(node), ts_node_prev_named_sibling(node));
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+            while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+                if (!ts_tree_cursor_goto_parent(&cursor)) {
+                    more = false;
+                    break;
+                }
+            }
+        }
+        ts_tree_cursor_delete(&cursor);
+        cbm_syntax_index_end(&index);
+        ts_tree_delete(tree);
+    }
+    ASSERT_TRUE(same);
+    ASSERT_GTE(visited, (size_t)100);
+    ASSERT_GTE(zero_width, (size_t)1);
+    PASS();
+}
+
+/* Asking for the sibling before each child of a wide parent, plainly and through the index. */
+static uint64_t cx_prev_sibling_work(int lines, bool plain) {
+    char *source = cx_lines_text("", cx_line_py_statement, "", lines);
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    if (source && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_PYTHON)))
+        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    if (parser)
+        ts_parser_delete(parser);
+    uint64_t work = 0;
+    if (tree) {
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        cbm_syntax_index_t index;
+        cbm_syntax_index_begin(&index, tree);
+        cbm_syntax_index_test_set_plain(plain);
+        TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode child = ts_tree_cursor_current_node(&cursor);
+                (void)cbm_syntax_prev_named_sibling(child);
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        cbm_syntax_index_test_set_plain(false);
+        cbm_syntax_index_end(&index);
+        cbm_resolve_stats_bind(previous);
+        work = cx_stat_work(&stats, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS);
+        ts_tree_delete(tree);
+    }
+    free(source);
+    return work;
+}
+TEST(complexity_prev_sibling_walk_is_linear) {
+    uint64_t first = cx_prev_sibling_work(CX_BINDING_LINES, true);
+    uint64_t second = cx_prev_sibling_work(CX_BINDING_LINES * 2, true);
+    double plain = cx_ratio((double)second, (double)first);
+    printf("    plain prev sibling steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, plain);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(plain >= 3.2);
+    first = cx_prev_sibling_work(CX_BINDING_LINES, false);
+    second = cx_prev_sibling_work(CX_BINDING_LINES * 2, false);
+    double indexed = cx_ratio((double)second, (double)first);
+    printf("    indexed prev sibling steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, indexed);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(indexed >= CX_RATIO_LO && indexed <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does);
+    RUN_TEST(complexity_prev_sibling_walk_is_linear);
+    RUN_TEST(complexity_source_same_named_definitions_are_near_linear);
+    RUN_TEST(complexity_swift_type_bases_are_near_linear);
+    RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
+    RUN_TEST(complexity_go_route_bindings_are_near_linear);
+    RUN_TEST(complexity_flat_preceding_label_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
     RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
+    RUN_TEST(complexity_import_map_same_local_name_is_linear);
+    RUN_TEST(complexity_spawn_match_is_linear_in_a_files_imports);
+    RUN_TEST(complexity_spawn_file_index_answers_as_the_rows_do);
     RUN_TEST(complexity_parse_memo_lasts_one_file);
     RUN_TEST(complexity_evidence_page_route_stores_what_sql_stores);
     RUN_TEST(complexity_shared_preparation_decides_the_same);

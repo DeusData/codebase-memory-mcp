@@ -1180,6 +1180,9 @@ typedef struct {
     const void *cs_file_ns_top;
     const char *cs_file_ns_name;
     uint32_t cs_file_ns_start;
+    /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
+     * allocated in `scratch`. */
+    void *go_block_bindings;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */

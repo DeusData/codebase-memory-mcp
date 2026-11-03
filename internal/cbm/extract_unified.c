@@ -14,6 +14,7 @@ enum { MAX_INFRA_BINDINGS = 8 };
 #include <stdint.h> // uint32_t, uint8_t
 #include <string.h>
 #include <strings.h> // strcasecmp (ObjectScript type inference)
+#include "resolve/stats.h"
 #include "resolve/syntax_index.h"
 
 // --- Scope stack management ---
@@ -2537,16 +2538,47 @@ static TSNode nasm_wrapped_label(TSNode node, int remaining_depth) {
     return (TSNode){0};
 }
 
-static TSNode nasm_preceding_label(TSNode node) {
+/* The nearest earlier sibling a probe finds a label in. The walk reaches siblings in order, so a
+ * search under the same parent stops at the sibling the last one started from, and what that one
+ * found holds for everything before it: each sibling is read once however many ask. */
+typedef TSNode (*flat_label_probe_fn)(TSNode sibling);
+
+static TSNode flat_preceding_label(CBMFlatLookback *memo, TSNode node, flat_label_probe_fn probe) {
+    TSNode parent = ts_node_parent(node);
+    bool known = memo->parent && memo->parent == parent.id;
+    if (known && memo->asked == node.id) {
+        return memo->found;
+    }
+    TSNode found = {0};
+    for (TSNode previous = ts_node_prev_named_sibling(node); !ts_node_is_null(previous);
+         previous = ts_node_prev_named_sibling(previous)) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        found = probe(previous);
+        if (!ts_node_is_null(found)) {
+            break;
+        }
+        if (known && memo->asked == previous.id) {
+            found = memo->found;
+            break;
+        }
+    }
+    memo->parent = parent.id;
+    memo->asked = node.id;
+    memo->found = found;
+    return found;
+}
+
+static TSNode nasm_label_probe(TSNode sibling) {
+    return nasm_wrapped_label(sibling, 2);
+}
+
+static TSNode nasm_preceding_label(TSNode node, WalkState *state) {
     TSNode current = node;
-    for (int level = 0; level < 4 && !ts_node_is_null(current); level++) {
-        TSNode previous = ts_node_prev_named_sibling(current);
-        while (!ts_node_is_null(previous)) {
-            TSNode label = nasm_wrapped_label(previous, 2);
-            if (!ts_node_is_null(label)) {
-                return label;
-            }
-            previous = ts_node_prev_named_sibling(previous);
+    for (int level = 0; level < FLAT_LOOKBACK_LEVELS && !ts_node_is_null(current); level++) {
+        TSNode label =
+            flat_preceding_label(&state->flat_lookback[level], current, nasm_label_probe);
+        if (!ts_node_is_null(label)) {
+            return label;
         }
         TSNode parent = ts_node_parent(current);
         if (ts_node_is_null(parent) || strcmp(ts_node_type(current), "source_file") == 0) {
@@ -2568,7 +2600,7 @@ static TSNode objectscript_routine_statement_tag(TSNode statement) {
                                           : cbm_find_child_by_kind(tag_statement, "tag");
 }
 
-static TSNode objectscript_routine_preceding_tag(TSNode node) {
+static TSNode objectscript_routine_preceding_tag(TSNode node, WalkState *state) {
     if (strcmp(ts_node_type(node), "statement") != 0) {
         return (TSNode){0};
     }
@@ -2578,14 +2610,7 @@ static TSNode objectscript_routine_preceding_tag(TSNode node) {
         !ts_node_is_null(cbm_find_child_by_kind(node, "procedure"))) {
         return (TSNode){0};
     }
-    for (TSNode previous = ts_node_prev_named_sibling(node); !ts_node_is_null(previous);
-         previous = ts_node_prev_named_sibling(previous)) {
-        TSNode tag = objectscript_routine_statement_tag(previous);
-        if (!ts_node_is_null(tag)) {
-            return tag;
-        }
-    }
-    return (TSNode){0};
+    return flat_preceding_label(&state->flat_lookback[0], node, objectscript_routine_statement_tag);
 }
 
 /* A Python default is evaluated while its enclosing namespace executes,
@@ -2635,7 +2660,7 @@ static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 
     TSNode label = {0};
     if (ctx->language == CBM_LANG_NASM && strcmp(ts_node_type(node), "actual_instruction") == 0) {
-        label = nasm_preceding_label(node);
+        label = nasm_preceding_label(node, state);
     } else if (ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
         if (strcmp(ts_node_type(node), "tag_statement") == 0) {
             /* A parameterized flat tag owns its header as well as the following
@@ -2643,7 +2668,7 @@ static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
              * parameter_list records lexical bindings under the same tag QN. */
             label = cbm_find_child_by_kind(node, "tag");
         } else {
-            label = objectscript_routine_preceding_tag(node);
+            label = objectscript_routine_preceding_tag(node, state);
         }
     }
     if (ts_node_is_null(label)) {
