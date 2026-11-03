@@ -301,6 +301,16 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_PUPPET:
         keywords = puppet_keywords;
         break;
+    case CBM_LANG_SWIFT:
+        /* `init` and `deinit` are Swift keywords. A reference to one
+         * (`.init(...)`, `Foo.init`) names an initializer of a type the bare
+         * name does not carry, so resolving it by name can only guess among
+         * every type's initializer (#2379). Otherwise the generic set. */
+        if (strcmp(name, "init") == 0 || strcmp(name, "deinit") == 0) {
+            return true;
+        }
+        keywords = generic_keywords;
+        break;
     default:
         keywords = generic_keywords;
         break;
@@ -1187,6 +1197,16 @@ bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
 // const", and a member lookup for "operator bool" (the implicit call in
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
+    if (lang == CBM_LANG_SWIFT) {
+        const char *kind = ts_node_type(name_node);
+        if (strcmp(kind, "init_declaration") == 0) {
+            return cbm_arena_strdup(a, "init");
+        }
+        if (strcmp(kind, "deinit_declaration") == 0) {
+            return cbm_arena_strdup(a, "deinit");
+        }
+    }
+
     char *text = cbm_node_text(a, name_node, source);
     /* A C keyword is never a function name: the definition is an error-recovery
      * artifact. No name means no def and no call scope (calls inside fall back
