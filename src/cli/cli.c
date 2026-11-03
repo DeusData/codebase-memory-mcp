@@ -386,6 +386,12 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
     return rc;
 }
 
+static size_t g_cli_decompress_max = DECOMPRESS_MAX_BYTES;
+
+void cbm_cli_set_decompress_max_for_test(size_t max_bytes) {
+    g_cli_decompress_max = max_bytes ? max_bytes : DECOMPRESS_MAX_BYTES;
+}
+
 void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops) {
     if (!ops) {
         memset(&g_cli_activation_test_ops, 0, sizeof(g_cli_activation_test_ops));
@@ -7535,8 +7541,8 @@ static unsigned char *gzip_decompress(const unsigned char *data, int data_len, s
     if (buf_cap < CLI_BUF_4K) {
         buf_cap = CLI_BUF_4K;
     }
-    if (buf_cap > DECOMPRESS_MAX_BYTES) {
-        buf_cap = DECOMPRESS_MAX_BYTES;
+    if (buf_cap > g_cli_decompress_max) {
+        buf_cap = g_cli_decompress_max;
     }
     unsigned char *decompressed = malloc(buf_cap);
     if (!decompressed) {
@@ -7549,7 +7555,7 @@ static unsigned char *gzip_decompress(const unsigned char *data, int data_len, s
     do {
         if (total >= buf_cap) {
             size_t new_cap = buf_cap * GROWTH_FACTOR;
-            if (new_cap > DECOMPRESS_MAX_BYTES) {
+            if (new_cap > g_cli_decompress_max) {
                 free(decompressed);
                 inflateEnd(&strm);
                 return NULL;

@@ -588,6 +588,11 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
  * through deterministic callbacks. NULL restores the production daemon IPC path. */
 void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
 
+/* Internal test seam: the most a release archive may decompress to. A macOS update test
+ * ships the test runner itself as its release, which is over the limit a real release is
+ * held to. 0 restores that limit. */
+void cbm_cli_set_decompress_max_for_test(size_t max_bytes);
+
 /* Internal integration-test seam: isolate the stable endpoint beneath a
  * private runtime parent. NULL restores the platform default. This is not a
  * command-line or environment override. */

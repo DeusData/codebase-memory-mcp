@@ -3037,6 +3037,8 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     uint32_t native_fixture_size = (uint32_t)sizeof(native_fixture_path);
     ASSERT_EQ(_NSGetExecutablePath(native_fixture_path, &native_fixture_size), 0);
     const char *native_fixture = native_fixture_path;
+    /* A debug test runner is larger than any release: the limit is for those. */
+    cbm_cli_set_decompress_max_for_test((size_t)1 << 31);
 #else
     const char *native_fixture = "/bin/true";
 #endif
@@ -3120,6 +3122,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     cli_activation_restore_env(old_home, old_cache);
     test_rmdir_r(tmpdir);
 
+    cbm_cli_set_decompress_max_for_test(0);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(fake.mutation_reserve_count, 1);
     ASSERT_EQ(fake.mutation_lease_release_count, 1);
@@ -3131,6 +3134,33 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     ASSERT_NOT_NULL(strstr(config_failure.diagnostic, "executable was kept"));
     PASS();
 #endif
+}
+
+/* What keeps a hostile archive from inflating without end. */
+TEST(cli_update_refuses_an_archive_over_the_decompression_limit) {
+    enum { PAYLOAD = 1 << 20, LIMIT = 1 << 16 };
+    unsigned char *payload = calloc(1, PAYLOAD);
+    ASSERT_NOT_NULL(payload);
+    int archive_len = 0;
+    unsigned char *archive = create_test_targz("codebase-memory-mcp", payload, PAYLOAD, &archive_len);
+    free(payload);
+    ASSERT_NOT_NULL(archive);
+
+    cbm_cli_set_decompress_max_for_test(LIMIT);
+    int over_len = 0;
+    unsigned char *over = cbm_extract_binary_from_targz(archive, archive_len, &over_len);
+    cbm_cli_set_decompress_max_for_test(0);
+    int under_len = 0;
+    unsigned char *under = cbm_extract_binary_from_targz(archive, archive_len, &under_len);
+    free(archive);
+
+    bool refused = over == NULL;
+    free(over);
+    bool accepted = under != NULL && under_len == PAYLOAD;
+    free(under);
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(accepted);
+    PASS();
 }
 
 /* 2026-10-09: /tmp filled up mid-update, and the update said only "signed
@@ -3176,6 +3206,8 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
     uint32_t native_fixture_size = (uint32_t)sizeof(native_fixture_path);
     ASSERT_EQ(_NSGetExecutablePath(native_fixture_path, &native_fixture_size), 0);
     const char *native_fixture = native_fixture_path;
+    /* A debug test runner is larger than any release: the limit is for those. */
+    cbm_cli_set_decompress_max_for_test((size_t)1 << 31);
 #else
 #if defined(__aarch64__)
     const char *asset_name = "codebase-memory-mcp-linux-arm64-portable.tar.gz";
@@ -3268,6 +3300,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
     cli_activation_restore_env(old_home, old_cache);
     test_rmdir_r(tmpdir);
 
+    cbm_cli_set_decompress_max_for_test(0);
     ASSERT_NEQ(rc, 0);
     ASSERT_NOT_NULL(strstr(output, strerror(ENOSPC)));
 #ifdef __APPLE__
@@ -20172,6 +20205,7 @@ SUITE(cli) {
     RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
+    RUN_TEST(cli_update_refuses_an_archive_over_the_decompression_limit);
     RUN_TEST(cli_update_names_the_failing_staging_step_and_os_error);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
