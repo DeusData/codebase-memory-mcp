@@ -1525,6 +1525,7 @@ typedef struct {
     bool ambiguous;
     bool binds;
     bool mapped;
+    bool blanked;
 } pxc_import_name_t;
 typedef struct {
     pxc_import_name_t *names;
@@ -1875,10 +1876,14 @@ int cbm_pxc_build_import_map_ex(const cbm_pipeline_ctx_t *ctx, const char *rel_p
         pxc_import_name_t *name = pxc_import_index_find(&index, imp->local_name);
         if (ambiguous) {
             /* Conflicting imports cannot choose the first indexed endpoint. An entry this
-             * loop added has no endpoint already, so only the edges' entries can have one. */
-            if (name->mapped) {
+             * loop added has no endpoint already, so only the edges' entries can have one.
+             * Once per name: the last dot ends a local name, so every row of `source ./a.sh`
+             * is named sh and every `part 'a.dart'` dart, and all of them conflict. */
+            if (name->mapped && !name->blanked) {
+                name->blanked = true;
                 int at = pxc_key_first(keys, edge_keys, edge_key_count, imp->local_name);
                 for (; at < edge_key_count && !strcmp(keys[edge_keys[at]], imp->local_name); at++) {
+                    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
                     free((void *)vals[edge_keys[at]]);
                     vals[edge_keys[at]] = strdup("");
                 }

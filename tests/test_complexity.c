@@ -3096,6 +3096,74 @@ TEST(complexity_import_map_keeps_conflicts_and_repeats) {
     PASS();
 }
 
+/* The last dot ends a local name, so every `source ./a.sh` is named sh and each row conflicts with
+ * the rest. Each row used to clear all the name's edge entries again. */
+static uint64_t cx_same_named_import_probes(int lines, int *mapped, int *blank) {
+    size_t room = (size_t)lines * CX_BINDING_LINE_ROOM + CX_BINDING_LINE_ROOM;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    for (int i = 0; i < lines; i++)
+        length += (size_t)snprintf(source + length, room - length, "source ./l%d.sh\n", i);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_BASH, "test", "main.sh", 0, NULL, NULL);
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("test", "/tmp/test");
+    char *file_qn = cbm_pipeline_fqn_compute("test", "main.sh", "__file__");
+    int64_t file =
+        gbuf && file_qn
+            ? cbm_gbuf_upsert_node(gbuf, "File", "main.sh", file_qn, "main.sh", 1, 1, "{}")
+            : 0;
+    uint64_t work = 0;
+    for (int i = 0; file > 0 && i < lines; i++) {
+        char qn[CX_BINDING_LINE_ROOM];
+        snprintf(qn, sizeof(qn), "test.l%d.sh", i);
+        int64_t target = cbm_gbuf_upsert_node(gbuf, "Module", qn, qn, qn, 1, 1, "{}");
+        cbm_gbuf_insert_edge(gbuf, file, target, "IMPORTS", "{\"local_name\":\"sh\"}");
+    }
+    if (result && file > 0) {
+        cbm_pipeline_ctx_t ctx = {.project_name = "test", .gbuf = gbuf};
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        const char **keys = NULL, **values = NULL;
+        int count = 0;
+        int rc = cbm_pxc_build_import_map_ex(&ctx, "main.sh", CBM_LANG_BASH, result, false, &keys,
+                                             &values, &count);
+        cbm_resolve_stats_bind(previous);
+        if (rc == 0)
+            work = cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+        *mapped = count;
+        *blank = 0;
+        for (int i = 0; i < count; i++)
+            *blank += !strcmp(keys[i], "sh") && !strcmp(values[i], "");
+        cbm_pxc_free_import_map(keys, values, count);
+    }
+    free(file_qn);
+    cbm_gbuf_free(gbuf);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+TEST(complexity_import_map_same_local_name_is_linear) {
+    int mapped_first = 0, mapped_second = 0, blank_first = 0, blank_second = 0;
+    uint64_t first = cx_same_named_import_probes(CX_BINDING_LINES, &mapped_first, &blank_first);
+    uint64_t second =
+        cx_same_named_import_probes(CX_BINDING_LINES * 2, &mapped_second, &blank_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    same-named imports lookup_probes %llu -> %llu (ratio %.2f)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    /* An entry per edge and one per row, and no name keeps an endpoint. */
+    ASSERT_EQ(mapped_first, CX_BINDING_LINES * 2);
+    ASSERT_EQ(blank_first, mapped_first);
+    ASSERT_EQ(mapped_second, CX_BINDING_LINES * 4);
+    ASSERT_EQ(blank_second, mapped_second);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 /* A worker's passes over one file share one parse, and a later file gets its own. */
 TEST(complexity_parse_memo_lasts_one_file) {
     static const char first[] = "x = 1\n";
@@ -3473,6 +3541,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_flat_preceding_label_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
     RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
+    RUN_TEST(complexity_import_map_same_local_name_is_linear);
     RUN_TEST(complexity_parse_memo_lasts_one_file);
     RUN_TEST(complexity_evidence_page_route_stores_what_sql_stores);
     RUN_TEST(complexity_shared_preparation_decides_the_same);
