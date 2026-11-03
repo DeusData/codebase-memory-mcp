@@ -3225,6 +3225,44 @@ static bool cx_source_shape_is_near_linear(CBMLanguage language, const char *pat
     return work[0] >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
 }
 
+/* A name can repeat all through one file: a script's variable, a chunk's `local ok`, `init` in
+ * a generated file. Each declaration asks which definition is its own. */
+CX_LINE(cx_line_lua_same_function, "local function helper() return %d end\n")
+CX_LINE(cx_line_lua_same_local, "local x = f(%d)\n")
+CX_LINE(cx_line_shell_same_variable, "x=%d\n")
+CX_LINE(cx_line_vim_same_function, "function! Foo()\n  return %d\nendfunction\n")
+CX_LINE(cx_line_tcl_same_proc, "proc f {} { return %d }\n")
+CX_LINE(cx_line_swift_same_function, "func f(a%d: Int) {}\n")
+CX_LINE(cx_line_dart_same_method, "class C_%d { void go() {} }\n")
+CX_LINE(cx_line_haskell_same_clause, "f %d = 1\n")
+
+TEST(complexity_source_same_named_definitions_are_near_linear) {
+    /* Every shape runs and prints, so a failure shows all of them. */
+    bool ok = cx_source_shape_is_near_linear(CBM_LANG_LUA, "same.lua", "",
+                                             cx_line_lua_same_function, "");
+    ok = cx_source_shape_is_near_linear(CBM_LANG_LUA, "same.lua", "", cx_line_lua_same_local, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_BASH, "same.sh", "", cx_line_shell_same_variable,
+                                        "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_VIMSCRIPT, "same.vim", "",
+                                        cx_line_vim_same_function, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_TCL, "same.tcl", "", cx_line_tcl_same_proc, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_SWIFT, "same.swift", "",
+                                        cx_line_swift_same_function, "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_DART, "same.dart", "", cx_line_dart_same_method,
+                                        "") &&
+         ok;
+    ok = cx_source_shape_is_near_linear(CBM_LANG_HASKELL, "Same.hs", "module Same where\n",
+                                        cx_line_haskell_same_clause, "") &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Every node of sources that parse, that do not, and that hold zero-width MISSING tokens: the
  * routed calls answer exactly as tree-sitter does. */
 TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does) {
@@ -3337,6 +3375,7 @@ TEST(complexity_prev_sibling_walk_is_linear) {
 SUITE(complexity) {
     RUN_TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does);
     RUN_TEST(complexity_prev_sibling_walk_is_linear);
+    RUN_TEST(complexity_source_same_named_definitions_are_near_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
     RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
     RUN_TEST(complexity_parse_memo_lasts_one_file);

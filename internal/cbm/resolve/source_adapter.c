@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "stats.h"
 #include "syntax_index.h"
 
 enum { SOURCE_MAX_VISITS = 4000000, SOURCE_MAX_DEPTH = 400 };
@@ -212,10 +213,27 @@ bool cbm_source_token(TSNode node, const char *token) {
     return false;
 }
 
-typedef struct source_def_link {
-    const CBMDefinition *def;
-    struct source_def_link *next;
-} source_def_link_t;
+/* One name's definitions in one file. A name can repeat all through a file (a script's `x=1`, a
+ * chunk's `local ok`, `init` in generated code) and each declaration asks which is its own, so
+ * these are sorted by first line, ties in the file's order. open_before threads the definitions
+ * still open where each one starts: every definition holding a line is on that path from the
+ * last one starting at or before the line, and it is as long as the nesting there. */
+typedef struct {
+    const CBMDefinition **defs;
+    int *open_before;
+    int count, filled;
+    bool settled;
+    bool one_qn_known;
+    const char *one_qn;
+} source_def_row_t;
+
+static int source_def_order(const void *left, const void *right) {
+    const CBMDefinition *a = *(const CBMDefinition *const *)left;
+    const CBMDefinition *b = *(const CBMDefinition *const *)right;
+    if (a->start_line != b->start_line)
+        return a->start_line < b->start_line ? -1 : 1;
+    return a < b ? -1 : a > b;
+}
 
 /* One join per declaration must not rescan every definition of a large file. */
 static bool source_def_index(cbm_source_walk_t *walk) {
@@ -229,49 +247,105 @@ static bool source_def_index(cbm_source_walk_t *walk) {
         const CBMDefinition *def = &defs->items[d];
         if (!def->name || !def->qualified_name)
             continue;
-        source_def_link_t *link = cbm_arena_alloc(walk->arena, sizeof(*link));
-        if (!link)
-            return false;
-        link->def = def;
-        link->next = cbm_ht_get(walk->def_index, def->name);
-        cbm_ht_set(walk->def_index, def->name, link);
+        source_def_row_t *row = cbm_ht_get(walk->def_index, def->name);
+        if (!row) {
+            row = cbm_arena_calloc(walk->arena, sizeof(*row));
+            if (!row)
+                return false;
+            cbm_ht_set(walk->def_index, def->name, row);
+        }
+        row->count++;
+    }
+    for (int d = 0; d < defs->count; d++) {
+        const CBMDefinition *def = &defs->items[d];
+        if (!def->name || !def->qualified_name)
+            continue;
+        source_def_row_t *row = cbm_ht_get(walk->def_index, def->name);
+        if (!row->defs) {
+            row->defs = cbm_arena_alloc(walk->arena, (size_t)row->count * sizeof(*row->defs));
+            if (!row->defs)
+                return false;
+        }
+        row->defs[row->filled++] = def;
     }
     return true;
 }
 
-const char *cbm_source_def_qn_label(cbm_source_walk_t *walk, const char *name, uint32_t line,
-                                    const char *label) {
+static const source_def_row_t *source_def_row(cbm_source_walk_t *walk, const char *name) {
     if (!name || !source_def_index(walk))
         return NULL;
-    const char *found = NULL;
+    source_def_row_t *row = cbm_ht_get(walk->def_index, name);
+    if (!row || row->settled)
+        return row;
+    row->open_before = cbm_arena_alloc(walk->arena, (size_t)row->count * sizeof(*row->open_before));
+    if (!row->open_before)
+        return NULL;
+    if (row->count > 1)
+        qsort(row->defs, (size_t)row->count, sizeof(*row->defs), source_def_order);
+    int top = -1;
+    for (int i = 0; i < row->count; i++) {
+        while (top >= 0 && row->defs[top]->end_line < row->defs[i]->start_line)
+            top = row->open_before[top];
+        row->open_before[i] = top;
+        top = i;
+    }
+    row->settled = true;
+    return row;
+}
+
+/* The last definition of the row starting at or before line, -1 when none does. */
+static int source_def_last_at(const source_def_row_t *row, uint32_t line) {
+    int low = 0, high = row->count;
+    while (low < high) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        int middle = low + (high - low) / 2;
+        if (row->defs[middle]->start_line <= line)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    return low - 1;
+}
+
+const char *cbm_source_def_qn_label(cbm_source_walk_t *walk, const char *name, uint32_t line,
+                                    const char *label) {
+    const source_def_row_t *row = source_def_row(walk, name);
+    if (!row)
+        return NULL;
+    const CBMDefinition *found = NULL;
     uint32_t best = UINT32_MAX;
-    for (const source_def_link_t *link = cbm_ht_get(walk->def_index, name); link;
-         link = link->next) {
-        const CBMDefinition *def = link->def;
-        if (def->start_line > line || def->end_line < line)
+    /* The tightest holding the line; of equal ones, the latest in the file's own order. */
+    for (int at = source_def_last_at(row, line); at >= 0; at = row->open_before[at]) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        const CBMDefinition *def = row->defs[at];
+        if (def->end_line < line)
             continue;
         if (label && (!def->label || strcmp(def->label, label)))
             continue;
         uint32_t span = def->end_line - def->start_line;
-        if (span < best) {
+        if (span < best || (span == best && found && def > found)) {
             best = span;
-            found = def->qualified_name;
+            found = def;
         }
     }
-    return found;
+    return found ? found->qualified_name : NULL;
 }
 
 const char *cbm_source_def_qn_of_name(cbm_source_walk_t *walk, const char *name) {
-    if (!name || !source_def_index(walk))
+    source_def_row_t *row =
+        name && source_def_index(walk) ? cbm_ht_get(walk->def_index, name) : NULL;
+    if (!row)
         return NULL;
-    const char *found = NULL;
-    for (const source_def_link_t *link = cbm_ht_get(walk->def_index, name); link;
-         link = link->next) {
-        if (found && strcmp(found, link->def->qualified_name))
-            return NULL;
-        found = link->def->qualified_name;
+    if (!row->one_qn_known) {
+        row->one_qn_known = true;
+        row->one_qn = row->defs[0]->qualified_name;
+        for (int i = 1; row->one_qn && i < row->filled; i++) {
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            if (strcmp(row->one_qn, row->defs[i]->qualified_name))
+                row->one_qn = NULL;
+        }
     }
-    return found;
+    return row->one_qn;
 }
 
 const char *cbm_source_def_qn(cbm_source_walk_t *walk, const char *name, uint32_t line) {
@@ -279,12 +353,9 @@ const char *cbm_source_def_qn(cbm_source_walk_t *walk, const char *name, uint32_
 }
 
 const char *cbm_source_def_qn_at(cbm_source_walk_t *walk, const char *name, uint32_t line) {
-    if (!name || !source_def_index(walk))
-        return NULL;
-    for (const source_def_link_t *link = cbm_ht_get(walk->def_index, name); link; link = link->next)
-        if (link->def->start_line == line)
-            return link->def->qualified_name;
-    return NULL;
+    const source_def_row_t *row = source_def_row(walk, name);
+    int at = row ? source_def_last_at(row, line) : -1;
+    return at >= 0 && row->defs[at]->start_line == line ? row->defs[at]->qualified_name : NULL;
 }
 
 bool cbm_source_join_path(const char *directory, const char *relative, char *out, size_t capacity) {
