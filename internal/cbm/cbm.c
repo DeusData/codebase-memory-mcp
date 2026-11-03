@@ -1155,7 +1155,16 @@ typedef struct {
     TSPoint skip_point;
     /* The `#if` line, left out as well once its branch turns out not to be complete. */
     TSRange directive;
+    bool has_alternative;
+    /* Braces this block opened less those it closed, outside any block inside it. */
+    int brace_net;
 } CBMAttrConditional;
+
+/* A block with no `#else` that left braces open, waiting at its own depth for one to close them. */
+typedef struct {
+    int open_braces;
+    TSRange open, close;
+} CBMAttrSplitBlock;
 
 /* Past spaces and comments, on the same line only when `same_line` asks for it. */
 static uint32_t cbm_attr_text_skip(const char *source, uint32_t length, uint32_t at,
@@ -1215,15 +1224,76 @@ static uint32_t cbm_attr_text_endif(const char *source, uint32_t length, uint32_
     return length;
 }
 
+/* Where the enum body opening here ends, when the grammar cannot hold it: an `#include` beside a
+ * `#define` or another `#include`. Otherwise 0, and one directive alone stays where it is. An
+ * enumerator list holds neither `;` nor `{`, and stopping at them keeps the scans of one file
+ * linear in its length. */
+static uint32_t cbm_attr_enum_directives_end(const char *source, uint32_t length, uint32_t open) {
+    bool defines = false, line_start = false;
+    int includes = 0;
+    for (uint32_t at = open + 1; at < length; at++) {
+        char ch = source[at];
+        if (ch == '\n') {
+            line_start = true;
+        } else if (ch == '/' && at + 1 < length && source[at + 1] == '/') {
+            while (at + 1 < length && source[at + 1] != '\n')
+                at++;
+        } else if (ch == '/' && at + 1 < length && source[at + 1] == '*') {
+            for (at += 2; at + 1 < length && !(source[at] == '*' && source[at + 1] == '/'); at++) {}
+            at++;
+        } else if (ch == '#' && line_start) {
+            uint32_t word = at + 1;
+            while (word < length && (source[word] == ' ' || source[word] == '\t'))
+                word++;
+            defines |= word + 6 <= length && !memcmp(source + word, "define", 6);
+            includes += word + 7 <= length && !memcmp(source + word, "include", 7);
+            /* A directive runs to the end of its line, continuations included. */
+            while (at + 1 < length && source[at + 1] != '\n') {
+                at += source[at + 1] == '\\' && at + 2 < length && source[at + 2] == '\n' ? 2 : 1;
+            }
+        } else if (ch != ' ' && ch != '\t' && ch != '\r') {
+            line_start = false;
+            if (ch == '{' || ch == ';') {
+                return 0;
+            }
+            if (ch == '}') {
+                return includes > 0 && (defines || includes > 1) ? at : 0;
+            }
+        }
+    }
+    return 0;
+}
+
+/* `#ifndef X / union { / #endif / ... / #ifndef X / }; / #endif`: a brace opened in one block and
+ * closed in another. No grammar holds half of a block, and how error recovery reads it depends on
+ * how much follows: past a dozen members DeclSpec.h lost its whole namespace. With both blocks'
+ * directives out, all of the text stays and balances, as in the configuration that has the braces.
+ * A block with an `#else` has two versions of its text and stays as it is. */
+static void cbm_attr_split_block(CBMAttrWords *words, CBMAttrSplitBlock *waiting,
+                                 const CBMAttrConditional *frame, TSRange endif) {
+    if (frame->brace_net > 0) {
+        *waiting = (CBMAttrSplitBlock){frame->brace_net, frame->directive, endif};
+    } else if (frame->brace_net < 0 && waiting->open_braces == -frame->brace_net) {
+        cbm_attr_range_add(words, waiting->open);
+        cbm_attr_range_add(words, waiting->close);
+        cbm_attr_range_add(words, frame->directive);
+        cbm_attr_range_add(words, endif);
+        waiting->open_braces = 0;
+    }
+}
+
 static void cbm_attr_expression_branches(const char *source, uint32_t length, CBMAttrWords *words) {
     CBMAttrConditional stack[CBM_ATTR_MAX_CONDITIONALS];
+    CBMAttrSplitBlock split[CBM_ATTR_MAX_CONDITIONALS];
+    memset(split, 0, sizeof(split));
     int top = 0, skipping = 0, depth = 0, overflow = 0;
     uint32_t at = 0, line_start = 0, row = 0;
     bool line_begun = false;
     /* Braces opened by `= {`. An initializer holds no `;`, so one closes the count whatever two
      * branches of a conditional did to it. */
     uint32_t initializer = 0;
-    bool after_assign = false, after_string = false;
+    uint32_t directive_enum_end = 0;
+    bool after_assign = false, after_enum = false, after_string = false;
     while (at < length) {
         char ch = source[at];
         if (ch == '\n') {
@@ -1267,8 +1337,11 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
             /* `T table[] = { / #define OP(x) {x}, / LIST / #undef OP / };`: no grammar has a
              * directive inside an initializer, and error recovery read a function named OP that
              * swallowed the next 1,400 lines of jemalloc's ctl.c. The preprocessor takes these
-             * lines out before any of it is C, and so does this. */
-            bool in_table = initializer > 0 && !skipping &&
+             * lines out before any of it is C, and so does this. An enum's body holding an
+             * `#include` beside another directive cost Type.h and InstrProf.h the namespace of all
+             * that follows it; its includes are read back from its text in
+             * cbm_note_c_includes_at. */
+            bool in_table = !skipping && (initializer > 0 || at < directive_enum_end) &&
                             (defines || (size == 5 && !memcmp(text, "undef", 5)) ||
                              (size == 7 && !memcmp(text, "include", 7)));
             while (end < length && source[end] != '\n') {
@@ -1324,6 +1397,7 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
                 }
             } else if (alternative && top && !overflow) {
                 CBMAttrConditional *frame = &stack[top - 1];
+                frame->has_alternative = true;
                 if (frame->in_expression && !frame->skipping) {
                     frame->skipping = true;
                     frame->skip_start = at;
@@ -1377,6 +1451,9 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
                             words, (TSRange){frame->skip_point, end_point, frame->skip_start, end});
                     } else if (frame->in_expression) {
                         cbm_attr_range_add(words, (TSRange){begin_point, end_point, at, end});
+                    } else if (!frame->has_alternative && !skipping) {
+                        cbm_attr_split_block(words, &split[top], frame,
+                                             (TSRange){begin_point, end_point, at, end});
                     }
                 }
             }
@@ -1436,17 +1513,23 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
             }
             after_string = false;
             after_assign = false;
+            after_enum |= word_end - at == 4 && !memcmp(source + at, "enum", 4);
             at = word_end;
             continue;
         }
         after_string = false;
         if (!skipping) {
+            if (top && !overflow && (ch == '{' || ch == '}')) {
+                stack[top - 1].brace_net += ch == '{' ? 1 : -1;
+            }
             if (ch == '(') {
                 depth++;
             } else if (ch == ')' && depth > 0) {
                 depth--;
             } else if (ch == '{' && (initializer || after_assign)) {
                 initializer++;
+            } else if (ch == '{' && after_enum) {
+                directive_enum_end = cbm_attr_enum_directives_end(source, length, at);
             } else if (ch == '}' && initializer) {
                 initializer--;
             } else if (ch == ';') {
@@ -1454,6 +1537,9 @@ static void cbm_attr_expression_branches(const char *source, uint32_t length, CB
             }
         }
         after_assign = ch == '=';
+        /* Until the body, or what shows there is none: `enum E f(void);`, `enum E e = A;`. */
+        if (ch == '{' || ch == ';' || ch == '(' || ch == '=')
+            after_enum = false;
         at++;
     }
 }

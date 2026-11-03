@@ -1531,6 +1531,7 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
+void cbm_note_c_includes_at(CBMExtractCtx *ctx, TSNode node, uint32_t *body_end);
 /* Owned inner tree for one fully audited Vue/Svelte inline script. Absolute
  * source coordinates are preserved; NULL means the host domain is unproved. */
 TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TSRange *range);

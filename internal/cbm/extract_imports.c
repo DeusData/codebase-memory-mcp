@@ -2085,12 +2085,13 @@ static char *strip_angle_brackets(CBMArena *a, char *path) {
 }
 
 /* Node kinds that only group file-level items: the branches of `#if` /
- * `#ifdef` (an include guard is one) and the body of `extern "C" { ... }`. */
+ * `#ifdef` (an include guard is one), the body of `extern "C" { ... }`, and a namespace:
+ * sanitizer_linux.cpp includes its syscall tables inside one. */
 static bool is_c_include_container(const char *kind) {
     return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
            strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
            strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
-           strcmp(kind, "declaration_list") == 0;
+           strcmp(kind, "declaration_list") == 0 || strcmp(kind, "namespace_definition") == 0;
 }
 
 /* Collect the includes among `parent`'s children, descending into
@@ -2137,6 +2138,114 @@ static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
 
 static void parse_c_imports(CBMExtractCtx *ctx) {
     parse_c_imports_in(ctx, ctx->root, 0);
+}
+
+/* `"path"` or `<path>` at this byte: what follows an `#include` the grammar did not name. The text
+ * may run on over a comment, so the path ends at its closing mark. `#include NAME` has no path. */
+static void push_c_include_text(CBMExtractCtx *ctx, uint32_t begin, uint32_t end) {
+    char open = ctx->source[begin];
+    if (open != '"' && open != '<') {
+        return;
+    }
+    char close = open == '"' ? '"' : '>';
+    uint32_t stop = begin + SKIP_ONE;
+    while (stop < end && ctx->source[stop] != close) {
+        stop++;
+    }
+    if (stop >= end || stop == begin + SKIP_ONE) {
+        return;
+    }
+    char *path =
+        cbm_arena_strndup(ctx->arena, ctx->source + begin + SKIP_ONE, stop - begin - SKIP_ONE);
+    if (!path) {
+        return;
+    }
+    CBMImport imp = {.local_name = path_last(ctx->arena, path),
+                     .module_path = path,
+                     .kind = close == '"' ? CBM_IMPORT_KIND_INCLUDE_QUOTED
+                                          : CBM_IMPORT_KIND_INCLUDE_SYSTEM,
+                     .site_start_byte = begin,
+                     .site_end_byte = stop + SKIP_ONE,
+                     .source_origin = CBM_SOURCE_ORIGIN_RAW};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+/* The grammar has no place for `#include` in an enum's body. A lone one reads as a directive it has
+ * no name for, and more than one are out of the tree altogether (cbm_attr_enum_directives_end), so
+ * the body's text is what says what it includes. A block comment is skipped, and a line comment
+ * starts no directive; an enumerator list holds no string one could hide in. */
+static void note_c_enum_body_includes(CBMExtractCtx *ctx, TSNode list) {
+    const char *source = ctx->source;
+    uint32_t end = ts_node_end_byte(list);
+    bool line_start = false;
+    for (uint32_t at = ts_node_start_byte(list); at < end; at++) {
+        char ch = source[at];
+        if (ch == '\n') {
+            line_start = true;
+        } else if (ch == '/' && at + SKIP_ONE < end && source[at + SKIP_ONE] == '*') {
+            at += PAIR_LEN;
+            while (at + SKIP_ONE < end && !(source[at] == '*' && source[at + SKIP_ONE] == '/')) {
+                at++;
+            }
+            at++;
+        } else if (ch == '#' && line_start) {
+            uint32_t word = at + SKIP_ONE;
+            while (word < end && (source[word] == ' ' || source[word] == '\t')) {
+                word++;
+            }
+            uint32_t line_end = word;
+            while (line_end < end && source[line_end] != '\n') {
+                bool continues = source[line_end] == '\\' && line_end + SKIP_ONE < end &&
+                                 source[line_end + SKIP_ONE] == '\n';
+                line_end += continues ? PAIR_LEN : SKIP_ONE;
+            }
+            size_t size = strlen("include");
+            if (line_end - word > size && memcmp(source + word, "include", size) == 0) {
+                uint32_t argument = word + (uint32_t)size;
+                while (argument < line_end &&
+                       (source[argument] == ' ' || source[argument] == '\t')) {
+                    argument++;
+                }
+                if (argument < line_end) {
+                    push_c_include_text(ctx, argument, line_end);
+                }
+            }
+            at = line_end - SKIP_ONE;
+        } else if (ch != ' ' && ch != '\t' && ch != '\r') {
+            line_start = false;
+        }
+    }
+}
+
+/* Where a C or C++ `#include` stands outside what parse_c_imports reads, this reads it. Called once
+ * for each node of a file, in order; `body_end` is where the last enum body read ends. */
+void cbm_note_c_includes_at(CBMExtractCtx *ctx, TSNode node, uint32_t *body_end) {
+    const char *kind = ts_node_type(node);
+    bool list = strcmp(kind, "enumerator_list") == 0;
+    if ((!list && strcmp(kind, "preproc_call") != 0) || ts_node_start_byte(node) < *body_end) {
+        return;
+    }
+    if (list) {
+        *body_end = ts_node_end_byte(node);
+        note_c_enum_body_includes(ctx, node);
+        return;
+    }
+    /* A struct's body, or an enum's the grammar could not read as a list: `#include` is a directive
+     * with no name there too. */
+    TSNode directive = ts_node_child_by_field_name(node, TS_FIELD("directive"));
+    TSNode argument = ts_node_child_by_field_name(node, TS_FIELD("argument"));
+    if (ts_node_is_null(directive) || ts_node_is_null(argument)) {
+        return;
+    }
+    const char *source = ctx->source;
+    /* The token is `#`, spaces and a word, so the spaces end inside it. */
+    uint32_t word = ts_node_start_byte(directive) + SKIP_ONE;
+    word += (uint32_t)strspn(source + word, " \t");
+    uint32_t word_end = ts_node_end_byte(directive);
+    size_t size = strlen("include");
+    if (word_end - word == size && memcmp(source + word, "include", size) == 0) {
+        push_c_include_text(ctx, ts_node_start_byte(argument), ts_node_end_byte(argument));
+    }
 }
 
 // --- Ruby imports ---

@@ -3054,6 +3054,9 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     const char *ext = ctx->rel_path ? strrchr(ctx->rel_path, '.') : NULL;
     bool tf_module = ctx->language == CBM_LANG_HCL && ext &&
                      (strcmp(ext, ".tf") == 0 || strcmp(ext, ".tofu") == 0);
+    bool c_includes = ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP ||
+                      ctx->language == CBM_LANG_OBJC;
+    uint32_t enum_body_end = 0;
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
@@ -3096,6 +3099,9 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             handle_string_refs(ctx, node, &state);
             handle_yaml_nested(ctx, node);
             scan_infra_bindings(ctx, node);
+            if (c_includes) {
+                cbm_note_c_includes_at(ctx, node, &enum_body_end);
+            }
 
             push_boundary_scopes(ctx, node, spec, &state, depth, &invocation);
         }

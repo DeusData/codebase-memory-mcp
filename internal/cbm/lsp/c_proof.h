@@ -24,6 +24,9 @@ typedef enum {
     CBM_C_DECL_TEMPLATE_PARAMETER, /* `template <class Value> class Pair`: name is Value, type_name
                                     * is Pair. What it means comes with each instantiation. */
     CBM_C_DECL_UNNAMED_TYPEDEF,    /* `typedef struct {...} Name;`: no tag is called Name */
+    CBM_C_DECL_FORWARD_CLASS,      /* `class Name;` in a namespace or at file scope: name is dotted
+                                    * from the module, and it is the C++ class of that name */
+    CBM_C_DECL_ENUMERATOR,         /* `enum E { A };`: name is A, type_name is E, target its QN */
 } CBMCDeclKind;
 
 enum {

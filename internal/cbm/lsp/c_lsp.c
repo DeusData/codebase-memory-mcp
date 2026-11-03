@@ -5397,22 +5397,20 @@ static bool c_nested_type_in_scope(const CLSPContext *ctx, const char *scope) {
            (klass->embedded_types && klass->embedded_types[0]);
 }
 
-/* A scope named from a module of `module_len` bytes: the top level of that file, a namespace around
- * this code, or one a visible `using namespace` brings here. */
-static bool c_scope_reached(CLSPContext *ctx, const char *written, const char *scope,
-                            size_t module_len, uint32_t at) {
-    if (!scope[module_len])
-        return true;
-    if (written[0] == ':')
-        return false;
-    const char *from = scope + module_len + 1;
+/* Does lookup reach this namespace, named from the top of its file? Around this code, written
+ * around an out-of-line definition (`void ns::Foo::run() { ... }`), or brought here by a visible
+ * `using namespace`. */
+static bool c_namespace_reached(CLSPContext *ctx, const char *from, uint32_t at) {
     size_t from_len = strlen(from);
-    const char *around = ctx->current_namespace;
-    if (around && ctx->module_qn && !strncmp(around, ctx->module_qn, ctx->module_qn_len) &&
-        around[ctx->module_qn_len] == '.') {
-        around += ctx->module_qn_len + 1;
-        if (!strncmp(around, from, from_len) && (!around[from_len] || around[from_len] == '.'))
-            return true;
+    const char *const places[] = {ctx->current_namespace, ctx->enclosing_func_qn};
+    for (size_t i = 0; i < sizeof(places) / sizeof(places[0]); i++) {
+        const char *around = places[i];
+        if (around && ctx->module_qn && !strncmp(around, ctx->module_qn, ctx->module_qn_len) &&
+            around[ctx->module_qn_len] == '.') {
+            around += ctx->module_qn_len + 1;
+            if (!strncmp(around, from, from_len) && (!around[from_len] || around[from_len] == '.'))
+                return true;
+        }
     }
     for (int i = 0; i < ctx->proof_using_count; i++) {
         const CProofUsing *using = &ctx->proof_usings[i];
@@ -5423,22 +5421,38 @@ static bool c_scope_reached(CLSPContext *ctx, const char *written, const char *s
     return false;
 }
 
-/* `ns::Name`: what the first segment means depends on where lookup starts. The declaration's scope,
- * with the written qualifier taken off, has to be a place that lookup reaches. */
-static bool c_qualifier_starts_here(CLSPContext *ctx, const char *written, const char *file_qn,
-                                    const char *scope, uint32_t at) {
-    /* `p.dir.t.hpp.__file__` is the file whose declarations are named `p.dir.t.Name`. */
+/* A scope named from a module of `module_len` bytes: the top level of that file, or a namespace
+ * lookup reaches. */
+static bool c_scope_reached(CLSPContext *ctx, const char *written, const char *scope,
+                            size_t module_len, uint32_t at) {
+    if (!scope[module_len])
+        return true;
+    if (written[0] == ':')
+        return false;
+    return c_namespace_reached(ctx, scope + module_len + 1, at);
+}
+
+/* `p.dir.t.hpp.__file__` is the file whose declarations are named `p.dir.t.Name`. The length of
+ * that prefix, or 0 when this is no file's name. */
+static size_t c_file_module_len(const char *file_qn) {
     static const char file_tail[] = ".__file__";
     size_t tail_len = sizeof(file_tail) - 1;
     size_t file_len = file_qn ? strlen(file_qn) : 0;
     if (file_len <= tail_len || strcmp(file_qn + file_len - tail_len, file_tail))
-        return false;
+        return 0;
     file_len -= tail_len;
     while (file_len && file_qn[file_len - 1] != '.')
         file_len--;
+    return file_len ? file_len - 1 : 0;
+}
+
+/* `ns::Name`: what the first segment means depends on where lookup starts. The declaration's scope,
+ * with the written qualifier taken off, has to be a place that lookup reaches. */
+static bool c_qualifier_starts_here(CLSPContext *ctx, const char *written, const char *file_qn,
+                                    const char *scope, uint32_t at) {
+    size_t file_len = c_file_module_len(file_qn);
     if (!file_len)
         return false;
-    file_len--;
     if (strncmp(scope, file_qn, file_len) || (scope[file_len] && scope[file_len] != '.'))
         return false;
     return c_scope_reached(ctx, written, scope, file_len, at);
@@ -8510,6 +8524,52 @@ static const char *c_proof_class_enumerator(CLSPContext *ctx, const CBMRegistere
     return NULL;
 }
 
+/* `Color::RED`, `Mode::FAST`, `gfx::Blend::ADD`: the whole written scope names an enum the unit
+ * sees, and that enum, in that file, declares the name. */
+static void c_emit_enumerator_of_enum(CLSPContext *ctx, TSNode qualified, TSNode scope, TSNode name,
+                                      const char *text, uint32_t at) {
+    TSNode top = qualified;
+    for (int hop = 0; hop < 16; hop++) {
+        TSNode above = ts_node_parent(top);
+        if (ts_node_is_null(above) || strcmp(ts_node_type(above), "qualified_identifier"))
+            break;
+        top = above;
+    }
+    const char *whole = c_node_text(ctx, top);
+    const char *written = whole
+                              ? cbm_arena_strndup(ctx->arena, whole,
+                                                  ts_node_end_byte(scope) - ts_node_start_byte(top))
+                              : NULL;
+    const CBMRegisteredType *type =
+        written ? c_proof_follow_alias(ctx, c_proof_type_by_name(ctx, written, at)) : NULL;
+    if (!type || !type->project_source || !type->graph_qualified_name || !type->source_file_qn ||
+        !type->short_name || !c_proof_type_visible(ctx, type->qualified_name, at))
+        return;
+    const char *target = NULL;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, text); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind != CBM_C_DECL_ENUMERATOR || strcmp(decl->name, text) || !decl->target ||
+            strcmp(decl->type_name, type->short_name) || strcmp(decl->file, type->source_file_qn))
+            continue;
+        if (target && strcmp(target, decl->target))
+            return;
+        target = decl->target;
+    }
+    if (!target)
+        return;
+    cbm_resolve_result_t typed = cbm_lsp_proof_type_lookup(
+        &ctx->field_types, written, scope, "c-written-enum-scope", type->qualified_name,
+        type->declaration_identity, type->graph_qualified_name, type->source_flags,
+        "enum-named-by-the-scope");
+    typed = c_proof_type_import(ctx, type->qualified_name, at, typed);
+    if (!cbm_resolve_admit(&typed))
+        return;
+    cbm_resolve_result_t member = c_proof_member_lookup(ctx, text, name, target, typed.proof);
+    if (cbm_resolve_admit(&member))
+        c_emit_proven(ctx, &member, text, CBM_RESOLVED_VALUE_REFERENCE, name);
+}
+
 /* `Triple::UnknownOS`: the scope names a class the unit sees, and the class declares the name. */
 static void c_emit_scoped_enumerator(CLSPContext *ctx, TSNode qualified, TSNode name) {
     TSNode written_name = ts_node_child_by_field_name(qualified, "name", 4);
@@ -8523,8 +8583,11 @@ static void c_emit_scoped_enumerator(CLSPContext *ctx, TSNode qualified, TSNode 
     uint32_t at = ts_node_start_byte(name);
     const CBMRegisteredType *klass = owner ? c_proof_named_class(ctx, owner, at) : NULL;
     const char *target = klass && text ? c_proof_class_enumerator(ctx, klass, text, at, 0) : NULL;
-    if (!target)
+    if (!target) {
+        if (text)
+            c_emit_enumerator_of_enum(ctx, qualified, scope, name, text, at);
         return;
+    }
     cbm_resolve_result_t typed = cbm_lsp_proof_type_lookup(
         &ctx->field_types, owner, scope, "c-written-class-scope", klass->qualified_name,
         klass->declaration_identity, klass->graph_qualified_name, klass->source_flags,
@@ -9228,6 +9291,158 @@ static bool c_enclosing_class_declares_other(CLSPContext *ctx, const char *name,
     return false;
 }
 
+/* The `class Fwd;` in view that this written name means, if exactly one is: the name as written has
+ * to be the tail of the declared one, and what it leaves off a namespace lookup reaches from here.
+ */
+static const CBMCDecl *c_forward_class_in_view(CLSPContext *ctx, const char *name,
+                                               const char *qualified, uint32_t at,
+                                               const CTUModule **via) {
+    const char *written = qualified ? c_proof_name(ctx, qualified) : name;
+    if (!written)
+        return NULL;
+    bool rooted = qualified && qualified[0] == ':';
+    if (qualified) {
+        /* A namespace alias can change what the first segment means. */
+        size_t first = strcspn(written, ".");
+        for (int i = 0; i < ctx->ns_alias_count; i++)
+            if (!strncmp(ctx->ns_alias_names[i], written, first) && !ctx->ns_alias_names[i][first])
+                return NULL;
+    }
+    size_t written_len = strlen(written);
+    const char *own = c_own_file_key(ctx);
+    const CBMCDecl *found = NULL;
+    const CTUModule *found_via = NULL;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        size_t length = decl->kind == CBM_C_DECL_FORWARD_CLASS ? strlen(decl->name) : 0;
+        if (length < written_len || strcmp(decl->name + length - written_len, written) ||
+            (length > written_len && decl->name[length - written_len - 1] != '.'))
+            continue;
+        const CTUModule *entry = NULL;
+        if (!strcmp(decl->file, own)) {
+            const char *key =
+                cbm_arena_sprintf(ctx->arena, "$type:%s.%s", ctx->module_qn, decl->name);
+            if (!key || !c_proof_declared(ctx, key, at))
+                continue;
+        } else {
+            entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+            const CBMCFileFacts *facts = cbm_c_file_facts(ctx->c_decls, decl->file);
+            if (!entry || entry->exports_only || entry->at >= at || !facts ||
+                (facts->plain_header && !facts->cpp_syntax))
+                continue;
+        }
+        if (length > written_len) {
+            const char *scope = cbm_arena_strndup(ctx->arena, decl->name, length - written_len - 1);
+            if (rooted || !scope || !c_namespace_reached(ctx, scope, at))
+                continue;
+        }
+        if (found && strcmp(found->name, decl->name))
+            return NULL;
+        found = decl;
+        found_via = entry;
+    }
+    *via = found_via;
+    return found;
+}
+
+static bool c_type_has_relative_name(const CLSPContext *ctx, const CBMRegisteredType *type,
+                                     const char *relative) {
+    const char *qn = type->qualified_name;
+    size_t module_len =
+        type->source_file_qn ? c_file_module_len(type->source_file_qn) : ctx->module_qn_len;
+    const char *module = type->source_file_qn ? type->source_file_qn : ctx->module_qn;
+    return qn && module_len && !strncmp(qn, module, module_len) && qn[module_len] == '.' &&
+           !strcmp(qn + module_len + 1, relative);
+}
+
+/* A type found by its short name, beside a `class Fwd;` in view that is not its declaration. Lookup
+ * goes from the inside out, so the forward declaration is what the name means unless the type is
+ * nearer: a member of the class around this code, or in a namespace around it inside the
+ * declaration's. */
+static bool c_forward_class_is_nearer(CLSPContext *ctx, const CBMRegisteredType *type,
+                                      const CBMCDecl *forward, uint32_t at) {
+    const char *qn = type->qualified_name;
+    const char *module = type->source_file_qn ? type->source_file_qn : ctx->module_qn;
+    size_t module_len =
+        type->source_file_qn ? c_file_module_len(type->source_file_qn) : ctx->module_qn_len;
+    if (!qn || !module_len || strncmp(qn, module, module_len) || qn[module_len] != '.')
+        return false;
+    const char *relative = qn + module_len + 1;
+    if (!strcmp(relative, forward->name))
+        return false;
+    const char *dot = strrchr(relative, '.');
+    if (!dot)
+        return true;
+    const char *around = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
+    const char *scope = cbm_arena_strndup(ctx->arena, relative, (size_t)(dot - relative));
+    if (!around || !scope || cbm_registry_lookup_type(ctx->proof_registry, around))
+        return false;
+    if (!c_namespace_reached(ctx, scope, at))
+        return true;
+    const char *forward_dot = strrchr(forward->name, '.');
+    size_t forward_scope = forward_dot ? (size_t)(forward_dot - forward->name) : 0;
+    return (size_t)(dot - relative) < forward_scope;
+}
+
+/* The class `class Fwd;` declares, wherever it is defined: the one definition in the project of
+ * that qualified name, as for a function declared by a prototype. Several definitions are several
+ * programs in one repository, and the one whose file includes this declaration was compiled against
+ * it. A class in an anonymous namespace has no linkage, a .c file holds no C++ class, and a name
+ * something else also has, or a class the facts did not read, says the search is not complete. */
+static const CBMRegisteredType *c_forward_class_definition(CLSPContext *ctx,
+                                                           const CBMCDecl *forward) {
+    static const char none = 0;
+    if (!ctx->forward_defs)
+        ctx->forward_defs = cbm_ht_create(16);
+    const void *known = ctx->forward_defs ? cbm_ht_get(ctx->forward_defs, forward->name) : NULL;
+    if (known)
+        return known == &none ? NULL : known;
+    const char *dot = strrchr(forward->name, '.');
+    const CBMRegisteredType *chosen = NULL, *compiled_against = NULL;
+    int definitions = 0, compiled_count = 0;
+    bool complete = true;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->proof_registry, dot ? dot + 1 : forward->name, &it);
+    int index;
+    while (complete && (index = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType *candidate = &it.reg->types[index];
+        if (!candidate->project_source || !candidate->source_file_qn ||
+            !c_type_has_relative_name(ctx, candidate, forward->name))
+            continue;
+        if (c_type_is_self_alias(candidate))
+            continue;
+        const CBMCFileFacts *facts = cbm_c_file_facts(ctx->c_decls, candidate->source_file_qn);
+        size_t file_len = strlen(candidate->source_file_qn);
+        static const char c_tail[] = ".c.__file__";
+        bool c_source =
+            file_len >= sizeof(c_tail) - 1 &&
+            !strcmp(candidate->source_file_qn + file_len - (sizeof(c_tail) - 1), c_tail);
+        if (c_source || (facts && facts->plain_header && !facts->cpp_syntax))
+            continue;
+        complete = !candidate->alias_of && (candidate->source_flags & CBM_SOURCE_DECL_KNOWN) &&
+                   candidate->declaration_identity && candidate->graph_qualified_name;
+        if (!complete || (candidate->source_flags & CBM_SOURCE_DECL_STATIC))
+            continue;
+        if (chosen && !strcmp(chosen->graph_qualified_name, candidate->graph_qualified_name))
+            continue;
+        definitions++;
+        if (definitions <= 64 &&
+            c_proof_file_reaches(ctx, candidate->source_file_qn, forward->file)) {
+            compiled_against = candidate;
+            compiled_count++;
+        }
+        chosen = candidate;
+    }
+    const CBMRegisteredType *result = !complete ? NULL
+                                      : definitions > 1
+                                          ? (compiled_count == 1 ? compiled_against : NULL)
+                                          : chosen;
+    if (ctx->forward_defs)
+        cbm_ht_set(ctx->forward_defs, forward->name, result ? (void *)result : (void *)&none);
+    return result;
+}
+
 /* A written type name. Its declaration in this translation unit is the target,
  * which is a typedef's own node, not what the typedef aliases. */
 static void c_emit_type_reference(CLSPContext *ctx, TSNode node) {
@@ -9302,6 +9517,27 @@ static void c_emit_type_reference(CLSPContext *ctx, TSNode node) {
     /* A tag, which may not be the type found for that spelling. */
     if (type && is_tag && c_tag_is_other_than(ctx, type, name, qualified != NULL, at))
         return;
+    /* `class Fwd;` in view says which class this is. A namesake found by its short name in another
+     * namespace is not it, and the class need not be defined anywhere this unit includes. */
+    const CTUModule *forward_via = NULL;
+    const CBMCDecl *forward =
+        c_cxx_rules(ctx) ? c_forward_class_in_view(ctx, name, qualified, at, &forward_via) : NULL;
+    if (forward && type && c_forward_class_is_nearer(ctx, type, forward, at))
+        type = NULL;
+    if (forward && !type) {
+        const CBMRegisteredType *defined = c_forward_class_definition(ctx, forward);
+        if (!defined || c_enclosing_class_declares_other(ctx, name, defined))
+            return;
+        cbm_resolve_result_t declared = cbm_lsp_proof_type_lookup(
+            &ctx->field_types, name, node, "c-forward-declared-class", defined->qualified_name,
+            defined->declaration_identity, defined->graph_qualified_name, defined->source_flags,
+            "visible-forward-declaration;one-definition-of-that-qualified-name");
+        if (forward_via)
+            declared = c_proof_import_join(ctx, declared, forward_via->via, CBM_PROOF_TYPE_BIND);
+        if (cbm_resolve_admit(&declared))
+            c_emit_proven(ctx, &declared, name, CBM_RESOLVED_TYPE_REFERENCE, node);
+        return;
+    }
     /* A member type of the class around this code hides a namesake outside the class. */
     if (type && !qualified && ctx->cpp_mode && c_enclosing_class_declares_other(ctx, name, type))
         return;
@@ -11493,6 +11729,10 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     if (ctx->macro_defs) {
         cbm_ht_free(ctx->macro_defs);
         ctx->macro_defs = NULL;
+    }
+    if (ctx->forward_defs) {
+        cbm_ht_free(ctx->forward_defs);
+        ctx->forward_defs = NULL;
     }
     if (ctx->eval_failure && ctx->resolved_calls)
         ctx->resolved_calls->count = resolved_before;

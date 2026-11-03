@@ -30,6 +30,8 @@ typedef struct {
     bool c_language;
     /* `#ifdef __cplusplus extern "C" { #endif`: the brace the grammar cannot pair. */
     bool file_extern_c;
+    /* What is declared here has no linkage, so no other file can define or name it. */
+    bool anonymous_namespace;
     const char *module;
     CBMCFileFacts *facts;
 } csp_context_t;
@@ -402,8 +404,33 @@ static const char *csp_base_type_name(csp_context_t *ctx, TSNode type) {
 }
 
 /* Enumerators sit in file scope whichever declaration wrote them, with no linkage. */
-static void csp_note_enumerators(csp_context_t *ctx, TSNode type, const char *owner) {
-    if (!ctx->facts || !csp_is(type, "enum_specifier") || strcmp(owner, ctx->module))
+/* `enum class` keeps its enumerators inside the enum. An unscoped enum puts them in what is around
+ * it. */
+static bool csp_enum_is_scoped(TSNode type) {
+    bool scoped = false;
+    TSTreeCursor head = ts_tree_cursor_new(type);
+    if (ts_tree_cursor_goto_first_child(&head))
+        do {
+            const char *word = ts_node_type(ts_tree_cursor_current_node(&head));
+            scoped |= !strcmp(word, "class") || !strcmp(word, "struct");
+        } while (ts_tree_cursor_goto_next_sibling(&head));
+    ts_tree_cursor_delete(&head);
+    return scoped;
+}
+
+/* `typedef_name` names an enum with no tag of its own: `typedef enum { A } E;`. */
+static void csp_note_enumerators(csp_context_t *ctx, TSNode type, const char *owner,
+                                 const char *typedef_name) {
+    if (!ctx->facts || !csp_is(type, "enum_specifier"))
+        return;
+    bool at_file_scope = !strcmp(owner, ctx->module);
+    const char *tag = csp_text(ctx, csp_field(type, "name"));
+    if (!tag)
+        tag = typedef_name;
+    /* `Color::RED` needs C++. C has no way to write it. */
+    bool qualifiable = tag && !ctx->c_language;
+    bool scoped = qualifiable && csp_enum_is_scoped(type);
+    if (!at_file_scope && !qualifiable)
         return;
     TSNode list = csp_field(type, "body");
     uint32_t count = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
@@ -411,9 +438,21 @@ static void csp_note_enumerators(csp_context_t *ctx, TSNode type, const char *ow
         TSNode item = ts_node_named_child(list, i);
         const char *name =
             csp_is(item, "enumerator") ? csp_text(ctx, csp_field(item, "name")) : NULL;
-        CBMCDecl *fact = name ? csp_add_decl(ctx, CBM_C_DECL_VALUE, name, 0) : NULL;
-        if (fact)
-            fact->target = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module, name);
+        if (!name)
+            continue;
+        if (at_file_scope) {
+            CBMCDecl *fact = csp_add_decl(ctx, CBM_C_DECL_VALUE, name, 0);
+            if (fact)
+                fact->target = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module, name);
+        }
+        if (qualifiable) {
+            CBMCDecl *fact = csp_add_decl(ctx, CBM_C_DECL_ENUMERATOR, name, 0);
+            if (fact) {
+                fact->type_name = tag;
+                fact->target = scoped ? cbm_arena_sprintf(ctx->arena, "%s.%s.%s", owner, tag, name)
+                                      : cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name);
+            }
+        }
     }
 }
 
@@ -422,7 +461,7 @@ static void csp_note_enumerators(csp_context_t *ctx, TSNode type, const char *ow
 static void csp_note_values(csp_context_t *ctx, TSNode node, const char *owner) {
     if (!ctx->facts || strcmp(owner, ctx->module))
         return;
-    csp_note_enumerators(ctx, csp_field(node, "type"), owner);
+    csp_note_enumerators(ctx, csp_field(node, "type"), owner, NULL);
     bool is_extern = csp_storage_is(ctx, node, "extern");
     bool is_static = csp_storage_is(ctx, node, "static");
     const char *type_name = csp_base_type_name(ctx, csp_field(node, "type"));
@@ -1349,16 +1388,8 @@ static void csp_note_member(csp_context_t *ctx, TSNode node, const char *klass,
     csp_member_name(ctx, klass, csp_field(type, "name"), access);
     if (!csp_is(type, "enum_specifier"))
         return;
-    /* `enum class` keeps its enumerators inside the enum. An unscoped enum puts them in the
-     * class, and the graph names them there. */
-    bool scoped = false;
-    TSTreeCursor head = ts_tree_cursor_new(type);
-    if (ts_tree_cursor_goto_first_child(&head))
-        do {
-            const char *word = ts_node_type(ts_tree_cursor_current_node(&head));
-            scoped |= !strcmp(word, "class") || !strcmp(word, "struct");
-        } while (ts_tree_cursor_goto_next_sibling(&head));
-    ts_tree_cursor_delete(&head);
+    /* An unscoped enum puts its enumerators in the class, and the graph names them there. */
+    bool scoped = csp_enum_is_scoped(type);
     TSNode body = csp_field(type, "body");
     uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
@@ -1368,6 +1399,11 @@ static void csp_note_member(csp_context_t *ctx, TSNode node, const char *klass,
         CBMCDecl *fact = csp_member_name(ctx, klass, csp_field(enumerator, "name"), access);
         if (fact && !scoped && klass_qn)
             fact->target = cbm_arena_sprintf(ctx->arena, "%s.%s", klass_qn, fact->name);
+        /* C has no class scope: an enumerator declared in a struct is a name of the file. */
+        const char *name = fact && ctx->c_language ? fact->name : NULL;
+        CBMCDecl *value = name ? csp_add_decl(ctx, CBM_C_DECL_VALUE, name, 0) : NULL;
+        if (value)
+            value->target = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module, name);
     }
 }
 
@@ -1382,12 +1418,16 @@ static TSNode csp_template_parameter_name(TSNode parameter) {
         csp_is(parameter, "optional_parameter_declaration") ||
         csp_is(parameter, "variadic_parameter_declaration"))
         return null_node;
-    uint32_t count = ts_node_named_child_count(parameter);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(parameter, i);
-        if (csp_is(child, "type_identifier"))
-            return child;
+    TSTreeCursor cursor = ts_tree_cursor_new(parameter);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (; more; more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        TSNode child = ts_tree_cursor_current_node(&cursor);
+        if (csp_is(child, "type_identifier")) {
+            null_node = child;
+            break;
+        }
     }
+    ts_tree_cursor_delete(&cursor);
     return null_node;
 }
 
@@ -1397,15 +1437,22 @@ static void csp_note_template_parameters(csp_context_t *ctx, TSNode klass, const
         if (!csp_is(up, "template_declaration"))
             continue;
         TSNode list = csp_field(up, "parameters");
-        uint32_t count = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
-        for (uint32_t i = 0; i < count; i++) {
-            TSNode parameter = csp_template_parameter_name(ts_node_named_child(list, i));
+        if (ts_node_is_null(list))
+            continue;
+        TSTreeCursor cursor = ts_tree_cursor_new(list);
+        bool more = ts_tree_cursor_goto_first_child(&cursor);
+        for (; more; more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+            TSNode item = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(item))
+                continue;
+            TSNode parameter = csp_template_parameter_name(item);
             const char *text = ts_node_is_null(parameter) ? NULL : csp_text(ctx, parameter);
             CBMCDecl *fact =
                 text ? csp_add_decl(ctx, CBM_C_DECL_TEMPLATE_PARAMETER, text, 0) : NULL;
             if (fact)
                 fact->type_name = name;
         }
+        ts_tree_cursor_delete(&cursor);
     }
 }
 
@@ -1550,8 +1597,23 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
     ts_tree_cursor_delete(&cursor);
     csp_mark(ctx, node, qn,
              CBM_SOURCE_DECL_KNOWN | (complete ? CBM_SOURCE_CLASS_DOMAIN_COMPLETE : 0) |
-                 (body_complete ? CBM_SOURCE_CLASS_BODY_COMPLETE : 0),
+                 (body_complete ? CBM_SOURCE_CLASS_BODY_COMPLETE : 0) |
+                 (ctx->anonymous_namespace ? CBM_SOURCE_DECL_STATIC : 0),
              -1);
+}
+
+/* `class Fwd;` where a namespace or the file holds it. In C++ this says which class Fwd is, by its
+ * qualified name: a class has linkage, and a program has one definition of it. A C tag has no
+ * linkage, so the same words there say nothing about a struct in another file. */
+static void csp_note_forward_class(csp_context_t *ctx, TSNode node, const char *owner) {
+    TSNode name_node = csp_field(node, "name");
+    if (!ctx->facts || ctx->c_language || ctx->anonymous_namespace ||
+        !ts_node_is_null(csp_field(node, "body")) || !csp_is(name_node, "type_identifier"))
+        return;
+    const char *name = csp_text(ctx, name_node);
+    const char *relative = name ? csp_relative(ctx, owner, name) : NULL;
+    if (relative)
+        (void)csp_add_decl(ctx, CBM_C_DECL_FORWARD_CLASS, relative, 0);
 }
 /* An #ifdef that splits a function's braces leaves `bool f(int x)` and its statements loose in
  * an ERROR. Definition extraction recovers that function from the expanded source, so it has an
@@ -1717,12 +1779,14 @@ static void csp_walk(csp_context_t *ctx, TSNode node, const char *owner, unsigne
         return;
     }
     if (csp_is(node, "enum_specifier")) {
-        csp_note_enumerators(ctx, node, owner);
+        csp_note_enumerators(ctx, node, owner, NULL);
         return;
     }
     if (csp_is(node, "type_definition")) {
         TSNode type = csp_field(node, "type"), declarator = csp_field(node, "declarator");
-        csp_note_enumerators(ctx, type, owner);
+        csp_note_enumerators(ctx, type, owner,
+                             csp_is(declarator, "type_identifier") ? csp_text(ctx, declarator)
+                                                                   : NULL);
         if (csp_is(declarator, "type_identifier") && !ts_node_is_null(csp_field(type, "body")) &&
             ts_node_is_null(csp_field(type, "name")))
             (void)csp_add_decl(ctx, CBM_C_DECL_UNNAMED_TYPEDEF, csp_text(ctx, declarator), 0);
@@ -1785,6 +1849,7 @@ static void csp_walk(csp_context_t *ctx, TSNode node, const char *owner, unsigne
     }
     if (csp_is(node, "class_specifier") || csp_is(node, "struct_specifier") ||
         csp_is(node, "union_specifier")) {
+        csp_note_forward_class(ctx, node, owner);
         csp_class(ctx, node, owner, NULL);
         return;
     }
@@ -1794,7 +1859,10 @@ static void csp_walk(csp_context_t *ctx, TSNode node, const char *owner, unsigne
         /* An anonymous namespace adds no segment to what it declares, and those are seen around it.
          */
         if (ts_node_is_null(csp_field(node, "name")) && !ts_node_is_null(body)) {
+            bool saved = ctx->anonymous_namespace;
+            ctx->anonymous_namespace = true;
             csp_walk(ctx, body, owner, depth + 1);
+            ctx->anonymous_namespace = saved;
             return;
         }
         if (name && !strstr(name, "::") && !ts_node_is_null(body)) {
@@ -2019,7 +2087,10 @@ const CBMCDeclIndex *cbm_c_decl_index_build(CBMArena *arena, const CBMLSPDef *de
             *link = (CBMCDeclLink){.decl = decl, .next = index->names[bucket]};
             index->names[bucket] = link;
             /* `ns.f` is also reachable by the name a call writes. */
-            const char *leaf = decl->kind == CBM_C_DECL_PROTOTYPE ? strrchr(decl->name, '.') : NULL;
+            const char *leaf =
+                decl->kind == CBM_C_DECL_PROTOTYPE || decl->kind == CBM_C_DECL_FORWARD_CLASS
+                    ? strrchr(decl->name, '.')
+                    : NULL;
             if (leaf) {
                 bucket = csp_hash(leaf + 1) & index->name_mask;
                 link = cbm_arena_alloc(arena, sizeof(*link));

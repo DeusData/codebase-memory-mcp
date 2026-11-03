@@ -5461,6 +5461,260 @@ TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module) {
     PASS();
 }
 
+/* `class Fwd;` says which class Fwd is, by its qualified name, wherever it is defined: a C++ class has
+ * linkage, and a program has one definition of it. This is what a prototype says of a function. It is
+ * not a unique short name: `n::OtherNs` with only `m::OtherNs` in the project stays unbound. A C tag has
+ * no linkage, so `struct CStyle;` says nothing about a struct in another file. */
+#define C_TU_FW_API                                                                             \
+    "namespace x { class Vetoed { public: int z; }; }\n"                                         \
+    "namespace n { namespace near_ns { struct Hidden { int h; }; } }\n"                          \
+    "namespace n { struct Holder { struct Inner { int i; }; int member(Inner *v); }; }\n"        \
+    "namespace n {\n"                                                                            \
+    "class Fwd;\n"                                                                               \
+    "class Twice;\n"                                                                             \
+    "class TwiceInc;\n"                                                                          \
+    "class NoDef;\n"                                                                             \
+    "class InAnon;\n"                                                                            \
+    "class OtherNs;\n"                                                                           \
+    "class Vetoed;\n"                                                                            \
+    "void outside();\n"                                                                          \
+    "class Hidden;\n"                                                                            \
+    "class Inner;\n"                                                                             \
+    "template <class T> class Box;\n"                                                            \
+    "}\n"                                                                                        \
+    "class TopFwd;\n"                                                                            \
+    "class TopAnon;\n"                                                                           \
+    "class TopC;\n"                                                                              \
+    "struct CStyle;\n"
+#define C_TU_FW_USE                                                                             \
+    "#include \"fw_api.hpp\"\n"                                                                  \
+    "#include \"fw_plain.h\"\n"                                                                  \
+    "int qualified(n::Fwd *a) { return a != nullptr; }\n"                                        \
+    "class OwnFwd;\n"                                                                            \
+    "int own_file(OwnFwd *z) { return z != nullptr; }\n"                                         \
+    "void n::outside() { Fwd *y = nullptr; (void)y; }\n"                                         \
+    "int rooted(::n::Fwd *b) { return b != nullptr; }\n"                                         \
+    "int top(TopFwd *c) { return c != nullptr; }\n"                                              \
+    "int tmpl(n::Box<int> *d) { return d != nullptr; }\n"                                        \
+    "namespace n { int inside(Fwd *e) { return e != nullptr; } }\n"                              \
+    "int compiled_against(n::TwiceInc *f) { return f != nullptr; }\n"                            \
+    "namespace n { int redirected(Vetoed *g) { return g != nullptr; } }\n"                       \
+    "namespace n { namespace near_ns { int nearer(Hidden *w) { return w != nullptr; } } }\n"     \
+    "namespace n { struct Derived : Holder { int inherited(Inner *x) { return x != nullptr; } }; }\n" \
+    "int two_definitions(n::Twice *h) { return h != nullptr; }\n"                                \
+    "int no_definition(n::NoDef *i) { return i != nullptr; }\n"                                  \
+    "int in_anonymous(n::InAnon *j) { return j != nullptr; }\n"                                  \
+    "int only_another_namespace(n::OtherNs *k) { return k != nullptr; }\n"                       \
+    "int anonymous_top(TopAnon *l) { return l != nullptr; }\n"                                   \
+    "int defined_in_c(TopC *o) { return o != nullptr; }\n"                                       \
+    "int c_tag(struct CStyle *p) { return p != nullptr; }\n"                                     \
+    "int plain_header(PlainFwd *q) { return q != nullptr; }\n"                                   \
+    "int not_reached(Fwd *s) { return s != nullptr; }\n"                                         \
+    "int before_it(Later *t) { return t != nullptr; }\n"                                         \
+    "class Later;\n"                                                                             \
+    "using namespace n;\n"                                                                       \
+    "int after_using(Fwd *u) { return u != nullptr; }\n"
+static const RQ_Source C_TU_FW[] = {
+    {.path = "fw_api.hpp", .text = C_TU_FW_API},
+    {.path = "fw_plain.h", .text = "struct PlainFwd;\n"},
+    {.path = "fw_defs.hpp",
+     .text = "namespace n { class Fwd { public: int z; }; }\n"
+             "namespace n { template <class T> class Box { public: T v; }; }\n"
+             "namespace n { class Vetoed { public: int z; }; }\n"
+             "namespace m { class OtherNs { public: int z; }; }\n"
+             "class TopFwd { public: int z; };\n"
+             "class Later { public: int z; };\n"
+             "namespace n { class Inner { public: int z; }; }\n"
+             "class OwnFwd { public: int z; };\n"},
+    {.path = "fw_two_a.hpp", .text = "namespace n { class Twice { public: int z; }; }\n"},
+    {.path = "fw_two_b.hpp", .text = "namespace n { class Twice { public: int y; }; }\n"},
+    {.path = "fw_inc_a.cpp",
+     .text = "#include \"fw_api.hpp\"\nnamespace n { class TwiceInc { public: int z; }; }\n"},
+    {.path = "fw_inc_b.cpp", .text = "namespace n { class TwiceInc { public: int y; }; }\n"},
+    {.path = "fw_anon.cpp",
+     .text = "namespace { class TopAnon { public: int z; }; }\n"
+             "namespace n { namespace { class InAnon { public: int z; }; } }\n"},
+    {.path = "fw_cdef.c", .text = "struct TopC { int c; };\nstruct CStyle { int c; };\n"},
+    {.path = "fw_plain_def.cpp", .text = "struct PlainFwd { int c; };\n"},
+    {.path = "fw_use.cpp", .text = C_TU_FW_USE},
+};
+
+TEST(resolver_cpp_forward_declared_class_binds_by_qualified_name) {
+    const char *use = C_TU_FW_USE;
+    const RQ_Target fwd = {.file = "fw_defs.hpp",
+                           .suffix = "fw_defs.n.Fwd",
+                           .label = "Class",
+                           .declaration_line = 1,
+                           .declaration_text = "namespace n { class Fwd { public: int z; }; }"};
+#define FW_USE(id, caller, context, word, target_)                                              \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("fw_use.cpp", use, "fw_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .target = target_}
+#define FW_NEVER(id, caller, context, word)                                                     \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("fw_use.cpp", use, "fw_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Expected expected[] = {
+        FW_USE("qualified", "qualified", "Fwd *a", "Fwd", fwd),
+        FW_USE("rooted", "rooted", "Fwd *b", "Fwd", fwd),
+        FW_USE("in-the-namespace", "n.inside", "Fwd *e", "Fwd", fwd),
+        FW_USE("by-a-using-directive", "after_using", "Fwd *u", "Fwd", fwd),
+        FW_USE("declared-in-this-file", "own_file", "OwnFwd *z", "OwnFwd",
+               ((RQ_Target){.file = "fw_defs.hpp",
+                            .suffix = "fw_defs.OwnFwd",
+                            .label = "Class",
+                            .declaration_line = 8,
+                            .declaration_text = "class OwnFwd { public: int z; };"})),
+        FW_USE("from-a-definition-written-outside-the-namespace", "n.outside", "Fwd *y", "Fwd", fwd),
+        FW_USE("at-file-scope", "top", "TopFwd *c", "TopFwd",
+               ((RQ_Target){.file = "fw_defs.hpp",
+                            .suffix = "fw_defs.TopFwd",
+                            .label = "Class",
+                            .declaration_line = 5,
+                            .declaration_text = "class TopFwd { public: int z; };"})),
+        FW_USE("a-template", "tmpl", "Box<int> *d", "Box",
+               ((RQ_Target){.file = "fw_defs.hpp",
+                            .suffix = "fw_defs.n.Box",
+                            .label = "Class",
+                            .declaration_line = 2,
+                            .declaration_text =
+                                "namespace n { template <class T> class Box { public: T v; }; }"})),
+        FW_USE("the-one-compiled-against-it", "compiled_against", "TwiceInc *f", "TwiceInc",
+               ((RQ_Target){.file = "fw_inc_a.cpp",
+                            .suffix = "fw_inc_a.n.TwiceInc",
+                            .label = "Class",
+                            .declaration_line = 2,
+                            .declaration_text =
+                                "namespace n { class TwiceInc { public: int z; }; }"})),
+        FW_USE("a-namespace-nearer-than-the-declaration", "n.near_ns.nearer", "Hidden *w", "Hidden",
+               ((RQ_Target){.file = "fw_api.hpp",
+                            .suffix = "fw_api.n.near_ns.Hidden",
+                            .label = "Class",
+                            .declaration_line = 2,
+                            .declaration_text =
+                                "namespace n { namespace near_ns { struct Hidden { int h; }; } }"})),
+        {.case_id = "a-nested-class-over-the-namespace-s",
+         .site = C_TU_WORD("fw_api.hpp", C_TU_FW_API, "fw_api", "Inner *v", "Inner"),
+         .relation = "USAGE",
+         .target = {.file = "fw_api.hpp",
+                    .suffix = "fw_api.n.Holder.Inner",
+                    .label = "Class",
+                    .declaration_line = 3,
+                    .declaration_text = "namespace n { struct Holder { struct Inner { int i; }; int "
+                                        "member(Inner *v); }; }"}},
+        FW_USE("an-inherited-class-over-the-namespace-s", "n.Derived.inherited", "Inner *x", "Inner",
+               ((RQ_Target){.file = "fw_api.hpp",
+                            .suffix = "fw_api.n.Holder.Inner",
+                            .label = "Class",
+                            .declaration_line = 3,
+                            .declaration_text = "namespace n { struct Holder { struct Inner { int i; }; int "
+                                                "member(Inner *v); }; }"})),
+        FW_USE("the-declaration-over-a-namesake-in-view", "n.redirected", "Vetoed *g", "Vetoed",
+               ((RQ_Target){.file = "fw_defs.hpp",
+                            .suffix = "fw_defs.n.Vetoed",
+                            .label = "Class",
+                            .declaration_line = 3,
+                            .declaration_text = "namespace n { class Vetoed { public: int z; }; }"})),
+    };
+    const RQ_Forbidden forbidden[] = {
+        FW_NEVER("two-definitions-neither-compiled-against-it", "two_definitions", "Twice *h", "Twice"),
+        FW_NEVER("no-definition", "no_definition", "NoDef *i", "NoDef"),
+        FW_NEVER("a-class-in-an-anonymous-namespace", "in_anonymous", "InAnon *j", "InAnon"),
+        FW_NEVER("the-short-name-in-another-namespace", "only_another_namespace", "OtherNs *k",
+                 "OtherNs"),
+        FW_NEVER("an-anonymous-class-at-file-scope", "anonymous_top", "TopAnon *l", "TopAnon"),
+        FW_NEVER("a-struct-in-a-c-file", "defined_in_c", "TopC *o", "TopC"),
+        FW_NEVER("a-c-tag", "c_tag", "CStyle *p", "CStyle"),
+        FW_NEVER("declared-by-a-plain-header", "plain_header", "PlainFwd *q", "PlainFwd"),
+        FW_NEVER("a-namespace-not-reached", "not_reached", "Fwd *s", "Fwd"),
+        FW_NEVER("before-its-declaration", "before_it", "Later *t", "Later"),
+    };
+#undef FW_USE
+#undef FW_NEVER
+    const CTUCase fixture = {.suite = "c-tu-forward-classes",
+                             .sources = C_TU_FW,
+                             .source_count = sizeof(C_TU_FW) / sizeof(C_TU_FW[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `Color::RED`: the written scope names an enum the unit sees, and that enum declares the name. */
+#define C_TU_EN_H                                                                               \
+    "enum Color { RED, GREEN };\n"                                                               \
+    "namespace gfx {\n"                                                                          \
+    "enum Blend { ADD, MULTIPLY };\n"                                                            \
+    "enum class Tone { WARM, COLD };\n"                                                          \
+    "}\n"                                                                                        \
+    "enum class Mode { FAST, SLOW };\n"                                                          \
+    "typedef enum { T_ONE, T_TWO } TypedefEnum;\n"                                               \
+    "enum Decoy { BLUE };\n"                                                                     \
+    "enum class Other { ELSEWHERE };\n"
+#define C_TU_EN_USE                                                                             \
+    "#include \"en.hpp\"\n"                                                                      \
+    "int unscoped() { return Color::RED; }\n"                                                    \
+    "int in_namespace() { return gfx::Blend::ADD; }\n"                                           \
+    "int scoped() { return (int)Mode::FAST; }\n"                                                 \
+    "int scoped_in_namespace() { return (int)gfx::Tone::COLD; }\n"                               \
+    "int of_a_typedef() { return TypedefEnum::T_TWO; }\n"                                        \
+    "int another_enum_s() { return Color::BLUE; }\n"                                             \
+    "int another_enum_s_scoped() { return (int)Other::FAST; }\n"                                 \
+    "int enum_not_included() { return Hidden::HID; }\n"
+static const RQ_Source C_TU_EN[] = {{.path = "en.hpp", .text = C_TU_EN_H},
+                                    {.path = "en_hidden.hpp", .text = "enum Hidden { HID };\n"},
+                                    {.path = "en_use.cpp", .text = C_TU_EN_USE}};
+
+TEST(resolver_cpp_enumerator_is_read_from_the_enum_written) {
+    const char *use = C_TU_EN_USE;
+#define EN_USE(id, caller, word, suffix_, line, written)                                        \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("en_use.cpp", use, "en_use." caller, word, word),                         \
+     .relation = "USAGE",                                                                        \
+     .target = {.file = "en.hpp",                                                                \
+                .suffix = suffix_,                                                               \
+                .label = "Variable",                                                             \
+                .declaration_line = line,                                                        \
+                .declaration_text = written}}
+#define EN_NEVER(id, caller, context, word)                                                     \
+    {.case_id = id,                                                                              \
+     .site = C_TU_WORD("en_use.cpp", use, "en_use." caller, context, word),                      \
+     .relation = "USAGE",                                                                        \
+     .any_target = true}
+    const RQ_Expected expected[] = {
+        EN_USE("unscoped", "unscoped", "RED", "en.RED", 1, "enum Color { RED, GREEN };"),
+        EN_USE("in-a-namespace", "in_namespace", "ADD", "en.gfx.ADD", 3,
+               "enum Blend { ADD, MULTIPLY };"),
+        EN_USE("scoped", "scoped", "FAST", "en.Mode.FAST", 6, "enum class Mode { FAST, SLOW };"),
+        EN_USE("scoped-in-a-namespace", "scoped_in_namespace", "COLD", "en.gfx.Tone.COLD", 4,
+               "enum class Tone { WARM, COLD };"),
+        EN_USE("of-a-typedef", "of_a_typedef", "T_TWO", "en.T_TWO", 7,
+               "typedef enum { T_ONE, T_TWO } TypedefEnum;"),
+    };
+    const RQ_Forbidden forbidden[] = {
+        EN_NEVER("an-enumerator-of-another-enum", "another_enum_s", "BLUE", "BLUE"),
+        EN_NEVER("a-name-the-enum-does-not-declare", "another_enum_s_scoped", "Other::FAST", "FAST"),
+        EN_NEVER("an-enum-this-unit-does-not-see", "enum_not_included", "HID", "HID"),
+    };
+#undef EN_USE
+#undef EN_NEVER
+    const CTUCase fixture = {.suite = "c-tu-qualified-enumerators",
+                             .sources = C_TU_EN,
+                             .source_count = sizeof(C_TU_EN) / sizeof(C_TU_EN[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 /* `enum class E : int;` in a block is a lone tag with no enumerators: reading them from the body it does
  * not have was a null dereference. A worker that crashes on one file has that file quarantined and the
  * index still reports success, so a repository lost the file silently until a second such file made the
@@ -5504,6 +5758,212 @@ TEST(resolver_cpp_opaque_enum_in_a_block_does_not_crash_and_hides_the_outer_one)
                              .forbidden_count = 2};
     for (int driver = 0; driver < 2; driver++)
         ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* `enum Kind { #define E(x) x, / #include "x.inc" };`: with both in the body, or two `#include`s, the
+ * parse breaks there and everything after it in the file lost its namespace: InstrProf.h, Type.h.
+ * `enum E pick(void)` and `enum E e = A;` have no body, so a directive after them stays where it is. */
+#define C_TU_ENUM_DIRECTIVES                                                                    \
+    "namespace ns {\n"                                                                           \
+    "enum Kind {\n"                                                                              \
+    "// the kinds; {see} below\n"                                                                \
+    "/* and; {here} */\n"                                                                        \
+    "#define ENTRY(k) k,\n"                                                                      \
+    "#include \"kinds.inc\"\n"                                                                   \
+    "#undef ENTRY\n"                                                                             \
+    "};\n"                                                                                       \
+    "enum Twin {\n"                                                                              \
+    "#include \"twin_a.inc\"\n"                                                                  \
+    "#include \"twin_b.inc\"\n"                                                                  \
+    "};\n"                                                                                       \
+    "class Later { public: int z; };\n"                                                          \
+    "int after_the_enum(Later *l) { return l->z; }\n"                                            \
+    "enum Kind pick(void) {\n"                                                                   \
+    "#define LOCAL_RESULT ((enum Kind)0)\n"                                                      \
+    "  return LOCAL_RESULT;\n"                                                                   \
+    "}\n"                                                                                        \
+    "int helper(void) { return 1; }\n"                                                           \
+    "#define CALLS_HELPER helper()\n"                                                            \
+    "int macro_after_a_function(void) { return CALLS_HELPER; }\n"                                \
+    "}\n"
+/* A `#define` alone parses where it stands, so nothing is taken out of this body and the name in it
+ * is still read. */
+#define C_TU_ENUM_DEFINE_ALONE                                                                  \
+    "enum tcp_state {\n"                                                                         \
+    "  STATE_OPEN = 0,\n"                                                                        \
+    "  STATE_LOSS = 1\n"                                                                         \
+    "#define STATEF_LOSS (1 << STATE_LOSS)\n"                                                    \
+    "};\n"
+static const RQ_Source C_TU_ENUM_DIR[] = {{.path = "enumdir.hpp", .text = C_TU_ENUM_DIRECTIVES},
+                                          {.path = "enumkeep.h", .text = C_TU_ENUM_DEFINE_ALONE}};
+
+TEST(resolver_cpp_enum_holding_a_define_and_an_include_keeps_the_namespace) {
+    const char *source = C_TU_ENUM_DIRECTIVES;
+    const char *alone = C_TU_ENUM_DEFINE_ALONE;
+    const RQ_Expected expected[] = {
+        {.case_id = "the-class-after-it-keeps-the-namespace",
+         .site = C_TU_WORD("enumdir.hpp", source, "enumdir.ns.after_the_enum", "Later *l", "Later"),
+         .relation = "USAGE",
+         .target = {.file = "enumdir.hpp",
+                    .suffix = "enumdir.ns.Later",
+                    .label = "Class",
+                    .declaration_line = 13,
+                    .declaration_text = "class Later { public: int z; };"}},
+        {.case_id = "and-a-member-of-it",
+         .site = C_TU_WORD("enumdir.hpp", source, "enumdir.ns.after_the_enum", "l->z", "z"),
+         .relation = "USAGE",
+         .target = {.file = "enumdir.hpp",
+                    .suffix = "enumdir.ns.Later.z",
+                    .label = "Field",
+                    .declaration_line = 13,
+                    .declaration_text = "class Later { public: int z; };"}},
+        {.case_id = "a-define-alone-in-the-body-is-left-in-place",
+         .site = C_TU_WORD("enumkeep.h", alone, "enumkeep", "(1 << STATE_LOSS)", "STATE_LOSS"),
+         .relation = "USAGE",
+         .target = {.file = "enumkeep.h",
+                    .suffix = "enumkeep.STATE_LOSS",
+                    .label = "Variable",
+                    .declaration_line = 3,
+                    .declaration_text = "  STATE_LOSS = 1"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-enum-directives",
+                             .sources = C_TU_ENUM_DIR,
+                             .source_count = 2,
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* A brace opened in one conditional block and closed in another. Short ones survive, so the members
+ * after it are what this needs: past a dozen, error recovery cost DeclSpec.h its whole namespace. How
+ * the second condition is spelled does not matter. With an `#else` there are two versions of the
+ * text, and that form keeps the namespace without any help: it must not be helped. */
+#define C_TU_SPLIT_MEMBERS                                                                      \
+    "  void setA(bool V) { A = V; }\n  bool getA() const { return A; }\n"                         \
+    "  void setB(bool V) { B = V; }\n  bool getB() const { return B; }\n"                         \
+    "  void setC(bool V) { C = V; }\n  bool getC() const { return C; }\n"                         \
+    "  void setD(bool V) { D = V; }\n  bool getD() const { return D; }\n"                         \
+    "  void setE(bool V) { E = V; }\n  bool getE() const { return E; }\n"                         \
+    "  void setF(bool V) { F = V; }\n  bool getF() const { return F; }\n"                         \
+    "  void setG(bool V) { G = V; }\n  bool getG() const { return G; }\n"                         \
+    "  void setH(bool V) { H = V; }\n  bool getH() const { return H; }\n"
+#define C_TU_SPLIT_TAIL                                                                         \
+    "};\n"                                                                                       \
+    "class Later { public: int z; };\n"                                                          \
+    "int after_the_block(Later *l) { return l->z; }\n"                                           \
+    "}\n"
+#define C_TU_SPLIT_UNION                                                                        \
+    "namespace ns {\nclass Holder {\n#ifndef X\n  union {\n#endif\n    int a;\n#ifndef X\n  };\n" \
+    "#endif\n" C_TU_SPLIT_MEMBERS C_TU_SPLIT_TAIL
+#define C_TU_SPLIT_SPELLED                                                                      \
+    "namespace ns {\nclass Holder {\n#ifndef X\n  union {\n#endif\n    int a;\n#if !defined(X)\n" \
+    "  };\n#endif\n" C_TU_SPLIT_MEMBERS C_TU_SPLIT_TAIL
+#define C_TU_SPLIT_ELSE                                                                         \
+    "namespace ns {\nclass Holder {\n#ifdef X\n  struct A {\n#else\n  struct B {\n#endif\n"       \
+    "    int a;\n#ifdef X\n  };\n#else\n  };\n#endif\n" C_TU_SPLIT_MEMBERS C_TU_SPLIT_TAIL
+static const RQ_Source C_TU_SPLIT[] = {{.path = "split_union.hpp", .text = C_TU_SPLIT_UNION},
+                                       {.path = "split_spelled.hpp", .text = C_TU_SPLIT_SPELLED},
+                                       {.path = "split_else.hpp", .text = C_TU_SPLIT_ELSE}};
+
+TEST(resolver_cpp_brace_split_across_conditionals_keeps_the_namespace) {
+    const char *with_union = C_TU_SPLIT_UNION;
+    const char *spelled = C_TU_SPLIT_SPELLED;
+    const char *with_else = C_TU_SPLIT_ELSE;
+#define SPLIT_ROWS(id, stem, text, line)                                                        \
+    {.case_id = id "-class",                                                                     \
+     .site = C_TU_WORD(stem ".hpp", text, stem ".ns.after_the_block", "Later *l", "Later"),      \
+     .relation = "USAGE",                                                                        \
+     .target = {.file = stem ".hpp",                                                             \
+                .suffix = stem ".ns.Later",                                                      \
+                .label = "Class",                                                                \
+                .declaration_line = line,                                                        \
+                .declaration_text = "class Later { public: int z; };"}},                         \
+    {                                                                                            \
+        .case_id = id "-member",                                                                 \
+        .site = C_TU_WORD(stem ".hpp", text, stem ".ns.after_the_block", "l->z", "z"),           \
+        .relation = "USAGE",                                                                     \
+        .target = {.file = stem ".hpp",                                                          \
+                   .suffix = stem ".ns.Later.z",                                                 \
+                   .label = "Field",                                                             \
+                   .declaration_line = line,                                                     \
+                   .declaration_text = "class Later { public: int z; };"},                       \
+    }
+    const RQ_Expected expected[] = {
+        SPLIT_ROWS("split-union", "split_union", with_union, 27),
+        SPLIT_ROWS("split-spelled-differently", "split_spelled", spelled, 27),
+        SPLIT_ROWS("two-versions-left-alone", "split_else", with_else, 31),
+    };
+#undef SPLIT_ROWS
+    const CTUCase fixture = {.suite = "c-tu-split-block",
+                             .sources = C_TU_SPLIT,
+                             .source_count = 3,
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Whether or not the `#include` is in the tree, the preprocessor takes it and it is an edge of this
+ * file. The path ends at its quote, whatever follows, and neither a computed path nor another
+ * directive nor one in a comment is an include. */
+static int c_imports_of_exactly(const CBMFileResult *result, const char *path) {
+    int count = 0;
+    for (int i = 0; i < result->imports.count; i++)
+        count += result->imports.items[i].module_path &&
+                 !strcmp(result->imports.items[i].module_path, path);
+    return count;
+}
+
+TEST(resolver_cpp_include_in_an_enum_body_stays_an_import) {
+    static const char source[] = C_TU_ENUM_DIRECTIVES;
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_CPP, "p", "enumdir.hpp", 0, NULL, NULL);
+    ASSERT(result != NULL);
+    ASSERT_EQ(c_imports_of_exactly(result, "kinds.inc"), 1);
+    ASSERT_EQ(c_imports_of_exactly(result, "twin_a.inc"), 1);
+    ASSERT_EQ(c_imports_of_exactly(result, "twin_b.inc"), 1);
+    cbm_free_result(result);
+    /* A namespace is no place the grammar lacks: this one is a plain `#include`, inside. */
+    static const char in_namespace[] = "namespace n {\n#include \"tables.inc\"\n}\n";
+    CBMFileResult *inside = cbm_extract_file(in_namespace, (int)strlen(in_namespace), CBM_LANG_CPP, "p",
+                                             "tables.hpp", 0, NULL, NULL);
+    ASSERT(inside != NULL);
+    ASSERT_EQ(c_imports_of_exactly(inside, "tables.inc"), 1);
+    cbm_free_result(inside);
+    /* One directive to a body, so that it is this read and no other that finds it. */
+    static const struct {
+        const char *source, *path, *site;
+    } shapes[] = {
+        {"enum S {\n#include \"trailing.h\" // why\n};\n", "trailing.h", "\"trailing.h\""},
+        {"enum S {\n#  include <sys/angle.h>\n};\n", "sys/angle.h", "<sys/angle.h>"},
+        {"enum S {\n#include COMPUTED_PATH\n};\n", NULL, NULL},
+        {"enum S {\n#pragma \"not_an_include.h\"\n};\n", NULL, NULL},
+        {"enum S {\n#include_nothing \"nor_this.h\"\n};\n", NULL, NULL},
+        {"struct S {\n#include \"fields.inc\"\n};\n", "fields.inc", "\"fields.inc\""},
+        {"struct S {\n#pragma \"not_an_include.h\"\n};\n", NULL, NULL},
+        {"enum S {\nA,\n// #include \"said.h\"\n/*\n#include \"block.h\"\n*/\nB\n};\n", NULL, NULL},
+    };
+    const CBMLanguage languages[] = {CBM_LANG_C, CBM_LANG_CPP};
+    for (size_t l = 0; l < sizeof(languages) / sizeof(languages[0]); l++) {
+        for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+            const char *text = shapes[i].source;
+            CBMFileResult *shaped =
+                cbm_extract_file(text, (int)strlen(text), languages[l], "p", "shapes.h", 0, NULL, NULL);
+            ASSERT(shaped != NULL);
+            ASSERT_EQ(shaped->imports.count, shapes[i].path ? 1 : 0);
+            if (shapes[i].path) {
+                const CBMImport *import = &shaped->imports.items[0];
+                ASSERT_STR_EQ(import->module_path, shapes[i].path);
+                ASSERT_EQ(import->site_end_byte - import->site_start_byte, strlen(shapes[i].site));
+                ASSERT(!strncmp(text + import->site_start_byte, shapes[i].site, strlen(shapes[i].site)));
+            }
+            cbm_free_result(shaped);
+        }
+    }
     PASS();
 }
 
@@ -6733,8 +7193,13 @@ SUITE(resolver_c) {
     RUN_TEST(resolver_cpp_template_field_reads_the_template_and_not_its_parameter_spelling);
     RUN_TEST(resolver_c_struct_tag_is_a_use_unless_it_declares);
     RUN_TEST(resolver_c_lone_tag_is_no_occurrence);
+    RUN_TEST(resolver_cpp_enum_holding_a_define_and_an_include_keeps_the_namespace);
+    RUN_TEST(resolver_cpp_brace_split_across_conditionals_keeps_the_namespace);
+    RUN_TEST(resolver_cpp_include_in_an_enum_body_stays_an_import);
     RUN_TEST(resolver_cpp_opaque_enum_in_a_block_does_not_crash_and_hides_the_outer_one);
     RUN_TEST(resolver_c_lone_tag_under_a_directive_is_no_occurrence);
+    RUN_TEST(resolver_cpp_forward_declared_class_binds_by_qualified_name);
+    RUN_TEST(resolver_cpp_enumerator_is_read_from_the_enum_written);
     RUN_TEST(resolver_cpp_tag_in_a_header_is_looked_up_from_its_own_module);
     RUN_TEST(resolver_c_a_static_left_in_an_error_stays_static);
     RUN_TEST(resolver_c_text_defines_macro_reads_to_the_end_of_the_text);

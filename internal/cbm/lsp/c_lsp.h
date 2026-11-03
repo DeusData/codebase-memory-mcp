@@ -50,6 +50,7 @@ typedef struct {
     bool macro_args_of_macro;
     /* Name to CMacroDefs: the definitions in this translation unit, each name scanned once. */
     struct CBMHashTable *macro_defs;
+    struct CBMHashTable *forward_defs; /* per `class Fwd;` in view: its one definition */
     bool macro_defs_ready;
     const cbm_resolve_import_snapshot_t *import_facts;
     bool require_import_proofs;

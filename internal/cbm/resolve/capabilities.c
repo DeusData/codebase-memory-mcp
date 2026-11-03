@@ -311,9 +311,10 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                           "with separate nodes, a template's dependent names, specialized class "
                           "templates, ADL with a second visible function, callable-field "
                           "selection, what only some definitions of a macro name, a name that is "
-                          "a macro in one preprocessor branch and a function in another, and a "
-                          "macro that an included header the index cannot read may redefine "
-                          "abstain.";
+                          "a macro in one preprocessor branch and a function in another, a macro "
+                          "that an included header the index cannot read may redefine, a C tag "
+                          "that is only forward-declared, and a forward-declared C++ class with "
+                          "competing definitions abstain.";
         break;
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
