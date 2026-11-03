@@ -2170,6 +2170,57 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
     PASS();
 }
 
+/* #2000, end to end: functions declared after an inline-HTML block reach the
+ * store with their CALLS edges, in the same file and across files. */
+TEST(pipeline_php_inline_html_calls_resolve_issue2000) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    static const struct {
+        const char *name;
+        const char *body;
+    } files[] = {
+        {"inline_html.php", "<?php\n"
+                            "function gamma() { return 2; }\n"
+                            "?>\n"
+                            "<div class=\"box\">\n"
+                            "  <p>plain markup after the closing tag</p>\n"
+                            "</div>\n"
+                            "<?php\n"
+                            "function delta() { return gamma(); }\n"},
+        {"price_helpers.php",
+         "<!-- shared helpers -->\n"
+         "<?php\n"
+         "function formatPrice($cents) { return number_format($cents / 100, 2); }\n"},
+        {"card_view.php", "<?php $title = 'Cards'; ?>\n"
+                          "<h1><?= $title ?></h1>\n"
+                          "<?php\n"
+                          "function renderCard($item) { return formatPrice($item['cents']); }\n"},
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        write_temp_file(g_tmpdir, files[i].name, files[i].body);
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test_php_inline_html.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT(cross_file_call_exists(s, project, "delta", "gamma"));
+    ASSERT(cross_file_call_exists(s, project, "renderCard", "formatPrice"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Terraform reference resolution, end to end.
  *
  * An HCL block names itself with its labels appended -- find_hcl_block_name
@@ -21140,8 +21191,9 @@ static int pyn_run_init_collision(int fillers) {
             const char *project = cbm_pipeline_project_name(p);
             imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
                                     "src.rowpkg.layout.Layout", "IMPORTS");
+            /* Layout defines __init__, so Layout("demo") targets it (#1642). */
             calls[run] = pyn_edge(s, project, "tests.test_app.test_build",
-                                  "src.rowpkg.layout.Layout", "CALLS");
+                                  "src.rowpkg.layout.Layout.__init__", "CALLS");
             method[run] = pyn_edge(s, project, "tests.test_app.test_build",
                                    "src.rowpkg.layout.Layout.create", "CALLS");
             cbm_store_close(s);
@@ -21160,7 +21212,7 @@ static int pyn_run_init_collision(int fillers) {
     for (int run = 0; run < 2; run++) {
         ASSERT_EQ(rc[run], 0);
         ASSERT_TRUE(imports[run]); /* the class stays importable */
-        ASSERT_TRUE(calls[run]);   /* Layout("demo") */
+        ASSERT_TRUE(calls[run]);   /* Layout("demo") -> Layout.__init__ */
         ASSERT_TRUE(method[run]);  /* .create() through the constructed type */
     }
     PASS();
@@ -22228,6 +22280,423 @@ static int pipeline_legacy_c_identity_index_is_rebuilt(int legacy_version) {
     PASS();
 }
 
+/* #759: index a Next.js App Router tree as project "nextjs" (a full index, or
+ * the incremental route a stored index of the same tree takes). */
+static int nextjs_index(const char *repo, const char *db_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "nextjs");
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+/* Every Route of a stored index with each handler that HANDLES it, one sorted
+ * line each: "METHOD path route_qn file_path handler_qn". A Route no handler
+ * reaches ends in "-". The properties are parsed (json_extract): a Route not
+ * from route metadata is marked "!source", a handler declared in another file
+ * "!file", a HANDLES edge whose handler property is not its handler's QN
+ * "!handler"; malformed JSON fails the query. */
+static bool nextjs_route_tuples(const char *db_path, char *out, size_t sz) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(
+            db,
+            "SELECT coalesce(group_concat(t, char(10)), '') FROM (SELECT "
+            "json_extract(r.properties,'$.method') || ' ' || r.name || ' ' || r.qualified_name || "
+            "' ' || r.file_path || ' ' || coalesce(h.qualified_name, '-') || CASE WHEN "
+            "json_extract(r.properties,'$.source') = 'decorator' THEN '' ELSE ' !source' END || "
+            "CASE WHEN h.id IS NULL OR h.file_path = r.file_path THEN '' ELSE ' !file' END || "
+            "CASE WHEN e.id IS NULL OR json_extract(e.properties,'$.handler') = h.qualified_name "
+            "THEN '' ELSE ' !handler' END AS t FROM nodes r LEFT JOIN edges e ON "
+            "e.target_id=r.id AND e.type='HANDLES' LEFT JOIN nodes h ON h.id=e.source_id WHERE "
+            "r.label='Route' ORDER BY t)",
+            -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out, sz, "%s", (const char *)sqlite3_column_text(st, 0));
+        ok = true;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return ok;
+}
+
+static int nextjs_by_qn(const void *a, const void *b) {
+    return strcmp(((const cbm_search_result_t *)a)->node.qualified_name,
+                  ((const cbm_search_result_t *)b)->node.qualified_name);
+}
+
+/* The Routes a search by label Route and declaring-file glob finds, one
+ * "qualified_name file_path" line each in QN order. */
+static bool nextjs_found_routes(const char *db_path, const char *glob, char *out, size_t sz) {
+    cbm_store_t *s = cbm_store_open_path_existing(db_path);
+    if (!s) {
+        return false;
+    }
+    cbm_search_params_t params = {.project = "nextjs",
+                                  .label = "Route",
+                                  .file_pattern = glob,
+                                  .min_degree = -1,
+                                  .max_degree = -1,
+                                  .limit = 100};
+    cbm_search_output_t res = {0};
+    bool ok = cbm_store_search(s, &params, &res) == CBM_STORE_OK;
+    if (ok && res.count > 1) {
+        qsort(res.results, (size_t)res.count, sizeof(res.results[0]), nextjs_by_qn);
+    }
+    size_t len = 0;
+    out[0] = '\0';
+    for (int i = 0; ok && i < res.count; i++) {
+        int n = snprintf(out + len, sz - len, "%s%s %s", i ? "\n" : "",
+                         res.results[i].node.qualified_name, res.results[i].node.file_path);
+        ok = n >= 0 && (size_t)n < sz - len;
+        len += ok ? (size_t)n : 0;
+    }
+    cbm_store_search_free(&res);
+    cbm_store_close(s);
+    return ok;
+}
+
+/* One index of a Next.js tree: its result, the route it took and the stored
+ * Routes after it (nextjs_route_tuples). */
+typedef struct {
+    int rc;
+    cbm_incremental_route_t route;
+    bool read;
+    char tuples[1024];
+} nextjs_run_t;
+
+static void nextjs_run(const char *repo, const char *db_path, nextjs_run_t *run) {
+    run->rc = nextjs_index(repo, db_path);
+    run->route = cbm_pipeline_incremental_test_last_route();
+    run->read = nextjs_route_tuples(db_path, run->tuples, sizeof(run->tuples));
+}
+
+/* #759: the HTTP verb Functions a Next.js route file exports HANDLE the Routes
+ * its directories name, in the stored graph: a dynamic segment, a group, a
+ * catch-all and the root, under src/app/ and app/. Each Route is there once,
+ * with its file, from its own handler, whose HANDLES property is its QN. A
+ * search by label Route and the declaring file's glob finds them. `fillers`
+ * more files put the index on the parallel extraction path. */
+static int nextjs_persisted_contract(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_routes_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "lib/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+    write_temp_file(tmp, "src/app/api/users/[id]/route.ts",
+                    "export function GET() {\n  return 1;\n}\n"
+                    "export const POST = async () => 1;\n");
+    write_temp_file(tmp, "src/app/(public)/api/[org]/users/[id]/route.ts",
+                    "export async function GET() {\n  return 2;\n}\n");
+    write_temp_file(tmp, "app/api/[...slug]/route.ts", "export function GET() {\n  return 3;\n}\n");
+    write_temp_file(tmp, "app/route.js", "export function GET() {\n  return 4;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    char found[1024];
+    bool searched =
+        nextjs_found_routes(db_path, "src/app/api/users/*/route.ts", found, sizeof(found));
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_TRUE(full.read);
+    ASSERT_STR_EQ(
+        full.tuples,
+        "GET / __route__GET__/ app/route.js nextjs.app.route.GET\n"
+        "GET /api/*slug __route__GET__/api/*slug app/api/[...slug]/route.ts "
+        "nextjs.app.api.[...slug].route.GET\n"
+        "GET /api/:org/users/:id __route__GET__/api/{}/users/{} "
+        "src/app/(public)/api/[org]/users/[id]/route.ts "
+        "nextjs.src.app.(public).api.[org].users.[id].route.GET\n"
+        "GET /api/users/:id __route__GET__/api/users/{} src/app/api/users/[id]/route.ts "
+        "nextjs.src.app.api.users.[id].route.GET\n"
+        "POST /api/users/:id __route__POST__/api/users/{} src/app/api/users/[id]/route.ts "
+        "nextjs.src.app.api.users.[id].route.POST");
+    ASSERT_TRUE(searched);
+    ASSERT_STR_EQ(found, "__route__GET__/api/users/{} src/app/api/users/[id]/route.ts\n"
+                         "__route__POST__/api/users/{} src/app/api/users/[id]/route.ts");
+    PASS();
+}
+
+TEST(pipeline_nextjs_persisted_route_contract_issue759) {
+    return nextjs_persisted_contract(0);
+}
+
+TEST(pipeline_nextjs_persisted_route_contract_parallel_issue759) {
+    return nextjs_persisted_contract(52);
+}
+
+/* #759 over the life of a route file. Each step re-indexes the stored graph;
+ * after each, the file's current handlers are its only Routes, each once, and
+ * an unrelated route file keeps its Route. An unchanged tree is a no-op, and a
+ * change to another file rebuilds the unchanged route files' Routes from their
+ * stored handlers (pass_route_nodes.c), which a search still finds. */
+TEST(pipeline_nextjs_incremental_lifecycle_issue759) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_life_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app/api/items/route.ts",
+                    "export function GET() {\n  return 1;\n}\n"
+                    "export async function POST() {\n  return 2;\n}\n");
+    write_temp_file(tmp, "app/api/health/route.ts", "export const GET = () => 'ok';\n");
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 1;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    nextjs_run_t same;
+    nextjs_run(tmp, db_path, &same);
+    char found_same[1024];
+    bool searched_same =
+        nextjs_found_routes(db_path, "app/api/*/route.ts", found_same, sizeof(found_same));
+
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 2;\n}\n");
+    nextjs_run_t helper_only;
+    nextjs_run(tmp, db_path, &helper_only);
+    char found_repair[1024];
+    bool searched_repair =
+        nextjs_found_routes(db_path, "app/api/*/route.ts", found_repair, sizeof(found_repair));
+
+    write_temp_file(tmp, "app/api/items/route.ts", "export function GET() {\n  return 1;\n}\n");
+    nextjs_run_t no_post;
+    nextjs_run(tmp, db_path, &no_post);
+
+    write_temp_file(tmp, "app/api/items/route.ts",
+                    "export function GET() {\n  const n = 10;\n  return n;\n}\n");
+    nextjs_run_t new_body;
+    nextjs_run(tmp, db_path, &new_body);
+
+    write_temp_file(tmp, "app/api/items/route.ts", "export function PATCH() {\n  return 3;\n}\n");
+    nextjs_run_t patch;
+    nextjs_run(tmp, db_path, &patch);
+
+    write_temp_file(tmp, "app/api/products/route.ts",
+                    "export function PATCH() {\n  return 3;\n}\n");
+    stem_unlink(tmp, "app/api/items/route.ts");
+    nextjs_run_t moved;
+    nextjs_run(tmp, db_path, &moved);
+
+    write_temp_file(tmp, "app/api/products/[id]/route.ts",
+                    "export function PATCH() {\n  return 3;\n}\n");
+    stem_unlink(tmp, "app/api/products/route.ts");
+    nextjs_run_t dynamic;
+    nextjs_run(tmp, db_path, &dynamic);
+
+    stem_unlink(tmp, "app/api/products/[id]/route.ts");
+    nextjs_run_t deleted;
+    nextjs_run(tmp, db_path, &deleted);
+    th_rmtree(tmp);
+
+    static const char health[] = "GET /api/health __route__GET__/api/health "
+                                 "app/api/health/route.ts nextjs.app.api.health.route.GET";
+    static const char routes[] = "GET /api/health __route__GET__/api/health "
+                                 "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                 "GET /api/items __route__GET__/api/items app/api/items/route.ts "
+                                 "nextjs.app.api.items.route.GET\n"
+                                 "POST /api/items __route__POST__/api/items app/api/items/route.ts "
+                                 "nextjs.app.api.items.route.POST";
+    static const char get_only[] = "GET /api/health __route__GET__/api/health "
+                                   "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                   "GET /api/items __route__GET__/api/items app/api/items/route.ts "
+                                   "nextjs.app.api.items.route.GET";
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_TRUE(full.read);
+    ASSERT_STR_EQ(full.tuples, routes);
+    ASSERT_EQ(same.rc, 0);
+    ASSERT_EQ(same.route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_STR_EQ(same.tuples, routes);
+    ASSERT_TRUE(searched_same);
+    ASSERT_STR_EQ(found_same, "__route__GET__/api/health app/api/health/route.ts\n"
+                              "__route__GET__/api/items app/api/items/route.ts\n"
+                              "__route__POST__/api/items app/api/items/route.ts");
+    ASSERT_EQ(helper_only.rc, 0);
+    ASSERT_EQ(helper_only.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_STR_EQ(helper_only.tuples, routes);
+    ASSERT_TRUE(searched_repair);
+    ASSERT_STR_EQ(found_repair, found_same);
+    ASSERT_EQ(no_post.rc, 0);
+    ASSERT_EQ(no_post.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_STR_EQ(no_post.tuples, get_only);
+    ASSERT_EQ(new_body.rc, 0);
+    ASSERT_EQ(new_body.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_STR_EQ(new_body.tuples, get_only);
+    ASSERT_EQ(patch.rc, 0);
+    ASSERT_STR_EQ(patch.tuples, "GET /api/health __route__GET__/api/health "
+                                "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                "PATCH /api/items __route__PATCH__/api/items "
+                                "app/api/items/route.ts nextjs.app.api.items.route.PATCH");
+    ASSERT_EQ(moved.rc, 0);
+    ASSERT_STR_EQ(moved.tuples, "GET /api/health __route__GET__/api/health "
+                                "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                "PATCH /api/products __route__PATCH__/api/products "
+                                "app/api/products/route.ts nextjs.app.api.products.route.PATCH");
+    ASSERT_EQ(dynamic.rc, 0);
+    ASSERT_STR_EQ(dynamic.tuples,
+                  "GET /api/health __route__GET__/api/health "
+                  "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                  "PATCH /api/products/:id __route__PATCH__/api/products/{} "
+                  "app/api/products/[id]/route.ts nextjs.app.api.products.[id].route.PATCH");
+    ASSERT_EQ(deleted.rc, 0);
+    ASSERT_STR_EQ(deleted.tuples, health);
+    PASS();
+}
+
+/* CBM_SEMANTIC_INDEX_VERSION 13 (#759): an index version 12 wrote has no route
+ * metadata, Route or HANDLES for a Next.js route file, and an unchanged tree
+ * is otherwise a no-op, so the version is what makes the new binary rebuild
+ * it. The stored index is put back to the version-12 state by hand (metadata,
+ * the handlers' route properties, the Routes and their edges); the run after
+ * that must replace it in full, the next one is a no-op. */
+TEST(pipeline_nextjs_semantic_upgrade_issue759) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_upgrade_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app/api/items/route.ts",
+                    "export function GET() {\n  return 1;\n}\n"
+                    "export const POST = async () => 2;\n");
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 1;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+    static const char all_nodes[] = "SELECT COUNT(*) FROM nodes";
+    static const char all_edges[] = "SELECT COUNT(*) FROM edges";
+    static const char routed[] =
+        "SELECT COUNT(*) FROM nodes WHERE json_extract(properties,'$.route_path') IS NOT NULL";
+
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    int nodes_before = k8s_inc_count(db_path, all_nodes);
+    int edges_before = k8s_inc_count(db_path, all_edges);
+
+    /* Put the published index back to what version 12 wrote. */
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    int coverage_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, "nextjs", &coverage_rows, &coverage_count),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, "nextjs", &meta), CBM_STORE_OK);
+    cbm_coverage_meta_t old_meta = meta;
+    old_meta.coverage_version = 12;
+    ASSERT_EQ(
+        cbm_store_coverage_replace_ex(store, "nextjs", coverage_rows, coverage_count, &old_meta),
+        CBM_STORE_OK);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
+    cbm_store_coverage_meta_clear(&meta);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "DELETE FROM edges WHERE source_id IN (SELECT id FROM nodes WHERE "
+                             "label = 'Route') OR target_id IN (SELECT id FROM nodes WHERE "
+                             "label = 'Route');"
+                             "DELETE FROM nodes WHERE label = 'Route';"
+                             "UPDATE nodes SET properties = json_remove(properties, "
+                             "'$.route_path', '$.route_method') "
+                             "WHERE json_extract(properties, '$.route_path') IS NOT NULL;"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+    nextjs_run_t version_12 = {0};
+    version_12.read = nextjs_route_tuples(db_path, version_12.tuples, sizeof(version_12.tuples));
+    int routed_12 = k8s_inc_count(db_path, routed);
+
+    /* Nothing in the tree changed: only the version says the index is stale. */
+    nextjs_run_t upgrade;
+    nextjs_run(tmp, db_path, &upgrade);
+    int nodes_after = k8s_inc_count(db_path, all_nodes);
+    int edges_after = k8s_inc_count(db_path, all_edges);
+    int routed_after = k8s_inc_count(db_path, routed);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t new_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, "nextjs", &new_meta), CBM_STORE_OK);
+    int stored_version = new_meta.coverage_version;
+    cbm_store_coverage_meta_clear(&new_meta);
+    cbm_store_close(store);
+    nextjs_run_t again;
+    nextjs_run(tmp, db_path, &again);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_STR_EQ(full.tuples, "GET /api/items __route__GET__/api/items app/api/items/route.ts "
+                               "nextjs.app.api.items.route.GET\n"
+                               "POST /api/items __route__POST__/api/items app/api/items/route.ts "
+                               "nextjs.app.api.items.route.POST");
+    ASSERT_TRUE(version_12.read);
+    ASSERT_STR_EQ(version_12.tuples, "");
+    ASSERT_EQ(routed_12, 0);
+    ASSERT_EQ(upgrade.rc, 0);
+    ASSERT_EQ(upgrade.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_STR_EQ(upgrade.tuples, full.tuples);
+    ASSERT_EQ(routed_after, 2);
+    ASSERT_EQ(nodes_after, nodes_before);
+    ASSERT_EQ(edges_after, edges_before);
+    ASSERT_EQ(stored_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_EQ(again.rc, 0);
+    ASSERT_EQ(again.route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_STR_EQ(again.tuples, full.tuples);
+    ASSERT_GTE(CBM_SEMANTIC_INDEX_VERSION, 13);
+    PASS();
+}
+
+/* #759: a quote is legal in a POSIX directory name, so a route path, its file
+ * and its handler's QN can hold one, escaped in the stored JSON. The route pass
+ * builds the Route from its handler's stored properties on every index
+ * (pass_route_nodes.c), so the full index and an incremental one after an
+ * unrelated edit must both store it intact. */
+TEST(pipeline_nextjs_quoted_route_round_trip_issue759) {
+#ifdef _WIN32
+    SKIP_PLATFORM("a quote is not a legal Windows path character");
+#else
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_quote_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app/api/a\"b/route.ts", "export function GET() {\n  return 1;\n}\n");
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 1;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 2;\n}\n");
+    nextjs_run_t helper_only;
+    nextjs_run(tmp, db_path, &helper_only);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_TRUE(full.read);
+    ASSERT_STR_EQ(full.tuples, "GET /api/a\"b __route__GET__/api/a\"b app/api/a\"b/route.ts "
+                               "nextjs.app.api.a\"b.route.GET");
+    ASSERT_EQ(helper_only.rc, 0);
+    ASSERT_EQ(helper_only.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(helper_only.read);
+    ASSERT_STR_EQ(helper_only.tuples, full.tuples);
+    PASS();
+#endif
+}
+
 TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
     return pipeline_legacy_c_identity_index_is_rebuilt(3);
 }
@@ -22495,6 +22964,253 @@ TEST(pipeline_swift_cross_package_import) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
+    PASS();
+}
+
+/* #2379 at graph level, as a SwiftPM package. Sources/Kit/Inits.swift is the
+ * issue's reproduction. Sources/App/Sub.swift imports the Kit target -- which
+ * sends name resolution down the import-aware path -- and calls initializers
+ * the way real code does: `super.init` to a project superclass in another
+ * target, `super.init` to a superclass outside the project, an explicit
+ * `T.init(...)` on a project type and on a type outside the project, `self.init`
+ * from an extension of a type outside the project, and an implicit `.init(...)`.
+ * Each of those can attract a false CALLS edge now that initializers are nodes. */
+static const char *const SWIFT_INIT_PACKAGE_SRC =
+    "let package = Package(\n"
+    "    name: \"Kit\",\n"
+    "    products: [.library(name: \"Kit\", targets: [\"Kit\"])],\n"
+    "    targets: [\n"
+    "        .target(name: \"Kit\", dependencies: []),\n"
+    "        .target(name: \"App\", dependencies: [\"Kit\"])\n"
+    "    ]\n"
+    ")\n";
+
+static const char *const SWIFT_INIT_INITS_SRC = "func helper() -> Int { 1 }\n"
+                                                "func other() -> Int { 2 }\n"
+                                                "\n"
+                                                "struct Box {\n"
+                                                "    let value: Int\n"
+                                                "    init() {\n"
+                                                "        value = helper()\n"
+                                                "    }\n"
+                                                "    func read() -> Int {\n"
+                                                "        other()\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "final class Holder {\n"
+                                                "    let value: Int\n"
+                                                "    init(seed: Int) {\n"
+                                                "        value = helper() + seed\n"
+                                                "    }\n"
+                                                "    convenience init() {\n"
+                                                "        self.init(seed: other())\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "enum Mode {\n"
+                                                "    case on\n"
+                                                "    init?(flag: Bool) {\n"
+                                                "        if helper() > 0 { self = .on } else { "
+                                                "return nil }\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "extension Box {\n"
+                                                "    init(raw: Int) {\n"
+                                                "        value = other()\n"
+                                                "    }\n"
+                                                "}\n";
+
+static const char *const SWIFT_INIT_BASE_SRC = "open class Base {\n"
+                                               "    public init() {}\n"
+                                               "}\n";
+
+static const char *const SWIFT_INIT_SUB_SRC = "import Kit\n"
+                                              "import UIKit\n"
+                                              "\n"
+                                              "class Sub: Base {\n"
+                                              "    override init() {\n"
+                                              "        super.init()\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "class Screen: UIViewController {\n"
+                                              "    init() {\n"
+                                              "        super.init(nibName: nil, bundle: nil)\n"
+                                              "    }\n"
+                                              "    func alert() -> UIAlertAction {\n"
+                                              "        UIAlertAction.init(title: nil, style: "
+                                              ".default)\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "extension Notification {\n"
+                                              "    init(tag: String) {\n"
+                                              "        self.init(name: Notification.Name(tag))\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "func make() -> Box {\n"
+                                              "    .init(raw: 1)\n"
+                                              "}\n"
+                                              "func explicit() -> Box {\n"
+                                              "    Box.init(raw: 2)\n"
+                                              "}\n";
+
+enum { SWIFT_INIT_EDGE_CAP = 32, SWIFT_INIT_EDGE_LEN = 192 };
+
+typedef struct {
+    int run_rc;
+    int calls;       /* CALLS edges seen; -1 if the store was not read */
+    int init_usages; /* USAGE edges into a node named init/deinit */
+    char edges[SWIFT_INIT_EDGE_CAP][SWIFT_INIT_EDGE_LEN]; /* "src -> tgt", sorted */
+} SwiftInitObservation;
+
+static int swift_init_edge_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* Qualified name relative to the project ("Inits.Box.init"). */
+static const char *swift_init_rel_qn(const char *qn, const char *project) {
+    size_t plen = strlen(project);
+    return strncmp(qn, project, plen) == 0 && qn[plen] == '.' ? qn + plen + 1 : qn;
+}
+
+static void swift_init_observe(cbm_store_t *s, const char *project, SwiftInitObservation *o) {
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    o->calls = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src = {0};
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                o->calls < SWIFT_INIT_EDGE_CAP) {
+                snprintf(o->edges[o->calls], SWIFT_INIT_EDGE_LEN, "%s -> %s",
+                         swift_init_rel_qn(src.qualified_name, project),
+                         swift_init_rel_qn(tgt.qualified_name, project));
+            }
+            o->calls++;
+            cbm_node_free_fields(&src);
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+    int kept = o->calls < SWIFT_INIT_EDGE_CAP ? o->calls : SWIFT_INIT_EDGE_CAP;
+    qsort(o->edges, (size_t)kept, sizeof(o->edges[0]), swift_init_edge_cmp);
+
+    edges = NULL;
+    count = 0;
+    o->init_usages = 0;
+    if (cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                tgt.name && (strcmp(tgt.name, "init") == 0 || strcmp(tgt.name, "deinit") == 0)) {
+                o->init_usages++;
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+}
+
+/* `pad` filler files push the run past MIN_FILES_FOR_PARALLEL so that, with
+ * `parallel`, it goes through pass_parallel.c rather than pass_calls.c. */
+static void swift_init_case(bool parallel, int pad, SwiftInitObservation *o) {
+    memset(o, 0, sizeof(*o));
+    o->run_rc = -1;
+    o->calls = -1;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return;
+    }
+    char path[512];
+    bool written = true;
+    const char *names[] = {"Package.swift", "Sources/Kit/Inits.swift", "Sources/Kit/Base.swift",
+                           "Sources/App/Sub.swift"};
+    const char *sources[] = {SWIFT_INIT_PACKAGE_SRC, SWIFT_INIT_INITS_SRC, SWIFT_INIT_BASE_SRC,
+                             SWIFT_INIT_SUB_SRC};
+    for (int i = 0; i < 4 && written; i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp, names[i]);
+        written = th_write_file(path, sources[i]) == 0;
+    }
+    for (int i = 0; i < pad && written; i++) {
+        char source[96];
+        snprintf(path, sizeof(path), "%s/Pad%02d.swift", tmp, i);
+        snprintf(source, sizeof(source), "func pad%02d() -> Int { %d }\n", i, i);
+        written = th_write_file(path, source) == 0;
+    }
+    if (written) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/swift_init.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o->run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            if (store && project) {
+                swift_init_observe(store, project, o);
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+}
+
+/* The exact CALLS set. Every initializer's own calls come from that
+ * initializer (the repro's file-level collapse is gone); Sub.init reaches
+ * Base.init in the other target and `Box.init(raw:)` reaches Box.init.
+ * UIViewController's and UIAlertAction's initializers, Notification's own and
+ * the implicit `.init(...)` are outside the project and form no edge -- in
+ * particular none to a project `init` that merely shares the name. Holder's
+ * convenience `self.init` is not a self-loop. */
+static int swift_init_assert_exact(const SwiftInitObservation *o) {
+    static const char *const expected[] = {
+        "Sources.App.Sub.Sub.init -> Sources.Kit.Base.Base.init",
+        "Sources.App.Sub.explicit -> Sources.Kit.Inits.Box.init",
+        "Sources.Kit.Inits.Box.init -> Sources.Kit.Inits.helper",
+        "Sources.Kit.Inits.Box.init -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Box.read -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Holder.init -> Sources.Kit.Inits.helper",
+        "Sources.Kit.Inits.Holder.init -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Mode.init -> Sources.Kit.Inits.helper",
+    };
+    enum { EXPECTED_CALLS = sizeof(expected) / sizeof(expected[0]) };
+    ASSERT_EQ(o->run_rc, 0);
+    ASSERT_EQ(o->init_usages, 0);
+    ASSERT_EQ(o->calls, (int)EXPECTED_CALLS);
+    for (int i = 0; i < (int)EXPECTED_CALLS; i++) {
+        ASSERT_STR_EQ(o->edges[i], expected[i]);
+    }
+    return 0;
+}
+
+TEST(pipeline_swift_init_exact_calls_sequential_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(false, 0, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
+/* Same input through pass_parallel.c: 55 fillers exceed MIN_FILES_FOR_PARALLEL. */
+TEST(pipeline_swift_init_exact_calls_parallel_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(true, 55, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
     PASS();
 }
 
@@ -26587,6 +27303,72 @@ TEST(cancelled_incremental_reindex_preserves_committed_db) {
     ASSERT_EQ(helper_after, baseline_helper);
     ASSERT_EQ(published_candidates, 0);
     ASSERT_TRUE(staging_cleaned);
+    PASS();
+}
+
+typedef struct {
+    bool allow;
+    int calls;
+} publish_gate_ctx_t;
+
+static bool publish_gate_decide(void *context) {
+    publish_gate_ctx_t *gate = context;
+    gate->calls++;
+    return gate->allow;
+}
+
+/* The publication gate (a supervised worker's claim on its publication fence)
+ * is the last word before the serving database is touched: refused, the run
+ * stops with the previous generation's file in place; allowed, it publishes
+ * as before. Asked exactly once either way. */
+TEST(publish_gate_decides_before_the_committed_db_is_touched) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    struct stat baseline;
+    ASSERT_EQ(stat(g_incr_dbpath, &baseline), 0);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "gate_candidate.go",
+                              "package main\n\nfunc GateCandidate() int { return 7 }\n"));
+    publish_gate_ctx_t refused = {.allow = false};
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_publish_gate(p, publish_gate_decide, &refused);
+    int refused_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    struct stat after_refusal;
+    bool same_file =
+        stat(g_incr_dbpath, &after_refusal) == 0 && after_refusal.st_ino == baseline.st_ino;
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    int refused_candidates = live ? count_nodes_named(live, project, "GateCandidate") : -1;
+    cbm_store_close(live);
+
+    publish_gate_ctx_t allowed = {.allow = true};
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_publish_gate(p, publish_gate_decide, &allowed);
+    int allowed_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    live = cbm_store_open_path(g_incr_dbpath);
+    int allowed_candidates = live ? count_nodes_named(live, project, "GateCandidate") : -1;
+    cbm_store_close(live);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(refused.calls, 1);
+    ASSERT_EQ(refused_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_TRUE(same_file);
+    ASSERT_EQ(refused_candidates, 0);
+    ASSERT_EQ(allowed.calls, 1);
+    ASSERT_EQ(allowed_rc, 0);
+    ASSERT_GT(allowed_candidates, 0);
     PASS();
 }
 
@@ -31055,6 +31837,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
+    RUN_TEST(pipeline_php_inline_html_calls_resolve_issue2000);
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
@@ -31201,6 +31984,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
     RUN_TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1);
     RUN_TEST(pipeline_semantic_version_5_index_is_rebuilt_in_full_c1);
+    RUN_TEST(pipeline_nextjs_persisted_route_contract_issue759);
+    RUN_TEST(pipeline_nextjs_persisted_route_contract_parallel_issue759);
+    RUN_TEST(pipeline_nextjs_incremental_lifecycle_issue759);
+    RUN_TEST(pipeline_nextjs_semantic_upgrade_issue759);
+    RUN_TEST(pipeline_nextjs_quoted_route_round_trip_issue759);
     RUN_TEST(pipeline_python_app_factory_routes_issue1548);
     RUN_TEST(pipeline_python_nested_def_is_function_local_issue1548);
     RUN_TEST(pipeline_python_local_classes_stay_in_their_def_issue1548);
@@ -31230,6 +32018,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_swift_cross_package_import);
+    RUN_TEST(pipeline_swift_init_exact_calls_sequential_issue2379);
+    RUN_TEST(pipeline_swift_init_exact_calls_parallel_issue2379);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
     RUN_TEST(pipeline_go_type_classification);
@@ -31361,6 +32151,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(cancelled_full_reindex_preserves_committed_db);
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
+    RUN_TEST(publish_gate_decides_before_the_committed_db_is_touched);
     RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
     RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);
 #ifdef __linux__

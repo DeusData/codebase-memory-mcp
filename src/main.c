@@ -897,15 +897,24 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     const char *worker_marker = cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_MARKER_ARG);
     const char *worker_quarantine =
         cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_QUARANTINE_ARG);
+    const char *worker_publish_fence =
+        cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_PUBLISH_FENCE_ARG);
     if (index_worker) {
         /* The graph lives on this process's heaps: SQLite gets heaps of its
          * own here, and only here (cbm_sqlite_dedicated_heap). */
         cbm_sqlite_dedicated_heap(true);
         cbm_memev_process_role("worker");
+        /* A full index saturates every core; run it below normal priority so
+         * interactive CLI/MCP queries are not starved. Before any indexing
+         * thread exists, so they all inherit it. Failure is harmless. */
+        if (!cbm_lower_cpu_priority()) {
+            cbm_log_info("index.worker.priority", "lowered", "false");
+        }
     }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
                                       cbm_index_worker_memory_budget_bytes());
+    cbm_index_set_worker_publish_fence(index_worker ? worker_publish_fence : NULL);
 
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -3209,6 +3218,7 @@ int main(int argc, char **argv) {
         cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                           invocation.marker_file, invocation.quarantine_file,
                                           invocation.memory_budget_bytes);
+        cbm_index_set_worker_publish_fence(invocation.publish_fence_file);
 #ifndef _WIN32
         /* Split into three ordered steps rather than one condition, because the
          * ORDER is load-bearing and the middle step only exists in test builds:
@@ -3389,9 +3399,9 @@ int main(int argc, char **argv) {
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =
         main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result, true);
-    cbm_daemon_ipc_endpoint_free(endpoint);
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
         main_report_client_bootstrap_failure(role, &bootstrap_result);
+        cbm_daemon_ipc_endpoint_free(endpoint);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
     }
@@ -3402,33 +3412,46 @@ int main(int argc, char **argv) {
      * like the bootstrap before them: a 1 s bound on the reply (a probe budget)
      * ended the server whenever the daemon's UI save ran long, which the smoke's
      * `--ui=true --port` run saw as a binary without UI assets. */
-    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
-        !main_set_client_context(g_daemon_client, NULL, tool_profile, NULL, NULL,
-                                 bootstrap_config.startup_timeout_ms)) {
-        (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
-        (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
-        g_daemon_client = NULL;
-        (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
-        return EXIT_FAILURE;
+    char mcp_session_root[MAIN_PATH_CAP] = {0};
+    char mcp_allowed_root[MAIN_PATH_CAP] = {0};
+    const char *mcp_allowed_root_ptr = NULL;
+    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
+        bool context_resolved =
+            main_session_context(NULL, mcp_session_root, mcp_allowed_root, &mcp_allowed_root_ptr);
+        cbm_daemon_runtime_application_status_t context_status =
+            context_resolved ? cbm_daemon_application_client_set_context(
+                                   g_daemon_client, mcp_session_root, mcp_allowed_root_ptr,
+                                   tool_profile, NULL, NULL, bootstrap_config.startup_timeout_ms)
+                             : CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+        if (context_status != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+            (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
+            (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
+            g_daemon_client = NULL;
+            cbm_daemon_ipc_endpoint_free(endpoint);
+            (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+            return EXIT_FAILURE;
+        }
     }
 
     /* Persist UI mutations only after the exact-build HELLO succeeds. A
      * conflicting binary must be observationally read-only: applying its
      * flags before bootstrap could reconfigure the already-running daemon
      * even though that client was then rejected. */
+    bool mcp_ui_enabled = false;
+    int mcp_ui_port = 0;
+    uint8_t mcp_ui_update_mask = 0;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT && cbm_mcp_tool_profile_allows_http(tool_profile)) {
-        bool ui_enabled = false;
-        int ui_port = 0;
         bool explicitly_enabled = false;
-        uint8_t update_mask =
-            parse_ui_flags(argc, argv, &ui_enabled, &ui_port, &explicitly_enabled);
-        if (update_mask != 0 &&
+        mcp_ui_update_mask =
+            parse_ui_flags(argc, argv, &mcp_ui_enabled, &mcp_ui_port, &explicitly_enabled);
+        if (mcp_ui_update_mask != 0 &&
             cbm_daemon_application_client_set_ui_config(
-                g_daemon_client, update_mask, ui_enabled, ui_port,
+                g_daemon_client, mcp_ui_update_mask, mcp_ui_enabled, mcp_ui_port,
                 bootstrap_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
             (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;
+            cbm_daemon_ipc_endpoint_free(endpoint);
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_FAILURE;
         }
@@ -3445,13 +3468,25 @@ int main(int argc, char **argv) {
         (void)fprintf(stderr, "codebase-memory-mcp: parent-death watchdog could not start\n");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
+        cbm_daemon_ipc_endpoint_free(endpoint);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
     }
 
     setup_signal_handlers();
-    int result = cbm_daemon_frontend_mcp_run(g_daemon_client, client_cohort_manager, stdin, stdout);
+    cbm_daemon_frontend_session_config_t frontend_session = {
+        .bootstrap = bootstrap_config,
+        .session_root = mcp_session_root,
+        .allowed_root = mcp_allowed_root_ptr,
+        .tool_profile = tool_profile,
+        .ui_update_mask = mcp_ui_update_mask,
+        .ui_enabled = mcp_ui_enabled,
+        .ui_port = mcp_ui_port,
+    };
+    int result = cbm_daemon_frontend_mcp_run(g_daemon_client, client_cohort_manager,
+                                             &frontend_session, stdin, stdout);
     g_daemon_client = NULL; /* frontend consumed the handle */
+    cbm_daemon_ipc_endpoint_free(endpoint);
     bool client_cohort_cleanup =
         main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
     atomic_store(&g_shutdown, 1);

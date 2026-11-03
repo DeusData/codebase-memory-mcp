@@ -571,7 +571,8 @@ static const char *objc_assign_types[] = {"assignment_expression", NULL};
 // well as in the name resolvers — extract_class_methods gates on this set, so
 // without the entry the requirement is walked and then discarded.
 static const char *swift_func_types[] = {"function_declaration", "protocol_function_declaration",
-                                         "macro_declaration", NULL};
+                                         "macro_declaration",    "init_declaration",
+                                         "deinit_declaration",   NULL};
 // KNOWN GAP: struct_declaration and enum_declaration are not node types in the
 // vendored tree-sitter-swift grammar — it models both as class_declaration — so
 // these two entries never match anything, and a bare Swift `enum` is labeled

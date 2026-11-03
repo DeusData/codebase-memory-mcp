@@ -18,6 +18,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <git/git_context.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <mcp/mcp_internal.h>
@@ -1211,6 +1212,57 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
     free(json);
     cbm_cli_set_version("dev");
+    PASS();
+}
+
+/* The lifecycle hook reads ignore_worktrees through this reader. It must never
+ * attach a store to the server (the daemon lends its session server) and never
+ * create the runtime store; a server with its own store answers from it. */
+TEST(mcp_ignore_worktrees_runtime_read_leaves_server_and_store_alone) {
+    char *raw = th_mktempdir("cbm_mcp_runtime_config");
+    ASSERT_NOT_NULL(raw);
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", raw);
+    char own_dir[320];
+    snprintf(own_dir, sizeof(own_dir), "%s/own", cache);
+    char store_path[400];
+    snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    struct stat st;
+    bool absent_off = server && !cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    bool still_absent = stat(store_path, &st) != 0;
+
+    cbm_config_t *runtime = cbm_config_open(cache);
+    bool stored = runtime && cbm_config_set(runtime, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(runtime);
+    bool runtime_on = server && cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    bool server_untouched = server && !cbm_mcp_ignore_worktrees_enabled(server);
+
+    cbm_config_t *own = cbm_config_open(own_dir);
+    if (server && own) {
+        cbm_mcp_server_set_config(server, own);
+    }
+    bool own_store_wins = server && own && !cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    if (server) {
+        cbm_mcp_server_set_config(server, NULL);
+    }
+    cbm_mcp_server_free(server);
+    cbm_config_close(own);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    int removed = th_rmtree(cache);
+
+    ASSERT(absent_off);
+    ASSERT(still_absent);
+    ASSERT(stored);
+    ASSERT(runtime_on);
+    ASSERT(server_untouched);
+    ASSERT(own_store_wins);
+    ASSERT_EQ(removed, 0);
     PASS();
 }
 
@@ -7839,9 +7891,465 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════
- *  TOOL HANDLERS WITH DATA
- * ══════════════════════════════════════════════════════════════════ */
+/* BT-240 RED: a live checkout SHA is not proof of the generation that produced
+ * graph content. Older databases lack an indexed-checkout identity, so verbose
+ * status must fail closed as unknown while exposing graph generation
+ * separately. */
+TEST(tool_index_status_fails_closed_without_indexed_checkout_identity) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"test-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_generation\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":null"));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_unavailable"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* BT-240 lean-default guard: the freshness verdict is diagnostics — a
+ * report-only signal that never auto-indexes — so it must stay out of the
+ * common (non-verbose) status call. */
+TEST(tool_index_status_omits_freshness_by_default) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"test-project\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
+    ASSERT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_sha"));
+    /* BT-240 increment 3: the worktree-status snapshot is part of the
+     * verbose-only freshness block and must not leak into the default call. */
+    ASSERT_NULL(strstr(inner, "status_available"));
+    ASSERT_NULL(strstr(inner, "tracked_changes"));
+    ASSERT_NULL(strstr(inner, "untracked_source"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── BT-240: freshness verdict against the recorded indexed checkout ──
+ * These shell out to git via cbm_popen (the same isolated spawn production
+ * git_context uses) rather than system(), so they run on every platform that
+ * has git on PATH — Windows CI included. A genuinely missing git is the only
+ * skip. */
+
+static int mcp_git_run(const char *dir, const char *args) {
+    char cmd[1024];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", dir, args, null_dev);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return -1;
+    }
+    char drain[256];
+    while (fgets(drain, sizeof(drain), fp)) {
+    }
+    return cbm_pclose(fp);
+}
+
+static int mcp_make_git_repo(const char *dir) {
+    if (th_mkdir_p(dir) != 0) return -1;
+    if (mcp_git_run(dir, "init -q") != 0) return -1;
+    if (mcp_git_run(dir, "config user.email test@example.com") != 0) return -1;
+    if (mcp_git_run(dir, "config user.name Test") != 0) return -1;
+    if (th_write_file(TH_PATH(dir, ".keep"), "") != 0) return -1;
+    if (mcp_git_run(dir, "add -A") != 0) return -1;
+    if (mcp_git_run(dir, "commit -qm init") != 0) return -1;
+    return 0;
+}
+
+/* Helper: build a server whose project root is the given git repo and whose
+ * coverage metadata records indexed_checkout_sha = sha (may be NULL). */
+static cbm_mcp_server_t *mcp_freshness_server(const char *repo, const char *sha) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) return NULL;
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_mcp_server_set_project(srv, "fresh-project");
+    cbm_store_upsert_project(st, "fresh-project", repo);
+    cbm_coverage_meta_t meta = {
+        .generation = "fresh-generation",
+        .index_mode = "fast",
+        .recorded_at = "2026-08-11T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+        .indexed_checkout_sha = sha,
+    };
+    if (cbm_store_coverage_replace_ex(st, "fresh-project", NULL, 0, &meta) != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"current\""));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_current"));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"use_graph\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status_available\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    /* A stale recorded identity that does not equal the live HEAD. */
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, "0000000000000000000000000000000000000000");
+    if (!srv) {
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_mismatch"));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\"0000000000000000000000000000000000000000\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"reindex_to_match_checkout\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: a modified tracked file makes the verdict stale even
+ * when the indexed SHA matches the live HEAD, with the sample surfaced. */
+TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
+        mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
+        mcp_git_run(repo, "commit -q -m add-tracked") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to commit tracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v2") != 0) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("failed to modify tracked file");
+    }
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "tracked_changes_present"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"paths\":[\"tracked.txt\"]"));
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":false"));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: untracked sources prevent "current" — verdict is
+ * unknown (no stale reason), with the untracked_not_indexed reason. */
+TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "newfile.txt"), "n") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to create untracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "untracked_not_indexed"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":1"));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: tracked changes win over untracked — both reasons are
+ * present but the verdict is stale, never unknown. */
+TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
+        mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
+        mcp_git_run(repo, "commit -q -m add-tracked") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to commit tracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v2") != 0 ||
+        th_write_file(TH_PATH(repo, "untracked.txt"), "n") != 0) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("failed to prepare mixed worktree");
+    }
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "tracked_changes_present"));
+    ASSERT_NOT_NULL(strstr(inner, "untracked_not_indexed"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: a non-git root with a recorded identity cannot prove
+ * current — status availability must be false and the verdict unknown. */
+TEST(tool_index_status_freshness_status_unavailable_non_git) {
+    char *repo = th_mktempdir("cbm_fresh_non_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+
+    /* Record an identity even though the root is not a git repository. */
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, "0123456789012345678901234567890123456789");
+    if (!srv) {
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status_available\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "status_unavailable"));
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: sample cap at the MCP layer — many untracked sources
+ * surface the true count, a bounded paths array and truncated=true. */
+TEST(tool_index_status_freshness_sample_cap_truncates) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    enum { N_FILES = 17, MCP_SAMPLE_MAX = 16 };
+    for (int i = 0; i < N_FILES; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/u%02d.txt", repo, i);
+        if (th_write_file(path, "u") != 0) {
+            th_rmtree(repo);
+            FAIL("failed to create untracked file");
+        }
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":17"));
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
+    static const char EXPECTED_PATHS[] =
+        "\"paths\":[\"u00.txt\",\"u01.txt\",\"u02.txt\",\"u03.txt\",\"u04.txt\",\"u05.txt\","
+        "\"u06.txt\",\"u07.txt\",\"u08.txt\",\"u09.txt\",\"u10.txt\",\"u11.txt\",\"u12.txt\","
+        "\"u13.txt\",\"u14.txt\",\"u15.txt\"]";
+    ASSERT_NOT_NULL(strstr(inner, EXPECTED_PATHS));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
 
 /* #2816: stored recursion must remain visible even when the CALLS graph has
  * no self-edges. Removing metadata emission must fail these assertions. */
@@ -23269,6 +23777,386 @@ TEST(index_supervisor_clean_exit_without_response_response_issue1300) {
     PASS();
 }
 
+#ifndef _WIN32
+typedef struct {
+    int calls;
+} index_worker_resource_clock_t;
+
+static uint64_t index_worker_resource_clock(void *context) {
+    index_worker_resource_clock_t *clock = context;
+    clock->calls++;
+    return clock->calls == 1 ? 100 : 1101;
+}
+
+enum {
+    IDXRESOURCE_OK = 0,
+    IDXRESOURCE_SETUP = 71,
+    IDXRESOURCE_NO_RESPONSE = 72,
+    IDXRESOURCE_BAD_CONTRACT = 73,
+    IDXRESOURCE_RETRIED = 74,
+};
+
+static int index_worker_resource_response_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server ||
+        cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXRESOURCE_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_worker_resource_clock_t clock = {0};
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_worker_resource_clock, NULL, &clock);
+    int before = cbm_index_supervisor_spawn_count();
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                   "\"_cbm_index_policy\":{\"index_max_files\":\"off\","
+                   "\"index_max_source_mb\":\"off\",\"index_max_rss_mb\":\"off\","
+                   "\"index_max_duration_seconds\":\"off\"}}",
+                   repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    int after = cbm_index_supervisor_spawn_count();
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    int result = IDXRESOURCE_OK;
+    if (!response) {
+        result = IDXRESOURCE_NO_RESPONSE;
+    } else if (!strstr(response, "resource_limit_exceeded") ||
+               !strstr(response, "\\\"stage\\\":\\\"worker\\\"") ||
+               !strstr(response, "\\\"resource\\\":\\\"duration_ms\\\"") ||
+               !strstr(response, "\\\"observed\\\":1001") ||
+               !strstr(response, "\\\"limit\\\":1000") ||
+               !strstr(response, "\\\"unit\\\":\\\"milliseconds\\\"")) {
+        result = IDXRESOURCE_BAD_CONTRACT;
+    } else if (after - before != 1) {
+        result = IDXRESOURCE_RETRIED;
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork-isolated MCP host harness; supervisor state machine is cross-platform");
+#else
+    char *repo = th_mktempdir("cbm_worker_resource_repo");
+    char *cache = th_mktempdir("cbm_worker_resource_cache");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(index_worker_resource_response_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    if (exit_code != IDXRESOURCE_OK) {
+        printf("    worker resource child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXRESOURCE_OK);
+    PASS();
+#endif
+}
+
+#ifndef _WIN32
+#include <fcntl.h>
+
+/* A worker limit must never be reported after the same attempt published.
+ * The real worker replaces the serving database and only then exports the
+ * persistence artifact. A FIFO planted at the artifact's temp path holds it
+ * inside that export, after the rename, for as long as nobody reads the FIFO,
+ * and the duration clock crosses its limit only once the serving database has
+ * been replaced. The limit is therefore observed in the post-publication
+ * window by construction, never by timing:
+ *   - uncoordinated, the supervisor stops the worker there and answers
+ *     resource_limit_exceeded with serving_index_preserved=true although the
+ *     previous generation is already gone;
+ *   - with the publication fence the worker claimed publication before the
+ *     rename, so the supervisor leaves the limit unenforced and logs that.
+ *     Only that log line releases the FIFO; the worker then finishes and
+ *     reports the published index. The artifact path is a directory, so the
+ *     export itself fails afterwards, which the #1665 response names. */
+typedef struct {
+    char live_db[CBM_SZ_1K];
+    ino_t previous_inode;
+    int over_limit_calls;
+} index_publication_race_clock_t;
+
+static char g_publication_race_fifo[CBM_SZ_1K];
+static bool g_publication_race_released;
+
+static uint64_t index_publication_race_clock(void *context) {
+    index_publication_race_clock_t *clock = context;
+    struct stat status;
+    if (stat(clock->live_db, &status) != 0 || status.st_ino == clock->previous_inode) {
+        return 100;
+    }
+    clock->over_limit_calls++;
+    return 1101;
+}
+
+static void index_publication_race_sink(const char *line) {
+    if (g_publication_race_released || !line ||
+        !strstr(line, "index.supervisor.resource_limit_after_publication")) {
+        return;
+    }
+    g_publication_race_released = true;
+    /* Blocks only until the held worker opens its end, then reads to EOF. */
+    int fifo = open(g_publication_race_fifo, O_RDONLY);
+    if (fifo >= 0) {
+        char buffer[CBM_SZ_4K];
+        ssize_t got = 0;
+        do {
+            got = read(fifo, buffer, sizeof(buffer));
+        } while (got > 0);
+        (void)close(fifo);
+    }
+}
+
+enum {
+    IDXPUB_OK = 0,
+    IDXPUB_SETUP = 81,
+    IDXPUB_FIRST_INDEX = 82,
+    IDXPUB_HOLD_SETUP = 83,
+    IDXPUB_NO_RESPONSE = 84,
+    IDXPUB_NOT_REPLACED = 85,
+    IDXPUB_NOT_CROSSED = 86,
+    IDXPUB_LIMIT_AFTER_PUBLICATION = 87,
+    IDXPUB_NOT_RELEASED = 88,
+    IDXPUB_NOT_REPORTED_PUBLISHED = 89,
+};
+
+static int index_publication_race_first_generation(cbm_mcp_server_t *server, const char *repo,
+                                                   const char *cache,
+                                                   index_publication_race_clock_t *clock) {
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    char *text = extract_text_content(response);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *status = yyjson_get_str(yyjson_obj_get(root, "status"));
+    const char *project = yyjson_get_str(yyjson_obj_get(root, "project"));
+    struct stat live;
+    bool indexed = status && strcmp(status, "indexed") == 0 && project &&
+                   snprintf(clock->live_db, sizeof(clock->live_db), "%s/%s.db", cache, project) <
+                       (int)sizeof(clock->live_db) &&
+                   stat(clock->live_db, &live) == 0;
+    if (indexed) {
+        clock->previous_inode = live.st_ino;
+    }
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    return indexed ? IDXPUB_OK : IDXPUB_FIRST_INDEX;
+}
+
+static int index_publication_race_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXPUB_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_publication_race_clock_t clock = {0};
+    int result = index_publication_race_first_generation(server, repo, cache, &clock);
+
+    /* A second generation to publish, the hold, and a 1 s duration limit. */
+    char art_dir[CBM_SZ_1K];
+    char art_path[CBM_SZ_1K];
+    (void)snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", repo);
+    (void)snprintf(art_path, sizeof(art_path), "%s/graph.db.zst", art_dir);
+    (void)snprintf(g_publication_race_fifo, sizeof(g_publication_race_fifo), "%s.tmp", art_path);
+    if (result == IDXPUB_OK &&
+        (th_write_file(TH_PATH(repo, "extra.c"), "int extra(void) { return 1; }\n") != 0 ||
+         mkdir(art_dir, 0700) != 0 || mkdir(art_path, 0700) != 0 ||
+         mkfifo(g_publication_race_fifo, 0600) != 0 ||
+         cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0)) {
+        result = IDXPUB_HOLD_SETUP;
+    }
+    char *response = NULL;
+    if (result == IDXPUB_OK) {
+        char args[CBM_SZ_2K];
+        (void)snprintf(args, sizeof(args),
+                       "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"persistence\":true}", repo);
+        cbm_log_set_level(CBM_LOG_WARN);
+        cbm_log_set_sink_ex(index_publication_race_sink, CBM_LOG_SINK_TEE);
+        cbm_index_supervisor_set_resource_hooks_for_testing(index_publication_race_clock, NULL,
+                                                            &clock);
+        response = cbm_mcp_handle_tool(server, "index_repository", args);
+        cbm_index_supervisor_reset_resource_hooks_for_testing();
+        cbm_log_set_sink(NULL);
+    }
+    struct stat live;
+    bool replaced = stat(clock.live_db, &live) == 0 && live.st_ino != clock.previous_inode;
+    if (result != IDXPUB_OK) {
+        /* setup failure already recorded */
+    } else if (!response) {
+        result = IDXPUB_NO_RESPONSE;
+    } else if (!replaced) {
+        result = IDXPUB_NOT_REPLACED;
+    } else if (clock.over_limit_calls == 0) {
+        result = IDXPUB_NOT_CROSSED;
+    } else if (strstr(response, "resource_limit_exceeded")) {
+        result = IDXPUB_LIMIT_AFTER_PUBLICATION;
+    } else if (!g_publication_race_released) {
+        result = IDXPUB_NOT_RELEASED;
+    } else if (!strstr(response, "Index database was published")) {
+        result = IDXPUB_NOT_REPORTED_PUBLISHED;
+    }
+    if (result != IDXPUB_OK && response) {
+        printf("    second response: %.600s\n", response);
+        fflush(stdout);
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_limit_never_reported_after_its_own_publication) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork + FIFO hold harness; the fence state machine is cross-platform and "
+                  "covered by the index_supervisor suite");
+#else
+    /* th_mktempdir returns one static buffer: keep each path in its own copy. */
+    const char *made = th_mktempdir("cbm_publication_race_repo");
+    char *repo = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_publication_race_cache");
+    char *cache = made ? strdup(made) : NULL;
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Hang guard only: two supervised runs that each start an ASan worker. */
+        alarm(180);
+        _exit(index_publication_race_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    free(repo);
+    free(cache);
+    if (exit_code != IDXPUB_OK) {
+        printf("    publication race child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXPUB_OK);
+    PASS();
+#endif
+}
+
+/* serving_index_preserved describes the request, not only its last attempt:
+ * an earlier attempt may have published before it crashed (recovery then runs
+ * another attempt), and an index that appeared during the request (artifact
+ * bootstrap) was not preserved. */
+TEST(index_worker_resource_response_reports_preservation_for_the_request) {
+    const char *made = th_mktempdir("cbm_request_facts_repo");
+    char *repo = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_request_facts_cache");
+    char *cache = made ? strdup(made) : NULL;
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"RequestFactsFixture\"}",
+                   repo);
+
+    cbm_mcp_index_request_facts_t before_index = {0};
+    cbm_mcp_index_request_facts_begin(args, &before_index);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    char *indexed = server ? cbm_mcp_handle_tool(server, "index_repository", args) : NULL;
+    cbm_mcp_server_free(server);
+    cbm_mcp_index_request_facts_t facts = {0};
+    cbm_mcp_index_request_facts_begin(args, &facts);
+
+    cbm_index_worker_result_t limited;
+    memset(&limited, 0, sizeof(limited));
+    limited.outcome = CBM_PROC_KILLED;
+    limited.tree_quiesced = true;
+    limited.resource_violation = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_DURATION_MS, .observed = 1001, .limit = 1000};
+    cbm_index_worker_result_t published_then_crashed;
+    memset(&published_then_crashed, 0, sizeof(published_then_crashed));
+    published_then_crashed.outcome = CBM_PROC_CRASH;
+    published_then_crashed.publication_committed = true;
+    cbm_mcp_index_request_facts_t after_recovery = facts;
+    cbm_mcp_index_request_facts_record(&after_recovery, &limited);
+    bool limited_attempt_commits_nothing = !after_recovery.publication_committed;
+    cbm_mcp_index_request_facts_record(&after_recovery, &published_then_crashed);
+
+    char *preserved = cbm_mcp_index_worker_resource_response(args, &limited, &facts);
+    char *earlier_published =
+        cbm_mcp_index_worker_resource_response(args, &limited, &after_recovery);
+    char *appeared = cbm_mcp_index_worker_resource_response(args, &limited, &before_index);
+    char *no_facts = cbm_mcp_index_worker_resource_response(args, &limited, NULL);
+    const char *kept = "\\\"serving_index_preserved\\\":true";
+    const char *not_kept = "\\\"serving_index_preserved\\\":false";
+    bool indexed_ok = indexed && strstr(indexed, "\\\"status\\\":\\\"indexed\\\"");
+    bool preserved_ok = preserved && strstr(preserved, kept);
+    bool earlier_ok = earlier_published && strstr(earlier_published, not_kept);
+    bool appeared_ok = appeared && strstr(appeared, not_kept);
+    bool no_facts_ok = no_facts && strstr(no_facts, not_kept);
+
+    free(indexed);
+    free(preserved);
+    free(earlier_published);
+    free(appeared);
+    free(no_facts);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+    th_cleanup(repo);
+    th_cleanup(cache);
+    free(repo);
+    free(cache);
+
+    ASSERT_FALSE(before_index.serving_index_existed);
+    ASSERT_TRUE(indexed_ok);
+    ASSERT_TRUE(facts.serving_index_existed);
+    ASSERT_FALSE(facts.publication_committed);
+    ASSERT_TRUE(limited_attempt_commits_nothing);
+    ASSERT_TRUE(after_recovery.publication_committed);
+    ASSERT_TRUE(preserved_ok);
+    ASSERT_TRUE(earlier_ok);
+    ASSERT_TRUE(appeared_ok);
+    ASSERT_TRUE(no_facts_ok);
+    PASS();
+}
+
 /* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
  * Distinct exit codes so the parent can report the exact failure mode. */
 enum {
@@ -24437,6 +25325,291 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
     ASSERT_EQ(count, 0);
     PASS();
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ *  ignore_worktrees — explicit index_repository on a linked worktree
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* An EXPLICIT index_repository call is refused only when ignore_worktrees is on
+ * AND repo_path is a linked worktree AND no per-call override was passed. The
+ * refusal must never fire for the MAIN checkout — that would break ordinary
+ * indexing for anyone enabling the key — and index_worktree=true must escape it.
+ *
+ * Default-off is the regression class the project guards hardest: with the key
+ * unset, a linked worktree still indexes exactly as today.
+ *
+ * Probe returns a bit set, or a negative fixture-setup code. */
+enum {
+    IGNORE_WT_REFUSED_WORKTREE = 1, /* expected when the key is on */
+    IGNORE_WT_REFUSED_MAIN = 2,     /* BUG if set */
+    IGNORE_WT_REFUSED_OVERRIDE = 4, /* BUG if set */
+};
+
+#ifndef _WIN32
+typedef struct {
+    char cache[256];
+    char main_repo[512];
+    char wt_repo[512];
+} ignore_wt_fixture_t;
+
+static void ignore_wt_fixture_cleanup(ignore_wt_fixture_t *fx) {
+    if (!fx) {
+        return;
+    }
+    if (fx->main_repo[0]) {
+        char prune[1024];
+        snprintf(prune, sizeof(prune), "git -C \"%s\" worktree prune >/dev/null 2>&1", fx->main_repo);
+        (void)system(prune);
+    }
+    if (fx->cache[0]) {
+        th_rmtree(fx->cache);
+    }
+}
+
+/* 0 = ready. -1 tmpdir, -2 mkdir, -3 git worktree fixture unavailable. */
+static int ignore_wt_fixture_setup(ignore_wt_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    char *raw = th_mktempdir("cbm_ignorewt");
+    if (!raw) {
+        return -1;
+    }
+    snprintf(fx->cache, sizeof(fx->cache), "%s", raw);
+    snprintf(fx->main_repo, sizeof(fx->main_repo), "%s/main", fx->cache);
+    snprintf(fx->wt_repo, sizeof(fx->wt_repo), "%s/wt", fx->cache);
+    if (th_mkdir_p(fx->main_repo) != 0) {
+        ignore_wt_fixture_cleanup(fx);
+        return -2;
+    }
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" init -q >/dev/null 2>&1 && "
+             "git -C \"%s\" config user.email t@example.com && "
+             "git -C \"%s\" config user.name T && touch \"%s/.keep\" && "
+             "git -C \"%s\" add .keep && git -C \"%s\" commit -q -m init && "
+             "git -C \"%s\" worktree add -q \"%s\" -b wtb",
+             fx->main_repo, fx->main_repo, fx->main_repo, fx->main_repo, fx->main_repo,
+             fx->main_repo, fx->main_repo, fx->wt_repo);
+    if (system(cmd) != 0) {
+        ignore_wt_fixture_cleanup(fx);
+        return -3;
+    }
+    return 0;
+}
+
+static bool ignore_wt_refused(cbm_mcp_server_t *srv, const char *repo_path, bool override) {
+    char args[2048];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo_path,
+             override ? ",\"index_worktree\":true" : "");
+    char *result = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool refused = result && strstr(result, "ignore_worktrees is enabled") != NULL;
+    free(result);
+    return refused;
+}
+
+static int ignore_worktrees_index_probe(const char *ignore_value) {
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup < 0) {
+        return setup;
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", fx.cache, 1);
+
+    int bits = -4;
+    cbm_config_t *cfg = cbm_config_open(fx.cache);
+    if (cfg) {
+        if (ignore_value) {
+            cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, ignore_value);
+        }
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_config(srv, cfg);
+            bits = 0;
+            if (ignore_wt_refused(srv, fx.wt_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_WORKTREE;
+            }
+            if (ignore_wt_refused(srv, fx.main_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_MAIN;
+            }
+            if (ignore_wt_refused(srv, fx.wt_repo, true)) {
+                bits |= IGNORE_WT_REFUSED_OVERRIDE;
+            }
+            cbm_mcp_server_free(srv);
+        }
+        cbm_config_close(cfg);
+    }
+
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    ignore_wt_fixture_cleanup(&fx);
+    return bits;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void ignore_wt_count_started(void *context) {
+    int *calls = context;
+    (*calls)++;
+}
+
+/* Drive initialize → maybe_auto_index on a linked worktree. ignore_value NULL
+ * leaves the key unset (default-off). The count hook fires only if auto-index
+ * reaches discovery, so a skip for linked_worktree must leave it at 0. */
+static int ignore_wt_autoindex_count_calls(const char *session_root, const char *ignore_value) {
+    char *raw = th_mktempdir("cbm_ignorewt_auto");
+    if (!raw) {
+        return -1;
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", raw);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(session_root) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_cleanup(cache);
+        return -2;
+    }
+
+    int calls = -3;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
+    if (srv) {
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        /* Fail-closed on the actual count so this never launches an index thread. */
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "-1");
+        if (ignore_value) {
+            cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, ignore_value);
+        }
+        cbm_mcp_server_set_config(srv, cfg);
+        calls = 0;
+        cbm_mcp_server_set_auto_index_count_test_hook(srv, ignore_wt_count_started, &calls);
+        char *response = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1430,\"method\":\"initialize\",\"params\":{}}");
+        free(response);
+        cbm_mcp_server_free(srv);
+    }
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    return calls;
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+#endif /* !_WIN32 */
+
+TEST(mcp_ignore_worktrees_gates_explicit_index_repository) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe("true");
+    if (bits == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (bits == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (bits < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    /* RED before the gate existed: nothing is ever refused. */
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) != 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+/* Default-off pin: key unset, linked worktree still indexes. The gate is
+ * opt-in; an unset key must be bit-for-bit today's behaviour. */
+TEST(mcp_ignore_worktrees_default_off_still_indexes_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe(NULL);
+    if (bits == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (bits == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (bits < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+TEST(mcp_ignore_worktrees_skips_auto_index_on_linked_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (setup == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (setup < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    int calls = ignore_wt_autoindex_count_calls(fx.wt_repo, "true");
+    ignore_wt_fixture_cleanup(&fx);
+    if (calls == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (calls < 0) {
+        FAIL("ignore_worktrees auto-index fixture failed");
+    }
+    ASSERT_EQ(calls, 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (setup == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (setup < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    int calls = ignore_wt_autoindex_count_calls(fx.wt_repo, NULL);
+    ignore_wt_fixture_cleanup(&fx);
+    if (calls == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (calls < 0) {
+        FAIL("ignore_worktrees auto-index fixture failed");
+    }
+    ASSERT_EQ(calls, 1);
+    PASS();
+#endif /* _WIN32 */
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
 
 /* ══════════════════════════════════════════════════════════════════
  *  #1466 / #713 — the auto_index_limit guard
@@ -26751,6 +27924,7 @@ SUITE(mcp) {
 
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
+    RUN_TEST(mcp_ignore_worktrees_runtime_read_leaves_server_and_store_alone);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_help_list_matches_registry);
     RUN_TEST(mcp_tools_list_latest_metadata);
@@ -26899,6 +28073,15 @@ SUITE(mcp) {
     RUN_TEST(tool_responses_carry_store_generation_issue2585);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_fails_closed_without_indexed_checkout_identity);
+    RUN_TEST(tool_index_status_omits_freshness_by_default);
+    RUN_TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes);
+    RUN_TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked);
+    RUN_TEST(tool_index_status_freshness_status_unavailable_non_git);
+    RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
@@ -27046,6 +28229,9 @@ SUITE(mcp) {
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
     RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
+    RUN_TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried);
+    RUN_TEST(index_worker_limit_never_reported_after_its_own_publication);
+    RUN_TEST(index_worker_resource_response_reports_preservation_for_the_request);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
@@ -27149,6 +28335,13 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    /* ignore_worktrees gate */
+    RUN_TEST(mcp_ignore_worktrees_gates_explicit_index_repository);
+    RUN_TEST(mcp_ignore_worktrees_default_off_still_indexes_worktree);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(mcp_ignore_worktrees_skips_auto_index_on_linked_worktree);
+    RUN_TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count);
+#endif
     RUN_TEST(mcp_auto_index_in_process_fresh_project_uses_full_width);
     RUN_TEST(mcp_auto_index_in_process_existing_index_keeps_headroom);
     RUN_TEST(mcp_background_flag_fresh_project_uses_full_width);

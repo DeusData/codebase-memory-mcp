@@ -148,8 +148,19 @@ detect_arch() {
     esac
 }
 
+is_android() {
+  [ "$(uname -o 2>/dev/null || true)" = "Android" ] \
+    || [ -n "${TERMUX_VERSION:-}" ] \
+    || [[ "${PREFIX:-}" == /data/data/com.termux/* ]]
+}
+
 OS=$(detect_os)
 ARCH=$(detect_arch)
+if [ "$OS" = "linux" ] && is_android; then
+  echo 'error: Android/Termux cannot run the Linux portable binary (static glibc; Android kills it with "Bad system call").' >&2
+  echo "Building from source in Termux may work but is not a supported platform yet - see issue #1202." >&2
+  exit 1
+fi
 
 echo "codebase-memory-mcp installer"
 echo "  os:      $OS"
