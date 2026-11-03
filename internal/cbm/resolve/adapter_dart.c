@@ -55,9 +55,18 @@ typedef struct {
     bool conditional; /* its library depends on the build's configuration */
 } dart_directive_t;
 
+/* What a question about a name needs of a library's imports, without reading them all. */
+typedef struct dart_import_row {
+    size_t index;
+    struct dart_import_row *next;
+} dart_import_row_t;
+
 typedef struct {
     dart_directive_t *imports;
     size_t import_count;
+    dart_import_row_t *conditional; /* whose library the build's configuration picks */
+    dart_import_row_t *open;        /* from outside the project, under a filter */
+    bool open_unfiltered;           /* one from outside the project passes every name */
 } dart_library_t;
 
 typedef struct dart_local {
@@ -80,6 +89,8 @@ typedef struct {
     dart_local_t *locals;
     CBMHashTable *libraries;
     CBMHashTable *import_memo;
+    CBMHashTable *imports_of; /* importer and imported library: that import's rows */
+    CBMHashTable *prefixes;   /* this library's import prefixes */
 } dart_ctx_t;
 
 typedef enum { DART_NOTHING, DART_FUNCTION, DART_CLASS, DART_INSTANCE, DART_LIBRARY } dart_kind_t;
@@ -703,6 +714,43 @@ static void dart_read_directives(dart_ctx_t *ctx, const char *library, const cha
             (*out_count)++;
 }
 
+static dart_import_row_t *dart_import_row(dart_ctx_t *ctx, size_t index, dart_import_row_t *next) {
+    dart_import_row_t *row = cbm_arena_alloc(ctx->walk->arena, sizeof(*row));
+    if (!row) {
+        cbm_source_fail(ctx->walk, "dart_library_allocation");
+        return next;
+    }
+    *row = (dart_import_row_t){index, next};
+    return row;
+}
+
+static const char *dart_import_key(dart_ctx_t *ctx, const char *importer, const char *imported) {
+    return cbm_arena_sprintf(ctx->walk->arena, "%s%c%s", importer, DART_DIRECTIVE_SEPARATOR,
+                             imported);
+}
+
+static void dart_index_imports(dart_ctx_t *ctx, const char *path, dart_library_t *library) {
+    bool own = !strcmp(path, ctx->library);
+    for (size_t i = 0; i < library->import_count; i++) {
+        const dart_directive_t *import = &library->imports[i];
+        if (own && import->prefix)
+            cbm_ht_set(ctx->prefixes, import->prefix, (void *)import->prefix);
+        if (import->conditional)
+            library->conditional = dart_import_row(ctx, i, library->conditional);
+        if (import->library) {
+            const char *key = dart_import_key(ctx, path, import->library);
+            if (key)
+                cbm_ht_set(ctx->imports_of, key,
+                           dart_import_row(ctx, i, cbm_ht_get(ctx->imports_of, key)));
+        } else if (!import->prefix) {
+            if ((!import->show || !import->show[0]) && (!import->hide || !import->hide[0]))
+                library->open_unfiltered = true;
+            else
+                library->open = dart_import_row(ctx, i, library->open);
+        }
+    }
+}
+
 static dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
     dart_library_t *library = cbm_ht_get(ctx->libraries, path);
     if (library)
@@ -714,21 +762,23 @@ static dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
         return NULL;
     }
     dart_read_directives(ctx, path, DART_IMPORTS, &library->imports, &library->import_count);
+    dart_index_imports(ctx, key, library);
     cbm_ht_set(ctx->libraries, key, library);
     return library;
 }
 
-/* Whether `from` reaches `library` through exports that pass this name. A library declaring the
- * key itself answers with its own, so no walk goes on through it. This reads who exports
- * `library`, directly or not, and no barrel's whole export list, and it recurses nowhere. */
-static bool dart_exports_reach(dart_ctx_t *ctx, const char *library, const char *from,
-                               const char *key, const char *name, bool *limited) {
+/* Every library that reaches `library` through exports that pass this name, each once. A library
+ * declaring the key itself answers with its own, so no walk goes on through it. This reads who
+ * exports `library`, directly or not, and no barrel's whole export list, and it recurses nowhere.
+ * True when `visit` said to stop. */
+typedef bool (*dart_up_fn)(const char *library, void *user);
+
+static bool dart_walk_up(dart_ctx_t *ctx, const char *library, const char *key, const char *name,
+                         cbm_source_chain_t *seen, dart_up_fn visit, void *user, bool *limited) {
     enum { DART_WALK_INLINE = 32 };
     const char *held[DART_WALK_INLINE];
     const char **stack = held;
     size_t depth = 0, capacity = DART_WALK_INLINE;
-    cbm_source_chain_t seen = {0};
-    (void)cbm_source_chain_first_visit(ctx->walk, &seen, library);
     for (const char *at = library; at; at = depth ? stack[--depth] : NULL) {
         for (const cbm_source_decl_t *edge = cbm_source_lookup(ctx->walk, at, DART_EXPORTERS); edge;
              edge = edge->next) {
@@ -736,15 +786,15 @@ static bool dart_exports_reach(dart_ctx_t *ctx, const char *library, const char 
             const char *const *bases = edge->bases;
             if (!bases || !dart_filter_passes(bases[1], bases[2], name))
                 continue;
-            if (!strcmp(bases[0], from))
-                return true;
-            if (!cbm_source_chain_first_visit(ctx->walk, &seen, bases[0])) {
-                if (seen.overflow) {
+            if (!cbm_source_chain_first_visit(ctx->walk, seen, bases[0])) {
+                if (seen->overflow) {
                     *limited = true;
                     return false;
                 }
                 continue;
             }
+            if (visit(bases[0], user))
+                return true;
             if (cbm_source_lookup(ctx->walk, bases[0], key))
                 continue;
             if (depth == capacity) {
@@ -763,6 +813,10 @@ static bool dart_exports_reach(dart_ctx_t *ctx, const char *library, const char 
     return false;
 }
 
+static bool dart_is_library(const char *library, void *user) {
+    return !strcmp(library, user);
+}
+
 /* A library's public name, including what it re-exports. A barrel can list the whole project and
  * every file can import it, so this starts from who declares the name: only they can answer. */
 static const cbm_source_decl_t *dart_library_public(dart_ctx_t *ctx, const char *path,
@@ -778,7 +832,11 @@ static const cbm_source_decl_t *dart_library_public(dart_ctx_t *ctx, const char 
          row = row->next) {
         cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         const cbm_source_decl_t *declared = cbm_source_lookup(ctx->walk, row->type, key);
-        if (declared == found || !dart_exports_reach(ctx, row->type, path, key, name, limited))
+        if (declared == found)
+            continue;
+        cbm_source_chain_t seen = {0};
+        (void)cbm_source_chain_first_visit(ctx->walk, &seen, row->type);
+        if (!dart_walk_up(ctx, row->type, key, name, &seen, dart_is_library, (void *)path, limited))
             continue;
         if (found) {
             *conflict = true;
@@ -790,6 +848,66 @@ static const cbm_source_decl_t *dart_library_public(dart_ctx_t *ctx, const char 
 }
 
 /* The declaration a name reaches through one library's imports, with this prefix. */
+typedef struct {
+    dart_ctx_t *ctx;
+    const char *path;
+    dart_import_row_t *rows;
+    size_t count;
+} dart_answering_t;
+
+/* This library's imports of a library that can answer. */
+static bool dart_note_answering(const char *imported, void *user) {
+    dart_answering_t *found = user;
+    const char *key = dart_import_key(found->ctx, found->path, imported);
+    const dart_import_row_t *row = key ? cbm_ht_get(found->ctx->imports_of, key) : NULL;
+    for (; row; row = row->next) {
+        found->rows = dart_import_row(found->ctx, row->index, found->rows);
+        found->count++;
+    }
+    return false;
+}
+
+static int dart_compare_index(const void *left, const void *right) {
+    size_t a = *(const size_t *)left, b = *(const size_t *)right;
+    return a < b ? -1 : a > b;
+}
+
+/* In written order, the imports that can change the answer for this name: those whose library, or
+ * something it exports, declares it, and those whose library the build picks. Every other import
+ * adds nothing, wherever it stands. False: the walk could not finish, so ask them all. */
+static bool dart_imports_answering(dart_ctx_t *ctx, const char *path,
+                                   const dart_library_t *library, const char *key, const char *name,
+                                   size_t **out, size_t *count) {
+    dart_answering_t found = {.ctx = ctx, .path = path};
+    cbm_source_chain_t seen = {0};
+    bool limited = false;
+    for (const cbm_source_decl_t *row = cbm_source_lookup(ctx->walk, DART_NAMES, key);
+         row && !limited; row = row->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        limited |= !cbm_source_chain_first_visit(ctx->walk, &seen, row->type) && seen.overflow;
+        (void)dart_note_answering(row->type, &found);
+        (void)dart_walk_up(ctx, row->type, key, name, &seen, dart_note_answering, &found, &limited);
+    }
+    if (limited)
+        return false;
+    for (const dart_import_row_t *row = library->conditional; row; row = row->next) {
+        found.rows = dart_import_row(ctx, row->index, found.rows);
+        found.count++;
+    }
+    size_t *items = found.count ? cbm_arena_alloc(ctx->walk->arena, found.count * sizeof(*items))
+                                : NULL;
+    if (found.count && !items)
+        return false;
+    size_t used = 0;
+    for (const dart_import_row_t *row = found.rows; row; row = row->next)
+        items[used++] = row->index;
+    if (used > 1)
+        qsort(items, used, sizeof(*items), dart_compare_index);
+    *out = items;
+    *count = used;
+    return true;
+}
+
 static const cbm_source_decl_t *dart_import_search(dart_ctx_t *ctx, const char *path,
                                                    const char *prefix, const char *key,
                                                    const char *name, const char **reason) {
@@ -799,8 +917,19 @@ static const cbm_source_decl_t *dart_import_search(dart_ctx_t *ctx, const char *
     const dart_library_t *library = dart_library(ctx, path);
     if (!library)
         return NULL;
+    size_t *answering = NULL, count = library->import_count;
+    bool some = dart_imports_answering(ctx, path, library, key, name, &answering, &count);
+    if (!some)
+        count = library->import_count;
     const cbm_source_decl_t *selected = NULL;
-    for (size_t i = 0; i < library->import_count; i++) {
+    size_t last = SIZE_MAX;
+    for (size_t step = 0; step < count; step++) {
+        size_t i = some ? answering[step] : step;
+        /* An import that declares a name and reaches it through an export comes up twice. */
+        if (i == last)
+            continue;
+        last = i;
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         const dart_directive_t *import = &library->imports[i];
         bool same_prefix = (!prefix && !import->prefix) ||
                            (prefix && import->prefix && !strcmp(prefix, import->prefix));
@@ -859,10 +988,12 @@ static const cbm_source_decl_t *dart_import_lookup(dart_ctx_t *ctx, const char *
 /* An import outside the project with no show list that rules this name out. */
 static bool dart_open_import_can_provide(dart_ctx_t *ctx, const char *name) {
     const dart_library_t *library = dart_library(ctx, ctx->library);
-    for (size_t i = 0; library && i < library->import_count; i++) {
-        const dart_directive_t *import = &library->imports[i];
-        if (!import->prefix && !import->library &&
-            dart_filter_passes(import->show, import->hide, name))
+    if (library && library->open_unfiltered)
+        return true;
+    for (const dart_import_row_t *row = library ? library->open : NULL; row; row = row->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        const dart_directive_t *import = &library->imports[row->index];
+        if (dart_filter_passes(import->show, import->hide, name))
             return true;
     }
     /* dart:core is imported implicitly, and has these functions. */
@@ -1195,14 +1326,13 @@ static dart_ref_t dart_name(dart_ctx_t *ctx, const char *name) {
         return ref;
     }
     /* A prefix is its own kind of name. */
-    const dart_library_t *library = dart_library(ctx, ctx->library);
-    for (size_t i = 0; library && i < library->import_count; i++) {
-        if (library->imports[i].prefix && !strcmp(library->imports[i].prefix, name)) {
-            ref.kind = DART_LIBRARY;
-            ref.prefix = library->imports[i].prefix;
-            ref.via_import = true;
-            return ref;
-        }
+    (void)dart_library(ctx, ctx->library);
+    const char *prefix = cbm_ht_get(ctx->prefixes, name);
+    if (prefix) {
+        ref.kind = DART_LIBRARY;
+        ref.prefix = prefix;
+        ref.via_import = true;
+        return ref;
     }
     return dart_implicit_this(ctx, name);
 }
@@ -1877,12 +2007,16 @@ static void dart_resolve(cbm_source_walk_t *walk) {
     }
     ctx.libraries = cbm_ht_create(16);
     ctx.import_memo = cbm_ht_create(64);
-    if (ctx.libraries && ctx.import_memo)
+    ctx.imports_of = cbm_ht_create(64);
+    ctx.prefixes = cbm_ht_create(16);
+    if (ctx.libraries && ctx.import_memo && ctx.imports_of && ctx.prefixes)
         dart_visit_members(&ctx, walk->root, 0);
     else
         cbm_source_fail(walk, "dart_library_allocation");
     cbm_ht_free(ctx.libraries);
     cbm_ht_free(ctx.import_memo);
+    cbm_ht_free(ctx.imports_of);
+    cbm_ht_free(ctx.prefixes);
 }
 
 /* The one shared name Dart has is a getter and a setter, which are one node here. */
