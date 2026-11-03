@@ -95,7 +95,8 @@ jobs:
 
       - name: Install build dependencies
         if: ${{ matrix.language == 'c-cpp' }}
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
 
       # PR c-cpp: compile the third-party objects (tree-sitter grammars,
       # sqlite, mimalloc, lz4, zstd, the tree-sitter runtime: ~1.3 GB of
@@ -113,7 +114,7 @@ jobs:
         run: scripts/ci/codeql-retrace-vendored.sh "$RUNNER_TEMP/codeql-retrace.txt"
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -128,7 +129,7 @@ jobs:
         run: scripts/build.sh --reuse-vendored --retrace-from "$RUNNER_TEMP/codeql-retrace.txt"
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           category: "/language:${{ matrix.language }}"
 

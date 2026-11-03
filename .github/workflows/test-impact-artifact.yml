@@ -44,12 +44,13 @@ jobs:
           persist-credentials: false
 
       - name: Install build deps and LLVM 21 (coverage toolchain)
+        timeout-minutes: 10
         run: |
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update
-          sudo apt-get install -y clang-21 llvm-21 libclang-rt-21-dev
+          sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update
+          sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y clang-21 llvm-21 libclang-rt-21-dev
 
       - name: Build the production binary and the coverage runner
         run: |
@@ -78,7 +79,7 @@ jobs:
             --out "$RUNNER_TEMP/bundle" --mode "$mode" --before "$before"
 
       - name: Upload the bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-impact-${{ github.sha }}
           path: ${{ runner.temp }}/bundle

@@ -44,6 +44,7 @@ int tf_deselected_count = 0;
 #include <windows.h>
 #include "foundation/win_utf8.h" /* cbm_module_path_utf8 — the runner's own image */
 #else
+#include <sys/wait.h> /* waitpid: the process-tree probe root */
 #include <unistd.h>
 #ifdef __APPLE__
 #include <fcntl.h>
@@ -454,10 +455,12 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         FILE *ready = marker ? cbm_fopen(marker, "wb") : NULL;
         if (ready) {
             (void)fprintf(
-                ready, "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\n",
+                ready,
+                "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\nfence=%s\n",
                 getenv("CBM_INDEX_SINGLE_THREAD") ? getenv("CBM_INDEX_SINGLE_THREAD") : "", marker,
                 getenv("CBM_INDEX_QUARANTINE_FILE") ? getenv("CBM_INDEX_QUARANTINE_FILE") : "",
-                cbm_mem_budget(), descendant);
+                cbm_mem_budget(), descendant,
+                cbm_index_worker_publish_fence() ? cbm_index_worker_publish_fence() : "");
             (void)fclose(ready);
         }
         (void)fprintf(stderr, "async worker hang-tree probe\n");
@@ -508,6 +511,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
+    cbm_index_set_worker_publish_fence(invocation.publish_fence_file);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
     cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
@@ -1802,6 +1806,7 @@ extern void suite_php_lsp(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
 extern void suite_perl_lsp(void);
+extern void suite_ruby_lsp(void);
 extern void suite_scope(void);
 extern void suite_type_rep(void);
 extern void suite_py_lsp(void);
@@ -1968,6 +1973,100 @@ static int tf_role_env_isolation(int argc, char **argv) {
     return 0;
 }
 
+/* Process-tree memory probe coverage (test_subprocess.c). The root starts ONE
+ * descendant that charges a controlled amount of memory, so a tree total can
+ * be checked against an allocation only a descendant holds. The descendant
+ * publishes its pid by an atomic rename once every page is touched, then
+ * blocks until it is killed. The root exits when its descendant dies, so a
+ * failed setup ends the tree instead of leaving the test waiting. */
+static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
+    char *end = NULL;
+    long mib = strtol(mib_text, &end, 10);
+    if (!end || *end != '\0' || mib < 0 || mib > 1024) {
+        return 81;
+    }
+    size_t bytes = (size_t)mib * 1024U * 1024U;
+    unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
+    if (bytes > 0 && !block) {
+        return 82;
+    }
+    if (block) {
+        memset(block, 0xA5, bytes);
+    }
+    char staged[1024];
+    int length = snprintf(staged, sizeof(staged), "%s.tmp", ready_path);
+    FILE *ready = length > 0 && (size_t)length < sizeof(staged) ? cbm_fopen(staged, "wb") : NULL;
+    if (!ready) {
+        return 83;
+    }
+#ifdef _WIN32
+    (void)fprintf(ready, "%lu\n", (unsigned long)GetCurrentProcessId());
+#else
+    (void)fprintf(ready, "%ld\n", (long)getpid());
+#endif
+    if (fclose(ready) != 0 || rename(staged, ready_path) != 0) {
+        return 84;
+    }
+    volatile unsigned char keep = block ? block[bytes - 1] : 0;
+    (void)keep;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(INFINITE);
+#else
+        (void)pause();
+#endif
+    }
+}
+
+static int tf_role_rss_tree_hold(int argc, char **argv) {
+    return argc == 4 ? tf_rss_tree_hold(argv[2], argv[3]) : -1;
+}
+
+static int tf_role_rss_tree_root(int argc, char **argv) {
+    if (argc != 4) {
+        return -1;
+    }
+#ifdef _WIN32
+    char *self = cbm_module_path_utf8();
+    const char *child_argv[] = {self, "__cbm_rss_tree_hold", argv[2], argv[3], NULL};
+    char command_line[8192];
+    bool built = self && cbm_build_win_cmdline(command_line, sizeof(command_line), child_argv);
+    wchar_t *wide_self = built ? cbm_utf8_to_wide(self) : NULL;
+    wchar_t *wide_command = built ? cbm_utf8_to_wide(command_line) : NULL;
+    STARTUPINFOW startup;
+    ZeroMemory(&startup, sizeof(startup));
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child;
+    ZeroMemory(&child, sizeof(child));
+    /* The child joins this process's Job Object by default, which is the tree
+     * the probe under test enumerates. */
+    BOOL started = wide_self && wide_command &&
+                   CreateProcessW(wide_self, wide_command, NULL, NULL, FALSE, 0, NULL, NULL,
+                                  &startup, &child);
+    free(wide_self);
+    free(wide_command);
+    free(self);
+    if (!started) {
+        return 85;
+    }
+    CloseHandle(child.hThread);
+    (void)WaitForSingleObject(child.hProcess, INFINITE);
+    CloseHandle(child.hProcess);
+#else
+    pid_t child = fork();
+    if (child < 0) {
+        return 85;
+    }
+    if (child == 0) {
+        _exit(tf_rss_tree_hold(argv[2], argv[3]));
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+#endif
+    return 86; /* the descendant ended: end the tree */
+}
+
 /* Installation tests use this executable as a structurally real candidate.
  * Mirror the production binary's minimal verification contract. */
 static int tf_role_version(int argc, char **argv) {
@@ -2060,6 +2159,8 @@ typedef struct {
 static const tf_role_t tf_roles[] = {
     TF_ROLE(TF_PHASE_RAW, "__cbm_env_values", tf_role_env_values),
     TF_ROLE(TF_PHASE_RAW, "__cbm_env_isolation", tf_role_env_isolation),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_root", tf_role_rss_tree_root),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_hold", tf_role_rss_tree_hold),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdin_probe", tf_role_subprocess_stdin_probe),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdout_probe", tf_role_subprocess_stdout_probe),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_git_facts_diff_probe", tf_role_git_facts_diff_probe),
@@ -2122,7 +2223,49 @@ static int tf_role_dispatch(tf_phase_t phase, int argc, char **argv) {
 
 const char *cbm_test_program_path;
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define TF_MSAN_MIMALLOC_OUTPUT 1
+#endif
+#endif
+
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+#include <mimalloc.h>
+#include <sanitizer/msan_interface.h>
+
+/* MSan lane only. mimalloc is deliberately left uninstrumented there
+ * (build/msan/mimalloc.o is compiled without -fsanitize=memory), so MSan never
+ * sees it write its own stack. Its text output is the one place those stack
+ * bytes reach an MSan interceptor: a message formatted in a mimalloc stack
+ * buffer arrives at fputs still carrying the shadow an earlier instrumented
+ * frame left there, and MSan reports initialized bytes as uninitialized.
+ * mimalloc 3.5.3 prints an arena-alignment fallback warning on the x86-64 MSan
+ * lane, which tripped this in the mem suite. Routing mimalloc's output through
+ * this handler marks the finished text initialized before it reaches fputs. */
+static bool tf_msan_mi_output_live;
+
+static void tf_msan_mi_output(const char *msg, void *arg) {
+    (void)arg;
+    /* Registering replays mimalloc's delayed-output buffer into the handler.
+     * Its constructor already wrote all of that to stderr before main, so the
+     * replay would only repeat it behind a stray newline: skip it. */
+    if (!tf_msan_mi_output_live || !msg) {
+        return;
+    }
+    /* Mark the text initialized before reading even its first byte. */
+    __msan_unpoison_string(msg);
+    if (!msg[0]) {
+        return;
+    }
+    (void)fputs(msg, stderr);
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+    mi_register_output(tf_msan_mi_output, NULL);
+    tf_msan_mi_output_live = true;
+#endif
     cbm_test_program_path = tf_runner_image(argc, argv);
     int role_rc = tf_role_dispatch(TF_PHASE_RAW, argc, argv);
     if (role_rc >= 0) {
@@ -2393,6 +2536,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
     RUN_SELECTED_SUITE(perl_lsp);
+    RUN_SELECTED_SUITE(ruby_lsp);
     RUN_SELECTED_SUITE(py_lsp);
     RUN_SELECTED_SUITE(kotlin_lsp);
     RUN_SELECTED_SUITE(kotlin_typed_calls);

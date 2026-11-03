@@ -2150,6 +2150,45 @@ TEST(ei_php_vendor_types_never_bind_by_name_issue1186) {
     PASS();
 }
 
+/* A vendor `use function` import shares its local name with a project class the
+ * file also imports. `new Thing()`, a `Thing $t` parameter and `extends Thing`
+ * name the class, so the function import must not veto their edges. The check
+ * reads each site's syntax from the parse tree, which the sequential
+ * definitions pass (a repo of 50 files or fewer) keeps for PHP results. */
+TEST(ei_php_vendor_function_import_keeps_same_named_class_sites) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/Thing.php", "<?php\nnamespace App\\Models;\n\nclass Thing {\n"
+                                 "    public function __construct() {}\n"
+                                 "    public function go() { return 1; }\n}\n"},
+        {"app/Http/UsesThing.php", "<?php\nnamespace App\\Http;\n\n"
+                                   "use App\\Models\\Thing;\nuse function Vendor\\Lib\\Thing;\n\n"
+                                   "class UsesThing extends Thing {\n"
+                                   "    public function run(Thing $t) {\n"
+                                   "        $made = new Thing();\n"
+                                   "        return $made->go();\n"
+                                   "    }\n}\n"}};
+    static const char *const uses = "app/Http/UsesThing.php";
+    static const char *const thing = "app/Models/Thing.php";
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 3);
+    int calls = store ? ei_php_checked_file_edges(store, lp.project, uses, "CALLS", thing) : -1;
+    int usages = store ? ei_php_checked_file_edges(store, lp.project, uses, "USAGE", thing) : -1;
+    int inherits =
+        store ? ei_php_checked_file_edges(store, lp.project, uses, "INHERITS", thing) : -1;
+    ei_cleanup(&lp, store);
+    if (calls != 2 || usages != 2 || inherits != 1) {
+        fprintf(stderr,
+                "  UsesThing.php -> Thing.php: CALLS %d (want 2), USAGE %d (want 2), "
+                "INHERITS %d (want 1)\n",
+                calls, usages, inherits);
+    }
+    ASSERT_EQ(calls, 2);    /* new Thing() and $made->go() */
+    ASSERT_EQ(usages, 2);   /* extends Thing and the Thing $t parameter */
+    ASSERT_EQ(inherits, 1); /* never vetoed: control */
+    PASS();
+}
+
 /* Build the metadata through the production writer, then challenge its
  * readback. A File node or an empty edge query alone is never completeness. */
 static bool ei_php_seed_result(cbm_gbuf_t *gb, const char *project, const char *rel,
@@ -2538,6 +2577,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186);
     RUN_TEST(ei_php_require_path_keeps_generic_resolution_issue1186);
     RUN_TEST(ei_php_vendor_types_never_bind_by_name_issue1186);
+    RUN_TEST(ei_php_vendor_function_import_keeps_same_named_class_sites);
     RUN_TEST(ei_php_binding_snapshot_requires_current_complete_evidence);
     RUN_TEST(ei_php_binding_snapshot_groups_kinds_and_invalidates_failed_rebuild);
     RUN_TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown);

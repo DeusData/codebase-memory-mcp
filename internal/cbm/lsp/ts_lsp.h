@@ -33,6 +33,14 @@ typedef struct {
     const char **import_module_qns;
     int import_count;
 
+    // Renamed named imports (`import { foo as bar }`): local binding -> the name
+    // the module exports. Parallel arrays of length import_alias_count; a
+    // binding absent here is exported under its local name.
+    const char **import_alias_locals;
+    const char **import_alias_exports;
+    int import_alias_count;
+    size_t import_alias_capacity;
+
     // File / surrounding context.
     const char *module_qn;          // QN of this file's module
     const char *enclosing_func_qn;  // current function being walked, NULL at module scope
