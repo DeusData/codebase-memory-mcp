@@ -4249,6 +4249,47 @@ TEST(resolver_source_swift_initializer_types_and_nested_context) {
     PASS();
 }
 
+/* A function type with no parameters still has a signature: the closure given to it has no $0,
+ * and its body resolves as any other. The signature is read long after the declaration was walked,
+ * so it has to outlive that walk: run with detect_stack_use_after_return=1 this was a dead frame. */
+static const char SW_NOARGS[] =
+    "struct Dog { func bark() {} }\n"                  /* 1 */
+    "func noArgs(_ body: () -> Void) {}\n"             /* 2 */
+    "func maybe(_ body: (() -> Void)?) {}\n"           /* 3 */
+    "class Flow {\n"                                   /* 4 */
+    "    func plain() { noArgs { Dog().bark() } }\n"   /* 5 */
+    "    func optional() { maybe { Dog().bark() } }\n" /* 6 */
+    "    func noFirst() { noArgs { $0.bark() } }\n"    /* 7 */
+    "}\n";                                             /* 8 */
+#define SW_NOARGS_FILE "Sources/App/NoArgs.swift"
+#define SW_NOARGS_CALL(id, method, needle, at, suffix, label, line, decl)                          \
+    SL_CALL_AT(id, SW_NOARGS_FILE, "Flow." method, needle, at, SW_NOARGS_FILE, suffix, label, line, decl)
+
+TEST(resolver_source_swift_a_closure_of_no_parameters) {
+    static const RQ_Source sources[] = {
+        {.path = "Package.swift", .text = SW_MANIFEST},
+        {.path = SW_NOARGS_FILE, .text = SW_NOARGS},
+    };
+    static const RQ_Expected expected[] = {
+        SW_NOARGS_CALL("the-function-given-it", "plain", "noArgs { Dog().bark() }", 0, "NoArgs.noArgs",
+                       "Function", 2, "func noArgs(_ body: () -> Void) {}"),
+        SW_NOARGS_CALL("a-call-in-its-body", "plain", "Dog().bark()", 0, "Dog.bark", "Method", 1,
+                       "struct Dog { func bark() {} }"),
+        SW_NOARGS_CALL("the-function-given-an-optional-one", "optional", "maybe { Dog().bark() }", 0,
+                       "NoArgs.maybe", "Function", 3, "func maybe(_ body: (() -> Void)?) {}"),
+        SW_NOARGS_CALL("a-call-in-that-body", "optional", "Dog().bark()", 0, "Dog.bark", "Method", 1,
+                       "struct Dog { func bark() {} }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("no-parameters-no-first-shorthand", SW_NOARGS_FILE, "Flow.noFirst", "$0.bark()", 0),
+    };
+    ASSERT(sl_check("swift-noargs", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 /* Types a closure's signature and a value's form state, and what they leave open. */
 static const char SW_FLOW[] =
     "struct Dog { func bark() {} }\n"                                           /* 1 */
@@ -6419,6 +6460,7 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_swift_implicit_members_and_overloads_by_type);
     RUN_TEST(resolver_source_swift_initializer_types_and_nested_context);
     RUN_TEST(resolver_source_swift_closures_and_value_forms);
+    RUN_TEST(resolver_source_swift_a_closure_of_no_parameters);
     RUN_TEST(resolver_source_dart_headers_reads_members_and_pubspec_paths);
     RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
     RUN_TEST(resolver_source_haskell_imports_and_scope);

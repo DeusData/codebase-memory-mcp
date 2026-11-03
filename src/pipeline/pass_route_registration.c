@@ -624,7 +624,7 @@ bool cbm_route_registration_real(const CBMCall *call) {
         return route_ruby_dsl_form(file, call);
     }
     size_t receiver_end = verb_start - 1;
-    if (callee[receiver_end] == ':' && receiver_end > 0 && callee[receiver_end - 1] == ':')
+    if (callee[receiver_end] == ':' && callee[receiver_end - 1] == ':')
         receiver_end--;
     if (receiver_end == 0)
         return false;

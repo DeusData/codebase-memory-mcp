@@ -240,8 +240,7 @@ static const char *swift_closure_signature(cbm_source_walk_t *walk, TSNode type,
     }
     if (!cbm_source_is(type, "function_type"))
         return NULL;
-    char mark[2] = {SWIFT_CLOSURE_MARK, 0};
-    const char *joined = mark;
+    const char *joined = cbm_arena_sprintf(walk->arena, "%c", SWIFT_CLOSURE_MARK);
     TSNode params = cbm_source_field(type, "params");
     uint32_t count = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
     for (uint32_t i = 0; joined && i < count; i++) {
@@ -341,8 +340,8 @@ static uint32_t swift_modifier_flags(cbm_source_walk_t *walk, TSNode declaration
 static uint32_t swift_member_flags(cbm_source_walk_t *walk, TSNode declaration,
                                    uint32_t inherited) {
     uint32_t flags = swift_modifier_flags(walk, declaration);
-    return flags & (CBM_SOURCE_DECL_F_PUBLIC | CBM_SOURCE_DECL_F_PRIVATE) ? flags
-                                                                          : flags | inherited;
+    bool stated = (flags & (CBM_SOURCE_DECL_F_PUBLIC | CBM_SOURCE_DECL_F_PRIVATE)) != 0;
+    return stated ? flags : flags | inherited;
 }
 
 /* ── Phase one ─────────────────────────────────────────────────────── */
