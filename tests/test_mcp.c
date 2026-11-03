@@ -23777,6 +23777,386 @@ TEST(index_supervisor_clean_exit_without_response_response_issue1300) {
     PASS();
 }
 
+#ifndef _WIN32
+typedef struct {
+    int calls;
+} index_worker_resource_clock_t;
+
+static uint64_t index_worker_resource_clock(void *context) {
+    index_worker_resource_clock_t *clock = context;
+    clock->calls++;
+    return clock->calls == 1 ? 100 : 1101;
+}
+
+enum {
+    IDXRESOURCE_OK = 0,
+    IDXRESOURCE_SETUP = 71,
+    IDXRESOURCE_NO_RESPONSE = 72,
+    IDXRESOURCE_BAD_CONTRACT = 73,
+    IDXRESOURCE_RETRIED = 74,
+};
+
+static int index_worker_resource_response_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server ||
+        cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXRESOURCE_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_worker_resource_clock_t clock = {0};
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_worker_resource_clock, NULL, &clock);
+    int before = cbm_index_supervisor_spawn_count();
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                   "\"_cbm_index_policy\":{\"index_max_files\":\"off\","
+                   "\"index_max_source_mb\":\"off\",\"index_max_rss_mb\":\"off\","
+                   "\"index_max_duration_seconds\":\"off\"}}",
+                   repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    int after = cbm_index_supervisor_spawn_count();
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    int result = IDXRESOURCE_OK;
+    if (!response) {
+        result = IDXRESOURCE_NO_RESPONSE;
+    } else if (!strstr(response, "resource_limit_exceeded") ||
+               !strstr(response, "\\\"stage\\\":\\\"worker\\\"") ||
+               !strstr(response, "\\\"resource\\\":\\\"duration_ms\\\"") ||
+               !strstr(response, "\\\"observed\\\":1001") ||
+               !strstr(response, "\\\"limit\\\":1000") ||
+               !strstr(response, "\\\"unit\\\":\\\"milliseconds\\\"")) {
+        result = IDXRESOURCE_BAD_CONTRACT;
+    } else if (after - before != 1) {
+        result = IDXRESOURCE_RETRIED;
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork-isolated MCP host harness; supervisor state machine is cross-platform");
+#else
+    char *repo = th_mktempdir("cbm_worker_resource_repo");
+    char *cache = th_mktempdir("cbm_worker_resource_cache");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(index_worker_resource_response_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    if (exit_code != IDXRESOURCE_OK) {
+        printf("    worker resource child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXRESOURCE_OK);
+    PASS();
+#endif
+}
+
+#ifndef _WIN32
+#include <fcntl.h>
+
+/* A worker limit must never be reported after the same attempt published.
+ * The real worker replaces the serving database and only then exports the
+ * persistence artifact. A FIFO planted at the artifact's temp path holds it
+ * inside that export, after the rename, for as long as nobody reads the FIFO,
+ * and the duration clock crosses its limit only once the serving database has
+ * been replaced. The limit is therefore observed in the post-publication
+ * window by construction, never by timing:
+ *   - uncoordinated, the supervisor stops the worker there and answers
+ *     resource_limit_exceeded with serving_index_preserved=true although the
+ *     previous generation is already gone;
+ *   - with the publication fence the worker claimed publication before the
+ *     rename, so the supervisor leaves the limit unenforced and logs that.
+ *     Only that log line releases the FIFO; the worker then finishes and
+ *     reports the published index. The artifact path is a directory, so the
+ *     export itself fails afterwards, which the #1665 response names. */
+typedef struct {
+    char live_db[CBM_SZ_1K];
+    ino_t previous_inode;
+    int over_limit_calls;
+} index_publication_race_clock_t;
+
+static char g_publication_race_fifo[CBM_SZ_1K];
+static bool g_publication_race_released;
+
+static uint64_t index_publication_race_clock(void *context) {
+    index_publication_race_clock_t *clock = context;
+    struct stat status;
+    if (stat(clock->live_db, &status) != 0 || status.st_ino == clock->previous_inode) {
+        return 100;
+    }
+    clock->over_limit_calls++;
+    return 1101;
+}
+
+static void index_publication_race_sink(const char *line) {
+    if (g_publication_race_released || !line ||
+        !strstr(line, "index.supervisor.resource_limit_after_publication")) {
+        return;
+    }
+    g_publication_race_released = true;
+    /* Blocks only until the held worker opens its end, then reads to EOF. */
+    int fifo = open(g_publication_race_fifo, O_RDONLY);
+    if (fifo >= 0) {
+        char buffer[CBM_SZ_4K];
+        ssize_t got = 0;
+        do {
+            got = read(fifo, buffer, sizeof(buffer));
+        } while (got > 0);
+        (void)close(fifo);
+    }
+}
+
+enum {
+    IDXPUB_OK = 0,
+    IDXPUB_SETUP = 81,
+    IDXPUB_FIRST_INDEX = 82,
+    IDXPUB_HOLD_SETUP = 83,
+    IDXPUB_NO_RESPONSE = 84,
+    IDXPUB_NOT_REPLACED = 85,
+    IDXPUB_NOT_CROSSED = 86,
+    IDXPUB_LIMIT_AFTER_PUBLICATION = 87,
+    IDXPUB_NOT_RELEASED = 88,
+    IDXPUB_NOT_REPORTED_PUBLISHED = 89,
+};
+
+static int index_publication_race_first_generation(cbm_mcp_server_t *server, const char *repo,
+                                                   const char *cache,
+                                                   index_publication_race_clock_t *clock) {
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    char *text = extract_text_content(response);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *status = yyjson_get_str(yyjson_obj_get(root, "status"));
+    const char *project = yyjson_get_str(yyjson_obj_get(root, "project"));
+    struct stat live;
+    bool indexed = status && strcmp(status, "indexed") == 0 && project &&
+                   snprintf(clock->live_db, sizeof(clock->live_db), "%s/%s.db", cache, project) <
+                       (int)sizeof(clock->live_db) &&
+                   stat(clock->live_db, &live) == 0;
+    if (indexed) {
+        clock->previous_inode = live.st_ino;
+    }
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    return indexed ? IDXPUB_OK : IDXPUB_FIRST_INDEX;
+}
+
+static int index_publication_race_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXPUB_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_publication_race_clock_t clock = {0};
+    int result = index_publication_race_first_generation(server, repo, cache, &clock);
+
+    /* A second generation to publish, the hold, and a 1 s duration limit. */
+    char art_dir[CBM_SZ_1K];
+    char art_path[CBM_SZ_1K];
+    (void)snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", repo);
+    (void)snprintf(art_path, sizeof(art_path), "%s/graph.db.zst", art_dir);
+    (void)snprintf(g_publication_race_fifo, sizeof(g_publication_race_fifo), "%s.tmp", art_path);
+    if (result == IDXPUB_OK &&
+        (th_write_file(TH_PATH(repo, "extra.c"), "int extra(void) { return 1; }\n") != 0 ||
+         mkdir(art_dir, 0700) != 0 || mkdir(art_path, 0700) != 0 ||
+         mkfifo(g_publication_race_fifo, 0600) != 0 ||
+         cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0)) {
+        result = IDXPUB_HOLD_SETUP;
+    }
+    char *response = NULL;
+    if (result == IDXPUB_OK) {
+        char args[CBM_SZ_2K];
+        (void)snprintf(args, sizeof(args),
+                       "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"persistence\":true}", repo);
+        cbm_log_set_level(CBM_LOG_WARN);
+        cbm_log_set_sink_ex(index_publication_race_sink, CBM_LOG_SINK_TEE);
+        cbm_index_supervisor_set_resource_hooks_for_testing(index_publication_race_clock, NULL,
+                                                            &clock);
+        response = cbm_mcp_handle_tool(server, "index_repository", args);
+        cbm_index_supervisor_reset_resource_hooks_for_testing();
+        cbm_log_set_sink(NULL);
+    }
+    struct stat live;
+    bool replaced = stat(clock.live_db, &live) == 0 && live.st_ino != clock.previous_inode;
+    if (result != IDXPUB_OK) {
+        /* setup failure already recorded */
+    } else if (!response) {
+        result = IDXPUB_NO_RESPONSE;
+    } else if (!replaced) {
+        result = IDXPUB_NOT_REPLACED;
+    } else if (clock.over_limit_calls == 0) {
+        result = IDXPUB_NOT_CROSSED;
+    } else if (strstr(response, "resource_limit_exceeded")) {
+        result = IDXPUB_LIMIT_AFTER_PUBLICATION;
+    } else if (!g_publication_race_released) {
+        result = IDXPUB_NOT_RELEASED;
+    } else if (!strstr(response, "Index database was published")) {
+        result = IDXPUB_NOT_REPORTED_PUBLISHED;
+    }
+    if (result != IDXPUB_OK && response) {
+        printf("    second response: %.600s\n", response);
+        fflush(stdout);
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_limit_never_reported_after_its_own_publication) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork + FIFO hold harness; the fence state machine is cross-platform and "
+                  "covered by the index_supervisor suite");
+#else
+    /* th_mktempdir returns one static buffer: keep each path in its own copy. */
+    const char *made = th_mktempdir("cbm_publication_race_repo");
+    char *repo = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_publication_race_cache");
+    char *cache = made ? strdup(made) : NULL;
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Hang guard only: two supervised runs that each start an ASan worker. */
+        alarm(180);
+        _exit(index_publication_race_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    free(repo);
+    free(cache);
+    if (exit_code != IDXPUB_OK) {
+        printf("    publication race child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXPUB_OK);
+    PASS();
+#endif
+}
+
+/* serving_index_preserved describes the request, not only its last attempt:
+ * an earlier attempt may have published before it crashed (recovery then runs
+ * another attempt), and an index that appeared during the request (artifact
+ * bootstrap) was not preserved. */
+TEST(index_worker_resource_response_reports_preservation_for_the_request) {
+    const char *made = th_mktempdir("cbm_request_facts_repo");
+    char *repo = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_request_facts_cache");
+    char *cache = made ? strdup(made) : NULL;
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"RequestFactsFixture\"}",
+                   repo);
+
+    cbm_mcp_index_request_facts_t before_index = {0};
+    cbm_mcp_index_request_facts_begin(args, &before_index);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    char *indexed = server ? cbm_mcp_handle_tool(server, "index_repository", args) : NULL;
+    cbm_mcp_server_free(server);
+    cbm_mcp_index_request_facts_t facts = {0};
+    cbm_mcp_index_request_facts_begin(args, &facts);
+
+    cbm_index_worker_result_t limited;
+    memset(&limited, 0, sizeof(limited));
+    limited.outcome = CBM_PROC_KILLED;
+    limited.tree_quiesced = true;
+    limited.resource_violation = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_DURATION_MS, .observed = 1001, .limit = 1000};
+    cbm_index_worker_result_t published_then_crashed;
+    memset(&published_then_crashed, 0, sizeof(published_then_crashed));
+    published_then_crashed.outcome = CBM_PROC_CRASH;
+    published_then_crashed.publication_committed = true;
+    cbm_mcp_index_request_facts_t after_recovery = facts;
+    cbm_mcp_index_request_facts_record(&after_recovery, &limited);
+    bool limited_attempt_commits_nothing = !after_recovery.publication_committed;
+    cbm_mcp_index_request_facts_record(&after_recovery, &published_then_crashed);
+
+    char *preserved = cbm_mcp_index_worker_resource_response(args, &limited, &facts);
+    char *earlier_published =
+        cbm_mcp_index_worker_resource_response(args, &limited, &after_recovery);
+    char *appeared = cbm_mcp_index_worker_resource_response(args, &limited, &before_index);
+    char *no_facts = cbm_mcp_index_worker_resource_response(args, &limited, NULL);
+    const char *kept = "\\\"serving_index_preserved\\\":true";
+    const char *not_kept = "\\\"serving_index_preserved\\\":false";
+    bool indexed_ok = indexed && strstr(indexed, "\\\"status\\\":\\\"indexed\\\"");
+    bool preserved_ok = preserved && strstr(preserved, kept);
+    bool earlier_ok = earlier_published && strstr(earlier_published, not_kept);
+    bool appeared_ok = appeared && strstr(appeared, not_kept);
+    bool no_facts_ok = no_facts && strstr(no_facts, not_kept);
+
+    free(indexed);
+    free(preserved);
+    free(earlier_published);
+    free(appeared);
+    free(no_facts);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+    th_cleanup(repo);
+    th_cleanup(cache);
+    free(repo);
+    free(cache);
+
+    ASSERT_FALSE(before_index.serving_index_existed);
+    ASSERT_TRUE(indexed_ok);
+    ASSERT_TRUE(facts.serving_index_existed);
+    ASSERT_FALSE(facts.publication_committed);
+    ASSERT_TRUE(limited_attempt_commits_nothing);
+    ASSERT_TRUE(after_recovery.publication_committed);
+    ASSERT_TRUE(preserved_ok);
+    ASSERT_TRUE(earlier_ok);
+    ASSERT_TRUE(appeared_ok);
+    ASSERT_TRUE(no_facts_ok);
+    PASS();
+}
+
 /* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
  * Distinct exit codes so the parent can report the exact failure mode. */
 enum {
@@ -27849,6 +28229,9 @@ SUITE(mcp) {
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
     RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
+    RUN_TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried);
+    RUN_TEST(index_worker_limit_never_reported_after_its_own_publication);
+    RUN_TEST(index_worker_resource_response_reports_preservation_for_the_request);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
