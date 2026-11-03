@@ -320,6 +320,9 @@ struct cbm_pipeline {
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
     void *before_publish_hook_ctx;
+    /* Production publication gate (cbm_pipeline_set_publish_gate). */
+    cbm_pipeline_publish_gate_fn publish_gate;
+    void *publish_gate_ctx;
     /* Test-only: sees the complete graph buffer before the dump releases its indexes. */
     void (*before_dump_hook)(const cbm_gbuf_t *, void *);
     void *before_dump_hook_ctx;
@@ -927,6 +930,14 @@ static int pipeline_refresh_git_context(cbm_pipeline_t *p) {
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+void cbm_pipeline_set_publish_gate(cbm_pipeline_t *p, cbm_pipeline_publish_gate_fn gate,
+                                   void *context) {
+    if (p) {
+        p->publish_gate = gate;
+        p->publish_gate_ctx = gate ? context : NULL;
     }
 }
 
@@ -1624,7 +1635,8 @@ const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
 }
 
 const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p) {
-    return p && cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL;
+    return p && cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy
+                                                                        : NULL;
 }
 
 cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p) {
@@ -4419,7 +4431,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .ignore_file = NULL,
         .max_file_size = 0,
         .resource_policy =
-            cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
+            cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
         .resource_violation = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;
@@ -5233,8 +5245,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_userconfig_t *fresh_config = cbm_userconfig_load_with_source(p->repo_path);
     bool source_matches = cbm_pipeline_project_source_matches(p, fresh_config);
     cbm_userconfig_free(fresh_config);
+    bool publish_allowed = source_matches;
     if (!source_matches) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_source_changed");
+    } else if (p->publish_gate && !p->publish_gate(p->publish_gate_ctx)) {
+        /* Last point at which the serving database is still untouched: the
+         * destination preparation below may already move it aside. */
+        cbm_log_warn("pipeline.publish_refused", "path", final_path);
+        publish_allowed = false;
+    }
+    if (!publish_allowed) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
