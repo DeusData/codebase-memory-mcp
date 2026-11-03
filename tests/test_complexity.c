@@ -67,6 +67,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "resolve/binding.h"
 #include "resolve/rust_names.h"
+#include "resolve/source_adapter.h"
 #include "lsp/lsp_work.h"
 #include "lsp/lsp_name_rows.h"
 #define CBM_SYNTAX_INDEX_IMPLEMENTATION /* the seam only: this file asks tree-sitter directly */
@@ -3143,7 +3144,199 @@ TEST(complexity_parse_memo_lasts_one_file) {
     PASS();
 }
 
+/* ── A language adapter's two phases ────────────────────────────────
+ * Over files already extracted, so what is counted is what the adapter itself walks: a
+ * name's definitions in a file, a library's directives, a type's bases. */
+#define CX_LINE(fn, format)                             \
+    static const char *fn(char *out, size_t cap, int i) { \
+        snprintf(out, cap, format, i);                  \
+        return out;                                     \
+    }
+#define CX_LINE3(fn, format)                            \
+    static const char *fn(char *out, size_t cap, int i) { \
+        snprintf(out, cap, format, i, i, i);            \
+        return out;                                     \
+    }
+
+typedef struct {
+    char path[64];
+    char *text;
+} CxSourceFile;
+
+static char *cx_lines_text(const char *head, CxLineFn line, const char *tail, int lines) {
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return NULL;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    (void)snprintf(source + length, room - length, "%s", tail);
+    return source;
+}
+
+static uint64_t cx_source_work(CBMLanguage language, const CxSourceFile *files, int count) {
+    CBMFileResult **results = calloc((size_t)count, sizeof(*results));
+    cbm_source_table_t *table = cbm_source_table_new();
+    bool ok = results && table;
+    for (int f = 0; ok && f < count; f++)
+        results[f] = cbm_extract_file(files[f].text, (int)strlen(files[f].text), language, "test",
+                                      files[f].path, 0, NULL, NULL);
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    for (int f = 0; ok && f < count; f++)
+        ok = results[f] && cbm_source_collect(table, results[f], language, files[f].path,
+                                              files[f].text, strlen(files[f].text));
+    for (int f = 0; ok && f < count; f++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        ok = cbm_source_unit_build(&arena, table, results[f], language, files[f].path,
+                                   files[f].text, strlen(files[f].text)) != NULL;
+        cbm_arena_destroy(&arena);
+    }
+    cbm_resolve_stats_bind(previous);
+    uint64_t work = ok ? cx_stat_work(&stats, CBM_RESOLVE_STAT_LOOKUP_PROBES) : 0;
+    for (int f = 0; results && f < count; f++)
+        if (results[f])
+            cbm_free_result(results[f]);
+    free(results);
+    if (table)
+        cbm_source_table_free(table);
+    return work;
+}
+
+/* One generated file, at CX_BINDING_LINES lines and at twice that. */
+static bool cx_source_shape_is_near_linear(CBMLanguage language, const char *path, const char *head,
+                                           CxLineFn line, const char *tail) {
+    uint64_t work[2] = {0, 0};
+    for (int round = 0; round < 2; round++) {
+        CxSourceFile file = {.text = cx_lines_text(head, line, tail, CX_BINDING_LINES << round)};
+        snprintf(file.path, sizeof(file.path), "%s", path);
+        if (file.text)
+            work[round] = cx_source_work(language, &file, 1);
+        free(file.text);
+    }
+    double ratio = cx_ratio((double)work[1], (double)work[0]);
+    printf("    %s source probes %llu -> %llu (ratio %.2f)\n", path, (unsigned long long)work[0],
+           (unsigned long long)work[1], ratio);
+    return work[0] >= CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+
+/* Every node of sources that parse, that do not, and that hold zero-width MISSING tokens: the
+ * routed calls answer exactly as tree-sitter does. */
+TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does) {
+    static const struct {
+        CBMLanguage language;
+        const char *source;
+    } cases[] = {
+        {CBM_LANG_PYTHON, "def f(a, b=1):\n    return [a, (b), {'k': a}]\n\nclass C:\n    x = 1\n"},
+        {CBM_LANG_TYPESCRIPT,
+         "@D() class A { @G('/x') m(a: number) { return a; } /* c */ n() {} }\nexport { A };\n"},
+        {CBM_LANG_GO, "package p\nfunc f() {\n  r := g()\n  r.GET(\"/x\", h)\n  // c\n  if r != nil "
+                      "{ return }\n}\n"},
+        {CBM_LANG_C, "int f(void { return 1 }\nstruct S { int a };\nint g(void) { x = ; }\n"},
+        {CBM_LANG_DART, "int f() { return 1; }\nclass C { void m() {} }\nint g( { }\n"},
+        {CBM_LANG_JAVASCRIPT, "class { m( }\nfunction f(a { return a\n"},
+        {CBM_LANG_NASM, "global s\ns:\n  mov eax, 1\n  ret\n"},
+        {CBM_LANG_ELIXIR, "defmodule M do\n  def f(a), do: a &&\nend\n"},
+    };
+    size_t visited = 0, zero_width = 0;
+    bool same = true;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        TSParser *parser = ts_parser_new();
+        ASSERT_NOT_NULL(parser);
+        ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(cases[c].language)));
+        TSTree *tree =
+            ts_parser_parse_string(parser, NULL, cases[c].source, (uint32_t)strlen(cases[c].source));
+        ts_parser_delete(parser);
+        ASSERT_NOT_NULL(tree);
+        cbm_syntax_index_t index;
+        cbm_syntax_index_begin(&index, tree);
+        TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+        for (bool more = true; more;) {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            visited++;
+            zero_width += ts_node_start_byte(node) == ts_node_end_byte(node);
+            same = same && ts_node_eq(cbm_syntax_prev_sibling(node), ts_node_prev_sibling(node));
+            same = same &&
+                   ts_node_eq(cbm_syntax_prev_named_sibling(node), ts_node_prev_named_sibling(node));
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+            while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+                if (!ts_tree_cursor_goto_parent(&cursor)) {
+                    more = false;
+                    break;
+                }
+            }
+        }
+        ts_tree_cursor_delete(&cursor);
+        cbm_syntax_index_end(&index);
+        ts_tree_delete(tree);
+    }
+    ASSERT_TRUE(same);
+    ASSERT_GTE(visited, (size_t)100);
+    ASSERT_GTE(zero_width, (size_t)1);
+    PASS();
+}
+
+/* Asking for the sibling before each child of a wide parent, plainly and through the index. */
+static uint64_t cx_prev_sibling_work(int lines, bool plain) {
+    char *source = cx_lines_text("", cx_line_py_statement, "", lines);
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    if (source && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_PYTHON)))
+        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    if (parser)
+        ts_parser_delete(parser);
+    uint64_t work = 0;
+    if (tree) {
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        cbm_syntax_index_t index;
+        cbm_syntax_index_begin(&index, tree);
+        cbm_syntax_index_test_set_plain(plain);
+        TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode child = ts_tree_cursor_current_node(&cursor);
+                (void)cbm_syntax_prev_named_sibling(child);
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+        cbm_syntax_index_test_set_plain(false);
+        cbm_syntax_index_end(&index);
+        cbm_resolve_stats_bind(previous);
+        work = cx_stat_work(&stats, CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS);
+        ts_tree_delete(tree);
+    }
+    free(source);
+    return work;
+}
+TEST(complexity_prev_sibling_walk_is_linear) {
+    uint64_t first = cx_prev_sibling_work(CX_BINDING_LINES, true);
+    uint64_t second = cx_prev_sibling_work(CX_BINDING_LINES * 2, true);
+    double plain = cx_ratio((double)second, (double)first);
+    printf("    plain prev sibling steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, plain);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(plain >= 3.2);
+    first = cx_prev_sibling_work(CX_BINDING_LINES, false);
+    second = cx_prev_sibling_work(CX_BINDING_LINES * 2, false);
+    double indexed = cx_ratio((double)second, (double)first);
+    printf("    indexed prev sibling steps %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, indexed);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(indexed >= CX_RATIO_LO && indexed <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does);
+    RUN_TEST(complexity_prev_sibling_walk_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
     RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
     RUN_TEST(complexity_parse_memo_lasts_one_file);

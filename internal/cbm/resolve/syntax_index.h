@@ -46,6 +46,11 @@ TSNode cbm_syntax_named_child(TSNode node, uint32_t position);
  * for the first child and the root. Tree-sitter has no such call: code that wants
  * it counts up to node from the first child, once per child of a wide parent. */
 TSNode cbm_syntax_previous_child(TSNode node);
+/* ts_node_prev_sibling and ts_node_prev_named_sibling walk from the parent's first child to
+ * node, so a walk back over a wide parent is quadratic in steps alone. A zero-width node has no
+ * place of its own among byte offsets, so tree-sitter's answer stands for it. */
+TSNode cbm_syntax_prev_sibling(TSNode node);
+TSNode cbm_syntax_prev_named_sibling(TSNode node);
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* The plain calls, with the sibling steps they really take added to
@@ -58,6 +63,8 @@ void cbm_syntax_index_test_set_plain(bool plain);
 #define ts_node_parent(node) cbm_syntax_parent(node)
 #define ts_node_child(node, position) cbm_syntax_child(node, position)
 #define ts_node_named_child(node, position) cbm_syntax_named_child(node, position)
+#define ts_node_prev_sibling(node) cbm_syntax_prev_sibling(node)
+#define ts_node_prev_named_sibling(node) cbm_syntax_prev_named_sibling(node)
 #endif
 
 #endif
