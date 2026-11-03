@@ -32,6 +32,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "stats.h"
 #include "syntax_index.h"
 
 #define DART_LIBRARY_RECORD "&library"
@@ -52,9 +53,13 @@ typedef struct {
     bool conditional; /* its library depends on the build's configuration */
 } dart_directive_t;
 
+/* A barrel's exports can list the whole project, and every file that imports it would read them
+ * all again while a name's walk stops at the chain's bound. So they are read as a walk reaches
+ * them: export_next is the first declaration not read yet. */
 typedef struct {
     dart_directive_t *imports, *exports;
-    size_t import_count, export_count;
+    size_t import_count, export_count, export_capacity;
+    const cbm_source_decl_t *export_next;
 } dart_library_t;
 
 typedef struct dart_local {
@@ -636,6 +641,30 @@ static bool dart_filter_passes(const char *show, const char *hide, const char *n
     return !dart_list_has(hide, name);
 }
 
+/* False for a directive this table holds in another form, which says nothing. */
+static bool dart_read_directive(dart_ctx_t *ctx, const cbm_source_decl_t *d,
+                                dart_directive_t *out) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    char *copy = d->type ? cbm_arena_strdup(ctx->walk->arena, d->type) : NULL;
+    char *parts[4] = {0};
+    int used = 0;
+    for (char *p = copy; p && used < 4;) {
+        parts[used++] = p;
+        char *mark = strchr(p, DART_DIRECTIVE_SEPARATOR);
+        if (mark)
+            *mark = '\0';
+        p = mark ? mark + 1 : NULL;
+    }
+    if (used != 4)
+        return false;
+    const char *path = dart_uri_library(ctx->walk, d->file, parts[0]);
+    if (path && !cbm_source_lookup(ctx->walk, path, DART_LIBRARY_RECORD))
+        path = NULL;
+    *out =
+        (dart_directive_t){path, parts[1][0] ? parts[1] : NULL, parts[2], parts[3], !parts[0][0]};
+    return true;
+}
+
 static void dart_read_directives(dart_ctx_t *ctx, const char *library, const char *key,
                                  dart_directive_t **out, size_t *out_count) {
     size_t count = 0;
@@ -647,28 +676,36 @@ static void dart_read_directives(dart_ctx_t *ctx, const char *library, const cha
     *out_count = 0;
     if (!items)
         return;
-    for (const cbm_source_decl_t *d = cbm_source_lookup(ctx->walk, library, key); d; d = d->next) {
-        char *copy = d->type ? cbm_arena_strdup(ctx->walk->arena, d->type) : NULL;
-        char *parts[4] = {0};
-        int used = 0;
-        for (char *p = copy; p && used < 4;) {
-            parts[used++] = p;
-            char *mark = strchr(p, DART_DIRECTIVE_SEPARATOR);
-            if (mark)
-                *mark = '\0';
-            p = mark ? mark + 1 : NULL;
-        }
-        if (used != 4)
-            continue;
-        const char *path = dart_uri_library(ctx->walk, d->file, parts[0]);
-        if (path && !cbm_source_lookup(ctx->walk, path, DART_LIBRARY_RECORD))
-            path = NULL;
-        items[(*out_count)++] = (dart_directive_t){path, parts[1][0] ? parts[1] : NULL, parts[2],
-                                                   parts[3], !parts[0][0]};
-    }
+    for (const cbm_source_decl_t *d = cbm_source_lookup(ctx->walk, library, key); d; d = d->next)
+        if (dart_read_directive(ctx, d, &items[*out_count]))
+            (*out_count)++;
 }
 
-static const dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
+/* The export at this position, read on the way if it has not been; NULL past the last. */
+static const dart_directive_t *dart_export_at(dart_ctx_t *ctx, dart_library_t *library,
+                                              size_t position) {
+    while (position >= library->export_count && library->export_next) {
+        if (library->export_count == library->export_capacity) {
+            size_t capacity = library->export_capacity ? library->export_capacity * 2 : 16;
+            dart_directive_t *items = cbm_arena_alloc(ctx->walk->arena, capacity * sizeof(*items));
+            if (!items) {
+                cbm_source_fail(ctx->walk, "dart_library_allocation");
+                return NULL;
+            }
+            if (library->export_count)
+                memcpy(items, library->exports, library->export_count * sizeof(*items));
+            library->exports = items;
+            library->export_capacity = capacity;
+        }
+        const cbm_source_decl_t *d = library->export_next;
+        library->export_next = d->next;
+        if (dart_read_directive(ctx, d, &library->exports[library->export_count]))
+            library->export_count++;
+    }
+    return position < library->export_count ? &library->exports[position] : NULL;
+}
+
+static dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
     dart_library_t *library = cbm_ht_get(ctx->libraries, path);
     if (library)
         return library;
@@ -679,7 +716,7 @@ static const dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
         return NULL;
     }
     dart_read_directives(ctx, path, DART_IMPORTS, &library->imports, &library->import_count);
-    dart_read_directives(ctx, path, DART_EXPORTS, &library->exports, &library->export_count);
+    library->export_next = cbm_source_lookup(ctx->walk, path, DART_EXPORTS);
     cbm_ht_set(ctx->libraries, key, library);
     return library;
 }
@@ -693,12 +730,16 @@ static const cbm_source_decl_t *dart_library_public(dart_ctx_t *ctx, const char 
     const cbm_source_decl_t *own = cbm_source_lookup(ctx->walk, path, key);
     if (own)
         return own;
-    const dart_library_t *library = dart_library(ctx, path);
+    dart_library_t *library = dart_library(ctx, path);
     if (!library)
         return NULL;
     const cbm_source_decl_t *found = NULL;
-    for (size_t i = 0; i < library->export_count; i++) {
-        const dart_directive_t *directive = &library->exports[i];
+    /* Past the chain's bound no further library can be visited, so none can change this. */
+    for (size_t i = 0; !chain->overflow; i++) {
+        const dart_directive_t *directive = dart_export_at(ctx, library, i);
+        if (!directive)
+            break;
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         if (!dart_filter_passes(directive->show, directive->hide, name))
             continue;
         const cbm_source_decl_t *exported =

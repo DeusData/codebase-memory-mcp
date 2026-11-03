@@ -3263,6 +3263,45 @@ TEST(complexity_source_same_named_definitions_are_near_linear) {
     PASS();
 }
 
+/* A barrel library re-exports the project, and every library that imports it read its whole
+ * export list again. */
+static uint64_t cx_dart_barrel_work(int libraries) {
+    CxSourceFile *files = calloc((size_t)libraries + 1, sizeof(*files));
+    if (!files)
+        return 0;
+    size_t room = (size_t)libraries * 32 + 1;
+    char *barrel = malloc(room);
+    size_t used = 0;
+    bool ok = barrel != NULL;
+    for (int i = 0; ok && i < libraries; i++) {
+        used += (size_t)snprintf(barrel + used, room - used, "export 'a%d.dart';\n", i);
+        snprintf(files[i].path, sizeof(files[i].path), "lib/a%d.dart", i);
+        files[i].text = malloc(96);
+        ok = files[i].text != NULL;
+        if (ok)
+            snprintf(files[i].text, 96, "import 'all.dart';\nint f%d() => f%d();\n", i,
+                     (i + 1) % libraries);
+    }
+    snprintf(files[libraries].path, sizeof(files[libraries].path), "lib/all.dart");
+    files[libraries].text = barrel;
+    uint64_t work = ok ? cx_source_work(CBM_LANG_DART, files, libraries + 1) : 0;
+    for (int i = 0; i <= libraries; i++)
+        free(files[i].text);
+    free(files);
+    return work;
+}
+TEST(complexity_dart_barrel_exports_are_near_linear) {
+    enum { BARREL_LIBRARIES = 500 };
+    uint64_t first = cx_dart_barrel_work(BARREL_LIBRARIES);
+    uint64_t second = cx_dart_barrel_work(BARREL_LIBRARIES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    barrel source probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)BARREL_LIBRARIES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 /* A function of route registrations asks, for each, what its receiver was bound to. */
 CX_LINE(cx_line_go_route, "  r.GET(\"/p%d\", h)\n")
 CX_LINE3(cx_line_go_group, "  g%d := r.Group(\"/g%d\")\n  g%d.GET(\"/x\", h)\n")
@@ -3418,6 +3457,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_syntax_index_prev_siblings_answer_as_tree_sitter_does);
     RUN_TEST(complexity_prev_sibling_walk_is_linear);
     RUN_TEST(complexity_source_same_named_definitions_are_near_linear);
+    RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
     RUN_TEST(complexity_flat_preceding_label_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
