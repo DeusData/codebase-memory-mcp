@@ -6,6 +6,7 @@
 static const char *const INDEX_POLICY_KEYS[] = {
     CBM_INDEX_CONFIG_MAX_FILES,
     CBM_INDEX_CONFIG_MAX_SOURCE_MB,
+    CBM_INDEX_CONFIG_SECRET_FILES,
 };
 
 static void set_error(char *error, size_t error_size, const char *key, uint64_t maximum) {
@@ -44,7 +45,8 @@ void cbm_index_policy_init(cbm_index_resource_policy_t *policy) {
 }
 
 bool cbm_index_policy_enabled(const cbm_index_resource_policy_t *policy) {
-    return policy && (policy->max_files.enabled || policy->max_source_bytes.enabled);
+    return policy && (policy->max_files.enabled || policy->max_source_bytes.enabled ||
+                      policy->index_secret_files);
 }
 
 size_t cbm_index_policy_key_count(void) {
@@ -58,7 +60,7 @@ const char *cbm_index_policy_key_at(size_t index) {
 const char *cbm_index_policy_default_value(const char *key) {
     for (size_t index = 0; index < cbm_index_policy_key_count(); index++) {
         if (key && strcmp(key, INDEX_POLICY_KEYS[index]) == 0) {
-            return "off";
+            return strcmp(key, CBM_INDEX_CONFIG_SECRET_FILES) == 0 ? "false" : "off";
         }
     }
     return NULL;
@@ -72,6 +74,17 @@ bool cbm_index_policy_set(cbm_index_resource_policy_t *policy, const char *key, 
     if (!policy || !key || !value) {
         set_error(error, error_size, key ? key : "index resource limit", 0);
         return false;
+    }
+
+    if (strcmp(key, CBM_INDEX_CONFIG_SECRET_FILES) == 0) {
+        if (strcmp(value, "true") != 0 && strcmp(value, "false") != 0) {
+            if (error && error_size > 0) {
+                (void)snprintf(error, error_size, "%s must be true or false", key);
+            }
+            return false;
+        }
+        policy->index_secret_files = strcmp(value, "true") == 0;
+        return true;
     }
 
     cbm_index_limit_u64_t *target = NULL;
@@ -107,6 +120,10 @@ bool cbm_index_policy_format(const cbm_index_resource_policy_t *policy, const ch
                              size_t out_size) {
     if (!policy || !key || !out || out_size == 0) {
         return false;
+    }
+    if (strcmp(key, CBM_INDEX_CONFIG_SECRET_FILES) == 0) {
+        int written = snprintf(out, out_size, "%s", policy->index_secret_files ? "true" : "false");
+        return written >= 0 && (size_t)written < out_size;
     }
     const cbm_index_limit_u64_t *limit = NULL;
     uint64_t divisor = 1;

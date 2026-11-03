@@ -7,6 +7,8 @@
 
 #define CBM_INDEX_CONFIG_MAX_FILES "index_max_files"
 #define CBM_INDEX_CONFIG_MAX_SOURCE_MB "index_max_source_mb"
+/* true = also index secret-bearing files (.env, private keys, credential files). */
+#define CBM_INDEX_CONFIG_SECRET_FILES "index_secret_files"
 
 #define CBM_INDEX_MAX_FILES_VALUE UINT64_C(10000000)
 #define CBM_INDEX_MAX_SOURCE_MB_VALUE UINT64_C(1048576)
@@ -20,6 +22,7 @@ typedef struct {
 typedef struct {
     cbm_index_limit_u64_t max_files;
     cbm_index_limit_u64_t max_source_bytes;
+    bool index_secret_files; /* false (zero value): secret-bearing files are skipped */
 } cbm_index_resource_policy_t;
 
 typedef enum {

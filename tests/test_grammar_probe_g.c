@@ -704,7 +704,8 @@ TEST(probe_dotenv_module_only) {
      * language.c, so file-based index_repository's cbm_language_for_filename
      * returns CBM_LANG_COUNT and the file is never indexed → 0 Module nodes.
      * Routing/registration gap, distinct from extraction classes 2/16.  RED. */
-    ASSERT_TRUE(m.modules == 1); /* REAL BUG — .env not routed by file index */
+    /* Secret-bearing files are not indexed by default (index_secret_files=false). */
+    ASSERT_TRUE(m.modules == 0);
     ASSERT_TRUE(m.variables == 0);
     PASS();
 }
@@ -718,7 +719,7 @@ TEST(probe_dotenv_local_suffix) {
      * FILENAME_TABLE/EXT_TABLE entry, so file-based index_repository never
      * routes it to CBM_LANG_DOTENV → 0 Module nodes.  Same routing gap as
      * probe_dotenv_module_only.  RED. */
-    ASSERT_TRUE(m.modules >= 1); /* REAL BUG — .env.local not routed by file index */
+    ASSERT_TRUE(m.modules == 0); /* skipped by default: .env.* is a secret file */
     PASS();
 }
 
