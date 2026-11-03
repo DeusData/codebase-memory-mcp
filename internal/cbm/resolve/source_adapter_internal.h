@@ -78,6 +78,7 @@ typedef struct cbm_source_walk {
     const char *extra_scope;
     const char *extra_name;
     uint32_t extra_line;
+    bool extra_composite;
 } cbm_source_walk_t;
 
 typedef void (*cbm_source_pass_fn)(cbm_source_walk_t *walk);

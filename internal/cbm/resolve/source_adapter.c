@@ -466,7 +466,8 @@ void cbm_source_emit_facts(cbm_source_walk_t *walk, uint32_t start, uint32_t end
                                       .start = start,
                                       .end = end,
                                       .kind = kind,
-                                      .line = walk->extra_line};
+                                      .line = walk->extra_line,
+                                      .composite = walk->extra_composite};
     }
     if (unit->count == unit->capacity) {
         size_t capacity = unit->capacity ? unit->capacity * 2 : 64;

@@ -237,6 +237,31 @@ static void erlang_visit_call(erlang_ctx_t *ctx, TSNode call) {
 }
 
 /* `fun f/1`: the module's own f/1, else an imported one. `fun m:f/1`: m's exported f/1. */
+/* `Flag andalso fun f/1` and a `fun f/1` among a case's clauses hand over one of several values, so
+ * the fun there only mentions its function. Anything else above it makes it one value again: a
+ * call's argument, a match, a list, a closure's body. */
+static bool erlang_fun_in_composite(TSNode fun) {
+    static const char *const branching[] = {"case_expr",    "if_expr",    "try_expr",
+                                            "receive_expr", "maybe_expr", NULL};
+    static const char *const within[] = {"paren_expr",    "block_expr", "clause_body",
+                                         "cr_clause",     "if_clause",  "catch_clause",
+                                         "receive_after", "try_after",  NULL};
+    for (TSNode parent = ts_node_parent(fun); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (cbm_source_is(parent, "binary_op_expr"))
+            return cbm_source_token(parent, "andalso") || cbm_source_token(parent, "orelse");
+        for (size_t i = 0; branching[i]; i++)
+            if (cbm_source_is(parent, branching[i]))
+                return true;
+        bool passes = false;
+        for (size_t i = 0; !passes && within[i]; i++)
+            passes = cbm_source_is(parent, within[i]);
+        if (!passes)
+            return false;
+    }
+    return false;
+}
+
 static void erlang_visit_fun_reference(erlang_ctx_t *ctx, TSNode node) {
     cbm_source_walk_t *walk = ctx->walk;
     const char *name = cbm_source_text(walk, cbm_source_field(node, "fun"));
@@ -270,11 +295,13 @@ static void erlang_visit_fun_reference(erlang_ctx_t *ctx, TSNode node) {
     walk->extra_scope = ctx->scope ? ctx->scope : walk->result->module_qn;
     walk->extra_name = name;
     walk->extra_line = ts_node_start_point(node).row + 1;
+    walk->extra_composite = erlang_fun_in_composite(node);
     cbm_source_emit_node(walk, node, CBM_SOURCE_SITE_REFERENCE, target,
                          CBM_RESOLVE_RULE_LANGUAGE_BINDING, domain, "erlang_function_reference");
     walk->extra_scope = NULL;
     walk->extra_name = NULL;
     walk->extra_line = 0;
+    walk->extra_composite = false;
 }
 
 static void erlang_visit(erlang_ctx_t *ctx, TSNode node, unsigned depth) {

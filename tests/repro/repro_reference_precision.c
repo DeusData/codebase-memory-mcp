@@ -3548,6 +3548,83 @@ TEST(repro_perl_conditional_coderefs_stay_usage) {
     PASS();
 }
 
+TEST(repro_elixir_complex_capture_stays_usage) {
+    static const char source[] =
+        "defmodule Complex do\n"
+        "  def handler, do: :ok\n"
+        "  def alternate, do: :ok\n"
+        "  def accept(callback), do: callback\n"
+        "  def complex(flag), do: accept(if flag, do: &handler/0, else: &alternate/0)\n"
+        "end\n";
+    int rc = rp_assert_complex_function_values_stay_usage("complex.ex", source, CBM_LANG_ELIXIR,
+                                                          "Function");
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+TEST(repro_erlang_complex_fun_reference_stays_usage) {
+    static const char source[] =
+        "-module(complex).\n"
+        "-export([complex/1]).\n"
+        "handler() -> ok.\n"
+        "alternate() -> ok.\n"
+        "accept(Callback) -> Callback.\n"
+        "complex(Flag) -> accept(case Flag of true -> fun handler/0; false -> fun alternate/0 end).\n";
+    int rc = rp_assert_complex_function_values_stay_usage("complex.erl", source, CBM_LANG_ERLANG,
+                                                          "Function");
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+/* A Dart tear-off read as a value mentions its function in every form, which is what this pins. */
+TEST(repro_dart_complex_tear_off_stays_usage) {
+    static const char source[] = "void handler() {}\n"
+                                 "void alternate() {}\n"
+                                 "void accept(void Function() callback) {}\n"
+                                 "void complex(bool flag) { accept(flag ? handler : alternate); }\n";
+    int rc = rp_assert_complex_function_values_stay_usage("complex.dart", source, CBM_LANG_DART,
+                                                          "Function");
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+/* `method(:handler)` is a call of Object#method with a symbol: nothing binds the symbol, so the
+ * site is no edge at all, and the contract's half that can apply is that it is no reference and
+ * no call of what it spells. */
+TEST(repro_ruby_complex_method_object_stays_unbound) {
+    static const char source[] = "def handler; end\n"
+                                 "def alternate; end\n"
+                                 "def accept(callback); end\n"
+                                 "def complex(flag)\n"
+                                 "  accept(flag ? method(:handler) : method(:alternate))\n"
+                                 "end\n";
+    ASSERT_TRUE(rp_extracts_clean(source, CBM_LANG_RUBY, "complex.rb"));
+    RProj project;
+    cbm_store_t *store = rh_index(&project, "complex.rb", source);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("complex Ruby fixture did not produce a graph store");
+    }
+    int handler_node = rp_node_count(store, project.project, "Function", "handler", NULL);
+    int alternate_node = rp_node_count(store, project.project, "Function", "alternate", NULL);
+    int registrar = rp_edge_count(store, project.project, "CALLS", "complex", NULL, "accept", NULL);
+    int references = rp_edge_count(store, project.project, "CALL_REFERENCE", "complex", NULL, NULL, NULL);
+    int handler_call = rp_edge_count(store, project.project, "CALLS", "complex", NULL, "handler", NULL);
+    int alternate_call =
+        rp_edge_count(store, project.project, "CALLS", "complex", NULL, "alternate", NULL);
+    rh_cleanup(&project, store);
+    ASSERT_GTE(handler_node, 1);
+    ASSERT_GTE(alternate_node, 1);
+    ASSERT_EQ(registrar, 1);
+    ASSERT_EQ(references, 0);
+    ASSERT_EQ(handler_call, 0);
+    ASSERT_EQ(alternate_call, 0);
+    PASS();
+}
+
 /* A function-pointer binding is exact only until an assignment makes its
  * target multi-valued.  Keeping the initializer's target alive here would
  * fabricate a CALL_REFERENCE for the later argument occurrence. */
@@ -3862,6 +3939,10 @@ SUITE(call_reference_language_complex_contract) {
     RUN_TEST(repro_kotlin_complex_callable_reference_stays_usage);
     RUN_TEST(repro_php_complex_first_class_callable_stays_usage);
     RUN_TEST(repro_perl_conditional_coderefs_stay_usage);
+    RUN_TEST(repro_elixir_complex_capture_stays_usage);
+    RUN_TEST(repro_erlang_complex_fun_reference_stays_usage);
+    RUN_TEST(repro_dart_complex_tear_off_stays_usage);
+    RUN_TEST(repro_ruby_complex_method_object_stays_unbound);
 }
 
 SUITE(repro_reference_precision) {

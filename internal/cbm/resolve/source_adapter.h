@@ -82,6 +82,7 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
  * Ruby's bare method name, a Ruby constant or a call deep in a Dart selector chain. scope
  * is the enclosing definition's QN, empty for the file. kind says whether the site calls
  * or mentions its target, line is the site's line when the adapter stated one, else 0.
+ * composite says a mentioned value is one of several, so the site only mentions it.
  * Only decided sites are listed. */
 typedef struct {
     const char *scope;
@@ -89,6 +90,7 @@ typedef struct {
     uint32_t start, end;
     cbm_source_site_kind_t kind;
     uint32_t line;
+    bool composite;
 } cbm_source_extra_call_t;
 const cbm_source_extra_call_t *cbm_source_unit_extra_calls(const cbm_source_unit_t *unit,
                                                            size_t *count);

@@ -4882,12 +4882,14 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
         cbm_resolve_result_t outcome = source_adapter_result(
             resolver, extra->name, extra->start, extra->end, CBM_SOURCE_ORIGIN_RAW, invocation);
         CBMCall site = {.start_line = (int)extra->line};
-        /* Naming something callable without calling it is a call reference. */
+        /* Naming something callable without calling it is a call reference. As with a carrier's
+         * may_be_call_reference, a value that is one of several only mentions it. */
         const char *relation =
             invocation ? "CALLS"
-            : callable_node(outcome.target
-                                ? cbm_gbuf_find_by_qn(resolver->file->graph, outcome.target)
-                                : NULL)
+            : !extra->composite &&
+                    callable_node(outcome.target
+                                      ? cbm_gbuf_find_by_qn(resolver->file->graph, outcome.target)
+                                      : NULL)
                 ? "CALL_REFERENCE"
                 : "USAGE";
         if (!record_result(resolver, extra->scope, extra->name, relation, extra->start, extra->end,
