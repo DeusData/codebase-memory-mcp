@@ -2156,6 +2156,11 @@ static void k8s_free_ids_entry(const char *key, void *value, void *ud) {
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
 }
 
+/* "\x1e<file>\x1f<name>": the objects of one name a file declares. An address never starts so. */
+static void k8s_file_key(char *out, size_t out_sz, const char *file, const char *name) {
+    snprintf(out, out_sz, "\x1e%s\x1f%s", file, name);
+}
+
 /* "<bundle>\x1f<name>": an interned bundle (by address) with an object
  * name, a type or a label pair. */
 static void k8s_bkey(char *out, size_t out_sz, const char *bundle, const char *name) {
@@ -2241,6 +2246,9 @@ static CBMHashTable *k8s_index_objects(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b
         if (nodes[i]->file_path && nodes[i]->name) {
             k8s_scope_job_t j = {ix, nodes[i]->name, nodes[i]->id, NULL};
             k8s_each_scope(b, nodes[i]->file_path, deploys, k8s_scope_add, &j);
+            char key[CBM_SZ_1K];
+            k8s_file_key(key, sizeof(key), nodes[i]->file_path, nodes[i]->name);
+            k8s_index_add(ix, key, nodes[i]->id);
         }
     }
     return ix;
@@ -2700,6 +2708,42 @@ static CBMHashTable *k8s_open_builds(const k8s_facts_t *f) {
     return dirs;
 }
 
+/* A USAGE reference draws its edge only when exactly one object answers it, wherever that object
+ * and any other stand, so the second answer ends the search. */
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    k8s_bundles_t *b;
+    const k8s_ref_t *ref;
+    const cbm_gbuf_node_t *src;
+    CBMHashTable *ix;
+    const char *name;
+    const cbm_gbuf_node_t *only;
+    bool several;
+    uint64_t read;
+} k8s_strict_job_t;
+
+static void k8s_strict_scope(const char *bundle, void *ud) {
+    k8s_strict_job_t *j = ud;
+    char key[CBM_SZ_1K];
+    k8s_bkey(key, sizeof(key), bundle, j->name);
+    const k8s_ids_t *v = cbm_ht_get(j->ix, key);
+    for (int i = 0; v && i < v->count && !j->several; i++) {
+        j->read++;
+        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(j->ctx->gbuf, v->items[i]);
+        if (!t || t == j->src || t == j->only || !t->label || strcmp(t->label, "Resource") != 0 ||
+            !t->file_path) {
+            continue;
+        }
+        /* A copy in another file counts only inside one declared build. */
+        bool other_file = strcmp(t->file_path, j->src->file_path) != 0;
+        if (!k8s_ref_meets(j->b, j->ref, j->src, t, other_file, true)) {
+            continue;
+        }
+        j->several = j->only != NULL;
+        j->only = j->only ? j->only : t;
+    }
+}
+
 static void k8s_free_open_dir(const char *key, void *value, void *ud) {
     (void)value;
     (void)ud;
@@ -2740,8 +2784,27 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
         char name[CBM_SZ_1K];
         snprintf(name, sizeof(name), "%s/%s", ref->kind, ref->name);
         int n = 0;
-        if (src && src->file_path) {
-            k8s_find_in_scopes(b, ix, src->file_path, name, true, &found);
+        /* A copy in the reference's own file that answers it is the one it means, as versioned
+         * manifests side by side are: then no other file's copy is read. */
+        bool own_file = false;
+        if (!strict && src && src->file_path) {
+            char key[CBM_SZ_1K];
+            k8s_file_key(key, sizeof(key), src->file_path, name);
+            const k8s_ids_t *mine = cbm_ht_get(ix, key);
+            for (int c = 0; mine && c < mine->count && !own_file; c++) {
+                const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(ctx->gbuf, mine->items[c]);
+                own_file = t && t != src && t->label && strcmp(t->label, "Resource") == 0 &&
+                           t->file_path && k8s_ref_meets(b, ref, src, t, false, false);
+            }
+            found.count = 0;
+            for (int c = 0; own_file && c < mine->count; c++) {
+                k8s_ids_push(&found, mine->items[c]);
+            }
+            if (own_file) {
+                k8s_ids_sort_unique(&found);
+            } else {
+                k8s_find_in_scopes(b, ix, src->file_path, name, true, &found);
+            }
             for (int c = 0; c < found.count; c++) {
                 const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(ctx->gbuf, found.items[c]);
                 if (t && k8s_grow((void **)&cands, &cand_cap, n, sizeof(*cands))) {
@@ -2765,52 +2828,42 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
                                                             : "ref",
                      ref->via);
         }
+        if (strict) {
+            k8s_strict_job_t job = {.ctx = ctx, .b = b, .ref = ref, .src = src, .ix = ix, .name = name};
+            if (src && src->file_path) {
+                k8s_each_scope(b, src->file_path, true, k8s_strict_scope, &job);
+            }
+            atomic_fetch_add_explicit(&g_k8s_candidates, job.read, memory_order_relaxed);
+            /* A build this reader cannot enumerate may hold another copy. */
+            bool own_file = job.only && strcmp(job.only->file_path, src->file_path) == 0;
+            bool open_build = !own_file && open_dirs && src && src->file_path &&
+                              k8s_in_open_build(open_dirs, src->file_path);
+            bool decided = job.only && !job.several && from > 0 && !open_build &&
+                           !k8s_kind_impostor(ref->declaration);
+            if (decided) {
+                cbm_gbuf_insert_edge(ctx->gbuf, from, job.only->id, ref->edge, props);
+            }
+            edges += decided;
+            unresolved += !decided;
+            continue;
+        }
         /* A name is one object per kind and namespace, so two declarations
          * of it in one bundle are alternatives (versioned manifests side by
-         * side): the declaration in the reference's own file, when there is
-         * one, is the one it means. */
-        bool own_file = false;
-        for (int c = 0; c < n && !own_file; c++) {
-            const cbm_gbuf_node_t *t = cands[c];
-            own_file = t != src && t->label && strcmp(t->label, "Resource") == 0 && t->file_path &&
-                       strcmp(t->file_path, src->file_path) == 0 &&
-                       k8s_ref_meets(b, ref, src, t, false, strict);
-        }
+         * side): every copy the reference can reach gets an edge. */
         int hits = 0;
-        bool conflict = false;
-        const cbm_gbuf_node_t *only = NULL;
         for (int c = 0; c < n; c++) {
             const cbm_gbuf_node_t *t = cands[c];
             if (t == src || !t->label || strcmp(t->label, "Resource") != 0 || !t->file_path ||
-                !k8s_ref_meets(b, ref, src, t, strict && strcmp(t->file_path, src->file_path) != 0,
-                               strict)) {
+                !k8s_ref_meets(b, ref, src, t, false, false)) {
                 continue;
             }
             /* A copy in another file gives way to the file's own, as versioned
-             * manifests side by side do; inside one declared build both are
-             * declared, so a strict reference abstains. */
+             * manifests side by side do. */
             if (own_file && strcmp(t->file_path, src->file_path) != 0) {
-                conflict |= strict;
                 continue;
             }
             hits++;
-            if (strict) {
-                only = t;
-                continue;
-            }
             cbm_gbuf_insert_edge(ctx->gbuf, from, t->id, ref->edge, props);
-        }
-        if (strict) {
-            /* A build this reader cannot enumerate may hold another copy. */
-            bool open_build = !own_file && open_dirs && src && src->file_path &&
-                              k8s_in_open_build(open_dirs, src->file_path);
-            hits = hits == 1 && from > 0 && !conflict && !open_build &&
-                           !k8s_kind_impostor(ref->declaration)
-                       ? hits
-                       : 0;
-            if (hits == 1) {
-                cbm_gbuf_insert_edge(ctx->gbuf, from, only->id, ref->edge, props);
-            }
         }
         edges += hits;
         unresolved += hits == 0;

@@ -3700,6 +3700,46 @@ TEST(complexity_source_chain_seen_set_grows) {
     PASS();
 }
 
+/* One name, declared by every manifest of one directory, and referred to by each. Whichever copy
+ * is meant, the second answer settles that a USAGE reference names no one object. */
+static uint64_t cx_k8s_same_copies_work(int copies) {
+    const char *root = th_mktempdir("cbm_cx_k8s");
+    if (!root)
+        return 0;
+    char repo[768], database[768], path[900];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    bool ok = cbm_mkdir_p(repo, 0755);
+    for (int i = 0; ok && i < copies; i++) {
+        char text[512];
+        snprintf(text, sizeof(text),
+                 "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: config\n---\n"
+                 "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app%d\nspec:\n"
+                 "  template:\n    spec:\n      containers:\n      - name: c\n        image: i\n"
+                 "        envFrom:\n        - configMapRef:\n            name: config\n",
+                 i);
+        snprintf(path, sizeof(path), "%s/d%d.yaml", repo, i);
+        ok = th_write_file(path, text) == 0;
+    }
+    uint64_t before = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+    ok = pipeline && cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+    uint64_t work = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed) - before;
+    th_cleanup(root);
+    return ok ? work : 0;
+}
+TEST(complexity_k8s_same_named_copies_are_near_linear) {
+    uint64_t first = cx_k8s_same_copies_work(200);
+    uint64_t second = cx_k8s_same_copies_work(400);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    k8s same-named copies: candidates %llu -> %llu (ratio %.2f)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)200);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 /* A function of route registrations asks, for each, what its receiver was bound to. */
 CX_LINE(cx_line_go_route, "  r.GET(\"/p%d\", h)\n")
 CX_LINE3(cx_line_go_group, "  g%d := r.Group(\"/g%d\")\n  g%d.GET(\"/x\", h)\n")
@@ -3858,6 +3898,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_swift_type_bases_are_near_linear);
     RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
     RUN_TEST(complexity_source_chain_walk_reads_every_ancestor_once);
+    RUN_TEST(complexity_k8s_same_named_copies_are_near_linear);
     RUN_TEST(complexity_source_chain_seen_set_grows);
     RUN_TEST(complexity_swift_privates_of_other_files_cost_nothing);
     RUN_TEST(complexity_shell_commands_of_a_big_process_are_near_linear);
