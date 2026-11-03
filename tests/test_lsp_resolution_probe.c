@@ -1385,6 +1385,36 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
     PASS();
 }
 
+/* One barrel re-exports the same module twice: `export *` and a renamed
+ * `export { innerFn as renamedFn }`. The walk searches impl for renamedFn
+ * through the star edge first; it must still search impl for innerFn
+ * through the renamed edge, so the call binds to impl's innerFn. */
+TEST(lrp_ts_barrel_star_and_renamed_same_module) {
+    static const LRP_File f[] = {
+        {"src/lib/impl.ts", "export function innerFn(x: number): number { return x - 1; }\n"
+                            "export function starFn(x: number): number { return x * 2; }\n"},
+        {"src/lib/barrel.ts", "export * from './impl';\n"
+                              "export { innerFn as renamedFn } from './impl';\n"},
+        {"src/app.ts", "import { renamedFn, starFn } from './lib/barrel';\n"
+                       "export function run(x: number): number {\n"
+                       "  return renamedFn(x) + starFn(x);\n"
+                       "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int renamed = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run",
+                                              "impl.innerFn");
+    int star = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.starFn");
+    printf("  [ts/barrel-same-module] renamed=%d star=%d\n", renamed, star);
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(renamed, 1);
+    ASSERT_EQ(star, 1);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -2033,6 +2063,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s7_generic);
     RUN_TEST(lrp_ts_s8_field_type_hint);
     RUN_TEST(lrp_ts_barrel_reexport_member_calls);
+    RUN_TEST(lrp_ts_barrel_star_and_renamed_same_module);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);

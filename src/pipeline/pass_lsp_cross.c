@@ -1468,7 +1468,19 @@ static bool pxc_edge_string_prop(const char *json, const char *key, char *out, s
     return true;
 }
 
-/* `visited` holds barrel file QNs already searched for `name`: barrels form
+static void pxc_free_visit_key(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    free(value);
+}
+
+/* Free a `visited` table built by pxc_barrel_symbol_qn and its owned keys. */
+static void pxc_barrel_visited_free(CBMHashTable *visited) {
+    cbm_ht_foreach(visited, pxc_free_visit_key, NULL);
+    cbm_ht_free(visited);
+}
+
+/* `visited` holds (barrel file QN, name) pairs already searched: barrels form
  * DAGs (and cycles) where one lib index is reachable through many paths, and
  * re-walking it on each path is exponential in the depth cap. */
 static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_name,
@@ -1501,10 +1513,24 @@ static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_na
             free(file_qn);
         }
     }
-    if (!file_node || cbm_ht_has(visited, file_node->qualified_name)) {
+    if (!file_node || !file_node->qualified_name) {
         return NULL;
     }
-    cbm_ht_set(visited, file_node->qualified_name, (void *)file_node);
+    /* Key on file and name: a named re-export renames the symbol, so one
+     * file can be searched for two names in one walk (`export *` and
+     * `export { a as b }` from the same module). The key owns its bytes and
+     * is the stored value; pxc_barrel_visited_free releases it. */
+    size_t vk_len = strlen(file_node->qualified_name) + 1 + strlen(name) + 1;
+    char *visit_key = (char *)malloc(vk_len);
+    if (!visit_key) {
+        return NULL;
+    }
+    snprintf(visit_key, vk_len, "%s\x1f%s", file_node->qualified_name, name);
+    if (cbm_ht_has(visited, visit_key)) {
+        free(visit_key);
+        return NULL;
+    }
+    cbm_ht_set(visited, visit_key, visit_key);
     char *defined = pxc_defined_symbol_qn(gbuf, project_name, rel, name);
     if (defined) {
         return defined;
@@ -1710,7 +1736,7 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
             CBMHashTable *visited = direct ? NULL : cbm_ht_create(16);
             if (visited) {
                 barrel = pxc_barrel_symbol_qn(gbuf, project_name, target, local, 0, visited);
-                cbm_ht_free(visited);
+                pxc_barrel_visited_free(visited);
             }
             free(direct);
             if (barrel) {
