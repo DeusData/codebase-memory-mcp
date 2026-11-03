@@ -17,6 +17,7 @@
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
 #include "foundation/workspace.h"
+#include "git/git_context.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -1980,6 +1981,18 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             application_refresh_watch_locked(session);
             continue;
         }
+        /* ignore_worktrees can be turned on after this session was queued for
+         * a capacity slot. Initial admission already skips linked worktrees;
+         * retry must apply the same gate or the pending checkout is indexed
+         * once a slot opens. */
+        if (cbm_mcp_ignore_worktrees_enabled(session->mcp) &&
+            cbm_git_is_linked_worktree(root_path)) {
+            session->auto_index_retry_pending = false;
+            cbm_log_info("daemon.autoindex.skipped", "project", project, "reason",
+                         "linked_worktree");
+            application_refresh_watch_locked(session);
+            continue;
+        }
         char *args = application_auto_index_args(application, root_path);
         if (!args) {
             continue;
@@ -2636,6 +2649,11 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
     bool auto_index_candidate = auto_index && !db_exists;
     if (auto_index_candidate &&
         !application_session_workspace_allowed(session, "auto_index_discovery")) {
+        auto_index_candidate = false;
+    }
+    if (auto_index_candidate && cbm_mcp_ignore_worktrees_enabled(session->mcp) &&
+        cbm_git_is_linked_worktree(root_path)) {
+        cbm_log_info("daemon.autoindex.skipped", "project", project, "reason", "linked_worktree");
         auto_index_candidate = false;
     }
     bool within_auto_index_limit =
@@ -4047,7 +4065,7 @@ cbm_daemon_runtime_application_callbacks_t cbm_daemon_application_runtime_callba
 static cbm_daemon_runtime_application_status_t application_client_exchange_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     uint8_t *request, uint32_t request_length, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms) {
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms) {
     uint8_t *response = NULL;
     uint32_t response_length = 0;
     if (response_out) {
@@ -4056,13 +4074,16 @@ static cbm_daemon_runtime_application_status_t application_client_exchange_tagge
     if (response_length_out) {
         *response_length_out = 0;
     }
+    if (request_sent_out) {
+        *request_sent_out = false;
+    }
     cbm_daemon_runtime_application_status_t status =
         request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID
             ? cbm_daemon_runtime_client_application_request(client, request, request_length,
                                                             &response, &response_length, timeout_ms)
-            : cbm_daemon_runtime_client_application_request_tagged(client, request_token, request,
-                                                                   request_length, &response,
-                                                                   &response_length, timeout_ms);
+            : cbm_daemon_runtime_client_application_request_tagged(
+                  client, request_token, request, request_length, &response, &response_length,
+                  request_sent_out, timeout_ms);
     free(request);
     if (status != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
         free(response);
@@ -4093,7 +4114,7 @@ static cbm_daemon_runtime_application_status_t application_client_exchange(
     uint8_t **response_out, uint32_t *response_length_out, uint32_t timeout_ms) {
     return application_client_exchange_tagged(client, CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID,
                                               request, request_length, response_out,
-                                              response_length_out, timeout_ms);
+                                              response_length_out, NULL, timeout_ms);
 }
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_context(
@@ -4221,7 +4242,7 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_ui_readine
 static cbm_daemon_runtime_application_status_t application_client_text_request_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     cbm_daemon_application_request_kind_t kind, const char *text, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms) {
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms) {
     if (!client || !text || !text[0]) {
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
@@ -4237,7 +4258,7 @@ static cbm_daemon_runtime_application_status_t application_client_text_request_t
     memcpy(request + 1, text, text_length);
     return application_client_exchange_tagged(client, request_token, request,
                                               (uint32_t)text_length + 1U, response_out,
-                                              response_length_out, timeout_ms);
+                                              response_length_out, request_sent_out, timeout_ms);
 }
 
 static cbm_daemon_runtime_application_status_t application_client_text_request(
@@ -4245,7 +4266,7 @@ static cbm_daemon_runtime_application_status_t application_client_text_request(
     const char *text, uint8_t **response_out, uint32_t *response_length_out, uint32_t timeout_ms) {
     return application_client_text_request_tagged(
         client, CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID, kind, text, response_out,
-        response_length_out, timeout_ms);
+        response_length_out, NULL, timeout_ms);
 }
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(
@@ -4258,10 +4279,10 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const char *message, uint8_t **response_out, uint32_t *response_length_out,
-    uint32_t timeout_ms) {
-    return application_client_text_request_tagged(client, request_token,
-                                                  CBM_DAEMON_APPLICATION_REQUEST_MCP, message,
-                                                  response_out, response_length_out, timeout_ms);
+    bool *request_sent_out, uint32_t timeout_ms) {
+    return application_client_text_request_tagged(
+        client, request_token, CBM_DAEMON_APPLICATION_REQUEST_MCP, message, response_out,
+        response_length_out, request_sent_out, timeout_ms);
 }
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_tool(

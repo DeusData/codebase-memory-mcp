@@ -1643,6 +1643,10 @@ cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *
     return p ? &p->resource_violation : NULL;
 }
 
+const char *cbm_pipeline_indexed_checkout_sha(const cbm_pipeline_t *p) {
+    return p ? p->git_ctx.head_sha : NULL;
+}
+
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
     return p ? p->cancelled : NULL;
 }
@@ -4177,6 +4181,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
                 .hash_records_complete = true,
                 .unresolved_calls_complete =
                     pipeline_unresolved_capture_complete(p, coverage_rows_available),
+                .indexed_checkout_sha = p->git_ctx.head_sha,
             },
         .surface_rows = p->surface_rows,
         .surface_row_count = p->surface_row_count,
