@@ -203,6 +203,67 @@ bool cbm_source_step(cbm_source_walk_t *walk, unsigned depth) {
     return true;
 }
 
+static size_t chain_hash(const char *text) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char *at = (const unsigned char *)text; *at; at++)
+        hash = (hash ^ *at) * 1099511628211ULL;
+    return (size_t)hash;
+}
+
+/* Where this name is in the table, or the empty slot it would take. */
+static const char **chain_slot(const char **slots, size_t capacity, const char *owner) {
+    size_t at = chain_hash(owner) & (capacity - 1);
+    uint64_t probes = 1;
+    while (slots[at] && strcmp(slots[at], owner)) {
+        at = (at + 1) & (capacity - 1);
+        probes++;
+    }
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, probes);
+    return &slots[at];
+}
+
+static bool chain_grow(cbm_source_walk_t *walk, cbm_source_chain_t *chain) {
+    size_t capacity = chain->capacity ? chain->capacity * 2 : (size_t)CBM_SOURCE_CHAIN_INLINE * 4;
+    const char **slots = cbm_arena_calloc(walk->arena, capacity * sizeof(*slots));
+    if (!slots)
+        return false;
+    if (chain->capacity) {
+        for (size_t i = 0; i < chain->capacity; i++)
+            if (chain->slots[i])
+                *chain_slot(slots, capacity, chain->slots[i]) = chain->slots[i];
+    } else {
+        for (size_t i = 0; i < chain->count; i++)
+            *chain_slot(slots, capacity, chain->seen[i]) = chain->seen[i];
+    }
+    chain->slots = slots;
+    chain->capacity = capacity;
+    return true;
+}
+
+bool cbm_source_chain_first_visit(cbm_source_walk_t *walk, cbm_source_chain_t *chain,
+                                  const char *owner) {
+    if (!chain->capacity) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        for (size_t i = 0; i < chain->count; i++)
+            if (!strcmp(chain->seen[i], owner))
+                return false;
+        if (chain->count < CBM_SOURCE_CHAIN_INLINE) {
+            chain->seen[chain->count++] = owner;
+            return true;
+        }
+    } else if (*chain_slot(chain->slots, chain->capacity, owner)) {
+        return false;
+    }
+    /* At most half full, so a probe stays short. */
+    if ((!chain->capacity || chain->count >= chain->capacity / 2) && !chain_grow(walk, chain)) {
+        chain->overflow = true;
+        return false;
+    }
+    *chain_slot(chain->slots, chain->capacity, owner) = owner;
+    chain->count++;
+    return true;
+}
+
 bool cbm_source_token(TSNode node, const char *token) {
     uint32_t count = ts_node_child_count(node);
     for (uint32_t i = 0; i < count; i++) {

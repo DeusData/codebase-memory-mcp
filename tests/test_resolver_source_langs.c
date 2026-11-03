@@ -9,6 +9,8 @@
 #include "store/store.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -6669,6 +6671,246 @@ TEST(resolver_source_vue_script_reaches_the_ecma_resolver) {
     PASS();
 }
 
+/* ── How long a walk is decides nothing ────────────────────────────── */
+
+/* printf into the heap; the fixtures below are too long to spell out. */
+static char *sl_sprintf(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static char *sl_sprintf(const char *format, ...) {
+    char small_buffer[256];
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(small_buffer, sizeof(small_buffer), format, args);
+    va_end(args);
+    if (written < 0)
+        return NULL;
+    char *text = malloc((size_t)written + 1);
+    if (!text)
+        return NULL;
+    va_start(args, format);
+    vsnprintf(text, (size_t)written + 1, format, args);
+    va_end(args);
+    return text;
+}
+
+static void sl_append(char **text, size_t *used, size_t *capacity, const char *line) {
+    size_t length = strlen(line);
+    if (*used + length + 1 > *capacity) {
+        *capacity = (*used + length + 1) * 2;
+        *text = realloc(*text, *capacity);
+    }
+    memcpy(*text + *used, line, length + 1);
+    *used += length;
+}
+
+static void sl_free_sources(RQ_Source *sources, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free((char *)sources[i].path);
+        free((char *)sources[i].text);
+    }
+    free(sources);
+}
+
+enum { SL_BARREL_WIDTH = 200, SL_CHAIN_DEPTH = 200 };
+
+/* Every kind of answer past where a fixed bound of 128 stopped: a plain name and a class in the
+ * middle and at the end, hide, show, a collision, a shallower declaration hiding a deeper one, a
+ * cycle, and names nobody declares. */
+TEST(resolver_source_dart_barrel_of_any_width_and_depth) {
+    size_t room = (size_t)SL_BARREL_WIDTH + SL_CHAIN_DEPTH + 4, count = 0;
+    RQ_Source *sources = calloc(room, sizeof(*sources));
+    ASSERT_NOT_NULL(sources);
+    sources[count++] = (RQ_Source){.path = strdup("pubspec.yaml"), .text = strdup("name: wide\n")};
+    char *barrel = NULL;
+    size_t used = 0, capacity = 0;
+    for (int i = 0; i < SL_BARREL_WIDTH; i++) {
+        const char *filter = i == 150 ? " hide hiddenFar" : i == 151 ? " show shownFar" : "";
+        char *line = sl_sprintf("export 'a%d.dart'%s;\n", i, filter);
+        sl_append(&barrel, &used, &capacity, line);
+        free(line);
+        const char *extra = i == 150   ? "void hiddenFar() {}\n"
+                            : i == 151 ? "void shownFar() {}\nvoid notShownFar() {}\n"
+                            : i == 160 || i == 170 ? "void twice() {}\n"
+                            : i == 190             ? "class Far {\n  void go() {}\n}\n"
+                                                   : "";
+        sources[count++] = (RQ_Source){.path = sl_sprintf("lib/a%d.dart", i),
+                                       .text = sl_sprintf("void f%d() {}\n%s", i, extra)};
+    }
+    sources[count++] = (RQ_Source){.path = strdup("lib/all.dart"), .text = barrel};
+    for (int i = 0; i < SL_CHAIN_DEPTH; i++) {
+        bool last = i == SL_CHAIN_DEPTH - 1;
+        sources[count++] = (RQ_Source){
+            .path = sl_sprintf("lib/deep%d.dart", i),
+            .text = last ? strdup("export 'deep0.dart';\nvoid deepName() {}\nvoid shadowed() {}\n")
+                         : sl_sprintf("export 'deep%d.dart';\n%s", i + 1,
+                                      i == 5 ? "void shadowed() {}\n" : "")};
+    }
+    sources[count++] = (RQ_Source){.path = strdup("lib/main.dart"),
+                                   .text = strdup("import 'all.dart';\n"
+                                                  "import 'deep0.dart';\n"
+                                                  "void callsFirst() { f0(); }\n"
+                                                  "void callsMiddle() { f128(); }\n"
+                                                  "void callsLast() { f199(); }\n"
+                                                  "void callsHidden() { hiddenFar(); }\n"
+                                                  "void callsShown() { shownFar(); }\n"
+                                                  "void callsNotShown() { notShownFar(); }\n"
+                                                  "void callsTwice() { twice(); }\n"
+                                                  "void callsClass() { Far(); }\n"
+                                                  "void callsMember(Far far) { far.go(); }\n"
+                                                  "void callsDeep() { deepName(); }\n"
+                                                  "void callsShadowed() { shadowed(); }\n"
+                                                  "void callsNobody() { nobody(); }\n")};
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("barrel-first", "lib/main.dart", "main.callsFirst", "f0()", 0, "lib/a0.dart",
+                   "a0.f0", "Function", 1, "void f0() {}"),
+        SL_CALL_AT("barrel-past-128", "lib/main.dart", "main.callsMiddle", "f128()", 0,
+                   "lib/a128.dart", "a128.f128", "Function", 1, "void f128() {}"),
+        SL_CALL_AT("barrel-last", "lib/main.dart", "main.callsLast", "f199()", 0, "lib/a199.dart",
+                   "a199.f199", "Function", 1, "void f199() {}"),
+        SL_CALL_AT("barrel-show-passes", "lib/main.dart", "main.callsShown", "shownFar()", 0,
+                   "lib/a151.dart", "a151.shownFar", "Function", 2, "void shownFar() {}"),
+        SL_CALL_AT("barrel-class", "lib/main.dart", "main.callsClass", "Far()", 0, "lib/a190.dart",
+                   "a190.Far", "Class", 2, "class Far {"),
+        SL_CALL_AT("barrel-class-member", "lib/main.dart", "main.callsMember", "far.go", 0,
+                   "lib/a190.dart", "Far.go", "Method", 3, "  void go() {}"),
+        SL_CALL_AT("chain-end", "lib/main.dart", "main.callsDeep", "deepName()", 0,
+                   "lib/deep199.dart", "deep199.deepName", "Function", 2, "void deepName() {}"),
+        SL_CALL_AT("chain-shallower-hides-deeper", "lib/main.dart", "main.callsShadowed",
+                   "shadowed()", 0, "lib/deep5.dart", "deep5.shadowed", "Function", 2,
+                   "void shadowed() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("barrel-hide-stops-it", "lib/main.dart", "main.callsHidden", "hiddenFar()", 0),
+        SL_DENY_AT("barrel-show-leaves-it-out", "lib/main.dart", "main.callsNotShown",
+                   "notShownFar()", 0),
+        SL_DENY_AT("barrel-two-libraries-collide", "lib/main.dart", "main.callsTwice", "twice()",
+                   0),
+        SL_DENY_AT("barrel-nobody-declares-it", "lib/main.dart", "main.callsNobody", "nobody()", 0),
+    };
+    bool ok = sl_check("dart-barrel", ".dart", "void filler() {}\n", sources, count, expected,
+                       sizeof(expected) / sizeof(expected[0]), forbidden,
+                       sizeof(forbidden) / sizeof(forbidden[0]));
+    sl_free_sources(sources, count);
+    ASSERT(ok);
+    PASS();
+}
+
+/* One language's chain: a root, links each naming the one before, then what uses the last. */
+static char *sl_chain_text(const char *head, const char *link, const char *tail) {
+    char *text = NULL;
+    size_t used = 0, capacity = 0;
+    sl_append(&text, &used, &capacity, head);
+    for (int i = 1; i < SL_CHAIN_DEPTH; i++) {
+        char line[160];
+        snprintf(line, sizeof(line), link, i, i - 1);
+        sl_append(&text, &used, &capacity, line);
+    }
+    sl_append(&text, &used, &capacity, tail);
+    return text;
+}
+
+static bool sl_chain_case(const char *project, const char *path, const char *filler_name,
+                          const char *filler_text, const char *manifest_path, const char *manifest,
+                          char *text, const RQ_Expected *expected, size_t expected_count,
+                          const RQ_Forbidden *forbidden, size_t forbidden_count) {
+    RQ_Source sources[2] = {{.path = path, .text = text},
+                            {.path = manifest_path, .text = manifest}};
+    bool ok = text && sl_check(project, filler_name, filler_text, sources, manifest ? 2 : 1,
+                               expected, expected_count, forbidden, forbidden_count);
+    free(text);
+    return ok;
+}
+
+TEST(resolver_source_dart_inheritance_of_any_depth) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("member-past-128-levels", "lib/chain.dart", "chain.useIt", "c.rootM", 0,
+                   "lib/chain.dart", "C0.rootM", "Method", 2, "  void rootM() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("member-nobody-declares", "lib/chain.dart", "chain.useAbsent", "c.neverM", 0),
+        SL_DENY_AT("a-cycle-ends", "lib/chain.dart", "chain.useCycle", "x.neverM", 0),
+    };
+    char *text = sl_chain_text("class C0 {\n  void rootM() {}\n}\n", "class C%d extends C%d {}\n",
+                               "class X extends Y {}\nclass Y extends X {}\n"
+                               "void useIt(C199 c) { c.rootM(); }\n"
+                               "void useAbsent(C199 c) { c.neverM(); }\n"
+                               "void useCycle(X x) { x.neverM(); }\n");
+    ASSERT(sl_chain_case("dart-chain", "lib/chain.dart", ".dart", "void filler() {}\n",
+                         "pubspec.yaml", "name: chain\n", text, expected,
+                         sizeof(expected) / sizeof(expected[0]), forbidden,
+                         sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+TEST(resolver_source_php_inheritance_of_any_depth) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("member-past-128-levels", "src/chain.php", "chain.useIt", "$c->rootM", 0,
+                   "src/chain.php", "C0.rootM", "Method", 3, "  public function rootM() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("member-nobody-declares", "src/chain.php", "chain.useAbsent", "$c->neverM", 0),
+    };
+    char *text = sl_chain_text("<?php\nclass C0 {\n  public function rootM() {}\n}\n",
+                               "class C%d extends C%d {}\n",
+                               "function useIt(C199 $c) { $c->rootM(); }\n"
+                               "function useAbsent(C199 $c) { $c->neverM(); }\n");
+    ASSERT(sl_chain_case("php-chain", "src/chain.php", ".php", "<?php\nfunction filler() {}\n",
+                         "README.md", NULL, text, expected,
+                         sizeof(expected) / sizeof(expected[0]), forbidden,
+                         sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+TEST(resolver_source_swift_inheritance_of_any_depth) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("member-past-128-levels", "Sources/App/Chain.swift", "Chain.useIt", "c.rootM()",
+                   0, "Sources/App/Chain.swift", "C0.rootM", "Method", 2, "  func rootM() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("member-nobody-declares", "Sources/App/Chain.swift", "Chain.useAbsent",
+                   "c.neverM()", 0),
+    };
+    char *text = sl_chain_text("class C0 {\n  func rootM() {}\n}\n", "class C%d: C%d {}\n",
+                               "func useIt(c: C199) { c.rootM() }\n"
+                               "func useAbsent(c: C199) { c.neverM() }\n");
+    ASSERT(sl_chain_case("swift-chain", "Sources/App/Chain.swift", ".swift", "func filler() {}\n",
+                         "Package.swift", SW_MANIFEST, text, expected,
+                         sizeof(expected) / sizeof(expected[0]), forbidden,
+                         sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+TEST(resolver_source_ruby_inheritance_of_any_depth) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("member-past-128-levels", "lib/chain.rb", "C199.use_it", "root_m", 0,
+                   "lib/chain.rb", "C0.root_m", "Method", 2, "  def root_m; end"),
+    };
+    char *text = sl_chain_text("class C0\n  def root_m; end\nend\n", "class C%d < C%d; end\n",
+                               "class C199 < C198\n  def use_it\n    root_m\n  end\nend\n");
+    ASSERT(sl_chain_case("ruby-chain", "lib/chain.rb", ".rb", "def filler\n  1\nend\n",
+                         "README.md", NULL, text, expected,
+                         sizeof(expected) / sizeof(expected[0]), NULL, 0));
+    PASS();
+}
+
+TEST(resolver_source_scala_inheritance_of_any_depth) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("member-past-128-levels", "src/chain.scala", "Use.useIt", "c.rootM()", 0,
+                   "src/chain.scala", "C0.rootM", "Method", 2, "  def rootM(): Unit = {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("member-nobody-declares", "src/chain.scala", "Use.useAbsent", "c.neverM()", 0),
+    };
+    char *text = sl_chain_text("class C0 {\n  def rootM(): Unit = {}\n}\n",
+                               "class C%d extends C%d\n",
+                               "object Use {\n  def useIt(c: C199): Unit = c.rootM()\n"
+                               "  def useAbsent(c: C199): Unit = c.neverM()\n}\n");
+    ASSERT(sl_chain_case("scala-chain", "src/chain.scala", ".scala",
+                         "object Filler { def f(): Unit = {} }\n", "README.md", NULL, text,
+                         expected, sizeof(expected) / sizeof(expected[0]), forbidden,
+                         sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_elixir_modules_aliases_imports_and_arity);
     RUN_TEST(resolver_source_erlang_module_arity_export_and_import);
@@ -6708,6 +6950,12 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_swift_closures_and_value_forms);
     RUN_TEST(resolver_source_swift_a_closure_of_no_parameters);
     RUN_TEST(resolver_source_dart_headers_reads_members_and_pubspec_paths);
+    RUN_TEST(resolver_source_dart_barrel_of_any_width_and_depth);
+    RUN_TEST(resolver_source_dart_inheritance_of_any_depth);
+    RUN_TEST(resolver_source_php_inheritance_of_any_depth);
+    RUN_TEST(resolver_source_swift_inheritance_of_any_depth);
+    RUN_TEST(resolver_source_ruby_inheritance_of_any_depth);
+    RUN_TEST(resolver_source_scala_inheritance_of_any_depth);
     RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
     RUN_TEST(resolver_source_haskell_imports_and_scope);
     RUN_TEST(resolver_source_ocaml_sequential_scope_and_modules);

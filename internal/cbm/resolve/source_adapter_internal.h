@@ -73,6 +73,7 @@ typedef struct cbm_source_walk {
     TSNode root;
     uint64_t visits;
     const char *failure;
+    const char *top_owner; /* collect: the owner a language files its top-level names under */
     CBMHashTable *def_index; /* lazily built, owned by the walk */
     /* Set around an emit for a site extraction has no carrier for. */
     const char *extra_scope;
@@ -121,24 +122,41 @@ extern const cbm_source_adapter_t cbm_source_adapter_tcl;
 extern const cbm_source_adapter_t cbm_source_adapter_make;
 
 /* One walk of a class chain. A class appears once on a linearized chain, so a
- * revisit adds nothing: a cycle or a diamond cannot make the walk exponential. */
-enum { CBM_SOURCE_CHAIN_MAX = 128 };
+ * revisit adds nothing: a cycle or a diamond cannot make the walk exponential. The names seen
+ * start inline, which is every ordinary walk, and move to a table on the walk's arena that
+ * grows with them. How long a chain is decides nothing.
+ *
+ * overflow means the walk stopped short of the whole chain: the arena refused, or the walk
+ * recursed past CBM_SOURCE_CHAIN_DEPTH_MAX. Each frame of a walker takes stack, on a worker
+ * thread's 8 MB, so that depth protects the stack from a generated chain. The deepest real
+ * hierarchies reach tens of levels; past it the name abstains with the walker's open outcome. */
+enum { CBM_SOURCE_CHAIN_INLINE = 16, CBM_SOURCE_CHAIN_DEPTH_MAX = 1024 };
 typedef struct {
-    const char *seen[CBM_SOURCE_CHAIN_MAX];
-    int count;
+    size_t count;
+    size_t capacity; /* table slots, a power of two; 0 while the names are inline */
+    const char **slots;
+    int depth;
     bool overflow;
+    const char *seen[CBM_SOURCE_CHAIN_INLINE];
 } cbm_source_chain_t;
 
-static inline bool cbm_source_chain_first_visit(cbm_source_chain_t *chain, const char *owner) {
-    for (int i = 0; i < chain->count; i++)
-        if (!strcmp(chain->seen[i], owner))
-            return false;
-    if (chain->count == CBM_SOURCE_CHAIN_MAX) {
+bool cbm_source_chain_first_visit(cbm_source_walk_t *walk, cbm_source_chain_t *chain,
+                                  const char *owner);
+
+/* A walker that recurses: first_visit, and one level deeper until the matching leave. */
+static inline bool cbm_source_chain_enter(cbm_source_walk_t *walk, cbm_source_chain_t *chain,
+                                          const char *owner) {
+    if (!cbm_source_chain_first_visit(walk, chain, owner))
+        return false;
+    if (chain->depth >= CBM_SOURCE_CHAIN_DEPTH_MAX) {
         chain->overflow = true;
         return false;
     }
-    chain->seen[chain->count++] = owner;
+    chain->depth++;
     return true;
+}
+static inline void cbm_source_chain_leave(cbm_source_chain_t *chain) {
+    chain->depth--;
 }
 
 /* Syntax helpers shared by the language files; none of them decides anything. */

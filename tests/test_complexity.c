@@ -3517,6 +3517,51 @@ TEST(complexity_dart_barrel_exports_are_near_linear) {
     PASS();
 }
 
+/* A type's ancestors, however many, are each read once. `deep` is a line of classes, one a level;
+ * otherwise one class implements them all, which recurses one level. The member is nobody's, so
+ * the walk reads them all. */
+static uint64_t cx_dart_ancestors_work(int ancestors, bool deep) {
+    size_t room = (size_t)ancestors * 64 + 256;
+    char *text = malloc(room);
+    if (!text)
+        return 0;
+    size_t used = 0;
+    used += (size_t)snprintf(text, room, "class C0 {}\n");
+    for (int i = 1; i < ancestors; i++)
+        used += deep ? (size_t)snprintf(text + used, room - used, "class C%d extends C%d {}\n", i,
+                                        i - 1)
+                     : (size_t)snprintf(text + used, room - used, "class C%d {}\n", i);
+    if (deep) {
+        used += (size_t)snprintf(text + used, room - used, "void use(C%d c) { c.nobody(); }\n",
+                                 ancestors - 1);
+    } else {
+        used += (size_t)snprintf(text + used, room - used, "class All implements C0");
+        for (int i = 1; i < ancestors; i++)
+            used += (size_t)snprintf(text + used, room - used, ", C%d", i);
+        used += (size_t)snprintf(text + used, room - used, " {}\nvoid use(All c) { c.nobody(); }\n");
+    }
+    CxSourceFile file = {.text = text};
+    snprintf(file.path, sizeof(file.path), "lib/chain.dart");
+    uint64_t work = cx_source_work(CBM_LANG_DART, &file, 1);
+    free(text);
+    return work;
+}
+static bool cx_dart_ancestors_are_near_linear(int ancestors, bool deep) {
+    uint64_t first = cx_dart_ancestors_work(ancestors, deep);
+    uint64_t second = cx_dart_ancestors_work(ancestors * 2, deep);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    dart %s ancestors %d: probes %llu -> %llu (ratio %.2f)\n", deep ? "deep" : "wide",
+           ancestors, (unsigned long long)first, (unsigned long long)second, ratio);
+    return first >= (uint64_t)ancestors && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_source_chain_walk_reads_every_ancestor_once) {
+    bool wide = cx_dart_ancestors_are_near_linear(1000, false);
+    bool deep = cx_dart_ancestors_are_near_linear(400, true);
+    ASSERT_TRUE(wide);
+    ASSERT_TRUE(deep);
+    PASS();
+}
+
 /* A function of route registrations asks, for each, what its receiver was bound to. */
 CX_LINE(cx_line_go_route, "  r.GET(\"/p%d\", h)\n")
 CX_LINE3(cx_line_go_group, "  g%d := r.Group(\"/g%d\")\n  g%d.GET(\"/x\", h)\n")
@@ -3674,6 +3719,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_source_same_named_definitions_are_near_linear);
     RUN_TEST(complexity_swift_type_bases_are_near_linear);
     RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
+    RUN_TEST(complexity_source_chain_walk_reads_every_ancestor_once);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
     RUN_TEST(complexity_flat_preceding_label_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);

@@ -564,9 +564,11 @@ static int scala_select(const scala_ctx_t *ctx, const cbm_source_decl_t *first, 
 
 static scala_lookup_t scala_find_member(scala_ctx_t *ctx, const char *key, const char *name,
                                         int arguments, bool bases_only, cbm_source_chain_t *chain,
-                                        const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, key))
-        return chain->overflow ? SCALA_OPEN : SCALA_ABSENT;
+                                        const cbm_source_decl_t **out);
+
+static scala_lookup_t scala_member_on(scala_ctx_t *ctx, const char *key, const char *name,
+                                      int arguments, bool bases_only, cbm_source_chain_t *chain,
+                                      const cbm_source_decl_t **out) {
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, key, SCALA_RECORD);
     if (!record || record->next || (record->flags & CBM_SOURCE_DECL_F_OPEN))
         return record && !bases_only && cbm_source_lookup(ctx->walk, key, name) &&
@@ -595,6 +597,16 @@ static scala_lookup_t scala_find_member(scala_ctx_t *ctx, const char *key, const
             return found;
     }
     return SCALA_ABSENT;
+}
+
+static scala_lookup_t scala_find_member(scala_ctx_t *ctx, const char *key, const char *name,
+                                        int arguments, bool bases_only, cbm_source_chain_t *chain,
+                                        const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, key))
+        return chain->overflow ? SCALA_OPEN : SCALA_ABSENT;
+    scala_lookup_t found = scala_member_on(ctx, key, name, arguments, bases_only, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
 }
 
 static const char *scala_key_package(cbm_source_walk_t *walk, const char *key) {
@@ -631,11 +643,14 @@ static scala_ref_t scala_resolve_path_in(scala_ctx_t *ctx, const char *path, con
 static scala_ref_t scala_inherited_names(scala_ctx_t *ctx, const char *key, const char *text,
                                          cbm_source_chain_t *chain) {
     scala_ref_t none = {.reason = "scala_name_not_in_project"};
-    if (!cbm_source_chain_first_visit(chain, key))
+    if (!cbm_source_chain_enter(ctx->walk, chain, key))
         return none;
+    scala_ref_t result = none;
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, key, SCALA_RECORD);
-    if (!record || record->next)
+    if (!record || record->next) {
+        cbm_source_chain_leave(chain);
         return none;
+    }
     for (size_t i = 0; record->bases && record->bases[i]; i++) {
         const char *parent = scala_lookup_type(ctx, key, record->bases[i], record->file);
         if (!parent)
@@ -643,10 +658,13 @@ static scala_ref_t scala_inherited_names(scala_ctx_t *ctx, const char *key, cons
         scala_ref_t found = scala_member_names(ctx, parent, text);
         if (found.kind == SCALA_UNKNOWN)
             found = scala_inherited_names(ctx, parent, text, chain);
-        if (found.kind != SCALA_UNKNOWN)
-            return found;
+        if (found.kind != SCALA_UNKNOWN) {
+            result = found;
+            break;
+        }
     }
-    return none;
+    cbm_source_chain_leave(chain);
+    return result;
 }
 
 /* A type name as `file` reads it from `owner`: the templates around it, that file's explicit

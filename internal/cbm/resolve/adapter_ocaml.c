@@ -1009,11 +1009,9 @@ static const char *ocaml_decl_path(ocaml_ctx_t *ctx, const cbm_source_decl_t *de
 
 /* Everything a unit brings in is known. Answers are kept for this file: a closure is
  * shared by every open of it, and each unit is read once per file. */
-static bool ocaml_unit_closed_walk(ocaml_ctx_t *ctx, const char *unit, cbm_source_chain_t *chain) {
-    if (ocaml_is_directory_module(unit) || ocaml_is_stdlib(unit))
-        return true;
-    if (!cbm_source_chain_first_visit(chain, unit))
-        return !chain->overflow;
+static bool ocaml_unit_closed_walk(ocaml_ctx_t *ctx, const char *unit, cbm_source_chain_t *chain);
+
+static bool ocaml_unit_closes(ocaml_ctx_t *ctx, const char *unit, cbm_source_chain_t *chain) {
     /* An interface can only hide, so either side being closed closes the unit. */
     const char *interface = ocaml_interface_of(ctx, unit);
     if (interface && ocaml_unit_closed(ctx, interface))
@@ -1027,6 +1025,16 @@ static bool ocaml_unit_closed_walk(ocaml_ctx_t *ctx, const char *unit, cbm_sourc
             return false;
     }
     return true;
+}
+
+static bool ocaml_unit_closed_walk(ocaml_ctx_t *ctx, const char *unit, cbm_source_chain_t *chain) {
+    if (ocaml_is_directory_module(unit) || ocaml_is_stdlib(unit))
+        return true;
+    if (!cbm_source_chain_enter(ctx->walk, chain, unit))
+        return !chain->overflow;
+    bool closed = ocaml_unit_closes(ctx, unit, chain);
+    cbm_source_chain_leave(chain);
+    return closed;
 }
 
 static bool ocaml_unit_closed(ocaml_ctx_t *ctx, const char *unit) {
@@ -1048,13 +1056,11 @@ static bool ocaml_unit_closed(ocaml_ctx_t *ctx, const char *unit) {
 
 /* A value of a closed or open-ended unit: the latest binding of it the unit makes. */
 static ocaml_lookup_t ocaml_unit_value(ocaml_ctx_t *ctx, const char *unit, const char *name,
-                                       cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (ocaml_is_stdlib(unit))
-        return OCAML_UNKNOWN;
-    if (ocaml_is_directory_module(unit))
-        return OCAML_ABSENT;
-    if (!cbm_source_chain_first_visit(chain, unit))
-        return chain->overflow ? OCAML_UNKNOWN : OCAML_ABSENT;
+                                       cbm_source_chain_t *chain, const cbm_source_decl_t **out);
+
+static ocaml_lookup_t ocaml_value_of_unit(ocaml_ctx_t *ctx, const char *unit, const char *name,
+                                          cbm_source_chain_t *chain,
+                                          const cbm_source_decl_t **out) {
     const char *interface = ocaml_interface_of(ctx, unit);
     if (interface) {
         const cbm_source_decl_t *listed = NULL;
@@ -1100,6 +1106,19 @@ static ocaml_lookup_t ocaml_unit_value(ocaml_ctx_t *ctx, const char *unit, const
         return OCAML_ABSENT;
     *out = best;
     return OCAML_FOUND;
+}
+
+static ocaml_lookup_t ocaml_unit_value(ocaml_ctx_t *ctx, const char *unit, const char *name,
+                                       cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (ocaml_is_stdlib(unit))
+        return OCAML_UNKNOWN;
+    if (ocaml_is_directory_module(unit))
+        return OCAML_ABSENT;
+    if (!cbm_source_chain_enter(ctx->walk, chain, unit))
+        return chain->overflow ? OCAML_UNKNOWN : OCAML_ABSENT;
+    ocaml_lookup_t found = ocaml_value_of_unit(ctx, unit, name, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
 }
 
 typedef struct {

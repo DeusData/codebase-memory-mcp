@@ -572,9 +572,10 @@ static bool php_same_decl(const cbm_source_decl_t *a, const cbm_source_decl_t *b
 }
 
 static php_lookup_t php_find_member(const php_ctx_t *ctx, const char *cls, const char *member,
-                                    cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, cls))
-        return chain->overflow ? PHP_OPEN : PHP_ABSENT;
+                                    cbm_source_chain_t *chain, const cbm_source_decl_t **out);
+
+static php_lookup_t php_member_on(const php_ctx_t *ctx, const char *cls, const char *member,
+                                  cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, cls, "");
     /* Not declared in the project: the class may still declare the member. */
     if (!record)
@@ -662,17 +663,25 @@ static php_lookup_t php_find_member(const php_ctx_t *ctx, const char *cls, const
     return PHP_ABSENT;
 }
 
+static php_lookup_t php_find_member(const php_ctx_t *ctx, const char *cls, const char *member,
+                                    cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, cls))
+        return chain->overflow ? PHP_OPEN : PHP_ABSENT;
+    php_lookup_t found = php_member_on(ctx, cls, member, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
+}
+
 static bool php_class_inherits_on(const php_ctx_t *ctx, const char *cls, const char *ancestor,
                                   cbm_source_chain_t *chain) {
-    if (!cls || !ancestor || !cbm_source_chain_first_visit(chain, cls))
+    if (!cls || !ancestor || !cbm_source_chain_enter(ctx->walk, chain, cls))
         return false;
-    if (!strcmp(cls, ancestor))
-        return true;
-    const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, cls, "");
-    for (size_t i = 0; record && record->bases && record->bases[i]; i++)
-        if (php_class_inherits_on(ctx, record->bases[i] + 2, ancestor, chain))
-            return true;
-    return false;
+    bool inherits = !strcmp(cls, ancestor);
+    const cbm_source_decl_t *record = inherits ? NULL : cbm_source_lookup(ctx->walk, cls, "");
+    for (size_t i = 0; !inherits && record && record->bases && record->bases[i]; i++)
+        inherits = php_class_inherits_on(ctx, record->bases[i] + 2, ancestor, chain);
+    cbm_source_chain_leave(chain);
+    return inherits;
 }
 
 static bool php_class_inherits(const php_ctx_t *ctx, const char *cls, const char *ancestor) {

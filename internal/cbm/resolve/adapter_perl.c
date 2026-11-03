@@ -456,9 +456,10 @@ static perl_lookup_t perl_own_sub(const perl_ctx_t *ctx, const char *package, co
 }
 
 static perl_lookup_t perl_find_method(const perl_ctx_t *ctx, const char *package, const char *name,
-                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, package))
-        return chain->overflow ? PERL_OPEN : PERL_ABSENT;
+                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out);
+
+static perl_lookup_t perl_method_of(const perl_ctx_t *ctx, const char *package, const char *name,
+                                    cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
     const cbm_source_decl_t *records = cbm_source_lookup(ctx->walk, package, "");
     if (!records)
         return PERL_OPEN; /* Not a project package: it may define the method. */
@@ -476,6 +477,15 @@ static perl_lookup_t perl_find_method(const perl_ctx_t *ctx, const char *package
         }
     }
     return PERL_ABSENT;
+}
+
+static perl_lookup_t perl_find_method(const perl_ctx_t *ctx, const char *package, const char *name,
+                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, package))
+        return chain->overflow ? PERL_OPEN : PERL_ABSENT;
+    perl_lookup_t found = perl_method_of(ctx, package, name, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
 }
 
 static void perl_note_import_word(perl_ctx_t *ctx, const char *word, void *user) {
@@ -545,20 +555,26 @@ static bool perl_exported_sub(const perl_ctx_t *ctx, const char *module, const c
     char key[256];
     int length = snprintf(key, sizeof(key), "%s%s", PERL_EXPORT_PREFIX, name);
     if (length < 0 || (size_t)length >= sizeof(key) ||
-        !cbm_source_chain_first_visit(chain, module) ||
-        !cbm_source_lookup(ctx->walk, module, PERL_EXPORTER_KEY) ||
-        cbm_source_lookup(ctx->walk, module, "import") ||
-        !cbm_source_lookup(ctx->walk, module, key))
+        !cbm_source_chain_enter(ctx->walk, chain, module))
         return false;
-    perl_lookup_t own = perl_own_sub(ctx, module, name, out);
-    if (own != PERL_ABSENT)
-        return own == PERL_FOUND;
-    length = snprintf(key, sizeof(key), "%s%s", PERL_IMPORTED_PREFIX, name);
-    if (length < 0 || (size_t)length >= sizeof(key))
-        return false;
-    const cbm_source_decl_t *imported = cbm_source_lookup(ctx->walk, module, key);
-    return imported && !imported->next && imported->type &&
-           perl_exported_sub(ctx, imported->type, name, chain, out);
+    bool exported = false;
+    if (cbm_source_lookup(ctx->walk, module, PERL_EXPORTER_KEY) &&
+        !cbm_source_lookup(ctx->walk, module, "import") &&
+        cbm_source_lookup(ctx->walk, module, key)) {
+        perl_lookup_t own = perl_own_sub(ctx, module, name, out);
+        if (own != PERL_ABSENT) {
+            exported = own == PERL_FOUND;
+        } else {
+            length = snprintf(key, sizeof(key), "%s%s", PERL_IMPORTED_PREFIX, name);
+            const cbm_source_decl_t *imported = length >= 0 && (size_t)length < sizeof(key)
+                                                    ? cbm_source_lookup(ctx->walk, module, key)
+                                                    : NULL;
+            exported = imported && !imported->next && imported->type &&
+                       perl_exported_sub(ctx, imported->type, name, chain, out);
+        }
+    }
+    cbm_source_chain_leave(chain);
+    return exported;
 }
 
 /* The named export of an Exporter-based module, or nothing. */

@@ -522,7 +522,7 @@ static void elixir_note_import(elixir_ctx_t *ctx, TSNode call) {
 /* `use M`: what M's `__using__` is known to return. A `use` in there follows on, and each
  * module is read once, so this costs the modules reachable from M. */
 static void elixir_apply_using(elixir_ctx_t *ctx, const char *module, cbm_source_chain_t *chain) {
-    if (!cbm_source_chain_first_visit(chain, module))
+    if (!cbm_source_chain_enter(ctx->walk, chain, module))
         return;
     for (const cbm_source_decl_t *decl = cbm_source_lookup(ctx->walk, module, ELIXIR_USING); decl;
          decl = decl->next) {
@@ -540,6 +540,7 @@ static void elixir_apply_using(elixir_ctx_t *ctx, const char *module, cbm_source
                                                  .except_text = decl->bases[ELIXIR_USING_EXCEPT]});
         }
     }
+    cbm_source_chain_leave(chain);
 }
 
 /* `only: [a: 1]` or `except: [a: 1]`. `only: :functions` and any computed list

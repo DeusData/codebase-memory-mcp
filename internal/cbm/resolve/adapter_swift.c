@@ -1173,9 +1173,11 @@ static const char *swift_type_in_this_module(swift_ctx_t *ctx, const char *type_
 
 static swift_lookup_t swift_find_member(swift_ctx_t *ctx, const char *type_key, const char *name,
                                         const swift_args_t *args, bool bases_only,
-                                        cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, type_key))
-        return chain->overflow ? SWIFT_OPEN : SWIFT_ABSENT;
+                                        cbm_source_chain_t *chain, const cbm_source_decl_t **out);
+
+static swift_lookup_t swift_member_on(swift_ctx_t *ctx, const char *type_key, const char *name,
+                                      const swift_args_t *args, bool bases_only,
+                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
     const char *module = swift_module_from_key(ctx->walk, type_key);
     const cbm_source_decl_t *records = cbm_source_lookup(ctx->walk, type_key, SWIFT_TYPE_RECORD);
     if (!records)
@@ -1289,6 +1291,16 @@ static swift_lookup_t swift_find_member(swift_ctx_t *ctx, const char *type_key, 
     if (result == SWIFT_FOUND)
         return open ? SWIFT_OPEN : result;
     return open || !declared ? SWIFT_OPEN : SWIFT_ABSENT;
+}
+
+static swift_lookup_t swift_find_member(swift_ctx_t *ctx, const char *type_key, const char *name,
+                                        const swift_args_t *args, bool bases_only,
+                                        cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, type_key))
+        return chain->overflow ? SWIFT_OPEN : SWIFT_ABSENT;
+    swift_lookup_t found = swift_member_on(ctx, type_key, name, args, bases_only, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
 }
 
 static swift_ref_t swift_member(swift_ctx_t *ctx, const swift_ref_t *receiver, const char *name,
@@ -1867,26 +1879,28 @@ static bool swift_inherits(swift_ctx_t *ctx, const char *type_key, const char *a
                            cbm_source_chain_t *chain) {
     if (!strcmp(type_key, ancestor))
         return true;
-    if (!cbm_source_chain_first_visit(chain, type_key))
+    if (!cbm_source_chain_enter(ctx->walk, chain, type_key))
         return false;
+    bool inherits = false;
     for (const cbm_source_decl_t *record =
              cbm_source_lookup(ctx->walk, type_key, SWIFT_TYPE_RECORD);
-         record; record = record->next) {
-        for (const char *const *base = record->bases; base && *base; base++) {
+         record && !inherits; record = record->next) {
+        for (const char *const *base = record->bases; base && *base && !inherits; base++) {
             const char *parent = swift_lookup_type(ctx, type_key, *base);
-            if (parent && swift_inherits(ctx, parent, ancestor, chain))
-                return true;
+            inherits = parent && swift_inherits(ctx, parent, ancestor, chain);
         }
     }
-    return false;
+    cbm_source_chain_leave(chain);
+    return inherits;
 }
 
 /* Whether a type can take a literal: it conforms to the protocol, or to one this table cannot
  * read. The standard's closed protocols do not refine the literal ones. */
 static bool swift_takes_literal(swift_ctx_t *ctx, const char *type_key, const char *protocol,
-                                cbm_source_chain_t *chain) {
-    if (!cbm_source_chain_first_visit(chain, type_key))
-        return chain->overflow;
+                                cbm_source_chain_t *chain);
+
+static bool swift_type_takes_literal(swift_ctx_t *ctx, const char *type_key, const char *protocol,
+                                     cbm_source_chain_t *chain) {
     const cbm_source_decl_t *records = cbm_source_lookup(ctx->walk, type_key, SWIFT_TYPE_RECORD);
     if (!records)
         return true;
@@ -1903,6 +1917,15 @@ static bool swift_takes_literal(swift_ctx_t *ctx, const char *type_key, const ch
         }
     }
     return false;
+}
+
+static bool swift_takes_literal(swift_ctx_t *ctx, const char *type_key, const char *protocol,
+                                cbm_source_chain_t *chain) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, type_key))
+        return chain->overflow;
+    bool takes = swift_type_takes_literal(ctx, type_key, protocol, chain);
+    cbm_source_chain_leave(chain);
+    return takes;
 }
 
 typedef enum { SWIFT_ARG_ANY, SWIFT_ARG_EXACT, SWIFT_ARG_NO } swift_arg_fit_t;

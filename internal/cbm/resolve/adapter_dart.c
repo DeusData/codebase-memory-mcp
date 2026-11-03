@@ -40,6 +40,8 @@
 #define DART_CLASS_PARAMS "&params" /* type: the class's own type parameters, `,T,U,` */
 #define DART_IMPORTS "&imports"
 #define DART_EXPORTS "&exports"
+#define DART_EXPORTERS "&exporters" /* under a library: who exports it; bases: them, show, hide */
+#define DART_NAMES "&names"         /* owner of a row per library declaring a top-level name */
 #define DART_CTOR_PREFIX "ctor:"
 #define DART_CLASS_PREFIX "class:"
 #define DART_DIRECTIVE_SEPARATOR '\x1e'
@@ -53,13 +55,9 @@ typedef struct {
     bool conditional; /* its library depends on the build's configuration */
 } dart_directive_t;
 
-/* A barrel's exports can list the whole project, and every file that imports it would read them
- * all again while a name's walk stops at the chain's bound. So they are read as a walk reaches
- * them: export_next is the first declaration not read yet. */
 typedef struct {
-    dart_directive_t *imports, *exports;
-    size_t import_count, export_count, export_capacity;
-    const cbm_source_decl_t *export_next;
+    dart_directive_t *imports;
+    size_t import_count;
 } dart_library_t;
 
 typedef struct dart_local {
@@ -154,7 +152,8 @@ static const char *dart_uri_library(cbm_source_walk_t *walk, const char *base_fi
         if (!slash)
             return NULL;
         char *name = cbm_arena_strndup(walk->arena, rest, (size_t)(slash - rest));
-        const char *lib = name ? cbm_source_table_dart_package(walk->table, base_file, name) : NULL;
+        const cbm_source_table_t *table = walk->table ? walk->table : walk->writable;
+        const char *lib = name ? cbm_source_table_dart_package(table, base_file, name) : NULL;
         return lib ? dart_path_join(walk, lib, slash + 1) : NULL;
     }
     if (strchr(uri, ':') || uri[0] == '/')
@@ -295,6 +294,34 @@ static void dart_note_directive(cbm_source_walk_t *walk, const char *library, TS
                           prefix, DART_DIRECTIVE_SEPARATOR, show, DART_DIRECTIVE_SEPARATOR, hide);
     if (decl && encoded)
         decl->type = cbm_source_table_intern(walk, encoded);
+    if (strcmp(key, DART_EXPORTS))
+        return;
+    const char *target = dart_uri_library(walk, walk->file, uri);
+    cbm_source_decl_t *edge = target ? cbm_source_declare(walk, target, DART_EXPORTERS, NULL,
+                                                          CBM_SOURCE_DECL_F_VALUE,
+                                                          ts_node_start_point(directive).row + 1)
+                                     : NULL;
+    const char **bases = edge ? cbm_source_table_alloc(walk, 4 * sizeof(*bases)) : NULL;
+    if (!bases)
+        return;
+    bases[0] = cbm_source_table_intern(walk, library);
+    bases[1] = cbm_source_table_intern(walk, show);
+    bases[2] = cbm_source_table_intern(walk, hide);
+    edge->bases = bases;
+}
+
+/* A declaration of this file. One at its top level is also listed under its name, for a walk
+ * through exports to start from. */
+static cbm_source_decl_t *dart_declare(cbm_source_walk_t *walk, const char *owner, const char *name,
+                                       const char *qn, uint32_t flags, uint32_t line) {
+    cbm_source_decl_t *decl = cbm_source_declare(walk, owner, name, qn, flags, line);
+    if (decl && owner == walk->top_owner) {
+        cbm_source_decl_t *row =
+            cbm_source_declare(walk, DART_NAMES, name, NULL, CBM_SOURCE_DECL_F_VALUE, line);
+        if (row)
+            row->type = decl->owner;
+    }
+    return decl;
 }
 
 static void dart_declare_function(cbm_source_walk_t *walk, const char *owner, TSNode signature,
@@ -305,7 +332,7 @@ static void dart_declare_function(cbm_source_walk_t *walk, const char *owner, TS
         return;
     uint32_t line = ts_node_start_point(name).row + 1;
     cbm_source_decl_t *decl =
-        cbm_source_declare(walk, owner, text, cbm_source_def_qn(walk, text, line), 0, line);
+        dart_declare(walk, owner, text, cbm_source_def_qn(walk, text, line), 0, line);
     const char *type = dart_member_type_text(walk, signature, type_params,
                                              dart_type_params(walk, signature, NULL));
     if (decl && type)
@@ -320,7 +347,7 @@ static void dart_declare_value(cbm_source_walk_t *walk, const char *owner, const
     if (!qn && name)
         qn = cbm_source_def_qn_label(walk, name, line, "Method");
     cbm_source_decl_t *decl =
-        name ? cbm_source_declare(walk, owner, name, qn, CBM_SOURCE_DECL_F_VALUE, line) : NULL;
+        name ? dart_declare(walk, owner, name, qn, CBM_SOURCE_DECL_F_VALUE, line) : NULL;
     if (decl && type)
         decl->type = cbm_source_table_intern(walk, type);
 }
@@ -519,7 +546,7 @@ static void dart_collect_class(cbm_source_walk_t *walk, const char *library, TSN
         return;
     /* The library holds the class's name and QN, for a constructor call; the record
      * under the class's own key holds what its members need. */
-    cbm_source_decl_t *in_library = cbm_source_declare(
+    cbm_source_decl_t *in_library = dart_declare(
         walk, library, key, cbm_source_def_qn(walk, name, line), CBM_SOURCE_DECL_F_TYPE, line);
     if (in_library)
         in_library->type = cbm_source_table_intern(walk, class_key);
@@ -583,6 +610,7 @@ static void dart_collect(cbm_source_walk_t *walk) {
     if (!library)
         return;
     (void)cbm_source_declare(walk, library, DART_LIBRARY_RECORD, NULL, CBM_SOURCE_DECL_F_TYPE, 1);
+    walk->top_owner = library;
     const char *pending = NULL;
     bool typed = false;
     uint32_t count = ts_node_named_child_count(walk->root);
@@ -612,9 +640,9 @@ static void dart_collect(cbm_source_walk_t *walk) {
             const char *key =
                 name ? cbm_arena_sprintf(walk->arena, "%s%s", DART_CLASS_PREFIX, name) : NULL;
             if (key)
-                (void)cbm_source_declare(walk, library, key, NULL,
-                                         CBM_SOURCE_DECL_F_TYPE | CBM_SOURCE_DECL_F_OPEN,
-                                         ts_node_start_point(child).row + 1);
+                (void)dart_declare(walk, library, key, NULL,
+                                   CBM_SOURCE_DECL_F_TYPE | CBM_SOURCE_DECL_F_OPEN,
+                                   ts_node_start_point(child).row + 1);
         } else if (cbm_source_is(child, "type_identifier")) {
             /* Top-level variables keep type and names as flat siblings. */
             pending = cbm_source_text(walk, child);
@@ -681,30 +709,6 @@ static void dart_read_directives(dart_ctx_t *ctx, const char *library, const cha
             (*out_count)++;
 }
 
-/* The export at this position, read on the way if it has not been; NULL past the last. */
-static const dart_directive_t *dart_export_at(dart_ctx_t *ctx, dart_library_t *library,
-                                              size_t position) {
-    while (position >= library->export_count && library->export_next) {
-        if (library->export_count == library->export_capacity) {
-            size_t capacity = library->export_capacity ? library->export_capacity * 2 : 16;
-            dart_directive_t *items = cbm_arena_alloc(ctx->walk->arena, capacity * sizeof(*items));
-            if (!items) {
-                cbm_source_fail(ctx->walk, "dart_library_allocation");
-                return NULL;
-            }
-            if (library->export_count)
-                memcpy(items, library->exports, library->export_count * sizeof(*items));
-            library->exports = items;
-            library->export_capacity = capacity;
-        }
-        const cbm_source_decl_t *d = library->export_next;
-        library->export_next = d->next;
-        if (dart_read_directive(ctx, d, &library->exports[library->export_count]))
-            library->export_count++;
-    }
-    return position < library->export_count ? &library->exports[position] : NULL;
-}
-
 static dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
     dart_library_t *library = cbm_ht_get(ctx->libraries, path);
     if (library)
@@ -716,38 +720,77 @@ static dart_library_t *dart_library(dart_ctx_t *ctx, const char *path) {
         return NULL;
     }
     dart_read_directives(ctx, path, DART_IMPORTS, &library->imports, &library->import_count);
-    library->export_next = cbm_source_lookup(ctx->walk, path, DART_EXPORTS);
     cbm_ht_set(ctx->libraries, key, library);
     return library;
 }
 
-/* A library's public name, including what it re-exports. */
+/* Whether `from` reaches `library` through exports that pass this name. A library declaring the
+ * key itself answers with its own, so no walk goes on through it. This reads who exports
+ * `library`, directly or not, and no barrel's whole export list, and it recurses nowhere. */
+static bool dart_exports_reach(dart_ctx_t *ctx, const char *library, const char *from,
+                               const char *key, const char *name, bool *limited) {
+    enum { DART_WALK_INLINE = 32 };
+    const char *held[DART_WALK_INLINE];
+    const char **stack = held;
+    size_t depth = 0, capacity = DART_WALK_INLINE;
+    cbm_source_chain_t seen = {0};
+    (void)cbm_source_chain_first_visit(ctx->walk, &seen, library);
+    for (const char *at = library; at; at = depth ? stack[--depth] : NULL) {
+        for (const cbm_source_decl_t *edge = cbm_source_lookup(ctx->walk, at, DART_EXPORTERS); edge;
+             edge = edge->next) {
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            const char *const *bases = edge->bases;
+            if (!bases || !dart_filter_passes(bases[1], bases[2], name))
+                continue;
+            if (!strcmp(bases[0], from))
+                return true;
+            if (!cbm_source_chain_first_visit(ctx->walk, &seen, bases[0])) {
+                if (seen.overflow) {
+                    *limited = true;
+                    return false;
+                }
+                continue;
+            }
+            if (cbm_source_lookup(ctx->walk, bases[0], key))
+                continue;
+            if (depth == capacity) {
+                const char **grown = cbm_arena_alloc(ctx->walk->arena, capacity * 2 * sizeof(*grown));
+                if (!grown) {
+                    *limited = true;
+                    return false;
+                }
+                memcpy(grown, stack, depth * sizeof(*grown));
+                stack = grown;
+                capacity *= 2;
+            }
+            stack[depth++] = bases[0];
+        }
+    }
+    return false;
+}
+
+/* A library's public name, including what it re-exports. A barrel can list the whole project and
+ * every file can import it, so this starts from who declares the name: only they can answer. */
 static const cbm_source_decl_t *dart_library_public(dart_ctx_t *ctx, const char *path,
                                                     const char *key, const char *name,
-                                                    cbm_source_chain_t *chain, bool *conflict) {
-    if (!path || !cbm_source_chain_first_visit(chain, path))
+                                                    bool *conflict, bool *limited) {
+    if (!path)
         return NULL;
     const cbm_source_decl_t *own = cbm_source_lookup(ctx->walk, path, key);
-    if (own)
+    if (own || !cbm_source_lookup(ctx->walk, path, DART_EXPORTS))
         return own;
-    dart_library_t *library = dart_library(ctx, path);
-    if (!library)
-        return NULL;
     const cbm_source_decl_t *found = NULL;
-    /* Past the chain's bound no further library can be visited, so none can change this. */
-    for (size_t i = 0; !chain->overflow; i++) {
-        const dart_directive_t *directive = dart_export_at(ctx, library, i);
-        if (!directive)
-            break;
+    for (const cbm_source_decl_t *row = cbm_source_lookup(ctx->walk, DART_NAMES, key); row;
+         row = row->next) {
         cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
-        if (!dart_filter_passes(directive->show, directive->hide, name))
+        const cbm_source_decl_t *declared = cbm_source_lookup(ctx->walk, row->type, key);
+        if (declared == found || !dart_exports_reach(ctx, row->type, path, key, name, limited))
             continue;
-        const cbm_source_decl_t *exported =
-            dart_library_public(ctx, directive->library, key, name, chain, conflict);
-        if (exported && found && exported != found)
+        if (found) {
             *conflict = true;
-        if (exported)
-            found = exported;
+            return found;
+        }
+        found = declared;
     }
     return found;
 }
@@ -775,15 +818,14 @@ static const cbm_source_decl_t *dart_import_search(dart_ctx_t *ctx, const char *
             *reason = "dart_conditional_import_may_provide_name";
             return NULL;
         }
-        bool conflict = false;
-        cbm_source_chain_t chain = {0};
+        bool conflict = false, limited = false;
         const cbm_source_decl_t *found =
-            dart_library_public(ctx, import->library, key, name, &chain, &conflict);
+            dart_library_public(ctx, import->library, key, name, &conflict, &limited);
         if (conflict) {
             *reason = "dart_export_conflict";
             return NULL;
         }
-        if (chain.overflow && !found) {
+        if (limited && !found) {
             *reason = "dart_export_graph_not_walked";
             return NULL;
         }
@@ -899,10 +941,8 @@ static dart_lookup_t dart_search_bases(dart_ctx_t *ctx, const cbm_source_decl_t 
 
 /* The class's own, then the last mixin back to the first, then the superclass,
  * then the interfaces. */
-static dart_lookup_t dart_find_member(dart_ctx_t *ctx, const char *class_key, const char *name,
-                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, class_key))
-        return chain->overflow ? DART_OPEN : DART_ABSENT;
+static dart_lookup_t dart_member_on(dart_ctx_t *ctx, const char *class_key, const char *name,
+                                    cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, class_key, DART_CLASS_RECORD);
     if (!record || record->next || (record->flags & CBM_SOURCE_DECL_F_OPEN))
         return DART_OPEN;
@@ -924,10 +964,19 @@ static dart_lookup_t dart_find_member(dart_ctx_t *ctx, const char *class_key, co
     return found;
 }
 
+static dart_lookup_t dart_find_member(dart_ctx_t *ctx, const char *class_key, const char *name,
+                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, class_key))
+        return chain->overflow ? DART_OPEN : DART_ABSENT;
+    dart_lookup_t found = dart_member_on(ctx, class_key, name, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
+}
+
 /* `super.m`: what the class inherits, in the same order, without its own members. */
 static dart_lookup_t dart_find_past_own(dart_ctx_t *ctx, const char *class_key, const char *name,
                                         cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, class_key))
+    if (!cbm_source_chain_first_visit(ctx->walk, chain, class_key))
         return DART_ABSENT;
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, class_key, DART_CLASS_RECORD);
     if (!record || record->next || (record->flags & CBM_SOURCE_DECL_F_OPEN))
@@ -981,12 +1030,22 @@ static int dart_param_index(dart_ctx_t *ctx, const char *cls, const char *name) 
 /* What parameter `param` of `owner` means seen from `cls`, walking the extends and with clauses
  * that fix it. A class key, a parameter of `cls` as "$T", or NULL. The chain bounds the walk: a
  * class appears once. */
+static const char *dart_type_arg_above(dart_ctx_t *ctx, const char *cls, const char *owner,
+                                       const char *param, cbm_source_chain_t *chain);
+
 static const char *dart_type_arg(dart_ctx_t *ctx, const char *cls, const char *owner,
                                  const char *param, cbm_source_chain_t *chain) {
     if (!strcmp(cls, owner))
         return cbm_arena_sprintf(ctx->walk->arena, "%c%s", DART_CLASS_PARAM, param);
-    if (!cbm_source_chain_first_visit(chain, cls))
+    if (!cbm_source_chain_enter(ctx->walk, chain, cls))
         return NULL;
+    const char *held = dart_type_arg_above(ctx, cls, owner, param, chain);
+    cbm_source_chain_leave(chain);
+    return held;
+}
+
+static const char *dart_type_arg_above(dart_ctx_t *ctx, const char *cls, const char *owner,
+                                       const char *param, cbm_source_chain_t *chain) {
     const cbm_source_decl_t *record = cbm_source_lookup(ctx->walk, cls, DART_CLASS_RECORD);
     if (!record || record->next)
         return NULL;

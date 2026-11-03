@@ -801,7 +801,7 @@ static const cbm_source_decl_t *ruby_follow_constant(const ruby_ctx_t *ctx,
                                                      const cbm_source_decl_t *records) {
     cbm_source_chain_t seen = {0};
     while (records && !records->next && (records->flags & RUBY_DECL_CONSTANT_ALIAS)) {
-        if (!cbm_source_chain_first_visit(&seen, records->owner))
+        if (!cbm_source_chain_first_visit(ctx->walk, &seen, records->owner))
             return NULL;
         const char *bar = strchr(records->type, '|');
         char cref[RUBY_CONSTANT_BUFFER];
@@ -841,9 +841,11 @@ static const char *ruby_base_owner(const ruby_ctx_t *ctx, const char *base) {
  * passed over: its table cannot be read. */
 static const cbm_source_decl_t *ruby_constant_of_ancestors(const ruby_ctx_t *ctx, const char *owner,
                                                            const char *name, size_t length,
-                                                           cbm_source_chain_t *chain) {
-    if (!cbm_source_chain_first_visit(chain, owner))
-        return NULL;
+                                                           cbm_source_chain_t *chain);
+
+static const cbm_source_decl_t *ruby_constant_above(const ruby_ctx_t *ctx, const char *owner,
+                                                    const char *name, size_t length,
+                                                    cbm_source_chain_t *chain) {
     static const char tags[] = {'P', 'I', 'S'};
     const cbm_source_decl_t *records = cbm_source_lookup(ctx->walk, owner, "");
     for (size_t t = 0; t < sizeof(tags); t++) {
@@ -866,6 +868,16 @@ static const cbm_source_decl_t *ruby_constant_of_ancestors(const ruby_ctx_t *ctx
         }
     }
     return NULL;
+}
+
+static const cbm_source_decl_t *ruby_constant_of_ancestors(const ruby_ctx_t *ctx, const char *owner,
+                                                           const char *name, size_t length,
+                                                           cbm_source_chain_t *chain) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, owner))
+        return NULL;
+    const cbm_source_decl_t *found = ruby_constant_above(ctx, owner, name, length, chain);
+    cbm_source_chain_leave(chain);
+    return found;
 }
 
 /* Reading `::A`, `A` or `A::B::C` with these scopes enclosing it, innermost last. */
@@ -1003,10 +1015,8 @@ static ruby_lookup_t ruby_search_superclass(const ruby_ctx_t *ctx, const cbm_sou
     return RUBY_ABSENT;
 }
 
-static ruby_lookup_t ruby_find_instance(const ruby_ctx_t *ctx, const char *owner, const char *name,
-                                        cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, owner))
-        return chain->overflow ? RUBY_OPEN : RUBY_ABSENT;
+static ruby_lookup_t ruby_instance_of(const ruby_ctx_t *ctx, const char *owner, const char *name,
+                                      cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
     if (!strcmp(owner, RUBY_OBJECT))
         return ruby_own(ctx, RUBY_OBJECT, name, out);
     const cbm_source_decl_t *records = cbm_source_lookup(ctx->walk, owner, "");
@@ -1034,12 +1044,23 @@ static ruby_lookup_t ruby_find_instance(const ruby_ctx_t *ctx, const char *owner
     return ruby_own(ctx, RUBY_OBJECT, name, out);
 }
 
+static ruby_lookup_t ruby_find_instance(const ruby_ctx_t *ctx, const char *owner, const char *name,
+                                        cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, owner))
+        return chain->overflow ? RUBY_OPEN : RUBY_ABSENT;
+    ruby_lookup_t found = ruby_instance_of(ctx, owner, name, chain, out);
+    cbm_source_chain_leave(chain);
+    return found;
+}
+
 static ruby_lookup_t ruby_find_singleton_on(const ruby_ctx_t *ctx, const char *owner,
                                             const char *name, cbm_source_chain_t *chain,
                                             cbm_source_chain_t *extended,
-                                            const cbm_source_decl_t **out) {
-    if (!cbm_source_chain_first_visit(chain, owner))
-        return chain->overflow ? RUBY_OPEN : RUBY_ABSENT;
+                                            const cbm_source_decl_t **out);
+
+static ruby_lookup_t ruby_singleton_of(const ruby_ctx_t *ctx, const char *owner, const char *name,
+                                       cbm_source_chain_t *chain, cbm_source_chain_t *extended,
+                                       const cbm_source_decl_t **out) {
     const cbm_source_decl_t *records = cbm_source_lookup(ctx->walk, owner, "");
     if (!records)
         return RUBY_OPEN;
@@ -1064,6 +1085,17 @@ static ruby_lookup_t ruby_find_singleton_on(const ruby_ctx_t *ctx, const char *o
     return ruby_own(ctx, RUBY_OBJECT, name, out);
 }
 
+static ruby_lookup_t ruby_find_singleton_on(const ruby_ctx_t *ctx, const char *owner,
+                                            const char *name, cbm_source_chain_t *chain,
+                                            cbm_source_chain_t *extended,
+                                            const cbm_source_decl_t **out) {
+    if (!cbm_source_chain_enter(ctx->walk, chain, owner))
+        return chain->overflow ? RUBY_OPEN : RUBY_ABSENT;
+    ruby_lookup_t found = ruby_singleton_of(ctx, owner, name, chain, extended, out);
+    cbm_source_chain_leave(chain);
+    return found;
+}
+
 static ruby_lookup_t ruby_find_singleton(const ruby_ctx_t *ctx, const char *owner, const char *name,
                                          const cbm_source_decl_t **out) {
     cbm_source_chain_t chain = {0}, extended = {0};
@@ -1081,7 +1113,7 @@ static ruby_lookup_t ruby_find_super(const ruby_ctx_t *ctx, const char *owner, c
         if (!singleton && (record->flags & CBM_SOURCE_DECL_F_INTERFACE))
             return RUBY_OPEN;
     cbm_source_chain_t chain = {0}, extended = {0};
-    (void)cbm_source_chain_first_visit(&chain, owner);
+    (void)cbm_source_chain_first_visit(ctx->walk, &chain, owner);
     ruby_lookup_t found = singleton
                               ? ruby_search_mixins(ctx, records, 'E', owner, name, &extended, out)
                               : ruby_search_mixins(ctx, records, 'I', owner, name, &chain, out);
@@ -1558,15 +1590,14 @@ static bool ruby_name_may_rebind(const ruby_ctx_t *ctx, const char *name,
     const cbm_source_decl_t *notes = cbm_source_lookup(ctx->walk, RUBY_REBINDING_DEFS, name);
     if (!notes)
         return false;
-    if (!cbm_source_chain_first_visit(chain, name))
+    if (!cbm_source_chain_enter(ctx->walk, chain, name))
         return chain->overflow;
-    for (const cbm_source_decl_t *note = notes; note; note = note->next) {
-        if (!note->type || !cbm_source_lookup(ctx->walk, RUBY_ALL_DEFS, note->type))
-            return true;
-        if (ruby_name_may_rebind(ctx, note->type, chain))
-            return true;
-    }
-    return false;
+    bool rebinds = false;
+    for (const cbm_source_decl_t *note = notes; note && !rebinds; note = note->next)
+        rebinds = !note->type || !cbm_source_lookup(ctx->walk, RUBY_ALL_DEFS, note->type) ||
+                  ruby_name_may_rebind(ctx, note->type, chain);
+    cbm_source_chain_leave(chain);
+    return rebinds;
 }
 
 static bool ruby_method_may_rebind(const ruby_visit_t *visit, const char *name) {
@@ -1585,20 +1616,20 @@ static bool ruby_decl_may_rebind(const ruby_ctx_t *ctx, const cbm_source_decl_t 
     const cbm_source_decl_t *notes = cbm_source_lookup(ctx->walk, own, decl->name);
     if (!notes)
         return false;
-    if (!cbm_source_chain_first_visit(chain, decl->qn ? decl->qn : decl->name))
+    if (!cbm_source_chain_enter(ctx->walk, chain, decl->qn ? decl->qn : decl->name))
         return chain->overflow;
     bool singleton = !strncmp(decl->name, "self.", 5);
-    for (const cbm_source_decl_t *note = notes; note; note = note->next) {
-        if (!note->type)
-            return true;
+    bool rebinds = false;
+    for (const cbm_source_decl_t *note = notes; note && !rebinds; note = note->next) {
         const cbm_source_decl_t *next = NULL;
-        ruby_lookup_t found = singleton
-                                  ? ruby_find_singleton(ctx, decl->owner, note->type, &next)
-                                  : ruby_find_instance_from(ctx, decl->owner, note->type, &next);
-        if (found != RUBY_FOUND || ruby_decl_may_rebind(ctx, next, chain))
-            return true;
+        ruby_lookup_t found =
+            !note->type ? RUBY_OPEN
+            : singleton ? ruby_find_singleton(ctx, decl->owner, note->type, &next)
+                        : ruby_find_instance_from(ctx, decl->owner, note->type, &next);
+        rebinds = found != RUBY_FOUND || ruby_decl_may_rebind(ctx, next, chain);
     }
-    return false;
+    cbm_source_chain_leave(chain);
+    return rebinds;
 }
 
 /* What self is inside the block handed to this call. */
