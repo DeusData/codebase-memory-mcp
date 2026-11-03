@@ -2170,6 +2170,57 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
     PASS();
 }
 
+/* #2000, end to end: functions declared after an inline-HTML block reach the
+ * store with their CALLS edges, in the same file and across files. */
+TEST(pipeline_php_inline_html_calls_resolve_issue2000) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    static const struct {
+        const char *name;
+        const char *body;
+    } files[] = {
+        {"inline_html.php", "<?php\n"
+                            "function gamma() { return 2; }\n"
+                            "?>\n"
+                            "<div class=\"box\">\n"
+                            "  <p>plain markup after the closing tag</p>\n"
+                            "</div>\n"
+                            "<?php\n"
+                            "function delta() { return gamma(); }\n"},
+        {"price_helpers.php",
+         "<!-- shared helpers -->\n"
+         "<?php\n"
+         "function formatPrice($cents) { return number_format($cents / 100, 2); }\n"},
+        {"card_view.php", "<?php $title = 'Cards'; ?>\n"
+                          "<h1><?= $title ?></h1>\n"
+                          "<?php\n"
+                          "function renderCard($item) { return formatPrice($item['cents']); }\n"},
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        write_temp_file(g_tmpdir, files[i].name, files[i].body);
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test_php_inline_html.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT(cross_file_call_exists(s, project, "delta", "gamma"));
+    ASSERT(cross_file_call_exists(s, project, "renderCard", "formatPrice"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Terraform reference resolution, end to end.
  *
  * An HCL block names itself with its labels appended -- find_hcl_block_name
@@ -27110,6 +27161,72 @@ TEST(cancelled_incremental_reindex_preserves_committed_db) {
     PASS();
 }
 
+typedef struct {
+    bool allow;
+    int calls;
+} publish_gate_ctx_t;
+
+static bool publish_gate_decide(void *context) {
+    publish_gate_ctx_t *gate = context;
+    gate->calls++;
+    return gate->allow;
+}
+
+/* The publication gate (a supervised worker's claim on its publication fence)
+ * is the last word before the serving database is touched: refused, the run
+ * stops with the previous generation's file in place; allowed, it publishes
+ * as before. Asked exactly once either way. */
+TEST(publish_gate_decides_before_the_committed_db_is_touched) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    struct stat baseline;
+    ASSERT_EQ(stat(g_incr_dbpath, &baseline), 0);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "gate_candidate.go",
+                              "package main\n\nfunc GateCandidate() int { return 7 }\n"));
+    publish_gate_ctx_t refused = {.allow = false};
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_publish_gate(p, publish_gate_decide, &refused);
+    int refused_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    struct stat after_refusal;
+    bool same_file =
+        stat(g_incr_dbpath, &after_refusal) == 0 && after_refusal.st_ino == baseline.st_ino;
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    int refused_candidates = live ? count_nodes_named(live, project, "GateCandidate") : -1;
+    cbm_store_close(live);
+
+    publish_gate_ctx_t allowed = {.allow = true};
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_publish_gate(p, publish_gate_decide, &allowed);
+    int allowed_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    live = cbm_store_open_path(g_incr_dbpath);
+    int allowed_candidates = live ? count_nodes_named(live, project, "GateCandidate") : -1;
+    cbm_store_close(live);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(refused.calls, 1);
+    ASSERT_EQ(refused_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_TRUE(same_file);
+    ASSERT_EQ(refused_candidates, 0);
+    ASSERT_EQ(allowed.calls, 1);
+    ASSERT_EQ(allowed_rc, 0);
+    ASSERT_GT(allowed_candidates, 0);
+    PASS();
+}
+
 TEST(backup_failed_publish_failure_preserves_final_sidecars) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -31575,6 +31692,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
+    RUN_TEST(pipeline_php_inline_html_calls_resolve_issue2000);
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
@@ -31886,6 +32004,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(cancelled_full_reindex_preserves_committed_db);
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
+    RUN_TEST(publish_gate_decides_before_the_committed_db_is_touched);
     RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
     RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);
 #ifdef __linux__
