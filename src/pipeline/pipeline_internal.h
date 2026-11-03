@@ -1684,8 +1684,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      are preserved and dotted-name collisions are disambiguated before section
  *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
  *      and diagram owners agree.
+ *  13: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *      / route.js under app/ or src/app/ exports, carries the route_path its
+ *      directories name and HANDLES its Route (extract_nextjs.c). An index
+ *      built before has none of these Routes for its unchanged route files,
+ *      so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1878,6 +1883,8 @@ const cbm_test_declarations_t *cbm_pipeline_test_declarations(const cbm_pipeline
 bool cbm_pipeline_project_source_matches(const cbm_pipeline_t *p, const cbm_userconfig_t *fresh);
 const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
 cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
+/* Borrowed checkout identity captured and validated for this pipeline run. */
+const char *cbm_pipeline_indexed_checkout_sha(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

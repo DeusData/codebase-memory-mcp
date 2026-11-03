@@ -8088,6 +8088,7 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
     {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    {CBM_CONFIG_IGNORE_WORKTREES, "false", "Skip linked git worktrees when indexing automatically"},
     /* Unset: the index mode decides (cbm_pipeline_doc_candidates_enabled). */
     {CBM_CONFIG_DOC_CANDIDATES, "auto",
      "Doc-code candidates: auto = on for full, off for moderate/fast; true/false forces"},
@@ -8100,6 +8101,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
     {CBM_INDEX_CONFIG_MAX_FILES, "off", "Max accepted source files per index, or off"},
     {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
+    {CBM_INDEX_CONFIG_MAX_RSS_MB, "off", "Max worker process-tree charged memory MiB, or off"},
+    {CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "off",
+     "Max wall-clock seconds for the whole index request, or off"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
@@ -8126,8 +8130,12 @@ static bool config_key_is_ui(const char *key) {
 }
 
 static bool config_key_is_index_policy(const char *key) {
-    return key && (strcmp(key, CBM_INDEX_CONFIG_MAX_FILES) == 0 ||
-                   strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0);
+    for (size_t index = 0; key && index < cbm_index_policy_key_count(); index++) {
+        if (strcmp(key, cbm_index_policy_key_at(index)) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {

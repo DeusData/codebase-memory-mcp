@@ -16,6 +16,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/perl_lsp.h"
 #include "lsp/py_lsp.h"
+#include "lsp/ruby_lsp.h"
 #include "lsp/ts_lsp.h"
 #include "lsp/cs_lsp.h"
 #include "lsp/java_lsp.h"
@@ -3318,6 +3319,18 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
+/* The bytes the grammar parses. PHP that leaves PHP mode (`?> markup <?php`)
+ * is parsed with its markup blanked (#2000); the rewrite keeps the length and
+ * every line break, so offsets and line numbers still refer to the file on
+ * disk. Every other language parses the file as it is. */
+static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const char *source,
+                                       int source_len) {
+    if (language == CBM_LANG_PHP) {
+        return cbm_php_mask_inline_html(a, source, source_len);
+    }
+    return source;
+}
+
 /* Initial block for the per-file traversal scratch arena, chosen by measuring
  * arena_grow on a 14k-file TypeScript tree: it fires on one file in 12,000 at
  * both this size and at 1 MB, and on most files at 256 KB, where the two
@@ -3738,6 +3751,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return result;
     }
 
+    source = extract_parse_bytes(a, language, source, source_len);
+
     // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
     // merge overflows a small stack during the parse (see
     // cbm_source_nesting_exceeds). Scoped to Perl: its ambiguous call grammar is
@@ -3907,6 +3922,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // OpenAPI operations as Routes (self-gated: API description documents).
     cbm_extract_openapi(&ctx);
 
+    // Next.js App Router handlers' routes (self-gated: app/**/route.ts and route.js).
+    cbm_extract_nextjs_routes(&ctx);
+
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {
         cbm_extract_k8s(&ctx);
@@ -3947,6 +3965,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         }
         if (language == CBM_LANG_PERL) {
             cbm_run_perl_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_RUBY) {
+            cbm_run_ruby_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_PYTHON) {
             cbm_run_py_lsp(a, result, source, source_len, root);

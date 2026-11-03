@@ -898,6 +898,192 @@ TEST(php_function) {
     PASS();
 }
 
+/* #2000: inline HTML between `?>` and `<?php` is valid PHP, but the php_only
+ * grammar has no rule for it, so everything after the first `?>` fell into an
+ * ERROR region and never reached the graph. */
+static const CBMCall *find_call_named(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0)
+            return &r->calls.items[i];
+    }
+    return NULL;
+}
+
+static int php_def_line(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0)
+            return (int)r->defs.items[i].start_line;
+    }
+    return -1;
+}
+
+TEST(php_inline_html_tail_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<?php\n"
+                               "function gamma() { return 2; }\n"
+                               "?>\n"
+                               "<div class=\"box\">\n"
+                               "  <p>plain markup after the closing tag</p>\n"
+                               "</div>\n"
+                               "<?php\n"
+                               "function delta() { return gamma(); }\n",
+                               CBM_LANG_PHP, "t", "inline_html.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "gamma"));
+    ASSERT(has_def(r, "Function", "delta"));
+    /* Lines are in original-file coordinates. */
+    ASSERT_EQ(php_def_line(r, "gamma"), 2);
+    ASSERT_EQ(php_def_line(r, "delta"), 8);
+    const CBMCall *c = find_call_named(r, "gamma");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(strstr(c->enclosing_func_qn, "delta"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* View-file shapes: echo tags keep their calls, and control structures that
+ * are opened in one PHP block and closed in a later one still parse. */
+TEST(php_inline_html_template_shapes_issue2000) {
+    CBMFileResult *r = extract("<!DOCTYPE html>\n"
+                               "<html><head><title><?= page_title($page) ?></title></head>\n"
+                               "<body>\n"
+                               "<?php if ($user): ?>\n"
+                               "  <p>Hello <?=$user->name?></p>\n"
+                               "<?php else: ?>\n"
+                               "  <a href=\"/login\">log in</a>\n"
+                               "<?php endif; ?>\n"
+                               "<?php foreach ($items as $item) { ?>\n"
+                               "  <li><?php echo render_item($item); ?></li>\n"
+                               "<?php } ?>\n"
+                               "<?php function footer_links() { return nav_links(); } ?>\n"
+                               "</body></html>\n",
+                               CBM_LANG_PHP, "t", "view.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "page_title"));
+    ASSERT(has_call(r, "render_item"));
+    ASSERT(has_def(r, "Function", "footer_links"));
+    ASSERT_EQ(php_def_line(r, "footer_links"), 12);
+    ASSERT(has_call(r, "nav_links"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `?>` only leaves PHP mode from code or a one-line comment. Inside strings,
+ * heredoc, nowdoc and block comments it is text; `#[` is an attribute, not a
+ * comment; `<?xml` in markup is not an open tag. */
+TEST(php_inline_html_close_tag_in_literals_issue2000) {
+    CBMFileResult *r = extract("<?php\n"
+                               "$a = 'single ?> quoted';\n"
+                               "$b = \"double ?> quoted \\\" still\";\n"
+                               "$c = <<<EOT\n"
+                               "  heredoc ?> body\n"
+                               "  EOT;\n"
+                               "$d = <<<'NOW'\n"
+                               "nowdoc ?> body\n"
+                               "NOW;\n"
+                               "/* block ?> comment */\n"
+                               "#[Pure]\n"
+                               "function one() { return 1; }\n"
+                               "// line comment ends here ?>\n"
+                               "<?xml version=\"1.0\"?><note/>\n"
+                               "<?php\n"
+                               "function two() { return one(); }\n",
+                               CBM_LANG_PHP, "t", "literals.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "one"));
+    ASSERT(has_def(r, "Function", "two"));
+    ASSERT_EQ(php_def_line(r, "two"), 16);
+    ASSERT(has_call(r, "one"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Markup is blanked, never parsed: code-shaped text outside the PHP tags must
+ * not produce definitions or calls, wherever it sits. */
+TEST(php_inline_html_markup_never_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<p>function before() { return leakBefore(); }</p>\n"
+                               "<?php\n"
+                               "function real() { return 1; }\n"
+                               "?>\n"
+                               "<p>function fake() { return leak(); }</p>\n"
+                               "<script>function jsFake() { leakScript(); }</script>\n"
+                               "<?xml version=\"1.0\"?><x>function xmlFake() { leakXml(); }</x>\n"
+                               "<?php\n"
+                               "function after() { return real(); }\n"
+                               "?>\n"
+                               "<p>class Tail { function tailFake() { leakTail(); } }</p>\n",
+                               CBM_LANG_PHP, "t", "markup.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "real"));
+    ASSERT(has_def(r, "Function", "after"));
+    ASSERT(has_call(r, "real"));
+    ASSERT_FALSE(has_def_any(r, "before"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    ASSERT_FALSE(has_def_any(r, "jsFake"));
+    ASSERT_FALSE(has_def_any(r, "xmlFake"));
+    ASSERT_FALSE(has_def_any(r, "Tail"));
+    ASSERT_FALSE(has_def_any(r, "tailFake"));
+    ASSERT_FALSE(has_call(r, "leak"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The mask hands back the caller's buffer, uncopied, when nothing needs
+ * rewriting, and a same-length rewrite otherwise. The pointer alone cannot
+ * tell copy-on-write from an eager copy, so the arena's allocation total is
+ * sampled around each call: no bytes for `plain` and `quoted`, a copy for
+ * `mixed`. */
+TEST(php_inline_html_mask_copies_only_on_write_issue2000) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *plain = "<?php\nfunction a() { return 1; }\n";
+    const char *quoted = "<?php\n$s = '?>';\n/* ?> */\n$h = <<<EOT\n?>\nEOT;\n";
+    const char *mixed = "<?php\nfunction a() {}\n?>\n<b>x</b>\n";
+
+    size_t before = cbm_arena_total(&arena);
+    ASSERT(cbm_php_mask_inline_html(&arena, plain, (int)strlen(plain)) == plain);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
+    ASSERT(cbm_php_mask_inline_html(&arena, quoted, (int)strlen(quoted)) == quoted);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
+    const char *masked = cbm_php_mask_inline_html(&arena, mixed, (int)strlen(mixed));
+    ASSERT(cbm_arena_total(&arena) > before);
+    ASSERT(masked != mixed);
+    ASSERT_EQ((int)strlen(masked), (int)strlen(mixed));
+    ASSERT_STR_EQ(masked, "<?php\nfunction a() {}\n; \n        \n");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* A trailing `?>` (common at the end of older class files) is not a partial
+ * parse, and CRLF line endings keep their line numbers. */
+TEST(php_inline_html_trailing_close_tag_crlf_issue2000) {
+    CBMFileResult *r = extract("<?php\r\n"
+                               "class Repo {\r\n"
+                               "    public function find($id) { return $id; }\r\n"
+                               "}\r\n"
+                               "?>\r\n",
+                               CBM_LANG_PHP, "t", "Repo.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Repo"));
+    ASSERT(has_def(r, "Method", "find"));
+    ASSERT_EQ(php_def_line(r, "find"), 3);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Ruby --- */
 TEST(ruby_class) {
     CBMFileResult *r = extract("class Animal\n  def initialize(name)\n    @name = name\n  end\n  "
@@ -6767,6 +6953,177 @@ TEST(extract_ts_nestjs_controller_routes_issue1428) {
     ASSERT_NOT_NULL(helper);
     ASSERT_NULL(helper->route_path);
     cbm_free_result(r);
+    PASS();
+}
+
+/* #759: the one definition named `name`; NULL for none or more than one. */
+static const CBMDefinition *nextjs_only_def(CBMFileResult *r, const char *name) {
+    const CBMDefinition *found = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            if (found) {
+                return NULL;
+            }
+            found = &r->defs.items[i];
+        }
+    }
+    return found;
+}
+
+/* #759: a Next.js App Router route file's exported HTTP verb handlers are the
+ * Functions extraction already makes for them, now carrying the route path of
+ * the file's directories -- `[id]` as `:id`, `[...slug]` as `*slug`, a
+ * `(group)` adding nothing -- and the verb as their method. A local
+ * declaration exported by name (`export { GET }`) is that same Function; no
+ * second definition appears. The 255-byte path is the longest that fits. */
+TEST(extract_nextjs_route_metadata_contract_issue759) {
+    char long_file[CBM_SZ_512];
+    char long_path[CBM_SZ_256];
+    char segment[CBM_SZ_256];
+    memset(segment, 'x', CBM_SZ_256 - PAIR_LEN);
+    segment[CBM_SZ_256 - PAIR_LEN] = '\0';
+    snprintf(long_file, sizeof(long_file), "app/%s/route.ts", segment);
+    snprintf(long_path, sizeof(long_path), "/%s", segment);
+    static const char verbs_src[] = "export async function GET() {}\n"
+                                    "export async function POST() {}\n"
+                                    "export function PUT() {}\n"
+                                    "export function PATCH() {}\n"
+                                    "export function DELETE() {}\n"
+                                    "export function HEAD() {}\n"
+                                    "export function OPTIONS() {}\n";
+    const struct {
+        const char *file;
+        const char *src;
+        const char *path;
+        const char *names[CBM_SZ_8];
+    } cases[] = {
+        {"src/app/api/users/[id]/route.ts",
+         "export function GET() { return 1; }\nexport const POST = async () => 2;\n",
+         "/api/users/:id",
+         {"GET", "POST"}},
+        {"app/api/verbs/route.ts",
+         verbs_src,
+         "/api/verbs",
+         {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}},
+        {"src/app/(public)/api/[org]/users/[id]/route.ts",
+         "export async function GET() { return 1; }\n",
+         "/api/:org/users/:id",
+         {"GET"}},
+        {"app/api/[...slug]/route.ts", "export function GET() {}\n", "/api/*slug", {"GET"}},
+        {"app/api/typed/route.ts",
+         "type Handler = () => Promise<number>;\nexport const GET: Handler = async () => 1;\n",
+         "/api/typed",
+         {"GET"}},
+        {"app/route.js", "export function GET() { return 1; }\n", "/", {"GET"}},
+        {"app/api/local/route.ts",
+         "function GET() { return 1; }\nconst POST = async () => 2;\nexport { GET, POST };\n",
+         "/api/local",
+         {"GET", "POST"}},
+        {long_file, "export function GET() {}\n", long_path, {"GET"}},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        CBMLanguage lang = strstr(cases[c].file, ".js") ? CBM_LANG_JAVASCRIPT : CBM_LANG_TYPESCRIPT;
+        CBMFileResult *r = extract(cases[c].src, lang, "t", cases[c].file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        int routed = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            routed += r->defs.items[i].route_path != NULL;
+        }
+        int want = 0;
+        for (; want < CBM_SZ_8 && cases[c].names[want]; want++) {
+            const CBMDefinition *d = nextjs_only_def(r, cases[c].names[want]);
+            ASSERT_NOT_NULL(d);
+            ASSERT_STR_EQ(d->label, "Function");
+            ASSERT_STR_EQ(d->file_path, cases[c].file);
+            ASSERT_NOT_NULL(d->route_path);
+            ASSERT_STR_EQ(d->route_path, cases[c].path);
+            ASSERT_STR_EQ(d->route_method, cases[c].names[want]);
+        }
+        ASSERT_EQ(routed, want);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* #759: nothing else routes. Not a route file, or a directory the route path
+ * cannot spell -- an optional catch-all, a private folder, a parallel slot,
+ * an intercepting route, a malformed bracket, a workspace package root, a path
+ * past 255 bytes. Not a runtime export of an HTTP verb Function of this file:
+ * an unexported, default, type-only or nested GET, a class method, a
+ * constant, a lower-case verb; and no handler is made up for a renamed,
+ * re-exported, wrapped or destructured export, or a `function` expression
+ * bound to a const: none of them has a Function of its own here. */
+TEST(extract_nextjs_rejects_nonroutes_issue759) {
+    char long_file[CBM_SZ_512];
+    char segment[CBM_SZ_256];
+    memset(segment, 'x', CBM_SZ_256 - SKIP_ONE);
+    segment[CBM_SZ_256 - SKIP_ONE] = '\0';
+    snprintf(long_file, sizeof(long_file), "app/%s/route.ts", segment);
+    const char *files[] = {
+        "pages/api/route.ts",
+        "app/api/page.ts",
+        "app/api/route.test.ts",
+        "app/api/view/route.tsx",
+        "app/api/view/route.jsx",
+        "app/api/module/route.mjs",
+        "app/_private/route.ts",
+        "src/app/api/_lib/route.ts",
+        "app/@modal/route.ts",
+        "app/(.)photo/route.ts",
+        "app/(..)(..)photo/route.ts",
+        "app/api/[[...opt]]/route.ts",
+        "app/api/[broken/route.ts",
+        "app/api/broken]/route.ts",
+        "app/api/[]/route.ts",
+        "app/api/[...]/route.ts",
+        "app/api/a[id]/route.ts",
+        "app/()/route.ts",
+        "apps/web/app/api/route.ts",
+        long_file,
+    };
+    const struct {
+        const char *file;
+        const char *src;
+    } sources[] = {
+        {"app/api/nonexports/route.ts", "function GET() {}\n"
+                                        "export default function POST() {}\n"
+                                        "function PUT() {}\n"
+                                        "export type { PUT };\n"
+                                        "function OPTIONS() {}\n"
+                                        "export { type OPTIONS };\n"
+                                        "export class Handlers { PATCH() {} }\n"
+                                        "export const DELETE = 42;\n"
+                                        "export function get() {}\n"
+                                        "export function helper() { function HEAD() {} }\n"},
+        {"app/api/bindings/route.ts", "const handler = async () => 1;\n"
+                                      "export { handler as GET };\n"
+                                      "export { POST } from './impl';\n"
+                                      "export const PUT = wrap(handler);\n"
+                                      "export const DELETE = function () {};\n"
+                                      "export const { PATCH } = handlers;\n"
+                                      "export const HEAD = handler as Handler;\n"
+                                      "export const OPTIONS = (async () => 1) satisfies Handler;\n"
+                                      "export * from './all';\n"},
+    };
+    const int file_count = (int)(sizeof(files) / sizeof(files[0]));
+    const int source_count = (int)(sizeof(sources) / sizeof(sources[0]));
+    for (int c = 0; c < file_count + source_count; c++) {
+        bool by_file = c < file_count;
+        const char *file = by_file ? files[c] : sources[c - file_count].file;
+        CBMFileResult *r =
+            extract(by_file ? "export function GET() {}\n" : sources[c - file_count].src,
+                    CBM_LANG_TYPESCRIPT, "t", file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        if (by_file) {
+            ASSERT_NOT_NULL(nextjs_only_def(r, "GET"));
+        }
+        for (int i = 0; i < r->defs.count; i++) {
+            ASSERT_NULL(r->defs.items[i].route_path);
+        }
+        cbm_free_result(r);
+    }
     PASS();
 }
 
@@ -14631,6 +14988,12 @@ SUITE(extraction) {
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
     RUN_TEST(php_function);
+    RUN_TEST(php_inline_html_tail_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_template_shapes_issue2000);
+    RUN_TEST(php_inline_html_close_tag_in_literals_issue2000);
+    RUN_TEST(php_inline_html_markup_never_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_mask_copies_only_on_write_issue2000);
+    RUN_TEST(php_inline_html_trailing_close_tag_crlf_issue2000);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
     RUN_TEST(ruby_constructor_callee_is_constant_path);
@@ -14934,6 +15297,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);
     RUN_TEST(extract_java_spring_relative_string_not_route_path);
     RUN_TEST(extract_ts_nestjs_controller_routes_issue1428);
+    RUN_TEST(extract_nextjs_route_metadata_contract_issue759);
+    RUN_TEST(extract_nextjs_rejects_nonroutes_issue759);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
