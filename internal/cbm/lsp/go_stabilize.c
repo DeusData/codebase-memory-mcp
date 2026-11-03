@@ -1486,8 +1486,10 @@ static void member_domains(go_collect_t *c, TSNode node, const char *name, const
 }
 
 static const CBMDefinition *definition(go_collect_t *c, TSNode node, TSNode name) {
-    const char *key = cbm_arena_sprintf(&c->call_arena, "%u:%s", ts_node_start_point(node).row + 1,
-                                        text(c, name));
+    const char *spelled = text(c, name);
+    const char *key = spelled ? cbm_arena_sprintf(&c->call_arena, "%u:%s",
+                                                  ts_node_start_point(node).row + 1, spelled)
+                              : NULL;
     const void *value = key ? cbm_ht_get(c->definitions, key) : NULL;
     return value == c ? NULL : value;
 }

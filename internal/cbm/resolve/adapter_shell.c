@@ -215,12 +215,13 @@ static void shell_collect_walk(shell_ctx_t *ctx, TSNode node, unsigned depth) {
         return;
     if (cbm_source_is(node, "function_definition")) {
         const char *name = cbm_source_text(walk, cbm_source_field(node, "name"));
-        uint32_t line = ts_node_start_point(node).row + 1;
         const cbm_source_decl_t *first =
             name ? cbm_source_lookup(walk, ctx->functions, name) : NULL;
-        if (name && !first)
+        if (name && !first) {
+            uint32_t line = ts_node_start_point(node).row + 1;
             (void)cbm_source_declare(walk, ctx->functions, name,
                                      cbm_source_def_qn_at(walk, name, line), 0, line);
+        }
     } else if (cbm_source_is(node, "command")) {
         const char *word = shell_command_word(walk, node);
         if (word && (!strcmp(word, "source") || !strcmp(word, ".")))

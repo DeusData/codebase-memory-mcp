@@ -830,10 +830,12 @@ static lua_value_t lua_eval_uncached(lua_ctx_t *ctx, const char *encoded, unsign
     lua_value_t value = lua_eval_root(ctx, root, depth);
     while (step) {
         const char *next = strchr(step + 1, LUA_STEP[0]);
-        const char *part =
-            next ? cbm_arena_strndup(walk->arena, step + 1, (size_t)(next - step - 1)) : step + 1;
-        if (!part)
-            return lua_unknown("lua_value_allocation");
+        const char *part = step + 1;
+        if (next) {
+            part = cbm_arena_strndup(walk->arena, step + 1, (size_t)(next - step - 1));
+            if (!part)
+                return lua_unknown("lua_value_allocation");
+        }
         value = part[0] == '.'   ? lua_member(ctx, value, part + 1, depth)
                 : part[0] == '#' ? lua_call_value_at(ctx, value, part + 1, depth)
                                  : lua_call_result(ctx, value, depth);
@@ -1525,9 +1527,9 @@ static void lua_visit_table(lua_ctx_t *ctx, TSNode node, unsigned depth) {
     cbm_source_walk_t *walk = ctx->walk;
     const char *owner = ctx->collecting ? lua_identity(ctx, 'T', ts_node_start_byte(node)) : NULL;
     const char *pending = NULL;
-    uint32_t pending_row = 0;
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
+        uint32_t pending_row = 0;
         do {
             TSNode field = ts_tree_cursor_current_node(&cursor);
             if (cbm_source_is(field, "comment")) {
@@ -1784,9 +1786,9 @@ static void lua_visit_statements(lua_ctx_t *ctx, TSNode node, unsigned depth) {
     /* `local` and `global` are field names on the statement, not kinds. */
     lua_doc_t doc = {0};
     lua_doc_t *outer = ctx->doc;
-    uint32_t last_row = UINT32_MAX;
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
+        uint32_t last_row = UINT32_MAX;
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
             if (!ts_node_is_named(child))
