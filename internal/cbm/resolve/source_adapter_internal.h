@@ -50,6 +50,7 @@ typedef struct cbm_source_decl {
     int arity_min, arity_max; /* arity_max -1 means variadic; both -1 means unknown */
     uint32_t flags;
     uint32_t line;
+    uint32_t order;           /* its place among the table's declarations */
     struct cbm_source_decl *next;
     struct cbm_source_decl *last; /* on a chain's head: its end, so appending stays constant */
 } cbm_source_decl_t;
@@ -73,6 +74,8 @@ typedef struct cbm_source_walk {
     TSNode root;
     const char *failure;
     const char *top_owner; /* collect: the owner a language files its top-level names under */
+    bool file_local_private; /* collect: F_PRIVATE means no other file can see the declaration */
+    bool names_declared;     /* collect: keep which names this language declares at all */
     CBMHashTable *def_index; /* lazily built, owned by the walk */
     /* Set around an emit for a site extraction has no carrier for. */
     const char *extra_scope;
@@ -214,6 +217,22 @@ const cbm_source_decl_t *cbm_source_lookup(const cbm_source_walk_t *walk, const 
  * across to another: Elixir's `:mod.f()` names an Erlang module. */
 const cbm_source_decl_t *cbm_source_lookup_in(const cbm_source_walk_t *walk, CBMLanguage language,
                                               const char *owner, const char *name);
+/* A chain as this file can see it, for a language that sets file_local_private: in order, every
+ * declaration but the private ones of other files, which cost nothing to step over. Begin with
+ * the chain's head, as a lookup returned it. */
+typedef struct {
+    const cbm_source_decl_t *whole;    /* the chain itself, when no declaration on it is private */
+    const cbm_source_decl_t *const *open; /* the rest of its others, past them */
+    size_t open_left;
+    const cbm_source_decl_t *own; /* this file's next private one */
+    const char *file;
+} cbm_source_seen_t;
+void cbm_source_seen_begin(cbm_source_seen_t *seen, const cbm_source_walk_t *walk,
+                           const cbm_source_decl_t *head);
+const cbm_source_decl_t *cbm_source_seen_next(cbm_source_seen_t *seen);
+/* Whether any declaration of this walk's language, under any owner, has this name. Only for a
+ * language that set names_declared while it collected. */
+bool cbm_source_name_declared(const cbm_source_walk_t *walk, const char *name);
 const char *cbm_source_table_package(const cbm_source_table_t *table, const char *name);
 const char *cbm_source_table_dart_package(const cbm_source_table_t *table, const char *file,
                                           const char *name);

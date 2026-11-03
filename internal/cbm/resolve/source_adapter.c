@@ -14,10 +14,20 @@ struct cbm_source_table {
     CBMArena arena;
     CBMHashTable *decls;
     CBMHashTable *qn_owners;
+    /* Only chains holding a file-local declaration. A chain's key: what the other files see of
+     * it. Its key and a file: that file's first local declaration on it. */
+    CBMHashTable *local_chains;
+    CBMHashTable *declared_names; /* language and name, for a language that asks */
+    uint32_t next_order;
     const CBMHashTable *packages;
     bool incomplete[CBM_LANG_COUNT];
     bool failed;
 };
+
+typedef struct {
+    const cbm_source_decl_t **items;
+    size_t count, capacity;
+} source_open_list_t;
 
 typedef struct {
     uint32_t start, end;
@@ -129,7 +139,9 @@ cbm_source_table_t *cbm_source_table_new(void) {
     cbm_arena_init(&table->arena);
     table->decls = cbm_ht_create(256);
     table->qn_owners = cbm_ht_create(256);
-    if (!table->decls || !table->qn_owners) {
+    table->local_chains = cbm_ht_create(16);
+    table->declared_names = cbm_ht_create(16);
+    if (!table->decls || !table->qn_owners || !table->local_chains || !table->declared_names) {
         cbm_source_table_free(table);
         return NULL;
     }
@@ -141,6 +153,8 @@ void cbm_source_table_free(cbm_source_table_t *table) {
         return;
     cbm_ht_free(table->decls);
     cbm_ht_free(table->qn_owners);
+    cbm_ht_free(table->local_chains);
+    cbm_ht_free(table->declared_names);
     cbm_arena_destroy(&table->arena);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, table);
 }
@@ -489,6 +503,94 @@ static const char *decl_key(CBMArena *arena, CBMLanguage language, const char *o
                              name ? name : "");
 }
 
+static bool source_open_push(cbm_source_table_t *table, source_open_list_t *list,
+                             const cbm_source_decl_t *decl) {
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity ? list->capacity * 2 : 4;
+        const cbm_source_decl_t **items = cbm_arena_alloc(&table->arena, capacity * sizeof(*items));
+        if (!items)
+            return false;
+        if (list->count)
+            memcpy(items, list->items, list->count * sizeof(*items));
+        list->items = items;
+        list->capacity = capacity;
+    }
+    list->items[list->count++] = decl;
+    return true;
+}
+
+/* Keeps a chain's two views. The chain itself stays whole: what it spells stays one list for
+ * every question that is not about a file's view. */
+static bool source_note_local(cbm_source_table_t *table, const char *key, const char *file,
+                              const cbm_source_decl_t *head, const cbm_source_decl_t *decl) {
+    source_open_list_t *list = cbm_ht_get(table->local_chains, key);
+    bool local = (decl->flags & CBM_SOURCE_DECL_F_PRIVATE) != 0;
+    if (!local)
+        return !list || source_open_push(table, list, decl);
+    if (!list) {
+        list = cbm_arena_calloc(&table->arena, sizeof(*list));
+        if (!list)
+            return false;
+        /* No declaration before this one was local, so those are all open. */
+        for (const cbm_source_decl_t *d = head; d && d != decl; d = d->next)
+            if (!source_open_push(table, list, d))
+                return false;
+        cbm_ht_set(table->local_chains, key, list);
+    }
+    const char *own_key = cbm_arena_sprintf(&table->arena, "%s\x1f%s", key, file);
+    if (!own_key)
+        return false;
+    if (!cbm_ht_get(table->local_chains, own_key))
+        cbm_ht_set(table->local_chains, own_key, (void *)decl);
+    return true;
+}
+
+void cbm_source_seen_begin(cbm_source_seen_t *seen, const cbm_source_walk_t *walk,
+                           const cbm_source_decl_t *head) {
+    *seen = (cbm_source_seen_t){.whole = head, .file = walk->file};
+    if (!head || !walk->table || !cbm_ht_count(walk->table->local_chains))
+        return;
+    char key[1536];
+    int length = snprintf(key, sizeof(key), "%d\x1f%s\x1f%s", (int)walk->language, head->owner,
+                          head->name);
+    if (length < 0 || (size_t)length >= sizeof(key))
+        return;
+    const source_open_list_t *list = cbm_ht_get(walk->table->local_chains, key);
+    if (!list)
+        return;
+    int full = snprintf(key + length, sizeof(key) - (size_t)length, "\x1f%s", walk->file);
+    if (full < 0 || (size_t)full >= sizeof(key) - (size_t)length)
+        return;
+    seen->whole = NULL;
+    seen->open = list->items;
+    seen->open_left = list->count;
+    seen->own = cbm_ht_get(walk->table->local_chains, key);
+}
+
+const cbm_source_decl_t *cbm_source_seen_next(cbm_source_seen_t *seen) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (seen->whole) {
+        const cbm_source_decl_t *decl = seen->whole;
+        seen->whole = decl->next;
+        return decl;
+    }
+    const cbm_source_decl_t *open = seen->open_left ? seen->open[0] : NULL;
+    if (open && (!seen->own || open->order < seen->own->order)) {
+        seen->open++;
+        seen->open_left--;
+        return open;
+    }
+    const cbm_source_decl_t *own = seen->own;
+    if (own) {
+        /* A file is collected whole, so its declarations stand together on the chain. */
+        const cbm_source_decl_t *next = own->next;
+        while (next && !strcmp(next->file, seen->file) && !(next->flags & CBM_SOURCE_DECL_F_PRIVATE))
+            next = next->next;
+        seen->own = next && !strcmp(next->file, seen->file) ? next : NULL;
+    }
+    return own;
+}
+
 cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner, const char *name,
                                       const char *qn, uint32_t flags, uint32_t line) {
     cbm_source_table_t *table = walk->writable;
@@ -508,7 +610,8 @@ cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner
                                 .arity_min = -1,
                                 .arity_max = -1,
                                 .flags = flags,
-                                .line = line};
+                                .line = line,
+                                .order = table->next_order++};
     if (!decl->owner || !decl->name || !decl->file || (qn && !decl->qn)) {
         table->failed = true;
         return NULL;
@@ -539,11 +642,32 @@ cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner
             table->failed = true;
             return NULL;
         }
-        return decl;
+    } else {
+        (head->last ? head->last : head)->next = decl;
+        head->last = decl;
     }
-    (head->last ? head->last : head)->next = decl;
-    head->last = decl;
+    if (walk->file_local_private && !source_note_local(table, key, decl->file, head ? head : decl, decl)) {
+        table->failed = true;
+        return NULL;
+    }
+    if (walk->names_declared && !head) {
+        const char *name_key = cbm_arena_sprintf(&table->arena, "%d\x1f%s", (int)walk->language, decl->name);
+        if (!name_key) {
+            table->failed = true;
+            return NULL;
+        }
+        if (!cbm_ht_get(table->declared_names, name_key))
+            cbm_ht_set(table->declared_names, name_key, (void *)decl->name);
+    }
     return decl;
+}
+
+bool cbm_source_name_declared(const cbm_source_walk_t *walk, const char *name) {
+    char key[768];
+    int length = snprintf(key, sizeof(key), "%d\x1f%s", (int)walk->language, name);
+    /* A key too long to ask about is answered as declared: the caller then walks. */
+    return !walk->table || length < 0 || (size_t)length >= sizeof(key) ||
+           cbm_ht_get(walk->table->declared_names, key) != NULL;
 }
 
 const cbm_source_decl_t *cbm_source_lookup_in(const cbm_source_walk_t *walk, CBMLanguage language,

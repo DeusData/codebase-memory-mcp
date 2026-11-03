@@ -107,6 +107,7 @@ typedef struct {
     int alias_depth;                     /* aliases followed to reach this lookup */
     int initializer_depth;               /* property initializers followed to reach it */
     CBMHashTable *file_private;          /* this file's private top-level type names, or NULL */
+    CBMHashTable *absent_answers;        /* type -> its chain's answer for a name nobody declares */
     bool imports_testing;                /* `#require` is Swift Testing's */
 } swift_ctx_t;
 
@@ -758,6 +759,8 @@ static CBMHashTable *swift_file_private_types(cbm_source_walk_t *walk) {
 static void swift_collect(cbm_source_walk_t *walk) {
     const char *module = swift_module_of(walk, walk->file);
     const char *owner = swift_module_owner(walk, module);
+    walk->file_local_private = true;
+    walk->names_declared = true;
     if (!owner)
         return;
     CBMHashTable *file_private = swift_file_private_types(walk);
@@ -865,7 +868,9 @@ static int swift_settle(swift_ctx_t *ctx, const swift_overloads_t *sets, size_t 
     bool several = false, tied = false;
     int best_exact = 0;
     for (size_t s = 0; s < set_count; s++) {
-        for (const cbm_source_decl_t *decl = sets[s].first; decl; decl = decl->next) {
+        cbm_source_seen_t seen;
+        cbm_source_seen_begin(&seen, ctx->walk, sets[s].first);
+        for (const cbm_source_decl_t *decl; (decl = cbm_source_seen_next(&seen));) {
             if (!swift_visible(ctx, decl, sets[s].testable, sets[s].same_module) ||
                 !swift_args_fit(decl, args) || (decl->flags & CBM_SOURCE_DECL_F_VALUE))
                 continue;
@@ -900,16 +905,28 @@ static int swift_select(swift_ctx_t *ctx, const cbm_source_decl_t *first, const 
     bool split = false;
     /* `T.method(.post)` beside `var method: M`: what is called is the function. */
     bool function_fits = false;
-    for (const cbm_source_decl_t *decl = first; args && decl && !function_fits; decl = decl->next)
+    cbm_source_seen_t seen;
+    cbm_source_seen_begin(&seen, ctx->walk, first);
+    while (args && !function_fits) {
+        const cbm_source_decl_t *decl = cbm_source_seen_next(&seen);
+        if (!decl)
+            break;
         function_fits = !(decl->flags & CBM_SOURCE_DECL_F_VALUE) &&
                         swift_visible(ctx, decl, testable, same_module) &&
                         swift_args_fit(decl, args);
+    }
     /* `var m` beside `func m(x: Int)`, named with no call: what is read is the value. */
     bool value_fits = false;
-    for (const cbm_source_decl_t *decl = first; !args && decl && !value_fits; decl = decl->next)
+    cbm_source_seen_begin(&seen, ctx->walk, first);
+    while (!args && !value_fits) {
+        const cbm_source_decl_t *decl = cbm_source_seen_next(&seen);
+        if (!decl)
+            break;
         value_fits = (decl->flags & CBM_SOURCE_DECL_F_VALUE) &&
                      swift_visible(ctx, decl, testable, same_module);
-    for (const cbm_source_decl_t *decl = first; decl; decl = decl->next) {
+    }
+    cbm_source_seen_begin(&seen, ctx->walk, first);
+    for (const cbm_source_decl_t *decl; (decl = cbm_source_seen_next(&seen));) {
         if (!swift_visible(ctx, decl, testable, same_module) || !swift_args_fit(decl, args))
             continue;
         if (function_fits && (decl->flags & CBM_SOURCE_DECL_F_VALUE))
@@ -943,7 +960,9 @@ static const cbm_source_decl_t *swift_visible_type(const swift_ctx_t *ctx,
                                                    const cbm_source_decl_t *first, bool testable,
                                                    bool same_module) {
     const cbm_source_decl_t *selected = NULL;
-    for (const cbm_source_decl_t *decl = first; decl; decl = decl->next) {
+    cbm_source_seen_t seen;
+    cbm_source_seen_begin(&seen, ctx->walk, first);
+    for (const cbm_source_decl_t *decl; (decl = cbm_source_seen_next(&seen));) {
         if (!swift_visible(ctx, decl, testable, same_module))
             continue;
         if (selected)
@@ -1289,13 +1308,30 @@ static swift_lookup_t swift_member_on(swift_ctx_t *ctx, const char *type_key, co
     return open || !declared ? SWIFT_OPEN : SWIFT_ABSENT;
 }
 
+/* A name no declaration of the project has, and none of the closed protocols' members: no type
+ * can select it, and what a walk answers is whether the chain leaves the project, which is the
+ * type's and not the name's. Each type is walked once per file for all such names. The marker is
+ * a name nothing can declare. */
+static const char SWIFT_ABSENT_NAME[] = "\x01";
+
 static swift_lookup_t swift_find_member(swift_ctx_t *ctx, const char *type_key, const char *name,
                                         const swift_args_t *args, bool bases_only,
                                         cbm_source_chain_t *chain, const cbm_source_decl_t **out) {
+    bool fresh = chain->count == 0 && ctx->absent_answers && swift_closed_base("Equatable", name) &&
+                 !cbm_source_name_declared(ctx->walk, name);
+    const char *memo = fresh ? cbm_ht_get(ctx->absent_answers, type_key) : NULL;
+    if (memo)
+        return memo[0] == 'o' ? SWIFT_OPEN : SWIFT_ABSENT;
     if (!cbm_source_chain_enter(ctx->walk, chain, type_key))
         return chain->overflow ? SWIFT_OPEN : SWIFT_ABSENT;
-    swift_lookup_t found = swift_member_on(ctx, type_key, name, args, bases_only, chain, out);
+    swift_lookup_t found = swift_member_on(ctx, type_key, fresh ? SWIFT_ABSENT_NAME : name, args,
+                                           bases_only, chain, out);
     cbm_source_chain_leave(chain);
+    const char *key = fresh && (found == SWIFT_OPEN || found == SWIFT_ABSENT) && !chain->overflow
+                          ? cbm_arena_strdup(ctx->walk->arena, type_key)
+                          : NULL;
+    if (key)
+        cbm_ht_set(ctx->absent_answers, key, found == SWIFT_OPEN ? "o" : "a");
     return found;
 }
 
@@ -1306,8 +1342,10 @@ static const char *swift_declared_type(swift_ctx_t *ctx, const cbm_source_decl_t
 /* Overloads in one file share a node, so selecting the node does not say which of them runs. */
 static bool swift_overloads_return_differently(swift_ctx_t *ctx, const cbm_source_decl_t *decl,
                                                const swift_args_t *args) {
-    for (const cbm_source_decl_t *other = cbm_source_lookup(ctx->walk, decl->owner, decl->name);
-         other; other = other->next) {
+    /* Another file's private declaration is another node, so it is never read here. */
+    cbm_source_seen_t seen;
+    cbm_source_seen_begin(&seen, ctx->walk, cbm_source_lookup(ctx->walk, decl->owner, decl->name));
+    for (const cbm_source_decl_t *other; (other = cbm_source_seen_next(&seen));) {
         if (other == decl || !swift_same_node(other, decl) || !swift_args_fit(other, args))
             continue;
         if ((!other->type) != (!decl->type) ||
@@ -1383,9 +1421,10 @@ static const char *swift_common_result(swift_ctx_t *ctx, const char *type_key, c
     const char *keys[] = {
         type_key, strcmp(module, ctx->module) ? swift_type_in_this_module(ctx, type_key) : NULL};
     for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-        for (const cbm_source_decl_t *decl = keys[k] ? cbm_source_lookup(ctx->walk, keys[k], name)
-                                                     : NULL;
-             decl; decl = decl->next) {
+        cbm_source_seen_t seen;
+        cbm_source_seen_begin(&seen, ctx->walk,
+                              keys[k] ? cbm_source_lookup(ctx->walk, keys[k], name) : NULL);
+        for (const cbm_source_decl_t *decl; (decl = cbm_source_seen_next(&seen));) {
             if (!swift_visible(ctx, decl, true, true) || !swift_args_fit(decl, args))
                 continue;
             const char *type =
@@ -2720,9 +2759,11 @@ static void swift_resolve(cbm_source_walk_t *walk) {
             ctx.imports_testing = true;
     }
     ctx.file_private = swift_file_private_types(walk);
+    ctx.absent_answers = cbm_ht_create(16);
     swift_visit_children(&ctx, walk->root, 0);
     if (ctx.file_private)
         cbm_ht_free(ctx.file_private);
+    cbm_ht_free(ctx.absent_answers);
     cbm_ht_free(ctx.module_imports);
     cbm_ht_free(ctx.expected);
     cbm_ht_free(ctx.argument_refs);

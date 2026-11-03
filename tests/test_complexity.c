@@ -3570,6 +3570,42 @@ TEST(complexity_source_chain_walk_reads_every_ancestor_once) {
     PASS();
 }
 
+/* Every file of a module has a private of one name. */
+static uint64_t cx_swift_private_work(int files_count) {
+    CxSourceFile *files = calloc((size_t)files_count + 1, sizeof(*files));
+    if (!files)
+        return 0;
+    bool ok = true;
+    for (int i = 0; ok && i < files_count; i++) {
+        snprintf(files[i].path, sizeof(files[i].path), "Sources/P/F%d.swift", i);
+        files[i].text = malloc(160);
+        ok = files[i].text != NULL;
+        if (ok)
+            snprintf(files[i].text, 160,
+                     "private let logger = Logger()\nprivate func helper() { }\n"
+                     "func g%d() { helper(); logger.info(); logger.info(); helper() }\n",
+                     i);
+    }
+    snprintf(files[files_count].path, sizeof(files[files_count].path), "Sources/P/Logger.swift");
+    files[files_count].text = strdup("class Logger { func info() {} }\n");
+    uint64_t work = ok ? cx_source_work(CBM_LANG_SWIFT, files, files_count + 1) : 0;
+    for (int i = 0; i <= files_count; i++)
+        free(files[i].text);
+    free(files);
+    return work;
+}
+TEST(complexity_swift_privates_of_other_files_cost_nothing) {
+    enum { FILES = 500 };
+    uint64_t first = cx_swift_private_work(FILES);
+    uint64_t second = cx_swift_private_work(FILES * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    swift private names: probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)FILES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 /* A process sourcing every library, and calling something of each. */
 static uint64_t cx_shell_sources_work(int sourced) {
     CxSourceFile *files = calloc((size_t)sourced + 1, sizeof(*files));
@@ -3823,6 +3859,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
     RUN_TEST(complexity_source_chain_walk_reads_every_ancestor_once);
     RUN_TEST(complexity_source_chain_seen_set_grows);
+    RUN_TEST(complexity_swift_privates_of_other_files_cost_nothing);
     RUN_TEST(complexity_shell_commands_of_a_big_process_are_near_linear);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
     RUN_TEST(complexity_flat_preceding_label_is_linear);
