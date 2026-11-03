@@ -6,7 +6,10 @@
  * `Runtime.getRuntime().exec`, a constructor as its class name.
  */
 #include "spawn_patterns.h"
+#include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/hash_table.h"
+#include "resolve/stats.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -415,6 +418,82 @@ static bool spawn_val_names(const char *val, const char *name) {
     return sep == '.' || sep == ':' || sep == '/' || sep == '\\';
 }
 
+/* The rows of the file being walked, once a call has asked: every call asks about them. */
+typedef struct {
+    const CBMImport *imports;
+    int count;
+    bool built;
+    CBMHashTable *first_row; /* local name -> its first row with a path */
+    CBMHashTable *modules;   /* a spawn table's module -> spawn_module_yes or spawn_module_no */
+} spawn_file_t;
+static CBM_TLS spawn_file_t spawn_file;
+static const char spawn_module_yes[] = "y";
+static const char spawn_module_no[] = "n";
+
+void cbm_spawn_file_end(void) {
+    cbm_ht_free(spawn_file.first_row);
+    cbm_ht_free(spawn_file.modules);
+    spawn_file = (spawn_file_t){0};
+}
+
+void cbm_spawn_file_begin(const CBMImport *imports, int count) {
+    cbm_spawn_file_end();
+    spawn_file.imports = imports;
+    spawn_file.count = count;
+}
+
+/* False: read the rows. These are not the file's, or memory ran out. */
+static bool spawn_file_ready(const CBMImport *imports, int count) {
+    if (count <= 0 || spawn_file.imports != imports || spawn_file.count != count) {
+        return false;
+    }
+    if (spawn_file.built) {
+        return spawn_file.first_row != NULL;
+    }
+    spawn_file.built = true;
+    CBMHashTable *rows = cbm_ht_create((uint32_t)count * 2U);
+    CBMHashTable *modules = cbm_ht_create(16);
+    bool ok = rows && modules;
+    for (int i = 0; ok && i < count; i++) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        const char *key = imports[i].local_name;
+        if (!key || !imports[i].module_path || cbm_ht_get(rows, key)) {
+            continue;
+        }
+        cbm_ht_set(rows, key, (void *)&imports[i]);
+        ok = cbm_ht_get(rows, key) == &imports[i];
+    }
+    if (!ok) {
+        cbm_ht_free(rows);
+        cbm_ht_free(modules);
+        return false;
+    }
+    spawn_file.first_row = rows;
+    spawn_file.modules = modules;
+    return true;
+}
+
+/* The first row with a path that names the callee's first key_len bytes. */
+static const CBMImport *spawn_row_named(const char *callee, size_t key_len,
+                                        const CBMImport *imports, int count) {
+    char name[CBM_SZ_512];
+    if (key_len < sizeof(name) && spawn_file_ready(imports, count)) {
+        memcpy(name, callee, key_len);
+        name[key_len] = '\0';
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        return cbm_ht_get(spawn_file.first_row, name);
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        const char *key = imports[i].local_name;
+        if (key && imports[i].module_path && strlen(key) == key_len &&
+            strncmp(key, callee, key_len) == 0) {
+            return &imports[i];
+        }
+    }
+    return NULL;
+}
+
 /* The callee as its import makes it: `sp.run` -> subprocess.run (an alias),
  * `run` -> subprocess.run (a member import), `spawn` -> child_process.spawn
  * (a named import mapped to its module). Empty when no import applies. */
@@ -423,27 +502,24 @@ static void spawn_expand(const char *callee, const CBMImport *imports, int count
     out[0] = '\0';
     size_t head = spawn_head_len(callee);
     size_t key_len = head ? head : strlen(callee);
-    for (int i = 0; i < count; i++) {
-        const char *key = imports[i].local_name;
-        if (!key || !imports[i].module_path || strlen(key) != key_len ||
-            strncmp(key, callee, key_len) != 0) {
-            continue;
-        }
-        const char *val = spawn_module(imports[i].module_path);
-        if (head) {
-            snprintf(out, n, "%s%s", val, callee + head);
-        } else if (spawn_val_names(val, callee)) {
-            snprintf(out, n, "%s", val);
-        } else {
-            snprintf(out, n, "%s.%s", val, callee);
-        }
+    const CBMImport *row = spawn_row_named(callee, key_len, imports, count);
+    if (!row) {
         return;
+    }
+    const char *val = spawn_module(row->module_path);
+    if (head) {
+        snprintf(out, n, "%s%s", val, callee + head);
+    } else if (spawn_val_names(val, callee)) {
+        snprintf(out, n, "%s", val);
+    } else {
+        snprintf(out, n, "%s.%s", val, callee);
     }
 }
 
-static bool spawn_imports_module(const CBMImport *imports, int count, const char *module) {
+static bool spawn_rows_import_module(const CBMImport *imports, int count, const char *module) {
     size_t ml = strlen(module);
     for (int i = 0; i < count; i++) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         if (!imports[i].module_path) {
             continue;
         }
@@ -454,6 +530,20 @@ static bool spawn_imports_module(const CBMImport *imports, int count, const char
         }
     }
     return false;
+}
+
+/* A spawn table names a fixed few modules, so one file reads its rows that many times at most. */
+static bool spawn_imports_module(const CBMImport *imports, int count, const char *module) {
+    if (!spawn_file_ready(imports, count)) {
+        return spawn_rows_import_module(imports, count, module);
+    }
+    const void *known = cbm_ht_get(spawn_file.modules, module);
+    if (known) {
+        return known == spawn_module_yes;
+    }
+    bool found = spawn_rows_import_module(imports, count, module);
+    cbm_ht_set(spawn_file.modules, module, (void *)(found ? spawn_module_yes : spawn_module_no));
+    return found;
 }
 
 /* Groovy `"git status".execute`: a quoted receiver, then the api suffix. */

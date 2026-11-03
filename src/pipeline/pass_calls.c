@@ -1627,6 +1627,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         bool field_index_ready =
             cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
         cbm_route_registration_file_begin(result, files[i].language, files[i].path);
+        cbm_spawn_file_begin(result->imports.items, result->imports.count);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1644,6 +1645,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 unresolved++;
             }
         }
+        cbm_spawn_file_end();
         cbm_route_registration_file_end();
         cbm_pipeline_external_import_index_free(&ext_imports);
         cbm_pipeline_lsp_field_index_free(&field_index);

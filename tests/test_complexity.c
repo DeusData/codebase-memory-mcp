@@ -3164,6 +3164,141 @@ TEST(complexity_import_map_same_local_name_is_linear) {
     PASS();
 }
 
+/* Every call's spawn check read every import row of its file. */
+enum { CX_SPAWN_NAME = 32 };
+static const char *cx_line_tcl_source_call(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "source");
+    return out;
+}
+static const char *cx_line_py_member_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "mod_%d.call", i);
+    return out;
+}
+static const char *cx_line_js_spawn_call(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "spawn");
+    return out;
+}
+static uint64_t cx_spawn_match_probes(CBMLanguage language, CxLineFn line, const char *last_module,
+                                      int count, int *matched) {
+    CBMImport *rows = calloc((size_t)count, sizeof(*rows));
+    char *text = malloc((size_t)count * 2 * CX_SPAWN_NAME);
+    if (!rows || !text) {
+        free(rows);
+        free(text);
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        char *local = text + (size_t)i * 2 * CX_SPAWN_NAME;
+        char *path = local + CX_SPAWN_NAME;
+        snprintf(local, CX_SPAWN_NAME, "mod_%d", i);
+        snprintf(path, CX_SPAWN_NAME, "pkg/mod_%d", i);
+        rows[i].local_name = local;
+        rows[i].module_path = i == count - 1 && last_module ? last_module : path;
+    }
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    cbm_spawn_file_begin(rows, count);
+    *matched = 0;
+    for (int i = 0; i < count; i++) {
+        char callee[CX_SPAWN_NAME];
+        *matched += cbm_spawn_match(language, line(callee, sizeof(callee), i), rows, count) != NULL;
+    }
+    cbm_spawn_file_end();
+    cbm_resolve_stats_bind(previous);
+    free(rows);
+    free(text);
+    return cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+}
+static bool cx_spawn_shape_is_linear(const char *label, CBMLanguage language, CxLineFn line,
+                                     const char *last_module, int matches_per_call) {
+    int matched_first = 0, matched_second = 0;
+    uint64_t first =
+        cx_spawn_match_probes(language, line, last_module, CX_BINDING_LINES, &matched_first);
+    uint64_t second =
+        cx_spawn_match_probes(language, line, last_module, CX_BINDING_LINES * 2, &matched_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s lookup_probes %llu -> %llu (ratio %.2f, matched %d, %d)\n", label,
+           (unsigned long long)first, (unsigned long long)second, ratio, matched_first,
+           matched_second);
+    return matched_first == CX_BINDING_LINES * matches_per_call &&
+           matched_second == CX_BINDING_LINES * 2 * matches_per_call &&
+           first >= (uint64_t)CX_BINDING_LINES && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+}
+TEST(complexity_spawn_match_is_linear_in_a_files_imports) {
+    bool ok = cx_spawn_shape_is_linear("tcl source", CBM_LANG_TCL, cx_line_tcl_source_call, NULL, 0);
+    ok = cx_spawn_shape_is_linear("py member", CBM_LANG_PYTHON, cx_line_py_member_call, NULL, 0) && ok;
+    ok = cx_spawn_shape_is_linear("js spawn", CBM_LANG_JAVASCRIPT, cx_line_js_spawn_call,
+                                  "child_process", 1) &&
+         ok;
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* The first row with a path answers for a name, whatever its later rows say, and rows the file did
+ * not name are read. Every call asks twice, since the second answer comes from what the first left. */
+TEST(complexity_spawn_file_index_answers_as_the_rows_do) {
+    static const CBMImport rows[] = {
+        {.local_name = NULL, .module_path = "subprocess"},
+        {.local_name = "sp", .module_path = NULL},
+        {.local_name = "sp", .module_path = "subprocess"},
+        {.local_name = "sp", .module_path = "os"},
+        {.local_name = "run", .module_path = "subprocess.run"},
+        {.local_name = "cp", .module_path = "node:child_process"},
+        {.local_name = "spawn", .module_path = "child_process"},
+        {.local_name = "exec", .module_path = "os/exec"},
+        {.local_name = "os", .module_path = "os"},
+        {.local_name = "open3", .module_path = "open3"},
+        {.local_name = "", .module_path = "empty"},
+        {.local_name = "System.Process", .module_path = "System.Process"},
+    };
+    static const CBMImport others[] = {{.local_name = "sp", .module_path = "os"},
+                                       {.local_name = "spawn", .module_path = "fs"}};
+    static const CBMLanguage languages[] = {
+        CBM_LANG_PYTHON, CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_GO,
+        CBM_LANG_C,      CBM_LANG_RUBY,       CBM_LANG_HASKELL,    CBM_LANG_TCL,
+        CBM_LANG_BASH,
+    };
+    char long_name[CBM_SZ_1K];
+    memset(long_name, 'n', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    const char *const callees[] = {
+        "sp.run",    "sp.check_output", "sp",           "run",     "cp.spawn",  "cp.exec",
+        "spawn",     "exec",            "exec.Command", "os.exec", "os.system", "system",
+        "source",    "missing",         "missing.run",  "a::b",    ".run",      "",
+        "callProcess", "Open3.popen3",  long_name,
+    };
+    int rows_count = (int)(sizeof(rows) / sizeof(rows[0]));
+    int others_count = (int)(sizeof(others) / sizeof(others[0]));
+    int spawns = 0;
+    for (size_t l = 0; l < sizeof(languages) / sizeof(languages[0]); l++) {
+        cbm_spawn_file_begin(rows, rows_count);
+        for (size_t c = 0; c < sizeof(callees) / sizeof(callees[0]); c++) {
+            cbm_spawn_file_end();
+            const cbm_spawn_api_t *read = cbm_spawn_match(languages[l], callees[c], rows, rows_count);
+            const cbm_spawn_api_t *read_other =
+                cbm_spawn_match(languages[l], callees[c], others, others_count);
+            cbm_spawn_file_begin(rows, rows_count);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], rows, rows_count) == read);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], rows, rows_count) == read);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], others, others_count) ==
+                        read_other);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], NULL, 0) ==
+                        cbm_spawn_match(languages[l], callees[c], others, 0));
+            spawns += read != NULL;
+        }
+        cbm_spawn_file_end();
+    }
+    /* Both rule families answered, so the comparison is not of NULL with NULL. */
+    ASSERT_GTE(spawns, 8);
+    ASSERT_NOT_NULL(cbm_spawn_match(CBM_LANG_PYTHON, "sp.run", rows, rows_count));
+    ASSERT_NOT_NULL(cbm_spawn_match(CBM_LANG_JAVASCRIPT, "spawn", rows, rows_count));
+    ASSERT_TRUE(cbm_spawn_match(CBM_LANG_JAVASCRIPT, "spawn", others, others_count) == NULL);
+    PASS();
+}
+
 /* A worker's passes over one file share one parse, and a later file gets its own. */
 TEST(complexity_parse_memo_lasts_one_file) {
     static const char first[] = "x = 1\n";
@@ -3542,6 +3677,8 @@ SUITE(complexity) {
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);
     RUN_TEST(complexity_import_map_keeps_conflicts_and_repeats);
     RUN_TEST(complexity_import_map_same_local_name_is_linear);
+    RUN_TEST(complexity_spawn_match_is_linear_in_a_files_imports);
+    RUN_TEST(complexity_spawn_file_index_answers_as_the_rows_do);
     RUN_TEST(complexity_parse_memo_lasts_one_file);
     RUN_TEST(complexity_evidence_page_route_stores_what_sql_stores);
     RUN_TEST(complexity_shared_preparation_decides_the_same);
