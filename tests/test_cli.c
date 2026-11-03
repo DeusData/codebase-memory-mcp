@@ -9984,6 +9984,143 @@ TEST(cli_hermes_stable_shell_context_contract) {
     PASS();
 }
 
+/* A fake HOME holding only ~/.hermes/config.yaml, so install and uninstall
+ * reach exactly the Hermes editors. */
+typedef struct {
+    char tmpdir[256];
+    char config_path[640];
+    char binary_path[640];
+    char *saved_home;
+    char *saved_path;
+    char *saved_hermes;
+} cli_hermes_cycle_t;
+
+static bool cli_hermes_cycle_open(cli_hermes_cycle_t *cycle, const char *initial_config) {
+    memset(cycle, 0, sizeof(*cycle));
+    snprintf(cycle->tmpdir, sizeof(cycle->tmpdir), "/tmp/cli-hermes-cycle-XXXXXX");
+    if (!cbm_mkdtemp(cycle->tmpdir)) {
+        cycle->tmpdir[0] = '\0';
+        return false;
+    }
+    cycle->saved_home = save_test_env("HOME");
+    cycle->saved_path = save_test_env("PATH");
+    cycle->saved_hermes = save_test_env("HERMES_HOME");
+    cbm_setenv("HOME", cycle->tmpdir, 1);
+    cbm_setenv("PATH", cycle->tmpdir, 1);
+    cbm_unsetenv("HERMES_HOME");
+
+    char hermes_dir[512];
+    snprintf(hermes_dir, sizeof(hermes_dir), "%s/.hermes", cycle->tmpdir);
+    snprintf(cycle->config_path, sizeof(cycle->config_path), "%s/config.yaml", hermes_dir);
+#ifdef _WIN32
+    snprintf(cycle->binary_path, sizeof(cycle->binary_path),
+             "%s/.local/bin/codebase-memory-mcp.exe", cycle->tmpdir);
+#else
+    snprintf(cycle->binary_path, sizeof(cycle->binary_path), "%s/.local/bin/codebase-memory-mcp",
+             cycle->tmpdir);
+#endif
+    test_mkdirp(hermes_dir);
+    return write_test_file(cycle->config_path, initial_config) == 0;
+}
+
+static void cli_hermes_cycle_close(cli_hermes_cycle_t *cycle) {
+    if (!cycle->tmpdir[0]) {
+        return;
+    }
+    restore_test_env("HOME", cycle->saved_home);
+    restore_test_env("PATH", cycle->saved_path);
+    restore_test_env("HERMES_HOME", cycle->saved_hermes);
+    test_rmdir_r(cycle->tmpdir);
+    cycle->tmpdir[0] = '\0';
+}
+
+/* Found while finishing #1862: when our hook was the only entry under
+ * `hooks:`, uninstall empties that mapping and the mapping editor writes it as
+ * `hooks: {}` (the same convention as `mcp_servers: {}`). The hook sequence
+ * editor then refused the file, so install -> uninstall -> install exited 1,
+ * and so did a repeated uninstall. The explicit empty mapping must be accepted:
+ * a repeated uninstall changes nothing and the reinstall restores the first
+ * install byte for byte, with exactly one owned hook. */
+TEST(cli_hermes_hook_reinstalls_after_uninstall_empties_hooks) {
+    cli_hermes_cycle_t cycle;
+    if (!cli_hermes_cycle_open(&cycle, "theme: solarized\n")) {
+        cli_hermes_cycle_close(&cycle);
+        FAIL("Hermes fake-HOME setup failed");
+    }
+    char *argv[] = {"uninstall", "--yes"};
+    int install_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *installed = read_test_file_alloc(cycle.config_path);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    char *emptied = read_test_file_alloc(cycle.config_path);
+    int repeat_rc = cli_test_cmd_uninstall(2, argv);
+    char *repeated = read_test_file_alloc(cycle.config_path);
+    int reinstall_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *reinstalled = read_test_file_alloc(cycle.config_path);
+    cli_hermes_cycle_close(&cycle);
+
+    bool installed_once = install_rc == 0 && installed &&
+                          test_count_substring(installed, "pre_llm_call:") == 1U &&
+                          test_count_substring(installed, "hook-augment") == 1U;
+    bool emptied_clean = uninstall_rc == 0 && emptied && strstr(emptied, "theme: solarized\n") &&
+                         test_count_substring(emptied, "hooks: {}\n") == 1U &&
+                         !strstr(emptied, "pre_llm_call") && !strstr(emptied, "hook-augment");
+    bool repeat_unchanged = repeat_rc == 0 && emptied && repeated && strcmp(repeated, emptied) == 0;
+    bool reinstalled_once =
+        reinstall_rc == 0 && installed && reinstalled && strcmp(reinstalled, installed) == 0;
+    free(installed);
+    free(emptied);
+    free(repeated);
+    free(reinstalled);
+    if (!installed_once)
+        FAIL("Hermes install must write exactly one owned pre_llm_call hook");
+    if (!emptied_clean)
+        FAIL("uninstall must remove the owned hook and leave only the empty hooks: {} mapping");
+    if (!repeat_unchanged)
+        FAIL("a repeated uninstall must accept hooks: {} and leave the file unchanged");
+    if (!reinstalled_once)
+        FAIL("reinstall must accept hooks: {} and restore exactly one owned hook");
+    PASS();
+}
+
+/* The same cycle with a user's own hook in the shared pre_llm_call sequence:
+ * the foreign hook survives untouched and uninstall restores the original
+ * file byte for byte. */
+TEST(cli_hermes_hook_cycle_keeps_foreign_pre_llm_hook) {
+    static const char original[] = "theme: solarized\n"
+                                   "mcp_servers: {}\n"
+                                   "hooks:\n"
+                                   "  pre_llm_call:\n"
+                                   "    - command: \"/usr/bin/user-hermes-hook\"\n";
+    cli_hermes_cycle_t cycle;
+    if (!cli_hermes_cycle_open(&cycle, original)) {
+        cli_hermes_cycle_close(&cycle);
+        FAIL("Hermes fake-HOME setup failed");
+    }
+    char *argv[] = {"uninstall", "--yes"};
+    int install_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *installed = read_test_file_alloc(cycle.config_path);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    char *restored = read_test_file_alloc(cycle.config_path);
+    int reinstall_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *reinstalled = read_test_file_alloc(cycle.config_path);
+    cli_hermes_cycle_close(&cycle);
+
+    bool merged = install_rc == 0 && installed &&
+                  test_count_substring(installed, "/usr/bin/user-hermes-hook") == 1U &&
+                  test_count_substring(installed, "pre_llm_call:") == 1U &&
+                  test_count_substring(installed, "hook-augment") == 1U;
+    bool restored_exactly = uninstall_rc == 0 && restored && strcmp(restored, original) == 0;
+    bool reinstalled_once =
+        reinstall_rc == 0 && installed && reinstalled && strcmp(reinstalled, installed) == 0;
+    free(installed);
+    free(restored);
+    free(reinstalled);
+    if (!merged || !restored_exactly || !reinstalled_once)
+        FAIL("a user's own pre_llm_call hook must survive install, uninstall and reinstall, and "
+             "uninstall must restore the original file byte for byte");
+    PASS();
+}
+
 #ifndef _WIN32
 TEST(cli_detected_agent_summary_includes_registry_clients) {
     char tmpdir[256];
@@ -21105,6 +21242,8 @@ SUITE(cli) {
     RUN_TEST(cli_junie_current_durable_context_contract);
     RUN_TEST(cli_rovo_installs_documented_global_memory);
     RUN_TEST(cli_hermes_stable_shell_context_contract);
+    RUN_TEST(cli_hermes_hook_reinstalls_after_uninstall_empties_hooks);
+    RUN_TEST(cli_hermes_hook_cycle_keeps_foreign_pre_llm_hook);
 #ifndef _WIN32
     RUN_TEST(cli_detected_agent_summary_includes_registry_clients);
 #endif
