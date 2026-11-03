@@ -17,6 +17,25 @@ typedef struct cbm_daemon_maintenance_monitor cbm_daemon_maintenance_monitor_t;
  * outlive the bounded grace period. */
 typedef bool (*cbm_daemon_maintenance_cancel_fn)(void *context);
 
+/* #2796: invoked on the frontend worker thread when a request exchange fails
+ * with a transport error while the MCP client's session is still live.
+ * dead_client remains owned by the frontend, which closes it after the swap
+ * and frees it only once every frontend thread has stopped; the callback must
+ * not use or close it. The callback establishes a replacement (connect-or-spawn
+ * plus session context) and returns it — NULL leaves the transport failure
+ * fatal. The returned client must be fresh, open, and distinct from every
+ * client returned earlier in this run (dead_client included); the frontend
+ * takes ownership: it closes the client if the swap is refused, and
+ * closes/frees it at the end of a successful run. The callback runs at most
+ * three times per run. It may take as long as a cold daemon spawn; the EOF
+ * drain and the join watchdog grant at most a hard 120 s grace per attempt.
+ * A maintenance activation still fail-stops the process on the monitor's own
+ * shorter grace, because a binary update must not wait for a reconnect. It
+ * must not read or write the frontend's stdin/stdout; stderr diagnostics are
+ * allowed, but the callback must not assume that stream is being drained. */
+typedef cbm_daemon_runtime_client_t *(*cbm_daemon_frontend_daemon_lost_fn)(
+    void *context, cbm_daemon_runtime_client_t *dead_client);
+
 /* Parse one JSON-RPC message and recognize only the exact cancellation
  * notification method. String contents, nested fields, method prefixes, and
  * requests carrying an id are not cancellation notifications. */
@@ -66,9 +85,17 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
  * either thread is blocked in stdio, requests cooperative cancellation for the
  * exact active request, and then bounds process exit. Kernel IPC close cancels
  * only this session's daemon work. EOF/parse failure closes the authenticated
- * session. An unexpected daemon transport failure likewise terminates the
- * process so an agent waiting with stdin still open observes server EOF. */
+ * session. An unexpected daemon transport failure is retried against a
+ * replacement daemon through daemon_lost (bounded, #2796); daemon answers such
+ * as busy, rejected, handler error or cancellation are not retried. A replayed
+ * request may already have executed in the dead daemon: a transport failure
+ * cannot distinguish "never sent" from "reply lost", so the interrupted call
+ * has at-least-once semantics. Without the callback — or once the retry budget
+ * is spent — the worker terminates the process immediately so an agent waiting
+ * with stdin still open observes server EOF. */
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
-                                cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out);
+                                cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out,
+                                cbm_daemon_frontend_daemon_lost_fn daemon_lost,
+                                void *daemon_lost_context);
 
 #endif /* CBM_DAEMON_FRONTEND_H */

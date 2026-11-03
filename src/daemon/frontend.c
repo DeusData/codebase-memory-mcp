@@ -4,6 +4,7 @@
 #include "daemon/frontend.h"
 
 #include "daemon/application.h"
+#include "daemon/frontend_liveness.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
@@ -39,6 +40,12 @@ enum {
      * receiving every response while a genuinely stuck request still gets
      * cancelled and the frontend exits cleanly. */
     FRONTEND_EOF_DRAIN_MS = 15000,
+    /* #2796: replacement-daemon attempts per frontend run once the transport
+     * fails mid-session. Bounded so a daemon that cannot come back still
+     * terminates the process exactly like the pre-reconnect behavior. A
+     * replacement spawn may legitimately outlast one drain window; the shared
+     * per-attempt grace lives in frontend_liveness.h. */
+    FRONTEND_DAEMON_RECONNECT_MAX = 3,
     FRONTEND_MAINTENANCE_POLL_MS = 10,
     /* Cadence for the quiet no-maintenance steady state. Every presence probe
      * try-acquires the maintenance marker lock, and on Windows that
@@ -60,6 +67,13 @@ enum {
         CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS + CBM_SUBPROCESS_FORCE_SETTLE_MS + 1000,
     FRONTEND_PARTICIPANT_NAME_CAP = 64,
 };
+
+/* A grace shorter than either ordinary window would cut a legitimate spawn
+ * off at the old deadline, silently restoring the pre-#2796 fatal path. */
+_Static_assert(CBM_DAEMON_FRONTEND_RECONNECT_GRACE_MS >= FRONTEND_EOF_DRAIN_MS,
+               "reconnect grace must cover the EOF drain window");
+_Static_assert(CBM_DAEMON_FRONTEND_RECONNECT_GRACE_MS >= FRONTEND_JOIN_WATCHDOG_MS,
+               "reconnect grace must cover the join watchdog window");
 
 typedef struct {
     char *message;
@@ -90,6 +104,30 @@ typedef struct {
     const char *active_id_str;
     cbm_daemon_runtime_application_token_t active_request_token;
     bool failed;
+    /* #2796: replacement supplier for a dead daemon transport, plus the retry
+     * budget already spent in this run. daemon_lost==NULL keeps the legacy
+     * fatal behavior. */
+    cbm_daemon_frontend_daemon_lost_fn daemon_lost;
+    void *daemon_lost_context;
+    /* Read by the worker and the EOF drain (grace reset per attempt). */
+    atomic_uint daemon_reconnects;
+    /* A cancellation for the active request arrived while its token was
+     * invalid during a reconnect; deliver it with the re-minted token. */
+    bool cancel_pending;
+    /* Clients replaced by a reconnect. close_begin has run, but the allocation
+     * stays alive until the run tail: the stdin reader and the maintenance
+     * monitor may still be using a pointer they read before the swap, and
+     * close_finish frees. Bounded by FRONTEND_DAEMON_RECONNECT_MAX. */
+    cbm_daemon_runtime_client_t *retired[FRONTEND_DAEMON_RECONNECT_MAX];
+    size_t retired_count;
+    /* True while the daemon_lost callback runs. A cold replacement spawn can
+     * outlast FRONTEND_EOF_DRAIN_MS, and the drain must treat that time as
+     * forward progress rather than a stuck request. */
+    atomic_bool reconnect_active;
+    /* cbm_now_ms() when the in-flight attempt started (0 when none has run).
+     * Both waiters anchor the per-attempt grace here, so the drain and the
+     * join watchdog spend one 120 s budget for the same attempt. */
+    atomic_uint_fast64_t reconnect_started_ms;
     /* Monotonic count of fully processed queue items (responses written or
      * cancellations acknowledged). The EOF drain below watches it to tell a
      * batch that is still making progress from a genuinely stuck request. */
@@ -97,6 +135,7 @@ typedef struct {
 } frontend_state_t;
 
 typedef struct {
+    frontend_state_t *state;
     atomic_bool complete;
 } frontend_join_watchdog_t;
 
@@ -306,19 +345,38 @@ static void frontend_input_closed(frontend_state_t *state) {
 
 static void *frontend_join_watchdog(void *opaque) {
     frontend_join_watchdog_t *watchdog = opaque;
-    uint64_t now = cbm_now_ms();
-    uint64_t deadline =
-        now > UINT64_MAX - FRONTEND_JOIN_WATCHDOG_MS ? UINT64_MAX : now + FRONTEND_JOIN_WATCHDOG_MS;
-    while (!atomic_load_explicit(&watchdog->complete, memory_order_acquire) &&
-           cbm_now_ms() < deadline) {
+    frontend_state_t *state = watchdog->state;
+    cbm_daemon_frontend_liveness_t liveness;
+    cbm_daemon_frontend_liveness_init(
+        &liveness, cbm_now_ms(),
+        atomic_load_explicit(&state->daemon_reconnects, memory_order_acquire));
+    while (!atomic_load_explicit(&watchdog->complete, memory_order_acquire)) {
+        uint64_t now = cbm_now_ms();
+        unsigned int attempts =
+            atomic_load_explicit(&state->daemon_reconnects, memory_order_acquire);
+        bool reconnecting = atomic_load_explicit(&state->reconnect_active, memory_order_acquire);
+        uint64_t attempt_started =
+            atomic_load_explicit(&state->reconnect_started_ms, memory_order_acquire);
+        if (!cbm_daemon_frontend_liveness_wait(&liveness, now, attempts, reconnecting,
+                                               attempt_started, FRONTEND_JOIN_WATCHDOG_MS)) {
+            /* The worker may have completed between the poll and the
+             * deadline; do not fail-stop a join that is already finishing.
+             * `complete` is published only after the main thread's join
+             * returns, so also query the worker state to cover the
+             * done-but-not-yet-joined window. */
+            if (atomic_load_explicit(&watchdog->complete, memory_order_acquire) ||
+                frontend_worker_is_done(state)) {
+                break;
+            }
+            /* A thin frontend owns no durable state. If stdout is
+             * backpressured, fclose/IPC cancellation cannot portably wake its
+             * worker on every platform. Fail-stop releases the authenticated
+             * connection and lets the daemon cancel this exact session instead
+             * of hanging forever. A replacement spawn in progress gets the
+             * same bounded grace as in the EOF drain. */
+            _Exit(EXIT_FAILURE);
+        }
         cbm_usleep(FRONTEND_WAIT_US);
-    }
-    if (!atomic_load_explicit(&watchdog->complete, memory_order_acquire)) {
-        /* A thin frontend owns no durable state. If stdout is backpressured,
-         * fclose/IPC cancellation cannot portably wake its worker on every
-         * platform. Fail-stop releases the authenticated connection and lets
-         * the daemon cancel this exact session instead of hanging forever. */
-        _Exit(EXIT_FAILURE);
     }
     return NULL;
 }
@@ -347,6 +405,7 @@ static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
         state->count--;
         state->queued_bytes -= item->length;
         state->in_request = true;
+        state->cancel_pending = false;
         state->active_has_id = item->has_id;
         state->active_id = item->id;
         state->active_id_str = item->id_str;
@@ -365,6 +424,7 @@ static void frontend_end_request(frontend_state_t *state, bool failed) {
     state->active_id = 0;
     state->active_id_str = NULL;
     state->active_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    state->cancel_pending = false;
     state->failed = state->failed || failed;
     cbm_mutex_unlock(&state->mutex);
 }
@@ -458,6 +518,9 @@ typedef enum {
     FRONTEND_CANCELLATION_STALE = 1,
     FRONTEND_CANCELLATION_QUEUED = 2,
     FRONTEND_CANCELLATION_ACTIVE = 3,
+    /* Matched the active request while its token was invalid during a
+     * reconnect; delivered when the retry publishes the new token. */
+    FRONTEND_CANCELLATION_DEFERRED = 4,
 } frontend_cancellation_route_t;
 
 /* Cancellation is an out-of-band frontend control message. A matching active
@@ -466,9 +529,13 @@ typedef enum {
  * without ever reaching the daemon. Stale/invalid targets are ignored. */
 static frontend_cancellation_route_t frontend_route_cancellation(
     frontend_state_t *state, const char *message,
-    cbm_daemon_runtime_application_token_t *request_token_out) {
+    cbm_daemon_runtime_application_token_t *request_token_out,
+    cbm_daemon_runtime_client_t **request_client_out) {
     if (request_token_out) {
         *request_token_out = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    }
+    if (request_client_out) {
+        *request_client_out = NULL;
     }
     cbm_jsonrpc_request_t request = {0};
     if (!frontend_parse_cancellation(message, &request)) {
@@ -478,13 +545,25 @@ static frontend_cancellation_route_t frontend_route_cancellation(
     frontend_cancellation_route_t route = FRONTEND_CANCELLATION_STALE;
     cbm_mutex_lock(&state->mutex);
     if (state->in_request && state->active_has_id &&
-        state->active_request_token != CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID &&
         cbm_mcp_cancel_request_matches(request.params_raw, state->active_id,
                                        state->active_id_str)) {
-        if (request_token_out) {
-            *request_token_out = state->active_request_token;
+        /* Remember the cancel even while the token is invalid during a
+         * reconnect: the retry delivers it with the freshly minted token. */
+        state->cancel_pending = true;
+        if (state->active_request_token != CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID) {
+            if (request_token_out) {
+                *request_token_out = state->active_request_token;
+            }
+            /* Snapshot the owner under the same lock as the token: the worker
+             * may already have swapped clients, and the token is only
+             * meaningful on the client that minted it. */
+            if (request_client_out) {
+                *request_client_out = state->client;
+            }
+            route = FRONTEND_CANCELLATION_ACTIVE;
+        } else {
+            route = FRONTEND_CANCELLATION_DEFERRED;
         }
-        route = FRONTEND_CANCELLATION_ACTIVE;
     } else {
         for (size_t offset = 0; offset < state->count; offset++) {
             size_t index = (state->head + offset) % FRONTEND_QUEUE_CAPACITY;
@@ -500,6 +579,126 @@ static frontend_cancellation_route_t frontend_route_cancellation(
     cbm_mutex_unlock(&state->mutex);
     cbm_jsonrpc_request_free(&request);
     return route;
+}
+
+/* #2796: swap in a replacement daemon client after a transport failure. The
+ * request token minted for the interrupted exchange was scoped to the dead
+ * client, so the caller must re-reserve one before re-issuing the request.
+ * The callback runs unmutexed (a cold daemon spawn takes seconds); the swap
+ * itself refuses once teardown has begun so no replacement outlives the run.
+ * The dead client stays allocated until the run tail because the stdin reader
+ * and the maintenance monitor can still hold a pointer read before the swap;
+ * close_begin marks it closed without freeing. */
+static bool frontend_daemon_reconnect(frontend_state_t *state) {
+    unsigned int attempts = atomic_load_explicit(&state->daemon_reconnects, memory_order_relaxed);
+    if (!state->daemon_lost || attempts >= FRONTEND_DAEMON_RECONNECT_MAX) {
+        return false;
+    }
+    cbm_mutex_lock(&state->mutex);
+    bool stopping = state->stopping;
+    cbm_daemon_runtime_client_t *dead = state->client;
+    if (!stopping) {
+        /* The published token belongs to the dead client. Invalidate it for
+         * the duration of the callback (a cold spawn takes seconds); a
+         * cancellation that arrives meanwhile is remembered in cancel_pending
+         * and delivered with the re-minted token. */
+        state->active_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    }
+    cbm_mutex_unlock(&state->mutex);
+    if (stopping) {
+        return false;
+    }
+    /* Publish the attempt's timestamp and active flag BEFORE incrementing the
+     * counter. A waiter that observes the new counter (acquire) must then see
+     * this attempt's timestamp too; incrementing first would let it pair a new
+     * counter with the previous attempt's timestamp and compress the new
+     * attempt's grace. */
+    atomic_store_explicit(&state->reconnect_started_ms, cbm_now_ms(), memory_order_release);
+    atomic_store_explicit(&state->reconnect_active, true, memory_order_release);
+    atomic_fetch_add_explicit(&state->daemon_reconnects, 1, memory_order_release);
+    cbm_daemon_runtime_client_t *replacement = state->daemon_lost(state->daemon_lost_context, dead);
+    atomic_store_explicit(&state->reconnect_active, false, memory_order_release);
+    if (!replacement || replacement == dead) {
+        return false;
+    }
+    /* A supplier that hands back a client retired earlier in this run would be
+     * appended twice and freed twice at the run tail. */
+    for (size_t i = 0; i < state->retired_count; i++) {
+        if (state->retired[i] == replacement) {
+            return false;
+        }
+    }
+    cbm_mutex_lock(&state->mutex);
+    if (state->stopping || state->client != dead) {
+        cbm_mutex_unlock(&state->mutex);
+        (void)cbm_daemon_runtime_client_close(replacement, FRONTEND_CLOSE_TIMEOUT_MS);
+        return false;
+    }
+    state->client = replacement;
+    cbm_mutex_unlock(&state->mutex);
+    (void)cbm_daemon_runtime_client_close_begin(dead);
+    /* daemon_reconnects bounds this to the array size; guard locally so a
+     * future caller cannot corrupt the run. */
+    if (state->retired_count < FRONTEND_DAEMON_RECONNECT_MAX) {
+        state->retired[state->retired_count++] = dead;
+    }
+    return true;
+}
+
+/* #2796: one request exchange with replacement-daemon retries. Returns the
+ * final status; response and response_length are set only on OK. */
+static cbm_daemon_runtime_application_status_t frontend_exchange_with_reconnect(
+    frontend_state_t *state, frontend_item_t *item, uint8_t **response, uint32_t *response_length) {
+    cbm_daemon_runtime_application_status_t status;
+    for (;;) {
+        status = cbm_daemon_application_client_mcp_tagged(state->client, item->request_token,
+                                                          item->message, response, response_length,
+                                                          FRONTEND_REQUEST_TIMEOUT_MS);
+        if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+            return status;
+        }
+        /* Only a transport failure triggers recovery. BUSY, UNAVAILABLE,
+         * REJECTED, HANDLER_ERROR and CANCELLED are daemon answers and must
+         * keep their existing meaning; CANCELLED in particular must never be
+         * re-issued as a fresh request. A dead transport is not this session's
+         * death: swap in a replacement client, re-mint the request token
+         * (tokens are scoped to the client that reserved them), and re-issue
+         * the interrupted request.
+         *
+         * TRANSPORT_ERROR also covers local allocation failures in the
+         * application layer while the connection is still healthy; replaying
+         * such a request is harmless (it never left the client) but costs a
+         * reconnect. It also covers a reply the client could not copy after
+         * the daemon executed the request (runtime response-copy failure).
+         * Such a request is replayed even though it may have run; the
+         * alternative is losing both the response and the session, and the
+         * transport failure carries no evidence either way. */
+        if (status != CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR ||
+            !frontend_daemon_reconnect(state)) {
+            return status;
+        }
+        /* Reserve and publish under one lock, like frontend_pop_begin. A
+         * cancellation that arrived while the reconnect held the token
+         * invalid is remembered in cancel_pending and delivered with this
+         * fresh token. */
+        cbm_mutex_lock(&state->mutex);
+        bool minted = cbm_daemon_runtime_client_application_token_reserve(state->client,
+                                                                          &item->request_token);
+        bool deliver_cancel = minted && state->cancel_pending;
+        if (minted) {
+            state->active_request_token = item->request_token;
+            state->cancel_pending = false;
+        }
+        cbm_mutex_unlock(&state->mutex);
+        if (!minted) {
+            /* The replacement is installed but cannot mint a token (it is
+             * already closing or unusable); the run teardown closes it. */
+            return status;
+        }
+        if (deliver_cancel) {
+            (void)cbm_daemon_runtime_client_application_cancel(state->client, item->request_token);
+        }
+    }
 }
 
 static void *frontend_worker(void *opaque) {
@@ -523,9 +722,7 @@ static void *frontend_worker(void *opaque) {
             failed = !frontend_write_cancelled_response(state->out, &item);
         } else {
             cbm_daemon_runtime_application_status_t status =
-                cbm_daemon_application_client_mcp_tagged(state->client, item.request_token,
-                                                         item.message, &response, &response_length,
-                                                         FRONTEND_REQUEST_TIMEOUT_MS);
+                frontend_exchange_with_reconnect(state, &item, &response, &response_length);
             if (status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
                 failed = !frontend_write_cancelled_response(state->out, &item);
             } else {
@@ -544,12 +741,14 @@ static void *frontend_worker(void *opaque) {
         atomic_fetch_add_explicit(&state->completed_items, 1, memory_order_release);
         if (failed) {
             if (!expected_stop) {
-                /* A failed daemon transport cannot wake a thread blocked in
-                 * stdio portably. This frontend owns no state: immediate
-                 * process exit closes the kernel IPC handle, which cancels
-                 * daemon session ownership without a detached reader or an
-                 * unsafe cross-thread fclose. Logging or flushing here could
-                 * itself block on agent-owned stdout/stderr. */
+                /* #2796: reached only without a daemon_lost callback or after
+                 * its retry budget is spent. A failed daemon transport cannot
+                 * wake a thread blocked in stdio portably. This frontend owns
+                 * no state: immediate process exit closes the kernel IPC
+                 * handle, which cancels daemon session ownership without a
+                 * detached reader or an unsafe cross-thread fclose. Logging or
+                 * flushing here could itself block on agent-owned
+                 * stdout/stderr. */
                 _Exit(EXIT_FAILURE);
             }
             break;
@@ -632,32 +831,47 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
 static bool frontend_stop_begin(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->stopping = true;
+    cbm_daemon_runtime_client_t *client = state->client;
     cbm_mutex_unlock(&state->mutex);
     /* Retain the client allocation until the worker is joined. This covers the
      * boundary where the worker has claimed an item but has not yet entered the
-     * runtime exchange: a late call observes closing instead of freed memory. */
-    return cbm_daemon_runtime_client_close_begin(state->client);
+     * runtime exchange: a late call observes closing instead of freed memory.
+     * The worker cannot swap after stopping is published, so this snapshot is
+     * the client this run owns. */
+    return cbm_daemon_runtime_client_close_begin(client);
 }
 
 static bool frontend_cancel_for_maintenance(void *opaque) {
     frontend_state_t *state = opaque;
     cbm_daemon_runtime_application_token_t request_token =
         CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    cbm_daemon_runtime_client_t *client = NULL;
+    bool in_request;
     cbm_mutex_lock(&state->mutex);
     state->stopping = true;
-    if (state->in_request) {
+    in_request = state->in_request;
+    if (in_request) {
         request_token = state->active_request_token;
+        client = state->client;
     }
     cbm_mutex_unlock(&state->mutex);
-    if (request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID) {
+    if (!in_request) {
         return false;
     }
-    return cbm_daemon_runtime_client_application_cancel(state->client, request_token) ==
+    if (request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID || !client) {
+        /* A reconnect holds the token invalid while a request is still in
+         * flight: report the cancel as requested so the monitor takes its
+         * bounded grace instead of exiting immediately. */
+        return true;
+    }
+    return cbm_daemon_runtime_client_application_cancel(client, request_token) ==
            CBM_DAEMON_RUNTIME_CANCEL_ACCEPTED;
 }
 
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
-                                cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out) {
+                                cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out,
+                                cbm_daemon_frontend_daemon_lost_fn daemon_lost,
+                                void *daemon_lost_context) {
     if (!client || !cohort_manager || !in || !out) {
         return -1;
     }
@@ -665,9 +879,14 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         .client = client,
         .cohort_manager = cohort_manager,
         .out = out,
+        .daemon_lost = daemon_lost,
+        .daemon_lost_context = daemon_lost_context,
     };
     cbm_mutex_init(&state.mutex);
     atomic_init(&state.completed_items, 0);
+    atomic_init(&state.daemon_reconnects, 0);
+    atomic_init(&state.reconnect_active, false);
+    atomic_init(&state.reconnect_started_ms, 0);
     cbm_daemon_maintenance_monitor_t *maintenance_monitor =
         frontend_maintenance_monitor_start(cohort_manager, frontend_cancel_for_maintenance, &state,
                                            EXIT_SUCCESS, "MCP frontend", true);
@@ -701,18 +920,17 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         }
         cbm_daemon_runtime_application_token_t cancel_token =
             CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+        cbm_daemon_runtime_client_t *cancel_client = NULL;
         frontend_cancellation_route_t cancellation =
-            frontend_route_cancellation(&state, message, &cancel_token);
+            frontend_route_cancellation(&state, message, &cancel_token, &cancel_client);
         if (cancellation != FRONTEND_CANCELLATION_NONE) {
             free(message);
             if (cancellation == FRONTEND_CANCELLATION_ACTIVE) {
-                cbm_daemon_runtime_cancel_result_t cancelled =
-                    cbm_daemon_runtime_client_application_cancel(state.client, cancel_token);
-                if (cancelled == CBM_DAEMON_RUNTIME_CANCEL_ERROR) {
-                    result = -1;
-                    close_begun = frontend_stop_begin(&state);
-                    break;
-                }
+                /* Cancellation is best-effort: ERROR means the client is
+                 * already unusable or closing. The in-flight exchange observes
+                 * the same failure (or stop), and the worker owns the recovery
+                 * decision instead of the reader tearing the session down. */
+                (void)cbm_daemon_runtime_client_application_cancel(cancel_client, cancel_token);
             }
             /* A queued cancellation is represented on that queue item; stale
              * and malformed targets are intentionally side-effect free. */
@@ -740,14 +958,44 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
          * writing — file redirects, piped harnesses, hook one-shots —
          * intermittently lost their tail responses. */
         uint64_t drained = atomic_load_explicit(&state.completed_items, memory_order_acquire);
-        uint64_t drain_deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
-        while (!frontend_worker_is_done(&state) && cbm_now_ms() < drain_deadline) {
+        cbm_daemon_frontend_liveness_t liveness;
+        cbm_daemon_frontend_liveness_init(
+            &liveness, cbm_now_ms(),
+            atomic_load_explicit(&state.daemon_reconnects, memory_order_acquire));
+        for (;;) {
+            if (frontend_worker_is_done(&state)) {
+                break;
+            }
+            uint64_t now = cbm_now_ms();
+            unsigned int attempts =
+                atomic_load_explicit(&state.daemon_reconnects, memory_order_acquire);
+            bool reconnecting = atomic_load_explicit(&state.reconnect_active, memory_order_acquire);
+            uint64_t attempt_started =
+                atomic_load_explicit(&state.reconnect_started_ms, memory_order_acquire);
+            if (!cbm_daemon_frontend_liveness_wait(&liveness, now, attempts, reconnecting,
+                                                   attempt_started, FRONTEND_EOF_DRAIN_MS)) {
+                if (frontend_worker_is_done(&state)) {
+                    break;
+                }
+                /* Re-sample once: an attempt that became visible after the
+                 * poll above is granted its grace instead of being cut off by
+                 * stop_begin. */
+                bool late_reconnect =
+                    atomic_load_explicit(&state.reconnect_active, memory_order_acquire);
+                uint64_t late_started =
+                    atomic_load_explicit(&state.reconnect_started_ms, memory_order_acquire);
+                if (late_reconnect &&
+                    cbm_daemon_frontend_liveness_reconnect_late(&liveness, now, late_started)) {
+                    continue;
+                }
+                break;
+            }
             cbm_usleep(FRONTEND_WAIT_US);
             uint64_t now_drained =
                 atomic_load_explicit(&state.completed_items, memory_order_acquire);
             if (now_drained != drained) {
                 drained = now_drained;
-                drain_deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
+                cbm_daemon_frontend_liveness_progress(&liveness, cbm_now_ms());
             }
         }
     }
@@ -758,6 +1006,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     cbm_thread_t watchdog_thread;
     bool watchdog_started = false;
     if (!frontend_worker_is_done(&state)) {
+        watchdog.state = &state;
         atomic_init(&watchdog.complete, false);
         if (cbm_thread_create(&watchdog_thread, 0, frontend_join_watchdog, &watchdog) != 0) {
             _Exit(EXIT_FAILURE);
@@ -781,6 +1030,11 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         (void)cbm_daemon_runtime_client_close_finish(state.client, FRONTEND_CLOSE_TIMEOUT_MS);
     } else {
         result = -1;
+    }
+    /* The worker is joined and the maintenance monitor is stopped, so no other
+     * thread can still reference a client retired by a reconnect. */
+    for (size_t i = 0; i < state.retired_count; i++) {
+        (void)cbm_daemon_runtime_client_close_finish(state.retired[i], FRONTEND_CLOSE_TIMEOUT_MS);
     }
     for (size_t i = 0; i < FRONTEND_QUEUE_CAPACITY; i++) {
         frontend_item_free(&state.queue[i]);

@@ -9,6 +9,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/subprocess.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -22,7 +23,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "foundation/subprocess.h"
 #include "foundation/win_utf8.h"
 #include <windows.h>
 #else
@@ -1301,17 +1301,8 @@ static bool bootstrap_production_spawn(void *context,
     return true;
 }
 #else
-static void bootstrap_child_close_fds(void) {
-    long open_max = sysconf(_SC_OPEN_MAX);
-    if (open_max < 0 || open_max > 1048576L) {
-        open_max = 65536L;
-    }
-    for (int fd = 3; fd < open_max; fd++) {
-        (void)close(fd);
-    }
-}
-
-static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec) {
+static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec,
+                                        long max_fd) {
     (void)umask(077);
     sigset_t empty;
     (void)sigemptyset(&empty);
@@ -1324,7 +1315,7 @@ static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t
     if (null_fd > STDERR_FILENO) {
         (void)close(null_fd);
     }
-    bootstrap_child_close_fds();
+    (void)cbm_posix_close_fds_from(STDERR_FILENO + 1, max_fd);
     execv(spec->executable_path, (char *const *)spec->argv);
     _exit(127);
 }
@@ -1335,6 +1326,10 @@ static bool bootstrap_production_spawn(void *context,
     if (!spec || !spec->detached || spec->inherit_standard_handles || spec->use_shell) {
         return false;
     }
+    /* Read the cap before fork: sysconf() may take libc locks, and the fork
+     * child may not (the frontend reconnects from a worker thread). The
+     * derivation is shared with the subprocess spawn path. */
+    long max_fd = cbm_posix_fd_close_cap();
     pid_t first = fork();
     if (first < 0) {
         return false;
@@ -1350,7 +1345,7 @@ static bool bootstrap_production_spawn(void *context,
         if (daemon > 0) {
             _exit(0);
         }
-        bootstrap_daemon_grandchild(spec);
+        bootstrap_daemon_grandchild(spec, max_fd);
     }
 
     int status = 0;

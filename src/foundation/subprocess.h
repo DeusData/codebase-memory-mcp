@@ -232,6 +232,20 @@ typedef enum {
     CBM_FD_CLOSE_LOOP       /* close() per descriptor up to _SC_OPEN_MAX: O(RLIMIT_NOFILE) */
 } cbm_fd_close_strategy_t;
 
+#ifndef _WIN32
+/* Fallback loop bound for the descriptor sweep below: sysconf(_SC_OPEN_MAX),
+ * or 65536 when that is unavailable or above 1048576. Callers invoke this
+ * BEFORE fork(); sysconf may take libc locks. */
+long cbm_posix_fd_close_cap(void);
+
+/* Close every descriptor >= lowfd in a fork+exec child (#1484, #2796).
+ * async-signal-safe: a raw close_range syscall, closefrom(), or close() only —
+ * no allocation and no stdio, because this runs between fork and exec in a
+ * child of a possibly multi-threaded process. `max_fd` is the cap returned by
+ * cbm_posix_fd_close_cap() in the parent. */
+cbm_fd_close_strategy_t cbm_posix_close_fds_from(int lowfd, long max_fd);
+#endif
+
 #if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
 /* Run the child's close-inherited-descriptors step in the CALLING process for
  * descriptors >= lowfd (callers pick a lowfd above everything they need) and
