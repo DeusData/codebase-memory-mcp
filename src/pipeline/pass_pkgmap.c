@@ -5445,6 +5445,27 @@ static const cbm_gbuf_node_t *typescript_paths_target(const cbm_pipeline_ctx_t *
 static const cbm_gbuf_node_t *go_import_by_source_module(const cbm_pipeline_ctx_t *ctx,
                                                          const char *source_rel, const char *path);
 
+/* A Go package is a directory, and an import targets that directory's node. The repository's
+ * own root is no Folder: the Project node is that directory, its QN the module of every root
+ * file (graph_buffer.c). caddy's go.mod and `package caddy` both sit there. *directory is the
+ * package's directory relative to the repository, NULL when the node records none. */
+static bool go_package_node(const cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *node,
+                            const char **directory) {
+    if (!node || !node->label)
+        return false;
+    if (!strcmp(node->label, "Folder")) {
+        if (directory)
+            *directory = node->file_path;
+        return true;
+    }
+    if (strcmp(node->label, "Project") || !ctx->project_name || !node->qualified_name ||
+        strcmp(node->qualified_name, ctx->project_name))
+        return false;
+    if (directory)
+        *directory = "";
+    return true;
+}
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const CBMImport *imp,
     CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only, bool *ambiguous) {
@@ -5498,7 +5519,7 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         free(qn);
         if (target && (!php_only || node_in_php_file(target)) &&
             (import_language_matches(src_lang, target) ||
-             (src_lang == CBM_LANG_GO && target->label && strcmp(target->label, "Folder") == 0))) {
+             (src_lang == CBM_LANG_GO && go_package_node(ctx, target, NULL)))) {
             if (target->label &&
                 (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
                 char sym[CBM_SZ_256];
@@ -5517,7 +5538,7 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                 }
                 return target;
             }
-            if (src_lang == CBM_LANG_GO && target->label && strcmp(target->label, "Folder") == 0)
+            if (src_lang == CBM_LANG_GO && go_package_node(ctx, target, NULL))
                 return target;
             /* Python's dotted import path may name a declaration exactly; a
              * plain module import may never bind an arbitrary function/class. */
@@ -6506,7 +6527,7 @@ static const cbm_gbuf_node_t *go_import_by_source_module(const cbm_pipeline_ctx_
     char *qn = cbm_pipeline_fqn_folder(ctx->project_name, package);
     const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
     free(qn);
-    return node && node->label && !strcmp(node->label, "Folder") ? node : NULL;
+    return go_package_node(ctx, node, NULL) ? node : NULL;
 }
 
 static bool go_import_inside_module(const char *import, const char *module, const char *owner,
@@ -6524,18 +6545,17 @@ static bool go_import_inside_module(const char *import, const char *module, cons
 
 bool cbm_pipeline_go_import_owned(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const CBMImport *import, const cbm_gbuf_node_t *target) {
-    if (!ctx || !source_rel || !import || !import->module_path || !target || !target->file_path ||
-        !target->label || strcmp(target->label, "Folder"))
+    const char *package_dir = NULL;
+    if (!ctx || !source_rel || !import || !import->module_path ||
+        !go_package_node(ctx, target, &package_dir) || !package_dir)
         return false;
     char source_owner[PKGMAP_PATH_BUF], source_module[PKGMAP_PATH_BUF],
         target_owner[PKGMAP_PATH_BUF], target_module[PKGMAP_PATH_BUF];
     if (!go_module_owner(ctx, source_rel, false, source_owner, source_module,
                          sizeof(source_owner)) ||
-        !go_module_owner(ctx, target->file_path, true, target_owner, target_module,
-                         sizeof(target_owner)))
+        !go_module_owner(ctx, package_dir, true, target_owner, target_module, sizeof(target_owner)))
         return false;
-    if (!go_import_inside_module(import->module_path, target_module, target_owner,
-                                 target->file_path))
+    if (!go_import_inside_module(import->module_path, target_module, target_owner, package_dir))
         return false;
     if (!strcmp(source_owner, target_owner))
         return !strcmp(source_module, target_module);

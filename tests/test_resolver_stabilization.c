@@ -1912,6 +1912,84 @@ static int go_duplicate_module_case(bool parallel) {
     th_rmtree(root);
     PASS();
 }
+/* caddy's go.mod sits at the repository root and its root directory is a package, imported as
+ * "github.com/caddyserver/caddy/v2" and bound as caddy. That directory has no Folder node: the
+ * Project node is it, since its QN is every root file's module. A decoy namesake lives in a
+ * subpackage, and a module without a replace directive takes the path from the module cache.
+ * With `duplicate`, a fixture's go.mod also declares the module path, as cli/cli's CodeQL tests
+ * do: the importer's own module still means the root, never the fixture's namesake package. */
+static int go_module_root_package_case(bool parallel, bool duplicate) {
+    const char *root = th_mktempdir("cbm_go_root_package");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "caddyconfig/caddyfile"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "foreign"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example/caddy/v2\ngo 1.22\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "foreign/go.mod"), "module example/foreign\ngo 1.22\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "caddy.go"),
+                            "// Copyright notice.\n\npackage caddy\n\n"
+                            "type Replacer struct{}\n\n"
+                            "func NewReplacer() *Replacer { return &Replacer{} }\n\n"
+                            "func (r *Replacer) ReplaceKnown(input, empty string) string {\n"
+                            "\treturn input\n}\n\n"
+                            "func GetModule(name string) (string, error) { return name, nil }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "caddyconfig/adapters.go"),
+                            "package caddyconfig\n\n"
+                            "func GetModule(name string) (string, error) { return \"\", nil }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "caddyconfig/caddyfile/adapter.go"),
+                            "package caddyfile\n\nimport (\n\t\"example/caddy/v2\"\n)\n\n"
+                            "func UnmarshalModule(moduleID string) (string, error) {\n"
+                            "\tmod, err := caddy.GetModule(moduleID)\n"
+                            "\trepl := caddy.NewReplacer()\n"
+                            "\treturn repl.ReplaceKnown(mod, \"\"), err\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "foreign/use.go"),
+                            "package foreign\n\nimport \"example/caddy/v2\"\n\n"
+                            "func Cached() { caddy.GetModule(\"x\") }\n"),
+              0);
+    if (duplicate) {
+        ASSERT(cbm_mkdir_p(TH_PATH(repo, "fixture"), 0755));
+        ASSERT_EQ(
+            th_write_file(TH_PATH(repo, "fixture/go.mod"), "module example/caddy/v2\ngo 1.22\n"),
+            0);
+        ASSERT_EQ(
+            th_write_file(TH_PATH(repo, "fixture/caddy.go"),
+                          "package caddy\n\n"
+                          "func GetModule(name string) (string, error) { return \"\", nil }\n"),
+            0);
+    }
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    const char *user = "test.caddyconfig.caddyfile.UnmarshalModule";
+    ASSERT_EQ(
+        count_edge_between(db, "IMPORTS", "test.caddyconfig.caddyfile.adapter.go.__file__", "test"),
+        1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", user, "test.GetModule"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", user, "test.NewReplacer"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", user, "test.Replacer.ReplaceKnown"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", user, "test.caddyconfig.GetModule"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", user, "test.fixture.GetModule"), 0);
+    ASSERT_EQ(count_edge_between(db, "IMPORTS", "test.foreign.use.go.__file__", "test"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.foreign.Cached", "test.GetModule"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.foreign.Cached", "test.caddyconfig.GetModule"),
+              0);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
 /* Go 1.26's new(expr) is an ERROR to the grammar, which used to cost the declaration around it.
  * A decoy method and a function that merely end in new stay what they are. */
 static int go_new_expression_case(bool parallel) {
@@ -2219,6 +2297,18 @@ TEST(resolver_stabilization_go_duplicate_module_path_sequential) {
 TEST(resolver_stabilization_go_duplicate_module_path_parallel) {
     return go_duplicate_module_case(true);
 }
+TEST(resolver_stabilization_go_module_root_package_sequential) {
+    return go_module_root_package_case(false, false);
+}
+TEST(resolver_stabilization_go_module_root_package_parallel) {
+    return go_module_root_package_case(true, false);
+}
+TEST(resolver_stabilization_go_module_root_beside_duplicate_module_sequential) {
+    return go_module_root_package_case(false, true);
+}
+TEST(resolver_stabilization_go_module_root_beside_duplicate_module_parallel) {
+    return go_module_root_package_case(true, true);
+}
 TEST(resolver_stabilization_go_pipeline_references_sequential) {
     return go_references_case(false);
 }
@@ -2337,6 +2427,10 @@ SUITE(resolver_stabilization) {
     RUN_TEST(resolver_stabilization_go_anonymous_structs_and_conversions_parallel);
     RUN_TEST(resolver_stabilization_go_duplicate_module_path_sequential);
     RUN_TEST(resolver_stabilization_go_duplicate_module_path_parallel);
+    RUN_TEST(resolver_stabilization_go_module_root_package_sequential);
+    RUN_TEST(resolver_stabilization_go_module_root_package_parallel);
+    RUN_TEST(resolver_stabilization_go_module_root_beside_duplicate_module_sequential);
+    RUN_TEST(resolver_stabilization_go_module_root_beside_duplicate_module_parallel);
     RUN_TEST(resolver_stabilization_go_pipeline_references_sequential);
     RUN_TEST(resolver_stabilization_go_pipeline_references_parallel);
     RUN_TEST(resolver_stabilization_go_pipeline_twins_and_package_level_sequential);
