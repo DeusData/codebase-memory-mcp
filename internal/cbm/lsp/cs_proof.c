@@ -53,7 +53,7 @@ static const char *csp_text(cs_proof_source_t *source, TSNode node) {
                : NULL;
 }
 static bool csp_budget(cs_proof_source_t *source, unsigned depth) {
-    if (++source->visits > 1000000 || depth > 128)
+    if (depth > 128)
         source->failed = true;
     return !source->failed;
 }

@@ -2514,10 +2514,8 @@ void oo_walk_dispose(oo_walk_t *w) {
 }
 
 bool oo_budget(oo_walk_t *w) {
-    /* Each source node is visited a bounded number of times. Exhaustion
-     * discards the file's staged rows; it never publishes a partial walk. */
-    if (++w->visits > 64u * 1024u * 1024u)
-        w->failed = true;
+    /* Each source node is visited a bounded number of times, so a file's size
+     * decides nothing. */
     return !w->failed;
 }
 

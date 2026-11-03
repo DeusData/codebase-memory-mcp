@@ -41,7 +41,7 @@ static const char *php_proof_text(php_source_t *source, TSNode node) {
                : NULL;
 }
 static bool php_proof_budget(php_source_t *source, unsigned depth) {
-    if (++source->visits > 1000000 || depth > 128)
+    if (depth > 128)
         source->failed = true;
     return !source->failed;
 }

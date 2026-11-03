@@ -6730,7 +6730,7 @@ TEST(resolver_source_dart_barrel_of_any_width_and_depth) {
         const char *extra = i == 150   ? "void hiddenFar() {}\n"
                             : i == 151 ? "void shownFar() {}\nvoid notShownFar() {}\n"
                             : i == 160 || i == 170 ? "void twice() {}\n"
-                            : i == 190             ? "class Far {\n  void go() {}\n}\n"
+                            : i == 190             ? "class Wide {\n  void go() {}\n}\n"
                                                    : "";
         sources[count++] = (RQ_Source){.path = sl_sprintf("lib/a%d.dart", i),
                                        .text = sl_sprintf("void f%d() {}\n%s", i, extra)};
@@ -6754,8 +6754,8 @@ TEST(resolver_source_dart_barrel_of_any_width_and_depth) {
                                                   "void callsShown() { shownFar(); }\n"
                                                   "void callsNotShown() { notShownFar(); }\n"
                                                   "void callsTwice() { twice(); }\n"
-                                                  "void callsClass() { Far(); }\n"
-                                                  "void callsMember(Far far) { far.go(); }\n"
+                                                  "void callsClass() { Wide(); }\n"
+                                                  "void callsMember(Wide w) { w.go(); }\n"
                                                   "void callsDeep() { deepName(); }\n"
                                                   "void callsShadowed() { shadowed(); }\n"
                                                   "void callsNobody() { nobody(); }\n")};
@@ -6768,10 +6768,10 @@ TEST(resolver_source_dart_barrel_of_any_width_and_depth) {
                    "a199.f199", "Function", 1, "void f199() {}"),
         SL_CALL_AT("barrel-show-passes", "lib/main.dart", "main.callsShown", "shownFar()", 0,
                    "lib/a151.dart", "a151.shownFar", "Function", 2, "void shownFar() {}"),
-        SL_CALL_AT("barrel-class", "lib/main.dart", "main.callsClass", "Far()", 0, "lib/a190.dart",
-                   "a190.Far", "Class", 2, "class Far {"),
-        SL_CALL_AT("barrel-class-member", "lib/main.dart", "main.callsMember", "far.go", 0,
-                   "lib/a190.dart", "Far.go", "Method", 3, "  void go() {}"),
+        SL_CALL_AT("barrel-class", "lib/main.dart", "main.callsClass", "Wide()", 0,
+                   "lib/a190.dart", "a190.Wide", "Class", 2, "class Wide {"),
+        SL_CALL_AT("barrel-class-member", "lib/main.dart", "main.callsMember", "w.go", 0,
+                   "lib/a190.dart", "Wide.go", "Method", 3, "  void go() {}"),
         SL_CALL_AT("chain-end", "lib/main.dart", "main.callsDeep", "deepName()", 0,
                    "lib/deep199.dart", "deep199.deepName", "Function", 2, "void deepName() {}"),
         SL_CALL_AT("chain-shallower-hides-deeper", "lib/main.dart", "main.callsShadowed",
@@ -6843,11 +6843,12 @@ TEST(resolver_source_dart_inheritance_of_any_depth) {
 
 TEST(resolver_source_php_inheritance_of_any_depth) {
     static const RQ_Expected expected[] = {
-        SL_CALL_AT("member-past-128-levels", "src/chain.php", "chain.useIt", "$c->rootM", 0,
+        SL_CALL_AT("member-past-128-levels", "src/chain.php", "chain.useIt", "$c->rootM()", 0,
                    "src/chain.php", "C0.rootM", "Method", 3, "  public function rootM() {}"),
     };
     static const RQ_Forbidden forbidden[] = {
-        SL_DENY_AT("member-nobody-declares", "src/chain.php", "chain.useAbsent", "$c->neverM", 0),
+        SL_DENY_AT("member-nobody-declares", "src/chain.php", "chain.useAbsent", "$c->neverM()",
+                   0),
     };
     char *text = sl_chain_text("<?php\nclass C0 {\n  public function rootM() {}\n}\n",
                                "class C%d extends C%d {}\n",
@@ -6881,7 +6882,7 @@ TEST(resolver_source_swift_inheritance_of_any_depth) {
 
 TEST(resolver_source_ruby_inheritance_of_any_depth) {
     static const RQ_Expected expected[] = {
-        SL_CALL_AT("member-past-128-levels", "lib/chain.rb", "C199.use_it", "root_m", 0,
+        SL_CALL_AT("member-past-128-levels", "lib/chain.rb", "C199.use_it", "root_m", 1,
                    "lib/chain.rb", "C0.root_m", "Method", 2, "  def root_m; end"),
     };
     char *text = sl_chain_text("class C0\n  def root_m; end\nend\n", "class C%d < C%d; end\n",
@@ -6908,6 +6909,207 @@ TEST(resolver_source_scala_inheritance_of_any_depth) {
                          "object Filler { def f(): Unit = {} }\n", "README.md", NULL, text,
                          expected, sizeof(expected) / sizeof(expected[0]), forbidden,
                          sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── How many of a thing there are decides nothing ─────────────────── */
+
+/* A file of `lines` copies of one line, each @ its number, between a head and a tail. */
+static char *sl_repeat_text(const char *head, const char *line, int lines, const char *tail) {
+    char *text = NULL;
+    size_t used = 0, capacity = 0;
+    sl_append(&text, &used, &capacity, head);
+    for (int i = 0; i < lines; i++) {
+        char number[16];
+        snprintf(number, sizeof(number), "%d", i);
+        for (const char *at = line; *at; at++) {
+            char one[2] = {*at, 0};
+            sl_append(&text, &used, &capacity, *at == '@' ? number : one);
+        }
+    }
+    sl_append(&text, &used, &capacity, tail);
+    return text;
+}
+
+TEST(resolver_source_php_a_variable_of_many_writes_keeps_its_type) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("twelve-writes-of-one-class", "src/writes.php", "writes.same", "$x->run()", 0,
+                   "src/writes.php", "A.run", "Method", 2, "class A { public function run() {} }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("a-late-write-of-another-class", "src/writes.php", "writes.mixed", "$y->run()",
+                   0),
+    };
+    char *writes = sl_repeat_text("", "  $x = new A();\n", 12, "");
+    char *other = sl_repeat_text("", "  $y = new A();\n", 11, "  $y = new B();\n");
+    char *text = sl_sprintf("<?php\n"
+                            "class A { public function run() {} }\n"
+                            "class B { public function run() {} }\n"
+                            "function same() {\n%s  $x->run();\n}\n"
+                            "function mixed() {\n%s  $y->run();\n}\n",
+                            writes, other);
+    free(writes);
+    free(other);
+    RQ_Source sources[] = {{.path = "src/writes.php", .text = text}};
+    bool ok = sl_check("php-writes", ".php", "<?php\nfunction filler() {}\n", sources, 1, expected,
+                       sizeof(expected) / sizeof(expected[0]), forbidden,
+                       sizeof(forbidden) / sizeof(forbidden[0]));
+    free(text);
+    ASSERT(ok);
+    PASS();
+}
+
+TEST(resolver_source_php_a_class_of_many_traits_reads_them_all) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("the-seventieth-trait", "src/traits.php", "Big.go", "$this->inTrait69()", 0,
+                   "src/traits.php", "T69.inTrait69", "Method", 71,
+                   "trait T69 { public function inTrait69() {} }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("nobody-declares-it", "src/traits.php", "Big.go", "$this->inNoTrait()", 0),
+    };
+    char *traits = sl_repeat_text("<?php\n", "trait T@ { public function inTrait@() {} }\n", 70,
+                                  "class Big {\n");
+    char *uses = sl_repeat_text("", "  use T@;\n", 70,
+                                "  public function go() {\n    $this->inTrait69();\n"
+                                "    $this->inNoTrait();\n  }\n}\n");
+    char *text = sl_sprintf("%s%s", traits, uses);
+    free(traits);
+    free(uses);
+    RQ_Source sources[] = {{.path = "src/traits.php", .text = text}};
+    bool ok = sl_check("php-traits", ".php", "<?php\nfunction filler() {}\n", sources, 1, expected,
+                       sizeof(expected) / sizeof(expected[0]), forbidden,
+                       sizeof(forbidden) / sizeof(forbidden[0]));
+    free(text);
+    ASSERT(ok);
+    PASS();
+}
+
+TEST(resolver_source_dart_a_class_of_many_bases_reads_them_all) {
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("the-fortieth-interface", "lib/bases.dart", "bases.use", "b.inBase39", 0,
+                   "lib/bases.dart", "B39.inBase39", "Method", 40,
+                   "class B39 { void inBase39() {} }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("nobody-declares-it", "lib/bases.dart", "bases.useAbsent", "b.inNoBase", 0),
+    };
+    char *classes = sl_repeat_text("", "class B@ { void inBase@() {} }\n", 40, "class Big implements Z");
+    char *list = sl_repeat_text("", ", B@", 40,
+                                " {}\nclass Z {}\nvoid use(Big b) { b.inBase39(); }\n"
+                                "void useAbsent(Big b) { b.inNoBase(); }\n");
+    char *text = sl_sprintf("%s%s", classes, list);
+    free(classes);
+    free(list);
+    RQ_Source sources[] = {{.path = "pubspec.yaml", .text = "name: bases\n"},
+                           {.path = "lib/bases.dart", .text = text}};
+    bool ok = sl_check("dart-bases", ".dart", "void filler() {}\n", sources, 2, expected,
+                       sizeof(expected) / sizeof(expected[0]), forbidden,
+                       sizeof(forbidden) / sizeof(forbidden[0]));
+    free(text);
+    ASSERT(ok);
+    PASS();
+}
+
+TEST(resolver_source_shell_a_process_of_many_sourced_files) {
+    enum { SOURCED = 300 };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("the-three-hundredth-file", "main.sh", "main.run", "in299", 0, "lib/s299.sh",
+                   "s299.in299", "Function", 1, "in299() { :; }"),
+        SL_CALL_AT("through-a-later-file", "main.sh", "main.run", "further", 0, "lib/past.sh",
+                   "past.further", "Function", 1, "further() { :; }"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("a-file-nothing-sources", "main.sh", "main.run", "notSourced", 0),
+        SL_DENY_AT("two-files-declare-it", "main.sh", "main.run", "inTwo", 0),
+    };
+    size_t count = 0;
+    RQ_Source *sources = calloc((size_t)SOURCED + 4, sizeof(*sources));
+    ASSERT_NOT_NULL(sources);
+    for (int i = 0; i < SOURCED; i++) {
+        const char *extra = i == 299   ? ". lib/past.sh\n"
+                            : i == 280 || i == 290 ? "inTwo() { :; }\n"
+                                                   : "";
+        sources[count++] = (RQ_Source){.path = sl_sprintf("lib/s%d.sh", i),
+                                       .text = sl_sprintf("in%d() { :; }\n%s", i, extra)};
+    }
+    sources[count++] =
+        (RQ_Source){.path = strdup("lib/past.sh"), .text = strdup("further() { :; }\n")};
+    sources[count++] =
+        (RQ_Source){.path = strdup("lib/alone.sh"), .text = strdup("notSourced() { :; }\n")};
+    sources[count++] = (RQ_Source){
+        .path = strdup("main.sh"),
+        .text = sl_repeat_text("", ". lib/s@.sh\n", SOURCED,
+                               "run() {\n  in299\n  further\n  notSourced\n  inTwo\n}\n")};
+    bool ok = sl_check("shell-closure", ".sh", "filler() { :; }\n", sources, count, expected,
+                       sizeof(expected) / sizeof(expected[0]), forbidden,
+                       sizeof(forbidden) / sizeof(forbidden[0]));
+    sl_free_sources(sources, count);
+    ASSERT(ok);
+    PASS();
+}
+
+/* A file's own extension is what its import's local name comes to, and it is nobody's name: `sh`,
+ * `tcl` and `dart` called in such a file mean what they mean without it. */
+TEST(resolver_source_an_extension_is_no_local_name) {
+    /* Nothing here declares sh, tcl or dart, and each file has two rows whose local name is one. */
+    static const RQ_Source plain[] = {
+        {.path = "pubspec.yaml", .text = "name: ext\n"},
+        {.path = "sh1/main.sh",
+         .text = "source ./a.sh\nsource ./b.sh\nrun() {\n  sh ./x.sh\n  helper\n}\n"},
+        {.path = "sh1/a.sh", .text = "helper() {\n  echo a\n}\n"},
+        {.path = "sh1/b.sh", .text = "other() {\n  echo b\n}\n"},
+        {.path = "tcl1/main.tcl",
+         .text = "source a.tcl\nsource b.tcl\nproc run {} {\n  tcl foo\n  helper\n}\n"},
+        {.path = "tcl1/a.tcl", .text = "proc helper {} { return 1 }\n"},
+        {.path = "tcl1/b.tcl", .text = "proc other {} { return 1 }\n"},
+        {.path = "lib/d1.dart",
+         .text = "part 'p1.dart';\npart 'p2.dart';\nvoid run() {\n  dart();\n  helper();\n}\n"},
+        {.path = "lib/p1.dart", .text = "part of 'd1.dart';\nvoid helper() {}\n"},
+        {.path = "lib/p2.dart", .text = "part of 'd1.dart';\nvoid other() {}\n"},
+    };
+    static const RQ_Expected plain_expected[] = {
+        SL_CALL_AT("sourced-function", "sh1/main.sh", "main.run", "helper", 0, "sh1/a.sh",
+                   "a.helper", "Function", 1, "helper() {"),
+        SL_CALL_AT("sourced-proc", "tcl1/main.tcl", "main.run", "helper", 0, "tcl1/a.tcl",
+                   "a.helper", "Function", 1, "proc helper {} { return 1 }"),
+        SL_CALL_AT("function-of-a-part", "lib/d1.dart", "d1.run", "helper()", 0, "lib/p1.dart",
+                   "p1.helper", "Function", 2, "void helper() {}"),
+    };
+    static const RQ_Forbidden plain_forbidden[] = {
+        SL_DENY_AT("the-outside-command-sh", "sh1/main.sh", "main.run", "sh ./x.sh", 0),
+        SL_DENY_AT("the-outside-command-tcl", "tcl1/main.tcl", "main.run", "tcl foo", 0),
+        SL_DENY_AT("nobody-declares-dart", "lib/d1.dart", "d1.run", "dart()", 0),
+    };
+    ASSERT(sl_check("extension-names", ".dart", "void filler() {}\n", plain,
+                    sizeof(plain) / sizeof(plain[0]), plain_expected,
+                    sizeof(plain_expected) / sizeof(plain_expected[0]), plain_forbidden,
+                    sizeof(plain_forbidden) / sizeof(plain_forbidden[0])));
+    /* Here a sourced file or a part does declare one, and the call means it. */
+    static const RQ_Source declared[] = {
+        {.path = "pubspec.yaml", .text = "name: ext2\n"},
+        {.path = "sh2/main.sh", .text = "source ./a.sh\nsource ./b.sh\nrun() {\n  sh ./x.sh\n}\n"},
+        {.path = "sh2/a.sh", .text = "sh() {\n  echo mine\n}\n"},
+        {.path = "sh2/b.sh", .text = "other() {\n  echo b\n}\n"},
+        {.path = "tcl2/main.tcl", .text = "source a.tcl\nsource b.tcl\nproc run {} {\n  tcl foo\n}\n"},
+        {.path = "tcl2/a.tcl", .text = "proc tcl {x} { return 1 }\n"},
+        {.path = "tcl2/b.tcl", .text = "proc other {} { return 1 }\n"},
+        {.path = "lib/d2.dart",
+         .text = "part 'p3.dart';\npart 'p4.dart';\nvoid run2() {\n  dart();\n}\n"},
+        {.path = "lib/p3.dart", .text = "part of 'd2.dart';\nvoid dart() {}\n"},
+        {.path = "lib/p4.dart", .text = "part of 'd2.dart';\nvoid other4() {}\n"},
+    };
+    static const RQ_Expected declared_expected[] = {
+        SL_CALL_AT("a-function-really-called-sh", "sh2/main.sh", "main.run", "sh ./x.sh", 0,
+                   "sh2/a.sh", "a.sh", "Function", 1, "sh() {"),
+        SL_CALL_AT("a-proc-really-called-tcl", "tcl2/main.tcl", "main.run", "tcl foo", 0,
+                   "tcl2/a.tcl", "a.tcl", "Function", 1, "proc tcl {x} { return 1 }"),
+        SL_CALL_AT("a-function-really-called-dart", "lib/d2.dart", "d2.run2", "dart()", 0,
+                   "lib/p3.dart", "p3.dart", "Function", 2, "void dart() {}"),
+    };
+    ASSERT(sl_check("extension-names-declared", ".dart", "void filler() {}\n", declared,
+                    sizeof(declared) / sizeof(declared[0]), declared_expected,
+                    sizeof(declared_expected) / sizeof(declared_expected[0]), NULL, 0));
     PASS();
 }
 
@@ -6956,6 +7158,11 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_swift_inheritance_of_any_depth);
     RUN_TEST(resolver_source_ruby_inheritance_of_any_depth);
     RUN_TEST(resolver_source_scala_inheritance_of_any_depth);
+    RUN_TEST(resolver_source_php_a_variable_of_many_writes_keeps_its_type);
+    RUN_TEST(resolver_source_php_a_class_of_many_traits_reads_them_all);
+    RUN_TEST(resolver_source_dart_a_class_of_many_bases_reads_them_all);
+    RUN_TEST(resolver_source_shell_a_process_of_many_sourced_files);
+    RUN_TEST(resolver_source_an_extension_is_no_local_name);
     RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
     RUN_TEST(resolver_source_haskell_imports_and_scope);
     RUN_TEST(resolver_source_ocaml_sequential_scope_and_modules);

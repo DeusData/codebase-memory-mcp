@@ -50,7 +50,7 @@ static const char *csp_text(csp_context_t *ctx, TSNode node) {
                : NULL;
 }
 static bool csp_budget(csp_context_t *ctx, unsigned depth) {
-    if (++ctx->visited > 1000000 || depth > 128)
+    if (depth > 128)
         ctx->failed = true;
     return !ctx->failed;
 }
@@ -169,15 +169,11 @@ static bool csp_builtin_word(const char *text, uint32_t length) {
 
 bool cbm_c_preprocessor_domain_unsupported(TSNode root, const char *source) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
-    uint32_t visited = 0;
     bool unsupported = false;
+    /* One pass over the file, so its size decides nothing. */
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
-        if (++visited > 1000000) {
-            unsupported = true;
-            break;
-        }
         if (!strcmp(kind, "preproc_def") || !strcmp(kind, "preproc_function_def")) {
             TSNode name = ts_node_child_by_field_name(node, "name", 4);
             if (!ts_node_is_null(name) &&

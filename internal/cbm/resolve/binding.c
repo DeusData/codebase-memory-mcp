@@ -8,7 +8,7 @@
 #include <string.h>
 #include "syntax_index.h"
 
-enum { BINDING_MAX_DEPTH = 512, BINDING_MAX_NODES = 1000000, BINDING_INITIAL_CAP = 32 };
+enum { BINDING_MAX_DEPTH = 512, BINDING_INITIAL_CAP = 32 };
 enum {
     BINDING_DECLARATION = 1,
     BINDING_IMPORT = 2,
@@ -1606,8 +1606,9 @@ static bool python_block_always_exits(TSNode block, unsigned depth) {
 /* Every value this function returns, outside nested scopes. A bare return and
  * None say nothing about the class of the others. Returns false when one is not
  * an access path, or the function yields. */
-static bool python_gather_returns(cbm_resolve_binding_index_t *index, TSNode node, const char **out,
-                                  uint32_t *count, uint32_t room, unsigned depth) {
+static bool python_gather_returns(cbm_resolve_binding_index_t *index, TSNode node,
+                                  const char ***out, uint32_t *count, uint32_t *room,
+                                  unsigned depth) {
     if (depth > 48)
         return false;
     for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
@@ -1624,9 +1625,19 @@ static bool python_gather_returns(cbm_resolve_binding_index_t *index, TSNode nod
             if (kind_is(value, "none"))
                 continue;
             const char *chain = python_chain(index, value, 0);
-            if (!chain || *count >= room)
+            if (!chain)
                 return false;
-            out[(*count)++] = chain;
+            if (*count == *room) {
+                uint32_t capacity = *room ? *room * 2 : 4;
+                const char **items = cbm_arena_alloc(index->arena, capacity * sizeof(*items));
+                if (!items)
+                    return false;
+                if (*count)
+                    memcpy(items, *out, *count * sizeof(*items));
+                *out = items;
+                *room = capacity;
+            }
+            (*out)[(*count)++] = chain;
             continue;
         }
         if (!python_gather_returns(index, child, out, count, room, depth + 1))
@@ -1638,9 +1649,8 @@ static bool python_gather_returns(cbm_resolve_binding_index_t *index, TSNode nod
 /* Called once the function's own scope exists: its locals resolve the returns. */
 static void python_note_returns(cbm_resolve_binding_index_t *index, TSNode function, size_t member,
                                 uint32_t scope) {
-    enum { RETURNS_MAX = 16 };
-    const char *chains[RETURNS_MAX];
-    uint32_t count = 0;
+    const char **chains = NULL;
+    uint32_t count = 0, room = 0;
     /* `-> Self` and `def f(self: T) -> T` return the receiver, whichever class that is. */
     TSNode declared_return = field(function, "return_type");
     binding_scope_t *body_scope = scope < index->scope_count ? &index->scopes[scope] : NULL;
@@ -1679,7 +1689,7 @@ static void python_note_returns(cbm_resolve_binding_index_t *index, TSNode funct
                             !strcmp(name, "__class_getitem__"));
     if (member >= index->python_member_count ||
         (!special && !ts_node_is_null(field(function, "return_type"))) ||
-        !python_gather_returns(index, field(function, "body"), chains, &count, RETURNS_MAX, 0) ||
+        !python_gather_returns(index, field(function, "body"), &chains, &count, &room, 0) ||
         !count)
         return;
     const char **kept = cbm_arena_alloc(index->arena, (count + 1) * sizeof(*kept));
@@ -4059,10 +4069,9 @@ static void note_dart_import(cbm_resolve_binding_index_t *index, TSNode node) {
     cbm_resolve_source_import_t import = {0};
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     unsigned depth = 0;
-    uint32_t visited = 0;
     for (;;) {
         TSNode child = ts_tree_cursor_current_node(&cursor);
-        if (++visited > BINDING_MAX_NODES || depth >= BINDING_MAX_DEPTH) {
+        if (depth >= BINDING_MAX_DEPTH) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_LIMITED, "dart_import_walk_limit");
             break;
         }
@@ -5507,13 +5516,11 @@ static void walk_tree(cbm_resolve_binding_index_t *index, TSNode root) {
     const char *kinds[BINDING_MAX_DEPTH] = {0};
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     unsigned depth = 0;
-    uint32_t visited = 0;
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         /* This walk is linear in the file. A node count would void the largest
-         * ECMAScript sources for their size alone; only nesting has a real bound. */
-        if ((++visited > BINDING_MAX_NODES && !javascript_language(index->language)) ||
-            depth >= BINDING_MAX_DEPTH) {
+         * sources for their size alone; only nesting has a real bound. */
+        if (depth >= BINDING_MAX_DEPTH) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_LIMITED, "binding_walk_limit");
             break;
         }
@@ -5716,11 +5723,10 @@ static void python_follow_write_aliases(cbm_resolve_binding_index_t *index) {
 static void python_namespace_effects(cbm_resolve_binding_index_t *index, TSNode root) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     unsigned depth = 0;
-    size_t visited = 0;
     index->python_effects_complete = true;
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (++visited > BINDING_MAX_NODES || depth > BINDING_MAX_DEPTH) {
+        if (depth > BINDING_MAX_DEPTH) {
             index->python_effects_complete = false;
             index->python_writes_unseen = true;
             break;

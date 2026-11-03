@@ -45,7 +45,7 @@
 #define SCALA_TYPE_NAME "type:"
 #define SCALA_OBJECT_NAME "object:"
 
-enum { SCALA_MAX_PACKAGES = 8, SCALA_MAX_BASES = 32 };
+enum { SCALA_MAX_PACKAGES = 8 };
 
 typedef struct scala_local {
     const char *name;
@@ -286,8 +286,7 @@ static void scala_collect_members(cbm_source_walk_t *walk, const char *package, 
 
 static void scala_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_decl_t *record,
                              const char *type_params) {
-    const char *found[SCALA_MAX_BASES];
-    size_t used = 0;
+    cbm_source_names_t found = {0};
     bool open = false;
     TSNode extend = cbm_source_field(node, "extend");
     uint32_t count = ts_node_is_null(extend) ? 0 : ts_node_named_child_count(extend);
@@ -296,17 +295,14 @@ static void scala_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_de
         if (cbm_source_is(child, "arguments"))
             continue;
         const char *text = scala_type_text(walk, child, type_params);
-        if (!text || used == SCALA_MAX_BASES)
-            open = true;
-        else
-            found[used++] = text;
+        open |= !text || !cbm_source_names_push(walk, &found, text);
     }
-    const char **copy = cbm_source_table_alloc(walk, (used + 1) * sizeof(*copy));
+    const char **copy = cbm_source_table_alloc(walk, (found.count + 1) * sizeof(*copy));
     if (!copy)
         return;
-    for (size_t i = 0; i < used; i++)
-        copy[i] = cbm_source_table_intern(walk, found[i]);
-    copy[used] = NULL;
+    for (size_t i = 0; i < found.count; i++)
+        copy[i] = cbm_source_table_intern(walk, found.items[i]);
+    copy[found.count] = NULL;
     record->bases = copy;
     if (open)
         record->flags |= CBM_SOURCE_DECL_F_OPEN;

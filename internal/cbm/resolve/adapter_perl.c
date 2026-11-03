@@ -42,7 +42,6 @@
 #include <stdlib.h>
 #include "syntax_index.h"
 
-enum { PERL_MAX_BASES = 32 };
 
 #define PERL_EXPORTER_KEY "&exporter"
 #define PERL_EXPORT_PREFIX "&export:"
@@ -165,16 +164,9 @@ static bool perl_literal_words(perl_ctx_t *ctx, TSNode node, perl_word_fn fn, vo
     return false;
 }
 
-typedef struct {
-    const char *words[PERL_MAX_BASES];
-    size_t count;
-} perl_words_t;
-
 static void perl_gather_word(perl_ctx_t *ctx, const char *word, void *user) {
-    (void)ctx;
-    perl_words_t *list = user;
-    if (list->count < PERL_MAX_BASES)
-        list->words[list->count++] = word;
+    if (!cbm_source_names_push(ctx->walk, user, word))
+        cbm_source_fail(ctx->walk, "perl_word_allocation");
 }
 
 static TSNode perl_use_arguments(TSNode use) {
@@ -241,29 +233,29 @@ static void perl_collect_use(perl_ctx_t *ctx, TSNode use) {
             (void)perl_literal_words(ctx, arguments, perl_declare_imported, (void *)module);
         return;
     }
-    perl_words_t words = {0};
+    cbm_source_names_t words = {0};
     bool literal =
         ts_node_is_null(arguments) || perl_literal_words(ctx, arguments, perl_gather_word, &words);
     if (mojo) {
         /* -base means the Mojo::Base class itself, -strict and -signatures add no
          * parent, and -role composes methods this walk does not model. */
-        perl_words_t parents = {0};
+        cbm_source_names_t parents = {0};
         bool open = !literal;
         for (size_t i = 0; i < words.count; i++) {
-            if (!strcmp(words.words[i], "-base"))
+            if (!strcmp(words.items[i], "-base"))
                 perl_gather_word(ctx, "Mojo::Base", &parents);
-            else if (!strcmp(words.words[i], "-role"))
+            else if (!strcmp(words.items[i], "-role"))
                 open = true;
-            else if (words.words[i][0] != '-')
-                perl_gather_word(ctx, words.words[i], &parents);
+            else if (words.items[i][0] != '-')
+                perl_gather_word(ctx, words.items[i], &parents);
         }
-        perl_set_bases(ctx, ctx->package, parents.words, parents.count, line, open);
+        perl_set_bases(ctx, ctx->package, parents.items, parents.count, line, open);
         return;
     }
     for (size_t i = 0; i < words.count; i++)
-        if (!strcmp(words.words[i], "Exporter"))
+        if (!strcmp(words.items[i], "Exporter"))
             perl_note_exporter(ctx, ctx->package, line);
-    perl_set_bases(ctx, ctx->package, words.words, words.count, line, !literal);
+    perl_set_bases(ctx, ctx->package, words.items, words.count, line, !literal);
 }
 
 // cppcheck-suppress constParameterCallback
@@ -279,12 +271,12 @@ static void perl_collect_array(perl_ctx_t *ctx, const char *array, TSNode right,
     if (!array)
         return;
     if (!strcmp(array, "ISA")) {
-        perl_words_t words = {0};
+        cbm_source_names_t words = {0};
         bool literal = perl_literal_words(ctx, right, perl_gather_word, &words);
         for (size_t i = 0; i < words.count; i++)
-            if (!strcmp(words.words[i], "Exporter"))
+            if (!strcmp(words.items[i], "Exporter"))
                 perl_note_exporter(ctx, ctx->package, line);
-        perl_set_bases(ctx, ctx->package, words.words, words.count, line, !literal);
+        perl_set_bases(ctx, ctx->package, words.items, words.count, line, !literal);
     } else if (!strcmp(array, "EXPORT") || !strcmp(array, "EXPORT_OK")) {
         (void)perl_literal_words(ctx, right, perl_declare_export, (void *)ctx->package);
     }
@@ -416,13 +408,13 @@ static void perl_collect_node(perl_ctx_t *ctx, TSNode node, unsigned depth) {
                     const char *array =
                         cbm_source_text(ctx->walk, ts_node_named_child(arguments, 0));
                     if (array && !strcmp(array, "@ISA")) {
-                        perl_words_t words = {0};
+                        cbm_source_names_t words = {0};
                         uint32_t count = ts_node_named_child_count(arguments);
                         bool literal = true;
                         for (uint32_t i = 1; i < count; i++)
                             literal &= perl_literal_words(ctx, ts_node_named_child(arguments, i),
                                                           perl_gather_word, &words);
-                        perl_set_bases(ctx, ctx->package, words.words, words.count,
+                        perl_set_bases(ctx, ctx->package, words.items, words.count,
                                        ts_node_start_point(child).row + 1, !literal);
                     }
                 }

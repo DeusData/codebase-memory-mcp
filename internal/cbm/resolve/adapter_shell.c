@@ -24,14 +24,16 @@
 #define SHELL_VARIABLES "V:"
 #define SHELL_LOCALS "W:"
 #define SHELL_FILES "P:"
+#define SHELL_DECLARERS "D:" /* a row per function: its name, and the file declaring it */
 
-enum { SHELL_PATH_BUF = 1024, SHELL_CLOSURE_MAX = 256 };
+enum { SHELL_PATH_BUF = 1024 };
 
 typedef struct {
     cbm_source_walk_t *walk;
     const char *functions, *sources, *unset, *variables, *locals;
     const char **closure; /* files this script's process consists of, itself first */
     size_t closure_count;
+    cbm_source_chain_t closure_seen;
     unsigned function_depth;
 } shell_ctx_t;
 
@@ -221,6 +223,9 @@ static void shell_collect_walk(shell_ctx_t *ctx, TSNode node, unsigned depth) {
             uint32_t line = ts_node_start_point(node).row + 1;
             (void)cbm_source_declare(walk, ctx->functions, name,
                                      cbm_source_def_qn_at(walk, name, line), 0, line);
+            cbm_source_decl_t *row = cbm_source_declare(walk, SHELL_DECLARERS, name, NULL, 0, line);
+            if (row)
+                row->type = cbm_source_table_intern(walk, walk->file);
         }
     } else if (cbm_source_is(node, "command")) {
         const char *word = shell_command_word(walk, node);
@@ -273,33 +278,44 @@ static void shell_collect(cbm_source_walk_t *walk) {
     shell_collect_walk(&ctx, walk->root, 0);
 }
 
-static bool shell_in_closure(const shell_ctx_t *ctx, const char *file) {
-    for (size_t i = 0; i < ctx->closure_count; i++)
-        if (!strcmp(ctx->closure[i], file))
-            return true;
-    return false;
+static bool shell_push_closure(shell_ctx_t *ctx, size_t *capacity, const char *file) {
+    if (ctx->closure_count == *capacity) {
+        size_t grown = *capacity ? *capacity * 2 : 16;
+        const char **items = cbm_arena_alloc(ctx->walk->arena, grown * sizeof(*items));
+        if (!items)
+            return false;
+        if (ctx->closure_count)
+            memcpy(items, ctx->closure, ctx->closure_count * sizeof(*items));
+        ctx->closure = items;
+        *capacity = grown;
+    }
+    ctx->closure[ctx->closure_count++] = file;
+    return true;
 }
 
-/* Breadth first through literal `source` statements; each file enters once. Past the bound the
- * process is not fully known, and a name no file so far declares stays unknown. */
+/* Breadth first through literal `source` statements; each file enters once. */
 static bool shell_build_closure(shell_ctx_t *ctx) {
     cbm_source_walk_t *walk = ctx->walk;
-    ctx->closure = cbm_arena_calloc(walk->arena, SHELL_CLOSURE_MAX * sizeof(*ctx->closure));
-    if (!ctx->closure)
+    cbm_source_chain_t *seen = &ctx->closure_seen;
+    size_t capacity = 0;
+    if (!cbm_source_chain_first_visit(walk, seen, walk->file) ||
+        !shell_push_closure(ctx, &capacity, walk->file))
         return false;
-    ctx->closure[ctx->closure_count++] = walk->file;
     for (size_t at = 0; at < ctx->closure_count; at++) {
         const char *owner = cbm_arena_sprintf(walk->arena, SHELL_SOURCES "%s", ctx->closure[at]);
         if (!owner)
             return false;
         for (const cbm_source_decl_t *entry = cbm_source_lookup(walk, owner, ""); entry;
              entry = entry->next) {
-            if (!entry->type || !cbm_source_lookup(walk, SHELL_FILES, entry->type) ||
-                shell_in_closure(ctx, entry->type))
+            if (!entry->type || !cbm_source_lookup(walk, SHELL_FILES, entry->type))
                 continue;
-            if (ctx->closure_count == SHELL_CLOSURE_MAX)
-                return true;
-            ctx->closure[ctx->closure_count++] = entry->type;
+            if (!cbm_source_chain_first_visit(walk, seen, entry->type)) {
+                if (seen->overflow)
+                    return false;
+                continue;
+            }
+            if (!shell_push_closure(ctx, &capacity, entry->type))
+                return false;
         }
     }
     return true;
@@ -332,10 +348,13 @@ static void shell_visit_command(shell_ctx_t *ctx, TSNode command) {
         return;
     }
     const cbm_source_decl_t *found = NULL;
-    for (size_t i = 1; i < ctx->closure_count; i++) {
-        const char *owner = cbm_arena_sprintf(walk->arena, SHELL_FUNCTIONS "%s", ctx->closure[i]);
+    for (const cbm_source_decl_t *row = cbm_source_lookup(walk, SHELL_DECLARERS, word); row;
+         row = row->next) {
+        if (!strcmp(row->type, walk->file) || !cbm_source_chain_has(&ctx->closure_seen, row->type))
+            continue;
+        const char *owner = cbm_arena_sprintf(walk->arena, SHELL_FUNCTIONS "%s", row->type);
         const cbm_source_decl_t *decl = owner ? cbm_source_lookup(walk, owner, word) : NULL;
-        if (!decl)
+        if (!decl || decl == found)
             continue;
         /* The later `source` wins at runtime, and order across files is not modelled. */
         if (found && (!decl->qn || !found->qn || strcmp(decl->qn, found->qn))) {

@@ -54,7 +54,7 @@ static const char *kt_proof_text(kt_proof_source_t *source, TSNode node) {
                : NULL;
 }
 static bool kt_proof_budget(kt_proof_source_t *source, unsigned depth) {
-    if (++source->visits > 1000000 || depth > 128)
+    if (depth > 128)
         source->failed = true;
     return !source->failed;
 }

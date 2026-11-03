@@ -26,7 +26,7 @@
 #include <stdlib.h>
 #include "syntax_index.h"
 
-enum { PHP_MAX_WRITES = 8, PHP_MAX_EXPR_DEPTH = 24 };
+enum { PHP_MAX_EXPR_DEPTH = 24 };
 
 typedef enum { PHP_USE_CLASS, PHP_USE_FUNCTION, PHP_USE_CONST } php_use_kind_t;
 
@@ -52,8 +52,8 @@ typedef struct php_var {
     const char *type;     /* proven canonical type */
     bool param, blocked, computed, computing;
     uint32_t available_from, escaped_from;
-    TSNode rhs[PHP_MAX_WRITES];
-    int writes;
+    TSNode *rhs; /* every write's value, in source order */
+    int writes, write_capacity;
     struct php_var *next;
 } php_var_t;
 
@@ -359,10 +359,13 @@ static void php_declare_method(php_ctx_t *ctx, const char *owner, TSNode method)
     }
 }
 
+static void php_push_base(php_ctx_t *ctx, cbm_source_names_t *found, const char *entry) {
+    if (!cbm_source_names_push(ctx->walk, found, entry))
+        cbm_source_fail(ctx->walk, "php_base_allocation");
+}
+
 static const char *const *php_bases(php_ctx_t *ctx, TSNode node, const char **parent) {
-    enum { MAX_BASES = 64 };
-    const char *found[MAX_BASES];
-    size_t used = 0;
+    cbm_source_names_t found = {0};
     *parent = NULL;
     uint32_t count = ts_node_named_child_count(node);
     bool interface = cbm_source_is(node, "interface_declaration");
@@ -373,7 +376,7 @@ static const char *const *php_bases(php_ctx_t *ctx, TSNode node, const char **pa
         if (!base && !implements)
             continue;
         uint32_t members = ts_node_named_child_count(child);
-        for (uint32_t m = 0; m < members && used < MAX_BASES; m++) {
+        for (uint32_t m = 0; m < members; m++) {
             TSNode member = ts_node_named_child(child, m);
             if (!cbm_source_is(member, "name") && !cbm_source_is(member, "qualified_name"))
                 continue;
@@ -384,8 +387,9 @@ static const char *const *php_bases(php_ctx_t *ctx, TSNode node, const char **pa
             bool is_parent = base && !interface;
             if (is_parent)
                 *parent = canonical;
-            found[used++] =
-                cbm_arena_sprintf(ctx->walk->arena, "%c:%s", is_parent ? 'P' : 'I', canonical);
+            php_push_base(
+                ctx, &found,
+                cbm_arena_sprintf(ctx->walk->arena, "%c:%s", is_parent ? 'P' : 'I', canonical));
         }
     }
     TSNode body = cbm_source_field(node, "body");
@@ -395,21 +399,21 @@ static const char *const *php_bases(php_ctx_t *ctx, TSNode node, const char **pa
         if (!cbm_source_is(child, "use_declaration"))
             continue;
         uint32_t members = ts_node_named_child_count(child);
-        for (uint32_t m = 0; m < members && used < MAX_BASES; m++) {
+        for (uint32_t m = 0; m < members; m++) {
             TSNode member = ts_node_named_child(child, m);
             if (!cbm_source_is(member, "name") && !cbm_source_is(member, "qualified_name"))
                 continue;
             const char *canonical = php_class_name(ctx, cbm_source_text(ctx->walk, member));
             if (canonical)
-                found[used++] = cbm_arena_sprintf(ctx->walk->arena, "T:%s", canonical);
+                php_push_base(ctx, &found, cbm_arena_sprintf(ctx->walk->arena, "T:%s", canonical));
         }
     }
-    const char **copy = cbm_source_table_alloc(ctx->walk, (used + 1) * sizeof(*copy));
+    const char **copy = cbm_source_table_alloc(ctx->walk, (found.count + 1) * sizeof(*copy));
     if (!copy)
         return NULL;
-    for (size_t i = 0; i < used; i++)
-        copy[i] = cbm_source_table_intern(ctx->walk, found[i]);
-    copy[used] = NULL;
+    for (size_t i = 0; i < found.count; i++)
+        copy[i] = cbm_source_table_intern(ctx->walk, found.items[i]);
+    copy[found.count] = NULL;
     return copy;
 }
 
@@ -785,11 +789,21 @@ static void php_audit_scope(php_ctx_t *ctx, php_scope_t *scope, TSNode node, uns
             const char *name = cbm_source_text(ctx->walk, left);
             php_var_t *var = name ? php_var(ctx, scope, name) : NULL;
             if (var) {
-                if (var->writes < PHP_MAX_WRITES)
-                    var->rhs[var->writes] = right;
+                if (var->writes == var->write_capacity) {
+                    int capacity = var->write_capacity ? var->write_capacity * 2 : 4;
+                    TSNode *rhs =
+                        cbm_arena_alloc(ctx->walk->arena, (size_t)capacity * sizeof(*rhs));
+                    if (rhs) {
+                        if (var->writes)
+                            memcpy(rhs, var->rhs, (size_t)var->writes * sizeof(*rhs));
+                        var->rhs = rhs;
+                        var->write_capacity = capacity;
+                    }
+                }
+                if (var->writes < var->write_capacity)
+                    var->rhs[var->writes++] = right;
                 else
                     var->blocked = true;
-                var->writes++;
                 uint32_t end = ts_node_end_byte(node);
                 if (!var->available_from || end < var->available_from)
                     var->available_from = end;
@@ -950,7 +964,7 @@ static const char *php_var_class(php_ctx_t *ctx, php_scope_t *scope, const char 
         var->computing = true;
         const char *type = var->param ? var->declared : NULL;
         bool consistent = !var->param || var->declared;
-        for (int w = 0; consistent && w < var->writes && w < PHP_MAX_WRITES; w++) {
+        for (int w = 0; consistent && w < var->writes; w++) {
             const char *written =
                 php_expr_class(ctx, scope, var->rhs[w], ts_node_start_byte(var->rhs[w]), depth + 1);
             consistent = written && (!type || !strcmp(type, written));

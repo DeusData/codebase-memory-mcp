@@ -460,9 +460,7 @@ static const char *dart_base_entry(cbm_source_walk_t *walk, char tag, TSNode typ
 
 /* Each base is recorded with its role, since the roles are searched in order. */
 static void dart_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_decl_t *record) {
-    enum { MAX_BASES = 32 };
-    const char *found[MAX_BASES];
-    size_t used = 0;
+    cbm_source_names_t found = {0};
     bool open = false;
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
@@ -474,8 +472,8 @@ static void dart_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_dec
         /* `mixin M on Base` and `extension E on Base` see Base's members as their own. */
         if (cbm_source_is(child, "type_identifier")) {
             const char *entry = dart_base_entry(walk, 'S', child);
-            if (entry && used < MAX_BASES)
-                found[used++] = entry;
+            if (entry)
+                open |= !cbm_source_names_push(walk, &found, entry);
             continue;
         }
         if (!tag)
@@ -490,21 +488,17 @@ static void dart_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_dec
                 if (!cbm_source_is(type, "type_identifier"))
                     continue;
                 const char *entry = dart_base_entry(walk, nested ? 'M' : tag, type);
-                if (!entry)
-                    continue;
-                if (used == MAX_BASES)
-                    open = true;
-                else
-                    found[used++] = entry;
+                if (entry)
+                    open |= !cbm_source_names_push(walk, &found, entry);
             }
         }
     }
-    const char **copy = cbm_source_table_alloc(walk, (used + 1) * sizeof(*copy));
+    const char **copy = cbm_source_table_alloc(walk, (found.count + 1) * sizeof(*copy));
     if (!copy)
         return;
-    for (size_t i = 0; i < used; i++)
-        copy[i] = found[i] ? cbm_source_table_intern(walk, found[i]) : NULL;
-    copy[used] = NULL;
+    for (size_t i = 0; i < found.count; i++)
+        copy[i] = found.items[i] ? cbm_source_table_intern(walk, found.items[i]) : NULL;
+    copy[found.count] = NULL;
     record->bases = copy;
     if (open)
         record->flags |= CBM_SOURCE_DECL_F_OPEN;

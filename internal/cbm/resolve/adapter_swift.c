@@ -56,7 +56,7 @@
 #define SWIFT_TARGET_KEY "@cbm:raw:swift-target:"
 #define SWIFT_AMBIGUOUS_PREFIX "@cbm:"
 
-enum { SWIFT_MAX_LABELS = 32, SWIFT_MAX_BASES = 32, SWIFT_MAX_INITIALIZER_CHAIN = 64 };
+enum { SWIFT_MAX_LABELS = 32, SWIFT_MAX_INITIALIZER_CHAIN = 64 };
 /* A type record of a struct: with no initializer anywhere it has one for its stored properties. */
 enum { SWIFT_RECORD_STRUCT = 1u << 16 };
 /* A parameter whose written type is a function: a trailing closure goes to one of these first.
@@ -599,8 +599,7 @@ static TSNode swift_body_of(TSNode node) {
 }
 
 static void swift_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_decl_t *record) {
-    const char *found[SWIFT_MAX_BASES];
-    size_t used = 0;
+    cbm_source_names_t found = {0};
     bool open = false;
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
@@ -608,17 +607,14 @@ static void swift_note_bases(cbm_source_walk_t *walk, TSNode node, cbm_source_de
         if (!cbm_source_is(child, "inheritance_specifier"))
             continue;
         const char *text = swift_type_text(walk, cbm_source_field(child, "inherits_from"), 0);
-        if (!text || used == SWIFT_MAX_BASES)
-            open = true;
-        else
-            found[used++] = text;
+        open |= !text || !cbm_source_names_push(walk, &found, text);
     }
-    const char **copy = cbm_source_table_alloc(walk, (used + 1) * sizeof(*copy));
+    const char **copy = cbm_source_table_alloc(walk, (found.count + 1) * sizeof(*copy));
     if (!copy)
         return;
-    for (size_t i = 0; i < used; i++)
-        copy[i] = cbm_source_table_intern(walk, found[i]);
-    copy[used] = NULL;
+    for (size_t i = 0; i < found.count; i++)
+        copy[i] = cbm_source_table_intern(walk, found.items[i]);
+    copy[found.count] = NULL;
     record->bases = copy;
     if (open)
         record->flags |= CBM_SOURCE_DECL_F_OPEN;

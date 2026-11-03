@@ -2160,26 +2160,38 @@ static bool c_proof_signature_equal(const CBMType *left, const CBMType *right) {
 static bool c_proof_file_reaches(CLSPContext *ctx, const char *from, const char *to) {
     if (!strcmp(from, to))
         return true;
-    enum { REACH_LIMIT = 4096 };
-    const char **seen = cbm_arena_alloc(ctx->arena, REACH_LIMIT * sizeof(*seen));
-    if (!seen)
+    CBMHashTable *known = cbm_ht_create(64);
+    if (!known)
         return false;
-    int head = 0, tail = 0;
-    seen[tail++] = from;
-    while (head < tail) {
-        const CBMCFileFacts *facts = cbm_c_file_facts(ctx->c_decls, seen[head++]);
-        for (int n = 0; facts && n < facts->include_count; n++) {
+    /* A file enters once; each entry lives on the arena, so the walk needs no second list. */
+    typedef struct c_reach_file {
+        const char *file;
+        struct c_reach_file *next;
+    } c_reach_file_t;
+    c_reach_file_t *head = cbm_arena_alloc(ctx->arena, sizeof(*head));
+    c_reach_file_t *tail = head;
+    if (head)
+        *head = (c_reach_file_t){.file = from};
+    cbm_ht_set(known, from, (void *)from);
+    bool reached = false;
+    for (; head && !reached; head = head->next) {
+        const CBMCFileFacts *facts = cbm_c_file_facts(ctx->c_decls, head->file);
+        for (int n = 0; facts && n < facts->include_count && !reached; n++) {
             const char *next = facts->includes[n];
-            if (!strcmp(next, to))
-                return true;
-            bool known = false;
-            for (int k = 0; k < tail && !known; k++)
-                known = !strcmp(seen[k], next);
-            if (!known && tail < REACH_LIMIT)
-                seen[tail++] = next;
+            reached = !strcmp(next, to);
+            if (reached || cbm_ht_get(known, next))
+                continue;
+            c_reach_file_t *entry = cbm_arena_alloc(ctx->arena, sizeof(*entry));
+            if (!entry)
+                continue;
+            *entry = (c_reach_file_t){.file = next};
+            tail->next = entry;
+            tail = entry;
+            cbm_ht_set(known, next, (void *)next);
         }
     }
-    return false;
+    cbm_ht_free(known);
+    return reached;
 }
 
 static const char *c_proof_func_file(CLSPContext *ctx, const CBMRegisteredFunc *candidate,

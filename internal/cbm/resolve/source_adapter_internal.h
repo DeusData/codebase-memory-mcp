@@ -71,7 +71,6 @@ typedef struct cbm_source_walk {
     const cbm_source_table_t *table; /* phase two only */
     cbm_source_unit_t *unit;         /* phase two only */
     TSNode root;
-    uint64_t visits;
     const char *failure;
     const char *top_owner; /* collect: the owner a language files its top-level names under */
     CBMHashTable *def_index; /* lazily built, owned by the walk */
@@ -143,6 +142,9 @@ typedef struct {
 bool cbm_source_chain_first_visit(cbm_source_walk_t *walk, cbm_source_chain_t *chain,
                                   const char *owner);
 
+/* Whether this walk has visited the name. */
+bool cbm_source_chain_has(const cbm_source_chain_t *chain, const char *owner);
+
 /* A walker that recurses: first_visit, and one level deeper until the matching leave. */
 static inline bool cbm_source_chain_enter(cbm_source_walk_t *walk, cbm_source_chain_t *chain,
                                           const char *owner) {
@@ -159,6 +161,13 @@ static inline void cbm_source_chain_leave(cbm_source_chain_t *chain) {
     chain->depth--;
 }
 
+/* A list that grows on the walk's arena, as a declaration's parent names are gathered. */
+typedef struct {
+    const char **items;
+    size_t count, capacity;
+} cbm_source_names_t;
+bool cbm_source_names_push(cbm_source_walk_t *walk, cbm_source_names_t *names, const char *name);
+
 /* Syntax helpers shared by the language files; none of them decides anything. */
 static inline bool cbm_source_is(TSNode node, const char *kind) {
     return !ts_node_is_null(node) && strcmp(ts_node_type(node), kind) == 0;
@@ -172,7 +181,7 @@ static inline TSNode cbm_source_field(TSNode node, const char *name) {
 TSNode cbm_source_named_field(TSNode node, const char *name);
 const char *cbm_source_text(cbm_source_walk_t *walk, TSNode node);
 const char *cbm_source_lower(cbm_source_walk_t *walk, const char *text);
-/* True while the file's walk stays inside its analysis budget. */
+/* True while the file's walk is not nested past what its stack can take. */
 bool cbm_source_step(cbm_source_walk_t *walk, unsigned depth);
 void cbm_source_fail(cbm_source_walk_t *walk, const char *reason);
 bool cbm_source_token(TSNode node, const char *token);

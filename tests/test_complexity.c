@@ -58,6 +58,7 @@
 #include "lsp/rust_proof.h"
 #include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "resolve/source_adapter_internal.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
@@ -3520,7 +3521,7 @@ TEST(complexity_dart_barrel_exports_are_near_linear) {
 /* A type's ancestors, however many, are each read once. `deep` is a line of classes, one a level;
  * otherwise one class implements them all, which recurses one level. The member is nobody's, so
  * the walk reads them all. */
-static uint64_t cx_dart_ancestors_work(int ancestors, bool deep) {
+static uint64_t cx_dart_ancestors_work(int ancestors, bool deep, bool asked) {
     size_t room = (size_t)ancestors * 64 + 256;
     char *text = malloc(room);
     if (!text)
@@ -3532,13 +3533,14 @@ static uint64_t cx_dart_ancestors_work(int ancestors, bool deep) {
                                         i - 1)
                      : (size_t)snprintf(text + used, room - used, "class C%d {}\n", i);
     if (deep) {
-        used += (size_t)snprintf(text + used, room - used, "void use(C%d c) { c.nobody(); }\n",
-                                 ancestors - 1);
+        used += (size_t)snprintf(text + used, room - used, "void use(C%d c) { %s }\n",
+                                 ancestors - 1, asked ? "c.nobody();" : "");
     } else {
         used += (size_t)snprintf(text + used, room - used, "class All implements C0");
         for (int i = 1; i < ancestors; i++)
             used += (size_t)snprintf(text + used, room - used, ", C%d", i);
-        used += (size_t)snprintf(text + used, room - used, " {}\nvoid use(All c) { c.nobody(); }\n");
+        used += (size_t)snprintf(text + used, room - used, " {}\nvoid use(All c) { %s }\n",
+                                 asked ? "c.nobody();" : "");
     }
     CxSourceFile file = {.text = text};
     snprintf(file.path, sizeof(file.path), "lib/chain.dart");
@@ -3546,9 +3548,15 @@ static uint64_t cx_dart_ancestors_work(int ancestors, bool deep) {
     free(text);
     return work;
 }
+/* What asking one member costs, apart from reading the file. */
+static uint64_t cx_dart_walk_work(int ancestors, bool deep) {
+    uint64_t asked = cx_dart_ancestors_work(ancestors, deep, true);
+    uint64_t silent = cx_dart_ancestors_work(ancestors, deep, false);
+    return asked > silent ? asked - silent : 0;
+}
 static bool cx_dart_ancestors_are_near_linear(int ancestors, bool deep) {
-    uint64_t first = cx_dart_ancestors_work(ancestors, deep);
-    uint64_t second = cx_dart_ancestors_work(ancestors * 2, deep);
+    uint64_t first = cx_dart_walk_work(ancestors, deep);
+    uint64_t second = cx_dart_walk_work(ancestors * 2, deep);
     double ratio = cx_ratio((double)second, (double)first);
     printf("    dart %s ancestors %d: probes %llu -> %llu (ratio %.2f)\n", deep ? "deep" : "wide",
            ancestors, (unsigned long long)first, (unsigned long long)second, ratio);
@@ -3559,6 +3567,100 @@ TEST(complexity_source_chain_walk_reads_every_ancestor_once) {
     bool deep = cx_dart_ancestors_are_near_linear(400, true);
     ASSERT_TRUE(wide);
     ASSERT_TRUE(deep);
+    PASS();
+}
+
+/* A process sourcing every library, and calling something of each. */
+static uint64_t cx_shell_sources_work(int sourced) {
+    CxSourceFile *files = calloc((size_t)sourced + 1, sizeof(*files));
+    size_t room = (size_t)sourced * 48 + 64;
+    char *text = malloc(room);
+    if (!files || !text) {
+        free(files);
+        free(text);
+        return 0;
+    }
+    size_t used = 0;
+    bool ok = true;
+    for (int i = 0; ok && i < sourced; i++) {
+        used += (size_t)snprintf(text + used, room - used, ". ./s%d.sh\n", i);
+        snprintf(files[i].path, sizeof(files[i].path), "s%d.sh", i);
+        files[i].text = malloc(48);
+        ok = files[i].text != NULL;
+        if (ok)
+            snprintf(files[i].text, 48, "f%d() { :; }\n", i);
+    }
+    used += (size_t)snprintf(text + used, room - used, "run() {\n");
+    for (int i = 0; ok && i < sourced; i++)
+        used += (size_t)snprintf(text + used, room - used, "  f%d\n", i);
+    used += (size_t)snprintf(text + used, room - used, "}\n");
+    snprintf(files[sourced].path, sizeof(files[sourced].path), "main.sh");
+    files[sourced].text = text;
+    uint64_t work = ok ? cx_source_work(CBM_LANG_BASH, files, sourced + 1) : 0;
+    for (int i = 0; i <= sourced; i++)
+        free(files[i].text);
+    free(files);
+    return work;
+}
+TEST(complexity_shell_commands_of_a_big_process_are_near_linear) {
+    uint64_t first = cx_shell_sources_work(500);
+    uint64_t second = cx_shell_sources_work(1000);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    shell closure commands: probes %llu -> %llu (ratio %.2f)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)500);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* The seen set itself: names enter once, and a long walk stays cheap per name. */
+static uint64_t cx_seen_set_work(int names, bool *held) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_source_walk_t walk = {.arena = &arena};
+    cbm_source_chain_t chain = {0};
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    char **texts = malloc((size_t)names * sizeof(*texts));
+    *held = texts != NULL;
+    for (int i = 0; *held && i < names; i++) {
+        texts[i] = cbm_arena_sprintf(&arena, "lib/deep/n%d.dart", i);
+        *held &= cbm_source_chain_first_visit(&walk, &chain, texts[i]);
+        *held &= cbm_source_chain_has(&chain, texts[i]);
+    }
+    for (int i = 0; *held && i < names; i++)
+        *held &= !cbm_source_chain_first_visit(&walk, &chain, texts[i]);
+    *held = *held && !chain.overflow && chain.count == (size_t)names;
+    cbm_resolve_stats_bind(previous);
+    uint64_t work = cx_stat_work(&stats, CBM_RESOLVE_STAT_LOOKUP_PROBES);
+    free(texts);
+    cbm_arena_destroy(&arena);
+    return work;
+}
+TEST(complexity_source_chain_seen_set_grows) {
+    bool first_held = false, second_held = false;
+    uint64_t first = cx_seen_set_work(5000, &first_held);
+    uint64_t second = cx_seen_set_work(10000, &second_held);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    seen set: probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_TRUE(first_held && second_held);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    /* The depth guard: one name past it stops the walk and says so. */
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_source_walk_t walk = {.arena = &arena};
+    cbm_source_chain_t chain = {0};
+    bool entered = true;
+    for (int i = 0; i < CBM_SOURCE_CHAIN_DEPTH_MAX; i++)
+        entered &= cbm_source_chain_enter(&walk, &chain, cbm_arena_sprintf(&arena, "n%d", i));
+    bool past = cbm_source_chain_enter(&walk, &chain, "past");
+    bool flagged = chain.overflow;
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(entered);
+    ASSERT_FALSE(past);
+    ASSERT_TRUE(flagged);
     PASS();
 }
 
@@ -3720,6 +3822,8 @@ SUITE(complexity) {
     RUN_TEST(complexity_swift_type_bases_are_near_linear);
     RUN_TEST(complexity_dart_barrel_exports_are_near_linear);
     RUN_TEST(complexity_source_chain_walk_reads_every_ancestor_once);
+    RUN_TEST(complexity_source_chain_seen_set_grows);
+    RUN_TEST(complexity_shell_commands_of_a_big_process_are_near_linear);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
     RUN_TEST(complexity_flat_preceding_label_is_linear);
     RUN_TEST(complexity_import_map_is_linear_in_a_files_imports);

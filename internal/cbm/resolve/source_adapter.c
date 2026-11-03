@@ -8,7 +8,7 @@
 #include "stats.h"
 #include "syntax_index.h"
 
-enum { SOURCE_MAX_VISITS = 4000000, SOURCE_MAX_DEPTH = 400 };
+enum { SOURCE_MAX_DEPTH = 400 };
 
 struct cbm_source_table {
     CBMArena arena;
@@ -196,7 +196,7 @@ void cbm_source_fail(cbm_source_walk_t *walk, const char *reason) {
 bool cbm_source_step(cbm_source_walk_t *walk, unsigned depth) {
     if (walk->failure)
         return false;
-    if (++walk->visits > SOURCE_MAX_VISITS || depth > SOURCE_MAX_DEPTH) {
+    if (depth > SOURCE_MAX_DEPTH) {
         cbm_source_fail(walk, "source_adapter_walk_limit");
         return false;
     }
@@ -240,6 +240,15 @@ static bool chain_grow(cbm_source_walk_t *walk, cbm_source_chain_t *chain) {
     return true;
 }
 
+bool cbm_source_chain_has(const cbm_source_chain_t *chain, const char *owner) {
+    if (chain->capacity)
+        return *chain_slot(chain->slots, chain->capacity, owner) != NULL;
+    for (size_t i = 0; i < chain->count; i++)
+        if (!strcmp(chain->seen[i], owner))
+            return true;
+    return false;
+}
+
 bool cbm_source_chain_first_visit(cbm_source_walk_t *walk, cbm_source_chain_t *chain,
                                   const char *owner) {
     if (!chain->capacity) {
@@ -261,6 +270,21 @@ bool cbm_source_chain_first_visit(cbm_source_walk_t *walk, cbm_source_chain_t *c
     }
     *chain_slot(chain->slots, chain->capacity, owner) = owner;
     chain->count++;
+    return true;
+}
+
+bool cbm_source_names_push(cbm_source_walk_t *walk, cbm_source_names_t *names, const char *name) {
+    if (names->count == names->capacity) {
+        size_t capacity = names->capacity ? names->capacity * 2 : 8;
+        const char **items = cbm_arena_alloc(walk->arena, capacity * sizeof(*items));
+        if (!items)
+            return false;
+        if (names->count)
+            memcpy(items, names->items, names->count * sizeof(*items));
+        names->items = items;
+        names->capacity = capacity;
+    }
+    names->items[names->count++] = name;
     return true;
 }
 

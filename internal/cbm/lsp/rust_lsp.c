@@ -5775,10 +5775,11 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 if (ti >= 0) {
                     reg->types[ti].is_interface = true;
                     if (!ts_node_is_null(body)) {
-                        const char *methods[64];
-                        int mc = 0;
                         uint32_t bc = ts_node_named_child_count(body);
-                        for (uint32_t j = 0; j < bc && mc < 63; j++) {
+                        const char **methods =
+                            (const char **)cbm_arena_alloc(arena, (bc + 1) * sizeof(const char *));
+                        int mc = 0;
+                        for (uint32_t j = 0; methods && j < bc; j++) {
                             TSNode item = ts_node_named_child(body, j);
                             const char *ik = ts_node_type(item);
                             if (strcmp(ik, "function_item") != 0 &&

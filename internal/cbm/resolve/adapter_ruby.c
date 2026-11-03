@@ -53,7 +53,7 @@
 #include <stdlib.h>
 #include "syntax_index.h"
 
-enum { RUBY_MAX_NEST = 32, RUBY_MAX_BASES = 64 };
+enum { RUBY_MAX_NEST = 32 };
 
 /* Declaration facts of this adapter, above the shared flags. */
 enum {
@@ -393,7 +393,7 @@ static void ruby_note_body_call(ruby_ctx_t *ctx, TSNode call, bool conditional) 
 
 /* Each mixin keeps the lexical path that its constant is read under. */
 static void ruby_gather_mixin(ruby_ctx_t *ctx, TSNode call, bool in_singleton_class,
-                              const char **bases, size_t *used) {
+                              cbm_source_names_t *bases) {
     const char *name = ruby_call_name(ctx->walk, call);
     char tag = 0;
     /* Inside `class << self`, include is what extend is outside it. */
@@ -407,15 +407,17 @@ static void ruby_gather_mixin(ruby_ctx_t *ctx, TSNode call, bool in_singleton_cl
         return;
     TSNode arguments = cbm_source_field(call, "arguments");
     uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
-    for (uint32_t i = 0; i < count && *used < RUBY_MAX_BASES; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         TSNode argument = ts_node_named_child(arguments, i);
         const char *text = NULL;
         if (cbm_source_is(argument, "constant") || cbm_source_is(argument, "scope_resolution") ||
             cbm_source_is(argument, "self"))
             text = cbm_source_text(ctx->walk, argument);
         /* A computed mixin is an unknown ancestor; the '?' keeps that visible. */
-        bases[(*used)++] =
+        const char *entry =
             cbm_arena_sprintf(ctx->walk->arena, "%c:%s|%s", tag, ruby_cref(ctx), text ? text : "?");
+        if (!entry || !cbm_source_names_push(ctx->walk, bases, entry))
+            cbm_source_fail(ctx->walk, "ruby_base_allocation");
     }
 }
 
@@ -459,8 +461,7 @@ static void ruby_collect_class(ruby_ctx_t *ctx, TSNode node, bool conditional, u
     if (spelled)
         qn = cbm_source_def_qn(ctx->walk, spelled, line);
     cbm_source_decl_t *record = cbm_source_declare(ctx->walk, owner, "", qn, flags, line);
-    const char *bases[RUBY_MAX_BASES];
-    size_t used = 0;
+    cbm_source_names_t bases = {0};
     TSNode superclass = cbm_source_field(node, "superclass");
     if (!ts_node_is_null(superclass) && ts_node_named_child_count(superclass)) {
         TSNode parent = ts_node_named_child(superclass, 0);
@@ -469,8 +470,10 @@ static void ruby_collect_class(ruby_ctx_t *ctx, TSNode node, bool conditional, u
                 ? cbm_source_text(ctx->walk, parent)
                 : NULL;
         /* Read in the enclosing nest: the class is not in scope for its own header. */
-        bases[used++] =
+        const char *entry =
             cbm_arena_sprintf(ctx->walk->arena, "S:%s|%s", ruby_cref(ctx), text ? text : "?");
+        if (!entry || !cbm_source_names_push(ctx->walk, &bases, entry))
+            cbm_source_fail(ctx->walk, "ruby_base_allocation");
     }
     if (!ruby_push(ctx, owner)) {
         cbm_source_fail(ctx->walk, "ruby_nesting_limit");
@@ -487,7 +490,7 @@ static void ruby_collect_class(ruby_ctx_t *ctx, TSNode node, bool conditional, u
             do {
                 TSNode child = ts_tree_cursor_current_node(&cursor);
                 if (cbm_source_is(child, "call")) {
-                    ruby_gather_mixin(ctx, child, false, bases, &used);
+                    ruby_gather_mixin(ctx, child, false, &bases);
                 } else if (cbm_source_is(child, "singleton_class") &&
                            cbm_source_is(cbm_source_field(child, "value"), "self")) {
                     TSNode inner = cbm_source_field(child, "body");
@@ -498,7 +501,7 @@ static void ruby_collect_class(ruby_ctx_t *ctx, TSNode node, bool conditional, u
                         do {
                             TSNode statement = ts_tree_cursor_current_node(&walker);
                             if (cbm_source_is(statement, "call"))
-                                ruby_gather_mixin(ctx, statement, true, bases, &used);
+                                ruby_gather_mixin(ctx, statement, true, &bases);
                         } while (ts_tree_cursor_goto_next_sibling(&walker));
                     }
                     ts_tree_cursor_delete(&walker);
@@ -508,11 +511,11 @@ static void ruby_collect_class(ruby_ctx_t *ctx, TSNode node, bool conditional, u
         ts_tree_cursor_delete(&cursor);
     }
     if (record) {
-        const char **copy = cbm_source_table_alloc(ctx->walk, (used + 1) * sizeof(*copy));
+        const char **copy = cbm_source_table_alloc(ctx->walk, (bases.count + 1) * sizeof(*copy));
         if (copy) {
-            for (size_t i = 0; i < used; i++)
-                copy[i] = cbm_source_table_intern(ctx->walk, bases[i]);
-            copy[used] = NULL;
+            for (size_t i = 0; i < bases.count; i++)
+                copy[i] = cbm_source_table_intern(ctx->walk, bases.items[i]);
+            copy[bases.count] = NULL;
             record->bases = copy;
         }
     }
