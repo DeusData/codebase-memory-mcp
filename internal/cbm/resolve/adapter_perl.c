@@ -42,7 +42,6 @@
 #include <stdlib.h>
 #include "syntax_index.h"
 
-
 #define PERL_EXPORTER_KEY "&exporter"
 #define PERL_EXPORT_PREFIX "&export:"
 #define PERL_IMPORTED_PREFIX "&imported:"

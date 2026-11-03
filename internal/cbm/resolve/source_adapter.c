@@ -551,8 +551,8 @@ void cbm_source_seen_begin(cbm_source_seen_t *seen, const cbm_source_walk_t *wal
     if (!head || !walk->table || !cbm_ht_count(walk->table->local_chains))
         return;
     char key[1536];
-    int length = snprintf(key, sizeof(key), "%d\x1f%s\x1f%s", (int)walk->language, head->owner,
-                          head->name);
+    int length =
+        snprintf(key, sizeof(key), "%d\x1f%s\x1f%s", (int)walk->language, head->owner, head->name);
     if (length < 0 || (size_t)length >= sizeof(key))
         return;
     const source_open_list_t *list = cbm_ht_get(walk->table->local_chains, key);
@@ -584,7 +584,8 @@ const cbm_source_decl_t *cbm_source_seen_next(cbm_source_seen_t *seen) {
     if (own) {
         /* A file is collected whole, so its declarations stand together on the chain. */
         const cbm_source_decl_t *next = own->next;
-        while (next && !strcmp(next->file, seen->file) && !(next->flags & CBM_SOURCE_DECL_F_PRIVATE))
+        while (next && !strcmp(next->file, seen->file) &&
+               !(next->flags & CBM_SOURCE_DECL_F_PRIVATE))
             next = next->next;
         seen->own = next && !strcmp(next->file, seen->file) ? next : NULL;
     }
@@ -646,12 +647,14 @@ cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner
         (head->last ? head->last : head)->next = decl;
         head->last = decl;
     }
-    if (walk->file_local_private && !source_note_local(table, key, decl->file, head ? head : decl, decl)) {
+    if (walk->file_local_private &&
+        !source_note_local(table, key, decl->file, head ? head : decl, decl)) {
         table->failed = true;
         return NULL;
     }
     if (walk->names_declared && !head) {
-        const char *name_key = cbm_arena_sprintf(&table->arena, "%d\x1f%s", (int)walk->language, decl->name);
+        const char *name_key =
+            cbm_arena_sprintf(&table->arena, "%d\x1f%s", (int)walk->language, decl->name);
         if (!name_key) {
             table->failed = true;
             return NULL;

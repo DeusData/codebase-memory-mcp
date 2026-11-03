@@ -1689,8 +1689,7 @@ static void python_note_returns(cbm_resolve_binding_index_t *index, TSNode funct
                             !strcmp(name, "__class_getitem__"));
     if (member >= index->python_member_count ||
         (!special && !ts_node_is_null(field(function, "return_type"))) ||
-        !python_gather_returns(index, field(function, "body"), &chains, &count, &room, 0) ||
-        !count)
+        !python_gather_returns(index, field(function, "body"), &chains, &count, &room, 0) || !count)
         return;
     const char **kept = cbm_arena_alloc(index->arena, (count + 1) * sizeof(*kept));
     if (!kept) {

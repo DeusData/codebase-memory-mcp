@@ -50,7 +50,7 @@ typedef struct cbm_source_decl {
     int arity_min, arity_max; /* arity_max -1 means variadic; both -1 means unknown */
     uint32_t flags;
     uint32_t line;
-    uint32_t order;           /* its place among the table's declarations */
+    uint32_t order; /* its place among the table's declarations */
     struct cbm_source_decl *next;
     struct cbm_source_decl *last; /* on a chain's head: its end, so appending stays constant */
 } cbm_source_decl_t;
@@ -73,7 +73,7 @@ typedef struct cbm_source_walk {
     cbm_source_unit_t *unit;         /* phase two only */
     TSNode root;
     const char *failure;
-    const char *top_owner; /* collect: the owner a language files its top-level names under */
+    const char *top_owner;   /* collect: the owner a language files its top-level names under */
     bool file_local_private; /* collect: F_PRIVATE means no other file can see the declaration */
     bool names_declared;     /* collect: keep which names this language declares at all */
     CBMHashTable *def_index; /* lazily built, owned by the walk */
@@ -221,7 +221,7 @@ const cbm_source_decl_t *cbm_source_lookup_in(const cbm_source_walk_t *walk, CBM
  * declaration but the private ones of other files, which cost nothing to step over. Begin with
  * the chain's head, as a lookup returned it. */
 typedef struct {
-    const cbm_source_decl_t *whole;    /* the chain itself, when no declaration on it is private */
+    const cbm_source_decl_t *whole; /* the chain itself, when no declaration on it is private */
     const cbm_source_decl_t *const *open; /* the rest of its others, past them */
     size_t open_left;
     const cbm_source_decl_t *own; /* this file's next private one */

@@ -308,10 +308,10 @@ static void dart_note_directive(cbm_source_walk_t *walk, const char *library, TS
     if (strcmp(key, DART_EXPORTS))
         return;
     const char *target = dart_uri_library(walk, walk->file, uri);
-    cbm_source_decl_t *edge = target ? cbm_source_declare(walk, target, DART_EXPORTERS, NULL,
-                                                          CBM_SOURCE_DECL_F_VALUE,
-                                                          ts_node_start_point(directive).row + 1)
-                                     : NULL;
+    cbm_source_decl_t *edge =
+        target ? cbm_source_declare(walk, target, DART_EXPORTERS, NULL, CBM_SOURCE_DECL_F_VALUE,
+                                    ts_node_start_point(directive).row + 1)
+               : NULL;
     const char **bases = edge ? cbm_source_table_alloc(walk, 4 * sizeof(*bases)) : NULL;
     if (!bases)
         return;
@@ -798,7 +798,8 @@ static bool dart_walk_up(dart_ctx_t *ctx, const char *library, const char *key, 
             if (cbm_source_lookup(ctx->walk, bases[0], key))
                 continue;
             if (depth == capacity) {
-                const char **grown = cbm_arena_alloc(ctx->walk->arena, capacity * 2 * sizeof(*grown));
+                const char **grown =
+                    cbm_arena_alloc(ctx->walk->arena, capacity * 2 * sizeof(*grown));
                 if (!grown) {
                     *limited = true;
                     return false;
@@ -875,9 +876,8 @@ static int dart_compare_index(const void *left, const void *right) {
 /* In written order, the imports that can change the answer for this name: those whose library, or
  * something it exports, declares it, and those whose library the build picks. Every other import
  * adds nothing, wherever it stands. False: the walk could not finish, so ask them all. */
-static bool dart_imports_answering(dart_ctx_t *ctx, const char *path,
-                                   const dart_library_t *library, const char *key, const char *name,
-                                   size_t **out, size_t *count) {
+static bool dart_imports_answering(dart_ctx_t *ctx, const char *path, const dart_library_t *library,
+                                   const char *key, const char *name, size_t **out, size_t *count) {
     dart_answering_t found = {.ctx = ctx, .path = path};
     cbm_source_chain_t seen = {0};
     bool limited = false;
@@ -894,8 +894,8 @@ static bool dart_imports_answering(dart_ctx_t *ctx, const char *path,
         found.rows = dart_import_row(ctx, row->index, found.rows);
         found.count++;
     }
-    size_t *items = found.count ? cbm_arena_alloc(ctx->walk->arena, found.count * sizeof(*items))
-                                : NULL;
+    size_t *items =
+        found.count ? cbm_arena_alloc(ctx->walk->arena, found.count * sizeof(*items)) : NULL;
     if (found.count && !items)
         return false;
     size_t used = 0;

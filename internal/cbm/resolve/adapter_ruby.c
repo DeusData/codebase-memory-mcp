@@ -1625,10 +1625,10 @@ static bool ruby_decl_may_rebind(const ruby_ctx_t *ctx, const cbm_source_decl_t 
     bool rebinds = false;
     for (const cbm_source_decl_t *note = notes; note && !rebinds; note = note->next) {
         const cbm_source_decl_t *next = NULL;
-        ruby_lookup_t found =
-            !note->type ? RUBY_OPEN
-            : singleton ? ruby_find_singleton(ctx, decl->owner, note->type, &next)
-                        : ruby_find_instance_from(ctx, decl->owner, note->type, &next);
+        ruby_lookup_t found = !note->type ? RUBY_OPEN
+                              : singleton
+                                  ? ruby_find_singleton(ctx, decl->owner, note->type, &next)
+                                  : ruby_find_instance_from(ctx, decl->owner, note->type, &next);
         rebinds = found != RUBY_FOUND || ruby_decl_may_rebind(ctx, next, chain);
     }
     cbm_source_chain_leave(chain);
