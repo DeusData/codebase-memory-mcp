@@ -1545,13 +1545,13 @@ static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_na
     char *found = NULL;
     for (int i = 0; i < edge_count; i++) {
         char kind[CBM_SZ_16];
-        char public_name[CBM_SZ_256];
         char imported_name[CBM_SZ_256];
         if (!pxc_edge_string_prop(edges[i]->properties_json, "reexport", kind, sizeof(kind))) {
             continue;
         }
         const char *next_name = name;
         if (strcmp(kind, "named") == 0) {
+            char public_name[CBM_SZ_256];
             if (!pxc_edge_string_prop(edges[i]->properties_json, "local_name", public_name,
                                       sizeof(public_name)) ||
                 strcmp(public_name, name) != 0 ||

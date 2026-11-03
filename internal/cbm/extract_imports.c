@@ -1841,9 +1841,8 @@ static void process_es_export_statement(CBMExtractCtx *ctx, TSNode node) {
                     continue;
                 }
                 const char *member = cbm_node_text(a, original, ctx->source);
-                const char *exported = ts_node_is_null(alias)
-                                           ? member
-                                           : cbm_node_text(a, alias, ctx->source);
+                const char *exported =
+                    ts_node_is_null(alias) ? member : cbm_node_text(a, alias, ctx->source);
                 CBMImport imp = {.local_name = exported,
                                  .module_path = path,
                                  .member = member,
@@ -1853,9 +1852,7 @@ static void process_es_export_statement(CBMExtractCtx *ctx, TSNode node) {
             return;
         }
         if (strcmp(kind, "*") == 0) {
-            CBMImport imp = {.local_name = "*",
-                             .module_path = path,
-                             .reexport = CBM_REEXPORT_STAR};
+            CBMImport imp = {.local_name = "*", .module_path = path, .reexport = CBM_REEXPORT_STAR};
             cbm_imports_push(&ctx->result->imports, a, imp);
             return;
         }

@@ -1366,14 +1366,13 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
                                          "LabelPrintService.printWithStats");
     int b4 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
                                          "TrackingCodeService.generate");
-    int renamed = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS",
-                                              "ShipInvoiceHandler.execute",
-                                              "internal.service.internalCall");
+    int renamed = lrp_exact_edge_by_qn_suffix(
+        store, lp.project, "CALLS", "ShipInvoiceHandler.execute", "internal.service.internalCall");
     int self =
         lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "LabelPrintService.printStream",
                                     "LabelPrintService.printWithStats");
-    printf("  [ts/barrel] B1=%d B2=%d B3=%d B4=%d renamed=%d self=%d\n", b1, b2, b3, b4,
-           renamed, self);
+    printf("  [ts/barrel] B1=%d B2=%d B3=%d B4=%d renamed=%d self=%d\n", b1, b2, b3, b4, renamed,
+           self);
     lrp_cleanup(&lp, store);
 
     ASSERT_EQ(b1, 1);
@@ -1404,8 +1403,8 @@ TEST(lrp_ts_barrel_star_and_renamed_same_module) {
     cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
     ASSERT_NOT_NULL(store);
 
-    int renamed = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run",
-                                              "impl.innerFn");
+    int renamed =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.innerFn");
     int star = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.starFn");
     printf("  [ts/barrel-same-module] renamed=%d star=%d\n", renamed, star);
     lrp_cleanup(&lp, store);

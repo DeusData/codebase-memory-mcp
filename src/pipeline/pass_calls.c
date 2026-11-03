@@ -165,7 +165,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                 free((void *)owned_vals[i]);
             }
             free((void *)owned_vals);
-            if (kept > 0 && borrowed_vals) {
+            if (kept > 0) {
                 *out_keys = keys;
                 *out_vals = borrowed_vals;
                 *out_count = kept;
