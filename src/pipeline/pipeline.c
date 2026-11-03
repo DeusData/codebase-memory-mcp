@@ -4176,10 +4176,9 @@ static bool resolver_stage_tables(cbm_db_writer_t *writer, void *context) {
     const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(generation->gbuf, &file_count);
     const cbm_resolve_summary_t *summaries =
         cbm_gbuf_resolver_summaries(generation->gbuf, &summary_count);
-    write->stage =
-        cbm_store_resolver_stage_write(writer, generation->project, rows, count, files, file_count,
-                                       summaries, summary_count, generation->workers);
-    return write->stage != NULL;
+    return cbm_store_resolver_stage_write(writer, generation->project, rows, count, files,
+                                          file_count, summaries, summary_count, generation->workers,
+                                          &write->stage);
 }
 
 static int publish_generation_impl(const cbm_pipeline_generation_t *generation,

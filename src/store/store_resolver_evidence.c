@@ -1674,7 +1674,9 @@ static bool evidence_run(sqlite3 *db, cbm_db_writer_t *direct, const char *proje
     cbm_free(CBM_MEM_CLASS_STORE, cache);
     cbm_arena_destroy(&w->owned);
     cbm_free(CBM_MEM_CLASS_STORE, writer);
-    if (ok && out)
+    /* The writer's tables keep pointing at the stage's SQL until finalize, which runs whether
+     * this worked or not, so a caller who asked for the stage frees it either way. */
+    if (out)
         *out = stage;
     else
         cbm_store_resolver_stage_free(stage);
@@ -1687,17 +1689,14 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     return db && evidence_run(db, NULL, project, rows, count, files, file_count, summaries,
                               summary_count, commit_batches, workers, NULL);
 }
-cbm_resolver_stage_t *cbm_store_resolver_stage_write(cbm_db_writer_t *writer, const char *project,
-                                                     const cbm_resolve_record_t *rows, size_t count,
-                                                     const cbm_resolve_file_t *files,
-                                                     size_t file_count,
-                                                     const cbm_resolve_summary_t *summaries,
-                                                     size_t summary_count, int workers) {
-    cbm_resolver_stage_t *stage = NULL;
-    return writer && evidence_run(NULL, writer, project, rows, count, files, file_count, summaries,
-                                  summary_count, false, workers, &stage)
-               ? stage
-               : NULL;
+bool cbm_store_resolver_stage_write(cbm_db_writer_t *writer, const char *project,
+                                    const cbm_resolve_record_t *rows, size_t count,
+                                    const cbm_resolve_file_t *files, size_t file_count,
+                                    const cbm_resolve_summary_t *summaries, size_t summary_count,
+                                    int workers, cbm_resolver_stage_t **stage) {
+    return writer && stage &&
+           evidence_run(NULL, writer, project, rows, count, files, file_count, summaries,
+                        summary_count, false, workers, stage);
 }
 bool cbm_store_resolver_stage_finish(sqlite3 *db, const char *project,
                                      const cbm_resolver_stage_t *stage) {
