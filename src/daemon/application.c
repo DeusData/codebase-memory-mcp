@@ -176,6 +176,11 @@ struct cbm_daemon_application_job {
     bool async_owned;
     bool worker_started;
     application_index_watch_owner_t *watch_owners;
+    uint64_t request_started_ms;
+    /* What a worker resource failure of this job is reported against; set
+     * before the first attempt, folded over every attempt (mcp_internal.h). */
+    bool request_facts_begun;
+    cbm_mcp_index_request_facts_t request_facts;
     cbm_daemon_application_job_t *next;
 };
 
@@ -378,8 +383,17 @@ static void application_worker_diagnostic(const char *line, void *context) {
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
+                                            uint64_t duration_origin_ms,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
+    cbm_index_resource_policy_t resource_policy;
+    char error[CBM_SZ_256] = {0};
+    if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
+                                                 sizeof(error))) {
+        cbm_log_error("daemon.index.policy", "error", error);
+        *worker_out = NULL;
+        return -1;
+    }
     application_default_worker_t *worker = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*worker));
     if (!worker) {
         return -1;
@@ -389,9 +403,9 @@ static int application_worker_start_default(void *context, const char *args_json
     const char *root = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
     worker->project = application_index_project_key(root, args_json);
     yyjson_doc_free(args_doc);
-    int result = cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
-                                                 quarantine_file, application_worker_diagnostic,
-                                                 worker, &worker->handle);
+    int result = cbm_index_worker_start_with_policy_log(
+        args_json, memory_budget_bytes, &resource_policy, false, marker_file, quarantine_file,
+        application_worker_diagnostic, worker, duration_origin_ms, &worker->handle);
     if (result != 0) {
         application_worker_destroy_default(NULL, worker);
         *worker_out = NULL;
@@ -1539,6 +1553,17 @@ static void application_cancelled_result(cbm_index_worker_result_t *result) {
     result->tree_quiesced = true;
 }
 
+/* Only an enabled worker limit can end a job in a worker resource failure, the
+ * one response the request facts feed; without one nothing is read. */
+static void application_job_request_facts_begin(cbm_daemon_application_job_t *job) {
+    cbm_index_resource_policy_t policy;
+    char error[CBM_SZ_256] = {0};
+    if (cbm_mcp_index_policy_from_internal_args(job->args_json, &policy, error, sizeof(error)) &&
+        cbm_index_policy_worker_enabled(&policy)) {
+        cbm_mcp_index_request_facts_begin(job->args_json, &job->request_facts);
+    }
+}
+
 static application_attempt_status_t application_job_run_attempt(cbm_daemon_application_job_t *job,
                                                                 const char *marker_path,
                                                                 const char *quarantine_path,
@@ -1572,10 +1597,17 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     }
 
     cbm_daemon_application_worker_t worker = NULL;
+    if (job->request_started_ms == 0) {
+        job->request_started_ms = cbm_index_worker_now_ms();
+    }
+    if (!job->request_facts_begun) {
+        job->request_facts_begun = true;
+        application_job_request_facts_begin(job);
+    }
     application_tmp_lock();
-    int start_result =
-        application->worker_ops.start(application->worker_ops.context, job->args_json,
-                                      memory_budget_bytes, marker_path, quarantine_path, &worker);
+    int start_result = application->worker_ops.start(
+        application->worker_ops.context, job->args_json, memory_budget_bytes, marker_path,
+        quarantine_path, job->request_started_ms, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED
@@ -1763,12 +1795,19 @@ static application_attempt_decision_t application_consume_attempt(
         application_attempt_disposition(job, attempt);
     application_record_attempt(attempt, &execution->last_result, &execution->have_last_result,
                                execution->last_log);
+    cbm_mcp_index_request_facts_record(&job->request_facts, &attempt->result);
     if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
         execution->response = attempt->result.response;
         attempt->result.response = NULL;
         execution->successful = application_index_response_succeeded(execution->response);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
+    }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        execution->response = cbm_mcp_index_worker_resource_response(
+            job->args_json, &attempt->result, &job->request_facts);
+        application_attempt_free(attempt);
+        return APPLICATION_ATTEMPT_DECISION_STOP;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
         execution->unsafe_terminal = true;
@@ -4026,7 +4065,7 @@ cbm_daemon_runtime_application_callbacks_t cbm_daemon_application_runtime_callba
 static cbm_daemon_runtime_application_status_t application_client_exchange_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     uint8_t *request, uint32_t request_length, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms) {
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms) {
     uint8_t *response = NULL;
     uint32_t response_length = 0;
     if (response_out) {
@@ -4035,13 +4074,16 @@ static cbm_daemon_runtime_application_status_t application_client_exchange_tagge
     if (response_length_out) {
         *response_length_out = 0;
     }
+    if (request_sent_out) {
+        *request_sent_out = false;
+    }
     cbm_daemon_runtime_application_status_t status =
         request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID
             ? cbm_daemon_runtime_client_application_request(client, request, request_length,
                                                             &response, &response_length, timeout_ms)
-            : cbm_daemon_runtime_client_application_request_tagged(client, request_token, request,
-                                                                   request_length, &response,
-                                                                   &response_length, timeout_ms);
+            : cbm_daemon_runtime_client_application_request_tagged(
+                  client, request_token, request, request_length, &response, &response_length,
+                  request_sent_out, timeout_ms);
     free(request);
     if (status != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
         free(response);
@@ -4072,7 +4114,7 @@ static cbm_daemon_runtime_application_status_t application_client_exchange(
     uint8_t **response_out, uint32_t *response_length_out, uint32_t timeout_ms) {
     return application_client_exchange_tagged(client, CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID,
                                               request, request_length, response_out,
-                                              response_length_out, timeout_ms);
+                                              response_length_out, NULL, timeout_ms);
 }
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_context(
@@ -4200,7 +4242,7 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_ui_readine
 static cbm_daemon_runtime_application_status_t application_client_text_request_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     cbm_daemon_application_request_kind_t kind, const char *text, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms) {
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms) {
     if (!client || !text || !text[0]) {
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
@@ -4216,7 +4258,7 @@ static cbm_daemon_runtime_application_status_t application_client_text_request_t
     memcpy(request + 1, text, text_length);
     return application_client_exchange_tagged(client, request_token, request,
                                               (uint32_t)text_length + 1U, response_out,
-                                              response_length_out, timeout_ms);
+                                              response_length_out, request_sent_out, timeout_ms);
 }
 
 static cbm_daemon_runtime_application_status_t application_client_text_request(
@@ -4224,7 +4266,7 @@ static cbm_daemon_runtime_application_status_t application_client_text_request(
     const char *text, uint8_t **response_out, uint32_t *response_length_out, uint32_t timeout_ms) {
     return application_client_text_request_tagged(
         client, CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID, kind, text, response_out,
-        response_length_out, timeout_ms);
+        response_length_out, NULL, timeout_ms);
 }
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(
@@ -4237,10 +4279,10 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const char *message, uint8_t **response_out, uint32_t *response_length_out,
-    uint32_t timeout_ms) {
-    return application_client_text_request_tagged(client, request_token,
-                                                  CBM_DAEMON_APPLICATION_REQUEST_MCP, message,
-                                                  response_out, response_length_out, timeout_ms);
+    bool *request_sent_out, uint32_t timeout_ms) {
+    return application_client_text_request_tagged(
+        client, request_token, CBM_DAEMON_APPLICATION_REQUEST_MCP, message, response_out,
+        response_length_out, request_sent_out, timeout_ms);
 }
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_tool(
