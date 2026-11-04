@@ -7,7 +7,9 @@ module CxApp
 
   class CxHelper
     def assist(text)
-      CxWidget.new.name + text
+      widget = CxWidget.new
+      widget.label
+      widget.name + text
     end
   end
 end

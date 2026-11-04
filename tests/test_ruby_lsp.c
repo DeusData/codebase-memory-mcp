@@ -1802,6 +1802,18 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     ASSERT(sh != NULL);
     int classes_before = sh->class_count;
     int funcs_before = sh->reg.func_count;
+    /* The counts cannot see a written field (a visit mark on a shared entry,
+     * say), so keep a byte copy of the class array and both hash indexes and
+     * compare them after the resolves. */
+    size_t classes_bytes = (size_t)sh->class_count * sizeof(RubyClassInfo);
+    size_t slots_bytes = ((size_t)sh->slot_mask + 1) * sizeof(int);
+    char *snap_classes = (char *)malloc(classes_bytes);
+    char *snap_by_qn = (char *)malloc(slots_bytes);
+    char *snap_by_path = (char *)malloc(slots_bytes);
+    ASSERT(snap_classes && snap_by_qn && snap_by_path);
+    memcpy(snap_classes, sh->classes, classes_bytes);
+    memcpy(snap_by_qn, sh->by_qn, slots_bytes);
+    memcpy(snap_by_path, sh->by_path, slots_bytes);
 
     const char *src1 =
         "class One\n  def run\n    c = Child.new\n    c.shared_m\n    c.own_m\n  end\nend\n";
@@ -1829,7 +1841,13 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     bool one_own = out_has(&o1, "test.app.one.One.run", "test.child.Child.own_m");
     bool two_inherited = out_has(&o2, "test.app.two.Two.run", "test.base.Base.shared_m");
     bool three_none = !out_has(&o3, "test.app.three.Three.run", "test.base.Base.shared_m");
-    bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before;
+    bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before &&
+                     memcmp(snap_classes, sh->classes, classes_bytes) == 0 &&
+                     memcmp(snap_by_qn, sh->by_qn, slots_bytes) == 0 &&
+                     memcmp(snap_by_path, sh->by_path, slots_bytes) == 0;
+    free(snap_classes);
+    free(snap_by_qn);
+    free(snap_by_path);
     if (!(one_inherited && one_own && two_inherited && three_none && untouched)) {
         out_dump(&o1);
         out_dump(&o2);
