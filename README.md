@@ -946,6 +946,41 @@ short, the next
 `index_repository` or `status` call for that project carries a `notice` suggesting the async
 mode. `index_status` keeps describing the published graph and its freshness.
 
+### Code referenced by changed documentation
+
+Use `detect_changes` with `scope: "doc_references"` to find indexed targets a
+changed documentation section names. This is a separate review-candidate query;
+its references never become behavioral blast-radius seeds. `base_branch` and
+`since` select the comparison base as usual.
+
+The query considers `.md`, `.markdown`, `.rst`, `.adoc`, `.asciidoc` paths and
+files with indexed Section nodes. Prose belongs to the nearest preceding indexed
+heading, until the next heading. Text before the first heading belongs to the
+document's File node. A deletion before the first surviving line is anchored at
+that line for review. The query
+follows one outbound `MENTIONS` hop from selected sections, returning resolved
+implementation targets alongside reason-coded unresolved references. Resolved
+references to recognized documentation paths and Section targets are omitted;
+unresolved references retain raw text and reasons because their target types
+are not established. Sources whose indexed bytes are stale or
+unavailable return an `unavailable` row. When no supported line hunks exist, the mapping is
+explicitly marked `whole_file_without_hunks` rather than claiming section-level
+precision. The query fixes Git's prefixes and uses raw, uncolored diffs. Quoted
+Git paths and paths beyond the shared parser's path bound use the whole-file
+fallback; their hunks cannot select another file's sections.
+
+Results identify `store_generation` and `coverage: "indexed_references_only"`.
+They describe the current index's references, not historical references removed
+by a document deletion or a complete inventory of semantic dependencies. Deleted
+or unindexed documents with one of those extensions remain visible as unavailable. Parser coverage and
+reference-attribution limitations still apply.
+
+`limit` bounds each page. Pass `next_cursor` back as `reference_cursor` to
+continue; the cursor refuses a changed question, graph publication, changed
+file contents or an offset outside the materialized results. `max_output_tokens` bounds output, and `truncated`/
+`total_relation` expose partial results. Behavioral traversal and seed options
+are rejected for this scope. Existing scopes retain their output and traversal.
+
 ### Querying
 
 | Tool | Description |
