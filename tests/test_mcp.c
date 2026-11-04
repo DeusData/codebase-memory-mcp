@@ -7783,6 +7783,297 @@ TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585) {
 }
 #endif
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+TEST(tool_search_code_serves_captured_bytes_issue2585) {
+    const char *modes[] = {"full", "compact"};
+    const char *fields[] = {"source", "context"};
+    for (int i = 0; i < 2; i++) {
+        char tmp[256];
+        cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+        ASSERT_NOT_NULL(srv);
+        ASSERT_EQ(record_main_go_hash(cbm_mcp_server_store(srv), tmp, true, true), CBM_STORE_OK);
+        char file[512], args[512];
+        snprintf(file, sizeof(file), "%s/project/main.go", tmp);
+        cbm_mcp_server_set_snippet_capture_test_hook(srv, snippet_capture_rewrite, file);
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"test-project\",\"pattern\":\"ProcessOrder\",\"mode\":\"%s\","
+                 "\"context\":1,\"format\":\"json\"}",
+                 modes[i]);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+        char *inner = extract_text_content(response);
+        yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *row = yyjson_arr_get_first(yyjson_obj_get(yyjson_doc_get_root(doc), "rows"));
+        yyjson_val *cell = yyjson_arr_get(row, 8);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(cell, "content_verified")));
+        const char *source = yyjson_get_str(yyjson_obj_get(cell, fields[i]));
+        ASSERT_NOT_NULL(source);
+        ASSERT_NOT_NULL(strstr(source, "ProcessOrder"));
+        ASSERT_NULL(strstr(source, "Intruder"));
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+        /* The live scanner still finds the new text, but cannot attribute its
+         * source bytes to the old indexed function. */
+        response = cbm_mcp_handle_tool(
+            srv, "search_code",
+            "{\"project\":\"test-project\",\"pattern\":\"Intruder\",\"mode\":\"full\","
+            "\"format\":\"json\"}");
+        inner = extract_text_content(response);
+        doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        row = yyjson_arr_get_first(yyjson_obj_get(yyjson_doc_get_root(doc), "rows"));
+        ASSERT_NOT_NULL(row);
+        cell = yyjson_arr_get(row, 8);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(cell, "source_drift")));
+        ASSERT_NULL(yyjson_obj_get(cell, "source"));
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+        cbm_mcp_server_free(srv);
+        cleanup_snippet_dir(tmp);
+    }
+    PASS();
+}
+
+static void count_search_capture(void *context, const char *path) {
+    (void)path;
+    (*(int *)context)++;
+}
+
+TEST(tool_search_code_shares_and_bounds_captured_files_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    ASSERT_EQ(record_main_go_hash(cbm_mcp_server_store(srv), tmp, true, true), CBM_STORE_OK);
+    int captures = 0;
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, count_search_capture, &captures);
+    const char *args = "{\"project\":\"test-project\",\"pattern\":\"func\",\"mode\":\"full\","
+                       "\"format\":\"json\"}";
+    for (int limited = 0; limited < 2; limited++) {
+        captures = 0;
+        cbm_mcp_server_set_search_capture_budget_for_test(srv, limited ? 8 : 0);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        char *inner = extract_text_content(response);
+        yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+        ASSERT_GT(yyjson_arr_size(rows), 1);
+        ASSERT_EQ(captures, 1);
+        size_t i, n;
+        yyjson_val *row;
+        yyjson_arr_foreach(rows, i, n, row) {
+            yyjson_val *source = yyjson_arr_get(row, 8);
+            ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(source, "content_verified")), !limited);
+            if (limited) {
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(source, "source_unavailable")),
+                              "capture_budget");
+                ASSERT_NULL(yyjson_obj_get(source, "source"));
+            } else
+                ASSERT_NOT_NULL(yyjson_obj_get(source, "source"));
+        }
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    captures = 0;
+    char *response = cbm_mcp_handle_tool(srv, "search_code",
+                                         "{\"project\":\"test-project\",\"pattern\":\"func\","
+                                         "\"mode\":\"files\",\"context\":1,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_EQ(captures, 0);
+    free(response);
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+typedef struct {
+    cbm_store_t *reader, *writer;
+    const char *root;
+    int written;
+} snapshot_publication_probe_t;
+
+static void snapshot_publish_during_capture(void *context, const char *path) {
+    (void)path;
+    snapshot_publication_probe_t *probe = context;
+    /* Deterministically cross the ordinary batch's renewal boundary. */
+    cbm_store_read_batch_expire_for_test(probe->reader);
+    probe->written = cbm_store_upsert_project(probe->writer, "test-project", probe->root);
+}
+
+TEST(tool_snapshot_pins_publication_across_writer_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *memory = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(memory);
+    cbm_store_t *memory_store = cbm_mcp_server_store(memory);
+    ASSERT_EQ(record_main_go_hash(memory_store, tmp, true, true), CBM_STORE_OK);
+    char database[512], project_root[512];
+    snprintf(database, sizeof(database), "%s/test-project.db", tmp);
+    snprintf(project_root, sizeof(project_root), "%s/project", tmp);
+    cbm_store_t *disk = cbm_store_open_path(database);
+    ASSERT_NOT_NULL(disk);
+    sqlite3_backup *backup =
+        sqlite3_backup_init(cbm_store_get_db(disk), "main", cbm_store_get_db(memory_store), "main");
+    ASSERT_NOT_NULL(backup);
+    ASSERT_EQ(sqlite3_backup_step(backup, -1), SQLITE_DONE);
+    ASSERT_EQ(sqlite3_backup_finish(backup), SQLITE_OK);
+    cbm_store_close(disk);
+    cbm_mcp_server_free(memory);
+    char *saved = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", tmp, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new("test-project");
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *reader = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(reader);
+    cbm_store_t *writer = cbm_store_open_path(database);
+    ASSERT_NOT_NULL(writer);
+    snapshot_publication_probe_t probe = {reader, writer, project_root, CBM_STORE_ERR};
+    char before[96], after[96];
+    ASSERT_EQ(cbm_store_generation(reader, before, sizeof(before)), CBM_STORE_OK);
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, snapshot_publish_during_capture, &probe);
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\",\"qualified_name\":\"ProcessOrder\",\"snapshot\":true,"
+        "\"format\":\"json\"}");
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+    ASSERT_EQ(probe.written, CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(writer, after, sizeof(after)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(before, after);
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "store_generation")), before);
+    yyjson_val *data = yyjson_obj_get(root, "data");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(data, "store_generation")), before);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(data, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_store_close(writer);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved);
+    free(saved);
+    cleanup_project_db(tmp, "test-project");
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+#endif
+
+/* #2585: every opt-in structural observation names its pinned publication.
+ * The original format is retained inside data; default requests stay unwrapped. */
+TEST(tool_snapshot_envelope_covers_evidence_tools_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+    char generation[96];
+    ASSERT_EQ(cbm_store_generation(store, generation, sizeof(generation)), CBM_STORE_OK);
+    const char *tools[] = {"query_graph",      "search_graph",         "trace_path",
+                           "get_code_snippet", "check_index_coverage", "search_code"};
+    const char *questions[] = {"\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 1\"",
+                               "\"name_pattern\":\"ProcessOrder\"",
+                               "\"function_name\":\"ProcessOrder\",\"direction\":\"inbound\"",
+                               "\"qualified_name\":\"ProcessOrder\"",
+                               "\"paths\":[\"main.go\"]",
+                               "\"pattern\":\"ProcessOrder\",\"mode\":\"full\""};
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+        char args[1024];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"test-project\",\"format\":\"json\",\"snapshot\":true,%s}",
+                 questions[i]);
+        char *response = cbm_mcp_handle_tool(srv, tools[i], args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_FALSE(response_contains_json_fragment(response, "\"isError\":true"));
+        char *inner = extract_text_content(response);
+        yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "store_generation")), generation);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "snapshot_consistent")));
+        ASSERT_TRUE(yyjson_is_obj(yyjson_obj_get(root, "data")));
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"test-project\",\"name_pattern\":\"ProcessOrder\",\"snapshot\":true}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(yyjson_doc_get_root(doc), "data")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    response = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"test-project\",\"format\":\"json\",\"snapshot\":false}");
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "snapshot_consistent"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    response = cbm_mcp_handle_tool(srv, "query_graph", "{\"snapshot\":\"true\"}");
+    ASSERT_TRUE(strstr(response, "snapshot must be true or false") != NULL);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_search_code_withholds_source_drift_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    /* The existing fixture records a same-size, same-metadata wrong hash. */
+    ASSERT_EQ(record_main_go_hash(store, tmp, false, true), CBM_STORE_OK);
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"project\":\"test-project\",\"pattern\":\"ProcessOrder\",\"mode\":\"full\","
+        "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "match_source")), "live_filesystem");
+    yyjson_val *row = yyjson_arr_get(yyjson_obj_get(root, "rows"), 0);
+    ASSERT_NOT_NULL(row);
+    yyjson_val *source = yyjson_arr_get(row, 8);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(source, "source_drift")));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(source, "content_verified")));
+    ASSERT_NULL(yyjson_obj_get(source, "source"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    /* A byte-identical file yields source from those verified bytes. */
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+    response = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"project\":\"test-project\",\"pattern\":\"ProcessOrder\",\"mode\":\"full\","
+        "\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    row = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "rows"), 0);
+    source = yyjson_arr_get(row, 8);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(source, "content_verified")));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(source, "source")), "ProcessOrder"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* #2585: metadata.generation names the coverage-recording run and does not
  * change on incremental re-index, so it cannot tell two publications apart.
  * store_generation does, and every response that carries it agrees. */
@@ -28071,6 +28362,13 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585);
 #endif
     RUN_TEST(tool_responses_carry_store_generation_issue2585);
+    RUN_TEST(tool_snapshot_envelope_covers_evidence_tools_issue2585);
+    RUN_TEST(tool_search_code_withholds_source_drift_issue2585);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(tool_search_code_serves_captured_bytes_issue2585);
+    RUN_TEST(tool_search_code_shares_and_bounds_captured_files_issue2585);
+    RUN_TEST(tool_snapshot_pins_publication_across_writer_issue2585);
+#endif
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
     RUN_TEST(tool_index_status_fails_closed_without_indexed_checkout_identity);

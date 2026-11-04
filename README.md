@@ -977,6 +977,39 @@ Static `CALLS` indexing omits direct self-call edges; traces that include `CALLS
 nodes, so a recursive function can have zero callees. Recursion metadata remains
 visible on continuation pages and when an output budget prevents rows from fitting.
 
+### Publication-bound observations
+
+`query_graph`, `search_graph`, `trace_path`, `get_code_snippet`, `search_code`
+and `check_index_coverage` accept `snapshot: true`. A successful request pins
+its structural database reads to one publication and returns this JSON envelope
+through both MCP and the CLI:
+
+```json
+{"store_generation":"u0123456789abcdefg7","snapshot_consistent":true,"data":{}}
+```
+
+`data` contains the original tool result: an object with `format: "json"`, or
+its original text with `format: "tree"`. Compare `store_generation` across all
+observations and continuation pages used together; retry when it changes.
+Existing output-token budgets apply to `data`; the envelope adds metadata and
+JSON quoting overhead.
+Failure to pin the database, unavailable generation metadata, cancellation or a
+lost read scope produces an error. Cross-service tracing reads multiple project
+stores and cannot use this single-publication option. Omit `snapshot` to retain
+the unwrapped response.
+
+The pin covers indexed structure, not the live filesystem. Snippet and coverage
+content-verification fields remain necessary. `search_code` match coordinates
+are explicitly identified by `match_source: "live_filesystem"`; they describe
+the scan, not indexed source locations. Full/context source cells report
+`content_verified`. Known drift adds `source_drift` and withholds source; verified
+source is sliced from the exact captured bytes checked against the indexed hash.
+Search shares captures by file path with a 64 MiB retained-buffer budget. If
+capture exceeds that budget, `source_unavailable: "capture_budget"` withholds
+source; narrow the query or use `get_code_snippet` for an individual symbol.
+Unverifiable source remains explicitly unverified. `metadata.generation` still
+identifies the coverage-recording run, separately from `store_generation`.
+
 ## Graph Data Model
 
 ### Node Labels
