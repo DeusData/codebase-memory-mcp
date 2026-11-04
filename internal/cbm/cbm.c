@@ -3634,6 +3634,61 @@ int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
 }
 #endif
 
+/* Extension visibility uses the file's direct imports, including imports
+ * written after a type declaration. The joined text is shared by its types. */
+static void cbm_swift_type_imports(CBMFileResult *result, CBMLanguage language) {
+    if (language != CBM_LANG_SWIFT) {
+        return;
+    }
+    size_t length = SKIP_ONE;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *path = result->imports.items[i].module_path;
+        if (path && path[0]) {
+            length += strlen(path) + SKIP_ONE;
+        }
+    }
+    char *imports = cbm_arena_alloc(&result->arena, length);
+    if (!imports) {
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *path = result->imports.items[i].module_path;
+        if (!path || !path[0]) {
+            continue;
+        }
+        if (used) {
+            imports[used++] = '|';
+        }
+        size_t n = strlen(path);
+        memcpy(imports + used, path, n);
+        used += n;
+    }
+    imports[used] = '\0';
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *def = &result->defs.items[i];
+        size_t count = 0;
+        bool is_type = false;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+            is_type = is_type || strcmp(kv[0], "swift_type_path") == 0 ||
+                      strcmp(kv[0], "swift_extension") == 0;
+            count += PAIR_LEN;
+        }
+        if (!is_type) {
+            continue;
+        }
+        const char **props =
+            cbm_arena_alloc(&result->arena, (count + PAIR_LEN + SKIP_ONE) * sizeof(*props));
+        if (props) {
+            memcpy(props, def->extra_props, count * sizeof(*props));
+            props[count] = "swift_imports";
+            props[count + SKIP_ONE] = imports;
+            props[count + PAIR_LEN] = NULL;
+            def->extra_props = props;
+        }
+    }
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -3901,6 +3956,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     cbm_extract_imports(&ctx);
     cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
+    cbm_swift_type_imports(result, language);
     if (cbm_lang_needs_cpp_branch_views(language)) {
         extract_cpp_branch_views(&ctx, ts_lang, timeout_micros);
     }

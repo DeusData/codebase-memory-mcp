@@ -3823,6 +3823,44 @@ TEST(swift_method_call) {
     PASS();
 }
 
+TEST(swift_type_imports_preserve_markers_and_complete_file_imports) {
+    CBMFileResult *r = extract("struct Service {}\n"
+                               "extension Service { func run() {} }\n"
+                               "import NIOCore\n"
+                               "@testable import NIOFS\n"
+                               "@_exported import struct Alpha.Service\n",
+                               CBM_LANG_SWIFT, "t", "Types.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, 3);
+    ASSERT_STR_EQ(r->imports.items[1].module_path, "NIOFS");
+    ASSERT_STR_EQ(r->imports.items[1].local_name, "NIOFS");
+    ASSERT_STR_EQ(r->imports.items[2].module_path, "Alpha.Service");
+    int types = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        bool marker = false;
+        const char *imports = NULL;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[1]; kv += 2) {
+            marker |=
+                strcmp(kv[0], "swift_type_path") == 0 || strcmp(kv[0], "swift_extension") == 0;
+            if (strcmp(kv[0], "swift_imports") == 0) {
+                imports = kv[1];
+            }
+        }
+        if (marker) {
+            types++;
+            ASSERT_NOT_NULL(imports);
+            ASSERT_STR_EQ(imports, "NIOCore|NIOFS|Alpha.Service");
+        } else {
+            ASSERT_NULL(imports);
+        }
+    }
+    ASSERT_EQ(types, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(swift_multiple_trailing_closure_extraction) {
     CBMFileResult *r =
         extract("func outer() { service.handle { nested() } onError: { recover() } }\n"
@@ -15621,6 +15659,7 @@ SUITE(extraction) {
     RUN_TEST(swift_struct);
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
+    RUN_TEST(swift_type_imports_preserve_markers_and_complete_file_imports);
     RUN_TEST(swift_multiple_trailing_closure_extraction);
     RUN_TEST(swift_trailing_closure_boundaries_survive_compact_and_spill);
     RUN_TEST(swift_constructor_call);

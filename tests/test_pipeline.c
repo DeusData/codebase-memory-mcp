@@ -16780,6 +16780,129 @@ TEST(pipeline_swift_cross_file_extension_issue2061) {
     PASS();
 }
 
+TEST(pipeline_swift_same_named_extensions_stay_in_module_issue2061) {
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_swift_extension_scope_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        const char *targets[] = {"Alpha", "Beta"};
+        const char *caller = "func invoke(service: Service) {\n"
+                             "    service.run(value: 1)\n"
+                             "    _ = Service.init(seed: 1)\n"
+                             "}\n";
+        char file[128];
+        for (int target = 0; target < 2; target++) {
+            snprintf(file, sizeof(file), "Sources/%s/Service.swift", targets[target]);
+            write_temp_file(tmp, file, "struct Service {}\n");
+            snprintf(file, sizeof(file), "Sources/%s/Extensions.swift", targets[target]);
+            write_temp_file(tmp, file,
+                            "extension Service {\n"
+                            "    init(seed: Int) {}\n"
+                            "    func run(value: Int) {}\n"
+                            "}\n");
+            snprintf(file, sizeof(file), "Sources/%s/Caller.swift", targets[target]);
+            write_temp_file(tmp, file, caller);
+            snprintf(file, sizeof(file), "Sources/%s/AStringExtension.swift", targets[target]);
+            write_temp_file(tmp, file,
+                            "protocol StringBehavior {}\n"
+                            "extension StringBehavior { func inherited() {} }\n"
+                            "extension String { func local() {} }\n");
+            snprintf(file, sizeof(file), "Sources/%s/StringCaller.swift", targets[target]);
+            write_temp_file(tmp, file,
+                            "extension String: StringBehavior {\n"
+                            "    func invokeStringExtension() { self.local(); self.inherited() }\n"
+                            "}\n");
+        }
+        write_temp_file(tmp, "Sources/Unrelated/Types.swift", "struct String {}\n");
+        write_temp_file(tmp, "Source/Core/Legacy.swift", "struct Legacy {}\n");
+        char legacy[512];
+        snprintf(legacy, sizeof(legacy), "import %s\nextension Legacy { func legacy() {} }\n",
+                 strrchr(tmp, '/') + 1);
+        write_temp_file(tmp, "Tests/Legacy.swift", legacy);
+        write_temp_file(tmp, "Source/Core/Caller.swift",
+                        "func legacyCaller(value: Legacy) { value.legacy() }\n");
+        write_temp_file(tmp, "Sources/AlphaExtras/Extensions.swift",
+                        "@testable import Alpha\n"
+                        "extension Service { func extra() {} }\n");
+        write_temp_file(tmp, "Sources/AlphaExtras/Caller.swift",
+                        "@testable import Alpha\n"
+                        "func invokeExtra(service: Service) { service.extra() }\n");
+        for (int i = 0; mode && i < 50; i++) {
+            snprintf(file, sizeof(file), "Sources/Alpha/Filler%d.swift", i);
+            write_temp_file(tmp, file, "// filler\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], changed_path[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(changed_path, sizeof(changed_path), "%s/Sources/Alpha/Caller.swift", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[256];
+                snprintf(changed, sizeof(changed), "%s// changed\n", caller);
+                write_temp_file(tmp, "Sources/Alpha/Caller.swift", changed);
+                ASSERT_EQ(pipeline_test_set_mtime(changed_path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            const char *project = cbm_pipeline_project_name(p);
+            const char *suffixes[] = {"Sources.Alpha.Caller.invoke(service:Service)",
+                                      "Sources.Beta.Caller.invoke(service:Service)",
+                                      "Sources.Alpha.Extensions.Service.run(value:Int)",
+                                      "Sources.Beta.Extensions.Service.run(value:Int)",
+                                      "Sources.Alpha.Extensions.Service.init(seed:Int)",
+                                      "Sources.Beta.Extensions.Service.init(seed:Int)",
+                                      "Sources.AlphaExtras.Caller.invokeExtra(service:Service)",
+                                      "Sources.AlphaExtras.Extensions.Service.extra()",
+                                      "Sources.Alpha.AStringExtension.String.local()",
+                                      "Sources.Alpha.StringCaller.String.invokeStringExtension()",
+                                      "Sources.Beta.AStringExtension.String.local()",
+                                      "Sources.Beta.StringCaller.String.invokeStringExtension()",
+                                      "Tests.Legacy.Legacy.legacy()",
+                                      "Source.Core.Caller.legacyCaller(value:Legacy)",
+                                      "Sources.Alpha.AStringExtension.StringBehavior.inherited()",
+                                      "Sources.Beta.AStringExtension.StringBehavior.inherited()"};
+            cbm_node_t nodes[16] = {0};
+            for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+                char qn[768];
+                snprintf(qn, sizeof(qn), "%s.%s", project, suffixes[i]);
+                ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &nodes[i]), CBM_STORE_OK);
+            }
+            for (int target = 0; target < 2; target++) {
+                for (int owner = 0; owner < 2; owner++) {
+                    ASSERT_EQ(pipeline_has_calls_edge(s, nodes[target].id, nodes[2 + owner].id),
+                              target == owner);
+                    ASSERT_EQ(pipeline_has_calls_edge(s, nodes[target].id, nodes[4 + owner].id),
+                              target == owner);
+                }
+            }
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[6].id, nodes[7].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[13].id, nodes[12].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[14].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[15].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[11].id, nodes[15].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[11].id, nodes[14].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[8].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[10].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[11].id, nodes[10].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[11].id, nodes[8].id), 0);
+            for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+                cbm_node_free_fields(&nodes[i]);
+            }
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
 TEST(pipeline_swift_capped_selector_survives_incremental_issue2061) {
     char type[2049], service[4608], caller[2304];
     memset(type, 'T', sizeof(type) - 1);
@@ -33052,6 +33175,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_extension_constraints_identity_issue2061);
     RUN_TEST(pipeline_swift_capped_selector_survives_incremental_issue2061);
     RUN_TEST(pipeline_swift_cross_file_extension_issue2061);
+    RUN_TEST(pipeline_swift_same_named_extensions_stay_in_module_issue2061);
     RUN_TEST(pipeline_swift_qualified_and_return_identity_issue2061);
     RUN_TEST(pipeline_swift_return_identity_issue2061);
     RUN_TEST(pipeline_swift_receiver_and_chained_closures_issue2061);

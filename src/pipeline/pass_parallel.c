@@ -2068,6 +2068,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
     cbm_pipeline_set_nsmap(namespace_map);
 
+    cbm_registry_build_swift_owners(ctx->registry, ctx->gbuf, ctx->repo_path);
+
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
                  itoa_log(defines_edges), "imports", itoa_log(imports_edges));
     return 0;

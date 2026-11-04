@@ -29,6 +29,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
+#include "foundation/arena.h"
 #include "foundation/dyn_array.h"
 #include "foundation/mem_core.h"
 #include "foundation/platform.h"
@@ -102,6 +103,28 @@ typedef struct {
     uint8_t count;
     char selector[];
 } swift_signature_t;
+typedef struct swift_owner swift_owner_t;
+struct swift_owner {
+    const char *qn;
+    const char *path;
+    const char *module;
+    const char *imports;
+    bool declaration;
+    swift_owner_t *primary;
+    swift_owner_t *members;
+    swift_owner_t *next_member;
+    swift_owner_t *next_path;
+    swift_owner_t *next;
+};
+
+typedef struct {
+    CBMArena arena;
+    const char *product;
+    CBMHashTable *by_qn;
+    CBMHashTable *by_path;
+    CBMHashTable *by_module_path;
+    swift_owner_t *types;
+} swift_owners_t;
 _Static_assert(CBM_LANG_COUNT <= UINT8_MAX, "CBMLanguage must fit the per-entry lang byte");
 
 struct cbm_registry {
@@ -117,6 +140,7 @@ struct cbm_registry {
     CBMHashTable *by_name;
     CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
     CBMHashTable *swift_overloads;  /* base callable QN -> overloads */
+    swift_owners_t *swift_owners;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -1489,6 +1513,17 @@ static void free_swift_overloads(const char *key, void *value, void *ud) {
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
 }
 
+static void swift_owners_free(swift_owners_t *index) {
+    if (!index) {
+        return;
+    }
+    cbm_ht_free(index->by_qn);
+    cbm_ht_free(index->by_path);
+    cbm_ht_free(index->by_module_path);
+    cbm_arena_destroy(&index->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, index);
+}
+
 void cbm_registry_free(cbm_registry_t *r) {
     if (!r) {
         return;
@@ -1504,6 +1539,7 @@ void cbm_registry_free(cbm_registry_t *r) {
         cbm_ht_foreach(r->swift_overloads, free_swift_overloads, NULL);
         cbm_ht_free(r->swift_overloads);
     }
+    swift_owners_free(r->swift_owners);
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -2922,40 +2958,191 @@ static yyjson_doc *swift_type_properties(const cbm_gbuf_t *graph, const char *qn
     return yyjson_read(node->properties_json, strlen(node->properties_json), 0);
 }
 
+/* SwiftPM targets keep their nested source directories together.
+ * shortcut: other layouts use their directory until build-manifest modules are available. */
+static const char *swift_owner_module(CBMArena *arena, const char *file) {
+    const char *end = strrchr(file, '/');
+    for (const char *part = file; *part;) {
+        const char *slash = strchr(part, '/');
+        if (!slash) {
+            break;
+        }
+        size_t n = (size_t)(slash - part);
+        if (n == strlen("Source") && memcmp(part, "Source", n) == 0) {
+            end = slash;
+            break;
+        }
+        if ((n == strlen("Sources") && memcmp(part, "Sources", n) == 0) ||
+            (n == strlen("Tests") && memcmp(part, "Tests", n) == 0)) {
+            const char *target = strchr(slash + SKIP_ONE, '/');
+            if (target) {
+                end = target;
+            }
+            break;
+        }
+        part = slash + SKIP_ONE;
+    }
+    return cbm_arena_strndup(arena, file, end ? (size_t)(end - file) : 0);
+}
+
+static const char *swift_module_path_key(CBMArena *arena, const char *module, const char *path) {
+    return cbm_arena_sprintf(arena, "%s\n%s", module, path);
+}
+
+static void swift_owner_collect(const cbm_gbuf_node_t *node, void *userdata) {
+    swift_owners_t *index = userdata;
+    if (!node->file_path || !node->properties_json ||
+        (!strstr(node->properties_json, "\"swift_type_path\"") &&
+         !strstr(node->properties_json, "\"swift_extension\""))) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    yyjson_val *props = yyjson_doc_get_root(doc);
+    const char *declaration = yyjson_get_str(yyjson_obj_get(props, "swift_type_path"));
+    const char *extension = yyjson_get_str(yyjson_obj_get(props, "swift_extension"));
+    const char *path = declaration ? declaration : extension;
+    swift_owner_t *type = path ? cbm_arena_alloc(&index->arena, sizeof(*type)) : NULL;
+    if (!type) {
+        yyjson_doc_free(doc);
+        return;
+    }
+    memset(type, 0, sizeof(*type));
+    type->qn = cbm_arena_strdup(&index->arena, node->qualified_name);
+    type->path = cbm_arena_strdup(&index->arena, path);
+    type->module = swift_owner_module(&index->arena, node->file_path);
+    const char *imports = yyjson_get_str(yyjson_obj_get(props, "swift_imports"));
+    type->imports = cbm_arena_strdup(&index->arena, imports ? imports : "");
+    type->declaration = declaration != NULL;
+    if (type->qn && type->path && type->module && type->imports) {
+        type->next = index->types;
+        index->types = type;
+        cbm_ht_set(index->by_qn, type->qn, type);
+        if (type->declaration) {
+            type->next_path = cbm_ht_get(index->by_path, type->path);
+            cbm_ht_set(index->by_path, type->path, type);
+            const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+            swift_owner_t *prior = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+            if (key && (!prior || strcmp(type->qn, prior->qn) < 0)) {
+                cbm_ht_set(index->by_module_path, key, type);
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+}
+
+static bool swift_owner_imports(const swift_owners_t *index, const swift_owner_t *extension,
+                                const char *module) {
+    const char *leaf = strrchr(module, '/');
+    leaf = leaf ? leaf + SKIP_ONE : module;
+    /* Legacy Source/ trees commonly expose the repository's product name. */
+    if (strcmp(leaf, "Source") == 0 || strcmp(leaf, "Sources") == 0) {
+        leaf = index->product;
+    }
+    size_t n = strlen(leaf);
+    for (const char *p = extension->imports; p && *p;) {
+        const char *end = strchr(p, '|');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (n && len >= n && memcmp(p, leaf, n) == 0 && (len == n || p[n] == '.')) {
+            return true;
+        }
+        p = end ? end + SKIP_ONE : NULL;
+    }
+    return false;
+}
+
+static swift_owner_t *swift_owner_primary(swift_owners_t *index, const swift_owner_t *type) {
+    const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+    swift_owner_t *local = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+    if (local) {
+        return local;
+    }
+    swift_owner_t *imported = NULL;
+    for (swift_owner_t *decl = cbm_ht_get(index->by_path, type->path); decl;
+         decl = decl->next_path) {
+        if (swift_owner_imports(index, type, decl->module)) {
+            if (imported && strcmp(imported->module, decl->module) != 0) {
+                return NULL; /* ambiguous imported declarations */
+            }
+            if (!imported || strcmp(decl->qn, imported->qn) < 0) {
+                imported = decl;
+            }
+        }
+    }
+    return imported;
+}
+
+static void swift_owner_group_members(swift_owners_t *index) {
+    /* Unindexed external types still share extensions within their own target. */
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        if (type->primary) {
+            continue;
+        }
+        const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+        swift_owner_t *prior = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        if (key && (!prior || strcmp(type->qn, prior->qn) < 0)) {
+            cbm_ht_set(index->by_module_path, key, type);
+        }
+    }
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        if (!type->primary) {
+            const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+            type->primary = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        }
+        if (type->primary) {
+            type->next_member = type->primary->members;
+            type->primary->members = type;
+        }
+    }
+}
+
+void cbm_registry_build_swift_owners(cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                     const char *repo_path) {
+    if (!r || !graph) {
+        return;
+    }
+    swift_owners_free(r->swift_owners);
+    r->swift_owners = NULL;
+    if (!r->swift_signatures) {
+        return;
+    }
+    swift_owners_t *index = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*index));
+    if (!index) {
+        return;
+    }
+    cbm_arena_init(&index->arena);
+    const char *product = repo_path ? strrchr(repo_path, '/') : NULL;
+    index->product = cbm_arena_strdup(&index->arena, product ? product + SKIP_ONE : "");
+    index->by_qn = cbm_ht_create(CBM_SZ_512);
+    index->by_path = cbm_ht_create(CBM_SZ_512);
+    index->by_module_path = cbm_ht_create(CBM_SZ_512);
+    if (!index->product || !index->by_qn || !index->by_path || !index->by_module_path) {
+        swift_owners_free(index);
+        return;
+    }
+    cbm_gbuf_foreach_node(graph, swift_owner_collect, index);
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        type->primary = swift_owner_primary(index, type);
+    }
+    swift_owner_group_members(index);
+    r->swift_owners = index;
+}
+
 static int swift_owner_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
                                   const CBMCall *call, const char *name, const char **out,
                                   int out_cap, const char **owner) {
-    const char *type_qn = *owner;
-    int found = swift_owner_bucket(r, call, type_qn, name, out, out_cap, 0);
-    const qn_array_t *types = cbm_ht_get(r->by_name, simple_name(type_qn));
-    if (found < 0 || !graph || !types || types->count < PAIR_LEN) {
-        return found;
+    (void)graph;
+    const swift_owner_t *type = r->swift_owners ? cbm_ht_get(r->swift_owners->by_qn, *owner) : NULL;
+    if (!type || !type->primary) {
+        return swift_owner_bucket(r, call, *owner, name, out, out_cap, 0);
     }
-    yyjson_doc *doc = swift_type_properties(graph, type_qn);
-    yyjson_val *props = yyjson_doc_get_root(doc);
-    const char *extension = yyjson_get_str(yyjson_obj_get(props, "swift_extension"));
-    const char *path =
-        extension ? extension : yyjson_get_str(yyjson_obj_get(props, "swift_type_path"));
-    /* A file QN identifies the node, while the nominal path identifies its extension target. */
-    for (int i = 0; path && i < types->count && found >= 0; i++) {
-        const char *qn = types->items[i];
-        if (strcmp(qn, type_qn) == 0) {
-            continue;
-        }
-        yyjson_doc *other_doc = swift_type_properties(graph, qn);
-        yyjson_val *other_props = yyjson_doc_get_root(other_doc);
-        const char *target = yyjson_get_str(yyjson_obj_get(other_props, "swift_extension"));
-        const char *declaration = yyjson_get_str(yyjson_obj_get(other_props, "swift_type_path"));
-        if (target && strcmp(path, target) == 0) {
-            found = swift_owner_bucket(r, call, qn, name, out, out_cap, found);
-        } else if (extension && *owner == type_qn && declaration &&
-                   strcmp(path, declaration) == 0) {
-            *owner = qn;
-            found = swift_owner_bucket(r, call, qn, name, out, out_cap, found);
-        }
-        yyjson_doc_free(other_doc);
+    if (type->primary->declaration) {
+        *owner = type->primary->qn;
     }
-    yyjson_doc_free(doc);
+    int found = 0;
+    for (const swift_owner_t *member = type->primary->members; member && found >= 0;
+         member = member->next_member) {
+        found = swift_owner_bucket(r, call, member->qn, name, out, out_cap, found);
+    }
     return found;
 }
 

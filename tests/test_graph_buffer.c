@@ -69,6 +69,43 @@ TEST(gbuf_upsert_updates) {
     PASS();
 }
 
+TEST(gbuf_swift_declaration_and_extension_keep_both_markers) {
+    const char *declaration = "{\"swift_type_path\":\"Service\",\"swift_extension\":null,"
+                              "\"base_classes\":[\"Base\"],\"docstring\":\"Nominal type\"}";
+    const char *extension =
+        "{\"swift_extension\":\"Service\",\"swift_type_path\":null,\"base_classes\":[]}";
+    for (int merge = 0; merge < 2; merge++) {
+        for (int reverse = 0; reverse < 2; reverse++) {
+            for (int extension_first = 0; extension_first < 2; extension_first++) {
+                cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+                cbm_gbuf_t *worker = merge ? cbm_gbuf_new("test", "/tmp") : NULL;
+                ASSERT_NOT_NULL(gb);
+                for (int i = 0; i < 2; i++) {
+                    bool is_extension = (i == reverse);
+                    int line = (is_extension == (extension_first != 0)) ? 1 : 10;
+                    cbm_gbuf_t *target = merge && i ? worker : gb;
+                    ASSERT_GT(cbm_gbuf_upsert_node(target, "Class", "Service", "test.Types.Service",
+                                                   "Types.swift", line, line + 2,
+                                                   is_extension ? extension : declaration),
+                              0);
+                }
+                if (merge) {
+                    cbm_gbuf_merge(gb, worker);
+                }
+                const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gb, "test.Types.Service");
+                ASSERT_NOT_NULL(node);
+                ASSERT_NOT_NULL(strstr(node->properties_json, "\"swift_type_path\":\"Service\""));
+                ASSERT_NOT_NULL(strstr(node->properties_json, "\"swift_extension\":\"Service\""));
+                ASSERT_NOT_NULL(strstr(node->properties_json, "\"base_classes\":[\"Base\"]"));
+                ASSERT_NOT_NULL(strstr(node->properties_json, "\"docstring\":\"Nominal type\""));
+                cbm_gbuf_free(worker);
+                cbm_gbuf_free(gb);
+            }
+        }
+    }
+    PASS();
+}
+
 TEST(gbuf_find_by_id) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "pkg.foo", "foo.go", 1, 5, "{}");
@@ -1443,6 +1480,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_free_null);
     RUN_TEST(gbuf_upsert_node);
     RUN_TEST(gbuf_upsert_updates);
+    RUN_TEST(gbuf_swift_declaration_and_extension_keep_both_markers);
     RUN_TEST(gbuf_find_by_id);
     RUN_TEST(gbuf_find_by_label);
     RUN_TEST(gbuf_find_by_name);

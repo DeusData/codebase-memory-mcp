@@ -248,6 +248,10 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+/* Freeze Swift declaration/extension ownership after all definitions are registered. */
+void cbm_registry_build_swift_owners(cbm_registry_t *registry, const cbm_gbuf_t *graph,
+                                     const char *repo_path);
+
 /* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
