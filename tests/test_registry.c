@@ -967,11 +967,11 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
 
     /* Proximity outranks the tie order: the sibling wins over a shallower stranger. */
-    cbm_registry_t *near = cbm_registry_new();
-    cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
-    cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
+    cbm_registry_t *proximity = cbm_registry_new();
+    cbm_registry_add(proximity, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
+    cbm_registry_add(proximity, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
                      "Function");
-    cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
+    cbm_resolution_t nr = cbm_registry_resolve(proximity, "vnic_rq_free",
                                                "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
     ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
 
@@ -979,7 +979,7 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     cbm_registry_free(backward);
     cbm_registry_free(lex_a);
     cbm_registry_free(lex_b);
-    cbm_registry_free(near);
+    cbm_registry_free(proximity);
     PASS();
 }
 
@@ -2060,10 +2060,10 @@ TEST(external_import_shadow_declared_package_kept) {
 
     /* The walk is by dotted segment, not by substring: a tree that declares
      * "org.example.tests" must not claim "org.example.testsuite.helper". */
-    CBMImport near[] = {
+    CBMImport adjacent_imports[] = {
         {.local_name = "near", .module_path = "org.example.testsuite.helper.near"},
     };
-    CBMImportArray narr = {.items = near, .count = 1, .cap = 1};
+    CBMImportArray narr = {.items = adjacent_imports, .count = 1, .cap = 1};
     CBMHashTable *prefix_only = cbm_ht_create(8);
     ASSERT_NOT_NULL(prefix_only);
     cbm_ht_set(prefix_only, "org.example.tests", (void *)"qn");
