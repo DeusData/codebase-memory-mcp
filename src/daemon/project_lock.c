@@ -1,5 +1,6 @@
 /* project_lock.c — Shared daemon/local-CLI project mutation leases. */
 #include "daemon/project_lock.h"
+#include "daemon/project_lock_internal.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -19,6 +20,11 @@ struct cbm_project_lock_lease {
     cbm_lock_lease_t *project;
     cbm_lock_lease_t *project_set;
 };
+
+bool cbm_project_lock_set_stage_hook_for_test(cbm_project_lock_manager_t *manager,
+                                              cbm_lock_registry_stage_hook_fn hook, void *context) {
+    return manager && cbm_lock_registry_set_stage_hook_for_test(manager->registry, hook, context);
+}
 
 static bool project_lock_key(const char *project, char out[PROJECT_LOCK_KEY_CAP]) {
     if (!project || !project[0] || strcmp(project, "*") == 0) {
