@@ -97,6 +97,37 @@ bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result);
 
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 
+/* ── JS/TS barrel registry ──
+ *
+ * A JS/TS named import whose IMPORTS edge lands on a barrel (a Folder through
+ * its index file, or a module that only re-exports the name) binds the
+ * definition the barrel's re-export chain reaches. The (barrel, name) ->
+ * definition answers are computed once per pass, after every IMPORTS edge
+ * exists, and the import-map builders of both drivers only read them:
+ *
+ *   new -> request (per IMPORTS edge, while the edges are created)
+ *       -> resolve (once, all edges exist) -> publish (before resolve starts)
+ *
+ * The published registry is read concurrently by the resolve workers and
+ * freed by the next publish; publish(NULL) at pipeline cleanup frees it. */
+typedef struct CBMTsBarrels CBMTsBarrels;
+
+CBMTsBarrels *cbm_pxc_ts_barrels_new(void);
+void cbm_pxc_ts_barrels_free(CBMTsBarrels *barrels);
+/* Record the member a JS/TS named import binds from `target`, the node its
+ * IMPORTS edge reaches. Default, namespace and re-export records, and other
+ * languages, are ignored. NULL barrels is a no-op. */
+void cbm_pxc_ts_barrels_request(CBMTsBarrels *barrels, const char *rel_path, const CBMImport *imp,
+                                const cbm_gbuf_node_t *target);
+/* Answer every recorded request from the graph's re-export IMPORTS edges. */
+void cbm_pxc_ts_barrels_resolve(CBMTsBarrels *barrels, const cbm_gbuf_t *gbuf,
+                                const char *project_name);
+/* Make `barrels` the registry the import-map builders read (takes ownership
+ * and frees the previous one). */
+void cbm_pxc_ts_barrels_publish(CBMTsBarrels *barrels);
+/* Complexity-gate telemetry: requests answered and walk steps, cumulative. */
+void cbm_pxc_ts_barrel_stats(uint64_t *requests, uint64_t *steps);
+
 /* ── Per-module def index (the gopls "package summary" pattern) ──
  *
  * The hot path used to register ALL all_defs[] into a fresh registry
