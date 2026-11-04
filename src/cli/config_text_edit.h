@@ -11,6 +11,16 @@ int cbm_text_upsert_managed_block(const char *file_path, const char *begin_marke
 int cbm_text_upsert_managed_block_limited(const char *file_path, const char *begin_marker,
                                           const char *end_marker, const char *owned_content,
                                           size_t max_document_bytes);
+/* Read-only ownership probe for a managed block, used before writing a file a
+ * client auto-loads as a module. Returns 0 when the block may be written (no
+ * file, a file whose content is only whitespace, or a file already carrying our
+ * markers), 1 when the file carries content but none of our markers — the
+ * caller must leave the user's file alone and say so rather than append to it,
+ * because the generated block redeclares module-level names a hand-ported
+ * module also declares (#2204) — and -1 for unsafe state or I/O failure. Never
+ * writes, so a dry run may call it. */
+int cbm_text_managed_block_status(const char *file_path, const char *begin_marker,
+                                  const char *end_marker);
 int cbm_text_remove_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker);
 

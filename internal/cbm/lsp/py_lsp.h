@@ -13,6 +13,7 @@
 typedef struct {
     const char *name;   // bound name, e.g. "fn"
     TSNode lambda_node; // the lambda AST node
+    bool expanding;     // body is being re-walked for a call site right now
 } CBMLambdaEntry;
 
 // Function-as-dict-value entry. When `funcs = {"a": foo, "b": bar}` is

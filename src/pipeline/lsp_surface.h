@@ -68,4 +68,11 @@ int cbm_lsp_surface_python_namespace_from_json(CBMArena *arena, const char *json
  */
 int cbm_lsp_surface_python_change(const char *old_json, const char *new_json);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Bracket each file callback, including skipped/error rows. Install only with
+ * no surface build running; clear after the observed build returns. */
+typedef void (*cbm_lsp_surface_row_observer_fn)(int index, bool entering, void *ctx);
+void cbm_lsp_surface_test_set_row_observer(cbm_lsp_surface_row_observer_fn observer, void *ctx);
+#endif
+
 #endif /* CBM_PIPELINE_LSP_SURFACE_H */

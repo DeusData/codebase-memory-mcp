@@ -51,17 +51,25 @@ jobs:
         run: |
           set -euo pipefail
           MESSAGE_FILE=.github/pr-acknowledgement.md
+          BODY_FILE="$RUNNER_TEMP/pr-acknowledgement-body.md"
 
           if [ ! -f "$MESSAGE_FILE" ]; then
             echo "No $MESSAGE_FILE in the base tree — acknowledgements are off."
             exit 0
           fi
 
-          # An empty or whitespace-only file is the documented off switch.
-          if [ -z "$(tr -d '[:space:]' < "$MESSAGE_FILE")" ]; then
-            echo "$MESSAGE_FILE is blank — acknowledgements are off."
+          # HTML comments in the template are notes for maintainers. Posted
+          # verbatim they become text a reader cannot see but a tool can, and
+          # our own PR screening holds every comment that carries hidden text.
+          # Strip them (an unterminated one runs to the end, as GitHub renders
+          # it) so the posted body is exactly what the contributor sees.
+          perl -0777 -pe 's/<!--.*?(?:-->|\z)[ \t]*\n?//gs' "$MESSAGE_FILE" > "$BODY_FILE"
+
+          # A body with no visible text is the documented off switch.
+          if [ -z "$(tr -d '[:space:]' < "$BODY_FILE")" ]; then
+            echo "$MESSAGE_FILE has no visible text — acknowledgements are off."
             exit 0
           fi
 
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$MESSAGE_FILE"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$BODY_FILE"
           echo "Acknowledged PR #${PR_NUMBER}."

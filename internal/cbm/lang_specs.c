@@ -571,7 +571,8 @@ static const char *objc_assign_types[] = {"assignment_expression", NULL};
 // well as in the name resolvers — extract_class_methods gates on this set, so
 // without the entry the requirement is walked and then discarded.
 static const char *swift_func_types[] = {"function_declaration", "protocol_function_declaration",
-                                         "macro_declaration", NULL};
+                                         "macro_declaration",    "init_declaration",
+                                         "deinit_declaration",   NULL};
 // KNOWN GAP: struct_declaration and enum_declaration are not node types in the
 // vendored tree-sitter-swift grammar — it models both as class_declaration — so
 // these two entries never match anything, and a bare Swift `enum` is labeled
@@ -1039,6 +1040,7 @@ static const char *solidity_field_types[] = {"state_variable_declaration", "stru
 static const char *solidity_call_types[] = {"call_expression", "call", "new_expression", NULL};
 static const char *solidity_import_types[] = {"import_directive", "import", "using_directive",
                                               NULL};
+static const char *solidity_decorator_types[] = {"modifier_invocation", NULL};
 static const char *solidity_branch_types[] = {"if_statement",    "for_statement",
                                               "while_statement", "do_while_statement",
                                               "try_statement",   NULL};
@@ -2116,7 +2118,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                            solidity_field_types, solidity_module_types, solidity_call_types,
                            solidity_import_types, empty_types, solidity_branch_types,
                            solidity_var_types, solidity_assign_types, solidity_throw_types, NULL,
-                           empty_types, NULL, NULL, tree_sitter_solidity, NULL},
+                           solidity_decorator_types, NULL, NULL, tree_sitter_solidity, NULL},
 
     // CBM_LANG_TYPST
     [CBM_LANG_TYPST] = {CBM_LANG_TYPST, typst_func_types, empty_types, empty_types,

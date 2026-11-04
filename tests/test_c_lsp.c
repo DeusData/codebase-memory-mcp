@@ -16000,8 +16000,8 @@ TEST(seal_go_shared_registry_readonly) {
     const char *src = "package main\nfunc helper(x int) int { return x + 1 }\n"
                       "func caller() int { return helper(1) }\n";
     CBMResolvedCallArray out = {0};
-    cbm_run_go_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
-                                       0, NULL, &out);
+    cbm_run_go_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", NULL, reg, NULL,
+                                       NULL, 0, NULL, &out);
     ASSERT_EQ(reg->func_count, fb);
     ASSERT_EQ(reg->type_count, tb);
     cbm_arena_destroy(&arena);
