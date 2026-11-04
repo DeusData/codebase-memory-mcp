@@ -109,6 +109,11 @@ typedef struct {
      * by the registrar against def_module_qn like return_types. NULL = not an
      * identity alias. */
     const char *alias_target;
+    /* Ruby only: singleton-side method (`def self.m`, `class << self`), and a
+     * class/module's mixin macros as "|"-separated "<k>:<Const>" pairs (k = i,
+     * p or e). See CBMDefinition. */
+    bool is_singleton;
+    const char *mixin_refs;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

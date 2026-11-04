@@ -1946,6 +1946,47 @@ TEST(lrp_ruby_cross_file_zeitwerk) {
     PASS();
 }
 
+/* ── Ruby: singleton side and cross-file mixins, through real extraction ──
+ * The hand-built-def rows pass the singleton flag and mixin macros in
+ * themselves; this one has the extractor produce them. `Child.run` is a
+ * `def self.run`, `Child.new.run` is Base's instance `run`, and `Widget`
+ * includes a module that overrides Base#greet, all from a caller in a fifth
+ * file. */
+TEST(lrp_ruby_cross_file_singleton_and_mixin) {
+    const LRP_File files[] = {
+        {"app/base.rb", "class Base\n  def run\n    1\n  end\n  def greet\n    2\n  end\nend\n"},
+        {"app/overrides.rb", "module Overrides\n  def greet\n    3\n  end\nend\n"},
+        {"app/child.rb", "class Child < Base\n  def self.run\n    4\n  end\nend\n"},
+        {"app/widget.rb", "class Widget < Base\n  include Overrides\nend\n"},
+        {"app/caller.rb", "class Caller\n"
+                          "  def go\n"
+                          "    Child.new.run\n"
+                          "    Child.run\n"
+                          "    Widget.new.greet\n"
+                          "  end\n"
+                          "end\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, 5);
+    const char *p = store ? lp.project : NULL;
+    int inst = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "base.Base.run");
+    int klass =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "child.Child.run");
+    int mixin = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go",
+                                            "overrides.Overrides.greet");
+    int base_greet =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "base.Base.greet");
+    if (inst != 1 || klass != 1 || mixin != 1 || base_greet != 0)
+        fprintf(stderr, "  [LRP] ruby singleton/mixin FAIL instance=%d class=%d mixin=%d base=%d\n",
+                inst, klass, mixin, base_greet);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(inst, 1);
+    ASSERT_EQ(klass, 1);
+    ASSERT_EQ(mixin, 1);
+    ASSERT_EQ(base_greet, 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ══════════════════════════════════════════════════════════════════════ */
@@ -2067,4 +2108,5 @@ SUITE(lsp_resolution_probe) {
 
     /* ── Ruby (project registry built once) ── */
     RUN_TEST(lrp_ruby_cross_file_zeitwerk);
+    RUN_TEST(lrp_ruby_cross_file_singleton_and_mixin);
 }

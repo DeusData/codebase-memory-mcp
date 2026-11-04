@@ -1913,8 +1913,8 @@ TEST(rubylsp_cross_reopened_class_work_is_bounded) {
     ASSERT(rubylsp_reopen_work(64, &build_r, &resolve_r));
     ASSERT(rubylsp_reopen_work(128, &build_2r, &resolve_2r));
     printf("  reopened-class work: build R=64 %llu, 2R %llu; resolve R=64 %llu, 2R %llu\n",
-           (unsigned long long)build_r, (unsigned long long)build_2r,
-           (unsigned long long)resolve_r, (unsigned long long)resolve_2r);
+           (unsigned long long)build_r, (unsigned long long)build_2r, (unsigned long long)resolve_r,
+           (unsigned long long)resolve_2r);
     ASSERT(build_2r < 3 * (build_r ? build_r : 1));
     ASSERT(2 * resolve_2r < 3 * (resolve_r ? resolve_r : 1));
     PASS();
@@ -1940,8 +1940,8 @@ static void rubylsp_order_defs(CBMLSPDef *defs, bool reversed) {
     cross_def(&t[7], "test.base.CxBase.label", "label", "Method", "test.base", "test.base.CxBase",
               NULL);
     cross_def(&t[8], "test.base.CxOther", "CxOther", "Class", "test.base", NULL, NULL);
-    cross_def(&t[9], "test.base.CxOther.label", "label", "Method", "test.base",
-              "test.base.CxOther", NULL);
+    cross_def(&t[9], "test.base.CxOther.label", "label", "Method", "test.base", "test.base.CxOther",
+              NULL);
     for (int i = 0; i < 10; i++)
         defs[i] = reversed ? t[9 - i] : t[i];
 }
@@ -1979,6 +1979,149 @@ TEST(rubylsp_cross_registry_is_def_order_independent) {
         ASSERT(f[i]);
         ASSERT(r[i]);
     }
+    PASS();
+}
+
+/* ── cross-file: singleton side and mixins (review items 5, 6) ───── */
+
+static const CBMDefinition *rubylsp_find_def(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+/* The extractor knows what CBMLSPDef used to lose: which methods sit on the
+ * singleton side (`def self.m`, `class << self`) and which mixin macros a
+ * class body holds. Only constants count; `extend self` is not one. */
+TEST(rubylsp_extractor_flags_singleton_methods_and_mixins) {
+    const char *src = "class Widget < Base\n"
+                      "  include Auditable\n"
+                      "  prepend Admin::Guard\n"
+                      "  extend Finders\n"
+                      "  extend self\n"
+                      "  def inst\n  end\n"
+                      "  def self.make\n  end\n"
+                      "  class << self\n"
+                      "    def build\n    end\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r != NULL);
+    const CBMDefinition *w = rubylsp_find_def(r, "Widget");
+    const CBMDefinition *inst = rubylsp_find_def(r, "inst");
+    const CBMDefinition *make = rubylsp_find_def(r, "make");
+    const CBMDefinition *build = rubylsp_find_def(r, "build");
+    bool ok = w && inst && make;
+    bool mixins =
+        ok && w->mixin_refs && strcmp(w->mixin_refs, "i:Auditable|p:Admin::Guard|e:Finders") == 0;
+    /* A method inside `class << self`, when the extractor emits one at all,
+     * must be on the singleton side. */
+    bool flags = ok && !inst->is_singleton && make->is_singleton && (!build || build->is_singleton);
+    printf("    defs: Widget=%d inst=%d make=%d build=%d (class << self def emitted: %s)\n",
+           w != NULL, inst != NULL, make != NULL, build != NULL, build ? "yes" : "no");
+    if (!(mixins && flags))
+        printf("    mixin_refs=%s\n", ok && w->mixin_refs ? w->mixin_refs : "(null)");
+    cbm_free_result(r);
+    ASSERT(ok);
+    ASSERT(mixins);
+    ASSERT(flags);
+    PASS();
+}
+
+/* Review item 5. `Child` defines `def self.run` and inherits instance `run`
+ * from Base. An instance call must reach Base#run, the one Ruby would call; a
+ * class-side call must reach Child.run. Registering each method on both keys
+ * made the instance call stop at the singleton. */
+TEST(rubylsp_cross_singleton_and_instance_do_not_shadow) {
+    CBMLSPDef defs[4];
+    cross_def(&defs[0], "test.base.Base", "Base", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[1], "test.base.Base.run", "run", "Method", "test.base", "test.base.Base", NULL);
+    cross_def(&defs[2], "test.child.Child", "Child", "Class", "test.child", NULL, "Base");
+    cross_def(&defs[3], "test.child.Child.run", "run", "Method", "test.child", "test.child.Child",
+              NULL);
+    defs[3].is_singleton = true;
+
+    const char *src = "class Caller\n  def go\n    Child.new.run\n    Child.run\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, 4, NULL, NULL, 0,
+                           NULL, &out);
+    bool instance = out_has(&out, "Caller.go", "test.base.Base.run");
+    bool klass = out_has(&out, "Caller.go", "test.child.Child.run");
+    if (!(instance && klass))
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    ASSERT(instance);
+    ASSERT(klass);
+    PASS();
+}
+
+static bool rubylsp_mixin_call(const char *decl_mixin, bool reopen_elsewhere, bool *module_hit,
+                               bool *base_hit) {
+    CBMLSPDef defs[8];
+    int n = 0;
+    cross_def(&defs[n++], "test.base.Base", "Base", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[n++], "test.base.Base.greet", "greet", "Method", "test.base", "test.base.Base",
+              NULL);
+    cross_def(&defs[n++], "test.mod.Overrides", "Overrides", "Module", "test.mod", NULL, NULL);
+    cross_def(&defs[n++], "test.mod.Overrides.greet", "greet", "Method", "test.mod",
+              "test.mod.Overrides", NULL);
+    /* The class is declared in file A (the head); the include is in A, or in
+     * a reopening in a later file Z. */
+    cross_def(&defs[n++], "test.a.Widget", "Widget", "Class", "test.a", NULL, "Base");
+    if (!reopen_elsewhere)
+        defs[n - 1].mixin_refs = decl_mixin;
+    if (reopen_elsewhere) {
+        cross_def(&defs[n++], "test.z.Widget", "Widget", "Class", "test.z", NULL, NULL);
+        defs[n - 1].mixin_refs = decl_mixin;
+    }
+    const char *src = "class Caller\n  def go\n    Widget.new.greet\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, n, NULL, NULL, 0,
+                           NULL, &out);
+    *module_hit = out_has(&out, "Caller.go", "test.mod.Overrides.greet");
+    *base_hit = out_has(&out, "Caller.go", "test.base.Base.greet");
+    if (!*module_hit && !*base_hit && out.count > 1)
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    return true;
+}
+
+/* Review item 6. A module the class includes shadows the superclass's method,
+ * whichever file the class and the include are in. A call from file B must not
+ * resolve to Base#greet, and an include of a module the table cannot see must
+ * block the walk rather than fall through to the superclass. */
+TEST(rubylsp_cross_mixin_shadows_superclass_across_files) {
+    bool module_hit;
+    bool base_hit;
+    ASSERT(rubylsp_mixin_call("i:Overrides", false, &module_hit, &base_hit));
+    ASSERT(module_hit);
+    ASSERT(!base_hit);
+    PASS();
+}
+
+TEST(rubylsp_cross_mixin_in_reopening_shadows_superclass) {
+    bool module_hit;
+    bool base_hit;
+    ASSERT(rubylsp_mixin_call("i:Overrides", true, &module_hit, &base_hit));
+    ASSERT(module_hit);
+    ASSERT(!base_hit);
+    PASS();
+}
+
+TEST(rubylsp_cross_unseen_mixin_blocks_superclass) {
+    bool module_hit;
+    bool base_hit;
+    ASSERT(rubylsp_mixin_call("i:Missing", false, &module_hit, &base_hit));
+    ASSERT(!module_hit);
+    ASSERT(!base_hit);
     PASS();
 }
 
@@ -2028,4 +2171,9 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_cross_registry_built_once_serves_many_files);
     RUN_TEST(rubylsp_cross_reopened_class_work_is_bounded);
     RUN_TEST(rubylsp_cross_registry_is_def_order_independent);
+    RUN_TEST(rubylsp_extractor_flags_singleton_methods_and_mixins);
+    RUN_TEST(rubylsp_cross_singleton_and_instance_do_not_shadow);
+    RUN_TEST(rubylsp_cross_mixin_shadows_superclass_across_files);
+    RUN_TEST(rubylsp_cross_mixin_in_reopening_shadows_superclass);
+    RUN_TEST(rubylsp_cross_unseen_mixin_blocks_superclass);
 }

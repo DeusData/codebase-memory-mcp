@@ -741,6 +741,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
         dst->is_abstract = src->is_abstract;
     }
+    if (lang == CBM_LANG_RUBY) {
+        dst->is_singleton = src->is_singleton;
+        dst->mixin_refs = src->mixin_refs ? cbm_arena_strdup(arena, src->mixin_refs) : NULL;
+    }
     return 0;
 }
 

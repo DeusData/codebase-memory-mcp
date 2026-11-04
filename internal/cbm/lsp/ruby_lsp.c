@@ -714,6 +714,23 @@ static const CBMRegisteredFunc *ruby_lookup_in_mixins(RubyLSPContext *ctx, const
         if (f || w->blocked)
             return f;
     }
+    /* A class reopened in other files: those files' mixins are in the merged
+     * record, so a module one of them includes still shadows the superclass. */
+    const CBMRubyCrossRegistry *sh = ctx->shared;
+    const RubyClassInfo *head = ruby_shared_head(sh, owner_qn);
+    for (int i = head ? head->mixin_n - 1 : -1; i >= 0; i--) {
+        const RubyMixinInfo *mi = &sh->mixins[head->mixin_start + i];
+        if (mi->kind != kind)
+            continue;
+        if (!mi->module_qn) {
+            w->blocked = true;
+            return NULL;
+        }
+        const CBMRegisteredFunc *f =
+            ruby_lookup_instance_method_depth(ctx, mi->module_qn, method_name, depth + 1, w);
+        if (f || w->blocked)
+            return f;
+    }
     return NULL;
 }
 
@@ -1984,6 +2001,90 @@ static void ruby_shared_insert(CBMRubyCrossRegistry *sh, int *slots, int idx, bo
     slots[i] = idx + 1;
 }
 
+typedef struct {
+    int head;            /* owning merged record (table index) */
+    int cls;             /* declaring entry (table index) */
+    const char *decl_qn; /* its QN, the canonical order key */
+    int seq;             /* position among that declaration's macros */
+    RubyMixinKind kind;
+    const char *ref; /* dotted constant */
+} RubyMixinTmp;
+
+static int ruby_mixin_tmp_cmp(const void *a, const void *b) {
+    const RubyMixinTmp *x = (const RubyMixinTmp *)a;
+    const RubyMixinTmp *y = (const RubyMixinTmp *)b;
+    if (x->head != y->head)
+        return x->head < y->head ? -1 : 1;
+    int c = strcmp(x->decl_qn, y->decl_qn);
+    return c ? c : x->seq - y->seq;
+}
+
+/* Resolve every declaration's include/prepend/extend macros once, from the
+ * scope that declared them, into the merged record of their constant, so a
+ * class's mixins are visible from every file. Order is canonical (declaring QN,
+ * then source order), so it does not depend on def order. An unresolvable
+ * module keeps module_qn NULL: lookups then fail closed. */
+static bool ruby_build_shared_mixins(CBMRubyCrossRegistry *sh, CBMArena *arena, RubyLSPContext *ctx,
+                                     const char **decl_mixins, const char **body_nesting) {
+    int total = 0;
+    for (int i = 0; i < sh->class_count; i++) {
+        if (!decl_mixins[i])
+            continue;
+        total++;
+        for (const char *p = decl_mixins[i]; *p; p++)
+            if (*p == '|')
+                total++;
+    }
+    if (!total)
+        return true;
+    RubyMixinTmp *tmp = (RubyMixinTmp *)cbm_arena_alloc(arena, (size_t)total * sizeof(*tmp));
+    if (!tmp)
+        return false;
+    int n = 0;
+    for (int i = 0; i < sh->class_count; i++) {
+        const char *p = decl_mixins[i];
+        int seq = 0;
+        while (p && *p) {
+            const char *end = strchr(p, '|');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (len > 2 && p[1] == ':' && (p[0] == 'i' || p[0] == 'p' || p[0] == 'e') &&
+                n < total) {
+                tmp[n].head = sh->classes[i].group_head - 1;
+                tmp[n].cls = i;
+                tmp[n].decl_qn = sh->classes[i].qn;
+                tmp[n].seq = seq++;
+                tmp[n].kind = p[0] == 'i'   ? RUBY_MIXIN_INCLUDE
+                              : p[0] == 'p' ? RUBY_MIXIN_PREPEND
+                                            : RUBY_MIXIN_EXTEND;
+                tmp[n].ref = ruby_dotted(arena, cbm_arena_strndup(arena, p + 2, len - 2));
+                n++;
+            }
+            p = end ? end + 1 : NULL;
+        }
+    }
+    if (!n)
+        return true;
+    qsort(tmp, (size_t)n, sizeof(*tmp), ruby_mixin_tmp_cmp);
+    sh->mixins = (RubyMixinInfo *)cbm_arena_alloc(arena, (size_t)n * sizeof(RubyMixinInfo));
+    if (!sh->mixins)
+        return false;
+    for (int i = 0; i < n; i++) {
+        RubyClassInfo *head = &sh->classes[tmp[i].head];
+        if (head->mixin_n == 0)
+            head->mixin_start = i;
+        head->mixin_n++;
+        RubyMixinInfo *mi = &sh->mixins[i];
+        memset(mi, 0, sizeof(*mi));
+        mi->owner_qn = head->qn;
+        mi->module_ref = tmp[i].ref;
+        mi->kind = tmp[i].kind;
+        ctx->nesting = body_nesting[tmp[i].cls];
+        mi->module_qn = ruby_resolve_constant(ctx, tmp[i].ref);
+    }
+    sh->mixin_count = n;
+    return true;
+}
+
 /* Slot of `path` in the by-path index, or -1 when absent. */
 static int ruby_shared_path_slot(const CBMRubyCrossRegistry *sh, const char *path) {
     unsigned i = ruby_hash(path) & sh->slot_mask;
@@ -2032,7 +2133,14 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
                                                               sizeof(RubyClassInfo));
     const char **decl_nesting = (const char **)cbm_arena_alloc(
         arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
-    if (!sh->by_qn || !sh->by_path || !sh->classes || !decl_nesting)
+    /* Per entry: the raw mixin macros and the full nesting its body resolves
+     * them in. */
+    const char **decl_mixins = (const char **)cbm_arena_alloc(
+        arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
+    const char **body_nesting = (const char **)cbm_arena_alloc(
+        arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
+    if (!sh->by_qn || !sh->by_path || !sh->classes || !decl_nesting || !decl_mixins ||
+        !body_nesting)
         return NULL;
     memset(sh->by_qn, 0, slots * sizeof(int));
     memset(sh->by_path, 0, slots * sizeof(int));
@@ -2066,6 +2174,8 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
          * resolved from there, as in the per-file pass. */
         const char *last = strrchr(suffix, '.');
         decl_nesting[n] = last ? cbm_arena_strndup(arena, suffix, (size_t)(last - suffix)) : "";
+        decl_mixins[n] = d->mixin_refs;
+        body_nesting[n] = suffix;
         ruby_shared_insert(sh, sh->by_qn, n, false);
         int slot = ruby_shared_path_slot(sh, path);
         if (slot < 0)
@@ -2081,11 +2191,13 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
     /* Pass B: methods, in a fixed QN order so a name defined by two reopenings
      * resolves to the smallest QN whatever the def order. Each registers under its
      * group head's QN (the merged record), so a lookup is one probe however
-     * many files reopen the class; the def keeps its own file's QN. The
-     * instance-vs-singleton split is not carried by CBMLSPDef, so each
-     * registers on BOTH keys. */
-    CBMLSPDef **fdefs = (CBMLSPDef **)cbm_arena_alloc(
-        arena, (size_t)(def_count ? def_count : 1) * sizeof(CBMLSPDef *));
+     * many files reopen the class; the def keeps its own file's QN. A method
+     * registers on exactly one key: the instance key, or "<qn>.self" for a
+     * `def self.m` / `class << self` method. Registering on both would let an
+     * instance call hit a singleton method of the same name and stop there,
+     * never reaching the inherited instance method Ruby would call. */
+    CBMLSPDef **fdefs = (CBMLSPDef **)cbm_arena_alloc(arena, (size_t)(def_count ? def_count : 1) *
+                                                                 sizeof(CBMLSPDef *));
     if (!fdefs)
         return NULL;
     int fcount = 0;
@@ -2105,19 +2217,16 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         rf.min_params = -1;
         rf.qualified_name = d->qualified_name;
         rf.short_name = d->short_name;
-        rf.receiver_type = receiver;
-        const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+        rf.receiver_type =
+            receiver && d->is_singleton ? cbm_arena_sprintf(arena, "%s.self", receiver) : receiver;
+        const CBMType **rets =
+            (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
         if (rets) {
             rets[0] = cbm_type_unknown();
             rets[1] = NULL;
         }
         rf.signature = cbm_type_func(arena, NULL, NULL, rets);
         cbm_registry_add_func(&sh->reg, rf);
-        if (receiver) {
-            CBMRegisteredFunc rs = rf;
-            rs.receiver_type = cbm_arena_sprintf(arena, "%s.self", receiver);
-            cbm_registry_add_func(&sh->reg, rs);
-        }
     }
 
     cbm_registry_finalize(&sh->reg);
@@ -2157,6 +2266,8 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         sh->classes[h].superclass_ref = sh->classes[provider[h]].superclass_ref;
         sh->classes[h].superclass_qn = sh->classes[provider[h]].superclass_qn;
     }
+    if (!ruby_build_shared_mixins(sh, arena, &ctx, decl_mixins, body_nesting))
+        return NULL;
     return sh;
 }
 

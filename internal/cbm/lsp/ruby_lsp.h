@@ -42,6 +42,11 @@ typedef struct {
      * index + 1 (the entry's own index + 1 for the head itself); 0 in a
      * per-file table. */
     int group_head;
+    /* Head entries only: this constant's include/prepend/extend records, a
+     * range of the registry's `mixins` array (all reopenings, in declaring-QN
+     * then source order). */
+    int mixin_start;
+    int mixin_n;
     /* Method-lookup visit marks: the stamp of the last walk that searched
      * this class on the instance / singleton side (ruby_walk_seen). */
     unsigned int seen_instance;
@@ -214,6 +219,8 @@ typedef struct CBMRubyCrossRegistry {
     int *by_qn;
     int *by_path;
     unsigned slot_mask;
+    RubyMixinInfo *mixins; /* owner_qn = the merged record's QN; grouped by head */
+    int mixin_count;
 } CBMRubyCrossRegistry;
 
 /* Build the shared registry from every project def. Strings are borrowed from

@@ -6869,6 +6869,24 @@ static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDef
     }
 }
 
+/* A Ruby `def self.m` (a singleton_method node) or a `def m` inside
+ * `class << self` lives on the singleton side of its class. */
+static bool ruby_def_is_singleton(TSNode node) {
+    if (strcmp(ts_node_type(node), "singleton_method") == 0) {
+        return true;
+    }
+    for (TSNode p = ts_node_parent(node); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        const char *t = ts_node_type(p);
+        if (strcmp(t, "singleton_class") == 0) {
+            return true;
+        }
+        if (strcmp(t, "class") == 0 || strcmp(t, "module") == 0 || strcmp(t, "program") == 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -7006,6 +7024,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(node), "function_signature_item") == 0) {
         def.is_abstract = true;
+    }
+    if (ctx->language == CBM_LANG_RUBY) {
+        def.is_singleton = ruby_def_is_singleton(node);
     }
 
     // Parameters — use func_node (inner function for templates)
@@ -8697,6 +8718,59 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     emit_class_def(ctx, node, spec, kind, name);
 }
 
+/* The `include`/`prepend`/`extend` macros of a Ruby class/module body as
+ * "<k>:<Const>" pairs joined by '|' (k = i, p, e), in source order; NULL when
+ * there are none. Only constant arguments count (`extend self` is not one),
+ * and only bare or `self.` calls, as the per-file resolver reads them. */
+static const char *ruby_class_mixin_refs(CBMArena *a, TSNode node, const char *source) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    TSNode scope = ts_node_is_null(body) ? node : body;
+    const char *out = NULL;
+    uint32_t n = ts_node_named_child_count(scope);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode call = ts_node_named_child(scope, i);
+        if (strcmp(ts_node_type(call), "call") != 0) {
+            continue;
+        }
+        TSNode meth = ts_node_child_by_field_name(call, TS_FIELD("method"));
+        TSNode recv = ts_node_child_by_field_name(call, TS_FIELD("receiver"));
+        TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+        if (ts_node_is_null(meth) || ts_node_is_null(args) ||
+            (!ts_node_is_null(recv) && strcmp(ts_node_type(recv), "self") != 0)) {
+            continue;
+        }
+        char *mname = cbm_node_text(a, meth, source);
+        char kind;
+        if (mname && strcmp(mname, "include") == 0) {
+            kind = 'i';
+        } else if (mname && strcmp(mname, "prepend") == 0) {
+            kind = 'p';
+        } else if (mname && strcmp(mname, "extend") == 0) {
+            kind = 'e';
+        } else {
+            continue;
+        }
+        uint32_t ac = ts_node_named_child_count(args);
+        for (uint32_t j = 0; j < ac; j++) {
+            TSNode arg = ts_node_named_child(args, j);
+            const char *at = ts_node_type(arg);
+            if (strcmp(at, "constant") != 0 && strcmp(at, "scope_resolution") != 0) {
+                continue;
+            }
+            char *ref = cbm_node_text(a, arg, source);
+            if (!ref || !ref[0]) {
+                continue;
+            }
+            while (ref[0] == ':') {
+                ref++;
+            }
+            out = out ? cbm_arena_sprintf(a, "%s|%c:%s", out, kind, ref)
+                      : cbm_arena_sprintf(a, "%c:%s", kind, ref);
+        }
+    }
+    return out;
+}
+
 /* Emit the class-like def for `node` under `name`, plus its members (enum
  * members, methods, fields, class variables). Split from extract_class_def so a
  * C `typedef struct { ... } Name;` can name its anonymous struct after the
@@ -8801,6 +8875,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
     }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    if (ctx->language == CBM_LANG_RUBY) {
+        def.mixin_refs = ruby_class_mixin_refs(a, node, ctx->source);
+    }
     // Go identity alias `type A = B` (#2033): keep the aliased type text so the
     // cross-file registries can set alias_of. A defined type `type A B` is a
     // type_spec and never gets here with this kind.
@@ -9275,6 +9352,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
         def.is_abstract = true;
+    }
+    if (ctx->language == CBM_LANG_RUBY) {
+        def.is_singleton = ruby_def_is_singleton(child);
     }
 
     TSNode params = find_function_params(child, ctx->language);
