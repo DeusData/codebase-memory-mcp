@@ -16713,7 +16713,7 @@ TEST(pipeline_swift_extension_constraints_identity_issue2061) {
 
 TEST(pipeline_swift_cross_file_extension_issue2061) {
     for (int mode = 0; mode < 2; mode++) {
-        char tmp[] = "/tmp/cbm_swift_extension_XXXXXX";
+        char tmp[256] = "/tmp/cbm_swift_extension_XXXXXX";
         ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
         write_temp_file(tmp, "Service.swift",
                         "struct Service { func run(value: String) {} }\n"
