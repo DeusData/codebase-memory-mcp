@@ -810,7 +810,10 @@ static const tool_def_t TOOLS[] = {
 
     {"detect_changes", "Map a Git diff to files and impact. Page with snapshot cursors.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
-     "\"string\",\"enum\":[\"files\",\"impact\",\"tests\"],\"default\":\"impact\"},"
+     "\"string\",\"enum\":[\"files\",\"impact\",\"tests\",\"doc_references\"],\"default\":"
+     "\"impact\"},"
+     "\"reference_cursor\":{\"type\":\"string\",\"description\":\"Continue "
+     "scope:doc_references.\"},"
      "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"],\"default\":"
      "\"inbound\",\"description\":\"inbound=callers; outbound=dependencies; both=union.\"},"
      "\"depth\":{\"type\":\"integer\",\"default\":2},"
@@ -19615,6 +19618,537 @@ static char *detect_test_impact(const char *args, const char *root_path, const c
 
 /* The request strings handle_detect_changes owns, released on every early
  * return (NULL is fine). */
+/* Documentation references are review candidates, never behavioral seeds. */
+typedef struct {
+    const char *document, *section, *target, *file, *label, *status, *reference, *mapping;
+    int line;
+} detect_doc_row_t;
+
+typedef struct {
+    CBMArena arena;
+    detect_doc_row_t rows[MCP_BFS_LIMIT_MAX];
+    int count;
+    bool saturated, failed;
+} detect_doc_rows_t;
+
+static bool detect_doc_file(const char *path) {
+    const char *ext = path ? strrchr(path, '.') : NULL;
+    return ext && ((strcmp(ext, ".md") == 0) || (strcmp(ext, ".markdown") == 0) ||
+                   (strcmp(ext, ".rst") == 0) || (strcmp(ext, ".adoc") == 0) ||
+                   (strcmp(ext, ".asciidoc") == 0));
+}
+
+static bool detect_doc_cancelled(void *context) {
+    return mcp_request_cancelled((const cbm_mcp_server_t *)context);
+}
+
+static void detect_doc_add(detect_doc_rows_t *rows, const char *document, const cbm_node_t *section,
+                           const cbm_node_t *target, const char *status, const char *reference,
+                           const char *mapping) {
+    if (rows->count == MCP_BFS_LIMIT_MAX) {
+        rows->saturated = true;
+        return;
+    }
+    detect_doc_row_t *row = &rows->rows[rows->count++];
+    row->document = cbm_arena_strdup(&rows->arena, document ? document : "");
+    row->section = cbm_arena_strdup(&rows->arena, section ? section->qualified_name : "");
+    row->target = cbm_arena_strdup(&rows->arena, target ? target->qualified_name : "");
+    row->file =
+        cbm_arena_strdup(&rows->arena, target && target->file_path ? target->file_path : "");
+    row->label = cbm_arena_strdup(&rows->arena, target ? target->label : "");
+    row->reference = cbm_arena_strdup(&rows->arena, reference ? reference : "");
+    row->status = cbm_arena_strdup(&rows->arena, status ? status : "");
+    row->mapping = mapping;
+    row->line = section ? section->start_line : 0;
+    rows->failed |= !row->document || !row->section || !row->target || !row->file || !row->label ||
+                    !row->reference || !row->status;
+}
+
+/* Section nodes store heading coordinates. Their prose belongs to the nearest
+ * preceding heading; the next heading ends that interval, regardless of level. */
+static bool detect_doc_selected(const cbm_node_t *source, const cbm_node_t *nodes, int n,
+                                const cbm_changed_hunk_t *hunks, int hcount, const char *file,
+                                const char **mapping) {
+    int start = (strcmp(source->label, "File") == 0) ? SKIP_ONE : source->start_line;
+    int end = INT_MAX;
+    for (int i = 0; i < n; i++) {
+        if ((strcmp(nodes[i].label, "Section") == 0) &&
+            nodes[i].start_line > ((strcmp(source->label, "File") == 0) ? 0 : start) &&
+            nodes[i].start_line <= end) {
+            end = nodes[i].start_line - SKIP_ONE;
+        }
+    }
+    bool has_hunk = false, selected = false;
+    for (int i = 0; i < hcount; i++) {
+        if (strcmp(hunks[i].path, file) != 0) {
+            continue;
+        }
+        has_hunk = true;
+        selected |= start <= hunks[i].end_line && end >= hunks[i].start_line;
+    }
+    *mapping = has_hunk ? "hunk" : "whole_file_without_hunks";
+    return has_hunk ? selected : true;
+}
+
+static const cbm_node_t *detect_doc_owner(const cbm_node_t *nodes, int n, int line) {
+    const cbm_node_t *owner = NULL;
+    for (int i = 0; i < n; i++) {
+        if ((strcmp(nodes[i].label, "File") == 0) && !owner) {
+            owner = &nodes[i];
+        }
+        if ((strcmp(nodes[i].label, "Section") == 0) && nodes[i].start_line <= line &&
+            (!owner || (strcmp(owner->label, "File") == 0) ||
+             nodes[i].start_line > owner->start_line)) {
+            owner = &nodes[i];
+        }
+    }
+    return owner;
+}
+
+static int detect_doc_row_compare(const void *left, const void *right) {
+    const detect_doc_row_t *a = left;
+    const detect_doc_row_t *b = right;
+    int cmp = strcmp(a->document, b->document);
+    if (!cmp) {
+        cmp = (a->line > b->line) - (a->line < b->line);
+    }
+    if (!cmp) {
+        cmp = strcmp(a->section, b->section);
+    }
+    if (!cmp) {
+        cmp = strcmp(a->status, b->status);
+    }
+    if (!cmp) {
+        cmp = strcmp(a->target, b->target);
+    }
+    if (!cmp) {
+        cmp = strcmp(a->reference, b->reference);
+    }
+    return cmp;
+}
+
+static bool detect_doc_diff_prefix(const char *line, size_t length, const char *prefix) {
+    size_t prefix_length = strlen(prefix);
+    return length >= prefix_length && memcmp(line, prefix, prefix_length) == 0;
+}
+
+/* The shared parser recognizes literal +++ b/ paths. Omit hunks for other
+ * headers so quoted paths, custom prefixes and deletions cannot inherit the
+ * preceding file's identity; those files use the explicit whole-file fallback.
+ * Only read file headers before the first hunk, since hunk content can itself
+ * start with --- or +++. Anchor surviving-file +0,0 ranges at line one. */
+static void detect_doc_normalize_hunks(char *diff) {
+    bool current_file = false;
+    bool file_header = true;
+    for (char *line = diff; line && *line;) {
+        char *next = strchr(line, '\n');
+        size_t length = next ? (size_t)(next - line) : strlen(line);
+        if (detect_doc_diff_prefix(line, length, "diff --git ")) {
+            file_header = true;
+            current_file = false;
+        } else if (file_header && detect_doc_diff_prefix(line, length, "--- ")) {
+            current_file = false;
+        } else if (file_header && detect_doc_diff_prefix(line, length, "+++ ")) {
+            size_t prefix_length = sizeof("+++ b/") - SKIP_ONE;
+            current_file = length > prefix_length && length - prefix_length < CBM_SZ_512 &&
+                           detect_doc_diff_prefix(line, length, "+++ b/");
+        } else if (!file_header && detect_doc_diff_prefix(line, length, "+++ ")) {
+            /* Hunk body text is not a new filename for the shared parser. */
+            line[0] = ' ';
+        } else if (detect_doc_diff_prefix(line, length, "@@ ")) {
+            file_header = false;
+            if (!current_file) {
+                line[0] = ' ';
+            } else {
+                char *plus = memchr(line, '+', length);
+                if (plus && length - (size_t)(plus - line) >= sizeof("+0,0 ") - SKIP_ONE &&
+                    memcmp(plus, "+0,0 ", sizeof("+0,0 ") - SKIP_ONE) == 0) {
+                    plus[SKIP_ONE] = '1';
+                }
+            }
+        }
+        line = next ? next + SKIP_ONE : NULL;
+    }
+}
+
+/* Each phase owns its temporary rows and returns a visible collection error. */
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+    const char *root_path;
+    const cbm_changed_hunk_t *hunks;
+    int hcount;
+} detect_doc_source_t;
+
+typedef struct {
+    const char *generation;
+    const char *snapshot;
+    uint64_t qhash;
+    int start;
+    int returned;
+    size_t budget;
+    bool json;
+    bool budget_hit;
+} detect_doc_page_t;
+
+enum {
+    DETECT_DOC_CURSOR_CAP = 80,
+    DETECT_DOC_DEFAULT_TOKENS = 3200,
+    DETECT_DOC_MIN_TOKENS = 128,
+    DETECT_DOC_MAX_TOKENS = 1000000
+};
+
+static void detect_doc_discard_store(cbm_mcp_server_t *srv) {
+    if (srv->owns_store) {
+        cbm_store_close(srv->store);
+    }
+    srv->store = NULL;
+    safe_free(srv->current_project);
+    srv->current_project = NULL;
+}
+
+static const char *detect_doc_generation(cbm_store_t *store, const char *expected,
+                                         char observed[QUERY_GRAPH_GENERATION_CAP]) {
+    if (cbm_store_generation(store, observed, QUERY_GRAPH_GENERATION_CAP) != CBM_STORE_OK ||
+        !observed[0] || strcmp(observed, "legacy") == 0 || strcmp(observed, expected) != 0) {
+        return "snapshot_changed: reindex or retry to establish the requested publication";
+    }
+    return NULL;
+}
+
+static const char *detect_doc_source_freshness(const detect_doc_source_t *input, const char *file) {
+    bool outside = false;
+    bool verified = false;
+    const char *freshness = coverage_path_freshness(input->store, input->project, input->root_path,
+                                                    file, &outside, &verified);
+    cbm_coverage_row_t *coverage = NULL;
+    int count = 0;
+    int rc = cbm_store_coverage_get_path(input->store, input->project, file, &coverage, &count);
+    bool gap = rc != CBM_STORE_OK;
+    for (int i = 0; i < count; i++) {
+        gap |= strcmp(coverage[i].kind, "unresolved_calls") != 0;
+    }
+    cbm_store_free_coverage(coverage, count);
+    if (gap) {
+        return "index_coverage_gap";
+    }
+    return coverage_freshness_current(freshness, verified) ? NULL : freshness;
+}
+
+static void detect_doc_add_target(const detect_doc_source_t *input, const char *file,
+                                  const cbm_node_t *source, int64_t target_id, const char *mapping,
+                                  detect_doc_rows_t *rows) {
+    cbm_node_t target = {0};
+    if (cbm_store_find_node_by_id(input->store, target_id, &target) != CBM_STORE_OK) {
+        rows->failed = true;
+        return;
+    }
+    if (strcmp(target.label, "Section") != 0 && !detect_doc_file(target.file_path)) {
+        detect_doc_add(rows, file, source, &target, "resolved", "", mapping);
+    }
+    free_node_contents(&target);
+}
+
+static void detect_doc_resolved(const detect_doc_source_t *input, const char *file,
+                                const cbm_node_t *nodes, int count, detect_doc_rows_t *rows) {
+    for (int i = 0; i < count && !rows->saturated; i++) {
+        const cbm_node_t *source = &nodes[i];
+        const char *mapping = NULL;
+        if ((strcmp(source->label, "Section") != 0 && strcmp(source->label, "File") != 0) ||
+            !detect_doc_selected(source, nodes, count, input->hunks, input->hcount, file,
+                                 &mapping)) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(input->store, source->id, "MENTIONS", &edges,
+                                                &edge_count) != CBM_STORE_OK) {
+            rows->failed = true;
+        }
+        for (int e = 0; e < edge_count && !rows->saturated; e++) {
+            detect_doc_add_target(input, file, source, edges[e].target_id, mapping, rows);
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+}
+
+static void detect_doc_unresolved(const detect_doc_source_t *input, const char *file,
+                                  const cbm_node_t *nodes, int count,
+                                  const cbm_doc_link_row_t *unresolved, int unresolved_count,
+                                  detect_doc_rows_t *rows) {
+    for (int i = 0; i < unresolved_count && !rows->saturated; i++) {
+        if (strcmp(unresolved[i].rel_path, file) != 0) {
+            continue;
+        }
+        const cbm_node_t *owner = detect_doc_owner(nodes, count, unresolved[i].line);
+        if (!owner) {
+            rows->failed = true;
+            continue;
+        }
+        const char *mapping = NULL;
+        if (detect_doc_selected(owner, nodes, count, input->hunks, input->hcount, file, &mapping)) {
+            detect_doc_add(rows, file, owner, NULL, unresolved[i].reason, unresolved[i].raw,
+                           mapping);
+        }
+    }
+}
+
+static const char *detect_doc_collect_file(const detect_doc_source_t *input, const char *file,
+                                           const cbm_doc_link_row_t *unresolved,
+                                           int unresolved_count, detect_doc_rows_t *rows) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_file(input->store, input->project, file, &nodes, &count) !=
+        CBM_STORE_OK) {
+        return "doc_references_unavailable: source lookup failed";
+    }
+    bool document = detect_doc_file(file);
+    for (int i = 0; i < count; i++) {
+        document |= strcmp(nodes[i].label, "Section") == 0;
+    }
+    if (document) {
+        const char *freshness = detect_doc_source_freshness(input, file);
+        if (!count || freshness) {
+            detect_doc_add(rows, file, NULL, NULL, "unavailable",
+                           freshness ? freshness : "unavailable", "unknown");
+        } else {
+            detect_doc_resolved(input, file, nodes, count, rows);
+            detect_doc_unresolved(input, file, nodes, count, unresolved, unresolved_count, rows);
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return NULL;
+}
+
+static const char *detect_doc_collect(const detect_doc_source_t *input, char **files,
+                                      int file_count, detect_doc_rows_t *rows) {
+    cbm_doc_link_row_t *unresolved = NULL;
+    int count = 0;
+    bool present = false;
+    const char *error = NULL;
+    if (cbm_store_doc_links_get(input->store, input->project, &unresolved, &count, &present) !=
+            CBM_STORE_OK ||
+        !present) {
+        error = "doc_references_unavailable: reindex to establish documentation reference coverage";
+    }
+    for (int i = 0; !error && i < count; i++) {
+        if (strcmp(unresolved[i].reason, "error") == 0) {
+            error = "doc_references_unavailable: documentation link layer failed";
+        }
+    }
+    for (int f = 0; !error && f < file_count && !rows->saturated; f++) {
+        error = detect_doc_collect_file(input, files[f], unresolved, count, rows);
+    }
+    cbm_store_free_doc_links(unresolved, count);
+    if (rows->failed) {
+        error = "doc_references_unavailable: reference collection failed";
+    }
+    return error;
+}
+
+static const char *detect_doc_prepare_page(const char *args, const char *project,
+                                           const char *base_branch, const detect_doc_rows_t *rows,
+                                           detect_doc_page_t *page) {
+    int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_IMPACT_LIMIT);
+    if (limit < SKIP_ONE) {
+        limit = SKIP_ONE;
+    }
+    if (limit > MCP_BFS_LIMIT_MAX) {
+        limit = MCP_BFS_LIMIT_MAX;
+    }
+    page->qhash = detect_params_hash(project, base_branch, "doc_references", "outbound", SKIP_ONE);
+    char *cursor = cbm_mcp_get_string_arg(args, "reference_cursor");
+    detect_cursor_t decoded = {0};
+    const char *error =
+        cursor ? detect_cursor_decode(cursor, 'd', page->snapshot, page->qhash, &decoded) : NULL;
+    if (!error && cursor && decoded.offset >= rows->count) {
+        error = "invalid_cursor: reference offset is outside the materialized result; "
+                "rerun without the cursor";
+    }
+    safe_free(cursor);
+    if (error) {
+        return error;
+    }
+    page->start = decoded.offset;
+    page->returned = rows->count - page->start;
+    if (page->returned > limit) {
+        page->returned = limit;
+    }
+    int tokens = cbm_mcp_get_int_arg(args, "max_output_tokens", DETECT_DOC_DEFAULT_TOKENS);
+    if (tokens < DETECT_DOC_MIN_TOKENS) {
+        tokens = DETECT_DOC_MIN_TOKENS;
+    }
+    if (tokens > DETECT_DOC_MAX_TOKENS) {
+        tokens = DETECT_DOC_MAX_TOKENS;
+    }
+    page->budget = (size_t)tokens * MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
+    char *format = cbm_mcp_get_string_arg(args, "format");
+    page->json = format && strcmp(format, "json") == 0;
+    safe_free(format);
+    return error;
+}
+
+static void detect_doc_render_rows(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                   const detect_doc_rows_t *rows, const detect_doc_page_t *page) {
+    yyjson_mut_val *out = yyjson_mut_arr(doc);
+    for (int i = page->start; i < page->start + page->returned; i++) {
+        const detect_doc_row_t *r = &rows->rows[i];
+        yyjson_mut_val *row = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, row, "document", r->document);
+        yyjson_mut_obj_add_strcpy(doc, row, "section", r->section);
+        yyjson_mut_obj_add_int(doc, row, "heading_line", r->line);
+        yyjson_mut_obj_add_strcpy(doc, row, "target", r->target);
+        yyjson_mut_obj_add_strcpy(doc, row, "file", r->file);
+        yyjson_mut_obj_add_strcpy(doc, row, "label", r->label);
+        yyjson_mut_obj_add_str(doc, row, "status", r->status);
+        yyjson_mut_obj_add_strcpy(doc, row, "reference", r->reference);
+        yyjson_mut_obj_add_str(doc, row, "change_mapping", r->mapping);
+        yyjson_mut_arr_add_val(out, row);
+    }
+    yyjson_mut_obj_add_val(doc, root, "references", out);
+}
+
+static char *detect_doc_render_page(const detect_doc_rows_t *rows, const detect_doc_page_t *page) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "scope", "doc_references");
+    yyjson_mut_obj_add_str(doc, root, "semantics", "referenced_targets_for_review");
+    yyjson_mut_obj_add_strcpy(doc, root, "store_generation", page->generation);
+    yyjson_mut_obj_add_str(doc, root, "coverage", "indexed_references_only");
+    yyjson_mut_obj_add_int(doc, root, "total", rows->count);
+    yyjson_mut_obj_add_str(doc, root, "total_relation", rows->saturated ? "gte" : "eq");
+    yyjson_mut_obj_add_int(doc, root, "returned", page->returned);
+    bool more = page->start + page->returned < rows->count;
+    yyjson_mut_obj_add_bool(doc, root, "has_more", more);
+    yyjson_mut_obj_add_bool(doc, root, "truncated", more || rows->saturated);
+    if (rows->saturated) {
+        yyjson_mut_obj_add_bool(doc, root, "engine_saturated", true);
+        yyjson_mut_obj_add_str(doc, root, "hint", "narrow the diff to enumerate more references");
+    }
+    if (page->budget_hit) {
+        yyjson_mut_obj_add_str(doc, root, "truncation_reason", "output_budget");
+        if (more && !page->returned) {
+            yyjson_mut_obj_add_bool(doc, root, "continuation_requires_higher_budget", true);
+        }
+    }
+    if (more && page->returned) {
+        char next[DETECT_DOC_CURSOR_CAP];
+        detect_cursor_encode('d', page->snapshot, page->qhash, page->start + page->returned, next);
+        yyjson_mut_obj_add_strcpy(doc, root, "next_cursor", next);
+    }
+    detect_doc_render_rows(doc, root, rows, page);
+    char *raw = yy_doc_to_str(doc);
+    char *payload = raw;
+    if (raw && !page->json) {
+        payload = cbm_json_to_tree(raw);
+        safe_free(raw);
+    }
+    yyjson_mut_doc_free(doc);
+    return payload;
+}
+
+static char *detect_doc_fit_page(cbm_mcp_server_t *srv, const detect_doc_rows_t *rows,
+                                 detect_doc_page_t *page, const char **error) {
+    while (!*error) {
+        if (mcp_request_cancelled(srv)) {
+            *error = "doc_references_unavailable: request cancelled";
+            break;
+        }
+        char *payload = detect_doc_render_page(rows, page);
+        if (payload && strlen(payload) <= page->budget) {
+            return payload;
+        }
+        safe_free(payload);
+        if (!page->returned) {
+            *error = "output_budget: raise max_output_tokens for documentation references";
+        } else {
+            /* Bound total row serialization below twice the requested page. */
+            page->returned /= PAIR_LEN;
+            page->budget_hit = true;
+        }
+    }
+    return NULL;
+}
+
+static const char *detect_doc_close_read(cbm_mcp_server_t *srv,
+                                         cbm_store_read_scope_t *read_scope) {
+    int checked = cbm_store_read_scope_check(read_scope);
+    int closed = cbm_store_read_scope_close(read_scope);
+    if (closed == CBM_STORE_SCOPE_DISCARD) {
+        detect_doc_discard_store(srv);
+    }
+    if (checked != CBM_STORE_OK || closed != CBM_STORE_OK) {
+        return "doc_references_unavailable: index read scope lost or cancelled";
+    }
+    return NULL;
+}
+
+static char *detect_doc_references(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
+                                   const char *root_path, const char *base_branch,
+                                   const char *head_oid, const char *base_oid,
+                                   const char *merge_base, const char *generation, char **files,
+                                   int file_count, const cbm_changed_hunk_t *hunks, int hcount,
+                                   bool hunks_complete, const char *input_snapshot,
+                                   const char *args) {
+    cbm_store_read_scope_t *read_scope = NULL;
+    int opened = cbm_store_read_scope_open(store, detect_doc_cancelled, srv, &read_scope);
+    if (opened != CBM_STORE_OK) {
+        if (opened == CBM_STORE_SCOPE_DISCARD) {
+            detect_doc_discard_store(srv);
+        }
+        return cbm_mcp_text_result("doc_references_unavailable: cannot pin index", true);
+    }
+    char observed[QUERY_GRAPH_GENERATION_CAP] = "";
+    const char *error = detect_doc_generation(store, generation, observed);
+    if (!hunks_complete) {
+        error = "doc_references_unavailable: changed line ranges could not be collected";
+    }
+    detect_doc_rows_t *rows = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*rows));
+    if (!rows) {
+        error = "doc_references_unavailable: out of memory";
+    } else {
+        cbm_arena_init_lazy(&rows->arena, CBM_SZ_4K);
+    }
+    if (!error) {
+        detect_doc_source_t input = {.store = store,
+                                     .project = project,
+                                     .root_path = root_path,
+                                     .hunks = hunks,
+                                     .hcount = hcount};
+        error = detect_doc_collect(&input, files, file_count, rows);
+    }
+    char snapshot[CBM_SZ_32 + SKIP_ONE] = "";
+    cbm_traverse_result_t empty_impact = {0};
+    if (!error &&
+        !detect_snapshot_fingerprint(srv, root_path, head_oid, base_oid, merge_base, observed,
+                                     files, file_count, &empty_impact, NULL, 0, 0, snapshot)) {
+        error = "snapshot_unavailable: changed document bytes could not be fingerprinted";
+    }
+    if (!error && (!input_snapshot[0] || strcmp(input_snapshot, snapshot) != 0)) {
+        error = "snapshot_changed: files changed while collecting documentation references";
+    }
+    if (!error && rows->count > SKIP_ONE) {
+        qsort(rows->rows, (size_t)rows->count, sizeof(rows->rows[0]), detect_doc_row_compare);
+    }
+    detect_doc_page_t page = {.generation = observed, .snapshot = snapshot};
+    if (!error) {
+        error = detect_doc_prepare_page(args, project, base_branch, rows, &page);
+    }
+    char *payload = error ? NULL : detect_doc_fit_page(srv, rows, &page, &error);
+    const char *scope_error = detect_doc_close_read(srv, read_scope);
+    if (scope_error) {
+        error = scope_error;
+    }
+    char *result = cbm_mcp_text_result(error ? error : payload, error != NULL);
+    safe_free(payload);
+    if (rows) {
+        cbm_arena_destroy(&rows->arena);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, rows);
+    return result;
+}
+
 static void detect_release(char *root_path, char *project, char *base_branch, char *scope) {
     free(root_path);
     free(project);
@@ -19633,6 +20167,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     /* scope: "files" = changed files only; "impact" = files + symbols (default).
      * Keep accepting the legacy "symbols" spelling for compatibility. */
     bool want_symbols = !scope || strcmp(scope, "symbols") == 0 || strcmp(scope, "impact") == 0;
+    bool want_doc_refs = scope && !strcmp(scope, "doc_references");
 
     /* `since` (e.g. "HEAD~10", "v0.5.0") is the documented diff base but was
      * previously parsed and never used: it takes precedence over base_branch.
@@ -19733,6 +20268,22 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         detect_walk_parse(store, project, args, direction, &walk_req, errbuf, sizeof(errbuf));
         if (!errbuf[0])
             detect_seed_parse(args, &seed_req, errbuf, sizeof(errbuf));
+    }
+    if (!errbuf[0] && want_doc_refs) {
+        yyjson_doc *request = yyjson_read(args, strlen(args), 0);
+        yyjson_val *input = request ? yyjson_doc_get_root(request) : NULL;
+        if (walk_req.active || seed_req.list || seed_req.product ||
+            yyjson_obj_get(input, "direction") || yyjson_obj_get(input, "depth")) {
+            (void)snprintf(errbuf, sizeof(errbuf),
+                           "scope:doc_references follows outbound MENTIONS once; behavioral walk "
+                           "and seed options do not apply");
+        }
+        yyjson_val *reference_cursor = yyjson_obj_get(input, "reference_cursor");
+        if (reference_cursor &&
+            (!yyjson_is_str(reference_cursor) || !yyjson_get_len(reference_cursor))) {
+            (void)snprintf(errbuf, sizeof(errbuf), "reference_cursor must be a nonempty string");
+        }
+        yyjson_doc_free(request);
     }
     if (errbuf[0]) {
         free(direction);
@@ -20156,18 +20707,39 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * `files` when the project root is a repository subdirectory (#1951). */
     cbm_changed_hunk_t *hunks = NULL;
     int hunk_count = 0;
-    if (!seed_rows.failed && (want_symbols || seed_req.list)) {
+    bool doc_hunks_complete = false;
+    char doc_input_snapshot[CBM_SZ_32 + SKIP_ONE] = "";
+    if (want_doc_refs) {
+        cbm_traverse_result_t no_impact = {0};
+        (void)detect_snapshot_fingerprint(srv, root_path, head_oid, base_oid, merge_base,
+                                          generation, files, file_count, &no_impact, NULL, 0, 0,
+                                          doc_input_snapshot);
+    }
+    if (!seed_rows.failed && (want_symbols || seed_req.list || want_doc_refs)) {
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
-        snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
-                 root_path, merge_base, head_oid, root_path);
+        if (want_doc_refs)
+            (void)snprintf(hunk_cmd, sizeof(hunk_cmd),
+                           "git -C \"%s\" diff --relative --unified=0 --no-ext-diff --no-textconv "
+                           "--no-color --src-prefix=a/ --dst-prefix=b/ \"%s\" -- 2>NUL",
+                           root_path, merge_base);
+        else
+            (void)snprintf(hunk_cmd, sizeof(hunk_cmd),
+                           "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
+                           "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
+                           root_path, merge_base, head_oid, root_path);
 #else
-        snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
-                 root_path, merge_base, head_oid, root_path);
+        if (want_doc_refs) {
+            (void)snprintf(hunk_cmd, sizeof(hunk_cmd),
+                           "git -C '%s' diff --relative --unified=0 --no-ext-diff --no-textconv "
+                           "--no-color --src-prefix=a/ --dst-prefix=b/ '%s' -- 2>/dev/null",
+                           root_path, merge_base);
+        } else {
+            (void)snprintf(hunk_cmd, sizeof(hunk_cmd),
+                           "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
+                           "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
+                           root_path, merge_base, head_oid, root_path);
+        }
 #endif
         char hunk_output_path[CBM_SZ_2K] = {0};
         cbm_proc_result_t hunk_result = {0};
@@ -20180,12 +20752,17 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (hfp) {
             (void)fseek(hfp, 0, SEEK_END);
             long hsz = ftell(hfp);
+            doc_hunks_complete = hsz >= 0;
             if (hsz > 0) {
                 (void)fseek(hfp, 0, SEEK_SET);
                 char *hbuf = malloc((size_t)hsz + SKIP_ONE);
                 if (hbuf) {
                     size_t hread = fread(hbuf, SKIP_ONE, (size_t)hsz, hfp);
                     hbuf[hread] = '\0';
+                    doc_hunks_complete = hread == (size_t)hsz;
+                    if (want_doc_refs) {
+                        detect_doc_normalize_hunks(hbuf);
+                    }
                     enum { HUNK_CAP = 4096 };
                     hunks = safe_realloc(NULL, (size_t)HUNK_CAP * sizeof(cbm_changed_hunk_t));
                     hunk_count = cbm_parse_hunks(hbuf, hunks, HUNK_CAP);
@@ -20195,6 +20772,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                      * scoping for the whole request rather than under-report a
                      * large refactor — whole-file seeding is the safe side. */
                     if (hunk_count >= HUNK_CAP) {
+                        doc_hunks_complete = false;
                         cbm_log_info("detect_changes.hunks", "action", "scoping_disabled", "reason",
                                      "hunk_cap_reached");
                         free(hunks);
@@ -20202,6 +20780,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                         hunk_count = 0;
                     }
                     free(hbuf);
+                } else {
+                    doc_hunks_complete = false;
                 }
             }
             (void)fclose(hfp);
@@ -20212,10 +20792,30 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         /* Hunk parsing is deliberately best-effort, but path collection is not.
          * Seed after both are complete so every exact path uses the same scoping
          * decision. */
-        for (int i = 0; i < file_count; i++) {
+        for (int i = 0; !want_doc_refs && i < file_count; i++) {
             detect_collect_seeds(store, project, files[i], hunks, hunk_count, &seeds, &seed_count,
                                  &seed_cap, &seed_req, &seed_rows);
         }
+    }
+
+    if (want_doc_refs) {
+        char *result = detect_doc_references(
+            srv, store, project, root_path, base_branch, head_oid, base_oid, merge_base, generation,
+            files, file_count, hunks, hunk_count, doc_hunks_complete, doc_input_snapshot, args);
+        cbm_test_config_free(seed_rows.config);
+        cbm_arena_destroy(&seed_rows.arena);
+        for (int i = 0; i < file_count; i++) {
+            safe_free(files[i]);
+        }
+        safe_free(files);
+        safe_free(seeds);
+        safe_free(hunks);
+        safe_free(impact_cursor_arg);
+        safe_free(changed_cursor_arg);
+        safe_free(module_cursor_arg);
+        safe_free(direction);
+        detect_release(root_path, project, base_branch, scope);
+        return result;
     }
 
     if (!seed_rows.failed && seed_rows.count > 1)
