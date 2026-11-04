@@ -577,6 +577,8 @@ typedef struct {
     const char *var_name;          // variable being assigned
     const char *type_name;         // declared type or RHS constructor type
     const char *enclosing_func_qn; // enclosing function, class, or module QN
+    uint32_t value_start_byte;     // Swift call initializer span; type_name may be unknown
+    uint32_t value_end_byte;       // exclusive; zero when no initializer call was recorded
 } CBMTypeAssign;
 
 // String reference: URL, config key, or async target found in source.

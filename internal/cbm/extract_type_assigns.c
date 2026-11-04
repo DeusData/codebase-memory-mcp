@@ -102,7 +102,7 @@ static void try_emit_type_assign(CBMExtractCtx *ctx, TSNode var_node, TSNode rhs
     const char *type_name =
         extract_constructor_type(ctx->arena, rhs_node, ctx->source, ctx->language);
     if (var_name && var_name[0] && type_name && type_name[0]) {
-        CBMTypeAssign ta;
+        CBMTypeAssign ta = {0};
         ta.var_name = var_name;
         ta.type_name = type_name;
         ta.enclosing_func_qn = func_qn;
@@ -219,6 +219,21 @@ static void swift_parameter_binding(TSNode node, TSNode *name, TSNode *type) {
     }
 }
 
+static bool swift_initializer_is_call(TSNode value) {
+    while (!ts_node_is_null(value)) {
+        const char *kind = ts_node_type(value);
+        if (strcmp(kind, "call_expression") == 0 || strcmp(kind, "call") == 0) {
+            return true;
+        }
+        if ((strcmp(kind, "try_expression") != 0 && strcmp(kind, "await_expression") != 0) ||
+            ts_node_named_child_count(value) == 0) {
+            return false;
+        }
+        value = ts_node_named_child(value, ts_node_named_child_count(value) - SKIP_ONE);
+    }
+    return false;
+}
+
 // --- Unified handler ---
 
 void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
@@ -234,9 +249,11 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
     }
     TSNode name = {0};
     TSNode type = {0};
+    TSNode value = {0};
     if (parameter) {
         swift_parameter_binding(node, &name, &type);
     } else {
+        value = ts_node_child_by_field_name(node, TS_FIELD("value"));
         TSNode pattern = ts_node_child_by_field_name(node, TS_FIELD("name"));
         if (!ts_node_is_null(pattern)) {
             name = cbm_find_child_by_kind(pattern, "simple_identifier");
@@ -249,7 +266,6 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
     const char *type_name =
         ts_node_is_null(type) ? NULL : cbm_node_text(ctx->arena, type, ctx->source);
     if (!type_name && !parameter) {
-        TSNode value = ts_node_child_by_field_name(node, TS_FIELD("value"));
         if (!ts_node_is_null(value)) {
             type_name = extract_constructor_type(ctx->arena, value, ctx->source, ctx->language);
             if (strcmp(ts_node_type(value), "array_literal") == 0) {
@@ -257,12 +273,21 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
             }
         }
     }
-    if (!ts_node_is_null(name) && type_name) {
+    bool initializer_call = swift_initializer_is_call(value);
+    if (!ts_node_is_null(name) && (type_name || initializer_call)) {
         const char *scope = state->enclosing_func_qn;
         if (scope == ctx->module_qn && state->enclosing_class_qn) {
             scope = state->enclosing_class_qn;
         }
-        CBMTypeAssign assignment = {cbm_node_text(ctx->arena, name, ctx->source), type_name, scope};
+        CBMTypeAssign assignment = {
+            .var_name = cbm_node_text(ctx->arena, name, ctx->source),
+            .type_name = type_name,
+            .enclosing_func_qn = scope,
+        };
+        if (initializer_call) {
+            assignment.value_start_byte = ts_node_start_byte(value);
+            assignment.value_end_byte = ts_node_end_byte(value);
+        }
         cbm_typeassign_push(&ctx->result->type_assigns, ctx->arena, assignment);
     }
 }

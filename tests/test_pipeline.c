@@ -16813,12 +16813,18 @@ TEST(pipeline_swift_same_named_extensions_stay_in_module_issue2061) {
                             "}\n");
         }
         write_temp_file(tmp, "Sources/Unrelated/Types.swift", "struct String {}\n");
+        write_temp_file(tmp, "Package.swift",
+                        "let package = Package(name: \"Fixture\", targets: [\n"
+                        " .target(name: \"Alpha\"), .target(name: \"Beta\"),\n"
+                        " .target(name: \"AlphaExtras\", dependencies: [\"Alpha\"]),\n"
+                        " .target(name: \"Unrelated\"),\n"
+                        " .target(name: \"LegacyProduct\", path: \"Source\"),\n"
+                        " .testTarget(name: \"LegacyTests\", path: \"Tests\")])\n");
         write_temp_file(tmp, "Source/Core/Legacy.swift", "struct Legacy {}\n");
-        char legacy[512];
-        snprintf(legacy, sizeof(legacy), "import %s\nextension Legacy { func legacy() {} }\n",
-                 strrchr(tmp, '/') + 1);
-        write_temp_file(tmp, "Tests/Legacy.swift", legacy);
-        write_temp_file(tmp, "Source/Core/Caller.swift",
+        write_temp_file(tmp, "Tests/Legacy.swift",
+                        "import LegacyProduct\nextension Legacy { func legacy() {} }\n");
+        write_temp_file(tmp, "Tests/LegacyCaller.swift",
+                        "import LegacyProduct\n"
                         "func legacyCaller(value: Legacy) { value.legacy() }\n");
         write_temp_file(tmp, "Sources/AlphaExtras/Extensions.swift",
                         "@testable import Alpha\n"
@@ -16864,7 +16870,7 @@ TEST(pipeline_swift_same_named_extensions_stay_in_module_issue2061) {
                                       "Sources.Beta.AStringExtension.String.local()",
                                       "Sources.Beta.StringCaller.String.invokeStringExtension()",
                                       "Tests.Legacy.Legacy.legacy()",
-                                      "Source.Core.Caller.legacyCaller(value:Legacy)",
+                                      "Tests.LegacyCaller.legacyCaller(value:Legacy)",
                                       "Sources.Alpha.AStringExtension.StringBehavior.inherited()",
                                       "Sources.Beta.AStringExtension.StringBehavior.inherited()"};
             cbm_node_t nodes[16] = {0};
@@ -16891,6 +16897,214 @@ TEST(pipeline_swift_same_named_extensions_stay_in_module_issue2061) {
             ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[10].id), 0);
             ASSERT_EQ(pipeline_has_calls_edge(s, nodes[11].id, nodes[10].id), 1);
             ASSERT_EQ(pipeline_has_calls_edge(s, nodes[11].id, nodes[8].id), 0);
+            for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+                cbm_node_free_fields(&nodes[i]);
+            }
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+TEST(pipeline_swift_custom_target_paths_and_manifest_edit_issue2061) {
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_swift_custom_targets_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        const char *roots[] = {"LibA", "LibB", "Nested/LibA"};
+        char file[128];
+        for (int i = 0; i < 3; i++) {
+            snprintf(file, sizeof(file), "%s/Core/Types.swift", roots[i]);
+            write_temp_file(tmp, file, "struct Service {}\n");
+            snprintf(file, sizeof(file), "%s/Extra/Extensions.swift", roots[i]);
+            write_temp_file(tmp, file, "extension Service { func run() {} }\n");
+            snprintf(file, sizeof(file), "%s/Core/Caller.swift", roots[i]);
+            write_temp_file(tmp, file,
+                            "func invoke(service: Service) { service.run(); service.inspect() }\n");
+        }
+        const char *extensions = "@testable import Alpha\n"
+                                 "extension Service { func inspect() {} }\n";
+        write_temp_file(tmp, "Checks/Extensions.swift", extensions);
+        write_temp_file(tmp, "Nested/Checks/Extensions.swift", extensions);
+        const char *imported_caller =
+            "import Alpha\n"
+            "func importedCaller(service: Service) { service.run(); service.inspect() }\n";
+        write_temp_file(tmp, "Checks/Caller.swift", imported_caller);
+        write_temp_file(tmp, "Nested/Checks/Caller.swift", imported_caller);
+        write_temp_file(tmp, "LibA/Core/Only.swift", "struct OnlyAlpha { func only() {} }\n");
+        write_temp_file(tmp, "Checks/UnknownCaller.swift",
+                        "import Beta\nfunc missing(value: OnlyAlpha) { value.only() }\n");
+        write_temp_file(tmp, "Common/Base.swift",
+                        "public class SharedBase { public func own() {} }\n");
+        write_temp_file(tmp, "Common/Extra.swift",
+                        "extension SharedBase { public func ownExtension() {} }\n");
+        const char *base_roots[] = {"LibA", "LibB"};
+        for (int i = 0; i < 2; i++) {
+            char source[512];
+            snprintf(file, sizeof(file), "%s/Extra/SharedExtensions.swift", base_roots[i]);
+            snprintf(source, sizeof(source),
+                     "import Base\nextension SharedBase { public func %s() {} }\n",
+                     i ? "betaOnly" : "alphaOnly");
+            write_temp_file(tmp, file, source);
+            snprintf(file, sizeof(file), "%s/Core/LocalChild.swift", base_roots[i]);
+            write_temp_file(tmp, file, "import Base\nclass LocalChild: SharedBase {}\n");
+            snprintf(file, sizeof(file), "%s/Core/SharedCaller.swift", base_roots[i]);
+            write_temp_file(
+                tmp, file,
+                "func sharedCaller(value: LocalChild) {\n"
+                " value.own(); value.ownExtension(); value.alphaOnly(); value.betaOnly()\n}\n");
+        }
+        write_temp_file(
+            tmp, "Both/Caller.swift",
+            "import Alpha\nimport Beta\nimport Base\n"
+            "func bothCaller(value: SharedBase) {\n"
+            " value.own(); value.ownExtension(); value.alphaOnly(); value.betaOnly()\n}\n");
+        const char *factory = "import Beta\n"
+                              "public class Result { public func finish() {} }\n"
+                              "public class Base { public func baseWork() {} }\n"
+                              "public class Factory {\n"
+                              "public func make() -> Result { Result() }\n"
+                              "public func qualified() -> Beta.Result { fatalError() }\n}\n"
+                              "public class Outer {\n"
+                              "public class Result { public func finish() {} }\n"
+                              "public func make() -> Result { Result() }\n}\n";
+        write_temp_file(tmp, "LibA/Core/Factory.swift", factory);
+        write_temp_file(tmp, "LibB/Core/Factory.swift", factory);
+        const char *factory_caller =
+            "import Alpha\n"
+            "class Result { func finish() {} }\n"
+            "func callFactory(_ factory: Factory) { factory.make().finish() }\n"
+            "func qualifiedFactory(_ factory: Factory) { factory.qualified().finish() }\n"
+            "func lexicalFactory(_ factory: Outer) { factory.make().finish() }\n";
+        write_temp_file(tmp, "Checks/FactoryCaller.swift", factory_caller);
+        write_temp_file(tmp, "Checks/BaseCaller.swift",
+                        "import Beta\nclass Child: Base {}\n"
+                        "func inheritedCall(_ child: Child) { child.baseWork() }\n");
+        write_temp_file(tmp, "Nested/Package.swift",
+                        "let package = Package(name: \"Nested\", targets: [\n"
+                        " .target(name: \"Alpha\", path: \"LibA\"),\n"
+                        " .testTarget(name: \"Checks\", path: \"Checks\")])\n");
+        for (int i = 0; mode && i < 50; i++) {
+            snprintf(file, sizeof(file), "LibA/Core/Filler%d.swift", i);
+            write_temp_file(tmp, file, "// filler\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], manifest[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(manifest, sizeof(manifest), "%s/Package.swift", tmp);
+        for (int phase = 0; phase < 4; phase++) {
+            bool swapped = phase >= 2;
+            if (phase == 0 || phase == 2) {
+                char source[512];
+                snprintf(source, sizeof(source),
+                         "let package = Package(name: \"UnrelatedProductName\", targets: [\n"
+                         " .target(name: \"Alpha\", path: \"%s\"),\n"
+                         " .target(name: \"Beta\", path: \"%s\"),\n"
+                         " .target(name: \"Base\", path: \"Common\"),\n"
+                         " .testTarget(name: \"Both\", path: \"Both\"),\n"
+                         " .testTarget(name: \"Checks\", path: \"Checks\")])\n",
+                         swapped ? "LibB" : "LibA", swapped ? "LibA" : "LibB");
+                write_temp_file(tmp, "Package.swift", source);
+                if (phase) {
+                    ASSERT_EQ(pipeline_test_set_mtime(manifest, 2000000000, 0), 0);
+                }
+            } else if (phase == 1) {
+                char changed[1024], caller_path[512];
+                snprintf(changed, sizeof(changed), "%s// changed\n", factory_caller);
+                write_temp_file(tmp, "Checks/FactoryCaller.swift", changed);
+                snprintf(caller_path, sizeof(caller_path), "%s/Checks/FactoryCaller.swift", tmp);
+                ASSERT_EQ(pipeline_test_set_mtime(caller_path, 2000000000, 0), 0);
+            } else {
+                snprintf(db, sizeof(db), "%s/fresh.db", tmp);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase == 1) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            const char *suffixes[] = {"LibA.Core.Caller.invoke(service:Service)",
+                                      "LibB.Core.Caller.invoke(service:Service)",
+                                      "Nested.LibA.Core.Caller.invoke(service:Service)",
+                                      "LibA.Extra.Extensions.Service.run()",
+                                      "LibB.Extra.Extensions.Service.run()",
+                                      "Nested.LibA.Extra.Extensions.Service.run()",
+                                      "Checks.Extensions.Service.inspect()",
+                                      "Nested.Checks.Extensions.Service.inspect()",
+                                      "Checks.Caller.importedCaller(service:Service)",
+                                      "Nested.Checks.Caller.importedCaller(service:Service)",
+                                      "Checks.UnknownCaller.missing(value:OnlyAlpha)",
+                                      "LibA.Core.Only.OnlyAlpha.only()",
+                                      "Checks.FactoryCaller.callFactory(_:Factory)",
+                                      "Checks.FactoryCaller.qualifiedFactory(_:Factory)",
+                                      "LibA.Core.Factory.Result.finish()",
+                                      "LibB.Core.Factory.Result.finish()",
+                                      "Checks.FactoryCaller.Result.finish()",
+                                      "Checks.BaseCaller.inheritedCall(_:Child)",
+                                      "LibA.Core.Factory.Base.baseWork()",
+                                      "LibB.Core.Factory.Base.baseWork()",
+                                      "Checks.FactoryCaller.lexicalFactory(_:Outer)",
+                                      "LibA.Core.Factory.Outer.Result.finish()",
+                                      "LibB.Core.Factory.Outer.Result.finish()",
+                                      "LibA.Core.SharedCaller.sharedCaller(value:LocalChild)",
+                                      "LibB.Core.SharedCaller.sharedCaller(value:LocalChild)",
+                                      "Both.Caller.bothCaller(value:SharedBase)",
+                                      "Common.Base.SharedBase.own()",
+                                      "LibA.Extra.SharedExtensions.SharedBase.alphaOnly()",
+                                      "LibB.Extra.SharedExtensions.SharedBase.betaOnly()",
+                                      "Common.Extra.SharedBase.ownExtension()"};
+            cbm_node_t nodes[30] = {0};
+            const char *project = cbm_pipeline_project_name(p);
+            for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+                char qn[768];
+                snprintf(qn, sizeof(qn), "%s.%s", project, suffixes[i]);
+                ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &nodes[i]), CBM_STORE_OK);
+            }
+            for (int caller = 0; caller < 3; caller++) {
+                for (int owner = 0; owner < 3; owner++) {
+                    ASSERT_EQ(pipeline_has_calls_edge(s, nodes[caller].id, nodes[3 + owner].id),
+                              caller == owner);
+                }
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[caller].id, nodes[6].id), 0);
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[caller].id, nodes[7].id), 0);
+            }
+            for (int owner = 0; owner < 3; owner++) {
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[8].id, nodes[3 + owner].id),
+                          owner == (swapped ? 1 : 0));
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[3 + owner].id), owner == 2);
+            }
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[8].id, nodes[6].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[8].id, nodes[7].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[6].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[9].id, nodes[7].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[10].id, nodes[11].id), swapped);
+            for (int owner = 0; owner < 2; owner++) {
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[12].id, nodes[14 + owner].id),
+                          owner == (swapped ? 1 : 0));
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[13].id, nodes[14 + owner].id),
+                          owner == (swapped ? 0 : 1));
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[17].id, nodes[18 + owner].id),
+                          owner == (swapped ? 0 : 1));
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[20].id, nodes[21 + owner].id),
+                          owner == (swapped ? 1 : 0));
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[20].id, nodes[14 + owner].id), 0);
+            }
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[12].id, nodes[16].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[13].id, nodes[16].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[20].id, nodes[16].id), 0);
+            for (int caller = 0; caller < 3; caller++) {
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[23 + caller].id, nodes[26].id), 1);
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[23 + caller].id, nodes[29].id), 1);
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[23 + caller].id, nodes[27].id),
+                          caller != 1);
+                ASSERT_EQ(pipeline_has_calls_edge(s, nodes[23 + caller].id, nodes[28].id),
+                          caller != 0);
+            }
             for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
                 cbm_node_free_fields(&nodes[i]);
             }
@@ -17087,6 +17301,209 @@ TEST(pipeline_swift_receiver_and_chained_closures_issue2061) {
                     cbm_store_find_node_by_qn(store, cbm_pipeline_project_name(p), qn, &target),
                     CBM_STORE_OK);
                 ASSERT_EQ(pipeline_has_calls_edge(store, caller.id, target.id), pairs[i].expected);
+                cbm_node_free_fields(&caller);
+                cbm_node_free_fields(&target);
+            }
+            cbm_store_close(store);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers) {
+    char long_type[129];
+    memset(long_type, 'T', sizeof(long_type) - 1);
+    long_type[sizeof(long_type) - 1] = '\0';
+    char types[4096];
+    int length = snprintf(
+        types, sizeof(types),
+        "struct %s {}\n"
+        "open class Session {\n#if DEBUG\n"
+        "open func request(_ value: Int, first: %s? = nil, second: %s? = nil) -> Request { "
+        "Request() }\n"
+        "#else\n"
+        "open func request(_ value: String, first: %s? = nil, second: %s? = nil) -> Request { "
+        "Request() }\n"
+        "#endif\n"
+        "func streamRequest(_ value: Int, first: %s? = nil, second: %s? = nil) -> Type<Int> { "
+        "fatalError() }\n"
+        "func streamRequest(_ value: String, first: %s? = nil, second: %s? = nil) -> Type<Int> { "
+        "fatalError() }\n"
+        "func diverge(_ value: Int, first: %s? = nil, second: %s? = nil) -> Request { Request() }\n"
+        "func diverge(_ value: String, first: %s? = nil, second: %s? = nil) -> OtherRequest { "
+        "OtherRequest() }\n"
+        "static func run(flag: Bool) {}\nopen func upload(_ value: Int) {}\n}\n"
+        "class ParentRequest {\nfunc validate() -> Self { self }\n"
+        "func selfOrOther(_ value: Int) -> Self { self }\n"
+        "func selfOrOther(_ value: String) -> OtherRequest { OtherRequest() }\n}\n"
+        "class Request: ParentRequest {\n"
+        "func responseDecodable(of type: Any.Type, completion: () -> Void) {}\n"
+        "func responseDecodable(wrong type: Any.Type, completion: () -> Void) {}\n}\n"
+        "class OtherRequest { func responseDecodable(of type: Any.Type, completion: () -> Void) {} "
+        "}\n"
+        "class Type<T> {\n"
+        "typealias Handler<Success, Failure: Error> = @Sendable (Success) throws -> Void\n"
+        "func responseStream(stream: Handler<Int,Never>) {}\n"
+        "func moveReaderIndex(forwardBy amount: Int) {}\n}\n"
+        "class Factory { func make() -> Session { Session() } }\n"
+        "class Unrelated { static func run(flag: Bool) {}\nfunc upload(_ value: Int) {} }\n",
+        long_type, long_type, long_type, long_type, long_type, long_type, long_type, long_type,
+        long_type, long_type, long_type, long_type, long_type);
+    ASSERT_GT(length, 0);
+    ASSERT_LT(length, (int)sizeof(types));
+    const char *calls =
+        "func same(_ session: Session) { session.request(.default)\n"
+        "    .validate().responseDecodable(of: String.self) {} }\n"
+        "func streamed(_ session: Session) { session.streamRequest(.bytes(1)).responseStream {} }\n"
+        "func divergent(_ session: Session) { session.diverge(.default).responseDecodable(of: "
+        "String.self) {} }\n"
+        "func wrongTail(_ session: Session) { session.request(.default).responseDecodable(unknown: "
+        "String.self) {} }\n"
+        "func selfDivergent(_ session: Session) { session.request(.default).selfOrOther(.default)"
+        ".responseDecodable(of: String.self) {} }\n"
+        "func metatype(_ type: Session.Type) { type.run(flag: true) }\n"
+        "func external(_ type: URLSession.Type) { type.run(flag: true) }\n"
+        "func upload(_ session: Session) { session.upload(1) }\n"
+        "func makeFactory() -> Factory { Factory() }\n"
+        "class LocalBase { func stored(_ session: Session) -> Session { session } }\n"
+        "class LocalSuite: LocalBase {\n"
+        "func wrapped() { let session = stored(Session()); session.upload(1) }\n}\n"
+        "class CrossSuite: BaseTestCase {\n"
+        "func wrapped() { let session = stored(Session()); session.request(.default)"
+        ".validate().responseDecodable(of: String.self) {} }\n"
+        "func storedStream() { let stream = storedStream(Type<Int>()); stream.responseStream {} }\n"
+        "func awaited() async throws { var chunk = try await self.readFromFile(); "
+        "chunk.moveReaderIndex(forwardBy: 1) }\n"
+        "func mixedFactory() { let session = mixed(.default); session.upload(1) }\n}\n"
+        "func nestedFactory() { let factory = makeFactory(); let session = factory.make(); "
+        "session.upload(1) }\n"
+        "func unknownFactory() { let session = missing(Session()); session.upload(1) }\n"
+        "func unknownRoot() { let session = unknown().make(); session.upload(1) }\n"
+        "func cyclicFactory() { let first = second.make(); let second = first.make(); "
+        "first.upload(1) }\n";
+    const struct {
+        const char *caller;
+        const char *target;
+        int expected;
+    } pairs[] = {
+        {"same(_:Session)", "Request.responseDecodable(of:Type,completion:()=>Void)", 1},
+        {"same(_:Session)", "Request.responseDecodable(wrong:Type,completion:()=>Void)", 0},
+        {"same(_:Session)", "ParentRequest.validate()=>Self", 1},
+        {"streamed(_:Session)", "Type.responseStream(stream:Handler<Int,Never>)", 1},
+        {"LocalSuite.wrapped()", "Session.upload(_:Int)", 1},
+        {"LocalSuite.wrapped()", "Unrelated.upload(_:Int)", 0},
+        {"CrossSuite.wrapped()", "ParentRequest.validate()=>Self", 1},
+        {"CrossSuite.wrapped()", "Request.responseDecodable(of:Type,completion:()=>Void)", 1},
+        {"CrossSuite.wrapped()", "OtherRequest.responseDecodable(of:Type,completion:()=>Void)", 0},
+        {"CrossSuite.storedStream()", "Type.responseStream(stream:Handler<Int,Never>)", 1},
+        {"CrossSuite.awaited()async", "Type.moveReaderIndex(forwardBy:Int)", 1},
+        {"CrossSuite.mixedFactory()", "Session.upload(_:Int)", 0},
+        {"CrossSuite.mixedFactory()", "Unrelated.upload(_:Int)", 0},
+        {"nestedFactory()", "Session.upload(_:Int)", 1},
+        {"nestedFactory()", "Unrelated.upload(_:Int)", 0},
+        {"unknownFactory()", "Session.upload(_:Int)", 0},
+        {"unknownFactory()", "Unrelated.upload(_:Int)", 0},
+        {"unknownRoot()", "Session.upload(_:Int)", 0},
+        {"unknownRoot()", "Unrelated.upload(_:Int)", 0},
+        {"cyclicFactory()", "Session.upload(_:Int)", 0},
+        {"cyclicFactory()", "Unrelated.upload(_:Int)", 0},
+        {"divergent(_:Session)", "Request.responseDecodable(of:Type,completion:()=>Void)", 0},
+        {"divergent(_:Session)", "OtherRequest.responseDecodable(of:Type,completion:()=>Void)", 0},
+        {"wrongTail(_:Session)", "Request.responseDecodable(of:Type,completion:()=>Void)", 0},
+        {"wrongTail(_:Session)", "Request.responseDecodable(wrong:Type,completion:()=>Void)", 0},
+        {"selfDivergent(_:Session)", "Request.responseDecodable(of:Type,completion:()=>Void)", 0},
+        {"selfDivergent(_:Session)", "OtherRequest.responseDecodable(of:Type,completion:()=>Void)",
+         0},
+        {"metatype(_:Type)", "Session.run(flag:Bool)static", 1},
+        {"metatype(_:Type)", "Unrelated.run(flag:Bool)static", 0},
+        {"external(_:Type)", "Session.run(flag:Bool)static", 0},
+        {"external(_:Type)", "Unrelated.run(flag:Bool)static", 0},
+        {"upload(_:Session)", "Session.upload(_:Int)", 1},
+        {"upload(_:Session)", "Unrelated.upload(_:Int)", 0},
+    };
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_swift_chain_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "Types.swift", types);
+        write_temp_file(tmp, "Calls.swift", calls);
+        write_temp_file(tmp, "BaseTestCase.swift",
+                        "class BaseTestCase {\n"
+                        "func stored(_ session: Session) -> Session { session }\n"
+                        "func storedStream(_ stream: Type<Int>) -> Type<Int> { stream }\n"
+                        "func readFromFile() async throws -> Type<Int> { fatalError() }\n"
+                        "func mixed(_ value: Int) -> Session { Session() }\n"
+                        "func mixed(_ value: String) -> Unrelated { Unrelated() }\n}\n"
+                        "class Foreign { func missing(_ value: Session) -> Session { value } }\n");
+        for (int i = 0; parallel && i < 55; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "Pad%d.swift", i);
+            write_temp_file(tmp, path, "// filler\n");
+        }
+        XlangEnvSave saved = xlang_env_select(parallel != 0);
+        char db[512], path[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(path, sizeof(path), "%s/Calls.swift", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[8192];
+                int changed_length = snprintf(changed, sizeof(changed), "%s// changed\n", calls);
+                ASSERT_GT(changed_length, 0);
+                ASSERT_LT(changed_length, (int)sizeof(changed));
+                write_temp_file(tmp, "Calls.swift", changed);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            cbm_store_t *store = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(store);
+            const char *project = cbm_pipeline_project_name(p);
+            cbm_node_t *requests = NULL;
+            int count = 0;
+            ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "request", &requests, &count),
+                      CBM_STORE_OK);
+            ASSERT_EQ(count, 2);
+            for (int i = 0; i < count; i++) {
+                ASSERT_NOT_NULL(strchr(requests[i].qualified_name, '#'));
+                ASSERT_NOT_NULL(strstr(requests[i].properties_json, "=>Request"));
+            }
+            cbm_store_free_nodes(requests, count);
+            for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+                char qn[1024];
+                cbm_node_t caller = {0}, target = {0};
+                snprintf(qn, sizeof(qn), "%s.Calls.%s", project, pairs[i].caller);
+                ASSERT_EQ(cbm_store_find_node_by_qn(store, project, qn, &caller), CBM_STORE_OK);
+                snprintf(qn, sizeof(qn), "%s.Types.%s", project, pairs[i].target);
+                ASSERT_EQ(cbm_store_find_node_by_qn(store, project, qn, &target), CBM_STORE_OK);
+                ASSERT_EQ(pipeline_has_calls_edge(store, caller.id, target.id), pairs[i].expected);
+                if (pairs[i].expected &&
+                    (strcmp(pairs[i].target, "Session.run(flag:Bool)static") == 0 ||
+                     strcmp(pairs[i].target, "Type.moveReaderIndex(forwardBy:Int)") == 0)) {
+                    cbm_edge_t *edges = NULL;
+                    int edge_count = 0;
+                    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, caller.id, "CALLS", &edges,
+                                                                  &edge_count),
+                              CBM_STORE_OK);
+                    const char *keyword = strcmp(pairs[i].caller, "metatype(_:Type)") == 0
+                                              ? "\"k\":\"flag\""
+                                              : "\"k\":\"forwardBy\"";
+                    int labelled = 0;
+                    for (int edge = 0; edge < edge_count; edge++) {
+                        if (edges[edge].target_id == target.id && edges[edge].properties_json &&
+                            strstr(edges[edge].properties_json, keyword)) {
+                            labelled++;
+                        }
+                    }
+                    ASSERT_EQ(labelled, 1);
+                    cbm_store_free_edges(edges, edge_count);
+                }
                 cbm_node_free_fields(&caller);
                 cbm_node_free_fields(&target);
             }
@@ -27400,6 +27817,33 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
  * plus fail-closed ambiguous-name cases. See pipeline_swift_cross_package_import
  * above for the full end-to-end proof. */
 
+TEST(pkgmap_swift_target_kinds_and_normalized_paths) {
+    const char *source = "let package = Package(name: \"IgnoredProduct\", targets: [\n"
+                         " .target(name: \"Core\", path: \"./Old/../Library.v2\"),\n"
+                         " .target(name: \"Root\", path: \".\"),\n"
+                         " .testTarget(name: \"CoreTests\"),\n"
+                         " .executableTarget(name: \"Tool\"),\n"
+                         " .macro(name: \"Macros\"), .plugin(name: \"Plugin\"),\n"
+                         " .target(name: \"Escapes\", path: \"../Other\"),\n"
+                         " .testTarget(name: \"Computed\", path: targetPath)])\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "Nested/Package.swift", source,
+                                     (int)strlen(source), &entries));
+    ASSERT_EQ(entries.count, 6);
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Nested/Library.v2");
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Root"), "Nested");
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreTests"), "Nested/Tests/CoreTests");
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Tool"), "Nested/Sources/Tool");
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Macros"), "Nested/Sources/Macros");
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Plugin"), "Nested/Plugins/Plugin");
+    for (int i = 0; i < entries.count; i++) {
+        ASSERT_STR_EQ(entries.items[i].manifest_rel, "Nested/Package.swift");
+    }
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
 TEST(pkgmap_swift_targets_registers_module) {
     static const char src[] = "// swift-tools-version:5.9\n"
                               "import PackageDescription\n"
@@ -27661,6 +28105,11 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
                     "{\"name\":\"@org/app\",\"main\":\"index.js\"}\n");
     write_temp_file(tmpdir, "vendor_big/lib/package.json",
                     "{\"name\":\"@org/vendored\",\"main\":\"index.js\"}\n");
+    write_temp_file(tmpdir, "packages/app/Package.swift",
+                    "let package = Package(name: \"App\", targets: [.target(name: \"App\")])\n");
+    write_temp_file(tmpdir, "vendor_big/lib/Package.swift",
+                    "let package = Package(name: \"Vendored\", targets: ["
+                    ".target(name: \"Vendored\")])\n");
 
     /* Control: NULL exclusion list — the walk reaches and parses BOTH
      * manifests (proves the excluded one is reachable + parseable). */
@@ -27669,6 +28118,11 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     cbm_pkgmap_scan_repo(tmpdir, &control, NULL, 0);
     ASSERT_TRUE(pkg_entries_has_name(&control, "@org/app"));
     ASSERT_TRUE(pkg_entries_has_name(&control, "@org/vendored"));
+    cbm_pkg_entries_free(&control);
+    cbm_pkg_entries_init(&control);
+    cbm_pkgmap_scan_swift_targets(tmpdir, &control, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&control, "App"));
+    ASSERT_TRUE(pkg_entries_has_name(&control, "Vendored"));
     cbm_pkg_entries_free(&control);
 
     /* With vendor_big excluded (as discovery reports for a gitignored
@@ -27679,6 +28133,15 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     cbm_pkgmap_scan_repo(tmpdir, &entries, excluded, 1);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "@org/app"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "@org/vendored"));
+    cbm_pkg_entries_free(&entries);
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_swift_targets(tmpdir, &entries, excluded, 1);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Vendored"));
+    for (int i = 0; i < entries.count; i++) {
+        ASSERT_NOT_NULL(entries.items[i].manifest_rel);
+        ASSERT_FALSE(strncmp(entries.items[i].manifest_rel, "vendor_big/", 11) == 0);
+    }
     cbm_pkg_entries_free(&entries);
 
     th_rmtree(tmpdir);
@@ -33176,9 +33639,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_capped_selector_survives_incremental_issue2061);
     RUN_TEST(pipeline_swift_cross_file_extension_issue2061);
     RUN_TEST(pipeline_swift_same_named_extensions_stay_in_module_issue2061);
+    RUN_TEST(pipeline_swift_custom_target_paths_and_manifest_edit_issue2061);
     RUN_TEST(pipeline_swift_qualified_and_return_identity_issue2061);
     RUN_TEST(pipeline_swift_return_identity_issue2061);
     RUN_TEST(pipeline_swift_receiver_and_chained_closures_issue2061);
+    RUN_TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers);
     RUN_TEST(pipeline_swift_default_before_required_candidates_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_unresolved_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_parallel_fallback_issue2061);
@@ -33346,6 +33811,7 @@ SUITE(pipeline) {
     RUN_TEST(k8s_extract_manifest_multidoc);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
     RUN_TEST(pkgmap_swift_targets_registers_module);
+    RUN_TEST(pkgmap_swift_target_kinds_and_normalized_paths);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
     RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);
     RUN_TEST(pkgmap_swift_target_honors_literal_path);

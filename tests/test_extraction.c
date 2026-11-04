@@ -3861,6 +3861,163 @@ TEST(swift_type_imports_preserve_markers_and_complete_file_imports) {
     PASS();
 }
 
+TEST(swift_conditional_type_members_keep_owners_and_source_lines) {
+    const char *source = "open class Session {\n"
+                         "#if canImport(Darwin) /* conditional\n"
+                         " * comment */\n"
+                         "open func request(_ value: Int) { called() }\n"
+                         "#if FEATURE\n"
+                         "open func nested() {}\n"
+                         "#else\n"
+                         "open func alternate() {}\n"
+                         "#endif\n"
+                         "#elseif canImport(FoundationNetworking)\n"
+                         "open func portable() {}\n"
+                         "#else\n"
+                         "open func fallback() {}\n"
+                         "#endif\n"
+                         "open func upload(_ value: Int) {}\n"
+                         "}\n"
+                         "let literal = #\"\"\"\n"
+                         "#if RAW\n"
+                         "func phantom() {}\n"
+                         "#endif\n"
+                         "\"\"\"#\n"
+                         "/* outer\n"
+                         "#if COMMENT\n"
+                         "/* nested */\n"
+                         "func fake() {}\n"
+                         "#endif\n"
+                         "*/\n"
+                         "func outside() {}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Session.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    const char *members[] = {"Session.request(_:Int)", "Session.nested()",
+                             "Session.alternate()",    "Session.portable()",
+                             "Session.fallback()",     "Session.upload(_:Int)"};
+    for (size_t i = 0; i < sizeof(members) / sizeof(members[0]); i++) {
+        const CBMDefinition *def = find_def_in_module(r, members[i]);
+        ASSERT_NOT_NULL(def);
+        ASSERT_STR_EQ(def->label, "Method");
+        ASSERT_STR_EQ(def->parent_class, "t.Session.Session");
+    }
+    ASSERT_EQ(find_def_in_module(r, "Session.request(_:Int)")->start_line, 4);
+    ASSERT_EQ(find_def_in_module(r, "Session.upload(_:Int)")->start_line, 15);
+    const CBMDefinition *outside = find_def_in_module(r, "outside()");
+    ASSERT_NOT_NULL(outside);
+    ASSERT_EQ(outside->start_line, 28);
+    ASSERT_FALSE(has_def_any(r, "phantom"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    const CBMCall *call = find_call_by_callee(r, "called");
+    ASSERT_NOT_NULL(call);
+    ASSERT_STR_EQ(call->enclosing_func_qn, "t.Session.Session.request(_:Int)");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_uncapped_selectors_keep_nested_return_types) {
+    CBMFileResult *r = extract("func generic(_ value: Int) -> Box<Result> { fatalError() }\n"
+                               "func callback() -> (Int) -> Result { fatalError() }\n",
+                               CBM_LANG_SWIFT, "t", "Returns.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *generic = find_def_in_module(r, "generic(_:Int)=>Box<Result>");
+    const CBMDefinition *callback = find_def_in_module(r, "callback()=>(Int)=>Result");
+    ASSERT_NOT_NULL(generic);
+    ASSERT_NOT_NULL(callback);
+    ASSERT_STR_EQ(generic->call_selector, "(_:Int)=>Box<Result>");
+    ASSERT_STR_EQ(callback->call_selector, "()=>(Int)=>Result");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_wrapped_trailing_closure_keeps_one_complete_call) {
+    const char *source =
+        "func invoke() async throws {\n"
+        "let request = session.request(.default).responseDecodable(of: Value.self) { value in\n"
+        "    consume(value)\n"
+        "}\n"
+        "let storedSession = stored(Session())\n"
+        "let awaitedSession = try await stored(Session())\n"
+        "factory()(flag: true)\n"
+        "}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Calls.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int responses = 0;
+    int factories = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (strcmp(call->callee_name, "session.request(.default).responseDecodable") == 0) {
+            responses++;
+            ASSERT_EQ(call->arg_count, 1);
+            ASSERT_STR_EQ(call->args[0].keyword, "of");
+            ASSERT_EQ(call->trailing_closure_count, 1);
+            ASSERT_TRUE(call->has_trailing_closure);
+            ASSERT_FALSE(call->trailing_closure_truncated);
+            ASSERT_EQ(source[call->site_end_byte - 1], '}');
+        } else if (strcmp(call->callee_name, "factory") == 0) {
+            factories++;
+            ASSERT_EQ(call->arg_count, 0);
+            ASSERT_FALSE(call->has_trailing_closure);
+        }
+    }
+    ASSERT_EQ(responses, 1);
+    ASSERT_EQ(factories, 1);
+    ASSERT_NOT_NULL(find_call_by_callee(r, "session.request"));
+    ASSERT_NOT_NULL(find_call_by_callee(r, "consume"));
+    const char *names[] = {"storedSession", "awaitedSession"};
+    const char *values[] = {"stored(Session())", "try await stored(Session())"};
+    for (int compact = 0; compact < 2; compact++) {
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const CBMTypeAssign *assignment = NULL;
+            for (int j = 0; j < r->type_assigns.count; j++) {
+                if (strcmp(r->type_assigns.items[j].var_name, names[i]) == 0) {
+                    assignment = &r->type_assigns.items[j];
+                }
+            }
+            ASSERT_NOT_NULL(assignment);
+            ASSERT_NULL(assignment->type_name);
+            size_t start = (size_t)(strstr(source, values[i]) - source);
+            ASSERT_EQ(assignment->value_start_byte, start);
+            ASSERT_EQ(assignment->value_end_byte, start + strlen(values[i]));
+        }
+        if (!compact) {
+            cbm_result_compact(r);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_selector_expands_only_lexical_function_aliases) {
+    CBMFileResult *r =
+        extract("typealias Plain = () -> Void\nstruct Payload {}\n"
+                "class Stream {\n"
+                "typealias Handler<T> = @Sendable (T) throws -> Void\n"
+                "func response(on queue: Int = 0, stream: Handler<Payload>) -> Self { self }\n}\n"
+                "class Wrong {\ntypealias Handler<T> = [T]\n"
+                "func response(stream: Handler<Payload>) {}\n}\n"
+                "class Top { func use(done: Plain) {} }\n",
+                CBM_LANG_SWIFT, "t", "Aliases.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *stream =
+        find_def_in_module(r, "Stream.response(on:Int,stream:Handler<Payload>)=>Self");
+    const CBMDefinition *wrong = find_def_in_module(r, "Wrong.response(stream:Handler<Payload>)");
+    const CBMDefinition *top = find_def_in_module(r, "Top.use(done:Plain)");
+    ASSERT_NOT_NULL(stream);
+    ASSERT_NOT_NULL(wrong);
+    ASSERT_NOT_NULL(top);
+    ASSERT_NOT_NULL(strstr(stream->call_selector, "stream:(T)throws=>Void"));
+    ASSERT_STR_EQ(wrong->call_selector, "(stream:Handler<Payload>)");
+    ASSERT_STR_EQ(top->call_selector, "(done:()=>Void)");
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(swift_multiple_trailing_closure_extraction) {
     CBMFileResult *r =
         extract("func outer() { service.handle { nested() } onError: { recover() } }\n"
@@ -15660,6 +15817,10 @@ SUITE(extraction) {
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_type_imports_preserve_markers_and_complete_file_imports);
+    RUN_TEST(swift_conditional_type_members_keep_owners_and_source_lines);
+    RUN_TEST(swift_uncapped_selectors_keep_nested_return_types);
+    RUN_TEST(swift_wrapped_trailing_closure_keeps_one_complete_call);
+    RUN_TEST(swift_selector_expands_only_lexical_function_aliases);
     RUN_TEST(swift_multiple_trailing_closure_extraction);
     RUN_TEST(swift_trailing_closure_boundaries_survive_compact_and_spill);
     RUN_TEST(swift_constructor_call);

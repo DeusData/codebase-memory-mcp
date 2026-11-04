@@ -65,7 +65,7 @@ CBMCallableIdentity cbm_callable_identity(CBMLanguage lang);
 /* Swift parameter defaults are call-resolution metadata, not graph identity.
  * Returns a bit per parameter; count > 64 is reported as 255. */
 uint64_t cbm_swift_default_mask(TSNode func_node, const char *source, uint8_t *count);
-/* Uncapped parameter spelling: matching must not parse a hashed identity. */
+/* Uncapped parameter and return spelling: matching and chains must not parse a hashed identity. */
 const char *cbm_swift_selector(CBMArena *a, TSNode func_node, const char *source);
 /* The identity suffix for the callable at `func_node` in the language's own
  * mode, or NULL when that mode is NONE (or the node carries no parameter

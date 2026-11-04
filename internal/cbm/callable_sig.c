@@ -67,6 +67,7 @@ typedef struct {
     size_t open_off;  /* offset of the parameter list's "(" */
     size_t close_off; /* offset just past its ")" */
     bool skip_names;  /* nested C parameter lists: leave out parameter names */
+    bool expand_swift_closure_aliases;
 } sig_ctx_t;
 
 static bool sig_ident_char(unsigned char ch) {
@@ -722,6 +723,106 @@ static void sig_kotlin_params(sig_ctx_t *c, TSNode node) {
 
 /* ── Swift ─────────────────────────────────────────────────────── */
 
+static bool sig_swift_alias_in_scope(const sig_ctx_t *c, TSNode scope, TSNode wanted,
+                                     TSNode *target) {
+    bool found = false;
+    uint32_t start = ts_node_start_byte(wanted);
+    uint32_t length = ts_node_end_byte(wanted) - start;
+    for (uint32_t i = 0; i < ts_node_named_child_count(scope); i++) {
+        TSNode alias = ts_node_named_child(scope, i);
+        if (strcmp(ts_node_type(alias), "typealias_declaration") != 0) {
+            continue;
+        }
+        TSNode name = sig_field(alias, "name");
+        if (ts_node_is_null(name) || ts_node_end_byte(name) - ts_node_start_byte(name) != length ||
+            memcmp(c->src + ts_node_start_byte(name), c->src + start, length) != 0) {
+            continue;
+        }
+        TSNode function = cbm_find_child_by_kind(alias, "function_type");
+        if (ts_node_is_null(function)) {
+            *target = (TSNode){0};
+            return true;
+        }
+        *target = function;
+        found = true;
+    }
+    return found;
+}
+
+/* Only direct function aliases in the type/file lexical scope prove a closure.
+ * Keep their declared spelling in QNs; selectors need only their callable shape. */
+static TSNode sig_swift_selector_type(const sig_ctx_t *c, TSNode parameter, TSNode type) {
+    if (!c->expand_swift_closure_aliases || strcmp(ts_node_type(type), "user_type") != 0) {
+        return type;
+    }
+    TSNode wanted = {0};
+    for (uint32_t i = 0; i < ts_node_named_child_count(type); i++) {
+        TSNode child = ts_node_named_child(type, i);
+        if (strcmp(ts_node_type(child), "type_identifier") == 0) {
+            if (!ts_node_is_null(wanted)) {
+                return type; /* qualified aliases need their declaring module */
+            }
+            wanted = child;
+        }
+    }
+    if (ts_node_is_null(wanted)) {
+        return type;
+    }
+    for (TSNode parent = ts_node_parent(parameter); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        const char *kind = ts_node_type(parent);
+        TSNode scope = {0};
+        if (strcmp(kind, "source_file") == 0) {
+            scope = parent;
+        } else if (strcmp(kind, "class_declaration") == 0 ||
+                   strcmp(kind, "protocol_declaration") == 0) {
+            scope = sig_field(parent, "body");
+        }
+        TSNode target = {0};
+        if (!ts_node_is_null(scope) && sig_swift_alias_in_scope(c, scope, wanted, &target)) {
+            return ts_node_is_null(target) ? type : target;
+        }
+    }
+    return type;
+}
+
+static void sig_swift_param_type(sig_ctx_t *c, TSNode p, TSNode internal) {
+    size_t before = c->len;
+    uint32_t count = ts_node_child_count(p);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode ch = ts_node_child(p, i);
+        const char *field = ts_node_field_name_for_child(p, i);
+        if (field && strcmp(field, "external_name") == 0) {
+            continue;
+        }
+        if (ts_node_eq(ch, internal)) {
+            continue;
+        }
+        /* A default expression selects call arity, not type identity. */
+        if ((field && strcmp(field, "default_value") == 0) || sig_node_text_is(c, ch, "=")) {
+            break;
+        }
+        const char *k = ts_node_type(ch);
+        if (strcmp(k, "parameter_modifiers") == 0) {
+            uint32_t mc = ts_node_named_child_count(ch);
+            for (uint32_t j = 0; j < mc; j++) {
+                TSNode m = ts_node_named_child(ch, j);
+                uint32_t ms = ts_node_start_byte(m);
+                if (ts_node_end_byte(m) > ms && c->src[ms] != '@') {
+                    sig_type_tokens(c, m); /* inout; @escaping etc. dropped */
+                }
+            }
+        } else if (ts_node_is_named(ch)) {
+            sig_type_tokens(c, sig_swift_selector_type(c, p, ch));
+        } else if (sig_node_text_is(c, ch, "...")) {
+            sig_raw_str(c, sig_variadic_marker(c->lang));
+        }
+    }
+    if (c->len == before) {
+        sig_raw(c, "?", SIG_CHAR_LEN);
+    }
+}
+
 static void sig_swift_param(sig_ctx_t *c, TSNode p) {
     TSNode external = sig_field(p, "external_name");
     TSNode internal = {0};
@@ -739,39 +840,7 @@ static void sig_swift_param(sig_ctx_t *c, TSNode p) {
     /* One name is both label and internal name; `_` means unlabeled. */
     sig_label_node(c, ts_node_is_null(external) ? internal : external);
     if (sig_writes_types(c)) {
-        size_t before = c->len;
-        for (uint32_t i = 0; i < count; i++) {
-            TSNode ch = ts_node_child(p, i);
-            const char *field = ts_node_field_name_for_child(p, i);
-            if (field && strcmp(field, "external_name") == 0) {
-                continue;
-            }
-            if (ts_node_eq(ch, internal)) {
-                continue;
-            }
-            /* A default expression selects call arity, not type identity. */
-            if ((field && strcmp(field, "default_value") == 0) || sig_node_text_is(c, ch, "=")) {
-                break;
-            }
-            const char *k = ts_node_type(ch);
-            if (strcmp(k, "parameter_modifiers") == 0) {
-                uint32_t mc = ts_node_named_child_count(ch);
-                for (uint32_t j = 0; j < mc; j++) {
-                    TSNode m = ts_node_named_child(ch, j);
-                    uint32_t ms = ts_node_start_byte(m);
-                    if (ts_node_end_byte(m) > ms && c->src[ms] != '@') {
-                        sig_type_tokens(c, m); /* inout; @escaping etc. dropped */
-                    }
-                }
-            } else if (ts_node_is_named(ch)) {
-                sig_type_tokens(c, ch);
-            } else if (sig_node_text_is(c, ch, "...")) {
-                sig_raw_str(c, sig_variadic_marker(c->lang));
-            }
-        }
-        if (c->len == before) {
-            sig_raw(c, "?", 1);
-        }
+        sig_swift_param_type(c, p, internal);
     }
     sig_entry_close(c);
 }
@@ -1199,10 +1268,20 @@ const char *cbm_swift_selector(CBMArena *a, TSNode node, const char *source) {
         return NULL;
     }
     sig_ctx_t c = {
-        .arena = a, .src = source, .lang = CBM_LANG_SWIFT, .mode = CBM_CALLABLE_ID_LABELED_TYPED};
+        .arena = a,
+        .src = source,
+        .lang = CBM_LANG_SWIFT,
+        .mode = CBM_CALLABLE_ID_LABELED_TYPED,
+        .expand_swift_closure_aliases = true,
+    };
     sig_raw_str(&c, "(");
     sig_swift_params(&c, node);
     sig_raw_str(&c, ")");
+    TSNode result = sig_field(node, "return_type");
+    if (!ts_node_is_null(result)) {
+        sig_raw_str(&c, "=>");
+        sig_type_tokens(&c, result);
+    }
     if (c.overflow) {
         return NULL;
     }

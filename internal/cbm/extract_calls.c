@@ -427,10 +427,42 @@ static char *extract_wolfram_callee(CBMArena *a, TSNode node, const char *source
 
 // Language-specific callee extraction for FP and niche languages.
 // Swift callee extraction from call/constructor expressions.
+static TSNode swift_trailing_closure_inner(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "call_expression") != 0) {
+        return (TSNode){0};
+    }
+    TSNode inner = ts_node_named_child(node, 0);
+    if (ts_node_is_null(inner) || strcmp(ts_node_type(inner), "call_expression") != 0) {
+        return (TSNode){0};
+    }
+    TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+    if (ts_node_is_null(suffix) ||
+        !ts_node_is_null(cbm_find_child_by_kind(suffix, "value_arguments")) ||
+        (ts_node_is_null(cbm_find_child_by_kind(suffix, "lambda_literal")) &&
+         ts_node_is_null(cbm_find_child_by_kind(node, "lambda_literal")))) {
+        return (TSNode){0};
+    }
+    return inner;
+}
+
+static TSNode swift_call_base(TSNode node) {
+    TSNode inner = swift_trailing_closure_inner(node);
+    while (!ts_node_is_null(inner)) {
+        node = inner;
+        inner = swift_trailing_closure_inner(node);
+    }
+    return node;
+}
+
 static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "constructor_expression") != 0) {
         return NULL;
     }
+    TSNode wrapped = swift_trailing_closure_inner(ts_node_parent(node));
+    if (!ts_node_is_null(wrapped) && ts_node_eq(wrapped, node)) {
+        return NULL;
+    }
+    node = swift_call_base(node);
     if (ts_node_named_child_count(node) > 0) {
         TSNode callee = ts_node_named_child(node, 0);
         const char *ck = ts_node_type(callee);
@@ -3991,6 +4023,7 @@ static TSNode objectscript_call_args(TSNode node) {
  * instead. A trailing closure has a call_suffix with no value_arguments, which
  * returns a null node and leaves the call without a string argument, as before. */
 static TSNode swift_call_args(TSNode node) {
+    node = swift_call_base(node);
     TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
     if (ts_node_is_null(suffix)) {
         return (TSNode){0};
@@ -4538,7 +4571,8 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
         return selection;
     }
 
-    selection.expr = language_specific_callee_expr(ctx->language, node);
+    TSNode callee_node = ctx->language == CBM_LANG_SWIFT ? swift_call_base(node) : node;
+    selection.expr = language_specific_callee_expr(ctx->language, callee_node);
     selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};

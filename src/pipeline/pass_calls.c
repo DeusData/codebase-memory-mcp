@@ -689,11 +689,32 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
  * by the parallel formatter itself (emit_http_async_edge), because route/service
  * edge props feed full-only predump passes (create_route_nodes /
  * create_data_flows) and must not differ between the two passes. */
-/* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
+/* Append a ,"args":[{"i":0,"k":"<keyword>","e":"<expr>","v":"<value>"},...] field onto a CALLS
  * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
  * this, so data_flow mode had no argument expressions to surface for small
  * (< 50 file) repos that take the sequential path (#514). Mirrors the parallel
  * path's append_args_json shape so both pipelines agree. */
+static int calls_format_arg(char *one, size_t cap, const CBMCallArg *arg, const char *prefix) {
+    char expr[CBM_SZ_256];
+    cbm_json_escape(expr, sizeof(expr), arg->expr ? arg->expr : "");
+    char keyword[CBM_SZ_256] = "";
+    if (arg->keyword) {
+        char escaped[CBM_SZ_128];
+        cbm_json_escape(escaped, sizeof(escaped), arg->keyword);
+        int length = snprintf(keyword, sizeof(keyword), ",\"k\":\"%s\"", escaped);
+        if (length <= 0 || (size_t)length >= sizeof(keyword)) {
+            return 0;
+        }
+    }
+    if (arg->value) {
+        char value[CBM_SZ_256];
+        cbm_json_escape(value, sizeof(value), arg->value);
+        return snprintf(one, cap, "%s{\"i\":%d%s,\"e\":\"%s\",\"v\":\"%s\"}", prefix, arg->index,
+                        keyword, expr, value);
+    }
+    return snprintf(one, cap, "%s{\"i\":%d%s,\"e\":\"%s\"}", prefix, arg->index, keyword, expr);
+}
+
 static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
     if (!call || call->arg_count <= 0) {
         return;
@@ -710,19 +731,8 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
     }
     pos += (size_t)n;
     for (int i = 0; i < call->arg_count; i++) {
-        const CBMCallArg *a = &call->args[i];
-        char esc_e[CBM_SZ_256];
-        cbm_json_escape(esc_e, sizeof(esc_e), a->expr ? a->expr : "");
         char one[CBM_SZ_512];
-        if (a->value) {
-            char esc_v[CBM_SZ_256];
-            cbm_json_escape(esc_v, sizeof(esc_v), a->value);
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}",
-                         i > 0 ? "," : "", a->index, esc_e, esc_v);
-        } else {
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
-                         esc_e);
-        }
+        n = calls_format_arg(one, sizeof(one), &call->args[i], i > 0 ? "," : "");
         /* Add rather than subtract: pos is unsigned, so `cap - pos - PAIR_LEN`
          * wraps once pos reaches cap - PAIR_LEN and stops bounding the memcpy
          * below. The closing write at the end of this function already guards

@@ -5,6 +5,7 @@
  * resolution strategies, and qualified name computation.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h" /* cbm_python_import_binding_contradicts (#2127) */
 
@@ -2392,6 +2393,69 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
     PASS();
 }
 
+TEST(swift_manifest_root_targets_respect_nested_package_boundaries) {
+    char *root = th_mktempdir("cbm_swift_root_targets");
+    ASSERT_NOT_NULL(root);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Package.swift"),
+                            "let package = Package(name: \"Product\", targets: ["
+                            ".target(name: \"Core\", path: \".\")])\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Nested/Package.swift"),
+                            "let package = Package(name: \"Nested\", targets: ["
+                            ".target(name: \"Core\", path: \".\")])\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Unknown/Package.swift"),
+                            "let package = Package(name: \"Unknown\", targets: ["
+                            ".target(name: \"Computed\", path: computed)])\n"),
+              0);
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", root);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(graph);
+    const char *qns[] = {"proj.Root.Type.Service", "proj.Root.Ext.Service",
+                         "proj.Nested.Type.Service", "proj.Nested.Ext.Service",
+                         "proj.Unknown.Ext.Service"};
+    const char *files[] = {"Core/Types.swift", "Extra/Extensions.swift", "Nested/Core/Types.swift",
+                           "Nested/Extra/Extensions.swift", "Unknown/Extra/Extensions.swift"};
+    const char *methods[] = {"proj.Root.Ext.Service.run()", "proj.Nested.Ext.Service.run()",
+                             "proj.Unknown.Ext.Service.run()"};
+    for (int i = 0; i < 5; i++) {
+        cbm_registry_add(r, "Service", qns[i], "Class");
+        ASSERT_GT(cbm_gbuf_upsert_node(graph, "Class", "Service", qns[i], files[i], 1, 3,
+                                       i == 0 || i == 2 ? "{\"swift_type_path\":\"Service\"}"
+                                                        : "{\"swift_extension\":\"Service\"}"),
+                  0);
+    }
+    for (int i = 0; i < 3; i++) {
+        cbm_registry_add(r, "run", methods[i], "Method");
+        cbm_registry_set_swift_signature(r, methods[i], 0, 0, "()");
+    }
+    cbm_registry_build_swift_owners(r, graph, root, NULL, 0);
+    CBMCall call = {.callee_name = "Service.run"};
+    const char *out[4] = {0};
+    ASSERT_EQ(cbm_registry_swift_candidates_in_file(r, &call, NULL, graph, "proj.Root.Type", NULL,
+                                                    0, out, 4),
+              1);
+    ASSERT_STR_EQ(out[0], methods[0]);
+    ASSERT_EQ(cbm_registry_swift_candidates_in_file(r, &call, NULL, graph, "proj.Nested.Type", NULL,
+                                                    0, out, 4),
+              1);
+    ASSERT_STR_EQ(out[0], methods[1]);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Package.swift"),
+                            "let package = Package(name: \"Product\", targets: ["
+                            ".target(name: \"Core\", path: \".\"),"
+                            ".target(name: \"Other\", path: \".\")])\n"),
+              0);
+    cbm_registry_build_swift_owners(r, graph, root, NULL, 0);
+    ASSERT_EQ(cbm_registry_swift_candidates_in_file(r, &call, NULL, graph, "proj.Root.Type", NULL,
+                                                    0, out, 4),
+              -1);
+    cbm_registry_free(r);
+    cbm_gbuf_free(graph);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
 TEST(swift_receiver_resolution_is_independent_of_registration_order) {
     const char *alpha = "proj.alpha.Service.work(flag:Bool)";
     const char *beta = "proj.beta.Service.work(flag:Bool)";
@@ -3047,6 +3111,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(swift_receiver_resolution_is_independent_of_registration_order);
+    RUN_TEST(swift_manifest_root_targets_respect_nested_package_boundaries);
     RUN_TEST(swift_overload_labels_defaults_and_trailing_closure);
     RUN_TEST(swift_multiple_trailing_closures_match_labels);
     RUN_TEST(swift_repeated_labels_skip_default_before_next_trailing_label);

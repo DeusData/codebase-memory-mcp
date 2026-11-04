@@ -3331,6 +3331,73 @@ static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const 
     return source;
 }
 
+/* The Swift grammar rejects conditional directives in type bodies. Mask only
+ * real AST directive tokens, so strings/comments and source coordinates survive. */
+static bool swift_mask_conditional_node(CBMArena *a, TSNode node, const char *source,
+                                        int source_len, char **masked) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "#if") == 0 || strcmp(kind, "#elseif") == 0 || strcmp(kind, "#else") == 0 ||
+        strcmp(kind, "#endif") == 0) {
+        if (!*masked) {
+            *masked = cbm_arena_strndup(a, source, (size_t)source_len);
+            if (!*masked) {
+                return false;
+            }
+        }
+        for (uint32_t i = ts_node_start_byte(node);
+             i < (uint32_t)source_len && source[i] != '\n' && source[i] != '\r'; i++) {
+            (*masked)[i] = ' ';
+        }
+    } else if (*masked &&
+               (strcmp(kind, "comment") == 0 || strcmp(kind, "multiline_comment") == 0)) {
+        for (uint32_t i = ts_node_start_byte(node);
+             i < ts_node_end_byte(node) && i < (uint32_t)source_len; i++) {
+            (*masked)[i] = source[i];
+        }
+    }
+    return true;
+}
+
+static const char *swift_mask_conditional_directives(CBMArena *a, TSNode root, const char *source,
+                                                     int source_len) {
+    char *masked = NULL;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool more = true;
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (!swift_mask_conditional_node(a, node, source, source_len, &masked)) {
+            break;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return masked ? masked : source;
+}
+
+static TSTree *swift_retry_conditional_parse(CBMArena *a, TSParser *parser, TSTree *tree,
+                                             CBMLanguage language, const char *source,
+                                             int source_len, TSParseOptions opts) {
+    if (!tree || language != CBM_LANG_SWIFT || !ts_node_has_error(ts_tree_root_node(tree))) {
+        return tree;
+    }
+    const char *masked =
+        swift_mask_conditional_directives(a, ts_tree_root_node(tree), source, source_len);
+    if (masked == source) {
+        return tree;
+    }
+    ts_tree_delete(tree);
+    ts_parser_reset(parser);
+    return cbm_parse_source(parser, masked, (uint32_t)source_len, opts);
+}
+
 /* Initial block for the per-file traversal scratch arena, chosen by measuring
  * arena_grow on a 14k-file TypeScript tree: it fires on one file in 12,000 at
  * both this size and at 1 MB, and on most files at 256 KB, where the two
@@ -3869,6 +3936,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
+    tree = swift_retry_conditional_parse(a, parser, tree, language, source, source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
