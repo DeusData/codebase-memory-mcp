@@ -51,6 +51,14 @@ struct CBMCargoManifest;
 
 /* Rust-flavoured LSP context: one per file, lifetime tied to a single
  * `cbm_extract_file()` invocation (or the cross-file caller's arena). */
+/* Probe memo entry for registered-type short-name resolution (lives in the
+ * per-file LSP context, arena-backed, lazily allocated; zeroed by memset). */
+typedef struct {
+    const char *name; /* borrowed probe key */
+    const char *hit;  /* registered QN; NULL = probed and absent/ambiguous */
+} RustProbeEntry;
+#define RUST_PROBE_MEMO_MAX 48
+
 typedef struct {
     CBMArena *arena;
     const char *source;
@@ -78,6 +86,12 @@ typedef struct {
 
     const char **glob_module_qns;
     int glob_count;
+
+    /* Registered-type short-name probe memo (see rust_short_probe_type):
+     * bare type names that no `use`/same-module form resolved get ONE
+     * O(registry) scan each, memoized for the rest of the file. */
+    RustProbeEntry *probe_memo;
+    int probe_count;
 
     /* Exact names from top-level out-of-line `mod name;` declarations. A
      * relative scoped type may be project-qualified only when its head is in

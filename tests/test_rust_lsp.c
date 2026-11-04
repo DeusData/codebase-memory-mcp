@@ -614,6 +614,184 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     PASS();
 }
 
+/* ── Issue #2605: cross-file struct fields must type the receiver ──────
+ *
+ * `entry: &mut Entry`, where Entry lives in another module and carries
+ * `session: Session`. Before the fix the registry held no fields at all, so
+ * `entry.session` was untypable and `push_daily()` fell to the textual suffix
+ * bucket, where the lexicographically earlier trait stub
+ * (Analytic.push_daily) absorbed the call. The tests pin BOTH directions: the
+ * inherent method gains the caller and the stub does not. */
+static void rustlsp_field_receiver_defs(CBMRustLSPDef *defs, bool with_fields) {
+    memset(defs, 0, sizeof(CBMRustLSPDef) * 5);
+    defs[0].qualified_name = "p.alpha.lib.Entry";
+    defs[0].short_name = "Entry";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "p.alpha.lib";
+    defs[0].field_defs = with_fields ? "session:Session" : NULL;
+    defs[1].qualified_name = "p.alpha.lib.Session";
+    defs[1].short_name = "Session";
+    defs[1].label = "Struct";
+    defs[1].def_module_qn = "p.alpha.lib";
+    defs[2].qualified_name = "p.alpha.lib.Session.push_daily";
+    defs[2].short_name = "push_daily";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "p.alpha.lib.Session";
+    defs[2].def_module_qn = "p.alpha.lib";
+    defs[3].qualified_name = "p.alpha.lib.Analytic";
+    defs[3].short_name = "Analytic";
+    defs[3].label = "Trait";
+    defs[3].def_module_qn = "p.alpha.lib";
+    defs[4].qualified_name = "p.alpha.lib.Analytic.push_daily";
+    defs[4].short_name = "push_daily";
+    defs[4].label = "Method";
+    defs[4].receiver_type = "p.alpha.lib.Analytic";
+    defs[4].def_module_qn = "p.alpha.lib";
+}
+
+/* The Tier-2 builder takes the pipeline's CBMLSPDef; mirror the same defs. */
+static void rustlsp_field_receiver_lspdefs(const CBMRustLSPDef *src, CBMLSPDef *dst, int n) {
+    memset(dst, 0, sizeof(CBMLSPDef) * (size_t)n);
+    for (int i = 0; i < n; i++) {
+        dst[i].qualified_name = src[i].qualified_name;
+        dst[i].short_name = src[i].short_name;
+        dst[i].label = src[i].label;
+        dst[i].receiver_type = src[i].receiver_type;
+        dst[i].def_module_qn = src[i].def_module_qn;
+        dst[i].return_types = src[i].return_types;
+        dst[i].embedded_types = src[i].embedded_types;
+        dst[i].field_defs = src[i].field_defs;
+        dst[i].method_names_str = src[i].method_names_str;
+        dst[i].signature_param_types = src[i].signature_param_types;
+        dst[i].signature_param_count = src[i].signature_param_count;
+        dst[i].trait_qn = src[i].trait_qn;
+        dst[i].is_rust_impl_relation = src[i].is_rust_impl_relation;
+        dst[i].is_abstract = src[i].is_abstract;
+        dst[i].lang = CBM_LANG_RUST;
+    }
+}
+
+/* A braced `use` maps the bare type name to a crate-rooted spelling that is
+ * not registered; the short-name probe must still reach the real type. */
+static const char *rustlsp_field_receiver_caller =
+    "use alpha::{Entry, Session};\n"
+    "\n"
+    "pub fn daily_from_store_at(entry: &mut Entry) {\n"
+    "    entry.session.push_daily();\n"
+    "}\n";
+
+static int rustlsp_array_index(const CBMResolvedCallArray *out, const char *caller,
+                               const char *callee) {
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *rc = &out->items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, caller) && rc->callee_qn &&
+            strstr(rc->callee_qn, callee)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int rustlsp_array_count(const CBMResolvedCallArray *out, const char *caller,
+                               const char *callee) {
+    int n = 0;
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *rc = &out->items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, caller) && rc->callee_qn &&
+            strstr(rc->callee_qn, callee)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(rustlsp_crossfile_field_receiver_resolves_inherent_method) {
+    CBMArena a;
+    cbm_arena_init(&a);
+
+    CBMRustLSPDef defs[5];
+    rustlsp_field_receiver_defs(defs, /*with_fields=*/true);
+
+    const char *imp_names[] = {"Entry"};
+    const char *imp_qns[] = {"alpha::Entry"};
+
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, rustlsp_field_receiver_caller,
+                           (int)strlen(rustlsp_field_receiver_caller), "p.store_ffi", defs, 5,
+                           imp_names, imp_qns, 1, NULL, &out);
+
+    int hit = rustlsp_array_index(&out, "daily_from_store_at", "Session.push_daily");
+    ASSERT_GTE(hit, 0);
+    ASSERT_TRUE(strstr(out.items[hit].strategy, "lsp_") != NULL);
+    ASSERT_EQ(rustlsp_array_count(&out, "daily_from_store_at", "Analytic.push_daily"), 0);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* Tier-2: the pipeline's parallel path builds this shared, read-only registry
+ * ONCE from every Rust def (rust_populate_cross_registry). The folded
+ * field_defs must be materialized here too, or the same mis-bind returns on
+ * any workspace big enough for the parallel path. */
+TEST(rustlsp_shared_registry_types_cross_file_field) {
+    CBMArena a;
+    cbm_arena_init(&a);
+
+    CBMRustLSPDef rust_defs[5];
+    rustlsp_field_receiver_defs(rust_defs, /*with_fields=*/true);
+    CBMLSPDef defs[5];
+    rustlsp_field_receiver_lspdefs(rust_defs, defs, 5);
+
+    const char *imp_names[] = {"Entry"};
+    const char *imp_qns[] = {"alpha::Entry"};
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 5);
+    ASSERT_NOT_NULL(reg);
+
+    /* The field must be attached to the registered type, not merely parsed. */
+    const CBMRegisteredType *entry = cbm_registry_lookup_type(reg, "p.alpha.lib.Entry");
+    ASSERT_NOT_NULL(entry);
+    ASSERT_TRUE(entry->field_names != NULL);
+    ASSERT_STR_EQ(entry->field_names[0], "session");
+    ASSERT_NOT_NULL(entry->field_types[0]);
+    ASSERT_STR_EQ(entry->field_types[0]->data.named.qualified_name, "p.alpha.lib.Session");
+
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_registry(&a, rustlsp_field_receiver_caller,
+                                         (int)strlen(rustlsp_field_receiver_caller), "p.store_ffi",
+                                         reg, imp_names, imp_qns, 1, NULL, NULL, &out, NULL);
+
+    ASSERT_GTE(rustlsp_array_index(&out, "daily_from_store_at", "Session.push_daily"), 0);
+    ASSERT_EQ(rustlsp_array_count(&out, "daily_from_store_at", "Analytic.push_daily"), 0);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* Control: with no field_defs the receiver is untypable again. The test pins
+ * that the fix comes from the typed field and not from some weaker fallback
+ * that would make the assertion above vacuous. */
+TEST(rustlsp_field_receiver_without_field_defs_stays_untyped) {
+    CBMArena a;
+    cbm_arena_init(&a);
+
+    CBMRustLSPDef rust_defs[5];
+    rustlsp_field_receiver_defs(rust_defs, /*with_fields=*/false);
+    CBMLSPDef defs[5];
+    rustlsp_field_receiver_lspdefs(rust_defs, defs, 5);
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 5);
+    ASSERT_NOT_NULL(reg);
+    const CBMRegisteredType *entry = cbm_registry_lookup_type(reg, "p.alpha.lib.Entry");
+    ASSERT_NOT_NULL(entry);
+    ASSERT_TRUE(entry->field_names == NULL);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 static CBMTypeRegistry *rustlsp_default_trait_registry(CBMArena *arena, bool add_ambiguous_type) {
     CBMLSPDef defs[5];
     memset(defs, 0, sizeof(defs));
@@ -6816,6 +6994,10 @@ void suite_rust_lsp(void) {
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
+    /* #2605: a cross-file struct field types the receiver (both paths) */
+    RUN_TEST(rustlsp_crossfile_field_receiver_resolves_inherent_method);
+    RUN_TEST(rustlsp_shared_registry_types_cross_file_field);
+    RUN_TEST(rustlsp_field_receiver_without_field_defs_stays_untyped);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
     RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);
