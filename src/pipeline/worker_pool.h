@@ -36,4 +36,11 @@ typedef struct {
  * If count <= 1 or workers <= 1, runs single-threaded. */
 void cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for_opts_t opts);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Observe the completed spawn attempt before the caller takes work. Install
+ * only while no dispatch is running; clear after the observed dispatch joins. */
+typedef void (*cbm_parallel_spawn_observer_fn)(int count, int helpers, void *ctx);
+void cbm_parallel_test_set_spawn_observer(cbm_parallel_spawn_observer_fn observer, void *ctx);
+#endif
+
 #endif /* CBM_WORKER_POOL_H */

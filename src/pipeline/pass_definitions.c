@@ -518,10 +518,15 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
      * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
-     * through the same predicate, so the three registries cannot diverge. */
+     * through the same predicate, so the three registries cannot diverge.
+     * A generated member is registered by qualified name only, at all three. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
-                                        lang, module_prefix_len);
+        if (cbm_def_props_generated(def->extra_props)) {
+            cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
+        } else {
+            cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
+                                            def->label, lang, module_prefix_len);
+        }
         if (def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
                                              def->param_default_mask, def->selector_param_count,
@@ -1014,6 +1019,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 }
                 cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
             }
+            cbm_work_arena_release();
             return CBM_NOT_FOUND;
         }
 
@@ -1147,6 +1153,16 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         total_calls += result->calls.count;
 
         if (local_cache) {
+            /* The cache lives through every later pass: hold the result as the
+             * parallel extract does (pass_parallel.c), without its tree (the
+             * cross-file LSP re-parses) and compacted. A PHP result keeps its
+             * tree: the vendor-import check reads each call and usage site's
+             * syntax from it (php_import_kind_at_site, pass_pkgmap.c), and this
+             * route keeps no source to fall back on. */
+            if (lang != CBM_LANG_PHP) {
+                cbm_free_tree(result);
+            }
+            cbm_result_compact(result);
             local_cache[i] = result;
         } else {
             /* Cache unavailable: imports for this file can still only
@@ -1160,6 +1176,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_free_result(result);
         }
     }
+    cbm_work_arena_release(); /* the working arena compaction kept between files */
 
     /* Every file's nodes exist now: link methods and diagram elements to
      * their parents (without the cache each file linked its own above). */
@@ -1223,5 +1240,6 @@ configured_failure:
         }
         cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
     }
+    cbm_work_arena_release(); /* compaction keeps it between files: release on every exit */
     return CBM_PIPELINE_ABORT_PRESERVE_DB;
 }
