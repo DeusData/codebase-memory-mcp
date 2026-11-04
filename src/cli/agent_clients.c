@@ -76,6 +76,9 @@ static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] =
     {CBM_AGENT_CLIENT_OMP, "omp", "Oh My Pi (omp)", CBM_AGENT_STABLE,
      CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "omp", agent_install_callback,
      agent_remove_callback},
+    {CBM_AGENT_CLIENT_ZCODE, "zcode", "ZCode", CBM_AGENT_STABLE,
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL, "zcode",
+     agent_install_callback, agent_remove_callback},
 };
 
 size_t cbm_agent_client_count(void) {
@@ -590,6 +593,12 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
             return written >= 0 && (size_t)written < path_out_size ? 0 : -1;
         }
         return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent/mcp.json");
+    case CBM_AGENT_CLIENT_ZCODE:
+        /* ZCode keeps user-scope MCP servers in the nested mcp.servers object
+         * of its CLI config file; the same-scope .agents/mcp.json fallback is
+         * read only when this file has no servers and is never written. */
+        return agent_join_path(path_out, path_out_size, options->home_dir,
+                               ".zcode/cli/config.json");
     case CBM_AGENT_CLIENT_PI:
         return 1;
     case CBM_AGENT_CLIENT_SOURCEGRAPH_CODY:
@@ -661,6 +670,8 @@ static int agent_client_marker_path(cbm_agent_client_id_t id,
             return written >= 0 && (size_t)written < path_out_size ? 0 : 1;
         }
         return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent");
+    case CBM_AGENT_CLIENT_ZCODE:
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".zcode");
     case CBM_AGENT_CLIENT_PI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pi/agent");
     default:
@@ -993,41 +1004,6 @@ static int agent_json_find_member(const char *data, size_t object_start, size_t 
     }
 }
 
-static int agent_json_find_entry(const char *document, size_t length, const char *section,
-                                 size_t *entry_start, size_t *entry_end) {
-    size_t bom = length >= 3U && (unsigned char)document[0] == 0xefU &&
-                         (unsigned char)document[1] == 0xbbU && (unsigned char)document[2] == 0xbfU
-                     ? 3U
-                     : 0U;
-    agent_json_scanner_t scanner = {.data = document, .length = length, .position = bom};
-    if (agent_json_skip_space(&scanner) != 0) {
-        return -1;
-    }
-    size_t root_start = scanner.position;
-    if (agent_json_scan_value(&scanner, 0U) != 0 || agent_json_skip_space(&scanner) != 0 ||
-        scanner.position != length || document[root_start] != '{') {
-        return -1;
-    }
-    size_t object_start = root_start;
-    size_t object_end = scanner.position;
-    if (section) {
-        size_t section_start = 0U;
-        size_t section_end = 0U;
-        int section_result = agent_json_find_member(document, root_start, object_end, section,
-                                                    &section_start, &section_end);
-        if (section_result != 0) {
-            return section_result;
-        }
-        if (document[section_start] != '{') {
-            return -1;
-        }
-        object_start = section_start;
-        object_end = section_end;
-    }
-    return agent_json_find_member(document, object_start, object_end, AGENT_ENTRY_KEY, entry_start,
-                                  entry_end);
-}
-
 static char *agent_json_escape(const char *value) {
     size_t length = strlen(value);
     if (length > (SIZE_MAX - 1U) / 6U) {
@@ -1080,7 +1056,7 @@ static char *agent_json_canonical(cbm_agent_client_id_t id, const char *binary_p
     }
     const char *extra = "";
     if (id == CBM_AGENT_CLIENT_GITLAB_DUO || id == CBM_AGENT_CLIENT_VISUAL_STUDIO ||
-        id == CBM_AGENT_CLIENT_OMP) {
+        id == CBM_AGENT_CLIENT_OMP || id == CBM_AGENT_CLIENT_ZCODE) {
         extra = ", \"type\": \"stdio\"";
     } else if (id == CBM_AGENT_CLIENT_ROVO_DEV) {
         extra = ", \"transport\": \"stdio\"";
@@ -1153,20 +1129,67 @@ static bool agent_json_owned(const char *document, size_t start, size_t end,
     return equal;
 }
 
-static const char *agent_json_section(cbm_agent_client_id_t id) {
+enum { AGENT_JSON_SECTION_MAX = 2U };
+
+/* Resolves the object path holding the server map and returns its depth; 0
+ * means the document root. ZCode nests its server map two levels deep under
+ * mcp.servers while every other JSON client uses one top-level section key. */
+static size_t agent_json_section_path(cbm_agent_client_id_t id,
+                                      const char *path[AGENT_JSON_SECTION_MAX]) {
     if (id == CBM_AGENT_CLIENT_AMP) {
-        return NULL;
+        return 0U;
+    }
+    if (id == CBM_AGENT_CLIENT_ZCODE) {
+        path[0] = "mcp";
+        path[1] = "servers";
+        return 2U;
     }
     if (id == CBM_AGENT_CLIENT_VISUAL_STUDIO) {
-        return "servers";
+        path[0] = "servers";
+    } else if (id == CBM_AGENT_CLIENT_SOURCEGRAPH_CODY) {
+        path[0] = "cody.mcpServers";
+    } else if (id == CBM_AGENT_CLIENT_POCHI) {
+        path[0] = "mcp";
+    } else {
+        path[0] = "mcpServers";
     }
-    if (id == CBM_AGENT_CLIENT_SOURCEGRAPH_CODY) {
-        return "cody.mcpServers";
+    return 1U;
+}
+
+static int agent_json_find_entry(const char *document, size_t length,
+                                 const char *const *section_path, size_t section_depth,
+                                 size_t *entry_start, size_t *entry_end) {
+    size_t bom = length >= 3U && (unsigned char)document[0] == 0xefU &&
+                         (unsigned char)document[1] == 0xbbU && (unsigned char)document[2] == 0xbfU
+                     ? 3U
+                     : 0U;
+    agent_json_scanner_t scanner = {.data = document, .length = length, .position = bom};
+    if (agent_json_skip_space(&scanner) != 0) {
+        return -1;
     }
-    if (id == CBM_AGENT_CLIENT_POCHI) {
-        return "mcp";
+    size_t root_start = scanner.position;
+    if (agent_json_scan_value(&scanner, 0U) != 0 || agent_json_skip_space(&scanner) != 0 ||
+        scanner.position != length || document[root_start] != '{') {
+        return -1;
     }
-    return "mcpServers";
+    size_t object_start = root_start;
+    size_t object_end = scanner.position;
+    for (size_t depth = 0U; depth < section_depth; depth++) {
+        size_t section_start = 0U;
+        size_t section_end = 0U;
+        int section_result = agent_json_find_member(
+            document, object_start, object_end, section_path[depth], &section_start, &section_end);
+        if (section_result != 0) {
+            return section_result;
+        }
+        if (document[section_start] != '{') {
+            return -1;
+        }
+        object_start = section_start;
+        object_end = section_end;
+    }
+    return agent_json_find_member(document, object_start, object_end, AGENT_ENTRY_KEY, entry_start,
+                                  entry_end);
 }
 
 static int agent_json_edit(cbm_agent_client_id_t id, const char *config_path,
@@ -1175,6 +1198,8 @@ static int agent_json_edit(cbm_agent_client_id_t id, const char *config_path,
     if (!canonical) {
         return CBM_AGENT_EDIT_ERROR;
     }
+    const char *section_path[AGENT_JSON_SECTION_MAX];
+    size_t section_depth = agent_json_section_path(id, section_path);
     char *document = NULL;
     size_t length = 0U;
     int read_result = cbm_json_like_read_document(config_path, &document, &length);
@@ -1186,7 +1211,7 @@ static int agent_json_edit(cbm_agent_client_id_t id, const char *config_path,
     size_t entry_end = 0U;
     int find_result = read_result == 1
                           ? 1
-                          : agent_json_find_entry(document, length, agent_json_section(id),
+                          : agent_json_find_entry(document, length, section_path, section_depth,
                                                   &entry_start, &entry_end);
     if (find_result < 0) {
         free(document);
@@ -1203,13 +1228,11 @@ static int agent_json_edit(cbm_agent_client_id_t id, const char *config_path,
         free(canonical);
         return CBM_AGENT_EDIT_OK;
     }
-    const char *section = agent_json_section(id);
-    const char *path[1] = {section};
     int edit_result =
         remove
-            ? cbm_json_like_remove_entry_if_unchanged(config_path, path, section ? 1U : 0U,
+            ? cbm_json_like_remove_entry_if_unchanged(config_path, section_path, section_depth,
                                                       AGENT_ENTRY_KEY, document, length)
-            : cbm_json_like_upsert_entry_if_unchanged(config_path, path, section ? 1U : 0U,
+            : cbm_json_like_upsert_entry_if_unchanged(config_path, section_path, section_depth,
                                                       AGENT_ENTRY_KEY, canonical,
                                                       read_result == 1 ? NULL : document, length);
     free(document);
@@ -1462,6 +1485,7 @@ static bool agent_json_client(cbm_agent_client_id_t id) {
     case CBM_AGENT_CLIENT_AMAZON_Q:
     case CBM_AGENT_CLIENT_CODEBUDDY:
     case CBM_AGENT_CLIENT_OMP:
+    case CBM_AGENT_CLIENT_ZCODE:
     case CBM_AGENT_CLIENT_IBM_BOB_IDE:
     case CBM_AGENT_CLIENT_IBM_BOB_SHELL:
     case CBM_AGENT_CLIENT_POCHI:
