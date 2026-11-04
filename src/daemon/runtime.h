@@ -347,6 +347,12 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
  * an unbounded idle hang. The host lifetime loop calls this every tick; it is a
  * no-op unless a last-committed-client linger is armed. */
 void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
+/* #2178 heartbeat over the listener's runtime artifacts, plus the participant
+ * guard the service owns when it started itself; see
+ * cbm_daemon_ipc_listener_touch for the 1/0/-1 result. Call only from the
+ * thread that stops and frees the service, which is the only thread that
+ * closes the listener. */
+int cbm_daemon_runtime_service_touch_listener(cbm_daemon_runtime_service_t *service);
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key);
 uint64_t cbm_daemon_runtime_service_client_process_id(cbm_daemon_runtime_service_t *service,
@@ -417,11 +423,12 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
 
 /* Execute using the sole outstanding token returned by token_reserve(). This
  * is the cancellable frontend path; the legacy helper above reserves
- * internally. */
+ * internally. request_sent_out reports whether the application frame crossed
+ * the local transport, including failures while awaiting its response. */
 cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_request_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const void *request, uint32_t request_length, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms);
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms);
 
 /* Begin a two-phase close without freeing the client. This atomically rejects
  * future exchanges and interrupts an exchange already in flight. Exactly one

@@ -42,6 +42,10 @@ typedef struct {
      * of a per-file table leave both 0. */
     int group_head;
     int shard_next;
+    /* Method-lookup visit marks: the stamp of the last walk that searched
+     * this class on the instance / singleton side (ruby_walk_seen). */
+    unsigned int seen_instance;
+    unsigned int seen_singleton;
 } RubyClassInfo;
 
 struct CBMRubyCrossRegistry;
@@ -144,6 +148,18 @@ typedef struct {
     /* Recursion guards. */
     int eval_depth;
     int walk_depth;
+
+    /* Stamp of the current method-lookup walk; each walk takes a fresh one
+     * so marks left by earlier walks never match. */
+    unsigned int lookup_stamp;
+
+    /* Visit marks for entries of the shared (read-only) class table. The table
+     * is read by every resolve worker at once, so a walk never marks it; its
+     * marks live here, in an open-addressing hash keyed by the shared index and
+     * sized by what this file touches. */
+    struct RubySharedMark *shared_marks;
+    int shared_mark_cap;
+    int shared_mark_count;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;

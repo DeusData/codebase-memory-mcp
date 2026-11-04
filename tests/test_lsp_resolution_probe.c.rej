@@ -1,0 +1,9 @@
+diff a/tests/test_lsp_resolution_probe.c b/tests/test_lsp_resolution_probe.c	(rejected hunks)
+@@ -1967,4 +2017,7 @@ SUITE(lsp_resolution_probe) {
+     RUN_TEST(lrp_ts_usage_import_type_with_decoy);
+     RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
+     RUN_TEST(lrp_python_usage_instantiation);
++
++    /* ── Ruby (project registry built once) ── */
++    RUN_TEST(lrp_ruby_cross_file_zeitwerk);
+ }

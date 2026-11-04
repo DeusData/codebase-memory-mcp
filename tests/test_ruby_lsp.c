@@ -46,6 +46,9 @@
 #include "cbm.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ruby_lsp.h"
+#include "lsp/lsp_work.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Helpers (mirror test_perl_lsp.c) ──────────────────────────── */
@@ -1323,6 +1326,210 @@ TEST(rubylsp_self_rebinding_blocks_no_edge) {
     PASS();
 }
 
+/* ── 17. Bounded resolver work ────────────────────────────────────
+ *
+ * Measured with counters, never with a clock (O9): CBM_LSP_WORK
+ * (lsp_work.h, seam builds) for lookup work, and the result arena's
+ * cumulative allocation for bytes built. Each fixture is measured at n and
+ * 2n: linear work doubles (ratio about 2); anything worse lands above the
+ * gate of 3. */
+
+static uint64_t rubylsp_counted_work(const char *src, size_t *arena_bytes) {
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_ruby(src);
+    uint64_t work = cbm_lsp_work_take();
+    if (arena_bytes)
+        *arena_bytes = r ? cbm_arena_total(&r->arena) : 0;
+    if (r)
+        cbm_free_result(r);
+    return work;
+}
+
+/* n modules where every module both prepends and includes the next one;
+ * the last defines one method. `Probe` reaches M0 through `include`
+ * (instance side) or `extend` (class side) and calls a method nobody
+ * defines, so the lookup must miss after searching every ancestor. */
+static char *rubylsp_mixin_chain_src(int n, bool class_side) {
+    size_t cap = (size_t)n * 96 + 256;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n)
+            off += (size_t)snprintf(src + off, cap - off,
+                                    "module M%d\n  prepend M%d\n  include M%d\nend\n", i, i + 1,
+                                    i + 1);
+        else
+            off += (size_t)snprintf(src + off, cap - off,
+                                    "module M%d\n  def leaf\n    1\n  end\nend\n", i);
+    }
+    if (class_side)
+        (void)snprintf(src + off, cap - off,
+                       "class Probe\n  extend M0\n  def self.run\n    nobody_defines_this()\n"
+                       "  end\nend\n");
+    else
+        (void)snprintf(src + off, cap - off,
+                       "class Probe\n  include M0\n  def run\n    nobody_defines_this()\n"
+                       "  end\nend\n");
+    return src;
+}
+
+static uint64_t rubylsp_mixin_chain_work(int n, bool class_side) {
+    char *src = rubylsp_mixin_chain_src(n, class_side);
+    if (!src)
+        return 0;
+    uint64_t work = rubylsp_counted_work(src, NULL);
+    free(src);
+    return work;
+}
+
+/* Review ask (a): Ruby linearizes ancestors, so a module reached through
+ * two paths (`prepend M; include M`, a diamond) is searched once. Without a
+ * visited set every level of the chain doubles the paths: 2^n visits
+ * (measured 4 -> 20,744 for n = 2..14). With it a miss costs one visit per
+ * module. Positive controls: the doubled pair still resolves through the
+ * prepend, and a diamond resolves to the shared module exactly once. */
+TEST(rubylsp_mixin_walk_visits_each_module_once) {
+    uint64_t inst_n = rubylsp_mixin_chain_work(6, false);
+    uint64_t inst_2n = rubylsp_mixin_chain_work(12, false);
+    uint64_t cls_n = rubylsp_mixin_chain_work(6, true);
+    uint64_t cls_2n = rubylsp_mixin_chain_work(12, true);
+    printf("  mixin chain work: instance n=6 %llu, n=12 %llu; class side n=6 %llu, n=12 %llu\n",
+           (unsigned long long)inst_n, (unsigned long long)inst_2n, (unsigned long long)cls_n,
+           (unsigned long long)cls_2n);
+    ASSERT(inst_n > 0 && cls_n > 0);
+    ASSERT(inst_2n <= 3 * inst_n);
+    ASSERT(cls_2n <= 3 * cls_n);
+
+    const char *src = "module Shared\n"
+                      "  def hello\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "module Left\n"
+                      "  include Shared\n"
+                      "end\n"
+                      "module Right\n"
+                      "  include Shared\n"
+                      "end\n"
+                      "module Twice\n"
+                      "  def twice\n"
+                      "    2\n"
+                      "  end\n"
+                      "end\n"
+                      "class Diamond\n"
+                      "  include Left\n"
+                      "  include Right\n"
+                      "  prepend Twice\n"
+                      "  include Twice\n"
+                      "  def run\n"
+                      "    hello()\n"
+                      "    twice()\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(count_resolved_exact(r, "test.main.Diamond.run", "test.main.Shared.hello") == 1);
+    ASSERT(count_resolved_exact(r, "test.main.Diamond.run", "test.main.Twice.twice") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `class Probe; def run; S0::S1::...::S<n-1>.new; end; end` */
+static char *rubylsp_deep_const_src(int n) {
+    size_t cap = (size_t)n * 12 + 128;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t off = (size_t)snprintf(src, cap, "class Probe\n  def run\n    ");
+    for (int i = 0; i < n; i++)
+        off += (size_t)snprintf(src + off, cap - off, i ? "::S%d" : "S%d", i);
+    (void)snprintf(src + off, cap - off, ".new\n  end\nend\n");
+    return src;
+}
+
+static size_t rubylsp_deep_const_bytes(int n) {
+    char *src = rubylsp_deep_const_src(n);
+    if (!src)
+        return 0;
+    size_t bytes = 0;
+    (void)rubylsp_counted_work(src, &bytes);
+    free(src);
+    return bytes;
+}
+
+/* Review ask (b): a constant path is built in one pass. Recursing once per
+ * `::` and re-formatting the growing prefix at every level costs one stack
+ * frame per segment and quadratic bytes; the loop has no recursion and
+ * writes the path once. The positive control pins the exact class QN for a
+ * deep path and for a leading `::`. */
+TEST(rubylsp_const_path_is_linear) {
+    size_t b_n = rubylsp_deep_const_bytes(800);
+    size_t b_2n = rubylsp_deep_const_bytes(1600);
+    printf("  const path arena bytes: n=800 %zu, n=1600 %zu\n", b_n, b_2n);
+    ASSERT(b_n > 0);
+    ASSERT(b_2n <= 3 * b_n);
+
+    const char *src = "module L0\n"
+                      "  module L1\n"
+                      "    module L2\n"
+                      "      module L3\n"
+                      "        module L4\n"
+                      "          class Leaf\n"
+                      "          end\n"
+                      "        end\n"
+                      "      end\n"
+                      "    end\n"
+                      "  end\n"
+                      "end\n"
+                      "class Top\n"
+                      "  class Inner\n"
+                      "  end\n"
+                      "end\n"
+                      "class Caller\n"
+                      "  def deep\n"
+                      "    L0::L1::L2::L3::L4::Leaf.new\n"
+                      "  end\n"
+                      "  def rooted\n"
+                      "    ::Top::Inner.new\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(require_resolved_exact(r, "test.main.Caller.deep", "test.main.L0.L1.L2.L3.L4.Leaf") >=
+           0);
+    ASSERT(require_resolved_exact(r, "test.main.Caller.rooted", "test.main.Top.Inner") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Review ask (c): the stdlib seed must survive allocation failure. A
+ * zero-initialised arena has no blocks and no grow size, so every
+ * allocation from it returns NULL. The seed must not write through a NULL
+ * return-type vector, and must not register an entry whose formatted name
+ * came back NULL (a NULL QN would reach strcmp in finalize and in every later
+ * lookup). */
+TEST(rubylsp_stdlib_seed_survives_alloc_failure) {
+    CBMArena reg_arena;
+    cbm_arena_init(&reg_arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &reg_arena);
+    CBMArena dead;
+    memset(&dead, 0, sizeof(dead));
+    cbm_ruby_stdlib_register(&reg, &dead);
+    ASSERT(reg.type_count > 0);
+    ASSERT(reg.func_count > 0); /* Kernel built-ins carry literal names */
+    for (int i = 0; i < reg.func_count; i++) {
+        ASSERT(reg.funcs[i].qualified_name != NULL);
+        ASSERT(reg.funcs[i].short_name != NULL);
+    }
+    cbm_registry_finalize(&reg);
+    ASSERT(cbm_registry_lookup_func(&reg, "puts") != NULL);
+    cbm_arena_destroy(&reg_arena);
+    PASS();
+}
+
 /* ── 17. Cross-file: defs from another file resolve ─────────────── */
 
 TEST(rubylsp_cross_file_defs) {
@@ -1674,6 +1881,9 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_send_no_edge);
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
     RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
+    RUN_TEST(rubylsp_mixin_walk_visits_each_module_once);
+    RUN_TEST(rubylsp_const_path_is_linear);
+    RUN_TEST(rubylsp_stdlib_seed_survives_alloc_failure);
     RUN_TEST(rubylsp_cross_file_defs);
     RUN_TEST(rubylsp_cross_file_ar_repro);
     RUN_TEST(rubylsp_cross_reopened_class_across_files);

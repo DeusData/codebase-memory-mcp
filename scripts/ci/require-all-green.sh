@@ -66,12 +66,13 @@ if 'LANES' in os.environ:
     single = {
         'lint / lint': 'lint', 'lint / lint-mem': 'lint-mem',
         'security / security-static': 'security-static',
-        'security / license-gate': 'license-gate', 'security / codeql-gate': 'codeql-gate',
+        'security / license-gate': 'license-gate',
         'test / test-diag': 'diag', 'test / test-msan': 'msan',
         'test / test-lsan-macos': 'lsan-macos', 'test / test-windows-guards': 'windows-guards',
         'test / shard-completeness': 'shard-completeness', 'contracts': 'contracts',
     }
-    matrix = ('test / test-unix (', 'test / test-windows (', 'test / test-tsan (', 'pr-smoke (')
+    matrix = ('test / test-unix (', 'test / test-windows (', 'test / test-tsan (', 'pr-smoke (',
+              'codeql / analyze (')
     def lane_of(name):
         if name in single:
             return single[name]

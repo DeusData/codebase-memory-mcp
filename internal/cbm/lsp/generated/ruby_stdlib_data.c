@@ -40,55 +40,59 @@
         cbm_registry_add_type(reg, rt); \
     } while (0)
 
-/* Register an instance method on receiver type `recv_` returning `ret_`. */
-#define REG_METHOD(recv_, name_, ret_)                                                          \
-    do {                                                                                        \
-        memset(&rf, 0, sizeof(rf));                                                             \
-        rf.min_params = -1;                                                                     \
-        rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", (recv_), (name_));                \
-        rf.short_name = (name_);                                                                \
-        rf.receiver_type = (recv_);                                                             \
-        {                                                                                       \
-            const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(*rets)); \
-            rets[0] = (ret_);                                                                   \
-            rets[1] = NULL;                                                                     \
-            rf.signature = cbm_type_func(arena, NULL, NULL, rets);                              \
-        }                                                                                       \
-        cbm_registry_add_func(reg, rf);                                                         \
+/* Signature `() -> ret`. Every seed allocation can fail (arena exhausted):
+ * a NULL return vector is left out, so the signature types as unknown (the
+ * same fallback ruby_register_method uses) instead of being written through. */
+static const CBMType *ruby_seed_signature(CBMArena *arena, const CBMType *ret) {
+    const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(*rets));
+    if (rets) {
+        rets[0] = ret;
+        rets[1] = NULL;
+    }
+    return cbm_type_func(arena, NULL, NULL, rets);
+}
+
+/* Register an instance method on receiver type `recv_` returning `ret_`.
+ * An entry whose formatted QN came back NULL is not registered: a NULL QN
+ * would reach strcmp in finalize and in every later lookup. */
+#define REG_METHOD(recv_, name_, ret_)                                           \
+    do {                                                                         \
+        memset(&rf, 0, sizeof(rf));                                              \
+        rf.min_params = -1;                                                      \
+        rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", (recv_), (name_)); \
+        if (!rf.qualified_name)                                                  \
+            break;                                                               \
+        rf.short_name = (name_);                                                 \
+        rf.receiver_type = (recv_);                                              \
+        rf.signature = ruby_seed_signature(arena, (ret_));                       \
+        cbm_registry_add_func(reg, rf);                                          \
     } while (0)
 
 /* Register a singleton (class-side) method: receiver key "<qn>.self"
- * matches ruby_lookup_singleton_method's keying convention. */
-#define REG_SMETHOD(recv_, name_, ret_)                                                         \
-    do {                                                                                        \
-        memset(&rf, 0, sizeof(rf));                                                             \
-        rf.min_params = -1;                                                                     \
-        rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", (recv_), (name_));                \
-        rf.short_name = (name_);                                                                \
-        rf.receiver_type = cbm_arena_sprintf(arena, "%s.self", (recv_));                        \
-        {                                                                                       \
-            const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(*rets)); \
-            rets[0] = (ret_);                                                                   \
-            rets[1] = NULL;                                                                     \
-            rf.signature = cbm_type_func(arena, NULL, NULL, rets);                              \
-        }                                                                                       \
-        cbm_registry_add_func(reg, rf);                                                         \
+ * matches ruby_lookup_singleton_method's keying convention. Skipped when
+ * either formatted name came back NULL (see REG_METHOD). */
+#define REG_SMETHOD(recv_, name_, ret_)                                          \
+    do {                                                                         \
+        memset(&rf, 0, sizeof(rf));                                              \
+        rf.min_params = -1;                                                      \
+        rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", (recv_), (name_)); \
+        rf.receiver_type = cbm_arena_sprintf(arena, "%s.self", (recv_));         \
+        if (!rf.qualified_name || !rf.receiver_type)                             \
+            break;                                                               \
+        rf.short_name = (name_);                                                 \
+        rf.signature = ruby_seed_signature(arena, (ret_));                       \
+        cbm_registry_add_func(reg, rf);                                          \
     } while (0)
 
 /* Register a global (Kernel) built-in function returning `ret_`. */
-#define REG_BUILTIN(name_, ret_)                                                                \
-    do {                                                                                        \
-        memset(&rf, 0, sizeof(rf));                                                             \
-        rf.min_params = -1;                                                                     \
-        rf.qualified_name = (name_);                                                            \
-        rf.short_name = (name_);                                                                \
-        {                                                                                       \
-            const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(*rets)); \
-            rets[0] = (ret_);                                                                   \
-            rets[1] = NULL;                                                                     \
-            rf.signature = cbm_type_func(arena, NULL, NULL, rets);                              \
-        }                                                                                       \
-        cbm_registry_add_func(reg, rf);                                                         \
+#define REG_BUILTIN(name_, ret_)                           \
+    do {                                                   \
+        memset(&rf, 0, sizeof(rf));                        \
+        rf.min_params = -1;                                \
+        rf.qualified_name = (name_);                       \
+        rf.short_name = (name_);                           \
+        rf.signature = ruby_seed_signature(arena, (ret_)); \
+        cbm_registry_add_func(reg, rf);                    \
     } while (0)
 
 void cbm_ruby_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena) {

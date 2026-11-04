@@ -295,6 +295,9 @@ bash "$ROOT/tests/test_activation_diagnostic_contract.sh"
 echo "=== Step 0e3: security gate fail-closed contract ==="
 bash "$ROOT/tests/test_security_gate_fail_closed.sh"
 
+echo "=== Step 0e4: memory-analyzer gate warning-suffix contract (#2442) ==="
+bash "$ROOT/tests/test_lint_mem_gate.sh"
+
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
@@ -315,6 +318,9 @@ bash "$ROOT/tests/test_parallel_harness_contract.sh"
 # real summary functions with fabricated suite logs, so it runs everywhere.
 echo "=== Step 0i2: suite failure-report contract ==="
 bash "$ROOT/tests/test_failure_report_contract.sh"
+
+echo "=== Step 0i3: benchmark harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_benchmark_runtime_isolation_contract.sh"
 
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
@@ -364,6 +370,9 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
 
+echo "=== Step 0x2: installer Android/Termux guard contract (#1202) ==="
+bash "$ROOT/tests/test_install_android_guard.sh"
+
 # Step 0y: the Windows leg must not decide its verdict from an exit status that
 # the ssh/msys2_shell chain can mangle — a channel that turns 0 into 1 can turn
 # 1 into 0, and that direction reports a RED Windows leg as green. Runs
@@ -383,6 +392,8 @@ bash "$ROOT/tests/test_setup_scripts_contract.sh"
 # every September 2026 PR push and real failure against it.
 echo "=== Step 0z: PR lane selector contract ==="
 bash "$ROOT/tests/test_select_lanes.sh"
+echo "=== Step 0z1: CodeQL retraces affected prebuilt objects ==="
+bash "$ROOT/tests/test_codeql_retrace.sh"
 echo "=== Step 0z2: lane selector history replay ==="
 bash "$ROOT/scripts/test-impact/replay-selector.sh"
 echo "=== Step 0z3: lane-aware aggregate gates (ci-ok, shard union) ==="
@@ -493,6 +504,14 @@ echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
+
+# Step 5-alloc: the production allocator object Step 5 just built. The unit
+# suites link mimalloc's debug build without the global override, so they cannot
+# see free(NULL) before the allocator's constructor (mimalloc #1341, PR #2562)
+# or the vendored local patches; this links small fixtures against
+# prod_mimalloc.o itself.
+echo "=== Step 5-alloc: production allocator contract (mimalloc #1341 + local patches) ==="
+bash "$ROOT/tests/test_prod_allocator_contract.sh" "$ROOT/$BUILD_DIR"
 
 # Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which
 # makes it the first casualty when static TLS grows — glibc takes the TLS block
