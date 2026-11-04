@@ -786,6 +786,27 @@ static TSNode sig_swift_selector_type(const sig_ctx_t *c, TSNode parameter, TSNo
     return type;
 }
 
+static void sig_swift_alias_parameters(sig_ctx_t *c, TSNode function) {
+    TSNode first = ts_node_child(function, 0);
+    if (ts_node_is_null(first) || !sig_node_text_is(c, first, "throws")) {
+        return;
+    }
+    /* The Swift grammar can attach the parameter tuple to @Sendable before throws. */
+    TSNode modifiers = ts_node_prev_named_sibling(function);
+    if (ts_node_is_null(modifiers) || strcmp(ts_node_type(modifiers), "type_modifiers") != 0) {
+        return;
+    }
+    TSNode attribute = cbm_find_child_by_kind(modifiers, "attribute");
+    if (ts_node_is_null(attribute) || ts_node_child_count(attribute) < 4 ||
+        !sig_node_text_is(c, ts_node_named_child(attribute, 0), "Sendable") ||
+        !sig_node_text_is(c, ts_node_child(attribute, 2), "(")) {
+        return;
+    }
+    for (uint32_t i = 2; i < ts_node_child_count(attribute); i++) {
+        sig_type_tokens(c, ts_node_child(attribute, i));
+    }
+}
+
 static void sig_swift_param_type(sig_ctx_t *c, TSNode p, TSNode internal) {
     size_t before = c->len;
     uint32_t count = ts_node_child_count(p);
@@ -813,7 +834,11 @@ static void sig_swift_param_type(sig_ctx_t *c, TSNode p, TSNode internal) {
                 }
             }
         } else if (ts_node_is_named(ch)) {
-            sig_type_tokens(c, sig_swift_selector_type(c, p, ch));
+            TSNode type = sig_swift_selector_type(c, p, ch);
+            if (!ts_node_eq(type, ch)) {
+                sig_swift_alias_parameters(c, type);
+            }
+            sig_type_tokens(c, type);
         } else if (sig_node_text_is(c, ch, "...")) {
             sig_raw_str(c, sig_variadic_marker(c->lang));
         }
