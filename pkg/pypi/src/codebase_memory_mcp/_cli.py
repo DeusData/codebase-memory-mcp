@@ -1290,9 +1290,10 @@ def _download(version: str) -> Path:
     os_name = _os_name()
     arch = _arch()
     ext = "zip" if os_name == "windows" else "tar.gz"
-    # Linux ships a fully-static "-portable" build; the standard linux binary
-    # dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
-    # have no such variant. Keep in sync with install.sh / install.js / cli.c.
+    # Linux ships a fully-static "-portable" build; the standard linux binary is
+    # built on Ubuntu 22.04, dynamically links glibc 2.35+ and fails on older
+    # distros. macOS/Windows have no such variant. Keep in sync with install.sh /
+    # install.js / cli.c.
     portable = "-portable" if os_name == "linux" else ""
     archive = f"codebase-memory-mcp-{os_name}-{arch}{portable}.{ext}"
     base, loopback = _download_base(version)

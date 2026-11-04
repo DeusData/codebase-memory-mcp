@@ -41,12 +41,15 @@ jobs:
           # Broad legs are REQUIRED gates (no optional / continue-on-error):
           # every smoke leg must pass. No `optional` flags anywhere.
           #
-          # NOTE: the *dynamic* linux binary links glibc 2.38+ and cannot run on
-          # older distros by design — older-glibc coverage is the -portable (static)
-          # binary's job, exercised green by the smoke-linux-portable broad legs
-          # (ubuntu-22.04 / 22.04-arm). So the dynamic broad legs stay on
-          # forward-compatible OSes only (macOS); running the dynamic binary on
-          # ubuntu-22.04 would fail Phase 1 (glibc too old), not a real regression.
+          # NOTE: the *dynamic* linux binary is built in a pinned Ubuntu 22.04
+          # container (_build.yml build-linux) and links glibc 2.35+; the
+          # composition gate (A6) asserts that floor on the built bytes and
+          # each core Linux leg runs the binary in a plain container of that
+          # image (smoke-unix "Runtime start on the glibc floor"), so no
+          # broad leg re-runs it on a 22.04 runner. Older-glibc coverage stays
+          # the -portable (static) binary's job, exercised green by the
+          # smoke-linux-portable broad legs (ubuntu-22.04 / 22.04-arm) and the
+          # glibc 2.31 check below.
           # Empty since the move off macos-14 (retired 2026-11-02): the darwin-arm64
           # artifact is now built AND smoked on macos-15, the core leg, which was
           # this broad leg.
@@ -127,6 +130,18 @@ jobs:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
           SMOKE_REQUIRE_UI: "1"
           SMOKE_REQUIRE_WRAPPERS: "1"
+
+      # The standard (dynamic) Linux binary must START and INDEX on the oldest
+      # userland it claims (#2486): a plain container of the SAME pinned
+      # ubuntu:22.04 image _build.yml build-linux builds in, nothing installed.
+      # A6 asserts the floor on the bytes; this runs them, on both arches (each
+      # Linux leg checks its own artifact). The venue-parity contract holds
+      # this digest equal to build-linux's.
+      - name: Runtime start on the glibc floor (plain ubuntu:22.04)
+        if: matrix.goos == 'linux'
+        env:
+          CBM_FLOOR_IMAGE: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+        run: scripts/ci/check-glibc-floor-runtime.sh --image "$CBM_FLOOR_IMAGE" "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
       - name: Security audits
         run: |
@@ -329,8 +344,8 @@ jobs:
 
       # The -portable binary is what all linux install/update paths now deliver;
       # it MUST start on old glibc (Debian 11 / RHEL 8 / Ubuntu 20.04). Runs it
-      # in debian:bullseye (glibc 2.31) — the standard dynamic binary would fail
-      # here with `GLIBC_2.38 not found`.
+      # in debian:bullseye (glibc 2.31) — the standard dynamic binary (glibc
+      # 2.35 floor) would not start here.
       - name: Old-glibc compatibility
         run: scripts/ci/check-glibc-compat.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
