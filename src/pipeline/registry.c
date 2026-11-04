@@ -2790,8 +2790,8 @@ static const char *swift_choose_candidate(const cbm_registry_t *r, const char **
     return chosen;
 }
 
-static int swift_owner_candidates(const cbm_registry_t *r, const CBMCall *call, const char *type_qn,
-                                  const char *name, const char **out, int out_cap) {
+static int swift_owner_bucket(const cbm_registry_t *r, const CBMCall *call, const char *type_qn,
+                              const char *name, const char **out, int out_cap, int found) {
     char base[CBM_SZ_4K];
     int n = snprintf(base, sizeof(base), "%s.%s", type_qn, name);
     if (n < 0 || (size_t)n >= sizeof(base)) {
@@ -2799,9 +2799,8 @@ static int swift_owner_candidates(const cbm_registry_t *r, const CBMCall *call, 
     }
     const qn_array_t *bucket = r->swift_overloads ? cbm_ht_get(r->swift_overloads, base) : NULL;
     if (!bucket) {
-        return 0;
+        return found;
     }
-    int found = 0;
     for (int i = 0; i < bucket->count; i++) {
         swift_signature_t *meta = cbm_ht_get(r->swift_signatures, bucket->items[i]);
         if (meta && swift_signature_matches(meta, call)) {
@@ -2811,6 +2810,51 @@ static int swift_owner_candidates(const cbm_registry_t *r, const CBMCall *call, 
             out[found++] = bucket->items[i];
         }
     }
+    return found;
+}
+
+static yyjson_doc *swift_type_properties(const cbm_gbuf_t *graph, const char *qn) {
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(graph, qn);
+    if (!node || !node->properties_json) {
+        return NULL;
+    }
+    return yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+}
+
+static int swift_owner_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMCall *call, const char *name, const char **out,
+                                  int out_cap, const char **owner) {
+    const char *type_qn = *owner;
+    int found = swift_owner_bucket(r, call, type_qn, name, out, out_cap, 0);
+    const qn_array_t *types = cbm_ht_get(r->by_name, simple_name(type_qn));
+    if (found < 0 || !graph || !types || types->count < PAIR_LEN) {
+        return found;
+    }
+    yyjson_doc *doc = swift_type_properties(graph, type_qn);
+    yyjson_val *props = yyjson_doc_get_root(doc);
+    const char *extension = yyjson_get_str(yyjson_obj_get(props, "swift_extension"));
+    const char *path =
+        extension ? extension : yyjson_get_str(yyjson_obj_get(props, "swift_type_path"));
+    /* A file QN identifies the node, while the nominal path identifies its extension target. */
+    for (int i = 0; path && i < types->count && found >= 0; i++) {
+        const char *qn = types->items[i];
+        if (strcmp(qn, type_qn) == 0) {
+            continue;
+        }
+        yyjson_doc *other_doc = swift_type_properties(graph, qn);
+        yyjson_val *other_props = yyjson_doc_get_root(other_doc);
+        const char *target = yyjson_get_str(yyjson_obj_get(other_props, "swift_extension"));
+        const char *declaration = yyjson_get_str(yyjson_obj_get(other_props, "swift_type_path"));
+        if (target && strcmp(path, target) == 0) {
+            found = swift_owner_bucket(r, call, qn, name, out, out_cap, found);
+        } else if (extension && *owner == type_qn && declaration &&
+                   strcmp(path, declaration) == 0) {
+            *owner = qn;
+            found = swift_owner_bucket(r, call, qn, name, out, out_cap, found);
+        }
+        yyjson_doc_free(other_doc);
+    }
+    yyjson_doc_free(doc);
     return found;
 }
 
@@ -2827,11 +2871,7 @@ static bool swift_type_seen(const char **types, int count, const char *qn) {
 
 static void swift_parent_types(const cbm_registry_t *r, const cbm_gbuf_t *graph, const char *owner,
                                const char **types, int *count) {
-    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(graph, owner);
-    if (!node || !node->properties_json) {
-        return;
-    }
-    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    yyjson_doc *doc = swift_type_properties(graph, owner);
     if (!doc) {
         return;
     }
@@ -2862,14 +2902,15 @@ static int swift_typed_candidates(const cbm_registry_t *r, const cbm_gbuf_t *gra
     int count = SKIP_ONE;
     /* shortcut: visit at most 64 hierarchy types, expand for larger valid hierarchies. */
     for (int i = 0; i < count; i++) {
-        int found = swift_owner_candidates(r, call, types[i], name, out, out_cap);
+        const char *owner = types[i];
+        int found = swift_owner_candidates(r, graph, call, name, out, out_cap, &owner);
         if (found != 0) {
             return found;
         }
         if (!graph || strcmp(name, "init") == 0 || strcmp(name, "deinit") == 0) {
             break;
         }
-        swift_parent_types(r, graph, types[i], types, &count);
+        swift_parent_types(r, graph, owner, types, &count);
     }
     return SWIFT_INCOMPATIBLE;
 }

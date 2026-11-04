@@ -14355,6 +14355,75 @@ TEST(pipeline_swift_extension_constraints_identity_issue2061) {
         "func invoke() { self.service.pick(1) }\n}\n");
 }
 
+TEST(pipeline_swift_cross_file_extension_issue2061) {
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[] = "/tmp/cbm_swift_extension_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "Service.swift",
+                        "struct Service { func run(value: String) {} }\n"
+                        "struct Other { func run(value: Int) {} }\n");
+        write_temp_file(tmp, "ZExtensions.swift",
+                        "extension Service {\n"
+                        "    init(seed: Int) {}\n"
+                        "    func run(value: Int) {}\n"
+                        "}\n");
+        const char *caller = "func invoke(service: Service) {\n"
+                             "    service.run(value: 1)\n"
+                             "    _ = Service.init(seed: 1)\n"
+                             "}\n";
+        write_temp_file(tmp, "Caller.swift", caller);
+        for (int i = 0; mode && i < 50; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "Filler%d.swift", i);
+            write_temp_file(tmp, path, "// filler\n");
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], path[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        snprintf(path, sizeof(path), "%s/Caller.swift", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[256];
+                snprintf(changed, sizeof(changed), "%s// changed\n", caller);
+                write_temp_file(tmp, "Caller.swift", changed);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            const char *project = cbm_pipeline_project_name(p);
+            const char *suffixes[] = {
+                "Caller.invoke(service:Service)", "ZExtensions.Service.run(value:Int)",
+                "ZExtensions.Service.init(seed:Int)", "Service.Other.run(value:Int)",
+                "Service.Service.run(value:String)"};
+            cbm_node_t nodes[5] = {0};
+            for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+                char qn[512];
+                snprintf(qn, sizeof(qn), "%s.%s", project, suffixes[i]);
+                ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &nodes[i]), CBM_STORE_OK);
+            }
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[0].id, nodes[1].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[0].id, nodes[2].id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[0].id, nodes[3].id), 0);
+            ASSERT_EQ(pipeline_has_calls_edge(s, nodes[0].id, nodes[4].id), 1);
+            for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+                cbm_node_free_fields(&nodes[i]);
+            }
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
 TEST(pipeline_swift_capped_selector_survives_incremental_issue2061) {
     char type[2049], service[4608], caller[2304];
     memset(type, 'T', sizeof(type) - 1);
@@ -29553,6 +29622,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_static_instance_identity_issue2061);
     RUN_TEST(pipeline_swift_extension_constraints_identity_issue2061);
     RUN_TEST(pipeline_swift_capped_selector_survives_incremental_issue2061);
+    RUN_TEST(pipeline_swift_cross_file_extension_issue2061);
     RUN_TEST(pipeline_swift_qualified_and_return_identity_issue2061);
     RUN_TEST(pipeline_swift_return_identity_issue2061);
     RUN_TEST(pipeline_swift_receiver_and_chained_closures_issue2061);

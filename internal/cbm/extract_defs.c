@@ -8323,6 +8323,22 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (ctx->language == CBM_LANG_CSHARP && !ctx->enclosing_class_qn) {
         def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
     }
+    if (ctx->language == CBM_LANG_SWIFT && ctx->module_qn) {
+        TSNode kind_node = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
+        size_t module_len = strlen(ctx->module_qn);
+        if (strncmp(class_qn, ctx->module_qn, module_len) == 0 && class_qn[module_len] == '.') {
+            const char **props = cbm_arena_alloc(a, (PAIR_LEN + SKIP_ONE) * sizeof(*props));
+            if (props) {
+                props[0] =
+                    !ts_node_is_null(kind_node) && strcmp(ts_node_type(kind_node), "extension") == 0
+                        ? "swift_extension"
+                        : "swift_type_path";
+                props[1] = class_qn + module_len + 1;
+                props[2] = NULL;
+                def.extra_props = props;
+            }
+        }
+    }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
