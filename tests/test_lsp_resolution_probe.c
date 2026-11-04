@@ -1414,6 +1414,164 @@ TEST(lrp_ts_barrel_star_and_renamed_same_module) {
     PASS();
 }
 
+/* An aliased named import binds the member, never its local alias. The barrel
+ * star-exports two modules: `helpers` defines helper, `format` defines a
+ * function named like the alias. `import { helper as format }` must bind the
+ * call to helpers.helper; searching the barrel for the alias would reach
+ * format.format instead. */
+TEST(lrp_ts_barrel_alias_binds_member_not_alias) {
+    static const LRP_File f[] = {
+        {"src/lib/helpers.ts", "export function helper(): number { return 1; }\n"},
+        {"src/lib/format.ts", "export function format(): number { return 2; }\n"},
+        {"src/lib/index.ts", "export * from './helpers';\n"
+                             "export * from './format';\n"},
+        {"src/app.ts", "import { helper as format } from './lib';\n"
+                       "export function run(): number {\n"
+                       "  return format();\n"
+                       "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+    int member =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "helpers.helper");
+    int alias = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "format.format");
+    printf("  [ts/barrel-alias] member=%d alias=%d\n", member, alias);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(member, 1);
+    ASSERT_EQ(alias, 0);
+    PASS();
+}
+
+/* A chain of 12 `export *` hops, longer than the old depth cap of 8. The walk
+ * is bounded only by its (file, name) visited set, so the call still binds to
+ * the defining file. A decoy defines the same name, so a name guess cannot
+ * pass this test. */
+TEST(lrp_ts_barrel_long_star_chain_binds_definition) {
+    enum { HOPS = 12 };
+    LRP_File f[HOPS + 3];
+    char names[HOPS + 3][64];
+    char bodies[HOPS + 3][128];
+    int n = 0;
+    snprintf(names[n], sizeof(names[n]), "src/chain/b0.ts");
+    snprintf(bodies[n], sizeof(bodies[n]), "export function deepFn(): number { return 0; }\n");
+    f[n].name = names[n];
+    f[n].content = bodies[n];
+    n++;
+    for (int i = 1; i <= HOPS; i++) {
+        snprintf(names[n], sizeof(names[n]), "src/chain/b%d.ts", i);
+        snprintf(bodies[n], sizeof(bodies[n]), "export * from './b%d';\n", i - 1);
+        f[n].name = names[n];
+        f[n].content = bodies[n];
+        n++;
+    }
+    f[n].name = "src/other/decoy.ts";
+    f[n].content = "export function deepFn(): number { return 99; }\n";
+    n++;
+    snprintf(bodies[n], sizeof(bodies[n]),
+             "import { deepFn } from './chain/b%d';\n"
+             "export function run(): number { return deepFn(); }\n",
+             HOPS);
+    f[n].name = "src/app.ts";
+    f[n].content = bodies[n];
+    n++;
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, n);
+    ASSERT_NOT_NULL(store);
+    int def = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "b0.deepFn");
+    int decoy = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "decoy.deepFn");
+    printf("  [ts/barrel-chain-12] def=%d decoy=%d\n", def, decoy);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(def, 1);
+    ASSERT_EQ(decoy, 0);
+    PASS();
+}
+
+/* `export { getX as x } from './impl'` exports x; it binds no local x in the
+ * barrel. A call to x() inside the barrel must not bind through the
+ * re-export record. */
+TEST(lrp_ts_reexport_binds_no_local_name) {
+    static const LRP_File f[] = {
+        {"src/lib/impl.ts", "export function getX(): number { return 1; }\n"},
+        {"src/lib/index.ts", "export { getX as x } from './impl';\n"
+                             "export function useLocal(): number {\n"
+                             "  return x();\n"
+                             "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+    int bound = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "useLocal", "impl.getX");
+    printf("  [ts/reexport-local] bound=%d\n", bound);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(bound, 0);
+    PASS();
+}
+
+/* The same barrel fixtures above the 50-file threshold, so the parallel
+ * resolver reads the barrel registry: the alias binds its member, the
+ * 12-hop chain reaches its definition, and a renamed re-export keeps its
+ * rename. */
+TEST(lrp_ts_barrel_parallel_resolver) {
+    enum { HOPS = 12, PAD = 60, MAXF = HOPS + PAD + 16 };
+    LRP_File f[MAXF];
+    static char names[MAXF][64];
+    static char bodies[MAXF][160];
+    int n = 0;
+#define LRP_ADD(path, ...)                                   \
+    do {                                                     \
+        snprintf(names[n], sizeof(names[n]), "%s", path);    \
+        snprintf(bodies[n], sizeof(bodies[n]), __VA_ARGS__); \
+        f[n].name = names[n];                                \
+        f[n].content = bodies[n];                            \
+        n++;                                                 \
+    } while (0)
+    LRP_ADD("src/lib/helpers.ts", "export function helper(): number { return 1; }\n");
+    LRP_ADD("src/lib/format.ts", "export function format(): number { return 2; }\n");
+    LRP_ADD("src/lib/impl.ts", "export function getState(): number { return 3; }\n");
+    LRP_ADD("src/lib/index.ts", "export * from './helpers';\nexport * from './format';\n"
+                                "export { getState as state } from './impl';\n");
+    LRP_ADD("src/chain/b0.ts", "export function deepFn(): number { return 0; }\n");
+    for (int i = 1; i <= HOPS; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "src/chain/b%d.ts", i);
+        LRP_ADD(path, "export * from './b%d';\n", i - 1);
+    }
+    LRP_ADD("src/other/decoy.ts", "export function deepFn(): number { return 99; }\n"
+                                  "export function state(): number { return 98; }\n");
+    LRP_ADD("src/app.ts",
+            "import { helper as format, state } from './lib';\n"
+            "import { deepFn } from './chain/b%d';\n"
+            "export function run(): number { return format() + state() + deepFn(); }\n",
+            HOPS);
+    for (int i = 0; i < PAD; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "src/pad/p%d.ts", i);
+        LRP_ADD(path, "export function pad%d(): number { return %d; }\n", i, i);
+    }
+#undef LRP_ADD
+    ASSERT_GT(n, 50);
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, n);
+    ASSERT_NOT_NULL(store);
+    int member =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "helpers.helper");
+    int alias = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "format.format");
+    int renamed =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.getState");
+    int chain = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "b0.deepFn");
+    int decoy = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "decoy.deepFn");
+    printf("  [ts/barrel-parallel] member=%d alias=%d renamed=%d chain=%d decoy=%d\n", member,
+           alias, renamed, chain, decoy);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(member, 1);
+    ASSERT_EQ(alias, 0);
+    ASSERT_EQ(renamed, 1);
+    ASSERT_EQ(chain, 1);
+    ASSERT_EQ(decoy, 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -2063,6 +2221,10 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s8_field_type_hint);
     RUN_TEST(lrp_ts_barrel_reexport_member_calls);
     RUN_TEST(lrp_ts_barrel_star_and_renamed_same_module);
+    RUN_TEST(lrp_ts_barrel_alias_binds_member_not_alias);
+    RUN_TEST(lrp_ts_barrel_long_star_chain_binds_definition);
+    RUN_TEST(lrp_ts_reexport_binds_no_local_name);
+    RUN_TEST(lrp_ts_barrel_parallel_resolver);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);
