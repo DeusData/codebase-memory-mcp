@@ -104,6 +104,10 @@ void cbm_mem_set_charged_for_tests(size_t bytes);
 /* Returns true if current RSS exceeds the budget. */
 bool cbm_mem_over_budget(void);
 
+/* Reject a known upcoming allocation before touching its pages. A zero
+ * budget means initialization has not run yet. Overflow-safe. */
+bool cbm_mem_would_exceed_budget(size_t additional_bytes);
+
 /* True when memory should be handed back NOW: our budget is exceeded, or the
  * machine itself is short. Use this for spill/reclaim decisions; use
  * cbm_mem_over_budget() for the decision to stop a run. System pressure must

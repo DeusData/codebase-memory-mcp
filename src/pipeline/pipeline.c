@@ -2894,7 +2894,10 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
         cbm_clock_gettime(CLOCK_MONOTONIC, t);
         int pr = seq_passes[si].fn(ctx, files, file_count);
-        if (pr == CBM_PIPELINE_ABORT_PRESERVE_DB || atomic_load(&ctx->test_declarations_failed)) {
+        if (pr == CBM_PIPELINE_ABORT_OVER_BUDGET) {
+            rc = pr;
+        } else if (pr == CBM_PIPELINE_ABORT_PRESERVE_DB ||
+                   atomic_load(&ctx->test_declarations_failed)) {
             rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
         } else if (pr != 0 && !seq_passes[si].ignore_err) {
             rc = pr;
@@ -3051,6 +3054,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int def_count = 0;
     CBMLSPDef *all_defs = NULL;
     int *def_starts = NULL;
+    CBMModuleDefIndex *module_def_index = NULL;
     /* The collected defs own their strings in this arena (results may be on
      * disk by now); the per-language cross registries share it. */
     CBMArena cross_lsp_arena;
@@ -3063,6 +3067,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                                           file_count, ctx->project_name,
                                                           def_modules, &def_count, def_starts)
                                : NULL;
+    }
+    if (def_count == CBM_PXC_DEFS_OVER_BUDGET) {
+        rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+        goto cross_lsp_cleanup;
     }
     if (def_count < 0) {
         atomic_store(&ctx->test_declarations_failed, 1);
@@ -3085,7 +3093,6 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
     }
     CBM_PROF_END_N("lsp_cross_prepare", "2_surface_rows", t_surfaces, file_count);
-    free(def_starts);
     /* Build inverted index: module_qn → defs. The fused resolve_worker
      * uses this to filter the global all_defs[] down to just the defs
      * each file actually needs (own_module + imported modules) — the
@@ -3093,8 +3100,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * cost from O(all_defs) to O(relevant_defs), typically 50-100×
      * smaller per file. */
     CBM_PROF_START(t_module_index);
-    CBMModuleDefIndex *module_def_index =
-        all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    module_def_index = all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
     CBM_PROF_END_N("lsp_cross_prepare", "3_module_def_index", t_module_index, def_count);
     /* Tier 2 full: pre-build per-language cross-LSP registries.
      * Built ONCE here; shared READ-ONLY across all files of that language
@@ -3102,6 +3108,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * — no registry build, no Phase 1b mutations. Languages added so far:
      * Go, Python, C/C++, C#, TS/JS, Java. Others (Kotlin, PHP) fall back to per-file. */
     CBMCrossLspRegistries cross_registries = {0};
+    if (cbm_mem_would_exceed_budget(0)) {
+        rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+        goto cross_lsp_cleanup;
+    }
     if (all_defs) {
         /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
          * ONE language instead of re-diagnosing the whole pass (the cs builder
@@ -3110,23 +3120,47 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         long b_ms[6];
         cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.go = cbm_go_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        if (cbm_mem_would_exceed_budget(0)) {
+            rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+            goto cross_lsp_cleanup;
+        }
         b_ms[0] = (long)elapsed_ms(t_b);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.python =
             cbm_py_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        if (cbm_mem_would_exceed_budget(0)) {
+            rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+            goto cross_lsp_cleanup;
+        }
         b_ms[1] = (long)elapsed_ms(t_b);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        if (cbm_mem_would_exceed_budget(0)) {
+            rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+            goto cross_lsp_cleanup;
+        }
         b_ms[2] = (long)elapsed_ms(t_b);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        if (cbm_mem_would_exceed_budget(0)) {
+            rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+            goto cross_lsp_cleanup;
+        }
         b_ms[3] = (long)elapsed_ms(t_b);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        if (cbm_mem_would_exceed_budget(0)) {
+            rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+            goto cross_lsp_cleanup;
+        }
         b_ms[4] = (long)elapsed_ms(t_b);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.java =
             cbm_java_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        if (cbm_mem_would_exceed_budget(0)) {
+            rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+            goto cross_lsp_cleanup;
+        }
         b_ms[5] = (long)elapsed_ms(t_b);
         char b_buf[6][CBM_SZ_16];
         const char *b_name[6] = {"go", "python", "c", "cs", "ts", "java"};
@@ -3157,6 +3191,11 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                  itoa_buf((int)elapsed_ms(*t)));
     pipeline_phase_mark("parallel_resolve");
     log_result_arenas("post_resolve", cache, file_count);
+cross_lsp_cleanup:
+    if (rc == CBM_PIPELINE_ABORT_OVER_BUDGET) {
+        cbm_log_error("mem.budget.exceeded", "phase", "lsp_cross_prepare", "action", "fail_whole");
+    }
+    free(def_starts);
     cbm_pxc_free_module_def_index(module_def_index);
     cbm_arena_destroy(&cross_lsp_arena); /* releases all per-lang registries */
     free(all_defs);
@@ -3167,8 +3206,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(def_modules);
     }
     cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
-    cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, cache, file_count);
-    cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, cache, file_count);
+    if (rc == 0) {
+        cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, cache, file_count);
+        cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, cache, file_count);
+    }
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);

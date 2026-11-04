@@ -1955,8 +1955,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 closure->def_modules = def_modules;
                 closure->def_module_count = def_modules ? ci : 0;
                 def_modules = NULL;
-                atomic_store(&ctx->test_declarations_failed, 1);
-                rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+                if (fresh_count == CBM_PXC_DEFS_OVER_BUDGET) {
+                    rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+                } else {
+                    atomic_store(&ctx->test_declarations_failed, 1);
+                    rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+                }
                 goto cross_resolve_cleanup;
             }
             if ((fresh_defs || fresh_count == 0) && def_starts &&
@@ -2030,8 +2034,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                                              ctx->project_name, def_modules, &all_def_count, NULL);
             }
             if (!all_defs || all_def_count <= 0) {
-                atomic_store(&ctx->test_declarations_failed, 1);
-                rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+                if (all_def_count == CBM_PXC_DEFS_OVER_BUDGET) {
+                    rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+                } else {
+                    atomic_store(&ctx->test_declarations_failed, 1);
+                    rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+                }
                 goto cross_resolve_cleanup;
             }
             module_def_index = cbm_pxc_build_module_def_index(all_defs, all_def_count);
@@ -2357,10 +2365,12 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
             /* Extract left pipeline NULL so file errors are not recorded twice.
              * Surface rows only borrow it for the background worker policy. */
             probe_ctx.pipeline = p;
-            rc = def_count < 0 ? CBM_PIPELINE_ABORT_PRESERVE_DB
-                               : cbm_lsp_surface_build_rows(&probe_ctx, project, cache, probe_files,
-                                                            probe_count, defs, def_starts, out_rows,
-                                                            out_count);
+            rc = def_count < 0
+                     ? (def_count == CBM_PXC_DEFS_OVER_BUDGET ? CBM_PIPELINE_ABORT_OVER_BUDGET
+                                                              : CBM_PIPELINE_ABORT_PRESERVE_DB)
+                     : cbm_lsp_surface_build_rows(&probe_ctx, project, cache, probe_files,
+                                                  probe_count, defs, def_starts, out_rows,
+                                                  out_count);
             probe_ctx.pipeline = NULL;
         } else {
             rc = -1;
