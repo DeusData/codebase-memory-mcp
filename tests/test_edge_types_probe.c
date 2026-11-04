@@ -1289,8 +1289,8 @@ TEST(http_calls_retrofit_java_interface_issue2723) {
 }
 
 /* Control: a JAX-RS interface keeps HANDLES. Its @GET is a marker and the path
- * is a sibling @Path, so the Retrofit reading (a verb with an argument) does
- * not depend on the declaring type being an interface. */
+ * is a sibling @Path, so it is not read as a Retrofit request (a verb with an
+ * argument) even though it is declared on an interface. */
 TEST(handles_jaxrs_interface_not_retrofit_issue2723) {
     static const EtFile f[] = {
         {"src/main/java/com/acme/api/OrderResource.java",
@@ -1312,6 +1312,39 @@ TEST(handles_jaxrs_interface_not_retrofit_issue2723) {
     for (int parallel = 0; parallel <= 1; parallel++) {
         ASSERT_TRUE(et_handles_exact(f, 1, handles, parallel));
         ASSERT_TRUE(et_edges_exact_routes(f, 1, "HTTP_CALLS", et_no_edges, parallel, NULL));
+    }
+    PASS();
+}
+
+/* Control: Pippo and Rapidoid put the path inside @GET("/x") on a controller
+ * class. Retrofit services must be interfaces, so these keep HANDLES. */
+TEST(handles_verb_path_controller_class_not_retrofit_issue2723) {
+    static const EtFile f[] = {
+        {"src/main/java/com/acme/web/ContactsController.java",
+         "package com.acme.web;\n\n"
+         "import ro.pippo.controller.Controller;\n"
+         "import ro.pippo.controller.GET;\n"
+         "import ro.pippo.controller.POST;\n\n"
+         "public class ContactsController extends Controller {\n"
+         "    @GET(\"/contacts\")\n"
+         "    public void index() {}\n\n"
+         "    @POST(\"/contacts\")\n"
+         "    public void create() {}\n"
+         "}\n"},
+        {"src/main/kotlin/com/acme/web/StatusController.kt",
+         "package com.acme.web\n\n"
+         "import org.rapidoid.annotation.GET\n\n"
+         "class StatusController {\n"
+         "    @GET(\"/status\")\n"
+         "    fun status(): String = \"ok\"\n"
+         "}\n"}};
+    static const EtHandles handles[] = {{"ContactsController.index", "/contacts"},
+                                        {"ContactsController.create", "/contacts"},
+                                        {"StatusController.status", "/status"},
+                                        {NULL, NULL}};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_handles_exact(f, 2, handles, parallel));
+        ASSERT_TRUE(et_edges_exact_routes(f, 2, "HTTP_CALLS", et_no_edges, parallel, NULL));
     }
     PASS();
 }
@@ -2982,6 +3015,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(http_calls_retrofit_kotlin_interface_issue2723);
     RUN_TEST(http_calls_retrofit_java_interface_issue2723);
     RUN_TEST(handles_jaxrs_interface_not_retrofit_issue2723);
+    RUN_TEST(handles_verb_path_controller_class_not_retrofit_issue2723);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_aspnet_attribute_routes_issue1692);
     RUN_TEST(handles_aspnet_attribute_routes_issue1041);

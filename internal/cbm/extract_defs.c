@@ -3619,6 +3619,28 @@ static TSNode annotation_arg_literal(TSNode arg) {
     return arg;
 }
 
+/* Java interface_declaration, or a Kotlin class_declaration spelled with the
+ * `interface` keyword (the grammar has no separate node kind for it). */
+static bool is_jvm_interface(TSNode class_node) {
+    if (ts_node_is_null(class_node)) {
+        return false;
+    }
+    const char *kind = ts_node_type(class_node);
+    if (strcmp(kind, "interface_declaration") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "class_declaration") != 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ts_node_child_count(class_node); i++) {
+        TSNode ch = ts_node_child(class_node, i);
+        if (!ts_node_is_named(ch) && strcmp(ts_node_type(ch), "interface") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Retrofit declares a client's requests as @GET("v1/orders") / @POST(...) on an
  * interface method. JAX-RS uses the same bare verb names, but its verbs are
  * marker annotations (the path is a sibling @Path), so a verb that carries an
@@ -9385,7 +9407,10 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
     const char *client_path = NULL;
     const char *client_method = NULL;
+    /* Retrofit services must be interfaces; Pippo and Rapidoid put the path in
+     * @GET("/x") on a controller class, and those methods serve the route. */
     if ((ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN) &&
+        is_jvm_interface(class_node) &&
         retrofit_client_route(a, child, ctx->source, spec, &client_path, &client_method)) {
         def.route_path = NULL;
         def.client_route_path = client_path;
