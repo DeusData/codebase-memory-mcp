@@ -37,7 +37,7 @@
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
-#include "lsp/ruby_lsp.h" /* cbm_run_ruby_lsp_cross (fallback cbm_pxc_run_one path) */
+#include "lsp/ruby_lsp.h" /* cbm_ruby_build_cross_registry; _cross is the per-file fallback */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 

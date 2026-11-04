@@ -1660,7 +1660,7 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
     case CBM_LANG_RUST:   /* fallback cbm_pxc_run_one path (manifest-aware) */
-    case CBM_LANG_RUBY:   /* fallback cbm_pxc_run_one path */
+    case CBM_LANG_RUBY:   /* tier-2 prebuilt registry path (pass_parallel.c) */
         return true;
     default:
         return false;

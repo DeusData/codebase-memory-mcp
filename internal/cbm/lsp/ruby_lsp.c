@@ -827,6 +827,26 @@ const CBMRegisteredFunc *ruby_lookup_singleton_method(RubyLSPContext *ctx, const
 
 /* ── ActiveRecord model detection (typing special case) ─────────── */
 
+/* Whether the finder rule (`User.find` -> User, relation chains keep the
+ * model) also fires for a model declared in ANOTHER file, which is the usual
+ * Rails layout. Set to false to keep the rule to models declared in the file
+ * being resolved; nothing else changes. */
+static bool ruby_ar_finder_cross_file = true;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_ruby_set_ar_finder_cross_file(bool on) {
+    ruby_ar_finder_cross_file = on;
+}
+#endif
+
+static bool ruby_class_declared_here(const RubyLSPContext *ctx, const char *qn) {
+    for (int i = 0; i < ctx->class_count; i++) {
+        if (strcmp(ctx->classes[i].qn, qn) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* True when class_qn's superclass chain reaches ActiveRecord::Base (or the
  * conventional ApplicationRecord intermediary, which per-file extraction
  * usually cannot see through). */
@@ -835,6 +855,8 @@ static bool ruby_is_ar_model(RubyLSPContext *ctx, const char *class_qn, int dept
         return false;
     if (strcmp(class_qn, "ActiveRecord.Base") == 0 || strcmp(class_qn, "ApplicationRecord") == 0)
         return true;
+    if (!ruby_ar_finder_cross_file && !ruby_class_declared_here(ctx, class_qn))
+        return false;
     const RubyClassInfo *ci = ruby_effective_class(ctx, class_qn);
     if (ci && ci->superclass_ref &&
         (strcmp(ci->superclass_ref, "ApplicationRecord") == 0 ||

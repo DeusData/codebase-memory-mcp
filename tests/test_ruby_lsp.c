@@ -1700,10 +1700,12 @@ static void cross_def(CBMLSPDef *d, const char *qn, const char *short_name, cons
     d->lang = CBM_LANG_RUBY;
 }
 
-static bool out_has(const CBMResolvedCallArray *out, const char *caller_sub, const char *callee) {
+/* Caller and callee both match exactly, as find_resolved_exact does for the
+ * single-file rows: a substring match would let a row pass on the wrong caller. */
+static bool out_has(const CBMResolvedCallArray *out, const char *caller, const char *callee) {
     for (int i = 0; i < out->count; i++) {
         if (out->items[i].caller_qn && out->items[i].callee_qn &&
-            strstr(out->items[i].caller_qn, caller_sub) &&
+            strcmp(out->items[i].caller_qn, caller) == 0 &&
             strcmp(out->items[i].callee_qn, callee) == 0)
             return true;
     }
@@ -1740,9 +1742,9 @@ TEST(rubylsp_cross_reopened_class_across_files) {
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.report", defs, 4, NULL, NULL, 0,
                            NULL, &out);
-    bool ctor = out_has(&out, "Report.run", "test.a.User");
-    bool name = out_has(&out, "Report.run", "test.a.User.name");
-    bool email = out_has(&out, "Report.run", "test.b.User.email");
+    bool ctor = out_has(&out, "test.app.report.Report.run", "test.a.User");
+    bool name = out_has(&out, "test.app.report.Report.run", "test.a.User.name");
+    bool email = out_has(&out, "test.app.report.Report.run", "test.b.User.email");
     if (!(ctor && name && email))
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -1772,8 +1774,8 @@ TEST(rubylsp_cross_compact_class_name) {
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.welcome", defs, 2, NULL, NULL,
                            0, NULL, &out);
-    bool ctor = out_has(&out, "Welcome.run", "test.admin.Admin::User");
-    bool greet = out_has(&out, "Welcome.run", "test.admin.Admin::User.greet");
+    bool ctor = out_has(&out, "test.app.welcome.Welcome.run", "test.admin.Admin::User");
+    bool greet = out_has(&out, "test.app.welcome.Welcome.run", "test.admin.Admin::User.greet");
     if (!(ctor && greet))
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -1823,10 +1825,10 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
                                          NULL, 0, NULL, &o2);
     cbm_run_ruby_lsp_cross_with_registry(&a3, src3, (int)strlen(src3), "test.app.three", sh, NULL,
                                          NULL, 0, NULL, &o3);
-    bool one_inherited = out_has(&o1, "One.run", "test.base.Base.shared_m");
-    bool one_own = out_has(&o1, "One.run", "test.child.Child.own_m");
-    bool two_inherited = out_has(&o2, "Two.run", "test.base.Base.shared_m");
-    bool three_none = !out_has(&o3, "Three.run", "test.base.Base.shared_m");
+    bool one_inherited = out_has(&o1, "test.app.one.One.run", "test.base.Base.shared_m");
+    bool one_own = out_has(&o1, "test.app.one.One.run", "test.child.Child.own_m");
+    bool two_inherited = out_has(&o2, "test.app.two.Two.run", "test.base.Base.shared_m");
+    bool three_none = !out_has(&o3, "test.app.three.Three.run", "test.base.Base.shared_m");
     bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before;
     if (!(one_inherited && one_own && two_inherited && three_none && untouched)) {
         out_dump(&o1);
@@ -1891,7 +1893,7 @@ static bool rubylsp_reopen_work(int reopenings, uint64_t *build_work, uint64_t *
         cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), "test.app.caller", sh, NULL,
                                              NULL, 0, NULL, &out);
     *resolve_work = cbm_lsp_work_take();
-    bool resolved = out_has(&out, "CxCaller.run", "test.base.CxBase.label");
+    bool resolved = out_has(&out, "test.app.caller.CxCaller.run", "test.base.CxBase.label");
     cbm_arena_destroy(&a);
     cbm_arena_destroy(&build);
     free(defs);
@@ -1957,10 +1959,10 @@ static bool rubylsp_order_edges(bool reversed, bool *ctor, bool *label, bool *du
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, 10, NULL, NULL,
                            0, NULL, &out);
-    *ctor = out_has(&out, "CxCaller.run", "test.m0.CxWidget");
-    *label = out_has(&out, "CxCaller.run", "test.base.CxBase.label");
-    *dup = out_has(&out, "CxCaller.run", "test.m1.CxWidget.dup_m");
-    *own = out_has(&out, "CxCaller.run", "test.m0.CxWidget.own");
+    *ctor = out_has(&out, "test.app.caller.CxCaller.run", "test.m0.CxWidget");
+    *label = out_has(&out, "test.app.caller.CxCaller.run", "test.base.CxBase.label");
+    *dup = out_has(&out, "test.app.caller.CxCaller.run", "test.m1.CxWidget.dup_m");
+    *own = out_has(&out, "test.app.caller.CxCaller.run", "test.m0.CxWidget.own");
     if (!(*ctor && *label && *dup && *own))
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -2050,8 +2052,8 @@ TEST(rubylsp_cross_singleton_and_instance_do_not_shadow) {
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, 4, NULL, NULL, 0,
                            NULL, &out);
-    bool instance = out_has(&out, "Caller.go", "test.base.Base.run");
-    bool klass = out_has(&out, "Caller.go", "test.child.Child.run");
+    bool instance = out_has(&out, "test.app.caller.Caller.go", "test.base.Base.run");
+    bool klass = out_has(&out, "test.app.caller.Caller.go", "test.child.Child.run");
     if (!(instance && klass))
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -2086,8 +2088,8 @@ static bool rubylsp_mixin_call(const char *decl_mixin, bool reopen_elsewhere, bo
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, n, NULL, NULL, 0,
                            NULL, &out);
-    *module_hit = out_has(&out, "Caller.go", "test.mod.Overrides.greet");
-    *base_hit = out_has(&out, "Caller.go", "test.base.Base.greet");
+    *module_hit = out_has(&out, "test.app.caller.Caller.go", "test.mod.Overrides.greet");
+    *base_hit = out_has(&out, "test.app.caller.Caller.go", "test.base.Base.greet");
     if (!*module_hit && !*base_hit && out.count > 1)
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -2122,6 +2124,50 @@ TEST(rubylsp_cross_unseen_mixin_blocks_superclass) {
     ASSERT(rubylsp_mixin_call("i:Missing", false, &module_hit, &base_hit));
     ASSERT(!module_hit);
     ASSERT(!base_hit);
+    PASS();
+}
+
+/* The finder rule (`User.find` -> User, relation chains keep the model) for a
+ * model declared in ANOTHER file, the usual Rails layout. It is one switch
+ * (ruby_ar_finder_cross_file): on by default; off keeps the rule to models
+ * declared in the file being resolved, with nothing else changed. */
+static bool rubylsp_ar_finder_cross_edge(void) {
+    CBMLSPDef defs[2];
+    cross_def(&defs[0], "test.models.user.User", "User", "Class", "test.models.user", NULL,
+              "ApplicationRecord");
+    cross_def(&defs[1], "test.models.user.User.full_name", "full_name", "Method",
+              "test.models.user", "test.models.user.User", NULL);
+    const char *src = "class Svc\n  def go\n    User.find(1).full_name\n    "
+                      "User.where(active: true).first.full_name\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.svc", defs, 2, NULL, NULL, 0,
+                           NULL, &out);
+    bool edge = out_has(&out, "test.app.svc.Svc.go", "test.models.user.User.full_name");
+    cbm_arena_destroy(&arena);
+    return edge;
+}
+
+TEST(rubylsp_cross_ar_finder_crosses_files_by_default) {
+    ASSERT(rubylsp_ar_finder_cross_edge());
+    PASS();
+}
+
+TEST(rubylsp_cross_ar_finder_same_file_only_when_switched_off) {
+    cbm_ruby_set_ar_finder_cross_file(false);
+    bool cross = rubylsp_ar_finder_cross_edge();
+    const char *src = "class User < ApplicationRecord\n  def full_name\n    'x'\n  end\nend\n"
+                      "class UsersController < ApplicationController\n  def show\n"
+                      "    User.find(1).full_name\n  end\nend\n";
+    CBMFileResult *r = extract_ruby(src);
+    bool same = r && find_resolved(r, "UsersController.show", "User.full_name") >= 0;
+    if (r)
+        cbm_free_result(r);
+    cbm_ruby_set_ar_finder_cross_file(true);
+    ASSERT(!cross);
+    ASSERT(same);
     PASS();
 }
 
@@ -2176,4 +2222,6 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_cross_mixin_shadows_superclass_across_files);
     RUN_TEST(rubylsp_cross_mixin_in_reopening_shadows_superclass);
     RUN_TEST(rubylsp_cross_unseen_mixin_blocks_superclass);
+    RUN_TEST(rubylsp_cross_ar_finder_crosses_files_by_default);
+    RUN_TEST(rubylsp_cross_ar_finder_same_file_only_when_switched_off);
 }
