@@ -79,6 +79,7 @@ codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config set watcher_enabled false
 codebase-memory-mcp config reset auto_index
+codebase-memory-mcp config get install_hooks
 ```
 
 Current keys:
@@ -96,6 +97,9 @@ Current keys:
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
 | `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). Like `index_max_rss_mb`, it stops a worker only before it starts to publish the new index; see [INDEX_RESOURCE_LIMITS.md](INDEX_RESOURCE_LIMITS.md). |
+| `install_hooks` | `true` | Install CBM-managed client hooks. `install --no-hooks` persists `false`; `install --hooks` restores `true`. |
+
+Bare installs and updates respect the stored hook preference. MCP registration, skills, instructions, and profiles remain installed when hooks are disabled.
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
