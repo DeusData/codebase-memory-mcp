@@ -100,7 +100,9 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 
         for (int i = 0; i < result->imports.count; i++) {
             const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+            /* A re-export binds no local name (`export { x } from './m'`). */
+            if (!imp->local_name || !imp->local_name[0] || !imp->module_path ||
+                !cbm_import_binds_local(imp)) {
                 continue;
             }
             char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
@@ -145,7 +147,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     for (int i = 0; i < edge_count; i++) {
         const cbm_gbuf_edge_t *e = edges[i];
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, e->target_id);
-        if (!target || !e->properties_json) {
+        if (!target || !e->properties_json || strstr(e->properties_json, "\"reexport\":\"")) {
             continue;
         }
 

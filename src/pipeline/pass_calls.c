@@ -229,9 +229,10 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
         }
         const char *name = NULL;
         size_t name_len = 0;
-        /* An annotation-only import (#1277) binds no CALLS name: skipped before
-         * the key is copied. */
-        if (!local_name_span_from_json(e->properties_json, &name, &name_len) ||
+        /* An annotation-only import (#1277) and a re-export bind no CALLS
+         * name: skipped before the key is copied. */
+        if ((e->properties_json && strstr(e->properties_json, "\"reexport\":\"")) ||
+            !local_name_span_from_json(e->properties_json, &name, &name_len) ||
             !cbm_imports_local_span_binds_runtime_name(result ? &result->imports : NULL, name,
                                                        name_len)) {
             continue;
@@ -330,7 +331,7 @@ static bool pc_receiver_client_base(const cbm_gbuf_t *gbuf, const char *project,
     const CBMImport *imp = NULL;
     for (int i = 0; result && i < result->imports.count; i++) {
         const CBMImport *it = &result->imports.items[i];
-        if (it->local_name && strcmp(it->local_name, recv) == 0) {
+        if (cbm_import_binds_local(it) && it->local_name && strcmp(it->local_name, recv) == 0) {
             imp = it;
             break;
         }
