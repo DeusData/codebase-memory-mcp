@@ -1845,6 +1845,143 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     PASS();
 }
 
+/* A class reopened in `reopenings` files (`Widget`, one module each, the first
+ * declaring `< CxBase`), plus the base. Work is counted for the registry build
+ * and for resolving one fixed file whose call sites all miss on the head's own
+ * methods (`label` is inherited from CxBase). */
+static bool rubylsp_reopen_work(int reopenings, uint64_t *build_work, uint64_t *resolve_work) {
+    int n = reopenings * 2 + 2;
+    CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)n, sizeof(CBMLSPDef));
+    char (*names)[64] = (char (*)[64])calloc((size_t)n * 3, sizeof(*names));
+    if (!defs || !names) {
+        free(defs);
+        free(names);
+        return false;
+    }
+    int d = 0;
+    int nm = 0;
+    cross_def(&defs[d++], "test.base.CxBase", "CxBase", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[d++], "test.base.CxBase.label", "label", "Method", "test.base",
+              "test.base.CxBase", NULL);
+    for (int i = 0; i < reopenings; i++) {
+        char *mod = names[nm++];
+        char *cls = names[nm++];
+        char *meth = names[nm++];
+        snprintf(mod, 64, "test.m%d", i);
+        snprintf(cls, 64, "test.m%d.CxWidget", i);
+        snprintf(meth, 64, "test.m%d.CxWidget.own%d", i, i);
+        cross_def(&defs[d++], cls, "CxWidget", "Class", mod, NULL, i == 0 ? "CxBase" : NULL);
+        cross_def(&defs[d++], meth, "own", "Method", mod, cls, NULL);
+    }
+    CBMArena build;
+    cbm_arena_init(&build);
+    (void)cbm_lsp_work_take();
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, d);
+    *build_work = cbm_lsp_work_take();
+
+    const char *src = "class CxCaller\n  def run\n    w = CxWidget.new\n    w.label\n"
+                      "    w.label\n    w.label\n    w.label\n    w.label\n    w.label\n"
+                      "    w.label\n    w.label\n  end\nend\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    (void)cbm_lsp_work_take();
+    if (sh)
+        cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), "test.app.caller", sh, NULL,
+                                             NULL, 0, NULL, &out);
+    *resolve_work = cbm_lsp_work_take();
+    bool resolved = out_has(&out, "CxCaller.run", "test.base.CxBase.label");
+    cbm_arena_destroy(&a);
+    cbm_arena_destroy(&build);
+    free(defs);
+    free(names);
+    return sh && resolved;
+}
+
+/* Review items 2b / 2c / 3. Constants are global, so a namespace module or a
+ * model is reopened in many files. Doubling the reopenings must at most double
+ * the registry build (a per-reopening tail walk makes it R^2/2, ratio 4), and
+ * must not change what resolving one fixed file costs at all: a lookup is one
+ * probe however many files reopen the class (a group walk per miss makes it
+ * grow with R). The resolve gate is therefore 1.5, not the build gate of 3. */
+TEST(rubylsp_cross_reopened_class_work_is_bounded) {
+    uint64_t build_r = 0;
+    uint64_t resolve_r = 0;
+    uint64_t build_2r = 0;
+    uint64_t resolve_2r = 0;
+    ASSERT(rubylsp_reopen_work(64, &build_r, &resolve_r));
+    ASSERT(rubylsp_reopen_work(128, &build_2r, &resolve_2r));
+    printf("  reopened-class work: build R=64 %llu, 2R %llu; resolve R=64 %llu, 2R %llu\n",
+           (unsigned long long)build_r, (unsigned long long)build_2r,
+           (unsigned long long)resolve_r, (unsigned long long)resolve_2r);
+    ASSERT(build_2r < 3 * (build_r ? build_r : 1));
+    ASSERT(2 * resolve_2r < 3 * (resolve_r ? resolve_r : 1));
+    PASS();
+}
+
+/* Review item 4: the merged record must not depend on def order. A full build
+ * orders defs by file index; the incremental closure route appends fresh defs
+ * to the persisted ones, so the same project can arrive in any order. The head
+ * is the smallest QN, the superclass comes from the smallest-QN declaration
+ * that has one, and a method defined by two reopenings resolves to the smaller
+ * QN. Built forwards and reversed, the resolved edges must be identical. */
+static void rubylsp_order_defs(CBMLSPDef *defs, bool reversed) {
+    CBMLSPDef t[10];
+    cross_def(&t[0], "test.m2.CxWidget", "CxWidget", "Class", "test.m2", NULL, "CxOther");
+    cross_def(&t[1], "test.m2.CxWidget.dup_m", "dup_m", "Method", "test.m2", "test.m2.CxWidget",
+              NULL);
+    cross_def(&t[2], "test.m1.CxWidget", "CxWidget", "Class", "test.m1", NULL, "CxBase");
+    cross_def(&t[3], "test.m1.CxWidget.dup_m", "dup_m", "Method", "test.m1", "test.m1.CxWidget",
+              NULL);
+    cross_def(&t[4], "test.m0.CxWidget", "CxWidget", "Class", "test.m0", NULL, NULL);
+    cross_def(&t[5], "test.m0.CxWidget.own", "own", "Method", "test.m0", "test.m0.CxWidget", NULL);
+    cross_def(&t[6], "test.base.CxBase", "CxBase", "Class", "test.base", NULL, NULL);
+    cross_def(&t[7], "test.base.CxBase.label", "label", "Method", "test.base", "test.base.CxBase",
+              NULL);
+    cross_def(&t[8], "test.base.CxOther", "CxOther", "Class", "test.base", NULL, NULL);
+    cross_def(&t[9], "test.base.CxOther.label", "label", "Method", "test.base",
+              "test.base.CxOther", NULL);
+    for (int i = 0; i < 10; i++)
+        defs[i] = reversed ? t[9 - i] : t[i];
+}
+
+static bool rubylsp_order_edges(bool reversed, bool *ctor, bool *label, bool *dup, bool *own) {
+    CBMLSPDef defs[10];
+    rubylsp_order_defs(defs, reversed);
+    const char *src = "class CxCaller\n  def run\n    w = CxWidget.new\n    w.label\n"
+                      "    w.dup_m\n    w.own\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, 10, NULL, NULL,
+                           0, NULL, &out);
+    *ctor = out_has(&out, "CxCaller.run", "test.m0.CxWidget");
+    *label = out_has(&out, "CxCaller.run", "test.base.CxBase.label");
+    *dup = out_has(&out, "CxCaller.run", "test.m1.CxWidget.dup_m");
+    *own = out_has(&out, "CxCaller.run", "test.m0.CxWidget.own");
+    if (!(*ctor && *label && *dup && *own))
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    return true;
+}
+
+TEST(rubylsp_cross_registry_is_def_order_independent) {
+    bool f[4];
+    bool r[4];
+    ASSERT(rubylsp_order_edges(false, &f[0], &f[1], &f[2], &f[3]));
+    ASSERT(rubylsp_order_edges(true, &r[0], &r[1], &r[2], &r[3]));
+    /* head = smallest QN (m0), superclass from the smallest-QN declaration
+     * that has one (m1's CxBase, not m2's CxOther), duplicate method from the
+     * smaller QN (m1) — in both orders. */
+    for (int i = 0; i < 4; i++) {
+        ASSERT(f[i]);
+        ASSERT(r[i]);
+    }
+    PASS();
+}
+
 /* ── suite ──────────────────────────────────────────────────────── */
 
 void suite_ruby_lsp(void) {
@@ -1889,4 +2026,6 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_cross_reopened_class_across_files);
     RUN_TEST(rubylsp_cross_compact_class_name);
     RUN_TEST(rubylsp_cross_registry_built_once_serves_many_files);
+    RUN_TEST(rubylsp_cross_reopened_class_work_is_bounded);
+    RUN_TEST(rubylsp_cross_registry_is_def_order_independent);
 }

@@ -36,12 +36,12 @@ typedef struct {
     bool is_module;             /* `module` (mixin source) vs `class` */
     /* Shared (project-wide) table only. A class reopened in another file has
      * a different QN there (the QN carries the file's module QN) but the same
-     * constant path; the entries for one path form a group so a method defined
-     * in any reopening is found. `group_head` is the first entry of the group,
-     * `shard_next` the next one; both are table index + 1, 0 = none. Entries
-     * of a per-file table leave both 0. */
+     * constant path. All declarations of one path share one merged record: the
+     * entry with the smallest QN (the group head), which holds every
+     * reopening's methods and the superclass. `group_head` is the head's table
+     * index + 1 (the entry's own index + 1 for the head itself); 0 in a
+     * per-file table. */
     int group_head;
-    int shard_next;
     /* Method-lookup visit marks: the stamp of the last walk that searched
      * this class on the instance / singleton side (ruby_walk_seen). */
     unsigned int seen_instance;
