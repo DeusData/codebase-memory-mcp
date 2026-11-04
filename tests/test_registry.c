@@ -505,6 +505,20 @@ TEST(resolve_unresolved) {
     PASS();
 }
 
+TEST(visual_basic_call_resolution_is_case_insensitive) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method",
+                          CBM_LANG_VISUALBASIC);
+    cbm_resolution_t res = cbm_registry_resolve_call_scoped(
+        r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_VISUALBASIC,
+        "proj.Worker.Run");
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Worker.Calculate");
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_many_nodes) {
     cbm_registry_t *r = cbm_registry_new();
     /* Add 500 functions */
@@ -2653,6 +2667,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
+    RUN_TEST(visual_basic_call_resolution_is_case_insensitive);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */
     RUN_TEST(confidence_band_high);

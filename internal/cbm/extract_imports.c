@@ -41,6 +41,7 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type);
 static void parse_wolfram_imports(CBMExtractCtx *ctx);
 static void parse_php_imports(CBMExtractCtx *ctx);
 static void parse_csharp_imports(CBMExtractCtx *ctx);
+static void parse_visual_basic_imports(CBMExtractCtx *ctx);
 static void parse_spec_imports(CBMExtractCtx *ctx);
 static void parse_hare_imports(CBMExtractCtx *ctx);
 static void parse_pascal_imports(CBMExtractCtx *ctx);
@@ -2692,6 +2693,30 @@ static void parse_csharp_imports(CBMExtractCtx *ctx) {
     ts_tree_cursor_delete(&cursor);
 }
 
+static void parse_visual_basic_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    uint32_t count = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode node = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(node), "imports_statement") != 0) {
+            continue;
+        }
+        TSNode path_node = ts_node_child_by_field_name(node, TS_FIELD("namespace"));
+        if (ts_node_is_null(path_node)) {
+            continue;
+        }
+        char *path = cbm_node_text(a, path_node, ctx->source);
+        if (!path || !path[0]) {
+            continue;
+        }
+        TSNode alias = ts_node_child_by_field_name(node, TS_FIELD("alias"));
+        const char *local =
+            ts_node_is_null(alias) ? path_last(a, path) : cbm_node_text(a, alias, ctx->source);
+        CBMImport imp = {.local_name = local, .module_path = path};
+        cbm_imports_push(&ctx->result->imports, a, imp);
+    }
+}
+
 // --- Generic spec-driven imports ---
 // For grammar-only languages that have no dedicated parser above, consume the
 // `import_node_types` declared in the language's CBMLangSpec.  Each root-level
@@ -4335,6 +4360,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
     case CBM_LANG_CSHARP:
+    case CBM_LANG_VISUALBASIC:
     case CBM_LANG_PHP:
         capture_namespace_decl(ctx);
         break;
@@ -4365,6 +4391,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_CSHARP:
         parse_csharp_imports(ctx);
+        break;
+    case CBM_LANG_VISUALBASIC:
+        parse_visual_basic_imports(ctx);
         break;
     case CBM_LANG_RUST:
         parse_rust_imports(ctx);

@@ -1574,6 +1574,15 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
 
+    /* VB.NET uses invocation syntax for both calls and array access. The
+     * grammar consequently places many ordinary callees in the `array` field. */
+    if (lang == CBM_LANG_VISUALBASIC && strcmp(nk, "array_access_expression") == 0) {
+        TSNode callee = ts_node_child_by_field_name(node, TS_FIELD("array"));
+        if (!ts_node_is_null(callee)) {
+            return cbm_node_text(a, callee, source);
+        }
+    }
+
     if (lang == CBM_LANG_FORTRAN && strcmp(nk, "subroutine_call") == 0) {
         TSNode subroutine = ts_node_child_by_field_name(node, TS_FIELD("subroutine"));
         if (!ts_node_is_null(subroutine)) {

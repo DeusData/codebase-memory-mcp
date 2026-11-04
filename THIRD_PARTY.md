@@ -60,8 +60,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Ten further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`) are
+- Eleven further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`, `vbnet`) are
   self-maintained forks that retain their original upstream authors' licenses —
   see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -80,6 +80,11 @@ License summary:
   MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
   DeusData patch that accepts non-ASCII letters in identifiers; its grammar
   source lives in `tools/tree-sitter-pascal/`.
+  `vbnet` is based on
+  [govindbanura/tree-sitter-vbnet](https://github.com/govindbanura/tree-sitter-vbnet)
+  (MIT, (c) 2025 Govind Banura) and carries the real-world compatibility patch
+  from [CodeGraph MCP](https://github.com/ColbyMchenry/CodeGraph) (MIT,
+  (c) 2025 Colby Mchenry); source and patch live in `tools/tree-sitter-vbnet/`.
 
 ### tree-sitter-plsql
 

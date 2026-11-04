@@ -44,6 +44,7 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
     "tsx": "tree-sitter/tree-sitter-typescript",
+    "vbnet": "govindbanura/tree-sitter-vbnet",
 }
 SPECIAL_NOTICE = {
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",

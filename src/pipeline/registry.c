@@ -130,6 +130,18 @@ static const char *simple_name(const char *qn) {
     return seg;
 }
 
+static void ascii_lower_copy(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) {
+        return;
+    }
+    size_t i = 0;
+    for (; src && src[i] && i + 1 < cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        dst[i] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    }
+    dst[i] = '\0';
+}
+
 /* Extract everything before the last dot. Returns heap-allocated string. */
 
 /* Count common dot-separated prefix segments. One pass over the shared prefix:
@@ -1152,6 +1164,7 @@ static int xl_family(CBMLanguage lang) {
         return XL_FAM_JVM;
     case CBM_LANG_CSHARP:
     case CBM_LANG_FSHARP:
+    case CBM_LANG_VISUALBASIC:
         return XL_FAM_DOTNET;
     case CBM_LANG_PHP:
     case CBM_LANG_BLADE:
@@ -1678,6 +1691,15 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     const char *primary =
         name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
     index_under_name(r, primary, owned_qn, lang);
+    /* Visual Basic identifiers are case-insensitive. Preserve their canonical
+     * spelling/QN, while adding a folded lookup key used by VB callers. */
+    if (lang == CBM_LANG_VISUALBASIC) {
+        char folded[CBM_SZ_512];
+        ascii_lower_copy(folded, sizeof(folded), primary);
+        if (folded[0] && strcmp(folded, primary) != 0) {
+            index_under_name(r, folded, owned_qn, lang);
+        }
+    }
     /* '#' is a QN fence; no extractor mints one for a REGISTERED definition
      * today (Rust cfg twins are variants of one plain QN; a C macro's QN ends in
      * "#macro", but Macro is no registry label, so it never gets here). A
@@ -2446,6 +2468,12 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
+    if (lang == CBM_LANG_VISUALBASIC) {
+        char folded[CBM_SZ_512];
+        ascii_lower_copy(folded, sizeof(folded), callee_name);
+        return registry_resolve_scoped(r, folded, module_qn, import_map_keys, import_map_vals,
+                                       import_map_count, lang_scope_len(module_qn, lang), false);
+    }
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                    import_map_count, lang_scope_len(module_qn, lang), false);
 }
@@ -2460,6 +2488,12 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
      * for the name; a C member call and every other language keep them. */
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
+    if (lang == CBM_LANG_VISUALBASIC) {
+        char folded[CBM_SZ_512];
+        ascii_lower_copy(folded, sizeof(folded), callee_name);
+        return registry_resolve_scoped(r, folded, module_qn, import_map_keys, import_map_vals,
+                                       import_map_count, lang_scope_len(module_qn, lang), false);
+    }
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                    import_map_count, lang_scope_len(module_qn, lang), skip_members);
 }

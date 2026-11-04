@@ -90,6 +90,10 @@ TEST(lang_ext_csharp) {
     ASSERT_EQ(cbm_language_for_extension(".cs"), CBM_LANG_CSHARP);
     PASS();
 }
+TEST(lang_ext_visual_basic) {
+    ASSERT_EQ(cbm_language_for_extension(".vb"), CBM_LANG_VISUALBASIC);
+    PASS();
+}
 /* Blazor components were unmapped, so a .razor file was never discovered at
  * all: indexing a Blazor app produced no nodes for any component, and reaching
  * them required an undocumented extra_extensions entry in a per-project
@@ -648,6 +652,10 @@ TEST(lang_name_cpp) {
 }
 TEST(lang_name_csharp) {
     ASSERT_STR_EQ(cbm_language_name(CBM_LANG_CSHARP), "C#");
+    PASS();
+}
+TEST(lang_name_visual_basic) {
+    ASSERT_STR_EQ(cbm_language_name(CBM_LANG_VISUALBASIC), "Visual Basic .NET");
     PASS();
 }
 TEST(lang_name_unknown) {
@@ -1682,6 +1690,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_h);
     RUN_TEST(lang_ext_ixx);
     RUN_TEST(lang_ext_csharp);
+    RUN_TEST(lang_ext_visual_basic);
     RUN_TEST(lang_ext_razor);
     RUN_TEST(lang_ext_cshtml);
     RUN_TEST(lang_ext_php);
@@ -1815,6 +1824,7 @@ SUITE(language) {
     RUN_TEST(lang_name_python);
     RUN_TEST(lang_name_cpp);
     RUN_TEST(lang_name_csharp);
+    RUN_TEST(lang_name_visual_basic);
     RUN_TEST(lang_name_unknown);
 
     /* .m disambiguation */
