@@ -996,21 +996,25 @@ static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const 
 }
 
 static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                  const CBMResolvedCall *lsp, bool allow_tail, CBMLanguage lang,
-                                  const CBMImportArray *imports, const cbm_gbuf_node_t *source_node,
-                                  const char *module_qn, const char **imp_keys,
-                                  const char **imp_vals, int imp_count, const char *route_mount,
-                                  CBMCallEvidence *evidence) {
+                                  const CBMResolvedCall *lsp, bool allow_tail, bool java_external,
+                                  CBMLanguage lang, const CBMImportArray *imports,
+                                  const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                  const char **imp_keys, const char **imp_vals, int imp_count,
+                                  const char *route_mount, CBMCallEvidence *evidence) {
     if (!lsp) {
         return false;
     }
     bool exact_external_target =
         call->requires_lsp_resolution && cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
+    /* A Java call on a JDK/library type binds its exact QN only: no tail
+     * match onto a same-named project method. MUST match pass_parallel.c. */
     const cbm_gbuf_node_t *target_node =
-        exact_external_target ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
-                                                                    lsp->callee_qn, allow_tail)
-                              : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
-                                                             lsp->callee_qn, allow_tail);
+        java_external           ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
+                                                                      lsp->callee_qn, false)
+        : exact_external_target ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
+                                                                      lsp->callee_qn, allow_tail)
+                                : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
+                                                               lsp->callee_qn, allow_tail);
     if (!target_node || source_node->id == target_node->id) {
         return false;
     }
@@ -1038,15 +1042,16 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     return true;
 }
 
-/* Vendor receivers and cross-language name guesses cannot bind project calls.
- * Keep the registry policy shared with the parallel resolver. */
+/* Vendor receivers, Java library receivers and cross-language name guesses
+ * cannot bind project calls. Keep the registry policy shared with the
+ * parallel resolver. */
 static cbm_resolution_t calls_registry_resolution(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                                   const char *module_qn, const char **imp_keys,
                                                   const char **imp_vals, int imp_count,
                                                   CBMLanguage lang, bool rust_external,
-                                                  bool php_vendor_call) {
+                                                  bool php_vendor_call, bool java_external) {
     cbm_resolution_t res = {0};
-    if (!rust_external && !php_vendor_call) {
+    if (!rust_external && !php_vendor_call && !java_external) {
         /* Python LEGB fallback first (MUST match pass_parallel.c). */
         res =
             cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn, imp_keys,
@@ -1114,8 +1119,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Service/route classification below still runs. Mirrors pass_parallel.c. */
     bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
                            cbm_pipeline_lsp_external_receiver(lsp);
-    if (calls_emit_lsp_target(ctx, call, lsp, allow_tail, lang, imports, source_node, module_qn,
-                              imp_keys, imp_vals, imp_count, route_mount, evidence)) {
+    /* A Java call on a JDK/library type is never bound to a project method
+     * found by name (no tail match, no registry guess). MUST match
+     * pass_parallel.c. */
+    bool java_external = cbm_pipeline_java_external_target(lang, lsp);
+    if (calls_emit_lsp_target(ctx, call, lsp, allow_tail, java_external, lang, imports, source_node,
+                              module_qn, imp_keys, imp_vals, imp_count, route_mount, evidence)) {
         return SKIP_ONE;
     }
 
@@ -1177,8 +1186,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * classify the call. MUST match pass_parallel.c. */
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
-    cbm_resolution_t res = calls_registry_resolution(
-        ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang, rust_external, php_vendor_call);
+    cbm_resolution_t res =
+        calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
+                                  rust_external, php_vendor_call, java_external);
     /* `p->open(fd)`: the registry does not split a callee on the arrow, and a
      * member is not a name it could resolve anyway. The object's type decides,
      * exactly as for the dot call handled further down. MUST match
