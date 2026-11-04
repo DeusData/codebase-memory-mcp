@@ -3939,8 +3939,12 @@ CBMTypeRegistry *cbm_cs_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
      * NULL, which must not be mistaken for OOM — the empty registry is still
      * built, finalized, and shared. */
     CBMLSPDef *cs = NULL;
-    if (def_count > 0) {
-        cs = (CBMLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(*cs));
+    int cs_count = 0;
+    for (int i = 0; i < def_count; i++) {
+        cs_count += defs[i].lang == CBM_LANG_CSHARP;
+    }
+    if (cs_count > 0) {
+        cs = (CBMLSPDef *)cbm_arena_alloc(arena, (size_t)cs_count * sizeof(*cs));
         if (!cs)
             return NULL;
     }

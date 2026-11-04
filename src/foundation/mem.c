@@ -649,6 +649,14 @@ bool cbm_mem_over_budget(void) {
     return charged > g_budget;
 }
 
+bool cbm_mem_would_exceed_budget(size_t additional_bytes) {
+    if (g_budget == 0) {
+        return false;
+    }
+    size_t charged = cbm_mem_charged();
+    return charged > g_budget || additional_bytes > g_budget - charged;
+}
+
 /* "Give memory back now" — true when our own budget is exceeded OR the MACHINE
  * is short, whichever comes first.
  *

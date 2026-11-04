@@ -17,6 +17,7 @@
 
 #include "pipeline/lsp_surface.h"
 #include "foundation/mem_core.h"
+#include "foundation/mem.h"
 #include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
@@ -40,6 +41,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -1186,14 +1188,15 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                     int *out_count, int *out_def_starts) {
     const cbm_result_spill_t *spill = ctx ? ctx->spill : NULL;
     bool owner_walk_required = ctx && atomic_load(&ctx->test_definition_owners_seen);
-    int total = 0;
+    CBMLSPDef *defs = NULL;
+    size_t total = 0;
     for (int i = 0; i < file_count; i++) {
-        int defs = 0;
+        int file_defs = 0;
         int impls = 0;
         int records = 0; /* a Python module's namespace records (re-exports) */
         if (cache[i]) {
             owner_walk_required = owner_walk_required || cache[i]->has_test_definition_owners;
-            defs = cache[i]->defs.count;
+            file_defs = cache[i]->defs.count;
             impls = cache[i]->impl_traits.count;
             records = pxc_py_namespace_record_bound(cache[i]);
         } else if (spill && cbm_result_spill_has(spill, i)) {
@@ -1201,12 +1204,12 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
              * size), so the bound needs no full load. */
             CBMFileResult hdr;
             if (cbm_result_spill_peek_header(spill, i, &hdr)) {
-                defs = hdr.defs.count;
+                file_defs = hdr.defs.count;
                 impls = hdr.impl_traits.count;
                 records = pxc_py_namespace_record_bound(&hdr);
             }
         }
-        total += defs;
+        total += file_defs;
         if (files[i].language == CBM_LANG_RUST) {
             total += impls;
         }
@@ -1221,7 +1224,14 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         return NULL;
     }
-    CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)total, sizeof(CBMLSPDef));
+    /* Spilling extraction results does not bound this project-wide array or
+     * its owned strings. Refuse the lower bound before calloc can turn a
+     * data archive into several more gigabytes of anonymous memory. */
+    if (total > INT_MAX || total > SIZE_MAX / sizeof(CBMLSPDef) ||
+        cbm_mem_would_exceed_budget(total * sizeof(CBMLSPDef))) {
+        goto over_budget;
+    }
+    defs = (CBMLSPDef *)calloc(total, sizeof(CBMLSPDef));
     if (!defs) {
         *out_count = 0;
         if (out_def_starts) {
@@ -1232,6 +1242,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     int capacity = total;
     int idx = 0;
     for (int fi = 0; fi < file_count; fi++) {
+        if (cbm_mem_would_exceed_budget(0)) {
+            goto over_budget;
+        }
         if (out_def_starts) {
             out_def_starts[fi] = idx;
         }
@@ -1251,12 +1264,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
 #endif
             fr_loaded = fr != NULL;
             if (!fr && owner_walk_required) {
-                free(defs);
                 *out_count = -1;
-                if (out_def_starts) {
-                    memset(out_def_starts, 0, (size_t)(file_count + 1) * sizeof(int));
-                }
-                return NULL;
+                goto collect_failure;
             }
         }
         if (!fr)
@@ -1289,6 +1298,15 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                         &bs.imp_count);
         }
         for (int di = 0; di < fr->defs.count; di++) {
+            /* One file can contain millions of JSON entries; a per-file
+             * check alone cannot bound the strings copied into the arena. */
+            if ((di & 255) == 0 && cbm_mem_would_exceed_budget(0)) {
+                cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count);
+                if (fr_loaded) {
+                    cbm_free_result(fr);
+                }
+                goto over_budget;
+            }
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
                                   files[fi].language, &defs[idx], bs.reg ? &bs : NULL) == 0) {
                 idx++;
@@ -1330,6 +1348,16 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     }
     *out_count = idx;
     return defs;
+
+over_budget:
+    cbm_log_error("mem.budget.exceeded", "phase", "lsp_cross_collect", "action", "fail_whole");
+    *out_count = CBM_PXC_DEFS_OVER_BUDGET;
+collect_failure:
+    free(defs);
+    if (out_def_starts) {
+        memset(out_def_starts, 0, ((size_t)file_count + 1) * sizeof(int));
+    }
+    return NULL;
 }
 
 /* Return the one source import path bound to `local_name`, or NULL when the
@@ -2547,7 +2575,10 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_pxc_collect_all_defs(ctx, &ctx->seq_cross_arena, cache, files, file_count,
                                  ctx->project_name, def_modules, &def_count, def_starts);
     if (def_count < 0 || (owner_walk_required && (!all_defs || def_count <= 0))) {
-        atomic_store(&ctx->test_declarations_failed, 1);
+        bool over_budget = def_count == CBM_PXC_DEFS_OVER_BUDGET;
+        if (!over_budget) {
+            atomic_store(&ctx->test_declarations_failed, 1);
+        }
         cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
         free(all_defs);
         for (int i = 0; i < file_count; i++) {
@@ -2558,7 +2589,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
             cbm_pxc_set_rust_manifest(NULL);
             cbm_arena_destroy(&cargo_arena);
         }
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return over_budget ? CBM_PIPELINE_ABORT_OVER_BUDGET : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the

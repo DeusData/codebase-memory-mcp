@@ -78,6 +78,20 @@ its measurement is skipped, because a total without a live member would
 under-report. On Linux the probe reads every `/proc/<pid>/stat` to find the
 tree's members, so a `/proc` mounted with `hidepid=1` makes it fail closed.
 
+## Internal cross-file memory budget
+
+The internal `CBM_MEM_BUDGET_MB` budget also applies when extraction results
+are gathered for cross-file resolution. The collector checks the remaining
+charged-memory budget before allocating the project-wide definition array and
+periodically while copying definitions. A budget refusal aborts the staged
+update and preserves the serving index. The parallel driver also checks the
+budget between shared registry builders.
+
+C# and Java/Kotlin registry scratch arrays scale with definitions of their
+own languages, rather than every definition in the repository. This avoids
+large unrelated data files multiplying those temporary allocations. These
+checks remain cooperative; they do not replace the process-tree watchdog.
+
 ## Counting and failure semantics
 
 `index_max_files` counts a file only after it passes directory pruning, ignore

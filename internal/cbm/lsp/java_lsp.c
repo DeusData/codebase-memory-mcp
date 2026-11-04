@@ -3850,8 +3850,12 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
      * NULL, which must not be mistaken for OOM — the empty registry is still
      * built, finalized, and shared. */
     CBMLSPDef *jvm = NULL;
-    if (def_count > 0) {
-        jvm = (CBMLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(*jvm));
+    int jvm_count = 0;
+    for (int i = 0; i < def_count; i++) {
+        jvm_count += defs[i].lang == CBM_LANG_JAVA || defs[i].lang == CBM_LANG_KOTLIN;
+    }
+    if (jvm_count > 0) {
+        jvm = (CBMLSPDef *)cbm_arena_alloc(arena, (size_t)jvm_count * sizeof(*jvm));
         if (!jvm) {
             return NULL;
         }

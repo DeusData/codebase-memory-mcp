@@ -1737,6 +1737,24 @@ TEST(mem_over_budget_follows_the_charged_reading) {
     PASS();
 }
 
+TEST(mem_upcoming_allocation_respects_remaining_budget) {
+    size_t saved = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests(1024);
+    cbm_mem_set_charged_for_tests(1000);
+    bool exact_fits = !cbm_mem_would_exceed_budget(24);
+    bool too_big = cbm_mem_would_exceed_budget(25);
+    bool overflow = cbm_mem_would_exceed_budget(SIZE_MAX);
+    cbm_mem_set_charged_for_tests(1025);
+    bool already_over = cbm_mem_would_exceed_budget(0);
+    cbm_mem_set_charged_for_tests(0);
+    cbm_mem_set_budget_for_tests(saved);
+    ASSERT_TRUE(exact_fits);
+    ASSERT_TRUE(too_big);
+    ASSERT_TRUE(overflow);
+    ASSERT_TRUE(already_over);
+    PASS();
+}
+
 TEST(mem_core_class_names_are_total) {
     ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_SEMANTIC), "semantic") == 0);
     ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_ARENA), "arena") == 0);
@@ -1840,4 +1858,5 @@ SUITE(mem) {
     RUN_TEST(mem_system_available_ram_is_within_total);
     RUN_TEST(mem_system_under_pressure_is_a_pure_threshold);
     RUN_TEST(mem_over_budget_follows_the_charged_reading);
+    RUN_TEST(mem_upcoming_allocation_respects_remaining_budget);
 }
