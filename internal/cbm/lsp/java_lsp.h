@@ -35,6 +35,8 @@
 #include "../cbm.h"
 #include "go_lsp.h" /* CBMLSPDef, CBMResolvedCallArray reused across languages */
 
+#define JAVA_EXT_MEMO 8
+
 /* Java `use`-style import kinds. Mirrors PHP's enum with Java semantics. */
 enum {
     CBM_JAVA_IMPORT_TYPE = 0,      /* import com.foo.Bar; — type import */
@@ -90,6 +92,12 @@ typedef struct {
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
+
+    /* java_receiver_is_external's answers for the packages probed so far
+     * (a few per file), so each costs one registry walk. */
+    const char *ext_memo_pkg[JAVA_EXT_MEMO];
+    bool ext_memo_val[JAVA_EXT_MEMO];
+    int ext_memo_next;
 } JavaLSPContext;
 
 /* ── Initialization / configuration ───────────────────────────────── */
