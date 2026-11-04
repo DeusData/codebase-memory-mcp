@@ -248,6 +248,11 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+/* Freeze Swift declaration/extension ownership after all definitions are registered. */
+void cbm_registry_build_swift_owners(cbm_registry_t *registry, const cbm_gbuf_t *graph,
+                                     const char *repo_path, char **excluded_dirs,
+                                     int excluded_count);
+
 /* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
@@ -362,8 +367,9 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 
 /* Per-worker manifest collection entry. */
 typedef struct {
-    char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
-    char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    char *pkg_name;     /* heap: "@myorg/pkg", "github.com/foo/bar" */
+    char *entry_rel;    /* heap: "packages/pkg/src/index" (no extension) */
+    char *manifest_rel; /* heap: owning SwiftPM manifest, NULL for other ecosystems */
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -935,6 +941,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
+/* Swift target roots plus package boundaries (pkg_name == NULL), using the literal parser. */
+int cbm_pkgmap_scan_swift_targets(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count);

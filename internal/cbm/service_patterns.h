@@ -34,6 +34,7 @@ void cbm_service_patterns_init(void);
  * Matches on library name substrings in the QN (e.g., "requests" in
  * "project.venv.requests.api.get"). Import-alias transparent. */
 cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn);
+cbm_svc_kind_t cbm_service_pattern_match_named(const char *resolved_qn, const char *name);
 
 /* True for a bare, unqualified call to the native `fetch()` API. Deliberately
  * NOT part of the substring tables above: those are matched unconditionally

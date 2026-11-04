@@ -29,13 +29,17 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
+#include "foundation/arena.h"
 #include "foundation/dyn_array.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "callable_sig.h" /* cbm_qn_callable_base_len_named: overloads share the name key */
+#include "yyjson/yyjson.h"
 
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,6 +98,41 @@ typedef struct {
     uint8_t *lang;
 } qn_array_t;
 
+typedef struct {
+    uint64_t defaults;
+    uint8_t count;
+    char selector[];
+} swift_signature_t;
+typedef struct swift_owner swift_owner_t;
+struct swift_owner {
+    const char *qn;
+    const char *path;
+    const char *module;
+    const char *module_name;
+    const char *manifest;
+    const char *imports;
+    bool declaration;
+    swift_owner_t *primary;
+    swift_owner_t *members;
+    swift_owner_t *next_member;
+    swift_owner_t *next_path;
+    swift_owner_t *next;
+};
+
+typedef struct {
+    CBMArena arena;
+    const cbm_registry_t *registry;
+    cbm_pkg_entries_t targets;
+    CBMHashTable *by_source_root;
+    CBMHashTable *by_manifest_root;
+    CBMHashTable *by_target_name;
+    cbm_pkg_entry_t ambiguous_target;
+    CBMHashTable *by_qn;
+    CBMHashTable *by_path;
+    CBMHashTable *by_module_path;
+    CBMHashTable *return_types;
+    swift_owner_t *types;
+} swift_owners_t;
 _Static_assert(CBM_LANG_COUNT <= UINT8_MAX, "CBMLanguage must fit the per-entry lang byte");
 
 struct cbm_registry {
@@ -107,6 +146,9 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+    CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
+    CBMHashTable *swift_overloads;  /* base callable QN -> overloads */
+    swift_owners_t *swift_owners;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -1465,6 +1507,36 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     free((void *)key);
 }
 
+static void free_swift_signature(const char *key, void *value, void *ud) {
+    (void)key;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+static void free_swift_overloads(const char *key, void *value, void *ud) {
+    (void)ud;
+    qn_array_t *overloads = value;
+    cbm_da_free(overloads);
+    cbm_free(CBM_MEM_CLASS_OTHER, overloads);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void swift_owners_free(swift_owners_t *index) {
+    if (!index) {
+        return;
+    }
+    cbm_ht_free(index->by_qn);
+    cbm_ht_free(index->by_path);
+    cbm_ht_free(index->by_module_path);
+    cbm_ht_free(index->return_types);
+    cbm_ht_free(index->by_source_root);
+    cbm_ht_free(index->by_manifest_root);
+    cbm_ht_free(index->by_target_name);
+    cbm_pkg_entries_free(&index->targets);
+    cbm_arena_destroy(&index->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, index);
+}
+
 void cbm_registry_free(cbm_registry_t *r) {
     if (!r) {
         return;
@@ -1472,6 +1544,15 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    if (r->swift_signatures) {
+        cbm_ht_foreach(r->swift_signatures, free_swift_signature, NULL);
+        cbm_ht_free(r->swift_signatures);
+    }
+    if (r->swift_overloads) {
+        cbm_ht_foreach(r->swift_overloads, free_swift_overloads, NULL);
+        cbm_ht_free(r->swift_overloads);
+    }
+    swift_owners_free(r->swift_owners);
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -1691,6 +1772,69 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
         index_under_name(r, name, owned_qn, lang);
     }
+}
+
+static void swift_index_overload(cbm_registry_t *r, const char *qn, const char *owned) {
+    if (!r->swift_overloads) {
+        r->swift_overloads = cbm_ht_create(CBM_SZ_512);
+    }
+    if (!r->swift_overloads) {
+        return;
+    }
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    char *base = cbm_alloc(CBM_MEM_CLASS_OTHER, base_len + SKIP_ONE);
+    if (!base) {
+        return;
+    }
+    memcpy(base, qn, base_len);
+    base[base_len] = '\0';
+    qn_array_t *overloads = cbm_ht_get(r->swift_overloads, base);
+    if (!overloads) {
+        overloads = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*overloads));
+        if (!overloads) {
+            cbm_free(CBM_MEM_CLASS_OTHER, base);
+            return;
+        }
+        cbm_ht_set(r->swift_overloads, base, overloads);
+    } else {
+        cbm_free(CBM_MEM_CLASS_OTHER, base);
+    }
+    for (int i = 0; i < overloads->count; i++) {
+        if (overloads->items[i] == owned) {
+            return;
+        }
+    }
+    cbm_da_push(overloads, (char *)owned);
+}
+
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count,
+                                      const char *selector) {
+    if (!r || !qualified_name) {
+        return;
+    }
+    const char *owned = cbm_ht_get_key(r->exact, qualified_name);
+    if (!owned) {
+        return;
+    }
+    if (!r->swift_signatures) {
+        r->swift_signatures = cbm_ht_create(CBM_SZ_512);
+        if (!r->swift_signatures) {
+            return;
+        }
+    }
+    const char *text =
+        selector ? selector : qualified_name + cbm_qn_callable_base_len(qualified_name);
+    swift_signature_t *sig = cbm_alloc(CBM_MEM_CLASS_OTHER, sizeof(*sig) + strlen(text) + SKIP_ONE);
+    if (!sig) {
+        return;
+    }
+    sig->defaults = default_mask;
+    sig->count = param_count;
+    memcpy(sig->selector, text, strlen(text) + SKIP_ONE);
+    cbm_free(CBM_MEM_CLASS_OTHER, cbm_ht_get(r->swift_signatures, owned));
+    cbm_ht_set(r->swift_signatures, owned, sig);
+    swift_index_overload(r, qualified_name, owned);
 }
 
 /* A generated member (a Java record's implicit accessor) is a definition the
@@ -2128,10 +2272,10 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
      * URL carry no underscore and stay guarded. */
     int has_underscore = 0;
     int all_caps = 1;
-    for (const char *c = dotted; c < last_dot && *c != '.'; c++) {
-        if (*c == '_') {
+    for (size_t i = 0; i < w && dotted[i] != '.'; i++) {
+        if (dotted[i] == '_') {
             has_underscore = 1;
-        } else if (*c >= 'a' && *c <= 'z') {
+        } else if (dotted[i] >= 'a' && dotted[i] <= 'z') {
             all_caps = 0;
             break;
         }
@@ -2428,6 +2572,1599 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
         }
     }
     return res;
+}
+
+/* Read labels from the uncapped selector. Types may contain commas in
+ * tuples, generic arguments or function types, so only top-level commas split
+ * parameters. The type text is used only to recognize a trailing closure. */
+typedef struct {
+    int parens;
+    int brackets;
+    int angles;
+} swift_parameter_depth_t;
+
+static void swift_parameter_depth_step(swift_parameter_depth_t *depth, char ch, char previous) {
+    switch (ch) {
+    case '(':
+        depth->parens++;
+        break;
+    case ')':
+        if (depth->parens > 0) {
+            depth->parens--;
+        }
+        break;
+    case '[':
+        depth->brackets++;
+        break;
+    case ']':
+        if (depth->brackets > 0) {
+            depth->brackets--;
+        }
+        break;
+    case '<':
+        depth->angles++;
+        break;
+    case '>':
+        if (depth->angles > 0 && previous != '=') {
+            depth->angles--;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static bool swift_type_wraps(const char *start, const char *end) {
+    if (*start != '(') {
+        return false;
+    }
+    swift_parameter_depth_t depth = {0};
+    bool comma = false;
+    for (const char *p = start; p < end; p++) {
+        swift_parameter_depth_step(&depth, *p, p == start ? '\0' : p[-SKIP_ONE]);
+        if (*p == ')' && depth.parens == 0) {
+            return p == end - SKIP_ONE && !comma;
+        }
+        if (*p == ',' && depth.parens == SKIP_ONE && depth.brackets == 0 && depth.angles == 0) {
+            comma = true;
+        }
+    }
+    return false;
+}
+
+static bool swift_type_is_closure(const char *start, const char *end) {
+    while (start < end) {
+        if (end[-SKIP_ONE] == '?') {
+            end--;
+            continue;
+        }
+        if (!swift_type_wraps(start, end)) {
+            break;
+        }
+        start++;
+        end--;
+    }
+    swift_parameter_depth_t depth = {0};
+    for (const char *p = start; p + SKIP_ONE < end; p++) {
+        if (*p == '=' && p[SKIP_ONE] == '>' && depth.parens == 0 && depth.brackets == 0 &&
+            depth.angles == 0) {
+            return true;
+        }
+        swift_parameter_depth_step(&depth, *p, p == start ? '\0' : p[-SKIP_ONE]);
+    }
+    return false;
+}
+
+enum { SWIFT_MAX_PARAMETERS = 64, SWIFT_INCOMPATIBLE = -1 };
+
+typedef struct {
+    const char *labels[SWIFT_MAX_PARAMETERS];
+    size_t label_lens[SWIFT_MAX_PARAMETERS];
+    bool closures[SWIFT_MAX_PARAMETERS];
+    bool variadics[SWIFT_MAX_PARAMETERS];
+    unsigned count;
+} swift_parameters_t;
+
+/* Exact match for a later trailing closure's label. NULL and empty labels
+ * never match, so a call with no captured label binds nothing by label. */
+static bool swift_label_matches(const char *label, const char *want, size_t want_len) {
+    return label && label[0] && strlen(label) == want_len && memcmp(label, want, want_len) == 0;
+}
+
+/* Whether trailing closure used may bind signature parameter i. The first
+ * unlabelled closure skips a default or variadic parameter only if a required
+ * parameter precedes the first parameter matching the next trailing label. */
+static bool swift_trailing_binds(const swift_signature_t *meta, const CBMCall *call,
+                                 const swift_parameters_t *params, unsigned i, unsigned total,
+                                 unsigned used) {
+    if (used >= total || !params->closures[i]) {
+        return false;
+    }
+    if (used > 0) {
+        const char *tl = call->trailing_closure_labels ? call->trailing_closure_labels[used] : NULL;
+        return swift_label_matches(tl, params->labels[i], params->label_lens[i]);
+    }
+    if (!params->variadics[i] && (meta->defaults & (UINT64_C(1) << i)) == 0) {
+        return true;
+    }
+    const char *next_label = total > SKIP_ONE && call->trailing_closure_labels
+                                 ? call->trailing_closure_labels[SKIP_ONE]
+                                 : NULL;
+    for (unsigned j = i + SKIP_ONE; j < params->count; j++) {
+        if (swift_label_matches(next_label, params->labels[j], params->label_lens[j])) {
+            break;
+        }
+        if (!params->variadics[j] && (meta->defaults & (UINT64_C(1) << j)) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool swift_parameter_add(swift_parameters_t *params, const char *entry, const char *end) {
+    if (params->count >= SWIFT_MAX_PARAMETERS) {
+        return false;
+    }
+    const char *colon = memchr(entry, ':', (size_t)(end - entry));
+    if (!colon) {
+        return false;
+    }
+    unsigned i = params->count;
+    params->labels[i] = entry;
+    params->label_lens[i] = (size_t)(colon - entry);
+    params->variadics[i] = end > colon + SKIP_ONE && end[-SKIP_ONE] == '~';
+    const char *type_end = params->variadics[i] ? end - SKIP_ONE : end;
+    params->closures[i] = swift_type_is_closure(colon + SKIP_ONE, type_end);
+    params->count++;
+    return true;
+}
+
+/* Declaration requirements distinguish nodes, without proving applicability. */
+static size_t swift_generic_prefix_len(const char *sig, size_t n) {
+    unsigned depth = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (sig[i] == '<') {
+            depth++;
+        } else if (sig[i] == '>' && (i == 0 || sig[i - SKIP_ONE] != '=')) {
+            if (depth == 0) {
+                return 0;
+            }
+            if (--depth == 0) {
+                return i + SKIP_ONE;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Split only at top-level commas; preserve the closure/variadic spelling rules. */
+static bool swift_parameters_read(const swift_signature_t *meta, swift_parameters_t *params) {
+    const char *sig = meta->selector;
+    size_t n = cbm_callable_return_offset(sig);
+    const size_t async_len = sizeof("async") - SKIP_ONE;
+    if (n >= async_len && memcmp(sig + n - async_len, "async", async_len) == 0) {
+        n -= async_len;
+    }
+    /* Declaration generic requirements distinguish nodes, but do not prove
+     * applicability. Read only params when selecting compatible candidates. */
+    if (n && sig[0] == '<') {
+        size_t i = swift_generic_prefix_len(sig, n);
+        if (i == 0 || i >= n) {
+            return false;
+        }
+        sig += i;
+        n -= i;
+    }
+    if (n < PAIR_LEN || sig[0] != '(' || sig[n - SKIP_ONE] != ')' || strchr(sig, '#')) {
+        return false;
+    }
+    const char *entry = sig + SKIP_ONE;
+    const char *end = sig + n - SKIP_ONE;
+    swift_parameter_depth_t depth = {0};
+    for (const char *p = entry; p <= end; p++) {
+        bool boundary = p == end || (*p == ',' && depth.parens == 0 && depth.brackets == 0 &&
+                                     depth.angles == 0);
+        if (boundary) {
+            if (p > entry && !swift_parameter_add(params, entry, p)) {
+                return false;
+            }
+            entry = p + SKIP_ONE;
+            continue;
+        }
+        char previous = p == entry ? '\0' : p[-SKIP_ONE];
+        swift_parameter_depth_step(&depth, *p, previous);
+    }
+    return params->count == meta->count;
+}
+
+static bool swift_argument_label_matches(const swift_parameters_t *params, const CBMCall *call,
+                                         unsigned i, int arg) {
+    if (arg >= call->arg_count) {
+        return false;
+    }
+    const char *given = call->args[arg].keyword;
+    if (!given) {
+        given = "_";
+    }
+    return strlen(given) == params->label_lens[i] &&
+           memcmp(given, params->labels[i], params->label_lens[i]) == 0;
+}
+
+static int swift_variadic_advance(const CBMCall *call, int arg, bool label_matches) {
+    if (!label_matches) {
+        return arg;
+    }
+    arg++;
+    while (arg < call->arg_count && !call->args[arg].keyword) {
+        arg++;
+    }
+    return arg;
+}
+
+static uint16_t swift_trailing_advance(const swift_parameters_t *params,
+                                       const swift_signature_t *meta, const CBMCall *call,
+                                       unsigned i, unsigned total, uint16_t states) {
+    uint16_t next = 0;
+    for (unsigned used = 0; used < total; used++) {
+        if ((states & (UINT16_C(1) << used)) &&
+            swift_trailing_binds(meta, call, params, i, total, used)) {
+            next |= (uint16_t)(UINT16_C(1) << (used + SKIP_ONE));
+        }
+    }
+    return next;
+}
+
+static void swift_parameter_advance(const swift_parameters_t *params, const swift_signature_t *meta,
+                                    const CBMCall *call, unsigned i, unsigned total, int arg,
+                                    uint16_t states, uint16_t *next) {
+    uint16_t trailing =
+        arg == call->arg_count ? swift_trailing_advance(params, meta, call, i, total, states) : 0;
+    if (params->variadics[i] || (meta->defaults & (UINT64_C(1) << i))) {
+        /* After explicit arguments, preserve the first eligible trailing
+         * binding instead of skipping it to a later one. */
+        next[arg] |= states & (uint16_t)~(trailing >> SKIP_ONE);
+    }
+    if (swift_argument_label_matches(params, call, i, arg)) {
+        int end = params->variadics[i] ? swift_variadic_advance(call, arg, true) : arg + SKIP_ONE;
+        next[end] |= states;
+        if (params->variadics[i] && end == call->arg_count) {
+            next[end] |= swift_trailing_advance(params, meta, call, i, total, states);
+        }
+    }
+    next[arg] |= trailing;
+}
+
+static bool swift_parameters_match(const swift_parameters_t *params, const swift_signature_t *meta,
+                                   const CBMCall *call) {
+    /* Preserve the legacy bool as one unlabelled closure for manual callers. */
+    unsigned trailing_total = call->trailing_closure_count;
+    if (trailing_total == 0 && call->has_trailing_closure) {
+        trailing_total = SKIP_ONE;
+    }
+    /* Each argument cursor retains the reachable trailing-closure counts.
+     * A matching label must not greedily consume an earlier default when
+     * the same label is needed by a later required parameter. */
+    uint16_t states[CBM_MAX_CALL_ARGS + SKIP_ONE] = {SKIP_ONE};
+    for (unsigned i = 0; i < params->count; i++) {
+        uint16_t next[CBM_MAX_CALL_ARGS + SKIP_ONE] = {0};
+        for (int arg = 0; arg <= call->arg_count; arg++) {
+            if (!states[arg]) {
+                continue;
+            }
+            swift_parameter_advance(params, meta, call, i, trailing_total, arg, states[arg], next);
+        }
+        memcpy(states, next, sizeof(states));
+    }
+    return (states[call->arg_count] & (UINT16_C(1) << trailing_total)) != 0;
+}
+
+static bool swift_signature_matches(const swift_signature_t *meta, const CBMCall *call) {
+    if (!meta || meta->count == UINT8_MAX || call->arg_count < 0 ||
+        call->arg_count > CBM_MAX_CALL_ARGS || (call->arg_count > 0 && !call->args) ||
+        call->args_truncated || call->trailing_closure_truncated ||
+        call->trailing_closure_count > CBM_MAX_TRAILING_CLOSURES) {
+        return false;
+    }
+    swift_parameters_t params;
+    params.count = 0;
+    if (!swift_parameters_read(meta, &params)) {
+        return false;
+    }
+    return swift_parameters_match(&params, meta, call);
+}
+
+/* Keep receiver choice ahead of general import/name choice. Without a module,
+ * this path still uses the deterministic distance tie-break, as before. */
+static const char *swift_choose_receiver(const cbm_registry_t *r, const char **matches, int matched,
+                                         const char *name, const CBMCall *call,
+                                         const char *module_qn, const char **import_vals,
+                                         int import_count, const char **scratch) {
+    if (!strchr(call->callee_name, '.')) {
+        return NULL;
+    }
+    size_t callee_len = strlen(call->callee_name);
+    const char **receiver_matches = scratch;
+    int receiver_count = 0;
+    for (int i = 0; i < matched; i++) {
+        size_t base = cbm_qn_callable_base_len_named(matches[i], name);
+        if (base >= callee_len &&
+            memcmp(matches[i] + base - callee_len, call->callee_name, callee_len) == 0 &&
+            (base == callee_len || matches[i][base - callee_len - SKIP_ONE] == '.')) {
+            receiver_matches[receiver_count++] = matches[i];
+        }
+    }
+    if (receiver_count == 0) {
+        return NULL;
+    }
+    const char **reachable = scratch + matched;
+    int reachable_count = 0;
+    if (import_vals) {
+        for (int i = 0; i < receiver_count; i++) {
+            if (is_import_reachable(receiver_matches[i], import_vals, import_count)) {
+                reachable[reachable_count++] = receiver_matches[i];
+            }
+        }
+    }
+    const char **preferred = reachable_count > 0 ? reachable : receiver_matches;
+    int preferred_count = reachable_count > 0 ? reachable_count : receiver_count;
+    return best_by_import_distance(r, preferred, NULL, NULL, preferred_count, module_qn);
+}
+
+static const char *swift_choose_candidate(const cbm_registry_t *r, const char **matches,
+                                          int matched, const char *name, const CBMCall *call,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **scratch) {
+    const char *chosen = swift_choose_receiver(r, matches, matched, name, call, module_qn,
+                                               import_vals, import_count, scratch);
+    if (chosen) {
+        return chosen;
+    }
+    const char **reachable = scratch;
+    int reachable_count = 0;
+    if (import_vals) {
+        for (int i = 0; i < matched; i++) {
+            if (is_import_reachable(matches[i], import_vals, import_count)) {
+                reachable[reachable_count++] = matches[i];
+            }
+        }
+    }
+    if (reachable_count > 0) {
+        chosen = module_qn
+                     ? best_by_import_distance(r, reachable, NULL, NULL, reachable_count, module_qn)
+                     : reachable[0];
+    }
+    if (!chosen) {
+        chosen = module_qn ? best_by_import_distance(r, matches, NULL, NULL, matched, module_qn)
+                           : matches[0];
+    }
+    return chosen;
+}
+
+static int swift_owner_bucket(const cbm_registry_t *r, const CBMCall *call, const char *type_qn,
+                              const char *name, const char **out, int out_cap, int found) {
+    char base[CBM_SZ_4K];
+    int n = snprintf(base, sizeof(base), "%s.%s", type_qn, name);
+    if (n < 0 || (size_t)n >= sizeof(base)) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    const qn_array_t *bucket = r->swift_overloads ? cbm_ht_get(r->swift_overloads, base) : NULL;
+    if (!bucket) {
+        return found;
+    }
+    for (int i = 0; i < bucket->count; i++) {
+        swift_signature_t *meta = cbm_ht_get(r->swift_signatures, bucket->items[i]);
+        if (meta && swift_signature_matches(meta, call)) {
+            if (found == out_cap) {
+                return SWIFT_INCOMPATIBLE;
+            }
+            out[found++] = bucket->items[i];
+        }
+    }
+    return found;
+}
+
+static yyjson_doc *swift_type_properties(const cbm_gbuf_t *graph, const char *qn) {
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(graph, qn);
+    if (!node || !node->properties_json) {
+        return NULL;
+    }
+    return yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+}
+
+/* shortcut: files outside literal SwiftPM targets use their source directory,
+ * add build-system module maps when other project formats are supported. */
+static size_t swift_owner_module_length(const char *file) {
+    const char *end = strrchr(file, '/');
+    for (const char *part = file; *part;) {
+        const char *slash = strchr(part, '/');
+        if (!slash) {
+            break;
+        }
+        size_t n = (size_t)(slash - part);
+        if (n == strlen("Source") && memcmp(part, "Source", n) == 0) {
+            end = slash;
+            break;
+        }
+        if ((n == strlen("Sources") && memcmp(part, "Sources", n) == 0) ||
+            (n == strlen("Tests") && memcmp(part, "Tests", n) == 0)) {
+            const char *target = strchr(slash + SKIP_ONE, '/');
+            if (target) {
+                end = target;
+            }
+            break;
+        }
+        part = slash + SKIP_ONE;
+    }
+    return end ? (size_t)(end - file) : 0;
+}
+
+static const char *swift_owner_module(CBMArena *arena, const char *file) {
+    return cbm_arena_strndup(arena, file, swift_owner_module_length(file));
+}
+
+static const char *swift_module_path_key(CBMArena *arena, const char *module, const char *path) {
+    return cbm_arena_sprintf(arena, "%s\n%s", module, path);
+}
+
+static const cbm_pkg_entry_t *swift_owner_target(const swift_owners_t *index, const char *file) {
+    char directory[CBM_SZ_4K];
+    size_t len = strlen(file);
+    if (len >= sizeof(directory)) {
+        return NULL;
+    }
+    memcpy(directory, file, len + SKIP_ONE);
+    for (;;) {
+        char *slash = strrchr(directory, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            directory[0] = '\0';
+        }
+        const cbm_pkg_entry_t *target = cbm_ht_get(index->by_source_root, directory);
+        if (target) {
+            return target;
+        }
+        if (cbm_ht_has(index->by_manifest_root, directory)) {
+            return &index->ambiguous_target;
+        }
+        if (!directory[0]) {
+            return NULL;
+        }
+    }
+}
+
+static void swift_owner_assign_module(swift_owners_t *index, swift_owner_t *type,
+                                      const char *file) {
+    const cbm_pkg_entry_t *target = swift_owner_target(index, file);
+    if (target && target->pkg_name) {
+        type->module =
+            cbm_arena_sprintf(&index->arena, "%s\n%s", target->manifest_rel, target->pkg_name);
+        type->module_name = target->pkg_name;
+        type->manifest = target->manifest_rel;
+    } else if (target) {
+        /* Overlapping target roots need sources/excludes before files can be assigned. */
+        type->module = cbm_arena_strdup(&index->arena, file);
+        type->module_name = "";
+    } else {
+        type->module = swift_owner_module(&index->arena, file);
+        const char *leaf = type->module ? strrchr(type->module, '/') : NULL;
+        type->module_name = leaf ? leaf + SKIP_ONE : type->module;
+    }
+}
+
+static void swift_owner_index_add(swift_owners_t *index, swift_owner_t *type) {
+    type->next = index->types;
+    index->types = type;
+    cbm_ht_set(index->by_qn, type->qn, type);
+    if (type->declaration) {
+        type->next_path = cbm_ht_get(index->by_path, type->path);
+        cbm_ht_set(index->by_path, type->path, type);
+        const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+        swift_owner_t *prior = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        if (key && (!prior || strcmp(type->qn, prior->qn) < 0)) {
+            cbm_ht_set(index->by_module_path, key, type);
+        }
+    }
+}
+
+static void swift_return_type_collect(const cbm_gbuf_node_t *node, swift_owners_t *index) {
+    const char *key = cbm_ht_get_key(index->registry->swift_signatures, node->qualified_name);
+    if (!key || !node->properties_json) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    const char *type = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "return_type"));
+    const char *owned = type ? cbm_arena_strdup(&index->arena, type) : NULL;
+    if (owned) {
+        cbm_ht_set(index->return_types, key, (void *)owned);
+    }
+    yyjson_doc_free(doc);
+}
+
+static void swift_owner_collect(const cbm_gbuf_node_t *node, void *userdata) {
+    swift_owners_t *index = userdata;
+    swift_return_type_collect(node, index);
+    if (!node->file_path || !node->properties_json ||
+        (!strstr(node->properties_json, "\"swift_type_path\"") &&
+         !strstr(node->properties_json, "\"swift_extension\""))) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    yyjson_val *props = yyjson_doc_get_root(doc);
+    const char *declaration = yyjson_get_str(yyjson_obj_get(props, "swift_type_path"));
+    const char *extension = yyjson_get_str(yyjson_obj_get(props, "swift_extension"));
+    const char *path = declaration ? declaration : extension;
+    swift_owner_t *type = path ? cbm_arena_alloc(&index->arena, sizeof(*type)) : NULL;
+    if (!type) {
+        yyjson_doc_free(doc);
+        return;
+    }
+    memset(type, 0, sizeof(*type));
+    type->qn = cbm_arena_strdup(&index->arena, node->qualified_name);
+    type->path = cbm_arena_strdup(&index->arena, path);
+    swift_owner_assign_module(index, type, node->file_path);
+    const char *imports = yyjson_get_str(yyjson_obj_get(props, "swift_imports"));
+    type->imports = cbm_arena_strdup(&index->arena, imports ? imports : "");
+    type->declaration = declaration != NULL;
+    if (type->qn && type->path && type->module && type->imports) {
+        swift_owner_index_add(index, type);
+    }
+    yyjson_doc_free(doc);
+}
+
+static bool swift_owner_imports(const swift_owner_t *extension, const char *leaf) {
+    size_t n = strlen(leaf);
+    for (const char *p = extension->imports; p && *p;) {
+        const char *end = strchr(p, '|');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (n && len >= n && memcmp(p, leaf, n) == 0 && (len == n || p[n] == '.')) {
+            return true;
+        }
+        p = end ? end + SKIP_ONE : NULL;
+    }
+    return false;
+}
+
+static swift_owner_t *swift_owner_imported_primary(const swift_owners_t *index,
+                                                   const swift_owner_t *type) {
+    swift_owner_t *imported = NULL;
+    bool imported_local = false;
+    bool ambiguous = false;
+    for (swift_owner_t *decl = cbm_ht_get(index->by_path, type->path); decl;
+         decl = decl->next_path) {
+        if (swift_owner_imports(type, decl->module_name)) {
+            bool same_package =
+                type->manifest && decl->manifest && strcmp(type->manifest, decl->manifest) == 0;
+            if (imported_local && !same_package) {
+                continue;
+            }
+            if (same_package && !imported_local) {
+                imported = NULL;
+                imported_local = true;
+                ambiguous = false;
+            }
+            if (imported && strcmp(imported->module, decl->module) != 0) {
+                ambiguous = true;
+                continue;
+            }
+            if (!imported || strcmp(decl->qn, imported->qn) < 0) {
+                imported = decl;
+            }
+        }
+    }
+    return ambiguous ? NULL : imported;
+}
+
+static swift_owner_t *swift_owner_primary(const swift_owners_t *index, const swift_owner_t *type) {
+    char key[CBM_SZ_4K];
+    int length = snprintf(key, sizeof(key), "%s\n%s", type->module, type->path);
+    swift_owner_t *local =
+        length >= 0 && (size_t)length < sizeof(key) ? cbm_ht_get(index->by_module_path, key) : NULL;
+    return local ? local : swift_owner_imported_primary(index, type);
+}
+
+static void swift_owner_group_members(swift_owners_t *index) {
+    /* Unindexed external types still share extensions within their own target. */
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        if (type->primary) {
+            continue;
+        }
+        const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+        swift_owner_t *prior = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        if (key && (!prior || strcmp(type->qn, prior->qn) < 0)) {
+            cbm_ht_set(index->by_module_path, key, type);
+        }
+    }
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        if (!type->primary) {
+            const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+            type->primary = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        }
+        if (type->primary) {
+            type->next_member = type->primary->members;
+            type->primary->members = type;
+        }
+    }
+}
+
+void cbm_registry_build_swift_owners(cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                     const char *repo_path, char **excluded_dirs,
+                                     int excluded_count) {
+    if (!r || !graph) {
+        return;
+    }
+    swift_owners_free(r->swift_owners);
+    r->swift_owners = NULL;
+    if (!r->swift_signatures) {
+        return;
+    }
+    swift_owners_t *index = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*index));
+    if (!index) {
+        return;
+    }
+    cbm_arena_init(&index->arena);
+    index->registry = r;
+    cbm_pkg_entries_init(&index->targets);
+    (void)cbm_pkgmap_scan_swift_targets(repo_path, &index->targets, excluded_dirs, excluded_count);
+    index->by_source_root = cbm_ht_create(CBM_SZ_512);
+    index->by_manifest_root = cbm_ht_create(CBM_SZ_512);
+    index->by_target_name = cbm_ht_create(CBM_SZ_512);
+    index->by_qn = cbm_ht_create(CBM_SZ_512);
+    index->by_path = cbm_ht_create(CBM_SZ_512);
+    index->by_module_path = cbm_ht_create(CBM_SZ_512);
+    index->return_types = cbm_ht_create(CBM_SZ_512);
+    if (!index->by_source_root || !index->by_manifest_root || !index->by_target_name ||
+        !index->by_qn || !index->by_path || !index->by_module_path || !index->return_types) {
+        swift_owners_free(index);
+        return;
+    }
+    for (int i = 0; i < index->targets.count; i++) {
+        cbm_pkg_entry_t *target = &index->targets.items[i];
+        if (target->manifest_rel && !target->pkg_name && target->entry_rel) {
+            cbm_ht_set(index->by_manifest_root, target->entry_rel, target);
+        }
+        if (target->manifest_rel && target->pkg_name && target->entry_rel) {
+            const char *module =
+                swift_module_path_key(&index->arena, target->manifest_rel, target->pkg_name);
+            if (module) {
+                cbm_ht_set(index->by_target_name, module, target);
+            }
+            cbm_pkg_entry_t *prior = cbm_ht_get(index->by_source_root, target->entry_rel);
+            if (prior && (!prior->pkg_name || strcmp(prior->pkg_name, target->pkg_name) != 0 ||
+                          strcmp(prior->manifest_rel, target->manifest_rel) != 0)) {
+                cbm_ht_set(index->by_source_root, target->entry_rel, &index->ambiguous_target);
+            } else {
+                cbm_ht_set(index->by_source_root, target->entry_rel, target);
+            }
+        }
+    }
+    cbm_gbuf_foreach_node(graph, swift_owner_collect, index);
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        type->primary = swift_owner_primary(index, type);
+    }
+    swift_owner_group_members(index);
+    r->swift_owners = index;
+}
+
+static bool swift_module_visible(const swift_owners_t *index, const cbm_pkg_entry_t *target,
+                                 const CBMFileResult *file, const swift_owner_t *owner);
+
+static const char *swift_caller_path(const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                     const char *module_qn) {
+    const cbm_gbuf_node_t *module =
+        graph && module_qn ? cbm_gbuf_find_by_qn(graph, module_qn) : NULL;
+    if (module && module->file_path) {
+        return module->file_path;
+    }
+    return file && file->defs.count ? file->defs.items[0].file_path : NULL;
+}
+
+static bool swift_extension_visible(const swift_owners_t *index, const CBMFileResult *file,
+                                    const cbm_gbuf_t *graph, const char *module_qn,
+                                    const swift_owner_t *provider) {
+    if (provider->declaration || !file ||
+        (provider->primary && provider->primary->declaration &&
+         strcmp(provider->module, provider->primary->module) == 0)) {
+        return true;
+    }
+    const char *path = swift_caller_path(file, graph, module_qn);
+    const cbm_pkg_entry_t *target = path ? swift_owner_target(index, path) : NULL;
+    if (path && (!target || !target->pkg_name)) {
+        size_t length = target ? strlen(path) : swift_owner_module_length(path);
+        if (length == strlen(provider->module) && memcmp(path, provider->module, length) == 0) {
+            return true;
+        }
+    }
+    return swift_module_visible(index, target, file, provider);
+}
+
+static int swift_owner_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMFileResult *file, const char *module_qn,
+                                  const CBMCall *call, const char *name, const char **out,
+                                  int out_cap, const char **owner) {
+    const swift_owner_t *type = r->swift_owners ? cbm_ht_get(r->swift_owners->by_qn, *owner) : NULL;
+    if (!type || !type->primary) {
+        return swift_owner_bucket(r, call, *owner, name, out, out_cap, 0);
+    }
+    if (type->primary->declaration) {
+        *owner = type->primary->qn;
+    }
+    int found = 0;
+    for (const swift_owner_t *member = type->primary->members; member && found >= 0;
+         member = member->next_member) {
+        if (swift_extension_visible(r->swift_owners, file, graph, module_qn, member)) {
+            found = swift_owner_bucket(r, call, member->qn, name, out, out_cap, found);
+        }
+    }
+    return found;
+}
+
+enum { SWIFT_MAX_ANCESTORS = 64 };
+
+static bool swift_receiver_type_text(const char *type, char *out, size_t cap);
+
+static const swift_owner_t *swift_lexical_type(const swift_owners_t *index,
+                                               const swift_owner_t *scope, const char *nominal) {
+    size_t prefix = strlen(scope->path);
+    while (prefix) {
+        char key[CBM_SZ_4K];
+        int length = snprintf(key, sizeof(key), "%s\n%.*s.%s", scope->module, (int)prefix,
+                              scope->path, nominal);
+        const swift_owner_t *type = length >= 0 && (size_t)length < sizeof(key)
+                                        ? cbm_ht_get(index->by_module_path, key)
+                                        : NULL;
+        if (type) {
+            return type;
+        }
+        while (prefix && scope->path[prefix - SKIP_ONE] != '.') {
+            prefix--;
+        }
+        if (prefix) {
+            prefix--;
+        }
+    }
+    return NULL;
+}
+
+/* A declared type name belongs to the declaration's file, not the caller's. */
+static const char *swift_type_in_owner(const cbm_registry_t *r, const char *owner,
+                                       const char *type) {
+    char nominal[CBM_SZ_4K];
+    if (!swift_receiver_type_text(type, nominal, sizeof(nominal))) {
+        return NULL;
+    }
+    swift_owners_t *index = r->swift_owners;
+    const swift_owner_t *context = index ? cbm_ht_get(index->by_qn, owner) : NULL;
+    if (!context) {
+        return cbm_registry_resolve(r, nominal, owner, NULL, NULL, 0).qualified_name;
+    }
+    swift_owner_t reference = *context;
+    reference.path = nominal;
+    const swift_owner_t *resolved = swift_lexical_type(index, context, nominal);
+    if (!resolved && context->primary) {
+        resolved = swift_lexical_type(index, context->primary, nominal);
+    }
+    if (!resolved) {
+        resolved = swift_owner_primary(index, &reference);
+    }
+    if (resolved) {
+        return resolved->qn;
+    }
+    char *dot = strchr(nominal, '.');
+    if (!dot) {
+        return NULL;
+    }
+    *dot = '\0';
+    bool local = strcmp(nominal, context->module_name) == 0;
+    if (!local && !swift_owner_imports(context, nominal)) {
+        return NULL;
+    }
+    reference.path = dot + SKIP_ONE;
+    reference.imports = local ? "" : nominal;
+    resolved = local ? swift_owner_primary(index, &reference)
+                     : swift_owner_imported_primary(index, &reference);
+    return resolved ? resolved->qn : NULL;
+}
+
+static bool swift_type_seen(const char **types, int count, const char *qn) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(types[i], qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void swift_parent_types(const cbm_registry_t *r, const cbm_gbuf_t *graph, const char *owner,
+                               const char **types, int *count) {
+    yyjson_doc *doc = swift_type_properties(graph, owner);
+    if (!doc) {
+        return;
+    }
+    yyjson_val *bases = yyjson_obj_get(yyjson_doc_get_root(doc), "base_classes");
+    size_t i;
+    size_t max;
+    yyjson_val *base;
+    yyjson_arr_foreach(bases, i, max, base) {
+        const char *name = yyjson_get_str(base);
+        if (*count == SWIFT_MAX_ANCESTORS) {
+            break;
+        }
+        if (!name) {
+            continue;
+        }
+        const char *parent = swift_type_in_owner(r, owner, name);
+        if (parent && !swift_type_seen(types, *count, parent)) {
+            types[(*count)++] = parent;
+        }
+    }
+    yyjson_doc_free(doc);
+}
+
+static int swift_typed_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMFileResult *file, const char *module_qn,
+                                  const CBMCall *call, const char *type_qn, const char *name,
+                                  const char **out, int out_cap) {
+    const char *types[SWIFT_MAX_ANCESTORS] = {type_qn};
+    int count = SKIP_ONE;
+    /* shortcut: visit at most 64 hierarchy types, expand for larger valid hierarchies. */
+    for (int i = 0; i < count; i++) {
+        const char *owner = types[i];
+        int found =
+            swift_owner_candidates(r, graph, file, module_qn, call, name, out, out_cap, &owner);
+        if (found != 0) {
+            return found;
+        }
+        if (!graph || strcmp(name, "init") == 0 || strcmp(name, "deinit") == 0) {
+            break;
+        }
+        swift_parent_types(r, graph, owner, types, &count);
+    }
+    return SWIFT_INCOMPATIBLE;
+}
+
+enum { SWIFT_NO_TYPE_RECEIVER = -2 };
+
+static const swift_owner_t *swift_target_type(const swift_owners_t *index,
+                                              const cbm_pkg_entry_t *target, const char *type) {
+    char key[CBM_SZ_4K];
+    int n = snprintf(key, sizeof(key), "%s\n%s\n%s", target->manifest_rel, target->pkg_name, type);
+    return n >= 0 && (size_t)n < sizeof(key) ? cbm_ht_get(index->by_module_path, key) : NULL;
+}
+
+static const swift_owner_t *swift_imported_type(const swift_owners_t *index,
+                                                const cbm_pkg_entry_t *target,
+                                                const CBMFileResult *file, const char *type,
+                                                bool *ambiguous) {
+    const swift_owner_t *selected = NULL;
+    for (int i = 0; i < file->imports.count; i++) {
+        const char *name = file->imports.items[i].module_path;
+        if (!name) {
+            continue;
+        }
+        size_t length = strcspn(name, ".");
+        char key[CBM_SZ_4K];
+        int n = snprintf(key, sizeof(key), "%s\n%.*s", target->manifest_rel, (int)length, name);
+        const cbm_pkg_entry_t *imported =
+            n >= 0 && (size_t)n < sizeof(key) ? cbm_ht_get(index->by_target_name, key) : NULL;
+        if (!imported) {
+            continue;
+        }
+        const char *nominal = strncmp(type, name, length) == 0 && type[length] == '.'
+                                  ? type + length + SKIP_ONE
+                                  : type;
+        const swift_owner_t *candidate = swift_target_type(index, imported, nominal);
+        if (candidate) {
+            *ambiguous =
+                *ambiguous || (selected && strcmp(selected->module, candidate->module) != 0);
+            selected = candidate;
+        }
+    }
+    return selected;
+}
+
+static bool swift_module_visible(const swift_owners_t *index, const cbm_pkg_entry_t *target,
+                                 const CBMFileResult *file, const swift_owner_t *owner) {
+    if (target && target->pkg_name && owner->manifest &&
+        strcmp(owner->manifest, target->manifest_rel) == 0 &&
+        strcmp(owner->module_name, target->pkg_name) == 0) {
+        return true;
+    }
+    bool visible = false;
+    size_t length = strlen(owner->module_name);
+    for (int i = 0; i < file->imports.count; i++) {
+        const char *name = file->imports.items[i].module_path;
+        visible = visible || (name && length && strncmp(name, owner->module_name, length) == 0 &&
+                              (name[length] == '\0' || name[length] == '.'));
+    }
+    if (!target || !target->pkg_name) {
+        return visible;
+    }
+    char key[CBM_SZ_4K];
+    int n = snprintf(key, sizeof(key), "%s\n%s", target->manifest_rel, owner->module_name);
+    bool local_module = n >= 0 && (size_t)n < sizeof(key) && cbm_ht_has(index->by_target_name, key);
+    if (!visible || (local_module &&
+                     (!owner->manifest || strcmp(owner->manifest, target->manifest_rel) != 0))) {
+        return false;
+    }
+    return true;
+}
+
+static bool swift_receiver_visible(const swift_owners_t *index, const cbm_pkg_entry_t *target,
+                                   const CBMFileResult *file, const swift_owner_t *owner) {
+    owner = owner->primary && owner->primary->declaration ? owner->primary : owner;
+    return swift_module_visible(index, target, file, owner);
+}
+
+/* The global import map has one value per name. SwiftPM packages can each
+ * declare Core, so retain the caller's package before choosing its receiver. */
+static const char *swift_receiver_qn(const cbm_registry_t *r, const CBMFileResult *file,
+                                     const cbm_gbuf_t *graph, const char *type,
+                                     const char *module_qn, const char **import_vals,
+                                     int import_count) {
+    const swift_owners_t *index = r->swift_owners;
+    const char *path = swift_caller_path(file, graph, module_qn);
+    const cbm_pkg_entry_t *target =
+        index && path ? swift_owner_target(r->swift_owners, path) : NULL;
+    if (target && target->pkg_name && file) {
+        const swift_owner_t *selected = swift_target_type(index, target, type);
+        if (selected) {
+            return selected->qn;
+        }
+        bool ambiguous = false;
+        selected = swift_imported_type(index, target, file, type, &ambiguous);
+        if (ambiguous || selected) {
+            return ambiguous ? NULL : selected->qn;
+        }
+    }
+    cbm_resolution_t fallback =
+        cbm_registry_resolve(r, type, module_qn, NULL, import_vals, import_count);
+    const swift_owner_t *owner =
+        index && fallback.qualified_name ? cbm_ht_get(index->by_qn, fallback.qualified_name) : NULL;
+    if (owner && target && target->pkg_name && file &&
+        !swift_receiver_visible(index, target, file, owner)) {
+        return NULL;
+    }
+    return fallback.qualified_name;
+}
+
+static int swift_named_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMFileResult *file, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap) {
+    const char *dot = strrchr(call->callee_name, '.');
+    if (dot && isupper((unsigned char)call->callee_name[0]) &&
+        (size_t)(dot - call->callee_name) < CBM_SZ_512) {
+        char type[CBM_SZ_512];
+        memcpy(type, call->callee_name, (size_t)(dot - call->callee_name));
+        type[dot - call->callee_name] = '\0';
+        const char *receiver =
+            swift_receiver_qn(r, file, graph, type, module_qn, import_vals, import_count);
+        if (receiver) {
+            return swift_typed_candidates(r, graph, file, module_qn, call, receiver,
+                                          simple_name(call->callee_name), out, out_cap);
+        }
+        return SWIFT_INCOMPATIBLE;
+    }
+    return SWIFT_NO_TYPE_RECEIVER;
+}
+
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap) {
+    if (!r || !r->swift_signatures || !call || !call->callee_name || !out || out_cap < SKIP_ONE) {
+        return 0;
+    }
+    const char *name = simple_name(call->callee_name);
+    int typed = swift_named_candidates(r, NULL, NULL, call, module_qn, import_vals, import_count,
+                                       out, out_cap);
+    if (typed != SWIFT_NO_TYPE_RECEIVER) {
+        return typed;
+    }
+    qn_array_t *bucket = cbm_ht_get(r->by_name, name);
+    if (!bucket) {
+        return 0;
+    }
+    enum { SWIFT_MATCH_BUFFERS = 3 };
+    if ((size_t)bucket->count > SIZE_MAX / sizeof(const char *) / SWIFT_MATCH_BUFFERS) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    const char **matches = cbm_alloc(
+        CBM_MEM_CLASS_OTHER, (size_t)bucket->count * SWIFT_MATCH_BUFFERS * sizeof(*matches));
+    if (!matches) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    int matched = 0;
+    bool has_swift = false;
+    for (int i = 0; i < bucket->count; i++) {
+        const char *qn = bucket->items[i];
+        swift_signature_t *meta = cbm_ht_get(r->swift_signatures, qn);
+        has_swift = has_swift || meta != NULL;
+        if (meta && receiver_chain_admits(call->callee_name, qn) &&
+            swift_signature_matches(meta, call)) {
+            matches[matched++] = qn;
+        }
+    }
+    if (matched == 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, matches);
+        return has_swift ? SWIFT_INCOMPATIBLE : 0;
+    }
+    const char *chosen = swift_choose_candidate(r, matches, matched, name, call, module_qn,
+                                                import_vals, import_count, matches + bucket->count);
+    if (!chosen) {
+        cbm_free(CBM_MEM_CLASS_OTHER, matches);
+        return 0;
+    }
+    size_t chosen_base = cbm_qn_callable_base_len_named(chosen, name);
+    int found = 0;
+    for (int i = 0; i < matched; i++) {
+        size_t base = cbm_qn_callable_base_len_named(matches[i], name);
+        if (base == chosen_base && memcmp(matches[i], chosen, base) == 0) {
+            if (found == out_cap) {
+                cbm_free(CBM_MEM_CLASS_OTHER, matches);
+                return SWIFT_INCOMPATIBLE;
+            }
+            out[found++] = matches[i];
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, matches);
+    return found;
+}
+
+enum { SWIFT_SCOPE_MODULE = 1, SWIFT_SCOPE_CLASS = 2, SWIFT_SCOPE_LOCAL = 3 };
+enum { SWIFT_INITIALIZER_BINDINGS = 8 };
+
+typedef struct {
+    const CBMTypeAssign *assignment;
+    const char *type;
+    bool ready;
+} swift_inferred_binding_t;
+
+typedef struct {
+    swift_inferred_binding_t items[SWIFT_INITIALIZER_BINDINGS];
+    unsigned count;
+    const CBMTypeAssign *missing;
+} swift_binding_work_t;
+
+typedef struct {
+    const cbm_registry_t *registry;
+    const CBMFileResult *file;
+    const cbm_gbuf_t *graph;
+    const char *module_qn;
+    const char **imports;
+    int import_count;
+} swift_inference_t;
+
+static const char *swift_initializer_type(const swift_inference_t *context,
+                                          swift_binding_work_t *work,
+                                          const CBMTypeAssign *assignment);
+static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
+                                     const CBMCall *call, const char **out, int out_cap);
+
+static int swift_binding_rank(const char *binding, const char *scope, const char *class_qn,
+                              const char *module_qn, bool field) {
+    if (!field && scope && strcmp(binding, scope) == 0) {
+        return SWIFT_SCOPE_LOCAL;
+    }
+    if (class_qn && strcmp(binding, class_qn) == 0) {
+        return SWIFT_SCOPE_CLASS;
+    }
+    if (!field && module_qn && strcmp(binding, module_qn) == 0) {
+        return SWIFT_SCOPE_MODULE;
+    }
+    return 0;
+}
+
+static int swift_assignment_rank(const CBMTypeAssign *assignment, const char *name,
+                                 const char *scope, const char *class_qn, const char *module_qn,
+                                 bool field) {
+    if (!assignment->var_name || !assignment->enclosing_func_qn ||
+        strcmp(assignment->var_name, name) != 0) {
+        return 0;
+    }
+    return swift_binding_rank(assignment->enclosing_func_qn, scope, class_qn, module_qn, field);
+}
+
+static int swift_cached_binding(const swift_binding_work_t *work, const CBMTypeAssign *assignment) {
+    for (unsigned i = 0; i < work->count; i++) {
+        if (work->items[i].assignment == assignment) {
+            return (int)i;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+static const char *swift_binding_cached_type(swift_binding_work_t *work,
+                                             const CBMTypeAssign *assignment) {
+    int cached = swift_cached_binding(work, assignment);
+    if (cached >= 0 && work->items[cached].ready) {
+        return work->items[cached].type;
+    }
+    if (!work->missing) {
+        work->missing = assignment;
+    }
+    return "";
+}
+
+/* Conflicting block-local bindings stay unknown rather than selecting a
+ * same-name method on either type. */
+static const char *swift_binding_type(const swift_inference_t *context, swift_binding_work_t *work,
+                                      const char *name, const char *scope, const char *class_qn,
+                                      const char *module_qn, bool field) {
+    const CBMFileResult *file = context->file;
+    int best = 0;
+    for (int i = 0; i < file->type_assigns.count; i++) {
+        const CBMTypeAssign *a = &file->type_assigns.items[i];
+        int rank = swift_assignment_rank(a, name, scope, class_qn, module_qn, field);
+        if (rank > best) {
+            best = rank;
+        }
+    }
+    if (!best) {
+        return NULL;
+    }
+    const char *type = NULL;
+    for (int i = 0; i < file->type_assigns.count; i++) {
+        const CBMTypeAssign *a = &file->type_assigns.items[i];
+        if (swift_assignment_rank(a, name, scope, class_qn, module_qn, field) != best) {
+            continue;
+        }
+        const char *candidate = a->type_name ? a->type_name : swift_binding_cached_type(work, a);
+        if (type && strcmp(type, candidate) != 0) {
+            return "";
+        }
+        type = candidate;
+    }
+    return type;
+}
+
+static void swift_enclosing_class(const CBMCall *call, char *class_qn) {
+    class_qn[0] = '\0';
+    if (!call->enclosing_func_qn || strlen(call->enclosing_func_qn) >= CBM_SZ_4K) {
+        return;
+    }
+    size_t n = cbm_qn_callable_base_len(call->enclosing_func_qn);
+    memcpy(class_qn, call->enclosing_func_qn, n);
+    class_qn[n] = '\0';
+    char *dot = strrchr(class_qn, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+}
+
+static const char *swift_file_receiver(const swift_inference_t *context, swift_binding_work_t *work,
+                                       const CBMCall *call, const char *module_qn, char *expression,
+                                       char *class_qn, char **member) {
+    swift_enclosing_class(call, class_qn);
+    char *dot = strchr(expression, '.');
+    *dot = '\0';
+    *member = dot + SKIP_ONE;
+    if (strcmp(expression, "self") == 0) {
+        dot = strchr(*member, '.');
+        if (!dot) {
+            return class_qn;
+        }
+        *dot = '\0';
+        const char *type = swift_binding_type(context, work, *member, call->enclosing_func_qn,
+                                              class_qn, module_qn, true);
+        *member = dot + SKIP_ONE;
+        return type;
+    }
+    const char *type = swift_binding_type(context, work, expression, call->enclosing_func_qn,
+                                          class_qn, module_qn, false);
+    if (!type && isupper((unsigned char)expression[0])) {
+        return expression;
+    }
+    return type;
+}
+
+/* Dots inside arguments do not separate receiver segments. */
+static char *swift_after_arguments(char *args) {
+    unsigned depth = SKIP_ONE;
+    char quote = '\0';
+    for (char *p = args + SKIP_ONE; *p; p++) {
+        if (*p == '\\' && p[SKIP_ONE]) {
+            p++;
+        } else if (quote) {
+            if (*p == quote) {
+                quote = '\0';
+            }
+        } else if (*p == '"') {
+            quote = *p;
+        } else if (*p == '(') {
+            depth++;
+        } else if (*p == ')' && --depth == 0) {
+            p++;
+            while (isspace((unsigned char)*p)) {
+                p++;
+            }
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static const CBMCall *swift_inner_call(const CBMFileResult *file, const CBMCall *call,
+                                       size_t prefix) {
+    for (int i = 0; i < file->calls.count; i++) {
+        const CBMCall *candidate = &file->calls.items[i];
+        if (candidate->callee_name && strlen(candidate->callee_name) == prefix &&
+            strncmp(candidate->callee_name, call->callee_name, prefix) == 0 &&
+            candidate->site_start_byte >= call->site_start_byte &&
+            candidate->site_end_byte <= call->site_end_byte) {
+            return candidate;
+        }
+    }
+    return NULL;
+}
+
+static const char *swift_chain_return_spelling(const cbm_registry_t *r, const char *qn) {
+    const swift_signature_t *sig = cbm_ht_get(r->swift_signatures, qn);
+    const char *signature = sig ? sig->selector : qn;
+    size_t offset = cbm_callable_return_offset(signature);
+    if (!signature[offset]) {
+        signature = qn;
+        offset = cbm_callable_return_offset(signature);
+    }
+    return offset && signature[offset] ? signature + offset + PAIR_LEN : NULL;
+}
+
+static const char *swift_chain_return_qn(const cbm_registry_t *r, const char *qn,
+                                         const char *receiver, const char *member,
+                                         const char *returned) {
+    if (strcmp(returned, "Self") == 0) {
+        return receiver;
+    }
+    char owner[CBM_SZ_4K];
+    size_t base = cbm_qn_callable_base_len_named(qn, member);
+    size_t name_length = strlen(member);
+    if (base <= name_length || base - name_length - SKIP_ONE >= sizeof(owner)) {
+        return NULL;
+    }
+    size_t length = base - name_length - SKIP_ONE;
+    memcpy(owner, qn, length);
+    owner[length] = '\0';
+    const char *raw = r->swift_owners ? cbm_ht_get(r->swift_owners->return_types, qn) : NULL;
+    return swift_type_in_owner(r, owner, raw ? raw : returned);
+}
+
+static const char *swift_function_return_type(const swift_inference_t *context, const char *qn,
+                                              const char *returned) {
+    const cbm_registry_t *r = context->registry;
+    swift_owners_t *index = r->swift_owners;
+    const cbm_gbuf_node_t *declaration = cbm_gbuf_find_by_qn(context->graph, qn);
+    if (!index || !declaration || !declaration->file_path) {
+        return NULL;
+    }
+    const char *raw = cbm_ht_get(index->return_types, qn);
+    char nominal[CBM_SZ_4K];
+    if (!swift_receiver_type_text(raw ? raw : returned, nominal, sizeof(nominal))) {
+        return NULL;
+    }
+    const cbm_pkg_entry_t *target = swift_owner_target(index, declaration->file_path);
+    const swift_owner_t *type = NULL;
+    if (target && target->pkg_name) {
+        type = swift_target_type(index, target, nominal);
+    } else if (!target) {
+        char key[CBM_SZ_4K];
+        size_t length = swift_owner_module_length(declaration->file_path);
+        int n =
+            snprintf(key, sizeof(key), "%.*s\n%s", (int)length, declaration->file_path, nominal);
+        type = n >= 0 && (size_t)n < sizeof(key) ? cbm_ht_get(index->by_module_path, key) : NULL;
+    }
+    if (type) {
+        return type->qn;
+    }
+    const char *caller = swift_caller_path(context->file, context->graph, context->module_qn);
+    if (caller && strcmp(caller, declaration->file_path) == 0) {
+        const char *resolved =
+            swift_receiver_qn(r, context->file, context->graph, nominal, context->module_qn,
+                              context->imports, context->import_count);
+        const swift_owner_t *owner = resolved ? cbm_ht_get(index->by_qn, resolved) : NULL;
+        return owner && swift_receiver_visible(index, target, context->file, owner) ? resolved
+                                                                                    : NULL;
+    }
+    return NULL; /* No declaring-file imports are available for a remote free function. */
+}
+
+static const char *swift_candidates_return_type(const swift_inference_t *context, int count,
+                                                const char **out, const char *receiver,
+                                                const char *member) {
+    const cbm_registry_t *r = context->registry;
+    const char *type = NULL;
+    const char *spelling = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *returned = swift_chain_return_spelling(r, out[i]);
+        if (!returned || (spelling && strcmp(spelling, returned) != 0)) {
+            return NULL;
+        }
+        const char *label = cbm_ht_get(r->exact, out[i]);
+        const char *resolved = label && strcmp(label, "Function") == 0
+                                   ? swift_function_return_type(context, out[i], returned)
+                                   : swift_chain_return_qn(r, out[i], receiver, member, returned);
+        if (!resolved || (type && strcmp(type, resolved) != 0)) {
+            return NULL;
+        }
+        spelling = returned;
+        type = resolved;
+    }
+    return type;
+}
+
+static const char *swift_chain_return(const swift_inference_t *context, const CBMCall *inner,
+                                      const char *receiver, const char *member, const char **out,
+                                      int out_cap) {
+    if (!inner) {
+        return NULL;
+    }
+    int count = swift_typed_candidates(context->registry, context->graph, context->file,
+                                       context->module_qn, inner, receiver, member, out, out_cap);
+    return swift_candidates_return_type(context, count, out, receiver, member);
+}
+
+static const CBMCall *swift_initializer_call(const CBMFileResult *file,
+                                             const CBMTypeAssign *assignment) {
+    const CBMCall *selected = NULL;
+    uint32_t widest = 0;
+    if (assignment->value_end_byte <= assignment->value_start_byte) {
+        return NULL;
+    }
+    for (int i = 0; i < file->calls.count; i++) {
+        const CBMCall *call = &file->calls.items[i];
+        if (!call->callee_name || call->site_start_byte < assignment->value_start_byte ||
+            call->site_end_byte != assignment->value_end_byte ||
+            call->site_end_byte <= call->site_start_byte) {
+            continue;
+        }
+        uint32_t width = call->site_end_byte - call->site_start_byte;
+        if (width > widest) {
+            selected = call;
+            widest = width;
+        } else if (width == widest && selected &&
+                   (call->site_start_byte != selected->site_start_byte ||
+                    strcmp(call->callee_name, selected->callee_name) != 0)) {
+            return NULL;
+        }
+    }
+    return selected;
+}
+
+static bool swift_initializer_function_visible(const swift_inference_t *context, const char *qn) {
+    const swift_owners_t *index = context->registry->swift_owners;
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(context->graph, qn);
+    if (!index || !node || !node->file_path) {
+        return false;
+    }
+    const cbm_pkg_entry_t *target = swift_owner_target(index, node->file_path);
+    char module[CBM_SZ_4K];
+    swift_owner_t provider = {.module = module};
+    if (target && target->pkg_name) {
+        int n = snprintf(module, sizeof(module), "%s\n%s", target->manifest_rel, target->pkg_name);
+        if (n < 0 || (size_t)n >= sizeof(module)) {
+            return false;
+        }
+        provider.module_name = target->pkg_name;
+        provider.manifest = target->manifest_rel;
+    } else {
+        size_t length =
+            target ? strlen(node->file_path) : swift_owner_module_length(node->file_path);
+        if (length >= sizeof(module)) {
+            return false;
+        }
+        memcpy(module, node->file_path, length);
+        module[length] = '\0';
+        const char *leaf = strrchr(module, '/');
+        provider.module_name = leaf ? leaf + SKIP_ONE : module;
+    }
+    return swift_extension_visible(index, context->file, context->graph, context->module_qn,
+                                   &provider);
+}
+
+static int swift_initializer_member_candidates(const swift_inference_t *context,
+                                               swift_binding_work_t *work, const CBMCall *call,
+                                               const char **out) {
+    char expression[CBM_SZ_4K];
+    char owner[CBM_SZ_4K];
+    if (strlen(call->callee_name) >= sizeof(expression)) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    (void)snprintf(expression, sizeof(expression), "%s", call->callee_name);
+    char *member = NULL;
+    const char *type =
+        swift_file_receiver(context, work, call, context->module_qn, expression, owner, &member);
+    if (!type || !type[0]) {
+        return SWIFT_INCOMPATIBLE; /* Unknown roots cannot establish an initializer's type. */
+    }
+    return swift_candidates_for_file(context, work, call, out, REG_MAX_CANDIDATES);
+}
+
+static int swift_initializer_candidates(const swift_inference_t *context,
+                                        swift_binding_work_t *work, const CBMTypeAssign *assignment,
+                                        const CBMCall *call, const char **out, char *owner) {
+    owner[0] = '\0';
+    if (strchr(call->callee_name, '.')) {
+        return swift_initializer_member_candidates(context, work, call, out);
+    }
+    swift_enclosing_class(call, owner);
+    const swift_owners_t *index = context->registry->swift_owners;
+    if (index && cbm_ht_has(index->by_qn, assignment->enclosing_func_qn)) {
+        (void)snprintf(owner, CBM_SZ_4K, "%s", assignment->enclosing_func_qn);
+    }
+    if (index && cbm_ht_has(index->by_qn, owner)) {
+        int count = swift_typed_candidates(context->registry, context->graph, context->file,
+                                           context->module_qn, call, owner, call->callee_name, out,
+                                           REG_MAX_CANDIDATES);
+        if (count > 0) {
+            return count;
+        }
+    }
+    owner[0] = '\0';
+    int count =
+        cbm_registry_swift_candidates(context->registry, call, context->module_qn, context->imports,
+                                      context->import_count, out, REG_MAX_CANDIDATES);
+    for (int i = 0; i < count; i++) {
+        const char *label = cbm_ht_get(context->registry->exact, out[i]);
+        if (!label || strcmp(label, "Function") != 0 ||
+            !swift_initializer_function_visible(context, out[i])) {
+            return SWIFT_INCOMPATIBLE;
+        }
+    }
+    return count;
+}
+
+static const char *swift_initializer_type(const swift_inference_t *context,
+                                          swift_binding_work_t *work,
+                                          const CBMTypeAssign *assignment) {
+    const CBMCall *call = swift_initializer_call(context->file, assignment);
+    if (!call) {
+        return NULL;
+    }
+    const char *out[REG_MAX_CANDIDATES];
+    char owner[CBM_SZ_4K];
+    int count = swift_initializer_candidates(context, work, assignment, call, out, owner);
+    return swift_candidates_return_type(context, count, out, owner[0] ? owner : NULL,
+                                        simple_name(call->callee_name));
+}
+
+/* Evaluate only demanded initializer dependencies. Pending entries identify
+ * cycles; capacity exhaustion leaves the dependent binding unknown.
+ * shortcut: at most 8 demanded bindings per call, expand for longer real initializer chains. */
+static void swift_resolve_initializer_bindings(const swift_inference_t *context,
+                                               swift_binding_work_t *work,
+                                               const CBMTypeAssign *assignment) {
+    if (work->count >= SWIFT_INITIALIZER_BINDINGS) {
+        return;
+    }
+    unsigned stack[SWIFT_INITIALIZER_BINDINGS];
+    unsigned depth = SKIP_ONE;
+    stack[0] = work->count++;
+    work->items[stack[0]].assignment = assignment;
+    while (depth) {
+        swift_inferred_binding_t *entry = &work->items[stack[depth - SKIP_ONE]];
+        work->missing = NULL;
+        const char *type = swift_initializer_type(context, work, entry->assignment);
+        if (work->missing) {
+            int dependency = swift_cached_binding(work, work->missing);
+            if (dependency < 0 && work->count < SWIFT_INITIALIZER_BINDINGS) {
+                unsigned next = work->count++;
+                work->items[next].assignment = work->missing;
+                stack[depth++] = next;
+                continue;
+            }
+            type = NULL;
+        }
+        entry->type = type ? type : "";
+        entry->ready = true;
+        depth--;
+    }
+}
+
+static bool swift_receiver_type_text(const char *type, char *out, size_t cap) {
+    size_t n = strcspn(type, "<?! (");
+    size_t metatype_len = sizeof(".Type") - SKIP_ONE;
+    if (n > metatype_len && memcmp(type + n - metatype_len, ".Type", metatype_len) == 0) {
+        n -= metatype_len;
+    }
+    if (n == 0 || n >= cap) {
+        return false;
+    }
+    memcpy(out, type, n);
+    out[n] = '\0';
+    return true;
+}
+
+static bool swift_call_uses_named_receiver(const CBMFileResult *file, const CBMCall *call) {
+    return !file || !strchr(call->callee_name, '.') ||
+           (isupper((unsigned char)call->callee_name[0]) && !strchr(call->callee_name, '('));
+}
+
+static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
+                                     const CBMCall *call, const char **out, int out_cap) {
+    const cbm_registry_t *r = context->registry;
+    const CBMFileResult *file = context->file;
+    const cbm_gbuf_t *graph = context->graph;
+    const char *module_qn = context->module_qn;
+    const char **import_vals = context->imports;
+    int import_count = context->import_count;
+    if (!r || !call || !call->callee_name || !out || out_cap < SKIP_ONE) {
+        return 0;
+    }
+    if (swift_call_uses_named_receiver(file, call)) {
+        int named = swift_named_candidates(r, graph, file, call, module_qn, import_vals,
+                                           import_count, out, out_cap);
+        return named == SWIFT_NO_TYPE_RECEIVER
+                   ? cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count,
+                                                   out, out_cap)
+                   : named;
+    }
+    char expression[CBM_SZ_4K];
+    char class_qn[CBM_SZ_4K] = {0};
+    if (strlen(call->callee_name) >= sizeof(expression)) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    (void)snprintf(expression, sizeof(expression), "%s", call->callee_name);
+    char *member = NULL;
+    const char *type =
+        swift_file_receiver(context, work, call, module_qn, expression, class_qn, &member);
+    if (!type) {
+        return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
+                                             out_cap);
+    }
+    bool from_chain = r->swift_owners && cbm_ht_has(r->swift_owners->by_qn, type);
+    while (type && type[0]) {
+        char type_text[CBM_SZ_4K];
+        if (!from_chain && !swift_receiver_type_text(type, type_text, sizeof(type_text))) {
+            return SWIFT_INCOMPATIBLE;
+        }
+        const char *receiver = from_chain ? cbm_ht_get_key(r->exact, type)
+                                          : swift_receiver_qn(r, file, graph, type_text, module_qn,
+                                                              import_vals, import_count);
+        if (!receiver) {
+            return SWIFT_INCOMPATIBLE; /* known non-project receiver */
+        }
+        char *args = strchr(member, '(');
+        if (!args) {
+            return swift_typed_candidates(r, graph, file, module_qn, call, receiver, member, out,
+                                          out_cap);
+        }
+        char *after = swift_after_arguments(args);
+        if (!after || *after != '.') {
+            return SWIFT_INCOMPATIBLE;
+        }
+        *args = '\0';
+        const CBMCall *inner = swift_inner_call(file, call, (size_t)(args - expression));
+        type = swift_chain_return(context, inner, receiver, member, out, out_cap);
+        from_chain = true;
+        member = after + SKIP_ONE;
+    }
+    return SWIFT_INCOMPATIBLE;
+}
+
+int cbm_registry_swift_candidates_in_file(const cbm_registry_t *r, const CBMCall *call,
+                                          const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **out, int out_cap) {
+    swift_binding_work_t work = {0};
+    swift_inference_t context = {
+        .registry = r,
+        .file = file,
+        .graph = graph,
+        .module_qn = module_qn,
+        .imports = import_vals,
+        .import_count = import_count,
+    };
+    for (unsigned attempt = 0; attempt <= SWIFT_INITIALIZER_BINDINGS; attempt++) {
+        work.missing = NULL;
+        int count = swift_candidates_for_file(&context, &work, call, out, out_cap);
+        if (!work.missing) {
+            return count;
+        }
+        if (work.count >= SWIFT_INITIALIZER_BINDINGS) {
+            return SWIFT_INCOMPATIBLE;
+        }
+        swift_resolve_initializer_bindings(&context, &work, work.missing);
+    }
+    return SWIFT_INCOMPATIBLE;
 }
 
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
@@ -2815,14 +4552,14 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 
     /* Build ".suffix" target */
     size_t slen = strlen(suffix);
-    char *target = malloc(slen + REG_SUFFIX_ALLOC);
+    char *target = cbm_alloc(CBM_MEM_CLASS_OTHER, slen + REG_SUFFIX_ALLOC);
     target[0] = '.';
     memcpy(target + SKIP_ONE, suffix, slen + SKIP_ONE);
 
     struct few_ctx ctx = {target, slen + SKIP_ONE, NULL, 0, 0};
     cbm_ht_foreach(r->exact, few_scan, &ctx);
 
-    free(target);
+    cbm_free(CBM_MEM_CLASS_OTHER, target);
     *out = ctx.results;
     return ctx.count;
 }

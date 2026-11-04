@@ -7,6 +7,7 @@
  * would misread: such a suffix degrades to its hashed form.
  */
 #include "callable_sig.h"
+#include "cbm.h"
 #include "helpers.h"
 #include <ctype.h>
 #include <stdbool.h>
@@ -22,20 +23,29 @@ enum {
     SIG_HASH_HEX = 16,                      /* FNV-1a 64 rendered as hex */
     SIG_OPERATOR_LEN = 8,                   /* strlen("operator") */
     SIG_CONST_LEN = 5,                      /* strlen("const") */
+    SIG_ASYNC_LEN = 5,                      /* strlen("async") */
+    SIG_ARROW_LEN = 2,                      /* strlen("=>") */
     SIG_VOLATILE_LEN = 8,                   /* strlen("volatile") */
     SIG_ARITY_DIGITS = 16,                  /* "(%d)" scratch */
     SIG_CAPPED_TAIL = 1 + SIG_HASH_HEX + 1, /* "#" hex ")" */
+    SIG_CHAR_LEN = 1,
+    SIG_SWIFT_DEFAULT_BITS = 64,
 };
 
 static const uint64_t SIG_FNV_OFFSET = 0xcbf29ce484222325ULL; /* FNV-1a 64 basis */
 static const uint64_t SIG_FNV_PRIME = 0x100000001b3ULL;
 static const char SIG_OPERATOR_CHARS[] = "+-*/%^&|~!=<>?[]";
+static const char SIG_TYPE_OPEN[] = "([<";
+static const char SIG_TYPE_CLOSE[] = ")]>";
 
 CBMCallableIdentity cbm_callable_identity(CBMLanguage lang) {
-    /* Every language keeps its historical QN until its enable change lands
-     * (with the index-format bump that change carries). The planned modes:
-     * Java/Kotlin/C#/C++/CUDA/Scala TYPED, Swift LABELED_TYPED, ObjC LABELED,
-     * dynamic tier-2 languages ARITY. */
+    /* Each language enables identity with its own index-format bump. */
+    if (lang == CBM_LANG_SWIFT) {
+        return CBM_CALLABLE_ID_LABELED_TYPED;
+    }
+    /* Other languages keep their historical QN until their own enable changes
+     * land with an index-format bump. Planned modes: Java/Kotlin/C#/C++/CUDA/
+     * Scala TYPED, ObjC LABELED, dynamic tier-2 languages ARITY. */
     (void)lang;
     return CBM_CALLABLE_ID_NONE;
 }
@@ -57,6 +67,7 @@ typedef struct {
     size_t open_off;  /* offset of the parameter list's "(" */
     size_t close_off; /* offset just past its ")" */
     bool skip_names;  /* nested C parameter lists: leave out parameter names */
+    bool expand_swift_closure_aliases;
 } sig_ctx_t;
 
 static bool sig_ident_char(unsigned char ch) {
@@ -79,7 +90,9 @@ static void sig_raw(sig_ctx_t *c, const char *s, size_t n) {
             c->overflow = true;
             return;
         }
-        memcpy(grown, c->buf, c->len);
+        if (c->len != 0) {
+            memcpy(grown, c->buf, c->len);
+        }
         c->buf = grown;
         c->cap = cap;
     }
@@ -710,6 +723,131 @@ static void sig_kotlin_params(sig_ctx_t *c, TSNode node) {
 
 /* ── Swift ─────────────────────────────────────────────────────── */
 
+static bool sig_swift_alias_in_scope(const sig_ctx_t *c, TSNode scope, TSNode wanted,
+                                     TSNode *target) {
+    bool found = false;
+    uint32_t start = ts_node_start_byte(wanted);
+    uint32_t length = ts_node_end_byte(wanted) - start;
+    for (uint32_t i = 0; i < ts_node_named_child_count(scope); i++) {
+        TSNode alias = ts_node_named_child(scope, i);
+        if (strcmp(ts_node_type(alias), "typealias_declaration") != 0) {
+            continue;
+        }
+        TSNode name = sig_field(alias, "name");
+        if (ts_node_is_null(name) || ts_node_end_byte(name) - ts_node_start_byte(name) != length ||
+            memcmp(c->src + ts_node_start_byte(name), c->src + start, length) != 0) {
+            continue;
+        }
+        TSNode function = cbm_find_child_by_kind(alias, "function_type");
+        if (ts_node_is_null(function)) {
+            *target = (TSNode){0};
+            return true;
+        }
+        *target = function;
+        found = true;
+    }
+    return found;
+}
+
+/* Only direct function aliases in the type/file lexical scope prove a closure.
+ * Keep their declared spelling in QNs; selectors need only their callable shape. */
+static TSNode sig_swift_selector_type(const sig_ctx_t *c, TSNode parameter, TSNode type) {
+    if (!c->expand_swift_closure_aliases || strcmp(ts_node_type(type), "user_type") != 0) {
+        return type;
+    }
+    TSNode wanted = {0};
+    for (uint32_t i = 0; i < ts_node_named_child_count(type); i++) {
+        TSNode child = ts_node_named_child(type, i);
+        if (strcmp(ts_node_type(child), "type_identifier") == 0) {
+            if (!ts_node_is_null(wanted)) {
+                return type; /* qualified aliases need their declaring module */
+            }
+            wanted = child;
+        }
+    }
+    if (ts_node_is_null(wanted)) {
+        return type;
+    }
+    for (TSNode parent = ts_node_parent(parameter); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        const char *kind = ts_node_type(parent);
+        TSNode scope = {0};
+        if (strcmp(kind, "source_file") == 0) {
+            scope = parent;
+        } else if (strcmp(kind, "class_declaration") == 0 ||
+                   strcmp(kind, "protocol_declaration") == 0) {
+            scope = sig_field(parent, "body");
+        }
+        TSNode target = {0};
+        if (!ts_node_is_null(scope) && sig_swift_alias_in_scope(c, scope, wanted, &target)) {
+            return ts_node_is_null(target) ? type : target;
+        }
+    }
+    return type;
+}
+
+static void sig_swift_alias_parameters(sig_ctx_t *c, TSNode function) {
+    TSNode first = ts_node_child(function, 0);
+    if (ts_node_is_null(first) || !sig_node_text_is(c, first, "throws")) {
+        return;
+    }
+    /* The Swift grammar can attach the parameter tuple to @Sendable before throws. */
+    TSNode modifiers = ts_node_prev_named_sibling(function);
+    if (ts_node_is_null(modifiers) || strcmp(ts_node_type(modifiers), "type_modifiers") != 0) {
+        return;
+    }
+    TSNode attribute = cbm_find_child_by_kind(modifiers, "attribute");
+    if (ts_node_is_null(attribute) || ts_node_child_count(attribute) < 4 ||
+        !sig_node_text_is(c, ts_node_named_child(attribute, 0), "Sendable") ||
+        !sig_node_text_is(c, ts_node_child(attribute, 2), "(")) {
+        return;
+    }
+    for (uint32_t i = 2; i < ts_node_child_count(attribute); i++) {
+        sig_type_tokens(c, ts_node_child(attribute, i));
+    }
+}
+
+static void sig_swift_param_type(sig_ctx_t *c, TSNode p, TSNode internal) {
+    size_t before = c->len;
+    uint32_t count = ts_node_child_count(p);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode ch = ts_node_child(p, i);
+        const char *field = ts_node_field_name_for_child(p, i);
+        if (field && strcmp(field, "external_name") == 0) {
+            continue;
+        }
+        if (ts_node_eq(ch, internal)) {
+            continue;
+        }
+        /* A default expression selects call arity, not type identity. */
+        if ((field && strcmp(field, "default_value") == 0) || sig_node_text_is(c, ch, "=")) {
+            break;
+        }
+        const char *k = ts_node_type(ch);
+        if (strcmp(k, "parameter_modifiers") == 0) {
+            uint32_t mc = ts_node_named_child_count(ch);
+            for (uint32_t j = 0; j < mc; j++) {
+                TSNode m = ts_node_named_child(ch, j);
+                uint32_t ms = ts_node_start_byte(m);
+                if (ts_node_end_byte(m) > ms && c->src[ms] != '@') {
+                    sig_type_tokens(c, m); /* inout; @escaping etc. dropped */
+                }
+            }
+        } else if (ts_node_is_named(ch)) {
+            TSNode type = sig_swift_selector_type(c, p, ch);
+            if (!ts_node_eq(type, ch)) {
+                sig_swift_alias_parameters(c, type);
+            }
+            sig_type_tokens(c, type);
+        } else if (sig_node_text_is(c, ch, "...")) {
+            sig_raw_str(c, sig_variadic_marker(c->lang));
+        }
+    }
+    if (c->len == before) {
+        sig_raw(c, "?", SIG_CHAR_LEN);
+    }
+}
+
 static void sig_swift_param(sig_ctx_t *c, TSNode p) {
     TSNode external = sig_field(p, "external_name");
     TSNode internal = {0};
@@ -727,35 +865,7 @@ static void sig_swift_param(sig_ctx_t *c, TSNode p) {
     /* One name is both label and internal name; `_` means unlabeled. */
     sig_label_node(c, ts_node_is_null(external) ? internal : external);
     if (sig_writes_types(c)) {
-        size_t before = c->len;
-        for (uint32_t i = 0; i < count; i++) {
-            TSNode ch = ts_node_child(p, i);
-            const char *field = ts_node_field_name_for_child(p, i);
-            if (field && strcmp(field, "external_name") == 0) {
-                continue;
-            }
-            if (ts_node_eq(ch, internal)) {
-                continue;
-            }
-            const char *k = ts_node_type(ch);
-            if (strcmp(k, "parameter_modifiers") == 0) {
-                uint32_t mc = ts_node_named_child_count(ch);
-                for (uint32_t j = 0; j < mc; j++) {
-                    TSNode m = ts_node_named_child(ch, j);
-                    uint32_t ms = ts_node_start_byte(m);
-                    if (ts_node_end_byte(m) > ms && c->src[ms] != '@') {
-                        sig_type_tokens(c, m); /* inout; @escaping etc. dropped */
-                    }
-                }
-            } else if (ts_node_is_named(ch)) {
-                sig_type_tokens(c, ch);
-            } else if (sig_node_text_is(c, ch, "...")) {
-                sig_raw_str(c, sig_variadic_marker(c->lang));
-            }
-        }
-        if (c->len == before) {
-            sig_raw(c, "?", 1);
-        }
+        sig_swift_param_type(c, p, internal);
     }
     sig_entry_close(c);
 }
@@ -770,6 +880,152 @@ static void sig_swift_params(sig_ctx_t *c, TSNode node) {
     }
 }
 
+/* Keep generic declarations and requirements in identity, without interpreting
+ * applicability at call sites. '/' preserves associated-type paths without
+ * introducing a QN separator; comments and whitespace use the token rules. */
+static TSNode sig_swift_extension_requirements(sig_ctx_t *c, TSNode node) {
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (strcmp(ts_node_type(parent), "class_declaration") == 0) {
+            return sig_node_text_is(c, sig_field(parent, "declaration_kind"), "extension")
+                       ? cbm_find_child_by_kind(parent, "type_constraints")
+                       : (TSNode){0};
+        }
+    }
+    return (TSNode){0};
+}
+
+static bool sig_swift_generic_root(const sig_ctx_t *c, TSNode params, TSNode requirements,
+                                   const char *root, size_t len) {
+    TSNode lists[] = {params, requirements};
+    for (size_t list = 0; list < sizeof(lists) / sizeof(lists[0]); list++) {
+        if (ts_node_is_null(lists[list])) {
+            continue;
+        }
+        for (uint32_t i = 0; i < ts_node_named_child_count(lists[list]); i++) {
+            TSNode entry = ts_node_named_child(lists[list], i);
+            if (ts_node_named_child_count(entry) == 0) {
+                continue;
+            }
+            TSNode name = ts_node_named_child(entry, 0);
+            if (list != 0) {
+                TSNode constrained = sig_field(name, "constrained_type");
+                if (ts_node_is_null(constrained) || ts_node_named_child_count(constrained) == 0) {
+                    continue;
+                }
+                name = ts_node_named_child(constrained, 0);
+            }
+            uint32_t start = ts_node_start_byte(name);
+            if (ts_node_end_byte(name) - start == len && memcmp(c->src + start, root, len) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void sig_swift_requirements(sig_ctx_t *c, TSNode requirements, TSNode params) {
+    size_t start = c->len;
+    sig_type_tokens(c, requirements);
+    for (size_t i = start; i < c->len; i++) {
+        if (c->buf[i] != '.') {
+            continue;
+        }
+        size_t root = i;
+        while (root > start && (sig_ident_char((unsigned char)c->buf[root - SIG_CHAR_LEN]) ||
+                                c->buf[root - SIG_CHAR_LEN] == '/')) {
+            root--;
+        }
+        size_t len = 0;
+        while (root + len < i && sig_ident_char((unsigned char)c->buf[root + len])) {
+            len++;
+        }
+        if (sig_swift_generic_root(c, params, requirements, c->buf + root, len)) {
+            c->buf[i] = '/';
+        }
+    }
+}
+
+static void sig_swift_tparams(sig_ctx_t *c, TSNode node) {
+    TSNode params = cbm_find_child_by_kind(node, "type_parameters");
+    TSNode requirements = cbm_find_child_by_kind(node, "type_constraints");
+    TSNode extension = sig_swift_extension_requirements(c, node);
+    if (ts_node_is_null(params) && ts_node_is_null(requirements) && ts_node_is_null(extension)) {
+        return;
+    }
+    size_t start = c->len;
+    if (!ts_node_is_null(params)) {
+        sig_type_tokens(c, params);
+        if (c->len > start && c->buf[c->len - SIG_CHAR_LEN] == '>') {
+            c->buf[--c->len] = '\0';
+        }
+    } else {
+        sig_raw_str(c, "<");
+    }
+    if (!ts_node_is_null(requirements)) {
+        sig_raw_str(c, ";");
+        sig_swift_requirements(c, requirements, params);
+    }
+    if (!ts_node_is_null(extension)) {
+        sig_raw_str(c, ";");
+        sig_swift_requirements(c, extension, params);
+    }
+    sig_raw_str(c, ">");
+}
+
+static const char *sig_swift_dispatch(sig_ctx_t *c, TSNode node) {
+    TSNode modifiers = cbm_find_child_by_kind(node, "modifiers");
+    uint32_t count = ts_node_is_null(modifiers) ? 0 : ts_node_child_count(modifiers);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode modifier = ts_node_child(modifiers, i);
+        if (sig_node_text_is(c, modifier, "static")) {
+            return "static";
+        }
+        if (sig_node_text_is(c, modifier, "class")) {
+            return "class";
+        }
+    }
+    return ts_node_is_null(cbm_find_child_by_kind(node, "class")) ? NULL : "class";
+}
+
+static bool sig_swift_parameter_has_default(TSNode parameter) {
+    uint32_t children = ts_node_child_count(parameter);
+    for (uint32_t i = 0; i < children; i++) {
+        const char *kind = ts_node_type(ts_node_child(parameter, i));
+        if (strcmp(kind, "=") == 0 || strstr(kind, "default_value") != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t cbm_swift_default_mask(TSNode node, const char *source, uint8_t *count) {
+    (void)source;
+    uint64_t defaults = 0;
+    unsigned parameters = 0;
+    int last = -SIG_CHAR_LEN;
+    uint32_t children = ts_node_child_count(node);
+    for (uint32_t i = 0; i < children; i++) {
+        TSNode ch = ts_node_child(node, i);
+        const char *kind = ts_node_type(ch);
+        if (strcmp(kind, "parameter") == 0) {
+            last = (int)parameters++;
+            if (last < SIG_SWIFT_DEFAULT_BITS && sig_swift_parameter_has_default(ch)) {
+                defaults |= UINT64_C(1) << last;
+            }
+        } else if (last >= 0 && last < SIG_SWIFT_DEFAULT_BITS && strcmp(kind, "=") == 0) {
+            defaults |= UINT64_C(1) << last;
+        } else if (last >= 0 && (strcmp(kind, ")") == 0 || strcmp(kind, "function_body") == 0)) {
+            break;
+        }
+    }
+    if (count) {
+        /* ponytail: >64 parameters have no bitmask; use a dynamic mask if Swift
+         * code with that many parameters needs overload call resolution. */
+        *count = parameters > SIG_SWIFT_DEFAULT_BITS ? UINT8_MAX : (uint8_t)parameters;
+    }
+    return defaults;
+}
 /* ── Scala ─────────────────────────────────────────────────────── */
 
 static void sig_scala_params(sig_ctx_t *c, TSNode node) {
@@ -852,10 +1108,12 @@ static void sig_generic_params(sig_ctx_t *c, TSNode node) {
 
 /* ── Spelling pass ─────────────────────────────────────────────── */
 
-/* Qualified type paths keep their last segment; "->" becomes "=>"; any other
+/* Qualified type paths keep their last segment.
+ * "->" becomes "=>"; any other
  * '.' or "::" (a receiver function type, a leading global scope) is dropped,
  * so the suffix contract holds whatever the grammar produced. */
-static size_t sig_spell(char *s, size_t n) {
+static size_t sig_spell(char *s, size_t n, CBMLanguage lang) {
+    (void)lang;
     size_t out = 0;
     size_t i = 0;
     while (i < n) {
@@ -958,6 +1216,8 @@ static void sig_render(sig_ctx_t *c, TSNode node) {
     }
     if (c->lang == CBM_LANG_CSHARP) {
         sig_cs_tparams(c, node);
+    } else if (c->lang == CBM_LANG_SWIFT) {
+        sig_swift_tparams(c, node);
     }
     c->open_off = c->len;
     sig_raw(c, "(", 1);
@@ -986,6 +1246,29 @@ static void sig_render(sig_ctx_t *c, TSNode node) {
     }
     sig_raw(c, ")", 1);
     c->close_off = c->len;
+    if (c->lang == CBM_LANG_SWIFT) {
+        const char *dispatch = sig_swift_dispatch(c, node);
+        if (dispatch) {
+            sig_raw_str(c, dispatch);
+        }
+        /* Only direct declaration children: a parameter's async closure type
+         * is already in params and must not mark the enclosing function. */
+        uint32_t count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            if (sig_node_text_is(c, ts_node_child(node, i), "async")) {
+                if (dispatch) {
+                    sig_raw_str(c, " ");
+                }
+                sig_raw_str(c, "async");
+                break;
+            }
+        }
+        TSNode result = sig_field(node, "return_type");
+        if (!ts_node_is_null(result) && sig_writes_types(c)) {
+            sig_raw_str(c, "=>");
+            sig_type_tokens(c, result);
+        }
+    }
 }
 
 static bool sig_roundtrips(const char *suffix, size_t n) {
@@ -1003,6 +1286,32 @@ static bool sig_roundtrips(const char *suffix, size_t n) {
 /* "(#<hash>)": the identity of a signature that cannot be spelled safely. */
 static const char *sig_hashed(CBMArena *a, const char *full, size_t n) {
     return cbm_arena_sprintf(a, "(#%016llx)", (unsigned long long)sig_fnv64(full, n));
+}
+
+const char *cbm_swift_selector(CBMArena *a, TSNode node, const char *source) {
+    if (!a || !source || ts_node_is_null(node)) {
+        return NULL;
+    }
+    sig_ctx_t c = {
+        .arena = a,
+        .src = source,
+        .lang = CBM_LANG_SWIFT,
+        .mode = CBM_CALLABLE_ID_LABELED_TYPED,
+        .expand_swift_closure_aliases = true,
+    };
+    sig_raw_str(&c, "(");
+    sig_swift_params(&c, node);
+    sig_raw_str(&c, ")");
+    TSNode result = sig_field(node, "return_type");
+    if (!ts_node_is_null(result)) {
+        sig_raw_str(&c, "=>");
+        sig_type_tokens(&c, result);
+    }
+    if (c.overflow) {
+        return NULL;
+    }
+    (void)sig_spell(c.buf, c.len, CBM_LANG_SWIFT);
+    return c.buf;
 }
 
 const char *cbm_callable_sig_mode(CBMArena *a, TSNode func_node, const char *source,
@@ -1035,7 +1344,7 @@ const char *cbm_callable_sig_mode(CBMArena *a, TSNode func_node, const char *sou
     if (!spelled) {
         return NULL;
     }
-    size_t n = sig_spell(spelled, full);
+    size_t n = sig_spell(spelled, full, lang);
     if (n <= CBM_CALLABLE_SIG_MAX) {
         return sig_roundtrips(spelled, n) ? spelled : sig_hashed(a, spelled, n);
     }
@@ -1046,12 +1355,12 @@ const char *cbm_callable_sig_mode(CBMArena *a, TSNode func_node, const char *sou
     int limit = c.too_many ? SIG_MAX_ENTRIES : c.entries;
     for (int i = 0; i < limit; i++) {
         char *prefix = cbm_arena_strndup(a, c.buf, c.entry_end[i]);
-        c.entry_end[i] = prefix ? sig_spell(prefix, c.entry_end[i]) : 0;
+        c.entry_end[i] = prefix ? sig_spell(prefix, c.entry_end[i], lang) : 0;
     }
     char *open_prefix = cbm_arena_strndup(a, c.buf, c.open_off);
     char *close_prefix = cbm_arena_strndup(a, c.buf, c.close_off);
-    c.open_off = open_prefix ? sig_spell(open_prefix, c.open_off) : 0;
-    c.close_off = close_prefix ? sig_spell(close_prefix, c.close_off) : 0;
+    c.open_off = open_prefix ? sig_spell(open_prefix, c.open_off, lang) : 0;
+    c.close_off = close_prefix ? sig_spell(close_prefix, c.close_off, lang) : 0;
     c.buf = spelled;
     c.len = n;
     const char *capped = sig_capped(a, &c, spelled, n);
@@ -1119,13 +1428,94 @@ size_t cbm_qn_callable_base_len_named(const char *qn, const char *name) {
     return anchored ? base : len;
 }
 
+/* Locate only a declaration's return marker, never a nested closure arrow or
+ * an arrow in generic requirements. Shared by inverse and Swift registry. */
+static bool sig_return_type_valid(const char *type) {
+    char stack[SIG_DEPTH_LIMIT];
+    unsigned depth = 0;
+    if (!type[0] || strpbrk(type, ".#;{}") || strstr(type, "::") || strstr(type, "->")) {
+        return false;
+    }
+    for (size_t i = 0; type[i]; i++) {
+        char ch = type[i];
+        if (ch == '>' && i > 0 && type[i - SIG_CHAR_LEN] == '=') {
+            continue;
+        }
+        const char *closing = strchr(SIG_TYPE_CLOSE, ch);
+        if (strchr(SIG_TYPE_OPEN, ch)) {
+            if (depth == SIG_DEPTH_LIMIT) {
+                return false;
+            }
+            stack[depth++] = ch;
+        } else if (closing) {
+            if (!depth) {
+                return false;
+            }
+            depth--;
+            if (stack[depth] != SIG_TYPE_OPEN[closing - SIG_TYPE_CLOSE]) {
+                return false;
+            }
+        }
+    }
+    return depth == 0;
+}
+
+static size_t sig_swift_qualifiers_start(const char *text, size_t end) {
+    static const char *const qualifiers[] = {"async", "static", "class"};
+    for (size_t i = 0; i < sizeof(qualifiers) / sizeof(qualifiers[0]); i++) {
+        size_t len = strlen(qualifiers[i]);
+        if (end > len && memcmp(text + end - len, qualifiers[i], len) == 0 &&
+            (text[end - len - 1] == ')' || text[end - len - 1] == ' ')) {
+            end -= len;
+            while (end && text[end - 1] == ' ') {
+                end--;
+            }
+        }
+    }
+    return end;
+}
+
+size_t cbm_callable_return_offset(const char *suffix) {
+    size_t len = strlen(suffix);
+    if (!strstr(suffix, "=>")) {
+        return len;
+    }
+    int parens = 0;
+    int brackets = 0;
+    int angles = 0;
+    for (size_t i = 0; i + SIG_CHAR_LEN < len; i++) {
+        char ch = suffix[i];
+        bool arrow = ch == '=' && suffix[i + SIG_CHAR_LEN] == '>';
+        size_t params_end = sig_swift_qualifiers_start(suffix, i);
+        bool after_params = params_end && suffix[params_end - SIG_CHAR_LEN] == ')';
+        if (arrow && after_params && parens == 0 && brackets == 0 && angles == 0) {
+            return sig_return_type_valid(suffix + i + SIG_ARROW_LEN) ? i : 0;
+        }
+        if (ch == '(') {
+            parens++;
+        } else if (ch == ')') {
+            parens--;
+        } else if (ch == '[') {
+            brackets++;
+        } else if (ch == ']') {
+            brackets--;
+        } else if (ch == '<' &&
+                   (angles > 0 || sig_ident_char((unsigned char)suffix[i + SIG_CHAR_LEN]))) {
+            angles++;
+        } else if (ch == '>' && angles > 0 && (i == 0 || suffix[i - SIG_CHAR_LEN] != '=')) {
+            angles--;
+        }
+    }
+    return len;
+}
+
 size_t cbm_qn_callable_base_len(const char *qn) {
     if (!qn) {
         return 0;
     }
     size_t len = strlen(qn);
     /* Trailing cvref (C++): const / volatile / & / && after the ')'. */
-    size_t t = len;
+    size_t t = sig_swift_qualifiers_start(qn, cbm_callable_return_offset(qn));
     for (;;) {
         if (t > 0 && qn[t - 1] == '&') {
             t--;
@@ -1171,7 +1561,7 @@ size_t cbm_qn_callable_base_len(const char *qn) {
         size_t q = p;
         while (q > 0) {
             q--;
-            if (qn[q] == '>') {
+            if (qn[q] == '>' && (q == 0 || qn[q - SIG_CHAR_LEN] != '=')) {
                 adepth++;
             } else if (qn[q] == '<') {
                 adepth--;

@@ -3331,6 +3331,73 @@ static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const 
     return source;
 }
 
+/* The Swift grammar rejects conditional directives in type bodies. Mask only
+ * real AST directive tokens, so strings/comments and source coordinates survive. */
+static bool swift_mask_conditional_node(CBMArena *a, TSNode node, const char *source,
+                                        int source_len, char **masked) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "#if") == 0 || strcmp(kind, "#elseif") == 0 || strcmp(kind, "#else") == 0 ||
+        strcmp(kind, "#endif") == 0) {
+        if (!*masked) {
+            *masked = cbm_arena_strndup(a, source, (size_t)source_len);
+            if (!*masked) {
+                return false;
+            }
+        }
+        for (uint32_t i = ts_node_start_byte(node);
+             i < (uint32_t)source_len && source[i] != '\n' && source[i] != '\r'; i++) {
+            (*masked)[i] = ' ';
+        }
+    } else if (*masked &&
+               (strcmp(kind, "comment") == 0 || strcmp(kind, "multiline_comment") == 0)) {
+        for (uint32_t i = ts_node_start_byte(node);
+             i < ts_node_end_byte(node) && i < (uint32_t)source_len; i++) {
+            (*masked)[i] = source[i];
+        }
+    }
+    return true;
+}
+
+static const char *swift_mask_conditional_directives(CBMArena *a, TSNode root, const char *source,
+                                                     int source_len) {
+    char *masked = NULL;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool more = true;
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (!swift_mask_conditional_node(a, node, source, source_len, &masked)) {
+            break;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return masked ? masked : source;
+}
+
+static TSTree *swift_retry_conditional_parse(CBMArena *a, TSParser *parser, TSTree *tree,
+                                             CBMLanguage language, const char *source,
+                                             int source_len, TSParseOptions opts) {
+    if (!tree || language != CBM_LANG_SWIFT || !ts_node_has_error(ts_tree_root_node(tree))) {
+        return tree;
+    }
+    const char *masked =
+        swift_mask_conditional_directives(a, ts_tree_root_node(tree), source, source_len);
+    if (masked == source) {
+        return tree;
+    }
+    ts_tree_delete(tree);
+    ts_parser_reset(parser);
+    return cbm_parse_source(parser, masked, (uint32_t)source_len, opts);
+}
+
 /* Initial block for the per-file traversal scratch arena, chosen by measuring
  * arena_grow on a 14k-file TypeScript tree: it fires on one file in 12,000 at
  * both this size and at 1 MB, and on most files at 256 KB, where the two
@@ -3634,6 +3701,61 @@ int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
 }
 #endif
 
+/* Extension visibility uses the file's direct imports, including imports
+ * written after a type declaration. The joined text is shared by its types. */
+static void cbm_swift_type_imports(CBMFileResult *result, CBMLanguage language) {
+    if (language != CBM_LANG_SWIFT) {
+        return;
+    }
+    size_t length = SKIP_ONE;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *path = result->imports.items[i].module_path;
+        if (path && path[0]) {
+            length += strlen(path) + SKIP_ONE;
+        }
+    }
+    char *imports = cbm_arena_alloc(&result->arena, length);
+    if (!imports) {
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *path = result->imports.items[i].module_path;
+        if (!path || !path[0]) {
+            continue;
+        }
+        if (used) {
+            imports[used++] = '|';
+        }
+        size_t n = strlen(path);
+        memcpy(imports + used, path, n);
+        used += n;
+    }
+    imports[used] = '\0';
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *def = &result->defs.items[i];
+        size_t count = 0;
+        bool is_type = false;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+            is_type = is_type || strcmp(kv[0], "swift_type_path") == 0 ||
+                      strcmp(kv[0], "swift_extension") == 0;
+            count += PAIR_LEN;
+        }
+        if (!is_type) {
+            continue;
+        }
+        const char **props =
+            cbm_arena_alloc(&result->arena, (count + PAIR_LEN + SKIP_ONE) * sizeof(*props));
+        if (props) {
+            memcpy(props, def->extra_props, count * sizeof(*props));
+            props[count] = "swift_imports";
+            props[count + SKIP_ONE] = imports;
+            props[count + PAIR_LEN] = NULL;
+            def->extra_props = props;
+        }
+    }
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -3814,6 +3936,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
+    tree = swift_retry_conditional_parse(a, parser, tree, language, source, source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
@@ -3901,6 +4024,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     cbm_extract_imports(&ctx);
     cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
+    cbm_swift_type_imports(result, language);
     if (cbm_lang_needs_cpp_branch_views(language)) {
         extract_cpp_branch_views(&ctx, ts_lang, timeout_micros);
     }

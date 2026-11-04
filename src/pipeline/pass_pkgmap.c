@@ -119,6 +119,7 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     }
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
+    e->items[e->count].manifest_rel = NULL;
     e->count++;
 }
 
@@ -126,6 +127,7 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     for (int i = 0; i < e->count; i++) {
         free(e->items[i].pkg_name);
         free(e->items[i].entry_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
     }
     free(e->items);
     e->items = NULL;
@@ -872,27 +874,78 @@ static char *swift_extract_after(const char *start, const char *end, const char 
     return swift_quoted_literal(hit + strlen(needle), end);
 }
 
+static bool swift_normalize_target_path(const char *suffix, char normalized[PKGMAP_PATH_BUF]) {
+    /* Target paths are directories; normalize dot segments without allowing
+     * a target to escape the package that declares it. */
+    size_t used = 0;
+    size_t parents[PKGMAP_PATH_BUF / PAIR_LEN];
+    size_t depth = 0;
+    if (suffix[0] == '/' || strpbrk(suffix, "\\:")) {
+        return false;
+    }
+    for (const char *part = suffix; *part;) {
+        const char *slash = strchr(part, '/');
+        size_t len = slash ? (size_t)(slash - part) : strlen(part);
+        const char *component = part;
+        part = slash ? slash + SKIP_ONE : part + len;
+        if (!len || (len == SKIP_ONE && component[0] == '.')) {
+            continue;
+        }
+        if (len == PAIR_LEN && memcmp(component, "..", PAIR_LEN) == 0) {
+            if (!depth) {
+                return false;
+            }
+            used = parents[--depth];
+            continue;
+        }
+        if (used + len + PAIR_LEN > PKGMAP_PATH_BUF ||
+            depth == sizeof(parents) / sizeof(parents[0])) {
+            return false;
+        }
+        parents[depth++] = used;
+        if (used) {
+            normalized[used++] = '/';
+        }
+        memcpy(normalized + used, component, len);
+        used += len;
+    }
+    normalized[used] = '\0';
+    return true;
+}
+
 /* Register `target_name` → its resolved source directory: the literal
  * `path:` argument the target declared, if any, else the conventional
  * `Sources/<target_name>` (fixed-convention, same approach parse_cargo_toml
  * takes for `src/lib`). `literal_path` is borrowed; caller retains
  * ownership. */
 static void swift_register_target(const char *rel_path, const char *target_name,
-                                  const char *literal_path, cbm_pkg_entries_t *entries) {
+                                  const char *literal_path, const char *source_root,
+                                  cbm_pkg_entries_t *entries) {
     if (!target_name || !target_name[0]) {
         return;
     }
     char suffix_buf[PKGMAP_PATH_BUF];
     const char *suffix;
-    if (literal_path && literal_path[0]) {
+    if (literal_path) {
         suffix = literal_path;
     } else {
-        snprintf(suffix_buf, sizeof(suffix_buf), "Sources/%s", target_name);
+        int len = snprintf(suffix_buf, sizeof(suffix_buf), "%s/%s", source_root, target_name);
+        if (len < 0 || (size_t)len >= sizeof(suffix_buf)) {
+            return;
+        }
         suffix = suffix_buf;
     }
-    char *entry = build_entry_path(rel_path, suffix);
+    char normalized[PKGMAP_PATH_BUF];
+    if (!swift_normalize_target_path(suffix, normalized)) {
+        return;
+    }
+    char *entry = normalized[0] ? build_entry_path(rel_path, normalized) : path_dirname(rel_path);
     if (entry) {
+        int before = entries->count;
         pkg_entries_push(entries, strdup(target_name), entry);
+        if (entries->count > before) {
+            entries->items[before].manifest_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        }
     }
 }
 
@@ -909,14 +962,28 @@ static void swift_register_target(const char *rel_path, const char *target_name,
  * mint a location that is not just unconfirmed but actively likely wrong. */
 static void swift_scan_targets(const char *source, const char *end, const char *rel_path,
                                cbm_pkg_entries_t *entries) {
-    static const char prefix[] = ".target(";
+    static const struct {
+        const char *prefix;
+        const char *root;
+    } targets[] = {
+        {".target(", "Sources"}, {".executableTarget(", "Sources"}, {".testTarget(", "Tests"},
+        {".macro(", "Sources"},  {".plugin(", "Plugins"},
+    };
     const char *cursor = source;
     while (cursor < end) {
-        const char *hit = swift_find_code_token(cursor, end, prefix);
+        const char *hit = NULL;
+        size_t selected = 0;
+        for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+            const char *candidate = swift_find_code_token(cursor, end, targets[i].prefix);
+            if (candidate && (!hit || candidate < hit)) {
+                hit = candidate;
+                selected = i;
+            }
+        }
         if (!hit) {
             return;
         }
-        const char *open = hit + strlen(prefix) - SKIP_ONE;
+        const char *open = hit + strlen(targets[selected].prefix) - SKIP_ONE;
         const char *close = swift_match_paren(open, end);
         if (!close) {
             return; /* unbalanced — nothing further here is trustworthy */
@@ -926,7 +993,8 @@ static void swift_scan_targets(const char *source, const char *end, const char *
             bool path_present = false;
             char *literal_path = swift_extract_after(open, close, "path:", &path_present);
             if (literal_path || !path_present) {
-                swift_register_target(rel_path, name, literal_path, entries);
+                swift_register_target(rel_path, name, literal_path, targets[selected].root,
+                                      entries);
             }
             free(literal_path);
             free(name);
@@ -1024,6 +1092,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     for (int w = 0; w < worker_count; w++) {
         cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
+            if (!we->items[i].pkg_name || !we->items[i].entry_rel) {
+                continue; /* package-boundary metadata has no import specifier */
+            }
             /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
              * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
              * instead: its readers map `Prefix\Sub\Class` onto a file path
@@ -1129,6 +1200,26 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
 }
 #endif
 
+static bool pkgmap_wants_manifest(const char *name, bool swift_only) {
+    return swift_only ? strcmp(name, "Package.swift") == 0 : is_pkgmap_manifest_basename(name);
+}
+
+static bool pkgmap_parse_walk_manifest(const char *name, const char *rel_path, const char *source,
+                                       int source_len, cbm_pkg_entries_t *entries,
+                                       bool swift_only) {
+    if (!cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
+        return false;
+    }
+    if (swift_only) {
+        int before = entries->count;
+        pkg_entries_push(entries, NULL, path_dirname(rel_path));
+        if (entries->count > before) {
+            entries->items[before].manifest_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        }
+    }
+    return true;
+}
+
 /* Recursive filesystem walker that finds and parses package manifest
  * files independently of the main discovery filter. The main discovery
  * filter intentionally hides package.json / composer.json etc. from
@@ -1144,10 +1235,23 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * recursion bound — even directory junctions / symlink cycles cannot make
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
+static bool pkgmap_dot_entry(const char *name) {
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+}
+
+static bool pkgmap_walk_paths(const char *abs_dir, const char *rel_dir, const char *name,
+                              char abs_path[PKGMAP_PATH_BUF], char rel_path[PKGMAP_PATH_BUF]) {
+    int abs_len = snprintf(abs_path, PKGMAP_PATH_BUF, "%s/%s", abs_dir, name);
+    int rel_len = rel_dir && rel_dir[0]
+                      ? snprintf(rel_path, PKGMAP_PATH_BUF, "%s/%s", rel_dir, name)
+                      : snprintf(rel_path, PKGMAP_PATH_BUF, "%s", name);
+    return abs_len >= 0 && abs_len < PKGMAP_PATH_BUF && rel_len >= 0 && rel_len < PKGMAP_PATH_BUF;
+}
+
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth, char **excluded_dirs, int excluded_count) {
+                           int depth, char **excluded_dirs, int excluded_count, bool swift_only) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
-        cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
+        cbm_log_info("pkgmap.walk", "depth_cap", rel_dir[0] ? rel_dir : ".");
         return 0;
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
@@ -1158,16 +1262,13 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
     cbm_dirent_t *entry;
     while ((entry = cbm_readdir(dir)) != NULL) {
         const char *name = entry->name;
-        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
+        if (pkgmap_dot_entry(name)) {
             continue;
         }
         char abs_path[PKGMAP_PATH_BUF];
         char rel_path[PKGMAP_PATH_BUF];
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
-        if (rel_dir && rel_dir[0]) {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name);
-        } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", name);
+        if (!pkgmap_walk_paths(abs_dir, rel_dir, name, abs_path, rel_path)) {
+            continue;
         }
         struct stat st;
         if (pkgmap_safe_stat(abs_path, &st) != 0) {
@@ -1188,13 +1289,13 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             }
 #endif
             parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
-                                      excluded_count);
+                                      excluded_count, swift_only);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
             continue;
         }
-        if (!is_pkgmap_manifest_basename(name)) {
+        if (!pkgmap_wants_manifest(name, swift_only)) {
             continue;
         }
         int source_len = 0;
@@ -1202,7 +1303,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (!source) {
             continue;
         }
-        if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
+        if (pkgmap_parse_walk_manifest(name, rel_path, source, source_len, entries, swift_only)) {
             parsed++;
         }
         cbm_free(CBM_MEM_CLASS_EXTRACT, source);
@@ -1227,9 +1328,16 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char
     if (!repo_path || !entries) {
         return 0;
     }
-    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
+    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count, false);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
+}
+
+int cbm_pkgmap_scan_swift_targets(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count) {
+    return repo_path && entries
+               ? pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count, true)
+               : 0;
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
