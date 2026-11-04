@@ -25,6 +25,7 @@ enum {
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/laravel_routing.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -131,12 +132,36 @@ static const cbm_gbuf_node_t *pc_find_by_computed_qn(const cbm_gbuf_t *gbuf, con
     return n;
 }
 
+/* The import map of rel_path. *out_vals_owned says who owns the value strings:
+ * the JS/TS map is cbm_pxc_build_import_map's (values owned), every other
+ * path borrows its values from the graph buffer. free_import_map takes the
+ * same flag. */
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
+                            const char ***out_vals, int *out_count, bool *out_vals_owned) {
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
+    *out_vals_owned = false;
+
+    /* JS/TS: the cross-file map follows re-export chains to the defining
+     * file, and every value it holds is the QN of a graph node. */
+    CBMLanguage lang = cbm_language_for_filename(rel_path);
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        const char **keys = NULL;
+        const char **vals = NULL;
+        int count = 0;
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result, &keys, &vals,
+                                 &count);
+        if (count > 0) {
+            *out_keys = keys;
+            *out_vals = vals;
+            *out_count = count;
+            *out_vals_owned = true;
+            return 0;
+        }
+        cbm_pxc_free_import_map(keys, vals, count);
+    }
 
     /* Fast path: build from cached extraction via the same resolver used for
      * IMPORTS edges. Do NOT use cbm_pipeline_fqn_module(module_path) — Python
@@ -225,7 +250,11 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     return 0;
 }
 
-static void free_import_map(const char **keys, const char **vals, int count) {
+static void free_import_map(const char **keys, const char **vals, int count, bool vals_owned) {
+    if (vals_owned) {
+        cbm_pxc_free_import_map(keys, vals, count);
+        return;
+    }
     if (keys) {
         for (int i = 0; i < count; i++) {
             free((void *)keys[i]);
@@ -1540,7 +1569,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        bool imp_vals_owned = false;
+        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count, &imp_vals_owned);
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -1578,7 +1608,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_free(CBM_MEM_CLASS_RESOLVE, evidence);
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count, imp_vals_owned);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -1714,7 +1744,9 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        bool imp_vals_owned = false;
+        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count,
+                         &imp_vals_owned);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -1733,7 +1765,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count, imp_vals_owned);
         free(source);
     }
 

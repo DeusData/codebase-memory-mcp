@@ -683,7 +683,19 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
                 char esc_ln[CBM_SZ_128];
                 cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
                 char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                if (imp->reexport == CBM_REEXPORT_NAMED && imp->member) {
+                    char esc_member[CBM_SZ_128];
+                    cbm_json_escape(esc_member, sizeof(esc_member), imp->member);
+                    snprintf(imp_props, sizeof(imp_props),
+                             "{\"local_name\":\"%s\",\"reexport\":\"named\","
+                             "\"imported\":\"%s\"}",
+                             esc_ln, esc_member);
+                } else if (imp->reexport == CBM_REEXPORT_STAR) {
+                    snprintf(imp_props, sizeof(imp_props),
+                             "{\"local_name\":\"%s\",\"reexport\":\"star\"}", esc_ln);
+                } else {
+                    snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                }
                 cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
                 count++;
             }

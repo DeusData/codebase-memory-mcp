@@ -1814,6 +1814,51 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
     return true;
 }
 
+static void process_es_export_statement(CBMExtractCtx *ctx, TSNode node) {
+    CBMArena *a = ctx->arena;
+    TSNode src = ts_node_child_by_field_name(node, TS_FIELD("source"));
+    if (ts_node_is_null(src)) {
+        return;
+    }
+    char *path = strip_quotes(a, cbm_node_text(a, src, ctx->source));
+    if (!path || !path[0]) {
+        return;
+    }
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_child(node, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "export_clause") == 0) {
+            uint32_t sc = ts_node_child_count(child);
+            for (uint32_t j = 0; j < sc; j++) {
+                TSNode spec = ts_node_child(child, j);
+                if (strcmp(ts_node_type(spec), "export_specifier") != 0) {
+                    continue;
+                }
+                TSNode original = ts_node_child_by_field_name(spec, TS_FIELD("name"));
+                TSNode alias = ts_node_child_by_field_name(spec, TS_FIELD("alias"));
+                if (ts_node_is_null(original)) {
+                    continue;
+                }
+                const char *member = cbm_node_text(a, original, ctx->source);
+                const char *exported =
+                    ts_node_is_null(alias) ? member : cbm_node_text(a, alias, ctx->source);
+                CBMImport imp = {.local_name = exported,
+                                 .module_path = path,
+                                 .member = member,
+                                 .reexport = CBM_REEXPORT_NAMED};
+                cbm_imports_push(&ctx->result->imports, a, imp);
+            }
+            return;
+        }
+        if (strcmp(kind, "*") == 0) {
+            CBMImport imp = {.local_name = "*", .module_path = path, .reexport = CBM_REEXPORT_STAR};
+            cbm_imports_push(&ctx->result->imports, a, imp);
+            return;
+        }
+    }
+}
+
 static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
@@ -1829,18 +1874,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
                 push_children = false;
             }
         } else if (strcmp(kind, "export_statement") == 0) {
-            /* Re-export: `export { x } from './mod'` / `export * from './mod'`.
-             * It carries a `source` string just like an import and creates the
-             * same module dependency. */
-            TSNode src = ts_node_child_by_field_name(node, TS_FIELD("source"));
-            if (!ts_node_is_null(src)) {
-                char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
-                if (path && path[0]) {
-                    CBMImport imp = {.local_name = path_last(ctx->arena, path),
-                                     .module_path = path};
-                    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
-                }
-            }
+            process_es_export_statement(ctx, node);
         } else if (strcmp(kind, "call_expression") == 0) {
             /* CommonJS require() — only consume the node if we recognized
              * it as a require call; otherwise keep traversing the children. */
