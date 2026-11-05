@@ -219,19 +219,42 @@ static void swift_parameter_binding(TSNode node, TSNode *name, TSNode *type) {
     }
 }
 
-static bool swift_initializer_is_call(TSNode value) {
+/* `try Foo(...)`, `try await make()`: the expression `try` / `await` wrap. */
+static TSNode swift_initializer_value(TSNode value) {
     while (!ts_node_is_null(value)) {
         const char *kind = ts_node_type(value);
-        if (strcmp(kind, "call_expression") == 0 || strcmp(kind, "call") == 0) {
-            return true;
-        }
         if ((strcmp(kind, "try_expression") != 0 && strcmp(kind, "await_expression") != 0) ||
             ts_node_named_child_count(value) == 0) {
-            return false;
+            return value;
         }
         value = ts_node_named_child(value, ts_node_named_child_count(value) - SKIP_ONE);
     }
-    return false;
+    return value;
+}
+
+static bool swift_initializer_is_call(TSNode value) {
+    value = swift_initializer_value(value);
+    if (ts_node_is_null(value)) {
+        return false;
+    }
+    const char *kind = ts_node_type(value);
+    return strcmp(kind, "call_expression") == 0 || strcmp(kind, "call") == 0;
+}
+
+/* `Foo(...)` names the type it builds. Under `try` / `await` only a bare type
+ * name does: `try Foo.make()` returns what make returns, which the registry
+ * infers from the initializer call instead. */
+static const char *swift_constructor_type(CBMExtractCtx *ctx, TSNode value) {
+    if (strcmp(ts_node_type(value), "array_literal") == 0) {
+        return "[?]";
+    }
+    TSNode constructed = swift_initializer_value(value);
+    const char *type =
+        extract_constructor_type(ctx->arena, constructed, ctx->source, ctx->language);
+    if (type && !ts_node_eq(constructed, value) && strpbrk(type, ".(")) {
+        return NULL;
+    }
+    return type;
 }
 
 // --- Unified handler ---
@@ -265,13 +288,8 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
     }
     const char *type_name =
         ts_node_is_null(type) ? NULL : cbm_node_text(ctx->arena, type, ctx->source);
-    if (!type_name && !parameter) {
-        if (!ts_node_is_null(value)) {
-            type_name = extract_constructor_type(ctx->arena, value, ctx->source, ctx->language);
-            if (strcmp(ts_node_type(value), "array_literal") == 0) {
-                type_name = "[?]";
-            }
-        }
+    if (!type_name && !parameter && !ts_node_is_null(value)) {
+        type_name = swift_constructor_type(ctx, value);
     }
     bool initializer_call = swift_initializer_is_call(value);
     if (!ts_node_is_null(name) && (type_name || initializer_call)) {
