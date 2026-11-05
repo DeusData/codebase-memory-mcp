@@ -2621,6 +2621,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ruby = cbm_ruby_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.java = cbm_java_build_cross_registry(xa, all_defs, def_count);
     }
 
     int processed = 0;
