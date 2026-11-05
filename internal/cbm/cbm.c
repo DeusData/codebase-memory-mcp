@@ -3382,6 +3382,21 @@ static const char *swift_mask_conditional_directives(CBMArena *a, TSNode root, c
     return masked ? masked : source;
 }
 
+/* Lines the error regions of this tree cover; a region past the cap counts one. */
+static uint64_t swift_error_lines(TSTree *tree, const char *source, int source_len) {
+    cbm_error_regions_t regions = {{0}, {0}, 0, 0};
+    cbm_collect_error_regions(ts_tree_root_node(tree), &regions, source, source_len);
+    uint64_t lines = (uint64_t)regions.dropped;
+    for (int i = 0; i < regions.count; i++) {
+        lines += regions.ends[i] - regions.starts[i] + SKIP_ONE;
+    }
+    return lines;
+}
+
+/* Masking can also make a file read worse: an `#error` line from a dropped
+ * branch stays in a type body. Keep the re-parse only when its error regions
+ * cover no more lines than the first parse's (#2061). Counting regions instead
+ * would reject a re-parse that splits one large region into a few small ones. */
 static TSTree *swift_retry_conditional_parse(CBMArena *a, TSParser *parser, TSTree *tree,
                                              CBMLanguage language, const char *source,
                                              int source_len, TSParseOptions opts) {
@@ -3393,9 +3408,17 @@ static TSTree *swift_retry_conditional_parse(CBMArena *a, TSParser *parser, TSTr
     if (masked == source) {
         return tree;
     }
-    ts_tree_delete(tree);
     ts_parser_reset(parser);
-    return cbm_parse_source(parser, masked, (uint32_t)source_len, opts);
+    TSTree *retry = cbm_parse_source(parser, masked, (uint32_t)source_len, opts);
+    if (retry && swift_error_lines(retry, masked, source_len) <=
+                     swift_error_lines(tree, source, source_len)) {
+        ts_tree_delete(tree);
+        return retry;
+    }
+    if (retry) {
+        ts_tree_delete(retry);
+    }
+    return tree;
 }
 
 /* Initial block for the per-file traversal scratch arena, chosen by measuring
