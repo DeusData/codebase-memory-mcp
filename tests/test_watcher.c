@@ -2260,6 +2260,127 @@ TEST(watcher_sustained_failure_logs_once_issue2015) {
     PASS();
 }
 
+/* ── Success cooldown (#2835) ─────────────────────────────────────── */
+
+TEST(success_delay_fast_index_keeps_interval) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 0), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1666), 5000); /* 3x < interval */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 20000), 60000);
+    PASS();
+}
+
+TEST(success_delay_slow_index_scales_by_factor) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1667), 5001);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 10000), 30000);
+    /* 90 s rebuild → next poll 4.5 min after it finishes. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 90000), 270000);
+    PASS();
+}
+
+TEST(success_delay_clamped_and_degenerate) {
+    /* Capped at 5 min (INDEX_FAIL_CEILING_MS) from 100 s of indexing up. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 100000), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 100001), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 300000), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MAX), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, -1), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MIN), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(-1, 0), 0);
+    /* Never below the caller's own cadence, even above the ceiling. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(INT_MAX, INT64_MAX), INT_MAX);
+    PASS();
+}
+
+TEST(success_delay_is_monotonic) {
+    int previous = cbm_watcher_success_delay_ms(5000, 0);
+    for (int64_t e = 0; e <= 2000000; e += 997) {
+        int delay = cbm_watcher_success_delay_ms(5000, e);
+        ASSERT_TRUE(delay >= previous);
+        ASSERT_TRUE(delay >= 5000 && delay <= 300000);
+        previous = delay;
+    }
+    PASS();
+}
+
+/* Wire-up: the cooldown must be measured around the real index_fn call and
+ * counted from when the index finished. The watcher's clock is frozen via a
+ * test seam and the callback advances it, so an index "takes" a chosen time
+ * with no sleep and the scheduled poll time can be asserted exactly. */
+#define COOL_NS_PER_MS 1000000LL
+static int64_t cool_clock_ns = 0;
+static int64_t cool_index_ms = 0;
+static int cool_index_calls = 0;
+static int cool_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    cool_index_calls++;
+    cool_clock_ns += cool_index_ms * COOL_NS_PER_MS;
+    cbm_watcher_test_set_clock_ns(cool_clock_ns);
+    return 0;
+}
+
+/* Re-index once (touch + poll until the callback runs; a transient git probe
+ * failure makes a poll a no-op, see the sustained-failure test) and return
+ * the scheduled next poll relative to when the index finished, in ms. */
+static int64_t cool_reindex_delay_ms(cbm_watcher_t *w, const char *file, const char *line,
+                                     int64_t index_ms) {
+    cool_index_ms = index_ms;
+    th_append_file(file, line);
+    int target = cool_index_calls + 1;
+    while (cool_index_calls < target) {
+        cbm_watcher_touch(w, "cool-repo");
+        cbm_watcher_poll_once(w);
+    }
+    return (cbm_watcher_test_next_poll_ns(w, "cool-repo") - cool_clock_ns) / COOL_NS_PER_MS;
+}
+
+TEST(watcher_success_cooldown_measures_index_issue2835) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cool_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    char p[300];
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cool_clock_ns = 1000LL * 1000 * COOL_NS_PER_MS; /* any nonzero start */
+    cbm_watcher_test_set_clock_ns(cool_clock_ns);
+    cool_index_calls = 0;
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, cool_index_callback, NULL);
+    cbm_watcher_watch(w, "cool-repo", tmpdir);
+    cbm_watcher_poll_once(w); /* baseline */
+
+    wt_path(p, sizeof(p), tmpdir, "file.txt");
+    /* Instant index: plain cadence. */
+    int64_t fast = cool_reindex_delay_ms(w, p, "a\n", 0);
+    /* 60 s index → 3 x 60 s, counted from the END of the index (anchoring at
+     * the start would give 120 s here). */
+    int64_t slow = cool_reindex_delay_ms(w, p, "b\n", 60000);
+    /* 200 s index → 600 s, capped at 5 min. */
+    int64_t capped = cool_reindex_delay_ms(w, p, "c\n", 200000);
+
+    /* Restore the real clock before any assert can return early. */
+    cbm_watcher_test_set_clock_ns(0);
+
+    ASSERT_EQ(fast, cbm_watcher_poll_interval_ms(1));
+    ASSERT_EQ(slow, 180000);
+    ASSERT_EQ(capped, 300000);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_index_failure_count_unknown_project) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -4043,6 +4164,11 @@ SUITE(watcher) {
     RUN_TEST(index_backoff_never_schedules_sooner_than_the_interval);
     RUN_TEST(watcher_index_failure_streak_increments_and_resets_issue2015);
     RUN_TEST(watcher_index_failure_backoff_gates_repolling_issue2015);
+    RUN_TEST(success_delay_fast_index_keeps_interval);
+    RUN_TEST(success_delay_slow_index_scales_by_factor);
+    RUN_TEST(success_delay_clamped_and_degenerate);
+    RUN_TEST(success_delay_is_monotonic);
+    RUN_TEST(watcher_success_cooldown_measures_index_issue2835);
     RUN_TEST(watcher_sustained_failure_logs_once_issue2015);
     RUN_TEST(watcher_index_failure_count_unknown_project);
     RUN_TEST(watcher_project_info_publishes_scan_issue2167);

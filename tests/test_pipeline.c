@@ -9710,6 +9710,108 @@ TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
 }
 #endif /* !_WIN32 */
 
+#ifdef _WIN32
+/* Create or delete a real file named nul in dir, as a Git Bash redirect such
+ * as `cmd > nul` leaves behind (#2646). The plain Win32 path <dir>/nul names
+ * the NUL device, so the file is reached only through the extended-length
+ * namespace, which needs an absolute path with backslashes (CI's TEMP uses
+ * forward slashes). */
+static bool pipeline_test_nul_file(const char *dir, bool create) {
+    enum { NUL_PATH_CAP = 1024, PREFIX_LEN = 4, LEAF_LEN = 4 };
+    static const wchar_t prefix[] = L"\\\\?\\";
+    static const wchar_t leaf[] = L"\\nul";
+    wchar_t path[NUL_PATH_CAP];
+    const DWORD room = NUL_PATH_CAP - PREFIX_LEN - LEAF_LEN;
+    wchar_t *wide_dir = cbm_utf8_to_wide(dir);
+    DWORD length = wide_dir ? GetFullPathNameW(wide_dir, room, path + PREFIX_LEN, NULL) : 0;
+    free(wide_dir);
+    if (length == 0 || length >= room) {
+        return false;
+    }
+    wmemcpy(path, prefix, PREFIX_LEN);
+    wmemcpy(path + PREFIX_LEN + length, leaf, LEAF_LEN + 1);
+    if (!create) {
+        return DeleteFileW(path) != 0;
+    }
+    HANDLE file =
+        CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(file);
+    return true;
+}
+
+/* #2646: the control-file walk cannot inspect a file named nul through the
+ * plain path, and it never needs to: only directories and control files can
+ * contribute to the manifest. Listing nul in .gitignore does not help, since
+ * the walk visits every entry. */
+TEST(pipeline_semantic_manifest_skips_nul_device_file_issue2646) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_nul_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app.py", "def NulNeighbor():\n    return 1\n");
+    write_temp_file(tmp, ".gitignore", "nul\n");
+    bool created = pipeline_test_nul_file(tmp, true);
+
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = -1;
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-skip-nul", tmp, NULL, 0, NULL, 0,
+                                                  NULL, NULL, &manifest, &manifest_count);
+    bool found_gitignore = false;
+    for (int i = 0; i < manifest_count; i++) {
+        if (manifest[i].rel_path && strcmp(manifest[i].rel_path, ".gitignore") == 0) {
+            found_gitignore = true;
+        }
+    }
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    bool deleted = created && pipeline_test_nul_file(tmp, false);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(created);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(found_gitignore);
+    ASSERT_TRUE(deleted);
+    PASS();
+}
+
+/* The user-visible half of #2646: one such file made every index run return
+ * CBM_PIPELINE_ABORT_PRESERVE_DB (aborted_previous_preserved), so a new
+ * project never got an index. */
+TEST(pipeline_full_index_survives_nul_device_file_issue2646) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_index_nul_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app.py", "def NulNeighbor():\n    return 1\n");
+    write_temp_file(tmp, ".gitignore", "nul\n");
+    bool created = pipeline_test_nul_file(tmp, true);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    char project[256] = "";
+    if (pipeline) {
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(pipeline));
+        cbm_pipeline_free(pipeline);
+    }
+    int indexed = -1;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (store) {
+        indexed = named_node_count(store, project, "NulNeighbor");
+        cbm_store_close(store);
+    }
+    bool deleted = created && pipeline_test_nul_file(tmp, false);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(created);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(indexed, 1);
+    ASSERT_TRUE(deleted);
+    PASS();
+}
+#endif /* _WIN32 */
+
 /* A fully validated staged graph must be able to recover from a definitely
  * non-SQLite destination without deleting evidence or overwriting an earlier
  * quarantine. The replacement happens only after the corrupt bytes are moved. */
@@ -34216,6 +34318,10 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
 #ifndef _WIN32
     RUN_TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory);
+#endif
+#ifdef _WIN32
+    RUN_TEST(pipeline_semantic_manifest_skips_nul_device_file_issue2646);
+    RUN_TEST(pipeline_full_index_survives_nul_device_file_issue2646);
 #endif
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);

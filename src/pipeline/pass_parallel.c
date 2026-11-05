@@ -3400,13 +3400,18 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *lsp_target = NULL;
+        /* Mirrors pass_calls.c: a Java call on a JDK/library type is never
+         * bound to a project method found by name. */
+        bool java_external = cbm_pipeline_java_external_target(lang, lsp);
         if (lsp) {
             /* Canonicalise to the gbuf node's QN so res.qualified_name matches
              * the gbuf even when the cross-file fallback had to prefix the
              * project name. */
             bool exact_external_target = call->requires_lsp_resolution &&
                                          cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
-            lsp_target = exact_external_target
+            lsp_target = java_external ? cbm_pipeline_lsp_target_node_strict(
+                                             rc->main_gbuf, rc->project_name, lsp->callee_qn, false)
+                         : exact_external_target
                              ? cbm_pipeline_lsp_target_node_strict(rc->main_gbuf, rc->project_name,
                                                                    lsp->callee_qn, allow_tail)
                              : cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
@@ -3451,7 +3456,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                           candidates, CBM_SZ_256);
         }
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
-            !rust_external && !php_vendor_call && count == 0) {
+            !rust_external && !php_vendor_call && !java_external && count == 0) {
             /* Python LEGB fallback first (MUST match pass_calls.c). */
             res = cbm_registry_resolve_call_scoped(rc->registry, call->callee_name, module_qn,
                                                    imp_keys, imp_vals, imp_count, lang,
