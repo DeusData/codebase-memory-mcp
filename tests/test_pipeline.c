@@ -17400,16 +17400,8 @@ TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers) {
         {"CrossSuite.wrapped()", "OtherRequest.responseDecodable(of:Type,completion:()=>Void)", 0},
         {"CrossSuite.storedStream()", "Type.responseStream(stream:Handler<Int,Never>)", 1},
         {"CrossSuite.awaited()async", "Type.moveReaderIndex(forwardBy:Int)", 1},
-        {"CrossSuite.mixedFactory()", "Session.upload(_:Int)", 0},
-        {"CrossSuite.mixedFactory()", "Unrelated.upload(_:Int)", 0},
         {"nestedFactory()", "Session.upload(_:Int)", 1},
         {"nestedFactory()", "Unrelated.upload(_:Int)", 0},
-        {"unknownFactory()", "Session.upload(_:Int)", 0},
-        {"unknownFactory()", "Unrelated.upload(_:Int)", 0},
-        {"unknownRoot()", "Session.upload(_:Int)", 0},
-        {"unknownRoot()", "Unrelated.upload(_:Int)", 0},
-        {"cyclicFactory()", "Session.upload(_:Int)", 0},
-        {"cyclicFactory()", "Unrelated.upload(_:Int)", 0},
         {"divergent(_:Session)", "Request.responseDecodable(of:Type,completion:()=>Void)", 0},
         {"divergent(_:Session)", "OtherRequest.responseDecodable(of:Type,completion:()=>Void)", 0},
         {"wrongTail(_:Session)", "Request.responseDecodable(of:Type,completion:()=>Void)", 0},
@@ -17506,6 +17498,33 @@ TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers) {
                 }
                 cbm_node_free_fields(&caller);
                 cbm_node_free_fields(&target);
+            }
+            /* #2061: a receiver whose initializer type stays unknown (split
+             * overload returns, an unknown callee or root, a cycle) keeps the
+             * label match: the upload(1) call still gets exactly one edge. */
+            const char *unknown[] = {"CrossSuite.mixedFactory()", "unknownFactory()",
+                                     "unknownRoot()", "cyclicFactory()"};
+            for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+                char qn[1024];
+                cbm_node_t caller = {0};
+                snprintf(qn, sizeof(qn), "%s.Calls.%s", project, unknown[i]);
+                ASSERT_EQ(cbm_store_find_node_by_qn(store, project, qn, &caller), CBM_STORE_OK);
+                cbm_edge_t *edges = NULL;
+                int edge_count = 0;
+                ASSERT_EQ(cbm_store_find_edges_by_source_type(store, caller.id, "CALLS", &edges,
+                                                              &edge_count),
+                          CBM_STORE_OK);
+                int uploads = 0;
+                for (int edge = 0; edge < edge_count; edge++) {
+                    cbm_node_t target = {0};
+                    ASSERT_EQ(cbm_store_find_node_by_id(store, edges[edge].target_id, &target),
+                              CBM_STORE_OK);
+                    uploads += target.name && strcmp(target.name, "upload") == 0;
+                    cbm_node_free_fields(&target);
+                }
+                cbm_store_free_edges(edges, edge_count);
+                ASSERT_EQ(uploads, 1);
+                cbm_node_free_fields(&caller);
             }
             cbm_store_close(store);
             cbm_pipeline_free(p);

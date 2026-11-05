@@ -3633,6 +3633,8 @@ typedef struct {
     const char *module_qn;
     const char **imports;
     int import_count;
+    /* Inferring an initializer's type: a label match is a guess, never a type. */
+    bool strict;
 } swift_inference_t;
 
 static const char *swift_initializer_type(const swift_inference_t *context,
@@ -3686,11 +3688,17 @@ static const char *swift_binding_cached_type(swift_binding_work_t *work,
     return "";
 }
 
-/* Conflicting block-local bindings stay unknown rather than selecting a
- * same-name method on either type. */
+/* Where a receiver's type came from: no binding, a declaration (an annotation,
+ * a parameter, a constructor call), or only an initializer whose type was
+ * inferred from the call it makes. */
+typedef enum { SWIFT_ORIGIN_NONE, SWIFT_ORIGIN_DECLARED, SWIFT_ORIGIN_INFERRED } swift_origin_t;
+
+/* Conflicting block-local bindings ("") select no same-name method on either
+ * type. A binding whose initializer type could not be inferred leaves the
+ * receiver unknown (NULL), so the call keeps the label match (#2061). */
 static const char *swift_binding_type(const swift_inference_t *context, swift_binding_work_t *work,
                                       const char *name, const char *scope, const char *class_qn,
-                                      const char *module_qn, bool field) {
+                                      const char *module_qn, bool field, swift_origin_t *origin) {
     const CBMFileResult *file = context->file;
     int best = 0;
     for (int i = 0; i < file->type_assigns.count; i++) {
@@ -3700,22 +3708,33 @@ static const char *swift_binding_type(const swift_inference_t *context, swift_bi
             best = rank;
         }
     }
+    *origin = best ? SWIFT_ORIGIN_INFERRED : SWIFT_ORIGIN_NONE;
     if (!best) {
         return NULL;
     }
     const char *type = NULL;
+    bool unknown = false;
     for (int i = 0; i < file->type_assigns.count; i++) {
         const CBMTypeAssign *a = &file->type_assigns.items[i];
         if (swift_assignment_rank(a, name, scope, class_qn, module_qn, field) != best) {
             continue;
         }
-        const char *candidate = a->type_name ? a->type_name : swift_binding_cached_type(work, a);
+        const char *candidate = a->type_name;
+        if (candidate) {
+            *origin = SWIFT_ORIGIN_DECLARED;
+        } else {
+            candidate = swift_binding_cached_type(work, a);
+            if (!candidate[0]) {
+                unknown = true;
+                continue;
+            }
+        }
         if (type && strcmp(type, candidate) != 0) {
             return "";
         }
         type = candidate;
     }
-    return type;
+    return unknown ? NULL : type;
 }
 
 static void swift_enclosing_class(const CBMCall *call, char *class_qn) {
@@ -3734,8 +3753,9 @@ static void swift_enclosing_class(const CBMCall *call, char *class_qn) {
 
 static const char *swift_file_receiver(const swift_inference_t *context, swift_binding_work_t *work,
                                        const CBMCall *call, const char *module_qn, char *expression,
-                                       char *class_qn, char **member) {
+                                       char *class_qn, char **member, swift_origin_t *origin) {
     swift_enclosing_class(call, class_qn);
+    *origin = SWIFT_ORIGIN_DECLARED;
     char *dot = strchr(expression, '.');
     *dot = '\0';
     *member = dot + SKIP_ONE;
@@ -3746,13 +3766,14 @@ static const char *swift_file_receiver(const swift_inference_t *context, swift_b
         }
         *dot = '\0';
         const char *type = swift_binding_type(context, work, *member, call->enclosing_func_qn,
-                                              class_qn, module_qn, true);
+                                              class_qn, module_qn, true, origin);
         *member = dot + SKIP_ONE;
         return type;
     }
     const char *type = swift_binding_type(context, work, expression, call->enclosing_func_qn,
-                                          class_qn, module_qn, false);
-    if (!type && isupper((unsigned char)expression[0])) {
+                                          class_qn, module_qn, false, origin);
+    if (*origin == SWIFT_ORIGIN_NONE && isupper((unsigned char)expression[0])) {
+        *origin = SWIFT_ORIGIN_DECLARED;
         return expression;
     }
     return type;
@@ -3867,6 +3888,34 @@ static const char *swift_function_return_type(const swift_inference_t *context, 
     return NULL; /* No declaring-file imports are available for a remote free function. */
 }
 
+/* `func run<Result>() -> Result`: the callee's own generic parameter names no
+ * type, so the value it returns stays unknown (#2061). The QN keeps the
+ * declaration's generic clause unless the signature was capped. */
+static bool swift_returns_generic_parameter(const char *qn, const char *member,
+                                            const char *returned) {
+    char nominal[CBM_SZ_4K];
+    if (!member || !swift_receiver_type_text(returned, nominal, sizeof(nominal))) {
+        return false;
+    }
+    const char *clause = qn + cbm_qn_callable_base_len_named(qn, member);
+    size_t length = clause[0] == '<' ? swift_generic_prefix_len(clause, strlen(clause)) : 0;
+    size_t name_length = strlen(nominal);
+    unsigned depth = 0;
+    for (size_t i = SKIP_ONE; i + SKIP_ONE < length && clause[i] != ';'; i++) {
+        bool entry = depth == 0 && (i == SKIP_ONE || clause[i - SKIP_ONE] == ',');
+        if (entry && strncmp(clause + i, nominal, name_length) == 0 && clause[i + name_length] &&
+            strchr(":,;>", clause[i + name_length])) {
+            return true;
+        }
+        if (clause[i] == '<') {
+            depth++;
+        } else if (clause[i] == '>' && clause[i - SKIP_ONE] != '=' && depth) {
+            depth--;
+        }
+    }
+    return false;
+}
+
 static const char *swift_candidates_return_type(const swift_inference_t *context, int count,
                                                 const char **out, const char *receiver,
                                                 const char *member) {
@@ -3875,7 +3924,8 @@ static const char *swift_candidates_return_type(const swift_inference_t *context
     const char *spelling = NULL;
     for (int i = 0; i < count; i++) {
         const char *returned = swift_chain_return_spelling(r, out[i]);
-        if (!returned || (spelling && strcmp(spelling, returned) != 0)) {
+        if (!returned || (spelling && strcmp(spelling, returned) != 0) ||
+            swift_returns_generic_parameter(out[i], member, returned)) {
             return NULL;
         }
         const char *label = cbm_ht_get(r->exact, out[i]);
@@ -3970,12 +4020,15 @@ static int swift_initializer_member_candidates(const swift_inference_t *context,
     }
     (void)snprintf(expression, sizeof(expression), "%s", call->callee_name);
     char *member = NULL;
-    const char *type =
-        swift_file_receiver(context, work, call, context->module_qn, expression, owner, &member);
+    swift_origin_t origin;
+    const char *type = swift_file_receiver(context, work, call, context->module_qn, expression,
+                                           owner, &member, &origin);
     if (!type || !type[0]) {
         return SWIFT_INCOMPATIBLE; /* Unknown roots cannot establish an initializer's type. */
     }
-    return swift_candidates_for_file(context, work, call, out, REG_MAX_CANDIDATES);
+    swift_inference_t strict = *context;
+    strict.strict = true;
+    return swift_candidates_for_file(&strict, work, call, out, REG_MAX_CANDIDATES);
 }
 
 static int swift_initializer_candidates(const swift_inference_t *context,
@@ -4078,6 +4131,44 @@ static bool swift_call_uses_named_receiver(const CBMFileResult *file, const CBMC
            (isupper((unsigned char)call->callee_name[0]) && !strchr(call->callee_name, '('));
 }
 
+/* Walk the receiver chain from its root type: each `name(...)` segment
+ * continues on the return type its compatible candidates agree on. */
+static int swift_receiver_candidates(const swift_inference_t *context, const CBMCall *call,
+                                     char *expression, const char *type, char *member,
+                                     const char **out, int out_cap) {
+    const cbm_registry_t *r = context->registry;
+    bool from_chain = r->swift_owners && cbm_ht_has(r->swift_owners->by_qn, type);
+    while (type && type[0]) {
+        char type_text[CBM_SZ_4K];
+        if (!from_chain && !swift_receiver_type_text(type, type_text, sizeof(type_text))) {
+            return SWIFT_INCOMPATIBLE;
+        }
+        const char *receiver =
+            from_chain
+                ? cbm_ht_get_key(r->exact, type)
+                : swift_receiver_qn(r, context->file, context->graph, type_text, context->module_qn,
+                                    context->imports, context->import_count);
+        if (!receiver) {
+            return SWIFT_INCOMPATIBLE; /* known non-project receiver */
+        }
+        char *args = strchr(member, '(');
+        if (!args) {
+            return swift_typed_candidates(r, context->graph, context->file, context->module_qn,
+                                          call, receiver, member, out, out_cap);
+        }
+        char *after = swift_after_arguments(args);
+        if (!after || *after != '.') {
+            return SWIFT_INCOMPATIBLE;
+        }
+        *args = '\0';
+        const CBMCall *inner = swift_inner_call(context->file, call, (size_t)(args - expression));
+        type = swift_chain_return(context, inner, receiver, member, out, out_cap);
+        from_chain = true;
+        member = after + SKIP_ONE;
+    }
+    return SWIFT_INCOMPATIBLE;
+}
+
 static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
                                      const CBMCall *call, const char **out, int out_cap) {
     const cbm_registry_t *r = context->registry;
@@ -4104,40 +4195,22 @@ static int swift_candidates_for_file(const swift_inference_t *context, swift_bin
     }
     (void)snprintf(expression, sizeof(expression), "%s", call->callee_name);
     char *member = NULL;
+    swift_origin_t origin;
     const char *type =
-        swift_file_receiver(context, work, call, module_qn, expression, class_qn, &member);
+        swift_file_receiver(context, work, call, module_qn, expression, class_qn, &member, &origin);
     if (!type) {
         return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
                                              out_cap);
     }
-    bool from_chain = r->swift_owners && cbm_ht_has(r->swift_owners->by_qn, type);
-    while (type && type[0]) {
-        char type_text[CBM_SZ_4K];
-        if (!from_chain && !swift_receiver_type_text(type, type_text, sizeof(type_text))) {
-            return SWIFT_INCOMPATIBLE;
-        }
-        const char *receiver = from_chain ? cbm_ht_get_key(r->exact, type)
-                                          : swift_receiver_qn(r, file, graph, type_text, module_qn,
-                                                              import_vals, import_count);
-        if (!receiver) {
-            return SWIFT_INCOMPATIBLE; /* known non-project receiver */
-        }
-        char *args = strchr(member, '(');
-        if (!args) {
-            return swift_typed_candidates(r, graph, file, module_qn, call, receiver, member, out,
-                                          out_cap);
-        }
-        char *after = swift_after_arguments(args);
-        if (!after || *after != '.') {
-            return SWIFT_INCOMPATIBLE;
-        }
-        *args = '\0';
-        const CBMCall *inner = swift_inner_call(file, call, (size_t)(args - expression));
-        type = swift_chain_return(context, inner, receiver, member, out, out_cap);
-        from_chain = true;
-        member = after + SKIP_ONE;
+    int found = swift_receiver_candidates(context, call, expression, type, member, out, out_cap);
+    /* A type inferred from an initializer call only narrows the label match:
+     * when it has no member with this name and these labels, keep the label
+     * match, as before that inference existed (#2061). */
+    if (found <= 0 && origin == SWIFT_ORIGIN_INFERRED && !context->strict) {
+        return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
+                                             out_cap);
     }
-    return SWIFT_INCOMPATIBLE;
+    return found;
 }
 
 int cbm_registry_swift_candidates_in_file(const cbm_registry_t *r, const CBMCall *call,
