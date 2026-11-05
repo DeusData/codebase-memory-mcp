@@ -17535,6 +17535,122 @@ TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers) {
     PASS();
 }
 
+/* One Swift corpus, sequential and parallel: every (caller, target) pair has
+ * the expected CALLS edge count. Callers and targets are "<file stem>.<QN>". */
+typedef struct {
+    const char *caller;
+    const char *target;
+    int expected;
+} swift_call_pair_t;
+
+static int swift_call_pairs_case(const char *const *files, int file_count,
+                                 const swift_call_pair_t *pairs, int pair_count) {
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_swift_pairs_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        for (int i = 0; i < file_count; i++) {
+            write_temp_file(tmp, files[i * 2], files[i * 2 + 1]);
+        }
+        for (int i = 0; parallel && i < 55; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "Pad%d.swift", i);
+            write_temp_file(tmp, path, "// filler\n");
+        }
+        XlangEnvSave saved = xlang_env_select(parallel != 0);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        cbm_store_t *store = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(store);
+        const char *project = cbm_pipeline_project_name(p);
+        for (int i = 0; i < pair_count; i++) {
+            char qn[1024];
+            cbm_node_t caller = {0}, target = {0};
+            snprintf(qn, sizeof(qn), "%s.%s", project, pairs[i].caller);
+            ASSERT_EQ(cbm_store_find_node_by_qn(store, project, qn, &caller), CBM_STORE_OK);
+            snprintf(qn, sizeof(qn), "%s.%s", project, pairs[i].target);
+            ASSERT_EQ(cbm_store_find_node_by_qn(store, project, qn, &target), CBM_STORE_OK);
+            ASSERT_EQ(pipeline_has_calls_edge(store, caller.id, target.id), pairs[i].expected);
+            cbm_node_free_fields(&caller);
+            cbm_node_free_fields(&target);
+        }
+        cbm_store_close(store);
+        cbm_pipeline_free(p);
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+/* #2061: `func run<Result>(...) -> Result` returns its own generic parameter,
+ * which names no type even where the project declares a `Result`. The bound
+ * variable stays unknown and its call keeps the label match, as it did before
+ * initializer types were inferred. */
+TEST(pipeline_swift_generic_return_keeps_label_match_issue2061) {
+    const char *files[] = {
+        "Types.swift",
+        "struct Result { func salWait(context: Int) -> Int { 0 } }\n"
+        "class Context {\n"
+        "    func run<Result>(body: () -> Result) -> Result { body() }\n"
+        "    func make<Element>(body: () -> Element) -> Element { body() }\n"
+        "}\n",
+        "Calls.swift",
+        "class Waiter {\n"
+        "    func salWait(context: Int) -> Int { 0 }\n"
+        "    func drain(count: Int) -> Int { 0 }\n"
+        "}\n"
+        "func generic(_ context: Context) { let result = context.run(body: { Waiter() }); "
+        "_ = result.salWait(context: 1) }\n"
+        "func element(_ context: Context) { let value = context.make(body: { Waiter() }); "
+        "_ = value.drain(count: 1) }\n",
+    };
+    const swift_call_pair_t pairs[] = {
+        {"Calls.generic(_:Context)", "Calls.Waiter.salWait(context:Int)=>Int", 1},
+        {"Calls.generic(_:Context)", "Types.Result.salWait(context:Int)=>Int", 0},
+        {"Calls.element(_:Context)", "Calls.Waiter.drain(count:Int)=>Int", 1},
+    };
+    return swift_call_pairs_case(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
+}
+
+/* #2061: `try` / `try await` around a constructor still names the receiver's
+ * type, and a subclass receiver reaches its base class and the base class's
+ * extension in another file. The Decoy members match the same labels, so a
+ * label match alone would land on them. */
+TEST(pipeline_swift_try_initializer_types_receiver_issue2061) {
+    const char *files[] = {
+        "Types.swift",
+        "class Reader {\n"
+        "    init(path: String) async throws {}\n"
+        "    func next(count: Int) -> Int { 0 }\n"
+        "}\n"
+        "class BaseSocket { func close() {} }\n"
+        "class ServerSocket: BaseSocket { init(port: Int) throws {} }\n",
+        "Vsock.swift",
+        "extension BaseSocket { func localVsockAddress() -> Int { 0 } }\n",
+        "Calls.swift",
+        "class Decoy {\n"
+        "    func next(count: Int) -> Int { 0 }\n"
+        "    func localVsockAddress() -> Int { 0 }\n"
+        "    func close() {}\n"
+        "}\n"
+        "func awaited() async throws { let reader = try await Reader(path: \"x\"); "
+        "_ = reader.next(count: 1) }\n"
+        "func vsock() throws { let socket = try ServerSocket(port: 1); "
+        "_ = socket.localVsockAddress(); socket.close() }\n",
+    };
+    const swift_call_pair_t pairs[] = {
+        {"Calls.awaited()async", "Types.Reader.next(count:Int)=>Int", 1},
+        {"Calls.awaited()async", "Calls.Decoy.next(count:Int)=>Int", 0},
+        {"Calls.vsock()", "Vsock.BaseSocket.localVsockAddress()=>Int", 1},
+        {"Calls.vsock()", "Calls.Decoy.localVsockAddress()=>Int", 0},
+        {"Calls.vsock()", "Types.BaseSocket.close()", 1},
+        {"Calls.vsock()", "Calls.Decoy.close()", 0},
+    };
+    return swift_call_pairs_case(files, 3, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
+}
+
 TEST(pipeline_swift_return_identity_issue2061) {
     const char *returns[] = {"pick()=>Int", "pick()=>String"};
     return swift_declaration_identity_case(
@@ -33663,6 +33779,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_return_identity_issue2061);
     RUN_TEST(pipeline_swift_receiver_and_chained_closures_issue2061);
     RUN_TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers);
+    RUN_TEST(pipeline_swift_generic_return_keeps_label_match_issue2061);
+    RUN_TEST(pipeline_swift_try_initializer_types_receiver_issue2061);
     RUN_TEST(pipeline_swift_default_before_required_candidates_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_unresolved_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_parallel_fallback_issue2061);

@@ -3917,6 +3917,56 @@ TEST(swift_conditional_type_members_keep_owners_and_source_lines) {
     PASS();
 }
 
+/* #2061: masking the directives leaves the `#error` line of the dropped
+ * branch in the class body. That re-parse reads less of the file than the
+ * first one (the type and its initializer disappear), so the first parse is
+ * kept. */
+TEST(swift_conditional_retry_keeps_the_better_parse_issue2061) {
+    const char *source = "protocol Locking {\n"
+                         "    func lock()\n"
+                         "    func unlock()\n"
+                         "}\n"
+                         "\n"
+                         "#if canImport(Darwin)\n"
+                         "final class SpinLock: Locking {\n"
+                         "    init() {}\n"
+                         "    func lock() {}\n"
+                         "    func unlock() {}\n"
+                         "}\n"
+                         "#elseif canImport(Foundation)\n"
+                         "extension NSLock: Locking {}\n"
+                         "#else\n"
+                         "#error(\"No lock is available on this platform.\")\n"
+                         "#endif\n"
+                         "\n"
+                         "final class Guarded<Value> {\n"
+                         "    #if canImport(Darwin)\n"
+                         "    private let lock = SpinLock()\n"
+                         "    #elseif canImport(Foundation)\n"
+                         "    private let lock = NSLock()\n"
+                         "    #else\n"
+                         "    #error(\"No lock is available on this platform.\")\n"
+                         "    #endif\n"
+                         "\n"
+                         "    private nonisolated(unsafe) var value: Value\n"
+                         "\n"
+                         "    init(_ value: Value) {\n"
+                         "        self.value = value\n"
+                         "    }\n"
+                         "\n"
+                         "    func read<U>(_ closure: (Value) throws -> U) rethrows -> U { "
+                         "try closure(value) }\n"
+                         "}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Guarded.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_def_in_module(r, "Guarded"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "init(_:Value)"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "SpinLock.init()"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(swift_uncapped_selectors_keep_nested_return_types) {
     CBMFileResult *r = extract("func generic(_ value: Int) -> Box<Result> { fatalError() }\n"
                                "func callback() -> (Int) -> Result { fatalError() }\n",
@@ -15818,6 +15868,7 @@ SUITE(extraction) {
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_type_imports_preserve_markers_and_complete_file_imports);
     RUN_TEST(swift_conditional_type_members_keep_owners_and_source_lines);
+    RUN_TEST(swift_conditional_retry_keeps_the_better_parse_issue2061);
     RUN_TEST(swift_uncapped_selectors_keep_nested_return_types);
     RUN_TEST(swift_wrapped_trailing_closure_keeps_one_complete_call);
     RUN_TEST(swift_selector_expands_only_lexical_function_aliases);
