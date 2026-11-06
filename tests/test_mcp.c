@@ -1054,6 +1054,41 @@ TEST(tree_table_uses_prefix_dictionary_only_when_it_materially_wins) {
     PASS();
 }
 
+TEST(index_attempt_only_project_can_be_deleted) {
+    char *cache = th_mktempdir("cbm_attempt_only_delete");
+    ASSERT_NOT_NULL(cache);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("AttemptOnlyFixture", cache, "explicit", &policy, false,
+                                            attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptOnlyFixture", cache, attempt_id, "failed",
+                                                 "worker_start_failed", NULL, false));
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    char *response =
+        cbm_mcp_handle_tool(server, "delete_project", "{\"project\":\"AttemptOnlyFixture\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\\\"status\\\":\\\"deleted\\\""));
+    free(response);
+    cbm_mcp_server_free(server);
+
+    yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptOnlyFixture"),
+              CBM_INDEX_ATTEMPT_NONE);
+    yyjson_mut_doc_free(document);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
  * ══════════════════════════════════════════════════════════════════ */
@@ -8544,6 +8579,280 @@ TEST(tool_trace_path_recursion_survives_budget_floor_issue2816) {
     cbm_mcp_server_free(srv);
     PASS();
 }
+
+TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
+    char *cache = th_mktempdir("cbm_attempt_record");
+    ASSERT_NOT_NULL(cache);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[128];
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "strict", error, sizeof(error)));
+    char attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("AttemptFixture", cache, "explicit", &policy, false,
+                                            attempt_id));
+    ASSERT_EQ(strlen(attempt_id), 32);
+    ASSERT_FALSE(cbm_mcp_index_attempt_transition(
+        "AttemptFixture", cache, "00000000000000000000000000000000", "running", NULL, NULL, false));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, attempt_id, "running",
+                                                 NULL, NULL, false));
+    char replacement_attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("AttemptFixture", cache, "auto", &policy, false,
+                                            replacement_attempt_id));
+    ASSERT_FALSE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, attempt_id, "failed",
+                                                  "index_failed", NULL, false));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, replacement_attempt_id,
+                                                 "running", NULL, NULL, false));
+
+    char attempt_path[512];
+    (void)snprintf(attempt_path, sizeof(attempt_path), "%s/status/AttemptFixture.json", cache);
+    yyjson_read_err read_error;
+    yyjson_doc *stored = yyjson_read_file(attempt_path, 0, NULL, &read_error);
+    ASSERT_NOT_NULL(stored);
+    yyjson_mut_doc *abandoned = yyjson_doc_mut_copy(stored, NULL);
+    yyjson_doc_free(stored);
+    ASSERT_NOT_NULL(abandoned);
+    yyjson_mut_val *abandoned_root = yyjson_mut_doc_get_root(abandoned);
+    ASSERT_TRUE(yyjson_mut_obj_put(abandoned_root,
+                                   yyjson_mut_strcpy(abandoned, "owner_start_token"),
+                                   yyjson_mut_uint(abandoned, 0)));
+    char *abandoned_json = yyjson_mut_write(abandoned, 0, NULL);
+    ASSERT_NOT_NULL(abandoned_json);
+    ASSERT_EQ(th_write_file(attempt_path, abandoned_json), 0);
+    free(abandoned_json);
+    yyjson_mut_doc_free(abandoned);
+
+    cbm_mcp_index_attempt_recover_abandoned();
+    yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    char *json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"state\":\"failed\""));
+    ASSERT_NOT_NULL(strstr(json, "\"failure_code\":\"worker_lost\""));
+    ASSERT_NOT_NULL(strstr(json, "\"profile\":\"strict\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    char probe_attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("AttemptFixture", cache, "auto", &policy, false,
+                                            probe_attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, probe_attempt_id,
+                                                 "running", NULL, NULL, false));
+    cbm_index_resource_violation_t probe_failure = {
+        .resource = CBM_INDEX_RESOURCE_RSS_BYTES,
+        .probe_failed = true,
+    };
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, probe_attempt_id,
+                                                 "failed", "resource_probe_failed", &probe_failure,
+                                                 false));
+    document = yyjson_mut_doc_new(NULL);
+    root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"failure_code\":\"resource_probe_failed\""));
+    ASSERT_NOT_NULL(strstr(json, "\"resource\":\"rss_bytes\""));
+    ASSERT_NOT_NULL(strstr(json, "\"probe_failed\":true"));
+    ASSERT_NULL(strstr(json, "\"observed\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    char watcher_attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("AttemptFixture", cache, "watcher", &policy, true,
+                                            watcher_attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, watcher_attempt_id,
+                                                 "running", NULL, NULL, false));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, watcher_attempt_id,
+                                                 "failed", "index_failed", NULL, false));
+    char retry_attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("AttemptFixture", cache, "explicit", &policy, false,
+                                            retry_attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, retry_attempt_id,
+                                                 "running", NULL, NULL, false));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("AttemptFixture", cache, retry_attempt_id,
+                                                 "failed", "index_failed", NULL, false));
+    document = yyjson_mut_doc_new(NULL);
+    root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"origin\":\"explicit\""));
+    ASSERT_NOT_NULL(strstr(json, "\"watcher_observed_change\":true"));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    ASSERT_TRUE(cbm_mcp_index_attempt_remove("AttemptFixture"));
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(index_attempt_status_omits_freshness_string) {
+    char *cache_created = th_mktempdir("cbm_attempt_fresh_cache");
+    char *cache = cache_created ? strdup(cache_created) : NULL;
+    char *repo_created = th_mktempdir("cbm_attempt_fresh_repo");
+    char *repo = repo_created ? strdup(repo_created) : NULL;
+    ASSERT_NOT_NULL(cache);
+    ASSERT_NOT_NULL(repo);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    const char *init[] = {"-c", "init.defaultBranch=main", "init", "-q", NULL};
+    const char *add[] = {"add", "main.c", NULL};
+    const char *commit[] = {"-c",     "user.name=Test",
+                            "-c",     "user.email=test@example.com",
+                            "-c",     "commit.gpgsign=false",
+                            "commit", "-q",
+                            "-m",     "init",
+                            NULL};
+    if (mcp_test_git(repo, init) != 0 || mcp_test_git(repo, add) != 0 ||
+        mcp_test_git(repo, commit) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_cleanup(cache);
+        th_cleanup(repo);
+        free(cache);
+        free(repo);
+        SKIP_PLATFORM("git fixture unavailable");
+    }
+    ASSERT_EQ(cbm_unlink(TH_PATH(repo, ".cbm-empty-gitconfig")), 0);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char db_path[512];
+    (void)snprintf(db_path, sizeof(db_path), "%s/FreshFixture.db", cache);
+    ASSERT_TRUE(mcp_make_valid_project_store_at(db_path, "FreshFixture", repo));
+    char attempt_id[33];
+    ASSERT_TRUE(
+        cbm_mcp_index_attempt_begin("FreshFixture", repo, "explicit", &policy, false, attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("FreshFixture", repo, attempt_id, "running", NULL,
+                                                 NULL, false));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("FreshFixture", repo, attempt_id, "completed",
+                                                 NULL, NULL, true));
+
+    yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    char *json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    char failed_attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("FreshFixture", repo, "explicit", &policy, false,
+                                            failed_attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("FreshFixture", repo, failed_attempt_id, "running",
+                                                 NULL, NULL, false));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("FreshFixture", repo, failed_attempt_id, "failed",
+                                                 "index_failed", NULL, false));
+    document = yyjson_mut_doc_new(NULL);
+    root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"state\":\"failed\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "untracked.c"), "int dirty;\n"), 0);
+    document = yyjson_mut_doc_new(NULL);
+    root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    ASSERT_EQ(cbm_unlink(TH_PATH(repo, "untracked.c")), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 1; }\n"), 0);
+    if (mcp_test_git(repo, add) != 0 || mcp_test_git(repo, commit) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_cleanup(cache);
+        th_cleanup(repo);
+        free(cache);
+        free(repo);
+        SKIP_PLATFORM("git fixture update unavailable");
+    }
+    ASSERT_EQ(cbm_unlink(TH_PATH(repo, ".cbm-empty-gitconfig")), 0);
+    document = yyjson_mut_doc_new(NULL);
+    root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    char changed_attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin("FreshFixture", repo, "explicit", &policy, false,
+                                            changed_attempt_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("FreshFixture", repo, changed_attempt_id,
+                                                 "running", NULL, NULL, false));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 2; }\n"), 0);
+    if (mcp_test_git(repo, add) != 0 || mcp_test_git(repo, commit) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_cleanup(cache);
+        th_cleanup(repo);
+        free(cache);
+        free(repo);
+        SKIP_PLATFORM("git fixture update unavailable");
+    }
+    ASSERT_EQ(cbm_unlink(TH_PATH(repo, ".cbm-empty-gitconfig")), 0);
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition("FreshFixture", repo, changed_attempt_id,
+                                                 "completed", NULL, NULL, true));
+    document = yyjson_mut_doc_new(NULL);
+    root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
+              CBM_INDEX_ATTEMPT_AVAILABLE);
+    json = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"generation_snapshot_available\":false"));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
+    free(json);
+    yyjson_mut_doc_free(document);
+
+    ASSERT_TRUE(cbm_mcp_index_attempt_remove("FreshFixture"));
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    th_cleanup(repo);
+    free(cache);
+    free(repo);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  TOOL HANDLERS WITH DATA
+ * ══════════════════════════════════════════════════════════════════ */
 
 TEST(tool_trace_call_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -17692,8 +18001,8 @@ static int doccand_rows(const char *cache) {
         sqlite3_finalize(st);
         st = NULL;
         n = 0;
-        if (has_table && sqlite3_prepare_v2(db, "SELECT count(*) FROM doc_link_candidates", -1,
-                                            &st, NULL) == SQLITE_OK) {
+        if (has_table && sqlite3_prepare_v2(db, "SELECT count(*) FROM doc_link_candidates", -1, &st,
+                                            NULL) == SQLITE_OK) {
             n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
             sqlite3_finalize(st);
         }
@@ -23864,6 +24173,17 @@ TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery) {
               CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
 
     result.supervision_failed = false;
+    result.tree_quiesced = true;
+    result.outcome = CBM_PROC_KILLED;
+    result.resource_violation = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_TASK_TEMP_BYTES, .observed = 2048, .limit = 1024};
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE);
+    result.tree_quiesced = false;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
+    result.resource_violation = (cbm_index_resource_violation_t){0};
+    result.tree_quiesced = true;
     result.outcome = CBM_PROC_CRASH;
     result.response = NULL;
     ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
@@ -24292,6 +24612,26 @@ TEST(index_worker_resource_response_reports_preservation_for_the_request) {
     PASS();
 }
 
+TEST(index_supervisor_resource_probe_failure_response_is_structured) {
+    cbm_index_worker_result_t worker_result = {
+        .resource_violation =
+            {
+                .resource = CBM_INDEX_RESOURCE_CACHE_BYTES,
+                .limit = 1024,
+                .probe_failed = true,
+            },
+    };
+    char *response = cbm_mcp_index_worker_resource_response("{\"repo_path\":\"/tmp/missing\"}",
+                                                            &worker_result, NULL);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"code\":\"resource_probe_failed\""));
+    ASSERT_NOT_NULL(strstr(response, "\"stage\":\"storage\""));
+    ASSERT_NOT_NULL(strstr(response, "\"resource\":\"cache_bytes\""));
+    ASSERT_NOT_NULL(strstr(response, "\"retryable\":true"));
+    free(response);
+    PASS();
+}
+
 /* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
  * Distinct exit codes so the parent can report the exact failure mode. */
 enum {
@@ -24576,6 +24916,7 @@ enum {
     IDX832_NULL_RESP = 52,   /* supervised entry degraded to NULL */
     IDX832_NOT_INDEXED = 53, /* response/store lacks the indexed Function node */
     IDX832_SERVER_FAIL = 54,
+    IDX832_ATTEMPT_MISSING = 55,
 };
 
 #ifndef _WIN32 /* helper used only by the POSIX fork harness below */
@@ -24610,6 +24951,24 @@ static int idx832_supervised_route_check(const char *repo_dir) {
     /* Store-level proof the worker child did real work: the Function node it wrote
      * must be queryable from a fresh server reading the DB the child produced. */
     char *project = cbm_project_name_from_path(repo_dir);
+    const char *cache = cbm_resolve_cache_dir();
+    char attempt_path[1024];
+    int attempt_length = project && cache ? snprintf(attempt_path, sizeof(attempt_path),
+                                                     "%s/status/%s.json", cache, project)
+                                          : -1;
+    yyjson_doc *attempt = attempt_length > 0 && (size_t)attempt_length < sizeof(attempt_path)
+                              ? yyjson_read_file(attempt_path, 0, NULL, NULL)
+                              : NULL;
+    yyjson_val *attempt_root = attempt ? yyjson_doc_get_root(attempt) : NULL;
+    yyjson_val *attempt_origin =
+        attempt_root && yyjson_is_obj(attempt_root) ? yyjson_obj_get(attempt_root, "origin") : NULL;
+    bool watcher_attempt = attempt_origin && yyjson_is_str(attempt_origin) &&
+                           strcmp(yyjson_get_str(attempt_origin), "watcher") == 0;
+    yyjson_doc_free(attempt);
+    if (!watcher_attempt) {
+        free(project);
+        return IDX832_ATTEMPT_MISSING;
+    }
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
         free(project);
@@ -25746,6 +26105,57 @@ TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count) {
 }
 #endif /* CBM_ENABLE_TEST_SEAMS */
 
+TEST(mcp_inprocess_autoindex_inherits_resource_policy) {
+    char *root = th_mktempdir("cbm-autoindex-policy-root");
+    char *cache = th_mktempdir("cbm-autoindex-policy-cache");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "first.c"), "int first(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "second.c"), "int second(void) { return 2; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char saved_cwd[CBM_SZ_4K];
+    bool cwd_saved = cbm_getcwd(saved_cwd, sizeof(saved_cwd)) != NULL;
+    bool environment_ready =
+        cwd_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 && cbm_chdir(root) == 0;
+    cbm_config_t *config = environment_ready ? cbm_config_open(cache) : NULL;
+    bool configured = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                      cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
+                      cbm_config_set(config, CBM_INDEX_CONFIG_MAX_FILES, "1") == 0;
+    char *project = configured ? cbm_project_name_from_path(root) : NULL;
+    char db_path[CBM_SZ_4K] = {0};
+    if (project) {
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    }
+
+    cbm_mcp_server_t *server = configured && project ? cbm_mcp_server_new(NULL) : NULL;
+    if (server) {
+        cbm_mcp_server_set_config(server, config);
+        char *response = cbm_mcp_server_handle(
+            server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+        free(response);
+        cbm_mcp_server_free(server); /* joins the in-process auto-index thread */
+    }
+    bool limit_preserved_no_index = project && !cbm_file_exists(db_path);
+
+    cbm_config_close(config);
+    if (cwd_saved) {
+        (void)cbm_chdir(saved_cwd);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    free(project);
+    th_cleanup(root);
+    th_cleanup(cache);
+
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(configured);
+    ASSERT_NOT_NULL(server);
+    ASSERT_TRUE(limit_preserved_no_index);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #1466 / #713 — the auto_index_limit guard
  *
@@ -26133,6 +26543,7 @@ enum {
     IDX853_NO_SPAWN = 62,           /* spawn_count unchanged → supervised path not exercised */
     IDX853_SETUP_FAIL = 63,         /* config/watcher/server/cwd setup failed */
     IDX853_BAD_COUNT = 64,          /* unexpected watch_count (<0 or >1) */
+    IDX853_ATTEMPT_MISSING = 65,    /* supervised auto path omitted its attempt record */
 };
 
 #ifndef _WIN32 /* helper used only by the POSIX fork harness below */
@@ -26191,9 +26602,27 @@ static int idx853_supervised_autowatch_check(const char *repo_dir, const char *c
 
         int spawns_after = cbm_index_supervisor_spawn_count();
         int watch_count = cbm_watcher_watch_count(watcher);
+        char *project = cbm_project_name_from_path(repo_dir);
+        char attempt_path[1024];
+        int attempt_length = project ? snprintf(attempt_path, sizeof(attempt_path),
+                                                "%s/status/%s.json", cache_dir, project)
+                                     : -1;
+        yyjson_doc *attempt = attempt_length > 0 && (size_t)attempt_length < sizeof(attempt_path)
+                                  ? yyjson_read_file(attempt_path, 0, NULL, NULL)
+                                  : NULL;
+        yyjson_val *attempt_root = attempt ? yyjson_doc_get_root(attempt) : NULL;
+        yyjson_val *attempt_origin = attempt_root && yyjson_is_obj(attempt_root)
+                                         ? yyjson_obj_get(attempt_root, "origin")
+                                         : NULL;
+        bool attempt_recorded = attempt_origin && yyjson_is_str(attempt_origin) &&
+                                strcmp(yyjson_get_str(attempt_origin), "auto") == 0;
+        yyjson_doc_free(attempt);
+        free(project);
 
         if (spawns_after == spawns_before) {
             code = IDX853_NO_SPAWN; /* supervised branch never ran — not a valid probe */
+        } else if (!attempt_recorded) {
+            code = IDX853_ATTEMPT_MISSING;
         } else if (watch_count == 1) {
             code = IDX853_WATCHER_REGISTERED; /* the discriminating RED assertion */
         } else if (watch_count == 0) {
@@ -27822,8 +28251,8 @@ static bool scan_fixture_list(const scan_fixture_t *fx, const char *extra) {
 /* Run the scan; returns the records it wrote (caller frees), CRs kept. */
 static char *scan_fixture_run(const scan_fixture_t *fx, const char *pattern, bool use_regex,
                               size_t output_limit, int *cause) {
-    *cause = cbm_mcp_search_scan_for_test(NULL, fx->list, pattern, use_regex, fx->out,
-                                          output_limit, UINT64_MAX);
+    *cause = cbm_mcp_search_scan_for_test(NULL, fx->list, pattern, use_regex, fx->out, output_limit,
+                                          UINT64_MAX);
     FILE *fp = cbm_fopen(fx->out, "rb");
     if (!fp) {
         return NULL;
@@ -28217,6 +28646,9 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked);
     RUN_TEST(tool_index_status_freshness_status_unavailable_non_git);
     RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
+    RUN_TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job);
+    RUN_TEST(index_attempt_status_omits_freshness_string);
+    RUN_TEST(index_attempt_only_project_can_be_deleted);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
@@ -28364,6 +28796,7 @@ SUITE(mcp) {
     RUN_TEST(index_repository_cli_name_override_issue823);
     RUN_TEST(index_repository_over_budget_reports_named_reason);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
+    RUN_TEST(index_supervisor_resource_probe_failure_response_is_structured);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
     RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
@@ -28468,6 +28901,7 @@ SUITE(mcp) {
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
+    RUN_TEST(mcp_inprocess_autoindex_inherits_resource_policy);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
