@@ -5773,12 +5773,13 @@ static const CBMImport *rust_find_import(const CBMFileResult *r, const char *loc
     return NULL;
 }
 
-static void assert_rust_import(const CBMFileResult *r, const char *local,
-                               const char *module_path) {
+static int assert_rust_import(const CBMFileResult *r, const char *local,
+                              const char *module_path) {
     const CBMImport *imp = rust_find_import(r, local);
     ASSERT_NOT_NULL(imp);
     ASSERT_NOT_NULL(imp->module_path);
     ASSERT_STR_EQ(imp->module_path, module_path);
+    return 0;
 }
 
 TEST(rust_imports) {
@@ -5794,16 +5795,16 @@ TEST(rust_imports) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_EQ(r->imports.count, 10);
-    assert_rust_import(r, "HashMap", "std::collections::HashMap");
-    assert_rust_import(r, "io", "std::io");
-    assert_rust_import(r, "Write", "std::io::Write");
-    assert_rust_import(r, "Serialize", "serde::Serialize");
-    assert_rust_import(r, "Handler", "crate::h::Handler");
-    assert_rust_import(r, "O", "crate::h::Other");
-    assert_rust_import(r, "C", "a::b::C");
-    assert_rust_import(r, "D", "a::b::D");
-    assert_rust_import(r, "E", "a::E");
-    assert_rust_import(r, "*", "crate::ops::*");
+    ASSERT_EQ(assert_rust_import(r, "HashMap", "std::collections::HashMap"), 0);
+    ASSERT_EQ(assert_rust_import(r, "io", "std::io"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Write", "std::io::Write"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Serialize", "serde::Serialize"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Handler", "crate::h::Handler"), 0);
+    ASSERT_EQ(assert_rust_import(r, "O", "crate::h::Other"), 0);
+    ASSERT_EQ(assert_rust_import(r, "C", "a::b::C"), 0);
+    ASSERT_EQ(assert_rust_import(r, "D", "a::b::D"), 0);
+    ASSERT_EQ(assert_rust_import(r, "E", "a::E"), 0);
+    ASSERT_EQ(assert_rust_import(r, "*", "crate::ops::*"), 0);
     cbm_free_result(r);
     PASS();
 }
