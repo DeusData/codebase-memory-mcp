@@ -12708,6 +12708,9 @@ TEST(pipeline_go_rw_usage_never_cross_into_c) {
  * the generic-engine lane on its 12-language fixture). A Rust call never
  * targets another language's definition. pad_files > 0 forces the parallel
  * resolver, whose Rust registry is the shared all-defs build. */
+static int imports_binding_count(cbm_store_t *s, const char *project, const char *file_path,
+                                 const char *local_name);
+
 /* Pads a Rust fixture with pad_files filler modules (pad_files > 0 forces the
  * parallel resolver: CBM_WORKERS=4 for the run), runs the full pipeline into
  * <tmp>/<db_name> and opens the store. NULL store = the run failed. */
@@ -12807,6 +12810,54 @@ TEST(pipeline_rust_call_never_binds_another_language) {
 
 TEST(pipeline_rust_call_never_binds_another_language_parallel) {
     return rust_registry_rust_only_case(52);
+}
+
+TEST(pipeline_rust_grouped_import_resolves_assoc_call_issue2922) {
+    enum { MANY_BYTES = 64 * 1024 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_grouped_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/h.rs",
+                    "pub struct Handler { pub n: u32 }\n"
+                    "impl Handler { pub fn new() -> Handler { Handler { n: 1 } } }\n"
+                    "pub struct Other;\n");
+
+    char *many = (char *)malloc(MANY_BYTES);
+    ASSERT_NOT_NULL(many);
+    size_t off = 0;
+    for (int i = 0; i < 300; i++) {
+        int n = snprintf(many + off, MANY_BYTES - off,
+                         "pub struct S%d;\nimpl S%d { pub fn new() -> S%d { S%d } }\n", i, i, i,
+                         i);
+        ASSERT_TRUE(n > 0 && (size_t)n < MANY_BYTES - off);
+        off += (size_t)n;
+    }
+    write_temp_file(tmp, "src/many.rs", many);
+    free(many);
+
+    write_temp_file(tmp, "src/main.rs",
+                    "mod h;\n"
+                    "mod many;\n"
+                    "use crate::h::{Handler, Other};\n"
+                    "fn grouped() -> u32 { let _o = Other; Handler::new().n }\n"
+                    "fn main() { grouped(); }\n");
+
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, 0, "rust_grouped.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(imports_binding_count(s, project, "src/main.rs", "Handler"), 1);
+    ASSERT_EQ(imports_binding_count(s, project, "src/main.rs", "Other"), 1);
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "grouped", "new", "src/h.rs"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
 }
 
 /* `Opts::write(true)` is an associated function. The LSP leaves it to the
@@ -31995,6 +32046,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_rust_call_never_binds_another_language);
     RUN_TEST(pipeline_rust_call_never_binds_another_language_parallel);
+    RUN_TEST(pipeline_rust_grouped_import_resolves_assoc_call_issue2922);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake);
     RUN_TEST(pipeline_rust_assoc_call_never_binds_free_namesake_parallel);
     RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls);

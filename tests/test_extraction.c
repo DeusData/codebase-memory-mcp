@@ -5764,15 +5764,46 @@ TEST(java_imports) {
     PASS();
 }
 
+static const CBMImport *rust_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0) {
+            return &r->imports.items[i];
+        }
+    }
+    return NULL;
+}
+
+static void assert_rust_import(const CBMFileResult *r, const char *local,
+                               const char *module_path) {
+    const CBMImport *imp = rust_find_import(r, local);
+    ASSERT_NOT_NULL(imp);
+    ASSERT_NOT_NULL(imp->module_path);
+    ASSERT_STR_EQ(imp->module_path, module_path);
+}
+
 TEST(rust_imports) {
     CBMFileResult *r = extract(
-        "use std::collections::HashMap;\nuse std::io::{self, Write};\nuse serde::Serialize;\n"
+        "use std::collections::HashMap;\n"
+        "use std::io::{self, Write};\n"
+        "use serde::Serialize;\n"
+        "use crate::h::{Handler, Other as O};\n"
+        "use a::{b::{C, D}, E};\n"
+        "use crate::ops::*;\n"
         "fn main() {}\n",
         CBM_LANG_RUST, "t", "main.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT_GT(r->imports.count, 0);
-    ASSERT(has_import(r, "std::collections::HashMap"));
+    ASSERT_EQ(r->imports.count, 10);
+    assert_rust_import(r, "HashMap", "std::collections::HashMap");
+    assert_rust_import(r, "io", "std::io");
+    assert_rust_import(r, "Write", "std::io::Write");
+    assert_rust_import(r, "Serialize", "serde::Serialize");
+    assert_rust_import(r, "Handler", "crate::h::Handler");
+    assert_rust_import(r, "O", "crate::h::Other");
+    assert_rust_import(r, "C", "a::b::C");
+    assert_rust_import(r, "D", "a::b::D");
+    assert_rust_import(r, "E", "a::E");
+    assert_rust_import(r, "*", "crate::ops::*");
     cbm_free_result(r);
     PASS();
 }
