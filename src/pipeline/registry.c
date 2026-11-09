@@ -3688,10 +3688,15 @@ static const char *swift_binding_cached_type(swift_binding_work_t *work,
     return "";
 }
 
-/* Where a receiver's type came from: no binding, a declaration (an annotation,
- * a parameter, a constructor call), or only an initializer whose type was
+/* Where a receiver's type came from: no binding, a declaration (an annotation
+ * or a parameter), a constructor call, or only an initializer whose type was
  * inferred from the call it makes. */
-typedef enum { SWIFT_ORIGIN_NONE, SWIFT_ORIGIN_DECLARED, SWIFT_ORIGIN_INFERRED } swift_origin_t;
+typedef enum {
+    SWIFT_ORIGIN_NONE,
+    SWIFT_ORIGIN_DECLARED,
+    SWIFT_ORIGIN_CONSTRUCTED,
+    SWIFT_ORIGIN_INFERRED
+} swift_origin_t;
 
 /* Conflicting block-local bindings ("") select no same-name method on either
  * type. A binding whose initializer type could not be inferred leaves the
@@ -3721,7 +3726,12 @@ static const char *swift_binding_type(const swift_inference_t *context, swift_bi
         }
         const char *candidate = a->type_name;
         if (candidate) {
-            *origin = SWIFT_ORIGIN_DECLARED;
+            /* A declaration among the bindings decides; else a constructor. */
+            if (!a->constructed) {
+                *origin = SWIFT_ORIGIN_DECLARED;
+            } else if (*origin != SWIFT_ORIGIN_DECLARED) {
+                *origin = SWIFT_ORIGIN_CONSTRUCTED;
+            }
         } else {
             candidate = swift_binding_cached_type(work, a);
             if (!candidate[0]) {
@@ -4169,6 +4179,33 @@ static int swift_receiver_candidates(const swift_inference_t *context, const CBM
     return SWIFT_INCOMPATIBLE;
 }
 
+/* A type that only an initializer gives narrows the label match: when it has
+ * no member with this name and these labels, the call keeps the label match,
+ * as before initializer types were read (#2061). A constructor counts unless
+ * the project does not declare its type: DispatchSemaphore() and Task {...}
+ * name types it does not know, Data() one it only extends, and a label match
+ * would guess at members the project does not have. */
+static bool swift_keeps_label_match(const swift_inference_t *context, swift_origin_t origin,
+                                    const char *type) {
+    if (context->strict) {
+        return false; /* Inferring an initializer's type: a label match is a guess. */
+    }
+    if (origin != SWIFT_ORIGIN_CONSTRUCTED) {
+        return origin == SWIFT_ORIGIN_INFERRED;
+    }
+    char type_text[CBM_SZ_4K];
+    const char *qn =
+        swift_receiver_type_text(type, type_text, sizeof(type_text))
+            ? swift_receiver_qn(context->registry, context->file, context->graph, type_text,
+                                context->module_qn, context->imports, context->import_count)
+            : NULL;
+    const swift_owners_t *index = context->registry->swift_owners;
+    const swift_owner_t *owner = qn && index ? cbm_ht_get(index->by_qn, qn) : NULL;
+    /* No owner: `Foo.make()` read as a constructor names a function, whose
+     * result keeps the label match like an inferred one. */
+    return qn && (!owner || (owner->primary && owner->primary->declaration));
+}
+
 static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
                                      const CBMCall *call, const char **out, int out_cap) {
     const cbm_registry_t *r = context->registry;
@@ -4203,10 +4240,7 @@ static int swift_candidates_for_file(const swift_inference_t *context, swift_bin
                                              out_cap);
     }
     int found = swift_receiver_candidates(context, call, expression, type, member, out, out_cap);
-    /* A type inferred from an initializer call only narrows the label match:
-     * when it has no member with this name and these labels, keep the label
-     * match, as before that inference existed (#2061). */
-    if (found <= 0 && origin == SWIFT_ORIGIN_INFERRED && !context->strict) {
+    if (found <= 0 && swift_keeps_label_match(context, origin, type)) {
         return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
                                              out_cap);
     }

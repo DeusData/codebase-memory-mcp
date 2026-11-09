@@ -17753,6 +17753,47 @@ TEST(pipeline_swift_try_initializer_types_receiver_issue2061) {
     return swift_call_pairs_case(files, 3, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
 }
 
+/* #2061: a project type that only a constructor call gives (`Foo()`,
+ * `try Foo(...)`) narrows the label match like an inferred one: a member the
+ * type has wins over a same-label member elsewhere, and a member it lacks
+ * keeps the label match. An annotation or a parameter still decides alone,
+ * and so does a constructor of a type the project does not declare, whether
+ * it does not know the type (NSLock) or only extends it (Data). */
+TEST(pipeline_swift_constructor_receiver_keeps_label_match_issue2061) {
+    const char *files[] = {
+        "Types.swift",
+        "class Store {\n"
+        "    init() {}\n"
+        "    init(path: String) throws {}\n"
+        "    func write(count: Int) {}\n"
+        "}\n"
+        "extension Data { func checksum() -> Int { 0 } }\n",
+        "Calls.swift",
+        "class Reader {\n"
+        "    func read(count: Int) -> Int { 0 }\n"
+        "    func write(count: Int) {}\n"
+        "}\n"
+        "func constructed() { let store = Store(); _ = store.read(count: 1); "
+        "store.write(count: 1) }\n"
+        "func tried() throws { let store = try Store(path: \"x\"); _ = store.read(count: 1) }\n"
+        "func annotated() { let store: Store = Store(); _ = store.read(count: 1) }\n"
+        "func parameter(_ store: Store) { _ = store.read(count: 1) }\n"
+        "func external() { let lock = NSLock(); _ = lock.read(count: 1) }\n"
+        "func extended() { let data = Data(); _ = data.read(count: 1) }\n",
+    };
+    const swift_call_pair_t pairs[] = {
+        {"Calls.constructed()", "Calls.Reader.read(count:Int)=>Int", 1},
+        {"Calls.constructed()", "Types.Store.write(count:Int)", 1},
+        {"Calls.constructed()", "Calls.Reader.write(count:Int)", 0},
+        {"Calls.tried()", "Calls.Reader.read(count:Int)=>Int", 1},
+        {"Calls.annotated()", "Calls.Reader.read(count:Int)=>Int", 0},
+        {"Calls.parameter(_:Store)", "Calls.Reader.read(count:Int)=>Int", 0},
+        {"Calls.external()", "Calls.Reader.read(count:Int)=>Int", 0},
+        {"Calls.extended()", "Calls.Reader.read(count:Int)=>Int", 0},
+    };
+    return swift_call_pairs_case(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
+}
+
 TEST(pipeline_swift_return_identity_issue2061) {
     const char *returns[] = {"pick()=>Int", "pick()=>String"};
     return swift_declaration_identity_case(
@@ -33883,6 +33924,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_capped_chain_returns_and_metatype_receivers);
     RUN_TEST(pipeline_swift_generic_return_keeps_label_match_issue2061);
     RUN_TEST(pipeline_swift_try_initializer_types_receiver_issue2061);
+    RUN_TEST(pipeline_swift_constructor_receiver_keeps_label_match_issue2061);
     RUN_TEST(pipeline_swift_default_before_required_candidates_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_unresolved_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_parallel_fallback_issue2061);

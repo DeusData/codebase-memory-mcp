@@ -301,6 +301,8 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
             .var_name = cbm_node_text(ctx->arena, name, ctx->source),
             .type_name = type_name,
             .enclosing_func_qn = scope,
+            /* No annotation: the type is the one the initializer call constructs. */
+            .constructed = type_name && initializer_call && ts_node_is_null(type),
         };
         if (initializer_call) {
             assignment.value_start_byte = ts_node_start_byte(value);
