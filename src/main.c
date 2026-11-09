@@ -1165,7 +1165,7 @@ static void print_help(void) {
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
-    printf("\nSupported automatic/conditional client surfaces (45):\n");
+    printf("\nSupported automatic/conditional client surfaces (46):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
     printf("  Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands,\n");
@@ -1174,7 +1174,7 @@ static void print_help(void) {
     printf("  Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn,\n");
     printf("  Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE,\n");
     printf("  CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi,\n");
-    printf("  Sourcegraph Cody, Oh My Pi (omp)\n");
+    printf("  Sourcegraph Cody, Oh My Pi (omp), agentty\n");
     printf("  Conditional/explicit targets are changed only when their documented\n");
     printf("  platform, marker, or explicit existing config path is present.\n");
     printf("  Manual/UI MCP boundaries: Qodo, Warp, JetBrains AI/ACP, Replit,\n");
@@ -2465,7 +2465,7 @@ static void main_daemon_ctl_print_ui_configuration(void) {
                "`daemon start --open` verifies it)\n",
                ui_config.ui_port);
     } else {
-        printf("  ui: disabled (enable with `daemon start` in a UI build)\n");
+        printf("  ui: disabled (enable with `config set ui_enabled true`)\n");
     }
 }
 
@@ -2687,8 +2687,12 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
         if (!ui_config.ui_enabled) {
-            (void)fprintf(stderr, "error: UI is disabled for the active daemon; browser was not "
-                                  "opened\n");
+            main_daemon_ctl_print_ui_configuration();
+            if (open_browser) {
+                (void)fprintf(stderr,
+                              "error: UI is disabled for the active daemon; browser was not "
+                              "opened\n");
+            }
             return open_browser ? EXIT_FAILURE : EXIT_SUCCESS;
         }
         if (requested_port > 0 && requested_port != ui_config.ui_port) {
@@ -2749,10 +2753,14 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
      * _config.db) ran long on a loaded runner. */
     int ui_port = 0;
     bool ui_configured = false;
-    if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
-        cbm_ui_config_t ui_config;
-        cbm_ui_config_load(&ui_config);
-        ui_port = requested_port > 0 ? requested_port : ui_config.ui_port;
+    cbm_ui_config_t ui_config;
+    cbm_ui_config_load(&ui_config);
+    /* A bare start inherits the saved choice, just like automatic startup.
+     * Only an explicit UI request may re-enable a deliberately disabled UI
+     * (cbm_ui_config_daemon_start_ui; the ui suite pins the rule). */
+    bool ui_requested =
+        cbm_ui_config_daemon_start_ui(&ui_config, requested_port, open_browser, &ui_port);
+    if (CBM_EMBEDDED_FILE_COUNT > 0 && ui_requested) {
         uint8_t update_mask = 0x03U; /* enabled + port */
         bool context_set =
             main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,
@@ -2798,6 +2806,9 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
+    if (CBM_EMBEDDED_FILE_COUNT > 0 && !ui_requested) {
+        main_daemon_ctl_print_ui_configuration();
+    }
     /* Skipped when the handshake was refused: that path announces the port as
      * warming, which would be a promise nothing is keeping. */
     int ui_result =
