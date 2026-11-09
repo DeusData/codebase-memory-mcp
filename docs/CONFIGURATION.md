@@ -79,6 +79,7 @@ codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config set watcher_enabled false
 codebase-memory-mcp config reset auto_index
+codebase-memory-mcp config get install_hooks
 ```
 
 Current keys:
@@ -96,6 +97,9 @@ Current keys:
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
 | `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). Like `index_max_rss_mb`, it stops a worker only before it starts to publish the new index; see [INDEX_RESOURCE_LIMITS.md](INDEX_RESOURCE_LIMITS.md). |
+| `install_hooks` | `true` | Install CBM-managed client hooks. `install --no-hooks` persists `false`; `install --hooks` restores `true`. |
+
+Bare installs and updates respect the stored hook preference. MCP registration, skills, instructions, and profiles remain installed when hooks are disabled.
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
@@ -205,6 +209,8 @@ Current format:
 Notes:
 
 - If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- A bare `daemon start` honors the saved `ui_enabled` value, including `false`. Enable the UI with `codebase-memory-mcp config set ui_enabled true`.
+- On a cold start, `daemon start --open` or `daemon start --port=N` explicitly enables the UI and persists that choice. An already-active daemon keeps its current settings; stop it first to change ports with `--port=N`.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
