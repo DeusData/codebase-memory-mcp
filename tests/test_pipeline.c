@@ -4919,6 +4919,77 @@ TEST(incremental_dockerfile_edit_keeps_build_edges) {
     PASS();
 }
 
+/* Editing a Retrofit interface keeps its requests as HTTP_CALLS (#2723): the
+ * incremental routes re-extract the file and must not mint HANDLES for it.
+ * `legacy`: through the full-load route, else the closure-repair route. Returns "full=calls/handles
+ * inc=calls/handles", or NULL; *route: the route taken. */
+static char *incremental_retrofit_keep(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_retrofitkeep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "src/OrderApi.kt",
+                    "package com.acme\n\nimport retrofit2.http.GET\nimport retrofit2.http.POST\n\n"
+                    "interface OrderApi {\n"
+                    "    @GET(\"/v1/orders/{id}\")\n    suspend fun getOrder(id: String): String\n"
+                    "    @POST(\"v1/orders\")\n    suspend fun createOrder(body: String): String\n"
+                    "}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/retrofitkeep.db", tmp);
+    static const char calls[] = "SELECT COUNT(*) FROM edges e JOIN nodes r ON r.id=e.target_id "
+                                "WHERE e.type='HTTP_CALLS' AND r.label='Route' "
+                                "AND r.qualified_name IN ('__route__GET__/v1/orders/{}',"
+                                "'__route__POST__/v1/orders')";
+    static const char handles[] = "SELECT COUNT(*) FROM edges WHERE type='HANDLES'";
+    int full_calls = -1;
+    int full_handles = -1;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        full_calls = k8s_inc_count(db_path, calls);
+        full_handles = k8s_inc_count(db_path, handles);
+    }
+    write_temp_file(tmp, "src/OrderApi.kt",
+                    "package com.acme\n\nimport retrofit2.http.GET\nimport retrofit2.http.POST\n\n"
+                    "// edited\ninterface OrderApi {\n"
+                    "    @GET(\"/v1/orders/{id}\")\n    suspend fun getOrder(id: String): String\n"
+                    "    @POST(\"v1/orders\")\n    suspend fun createOrder(body: String): String\n"
+                    "}\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "full=%d/%d inc=%d/%d", full_calls, full_handles,
+                 k8s_inc_count(db_path, calls), k8s_inc_count(db_path, handles));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_edit_keeps_retrofit_http_calls_issue2723) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_retrofit_keep(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2/0 inc=2/0");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_retrofit_keep(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2/0 inc=2/0");
+    free(got);
+#endif
+    PASS();
+}
+
 /* A compose file's edit replaces its build edges: the renamed image keeps
  * no edge (nor node), the new one has its edge. `legacy`: through the
  * full-load route, else the closure-repair route. Returns "old=N new=M"
@@ -32364,6 +32435,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
+    RUN_TEST(incremental_edit_keeps_retrofit_http_calls_issue2723);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
     RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
     RUN_TEST(incremental_image_split_change_rebuilds);
