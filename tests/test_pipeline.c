@@ -6780,6 +6780,108 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     PASS();
 }
 
+/* A barrel's `export *` moves to another module; no definition changes. The
+ * importer's CALLS follow the barrel's re-export lines, so after the
+ * incremental run they must equal a clean rebuild: run() calls b.ts's pick,
+ * and no longer a.ts's. The barrel defines nothing, so its LSP definitions
+ * are unchanged; what keeps the closure repair from treating the edit as a
+ * body edit is the TS doc-link scope, which records every `export ... from`
+ * line and counts a changed one as a change for every file (the route is a
+ * full rebuild). The importer is no direct dependent of the barrel, so a
+ * repair that missed it would keep the stale edge to a.ts. */
+static void barrel_switch_counts(const char *db, const char *project, int *to_a, int *to_b) {
+    *to_a = -1;
+    *to_b = -1;
+    cbm_store_t *store = cbm_store_open_path(db);
+    if (!store) {
+        return;
+    }
+    *to_a = named_edge_to_file_count(store, project, "CALLS", "run", "pick", "lib/a.ts");
+    *to_b = named_edge_to_file_count(store, project, "CALLS", "run", "pick", "lib/b.ts");
+    cbm_store_close(store);
+}
+
+TEST(pipeline_incremental_barrel_reexport_switch_matches_full) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_barrel_switch_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib/a.ts", "export function pick(): number {\n  return 1;\n}\n");
+    write_temp_file(tmp, "lib/b.ts", "export function pick(): number {\n  return 2;\n}\n");
+    write_temp_file(tmp, "lib/index.ts", "export * from './a';\n");
+    write_temp_file(tmp, "app.ts",
+                    "import { pick } from './lib';\n"
+                    "export function run(): number {\n"
+                    "  return pick();\n"
+                    "}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/barrel.db", tmp);
+
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    int base_a;
+    int base_b;
+    barrel_switch_counts(db, project, &base_a, &base_b);
+
+    write_temp_file(tmp, "lib/index.ts", "export * from './b';\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incr);
+    ASSERT_EQ(cbm_pipeline_run(incr), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incr);
+    int incr_a;
+    int incr_b;
+    barrel_switch_counts(db, project, &incr_a, &incr_b);
+    int incr_nodes = -1;
+    int incr_edges = -1;
+    cbm_store_t *store = cbm_store_open_path(db);
+    if (store) {
+        incr_nodes = cbm_store_count_nodes(store, project);
+        incr_edges = cbm_store_count_edges(store, project);
+        cbm_store_close(store);
+    }
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/reference-full.db", tmp);
+    cbm_unlink(full_db);
+    cbm_remove_db_sidecars(full_db);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    char full_project[256];
+    snprintf(full_project, sizeof(full_project), "%s", cbm_pipeline_project_name(full));
+    cbm_pipeline_free(full);
+    int full_a;
+    int full_b;
+    barrel_switch_counts(full_db, full_project, &full_a, &full_b);
+    int full_nodes = -1;
+    int full_edges = -1;
+    store = cbm_store_open_path(full_db);
+    if (store) {
+        full_nodes = cbm_store_count_nodes(store, full_project);
+        full_edges = cbm_store_count_edges(store, full_project);
+        cbm_store_close(store);
+    }
+    th_rmtree(tmp);
+    printf("  [barrel-switch] route=%d base a=%d b=%d incr a=%d b=%d full a=%d b=%d\n", (int)route,
+           base_a, base_b, incr_a, incr_b, full_a, full_b);
+
+    /* the baseline really bound through the barrel (non-vacuous) */
+    ASSERT_EQ(base_a, 1);
+    ASSERT_EQ(base_b, 0);
+    ASSERT_EQ(full_a, 0);
+    ASSERT_EQ(full_b, 1);
+    ASSERT_EQ(incr_a, full_a);
+    ASSERT_EQ(incr_b, full_b);
+    ASSERT_EQ(incr_nodes, full_nodes);
+    ASSERT_EQ(incr_edges, full_edges);
+    PASS();
+}
+
 /* Companion to pipeline_adr_written_during_reindex_survives (the full route):
  * an ADR written from the publication hook mid-reindex must also survive the
  * closure-DELTA route (item 7a — "both the full and the delta route"). The
@@ -32491,6 +32593,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_dbt_jinja_lineage);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
+    RUN_TEST(pipeline_incremental_barrel_reexport_switch_matches_full);
     RUN_TEST(pipeline_incremental_root_path_refreshed_across_directories);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);

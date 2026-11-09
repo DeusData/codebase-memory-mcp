@@ -4588,6 +4588,7 @@ cleanup:
     cbm_pipeline_set_pkgmap(NULL);
     cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
     cbm_pipeline_set_nsmap(NULL);
+    cbm_pxc_ts_barrels_publish(NULL);
     cbm_discover_free(files, file_count);
     if (p->frozen) {
         p->frozen->baseline = baseline_manifest;

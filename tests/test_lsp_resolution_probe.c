@@ -1272,6 +1272,306 @@ TEST(lrp_ts_s8_field_type_hint) {
     PASS();
 }
 
+/* Barrels: a type imported through an index.ts that re-exports it must resolve
+ * to the defining module. Covers a dotted folder imported by alias (B1), a lib
+ * barrel with a named re-export (B2), a relative import of a barrel folder
+ * (B3) and a nested `export *` barrel (B4). The import used to stop at the
+ * Folder/barrel module, so every DI call below had no CALLS edge. */
+TEST(lrp_ts_barrel_reexport_member_calls) {
+    static const LRP_File f[] = {
+        {"apps/api/tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{"
+                                   "\"@acme/shipping\":[\"libs/shipping/src\"],"
+                                   "\"@acme/shipping/*\":[\"libs/shipping/src/*\"]}}}\n"},
+        {"apps/api/libs/shipping/src/application/service/label-print.service/"
+         "label-print.service.ts",
+         "import { LabelPrintParams } from \"./label-print.interface\";\n"
+         "export class LabelPrintService {\n"
+         "  printStream(params: LabelPrintParams): string {\n"
+         "    return this.printWithStats(params).body;\n"
+         "  }\n"
+         "  printWithStats(params: LabelPrintParams): { body: string; pages: number } {\n"
+         "    return { body: params.shipmentId, pages: 1 };\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/service/label-print.service/"
+         "label-print.interface.ts",
+         "export interface LabelPrintParams {\n"
+         "  shipmentId: string;\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/service/label-print.service/index.ts",
+         "export * from \"./label-print.service\";\n"
+         "export * from \"./label-print.interface\";\n"},
+        {"apps/api/libs/shipping/src/domain/tracking/tracking-code.service.ts",
+         "export class TrackingCodeService {\n"
+         "  generate(shipmentId: string): string {\n"
+         "    return shipmentId;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/domain/tracking/index.ts",
+         "export * from \"./tracking-code.service\";\n"},
+        {"apps/api/libs/shipping/src/domain/carrier.service.ts",
+         "export class CarrierService {\n"
+         "  quote(weightKg: number): number {\n"
+         "    return weightKg * 2;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/domain/internal.service.ts",
+         "export function internalCall(): number { return 7; }\n"},
+        {"apps/api/libs/shipping/src/domain/public.ts",
+         "export { internalCall as publicCall } from './internal.service.js';\n"},
+        {"apps/api/libs/shipping/src/index.ts",
+         "export * from \"./domain/tracking\";\n"
+         "export {\n"
+         "  CarrierService,\n"
+         "} from \"./domain/carrier.service\";\n"
+         "export { publicCall as apiCall } from './domain/public.js';\n"
+         "export type { LabelPrintParams } from \"./application/service/label-print.service\";\n"},
+        {"apps/api/libs/invoice/src/application/command/handler/ship-invoice.handler.ts",
+         "import { LabelPrintService } from "
+         "\"@acme/shipping/application/service/label-print.service\";\n"
+         "import { apiCall, CarrierService, TrackingCodeService } from \"@acme/shipping\";\n"
+         "export class ShipInvoiceHandler {\n"
+         "  constructor(\n"
+         "    private readonly labelPrintService: LabelPrintService,\n"
+         "    private readonly carrierService: CarrierService,\n"
+         "    private readonly trackingCodeService: TrackingCodeService,\n"
+         "  ) {}\n"
+         "  execute(shipmentId: string): string {\n"
+         "    const cost = this.carrierService.quote(3);\n"
+         "    const code = this.trackingCodeService.generate(shipmentId);\n"
+         "    const renamed = apiCall();\n"
+         "    const label = this.labelPrintService.printStream({ shipmentId });\n"
+         "    return `${label}:${code}:${cost}:${renamed}`;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/invoice/src/application/service/label-preview.service.ts",
+         "import { LabelPrintService } from "
+         "\"../../../../shipping/src/application/service/label-print.service\";\n"
+         "export class LabelPreviewService {\n"
+         "  constructor(private readonly labelPrintService: LabelPrintService) {}\n"
+         "  preview(shipmentId: string): number {\n"
+         "    return this.labelPrintService.printWithStats({ shipmentId }).pages;\n"
+         "  }\n"
+         "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int b1 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
+                                         "LabelPrintService.printStream");
+    int b2 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
+                                         "CarrierService.quote");
+    int b3 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "LabelPreviewService.preview",
+                                         "LabelPrintService.printWithStats");
+    int b4 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
+                                         "TrackingCodeService.generate");
+    int renamed = lrp_exact_edge_by_qn_suffix(
+        store, lp.project, "CALLS", "ShipInvoiceHandler.execute", "internal.service.internalCall");
+    int self =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "LabelPrintService.printStream",
+                                    "LabelPrintService.printWithStats");
+    printf("  [ts/barrel] B1=%d B2=%d B3=%d B4=%d renamed=%d self=%d\n", b1, b2, b3, b4, renamed,
+           self);
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(b1, 1);
+    ASSERT_EQ(b2, 1);
+    ASSERT_EQ(b3, 1);
+    ASSERT_EQ(b4, 1);
+    ASSERT_EQ(renamed, 1);
+    ASSERT_EQ(self, 1);
+    PASS();
+}
+
+/* One barrel re-exports the same module twice: `export *` and a renamed
+ * `export { innerFn as renamedFn }`. The walk searches impl for renamedFn
+ * through the star edge first; it must still search impl for innerFn
+ * through the renamed edge, so the call binds to impl's innerFn. */
+TEST(lrp_ts_barrel_star_and_renamed_same_module) {
+    static const LRP_File f[] = {
+        {"src/lib/impl.ts", "export function innerFn(x: number): number { return x - 1; }\n"
+                            "export function starFn(x: number): number { return x * 2; }\n"},
+        {"src/lib/barrel.ts", "export * from './impl';\n"
+                              "export { innerFn as renamedFn } from './impl';\n"},
+        {"src/app.ts", "import { renamedFn, starFn } from './lib/barrel';\n"
+                       "export function run(x: number): number {\n"
+                       "  return renamedFn(x) + starFn(x);\n"
+                       "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int renamed =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.innerFn");
+    int star = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.starFn");
+    printf("  [ts/barrel-same-module] renamed=%d star=%d\n", renamed, star);
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(renamed, 1);
+    ASSERT_EQ(star, 1);
+    PASS();
+}
+
+/* An aliased named import binds the member, never its local alias. The barrel
+ * star-exports two modules: `helpers` defines helper, `format` defines a
+ * function named like the alias. `import { helper as format }` must bind the
+ * call to helpers.helper; searching the barrel for the alias would reach
+ * format.format instead. */
+TEST(lrp_ts_barrel_alias_binds_member_not_alias) {
+    static const LRP_File f[] = {
+        {"src/lib/helpers.ts", "export function helper(): number { return 1; }\n"},
+        {"src/lib/format.ts", "export function format(): number { return 2; }\n"},
+        {"src/lib/index.ts", "export * from './helpers';\n"
+                             "export * from './format';\n"},
+        {"src/app.ts", "import { helper as format } from './lib';\n"
+                       "export function run(): number {\n"
+                       "  return format();\n"
+                       "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+    int member =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "helpers.helper");
+    int alias = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "format.format");
+    printf("  [ts/barrel-alias] member=%d alias=%d\n", member, alias);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(member, 1);
+    ASSERT_EQ(alias, 0);
+    PASS();
+}
+
+/* A chain of 12 `export *` hops, longer than the old depth cap of 8. The walk
+ * is bounded only by its (file, name) visited set, so the call still binds to
+ * the defining file. A decoy defines the same name, so a name guess cannot
+ * pass this test. */
+TEST(lrp_ts_barrel_long_star_chain_binds_definition) {
+    enum { HOPS = 12 };
+    LRP_File f[HOPS + 3];
+    char names[HOPS + 3][64];
+    char bodies[HOPS + 3][128];
+    int n = 0;
+    snprintf(names[n], sizeof(names[n]), "src/chain/b0.ts");
+    snprintf(bodies[n], sizeof(bodies[n]), "export function deepFn(): number { return 0; }\n");
+    f[n].name = names[n];
+    f[n].content = bodies[n];
+    n++;
+    for (int i = 1; i <= HOPS; i++) {
+        snprintf(names[n], sizeof(names[n]), "src/chain/b%d.ts", i);
+        snprintf(bodies[n], sizeof(bodies[n]), "export * from './b%d';\n", i - 1);
+        f[n].name = names[n];
+        f[n].content = bodies[n];
+        n++;
+    }
+    f[n].name = "src/other/decoy.ts";
+    f[n].content = "export function deepFn(): number { return 99; }\n";
+    n++;
+    snprintf(bodies[n], sizeof(bodies[n]),
+             "import { deepFn } from './chain/b%d';\n"
+             "export function run(): number { return deepFn(); }\n",
+             HOPS);
+    f[n].name = "src/app.ts";
+    f[n].content = bodies[n];
+    n++;
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, n);
+    ASSERT_NOT_NULL(store);
+    int def = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "b0.deepFn");
+    int decoy = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "decoy.deepFn");
+    printf("  [ts/barrel-chain-12] def=%d decoy=%d\n", def, decoy);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(def, 1);
+    ASSERT_EQ(decoy, 0);
+    PASS();
+}
+
+/* `export { getX as x } from './impl'` exports x; it binds no local x in the
+ * barrel. A call to x() inside the barrel must not bind through the
+ * re-export record. */
+TEST(lrp_ts_reexport_binds_no_local_name) {
+    static const LRP_File f[] = {
+        {"src/lib/impl.ts", "export function getX(): number { return 1; }\n"},
+        {"src/lib/index.ts", "export { getX as x } from './impl';\n"
+                             "export function useLocal(): number {\n"
+                             "  return x();\n"
+                             "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+    int bound = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "useLocal", "impl.getX");
+    printf("  [ts/reexport-local] bound=%d\n", bound);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(bound, 0);
+    PASS();
+}
+
+/* The same barrel fixtures above the 50-file threshold, so the parallel
+ * resolver reads the barrel registry: the alias binds its member, the
+ * 12-hop chain reaches its definition, and a renamed re-export keeps its
+ * rename. */
+TEST(lrp_ts_barrel_parallel_resolver) {
+    enum { HOPS = 12, PAD = 60, MAXF = HOPS + PAD + 16 };
+    LRP_File f[MAXF];
+    static char names[MAXF][64];
+    static char bodies[MAXF][160];
+    int n = 0;
+#define LRP_ADD(path, ...)                                   \
+    do {                                                     \
+        snprintf(names[n], sizeof(names[n]), "%s", path);    \
+        snprintf(bodies[n], sizeof(bodies[n]), __VA_ARGS__); \
+        f[n].name = names[n];                                \
+        f[n].content = bodies[n];                            \
+        n++;                                                 \
+    } while (0)
+    LRP_ADD("src/lib/helpers.ts", "export function helper(): number { return 1; }\n");
+    LRP_ADD("src/lib/format.ts", "export function format(): number { return 2; }\n");
+    LRP_ADD("src/lib/impl.ts", "export function getState(): number { return 3; }\n");
+    LRP_ADD("src/lib/index.ts", "export * from './helpers';\nexport * from './format';\n"
+                                "export { getState as state } from './impl';\n");
+    LRP_ADD("src/chain/b0.ts", "export function deepFn(): number { return 0; }\n");
+    for (int i = 1; i <= HOPS; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "src/chain/b%d.ts", i);
+        LRP_ADD(path, "export * from './b%d';\n", i - 1);
+    }
+    LRP_ADD("src/other/decoy.ts", "export function deepFn(): number { return 99; }\n"
+                                  "export function state(): number { return 98; }\n");
+    LRP_ADD("src/app.ts",
+            "import { helper as format, state } from './lib';\n"
+            "import { deepFn } from './chain/b%d';\n"
+            "export function run(): number { return format() + state() + deepFn(); }\n",
+            HOPS);
+    for (int i = 0; i < PAD; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "src/pad/p%d.ts", i);
+        LRP_ADD(path, "export function pad%d(): number { return %d; }\n", i, i);
+    }
+#undef LRP_ADD
+    ASSERT_GT(n, 50);
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, n);
+    ASSERT_NOT_NULL(store);
+    int member =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "helpers.helper");
+    int alias = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "format.format");
+    int renamed =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "impl.getState");
+    int chain = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "b0.deepFn");
+    int decoy = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "app.run", "decoy.deepFn");
+    printf("  [ts/barrel-parallel] member=%d alias=%d renamed=%d chain=%d decoy=%d\n", member,
+           alias, renamed, chain, decoy);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(member, 1);
+    ASSERT_EQ(alias, 0);
+    ASSERT_EQ(renamed, 1);
+    ASSERT_EQ(chain, 1);
+    ASSERT_EQ(decoy, 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -1965,6 +2265,12 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s6_inherited_method);
     RUN_TEST(lrp_ts_s7_generic);
     RUN_TEST(lrp_ts_s8_field_type_hint);
+    RUN_TEST(lrp_ts_barrel_reexport_member_calls);
+    RUN_TEST(lrp_ts_barrel_star_and_renamed_same_module);
+    RUN_TEST(lrp_ts_barrel_alias_binds_member_not_alias);
+    RUN_TEST(lrp_ts_barrel_long_star_chain_binds_definition);
+    RUN_TEST(lrp_ts_reexport_binds_no_local_name);
+    RUN_TEST(lrp_ts_barrel_parallel_resolver);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);

@@ -1877,9 +1877,11 @@ static void pp_add_file_doc(const cbm_gbuf_node_t *file_node, const char *doc) {
     cbm_free(CBM_MEM_CLASS_GBUF_STRING, neu);
 }
 
-/* Create IMPORTS edges for one file's imports (parallel path). */
+/* Create IMPORTS edges for one file's imports (parallel path), recording each
+ * JS/TS named import's barrel request in `barrels` (nullable). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                const char *rel, CBMHashTable *namespace_map) {
+                                const char *rel, CBMHashTable *namespace_map,
+                                CBMTsBarrels *barrels) {
     int count = 0;
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1902,8 +1904,21 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
                 char esc_ln[CBM_SZ_128];
                 cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
                 char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                if (imp->reexport == CBM_REEXPORT_NAMED && imp->member) {
+                    char esc_member[CBM_SZ_128];
+                    cbm_json_escape(esc_member, sizeof(esc_member), imp->member);
+                    snprintf(imp_props, sizeof(imp_props),
+                             "{\"local_name\":\"%s\",\"reexport\":\"named\","
+                             "\"imported\":\"%s\"}",
+                             esc_ln, esc_member);
+                } else if (imp->reexport == CBM_REEXPORT_STAR) {
+                    snprintf(imp_props, sizeof(imp_props),
+                             "{\"local_name\":\"%s\",\"reexport\":\"star\"}", esc_ln);
+                } else {
+                    snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                }
                 cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
+                cbm_pxc_ts_barrels_request(barrels, rel, imp, target);
                 count++;
             }
         }
@@ -1991,10 +2006,13 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_free(CBM_MEM_CLASS_OTHER, namespaces);
     }
     free(rels);
+    /* JS/TS barrel requests, answered once every IMPORTS edge exists. */
+    CBMTsBarrels *barrels = cbm_pxc_ts_barrels_new();
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
             cbm_pipeline_namespace_map_free(namespace_map);
+            cbm_pxc_ts_barrels_free(barrels);
             return CBM_NOT_FOUND;
         }
 
@@ -2006,6 +2024,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!cbm_pipeline_test_extraction_ok(ctx, files[i].language, result)) {
                 cbm_pipeline_result_release(result, loaded);
                 cbm_pipeline_namespace_map_free(namespace_map);
+                cbm_pxc_ts_barrels_free(barrels);
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }
         }
@@ -2016,6 +2035,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         if (!cbm_pipeline_test_result_ok(ctx, result)) {
             cbm_pipeline_result_release(result, loaded);
             cbm_pipeline_namespace_map_free(namespace_map);
+            cbm_pxc_ts_barrels_free(barrels);
             return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
@@ -2039,7 +2059,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
         }
 
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        imports_edges += create_imports_edges(ctx, result, rel, namespace_map, barrels);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_diagram_arrows(ctx, result);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
@@ -2053,6 +2073,10 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * The pipeline owns it from here and frees it in its cleanup. */
     cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
     cbm_pipeline_set_nsmap(namespace_map);
+    /* Every IMPORTS edge exists: answer each barrel request once; the
+     * resolve workers only read the answers. */
+    cbm_pxc_ts_barrels_resolve(barrels, ctx->gbuf, ctx->project_name);
+    cbm_pxc_ts_barrels_publish(barrels);
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
                  itoa_log(defines_edges), "imports", itoa_log(imports_edges));

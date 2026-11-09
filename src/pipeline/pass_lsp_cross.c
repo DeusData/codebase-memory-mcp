@@ -33,6 +33,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
+#include "foundation/dyn_array.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
@@ -1419,6 +1420,549 @@ static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
     return qualified;
 }
 
+/* ── JS/TS barrels ─────────────────────────────────────────────────
+ * An import that lands on a Folder (`./svc` -> svc/index.ts) or on a module
+ * that only re-exports the name never reaches the declaring module, so
+ * `module.Name` is not in the registry and calls through the imported name
+ * stay unresolved. The barrel registry answers (barrel, name) -> definition
+ * by following only re-export IMPORTS edges, carrying
+ * `export { original as public }` names across each hop. The definition
+ * node is the proof; two different definitions fail closed.
+ *
+ * Shape (the one the shared cross-file registries use): while the IMPORTS
+ * passes create the edges, they record each JS/TS named import's (target,
+ * member) request. Once every IMPORTS edge exists, each distinct request is
+ * answered once and the registry is published; the import-map builders of
+ * both drivers only read it. One answer walks an explicit worklist bounded
+ * by its (file, name) visited set: there is no recursion, and no depth cap
+ * decides what lands in the graph. Each barrel is indexed once per pass
+ * (named re-exports by public name, the top-level definitions of its plain
+ * star targets by name), so one step of a walk costs the entries that carry
+ * the name plus the barrel's star targets that are barrels themselves, not
+ * the barrel's size. */
+
+static bool pxc_is_js_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+}
+
+static bool pxc_label_is_container(const char *label) {
+    return label && (strcmp(label, "Module") == 0 || strcmp(label, "Folder") == 0 ||
+                     strcmp(label, "File") == 0);
+}
+
+/* The definition of `name` in the file at rel_path, else NULL. The symbol QN
+ * cbm_pipeline_fqn_compute would give is the file's symbol prefix (a byte
+ * prefix of its File node QN: extension and a trailing index segment are
+ * only ever cut from the end) plus `.name`, so it is built on the stack and
+ * the lookup allocates nothing. */
+static const cbm_gbuf_node_t *pxc_defined_symbol(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                 const char *rel_path, const char *name) {
+    const cbm_gbuf_node_t *file_node = cbm_pipeline_file_node(gbuf, project_name, rel_path);
+    if (!file_node || !file_node->qualified_name) {
+        return NULL;
+    }
+    size_t prefix_len = cbm_pipeline_fqn_symbol_prefix_len(project_name, rel_path);
+    if (prefix_len == 0 || prefix_len >= strlen(file_node->qualified_name) ||
+        file_node->qualified_name[prefix_len] != '.') {
+        return NULL;
+    }
+    char qn[CBM_SZ_1K];
+    int wrote =
+        snprintf(qn, sizeof(qn), "%.*s.%s", (int)prefix_len, file_node->qualified_name, name);
+    if (wrote <= 0 || (size_t)wrote >= sizeof(qn)) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, qn);
+    if (node && node->qualified_name && node->label && !pxc_label_is_container(node->label)) {
+        return node;
+    }
+    return NULL;
+}
+
+static bool pxc_edge_string_prop(const char *json, const char *key, char *out, size_t out_sz) {
+    if (!json || !key || !out || out_sz == 0) {
+        return false;
+    }
+    char needle[CBM_SZ_64];
+    int wrote = snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (wrote <= 0 || (size_t)wrote >= sizeof(needle)) {
+        return false;
+    }
+    const char *start = strstr(json, needle);
+    if (!start) {
+        return false;
+    }
+    start += (size_t)wrote;
+    const char *end = strchr(start, '"');
+    size_t len = end ? (size_t)(end - start) : 0;
+    if (!end || len == 0 || len >= out_sz || memchr(start, '\\', len)) {
+        return false;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
+}
+
+/* An IMPORTS edge drawn for `export ... from` (pass_definitions.c,
+ * pass_parallel.c write the property). */
+static bool pxc_edge_is_reexport(const char *json) {
+    return json && strstr(json, "\"reexport\":\"") != NULL;
+}
+
+/* "<node id>\x1f<name>" into buf; false when it does not fit. */
+static bool pxc_rx_key(char *buf, size_t cap, int64_t id, const char *name) {
+    int n = snprintf(buf, cap, "%lld\x1f%s", (long long)id, name ? name : "");
+    return n > 0 && (size_t)n < cap;
+}
+
+/* The File node an IMPORTS target stands for: a Module's file, a Folder's
+ * index file, a File itself. NULL for a definition or an unknown target. */
+static const cbm_gbuf_node_t *pxc_barrel_file_of(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                 const cbm_gbuf_node_t *target) {
+    if (!target || !target->label || !target->file_path) {
+        return NULL;
+    }
+    if (strcmp(target->label, "File") == 0) {
+        return target;
+    }
+    if (strcmp(target->label, "Module") == 0) {
+        return cbm_pipeline_file_node(gbuf, project_name, target->file_path);
+    }
+    if (strcmp(target->label, "Folder") != 0) {
+        return NULL;
+    }
+    static const char *const index_names[] = {"index.ts", "index.tsx", "index.mts",
+                                              "index.js", "index.jsx", "index.mjs"};
+    char rel[CBM_SZ_1K];
+    for (size_t i = 0; i < sizeof(index_names) / sizeof(index_names[0]); i++) {
+        int n = snprintf(rel, sizeof(rel), "%s/%s", target->file_path, index_names[i]);
+        if (n <= 0 || (size_t)n >= sizeof(rel)) {
+            return NULL;
+        }
+        const cbm_gbuf_node_t *file_node = cbm_pipeline_file_node(gbuf, project_name, rel);
+        if (file_node) {
+            return file_node;
+        }
+    }
+    return NULL;
+}
+
+static bool pxc_file_reexports(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *file) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, file->id, "IMPORTS", &edges, &count) != 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (pxc_edge_is_reexport(edges[i]->properties_json)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Work counters for the complexity guard: requests answered, and walk steps
+ * (worklist items, index entries and edges examined). */
+static _Atomic uint64_t g_pxc_barrel_requests = 0;
+static _Atomic uint64_t g_pxc_barrel_steps = 0;
+
+static void pxc_barrel_step(void) {
+    atomic_fetch_add_explicit(&g_pxc_barrel_steps, 1, memory_order_relaxed);
+}
+
+void cbm_pxc_ts_barrel_stats(uint64_t *requests, uint64_t *steps) {
+    if (requests) {
+        *requests = atomic_load_explicit(&g_pxc_barrel_requests, memory_order_relaxed);
+    }
+    if (steps) {
+        *steps = atomic_load_explicit(&g_pxc_barrel_steps, memory_order_relaxed);
+    }
+}
+
+typedef struct {
+    int64_t target_id;
+    const char *member;
+    int64_t def_id; /* 0: no single definition; the import keeps its target */
+} pxc_barrel_req_t;
+
+struct CBMTsBarrels {
+    CBMArena arena;         /* requests and their keys */
+    CBMHashTable *requests; /* "target id\x1fmember" -> pxc_barrel_req_t */
+    CBM_DYN_ARRAY(pxc_barrel_req_t *) order;
+};
+
+/* An entry of the barrel index. Named: a re-export edge's target and the
+ * name searched there. Star: a definition of a plain star target. */
+typedef struct pxc_rx_entry {
+    struct pxc_rx_entry *next;
+    int64_t node_id;
+    const char *imported;
+} pxc_rx_entry_t;
+
+typedef struct {
+    const int64_t *star_barrels; /* File ids of star targets that re-export too */
+    int star_barrel_count;
+} pxc_rx_file_t;
+
+typedef struct {
+    int64_t file_id;
+    const char *name;
+} pxc_rx_item_t;
+
+/* One resolve: the per-barrel index (lives through every request) and one
+ * walk's worklist and visited set (reset per request). */
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *project;
+    CBMArena arena;          /* index entries and keys */
+    CBMHashTable *files;     /* "file id" -> pxc_rx_file_t */
+    CBMHashTable *named;     /* "file id\x1fpublic name" -> pxc_rx_entry_t list */
+    CBMHashTable *star_defs; /* "file id\x1fname" -> pxc_rx_entry_t list */
+    CBMArena walk_arena;     /* visited keys of one walk */
+    CBMHashTable *visited;   /* "file id\x1fname" */
+    CBM_DYN_ARRAY(pxc_rx_item_t) work;
+    int64_t found;
+    bool conflict; /* two definitions, or an incomplete walk: no answer */
+    bool failed;   /* an allocation failed: the index is incomplete */
+} pxc_rx_ctx_t;
+
+static void pxc_rx_prepend(pxc_rx_ctx_t *c, CBMHashTable *ht, int64_t file_id, const char *name,
+                           int64_t node_id, const char *imported) {
+    char key[CBM_SZ_512];
+    if (!pxc_rx_key(key, sizeof(key), file_id, name)) {
+        c->failed = true;
+        return;
+    }
+    pxc_rx_entry_t *e = (pxc_rx_entry_t *)cbm_arena_alloc(&c->arena, sizeof(*e));
+    const char *stored = cbm_ht_get_key(ht, key);
+    if (!stored) {
+        stored = cbm_arena_strdup(&c->arena, key);
+    }
+    if (!e || !stored) {
+        c->failed = true;
+        return;
+    }
+    e->node_id = node_id;
+    e->imported = imported;
+    e->next = (pxc_rx_entry_t *)cbm_ht_get(ht, stored);
+    cbm_ht_set(ht, stored, e);
+}
+
+/* Index the top-level definitions of a plain star target under the barrel. */
+static void pxc_rx_index_defs(pxc_rx_ctx_t *c, int64_t barrel_id, const cbm_gbuf_node_t *star) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(c->gbuf, star->id, "DEFINES", &edges, &count) != 0) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        pxc_barrel_step();
+        const cbm_gbuf_node_t *d = cbm_gbuf_find_by_id(c->gbuf, edges[i]->target_id);
+        if (!d || !d->name ||
+            pxc_defined_symbol(c->gbuf, c->project, star->file_path, d->name) != d) {
+            continue;
+        }
+        pxc_rx_prepend(c, c->star_defs, barrel_id, d->name, d->id, NULL);
+    }
+}
+
+/* The index of one barrel file, built on first use. */
+static const pxc_rx_file_t *pxc_rx_index(pxc_rx_ctx_t *c, const cbm_gbuf_node_t *file) {
+    char key[CBM_SZ_32];
+    snprintf(key, sizeof(key), "%lld", (long long)file->id);
+    pxc_rx_file_t *f = (pxc_rx_file_t *)cbm_ht_get(c->files, key);
+    if (f) {
+        return f;
+    }
+    f = (pxc_rx_file_t *)cbm_arena_calloc(&c->arena, sizeof(*f));
+    char *stored = cbm_arena_strdup(&c->arena, key);
+    if (!f || !stored) {
+        c->failed = true;
+        return NULL;
+    }
+    cbm_ht_set(c->files, stored, f);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(c->gbuf, file->id, "IMPORTS", &edges, &count) != 0 ||
+        count == 0) {
+        return f;
+    }
+    int64_t *barrels = (int64_t *)cbm_arena_alloc(&c->arena, (size_t)count * sizeof(int64_t));
+    if (!barrels) {
+        c->failed = true;
+        return f;
+    }
+    int barrel_count = 0;
+    for (int i = 0; i < count; i++) {
+        char kind[CBM_SZ_16];
+        if (!pxc_edge_string_prop(edges[i]->properties_json, "reexport", kind, sizeof(kind))) {
+            continue;
+        }
+        pxc_barrel_step();
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(c->gbuf, edges[i]->target_id);
+        if (!target) {
+            continue;
+        }
+        if (strcmp(kind, "named") == 0) {
+            char public_name[CBM_SZ_256];
+            char imported_name[CBM_SZ_256];
+            if (!pxc_edge_string_prop(edges[i]->properties_json, "local_name", public_name,
+                                      sizeof(public_name)) ||
+                !pxc_edge_string_prop(edges[i]->properties_json, "imported", imported_name,
+                                      sizeof(imported_name))) {
+                continue;
+            }
+            const char *imported = cbm_arena_strdup(&c->arena, imported_name);
+            if (!imported) {
+                c->failed = true;
+                continue;
+            }
+            pxc_rx_prepend(c, c->named, file->id, public_name, target->id, imported);
+        } else if (strcmp(kind, "star") == 0) {
+            const cbm_gbuf_node_t *star = pxc_barrel_file_of(c->gbuf, c->project, target);
+            if (!star || star->id == file->id || !star->file_path) {
+                continue;
+            }
+            if (pxc_file_reexports(c->gbuf, star)) {
+                barrels[barrel_count++] = star->id;
+            } else {
+                pxc_rx_index_defs(c, file->id, star);
+            }
+        }
+    }
+    f->star_barrels = barrels;
+    f->star_barrel_count = barrel_count;
+    return f;
+}
+
+static void pxc_rx_found(pxc_rx_ctx_t *c, int64_t id) {
+    if (c->found == 0) {
+        c->found = id;
+    } else if (c->found != id) {
+        c->conflict = true;
+    }
+}
+
+static void pxc_rx_enqueue_file(pxc_rx_ctx_t *c, const cbm_gbuf_node_t *file, const char *name) {
+    char *key = cbm_arena_sprintf(&c->walk_arena, "%lld\x1f%s", (long long)file->id, name);
+    if (!key) {
+        c->conflict = true;
+        return;
+    }
+    if (cbm_ht_has(c->visited, key)) {
+        return;
+    }
+    cbm_ht_set(c->visited, key, key);
+    pxc_rx_item_t item = {.file_id = file->id, .name = strchr(key, '\x1f') + SKIP_ONE};
+    int before = c->work.count;
+    cbm_da_push(&c->work, item);
+    if (c->work.count == before) {
+        c->conflict = true;
+    }
+}
+
+/* Queue the search for `name` at an IMPORTS target. A named re-export edge
+ * that reaches a definition directly (ordinary import resolution proved its
+ * imported member) is that definition. */
+static void pxc_rx_enqueue(pxc_rx_ctx_t *c, const cbm_gbuf_node_t *target, const char *name) {
+    if (!target || !target->label) {
+        return;
+    }
+    if (!pxc_label_is_container(target->label)) {
+        if (target->qualified_name) {
+            pxc_rx_found(c, target->id);
+        }
+        return;
+    }
+    const cbm_gbuf_node_t *file = pxc_barrel_file_of(c->gbuf, c->project, target);
+    if (file && file->file_path) {
+        pxc_rx_enqueue_file(c, file, name);
+    }
+}
+
+/* The one definition `name` reaches from target, else 0. */
+static int64_t pxc_rx_walk(pxc_rx_ctx_t *c, const cbm_gbuf_node_t *target, const char *name) {
+    c->found = 0;
+    c->conflict = false;
+    cbm_da_clear(&c->work);
+    cbm_ht_clear(c->visited);
+    cbm_arena_reset(&c->walk_arena);
+    pxc_rx_enqueue(c, target, name);
+    for (int w = 0; w < c->work.count && !c->conflict; w++) {
+        pxc_rx_item_t item = c->work.items[w]; /* by value: pushes may move the array */
+        pxc_barrel_step();
+        const cbm_gbuf_node_t *file = cbm_gbuf_find_by_id(c->gbuf, item.file_id);
+        if (!file || !file->file_path) {
+            continue;
+        }
+        const cbm_gbuf_node_t *def =
+            pxc_defined_symbol(c->gbuf, c->project, file->file_path, item.name);
+        if (def) {
+            pxc_rx_found(c, def->id);
+            continue;
+        }
+        const pxc_rx_file_t *idx = pxc_rx_index(c, file);
+        char key[CBM_SZ_512];
+        if (!idx || !pxc_rx_key(key, sizeof(key), file->id, item.name)) {
+            c->conflict = true;
+            break;
+        }
+        for (const pxc_rx_entry_t *e = (const pxc_rx_entry_t *)cbm_ht_get(c->named, key); e;
+             e = e->next) {
+            pxc_barrel_step();
+            pxc_rx_enqueue(c, cbm_gbuf_find_by_id(c->gbuf, e->node_id), e->imported);
+        }
+        if (strcmp(item.name, "default") == 0) {
+            continue; /* `export *` never re-exports a default export */
+        }
+        for (const pxc_rx_entry_t *e = (const pxc_rx_entry_t *)cbm_ht_get(c->star_defs, key); e;
+             e = e->next) {
+            pxc_barrel_step();
+            pxc_rx_found(c, e->node_id);
+        }
+        for (int b = 0; b < idx->star_barrel_count; b++) {
+            pxc_barrel_step();
+            const cbm_gbuf_node_t *star = cbm_gbuf_find_by_id(c->gbuf, idx->star_barrels[b]);
+            if (star) {
+                pxc_rx_enqueue_file(c, star, item.name);
+            }
+        }
+    }
+    return c->conflict || c->failed ? 0 : c->found;
+}
+
+CBMTsBarrels *cbm_pxc_ts_barrels_new(void) {
+    CBMTsBarrels *b = (CBMTsBarrels *)cbm_calloc(CBM_MEM_CLASS_RESOLVE, sizeof(*b));
+    if (!b) {
+        return NULL;
+    }
+    cbm_arena_init(&b->arena);
+    b->requests = cbm_ht_create(CBM_SZ_64);
+    if (!b->requests) {
+        cbm_arena_destroy(&b->arena);
+        cbm_free(CBM_MEM_CLASS_RESOLVE, b);
+        return NULL;
+    }
+    return b;
+}
+
+void cbm_pxc_ts_barrels_free(CBMTsBarrels *b) {
+    if (!b) {
+        return;
+    }
+    cbm_ht_free(b->requests);
+    cbm_da_free(&b->order);
+    cbm_arena_destroy(&b->arena);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, b);
+}
+
+/* A named import binds `member`; a default import binds the default export
+ * and a namespace import the module object, so neither names a member a
+ * barrel could re-export. */
+static bool pxc_import_binds_member(const CBMImport *imp) {
+    return cbm_import_binds_local(imp) && !imp->is_default && imp->member && imp->member[0] &&
+           strcmp(imp->member, "default") != 0;
+}
+
+void cbm_pxc_ts_barrels_request(CBMTsBarrels *b, const char *rel_path, const CBMImport *imp,
+                                const cbm_gbuf_node_t *target) {
+    if (!b || !rel_path || !imp || !target || !pxc_label_is_container(target->label) ||
+        !pxc_import_binds_member(imp) || !pxc_is_js_family(cbm_language_for_filename(rel_path))) {
+        return;
+    }
+    char key[CBM_SZ_512];
+    if (!pxc_rx_key(key, sizeof(key), target->id, imp->member) || cbm_ht_has(b->requests, key)) {
+        return;
+    }
+    pxc_barrel_req_t *r = (pxc_barrel_req_t *)cbm_arena_calloc(&b->arena, sizeof(*r));
+    char *stored = cbm_arena_strdup(&b->arena, key);
+    if (!r || !stored) {
+        return; /* no request: the import keeps its target */
+    }
+    r->target_id = target->id;
+    r->member = strchr(stored, '\x1f') + SKIP_ONE;
+    cbm_ht_set(b->requests, stored, r);
+    cbm_da_push(&b->order, r);
+}
+
+void cbm_pxc_ts_barrels_resolve(CBMTsBarrels *b, const cbm_gbuf_t *gbuf, const char *project_name) {
+    if (!b || !gbuf || b->order.count == 0) {
+        return;
+    }
+    pxc_rx_ctx_t c = {.gbuf = gbuf, .project = project_name};
+    cbm_arena_init(&c.arena);
+    cbm_arena_init(&c.walk_arena);
+    c.files = cbm_ht_create(CBM_SZ_64);
+    c.named = cbm_ht_create(CBM_SZ_64);
+    c.star_defs = cbm_ht_create(CBM_SZ_64);
+    c.visited = cbm_ht_create(CBM_SZ_64);
+    if (c.files && c.named && c.star_defs && c.visited) {
+        for (int i = 0; i < b->order.count; i++) {
+            pxc_barrel_req_t *r = b->order.items[i];
+            atomic_fetch_add_explicit(&g_pxc_barrel_requests, 1, memory_order_relaxed);
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, r->target_id);
+            r->def_id = 0;
+            if (!target || !target->label || !target->file_path) {
+                continue;
+            }
+            /* A module that defines the member keeps its own QN. */
+            if (strcmp(target->label, "Module") == 0 &&
+                pxc_defined_symbol(gbuf, project_name, target->file_path, r->member)) {
+                continue;
+            }
+            r->def_id = pxc_rx_walk(&c, target, r->member);
+        }
+    }
+    cbm_ht_free(c.files);
+    cbm_ht_free(c.named);
+    cbm_ht_free(c.star_defs);
+    cbm_ht_free(c.visited);
+    cbm_da_free(&c.work);
+    cbm_arena_destroy(&c.walk_arena);
+    cbm_arena_destroy(&c.arena);
+}
+
+/* The published registry: set by the IMPORTS passes before resolve starts,
+ * only read afterwards (one active pipeline at a time, as the pkgmap and the
+ * declared-package map). */
+static CBMTsBarrels *g_pxc_ts_barrels = NULL;
+
+void cbm_pxc_ts_barrels_publish(CBMTsBarrels *b) {
+    if (g_pxc_ts_barrels != b) {
+        cbm_pxc_ts_barrels_free(g_pxc_ts_barrels);
+    }
+    g_pxc_ts_barrels = b;
+}
+
+/* The definition the importing file's binding of `local` reaches through the
+ * barrel `target`, else NULL. The walk searches the member the import binds
+ * (`helper` for `import { helper as format }`), never the local alias. */
+static const cbm_gbuf_node_t *pxc_ts_barrel_def(const cbm_gbuf_t *gbuf, const CBMFileResult *result,
+                                                const char *local, const cbm_gbuf_node_t *target) {
+    const CBMTsBarrels *b = g_pxc_ts_barrels;
+    if (!b || !result || !local || !target) {
+        return NULL;
+    }
+    const CBMImport *imp = NULL;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *it = &result->imports.items[i];
+        if (!cbm_import_binds_local(it) || !it->local_name || strcmp(it->local_name, local) != 0) {
+            continue;
+        }
+        if (imp && (!imp->member || !it->member || strcmp(imp->member, it->member) != 0)) {
+            return NULL; /* one local, two different bindings */
+        }
+        imp = it;
+    }
+    char key[CBM_SZ_512];
+    if (!imp || !pxc_import_binds_member(imp) ||
+        !pxc_rx_key(key, sizeof(key), target->id, imp->member)) {
+        return NULL;
+    }
+    const pxc_barrel_req_t *r = (const pxc_barrel_req_t *)cbm_ht_get(b->requests, key);
+    return r && r->def_id ? cbm_gbuf_find_by_id(gbuf, r->def_id) : NULL;
+}
+
 static bool pxc_import_map_has_local(const char *const *keys, int count, const char *local_name) {
     if (!keys || !local_name)
         return false;
@@ -1493,7 +2037,8 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 
 bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result) {
     for (int i = 0; result && i < result->imports.count; i++) {
-        if (!cbm_import_binds_runtime_name(&result->imports.items[i]))
+        const CBMImport *imp = &result->imports.items[i];
+        if (cbm_import_binds_local(imp) && !cbm_import_binds_runtime_name(imp))
             return true;
     }
     return false;
@@ -1545,7 +2090,9 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
     for (int i = 0; i < edge_count; i++) {
         const cbm_gbuf_edge_t *e = edges[i];
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, e->target_id);
-        if (!target || !e->properties_json)
+        /* A re-export (`export { x } from './m'`) binds no local name in the
+         * file that writes it. */
+        if (!target || !e->properties_json || pxc_edge_is_reexport(e->properties_json))
             continue;
         const char *start = strstr(e->properties_json, "\"local_name\":\"");
         if (!start)
@@ -1563,7 +2110,17 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         /* An annotation-only import (#1277) binds no CALLS name: it gets no value. */
         bool binds = include_type_only ||
                      cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
-        char *value = binds ? pxc_import_value_qn(lang, result, local, target) : NULL;
+        /* JS/TS: a Module that defines the member keeps its own QN; a barrel
+         * that only re-exports it stands for the definition it reaches. The
+         * answer was computed once for the pass (cbm_pxc_ts_barrels_resolve). */
+        const cbm_gbuf_node_t *value_node = target;
+        if (binds && pxc_is_js_family(lang)) {
+            const cbm_gbuf_node_t *def = pxc_ts_barrel_def(gbuf, result, local, target);
+            if (def) {
+                value_node = def;
+            }
+        }
+        char *value = binds ? pxc_import_value_qn(lang, result, local, value_node) : NULL;
         if (!value) {
             free(local);
             continue;

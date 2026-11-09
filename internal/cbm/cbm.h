@@ -410,24 +410,38 @@ typedef enum {
     CBM_IMPORT_KIND_CONST,       // PHP `use const A\B`
 } CBMImportKind;
 
+typedef enum {
+    CBM_REEXPORT_NONE = 0,
+    CBM_REEXPORT_NAMED,
+    CBM_REEXPORT_STAR,
+} CBMReexportKind;
+
 typedef struct {
-    const char *local_name;  // local alias or name
-    const char *module_path; // resolved module path / QN
-    const char *member;      // ES named import: the exported name the local binds (`get` in
-                             // `import { get as navigate } from "axios"`); NULL otherwise
-    bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
-    bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
-                             // binds the name for annotations, never at runtime (#1277)
-    CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
+    const char *local_name;   // local alias or name
+    const char *module_path;  // resolved module path / QN
+    const char *member;       // ES named import: the exported name the local binds (`get` in
+                              // `import { get as navigate } from "axios"`); NULL otherwise
+    bool is_default;          // ES default import (`import X from "Y"`), JS/TS only (#1916)
+    bool type_checking_only;  // Python: inside a module-level `if TYPE_CHECKING:` block --
+                              // binds the name for annotations, never at runtime (#1277)
+    CBMImportKind kind;       // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
+    CBMReexportKind reexport; // ES `export {a as b} from` or `export * from`; NONE otherwise
 } CBMImport;
+
+/* True when an import binds its local name in the importing file. An ES
+ * re-export (`export { x } from './m'`, `export * from './m'`) binds nothing
+ * there: `x` is exported, not in scope. */
+static inline bool cbm_import_binds_local(const CBMImport *imp) {
+    return imp && imp->reexport == CBM_REEXPORT_NONE;
+}
 
 /* True when an import binds its local name at runtime. A Python import under
  * `if TYPE_CHECKING:` exists for annotations only: a call through that name
  * cannot happen, so no CALLS import map may bind it (an import_map edge
- * through it would be fabricated by construction). THE one rule every CALLS
- * import-map builder applies. */
+ * through it would be fabricated by construction). A re-export binds no
+ * local name at all. THE one rule every CALLS import-map builder applies. */
 static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
-    return imp && !imp->type_checking_only;
+    return cbm_import_binds_local(imp) && !imp->type_checking_only;
 }
 
 /* Content-only ordered Python namespace facts; no resolved target identities.

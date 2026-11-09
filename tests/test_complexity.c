@@ -98,6 +98,9 @@ enum {
     CX_PYEXT_FILES_PER_MOD = 20,
     CX_PYEXT_DEFS_PER_FILE = 120,
     CX_PYEXT_PROBES_PER_FILE = 3,
+    /* One shared TS barrel: per k, this many star-exported modules and as
+     * many importers (each imports a different name through the barrel). */
+    CX_TSBARREL_MODULES_PER_K = 20,
 };
 
 /* Linear growth bounds for a 2x input doubling. Fixed structural overhead
@@ -380,6 +383,57 @@ static int cx_build_pyext(const char *root, int k) {
     return 0;
 }
 
+/* Corpus shape #3 — one shared TypeScript barrel. lib/index.ts star-exports
+ * every module, and every importer imports its own name through the barrel:
+ * the barrel grows with k, and so do its importers. Answering each importer
+ * by scanning the barrel's star lines is importers x barrel size (~4 per
+ * doubling); the per-pass barrel registry answers each (barrel, name) once
+ * from a per-barrel index, so its work stays linear. */
+static int cx_build_tsbarrel(const char *root, int k) {
+    char dir[1024];
+    char path[1200];
+    int n = snprintf(dir, sizeof(dir), "%s/tsbarrel/lib", root);
+    if (n < 0 || (size_t)n >= sizeof(dir) || th_mkdir_p(dir) != 0)
+        return -1;
+    int modules = k * CX_TSBARREL_MODULES_PER_K;
+    n = snprintf(path, sizeof(path), "%s/index.ts", dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return -1;
+    FILE *barrel = fopen(path, "w");
+    if (!barrel)
+        return -1;
+    bool written = true;
+    for (int j = 0; written && j < modules; j++)
+        written = fprintf(barrel, "export * from './m%d';\n", j) >= 0;
+    if (fclose(barrel) != 0 || !written)
+        return -1;
+    for (int j = 0; j < modules; j++) {
+        n = snprintf(path, sizeof(path), "%s/m%d.ts", dir, j);
+        if (n < 0 || (size_t)n >= sizeof(path))
+            return -1;
+        FILE *f = fopen(path, "w");
+        if (!f)
+            return -1;
+        written =
+            fprintf(f, "export function barrelFn%d(): number {\n  return %d;\n}\n", j, j) >= 0;
+        if (fclose(f) != 0 || !written)
+            return -1;
+        n = snprintf(path, sizeof(path), "%s/tsbarrel/u%d.ts", root, j);
+        if (n < 0 || (size_t)n >= sizeof(path))
+            return -1;
+        f = fopen(path, "w");
+        if (!f)
+            return -1;
+        written = fprintf(f,
+                          "import { barrelFn%d } from './lib';\n"
+                          "export function useBarrel%d(): number {\n  return barrelFn%d();\n}\n",
+                          j, j, j) >= 0;
+        if (fclose(f) != 0 || !written)
+            return -1;
+    }
+    return 0;
+}
+
 /* ── Metrics ─────────────────────────────────────────────────────────── */
 
 /* Per-pass timing capture: a TEE log sink parses `pass.timing` lines during a
@@ -471,9 +525,46 @@ typedef struct {
     int pyrange_classes;
     int pyrange_peer_classes;
     int pyrange_controls;
+    uint64_t barrel_requests; /* (barrel, name) requests answered */
+    uint64_t barrel_steps;    /* barrel walk work: items, index entries, edges */
+    int tsbarrel_calls;       /* importer calls bound to the defining module */
     int errors;
     double wall_s;
 } CxMetrics;
+
+/* Count the importer calls that bound to the defining module tsbarrel/lib/mJ.ts. */
+static bool cx_tsbarrel_population(cbm_store_t *store, const char *project, CxMetrics *out) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Function", &nodes, &count) != CBM_STORE_OK)
+        return false;
+    for (int i = 0; i < count; i++) {
+        const cbm_node_t *caller = &nodes[i];
+        int j = -1;
+        if (!caller->name || sscanf(caller->name, "useBarrel%d", &j) != 1 || j < 0)
+            continue;
+        char want_name[64];
+        char want_path[96];
+        snprintf(want_name, sizeof(want_name), "barrelFn%d", j);
+        snprintf(want_path, sizeof(want_path), "tsbarrel/lib/m%d.ts", j);
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(store, caller->id, "CALLS", &edges, &edge_count) !=
+            CBM_STORE_OK)
+            continue;
+        for (int e = 0; e < edge_count; e++) {
+            cbm_node_t target = {0};
+            if (cbm_store_find_node_by_id(store, edges[e].target_id, &target) == CBM_STORE_OK &&
+                target.name && target.file_path && strcmp(target.name, want_name) == 0 &&
+                strcmp(target.file_path, want_path) == 0)
+                out->tsbarrel_calls++;
+            cbm_node_free_fields(&target);
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(nodes, count);
+    return true;
+}
 
 /* Count the intended corpus, then prove each use() kept its exact local LSP
  * call. Query errors are failures, never indistinguishable from zero rows. */
@@ -705,8 +796,12 @@ static double cx_now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool pyext, bool pyrange) {
+static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool pyext, bool pyrange,
+                  bool tsbarrel) {
     memset(out, 0, sizeof(*out));
+    uint64_t br0;
+    uint64_t bs0;
+    cbm_pxc_ts_barrel_stats(&br0, &bs0);
 
     uint64_t d0;
     uint64_t b0;
@@ -774,6 +869,11 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool py
     out->tf_candidates = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed) - fc0;
     out->dk_hub_edges = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed) - dh0;
 
+    uint64_t br1;
+    uint64_t bs1;
+    cbm_pxc_ts_barrel_stats(&br1, &bs1);
+    out->barrel_requests = br1 - br0;
+    out->barrel_steps = bs1 - bs0;
     out->py_probes = atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed) - pp0;
     out->py_probe_visits =
         atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed) - pv0;
@@ -801,7 +901,8 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool py
     out->py_wildcard_visits =
         atomic_load_explicit(&cbm_py_wildcard_invalidation_visits, memory_order_relaxed) - pwv0;
     bool extra_ok = (!pyext || cx_pyext_population(s, project, out)) &&
-                    (!pyrange || cx_pyrange_population(s, project, out));
+                    (!pyrange || cx_pyrange_population(s, project, out)) &&
+                    (!tsbarrel || cx_tsbarrel_population(s, project, out));
     cbm_store_close(s);
     return extra_ok ? 0 : -1;
 }
@@ -845,8 +946,9 @@ static int cx_measure(CxCorpusBuilder build, const char *prefix_a, const char *p
         bool paths = da >= 0 && (size_t)da < sizeof(db_a) && db >= 0 && (size_t)db < sizeof(db_b);
         bool pyext = build == cx_build_pyext;
         bool pyrange = build == cx_build_pyrange;
-        if (paths && cx_run(root_a, db_a, out_a, pyext, pyrange) == 0 &&
-            cx_run(root_b, db_b, out_b, pyext, pyrange) == 0) {
+        bool tsbarrel = build == cx_build_tsbarrel;
+        if (paths && cx_run(root_a, db_a, out_a, pyext, pyrange, tsbarrel) == 0 &&
+            cx_run(root_b, db_b, out_b, pyext, pyrange, tsbarrel) == 0) {
             rc = 0;
         }
     }
@@ -1047,6 +1149,36 @@ TEST(complexity_shared_package_growth_stays_linear) {
     ASSERT_GT((long long)a->perfile_defs, (long long)CX_MIN_BASE_WORK);
     double defs_r = cx_ratio((double)b->perfile_defs, (double)a->perfile_defs);
     ASSERT_TRUE(defs_r <= CX_RATIO_HI);
+    PASS();
+}
+
+/* One shared TS barrel that grows with k, imported through by importers that
+ * grow with k (shape #3). Every importer must bind to its defining module, and
+ * the barrel walk work must stay linear: answering each importer by scanning
+ * the barrel's star lines would be ~4 per doubling. */
+TEST(complexity_ts_shared_barrel_stays_linear) {
+    CxMetrics a = {0};
+    CxMetrics b = {0};
+    ASSERT_EQ(cx_measure(cx_build_tsbarrel, "cbm_cxbarrel_a", "cbm_cxbarrel_b", &a, &b), 0);
+    const int modules = CX_K_BASE * CX_TSBARREL_MODULES_PER_K;
+    /* both legs take the parallel driver (2 files per module + the barrel) */
+    ASSERT_GT(2 * modules + 1, 50);
+    printf("    barrel requests %llu -> %llu  steps %llu -> %llu  calls %d -> %d\n",
+           (unsigned long long)a.barrel_requests, (unsigned long long)b.barrel_requests,
+           (unsigned long long)a.barrel_steps, (unsigned long long)b.barrel_steps, a.tsbarrel_calls,
+           b.tsbarrel_calls);
+    /* Non-vacuous: every importer bound through the barrel, and the requests
+     * were really answered by the registry. */
+    ASSERT_EQ(a.tsbarrel_calls, modules);
+    ASSERT_EQ(b.tsbarrel_calls, modules * 2);
+    ASSERT_GTE(a.barrel_requests, (uint64_t)modules);
+    ASSERT_GT((long long)a.barrel_steps, (long long)CX_MIN_BASE_WORK);
+    double req_r = cx_ratio((double)b.barrel_requests, (double)a.barrel_requests);
+    double steps_r = cx_ratio((double)b.barrel_steps, (double)a.barrel_steps);
+    printf("    barrel requests ratio %.2f  steps ratio %.2f (linear ~2, importers x barrel ~4)\n",
+           req_r, steps_r);
+    ASSERT_TRUE(req_r >= CX_RATIO_LO && req_r <= CX_RATIO_HI);
+    ASSERT_TRUE(steps_r >= CX_RATIO_LO && steps_r <= CX_RATIO_HI);
     PASS();
 }
 
@@ -1395,6 +1527,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_infra_resolution_is_linear);
     RUN_TEST(complexity_importance_scoring_is_linear);
     RUN_TEST(complexity_shared_package_growth_stays_linear);
+    RUN_TEST(complexity_ts_shared_barrel_stays_linear);
     RUN_TEST(complexity_py_submodule_probe_avoids_registry_scan);
     RUN_TEST(complexity_throughput_report_written);
 }
