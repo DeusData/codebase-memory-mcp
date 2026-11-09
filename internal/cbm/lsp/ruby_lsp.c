@@ -829,13 +829,19 @@ const CBMRegisteredFunc *ruby_lookup_singleton_method(RubyLSPContext *ctx, const
 
 /* Whether the finder rule (`User.find` -> User, relation chains keep the
  * model) also fires for a model declared in ANOTHER file, which is the usual
- * Rails layout. Set to false to keep the rule to models declared in the file
- * being resolved; nothing else changes. */
-static bool ruby_ar_finder_cross_file = true;
+ * Rails layout. Off for now, so the rule keeps to models declared in the file
+ * being resolved and nothing else changes. Across files it mostly meets
+ * relation chains, and `Model.where(...).m` reaches the relation or the
+ * model's class methods in Ruby, never an instance method `m`; a judged sample
+ * of the cross-file edges came in below the 95% precision bar. Turn it on once
+ * relations are typed apart from records. */
+static bool ruby_ar_finder_cross_file = false;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
-void cbm_ruby_set_ar_finder_cross_file(bool on) {
+bool cbm_ruby_set_ar_finder_cross_file(bool on) {
+    bool prev = ruby_ar_finder_cross_file;
     ruby_ar_finder_cross_file = on;
+    return prev;
 }
 #endif
 

@@ -1570,8 +1570,12 @@ TEST(rubylsp_cross_file_defs) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
+    /* `f = User.find(3)` with User in another file needs the cross-file half
+     * of the finder rule, which is off by default (ruby_ar_finder_cross_file). */
+    bool prev = cbm_ruby_set_ar_finder_cross_file(true);
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.controller", defs, 3, NULL,
                            NULL, 0, NULL, &out);
+    (void)cbm_ruby_set_ar_finder_cross_file(prev);
 
     bool ctor = false;
     bool full_name = false;
@@ -1579,7 +1583,7 @@ TEST(rubylsp_cross_file_defs) {
     for (int i = 0; i < out.count; i++) {
         if (!out.items[i].callee_qn || !out.items[i].caller_qn)
             continue;
-        if (!strstr(out.items[i].caller_qn, "UsersController.show"))
+        if (strcmp(out.items[i].caller_qn, "test.app.controller.UsersController.show") != 0)
             continue;
         if (strcmp(out.items[i].callee_qn, "test.models.user.User") == 0)
             ctor = true;
@@ -1657,8 +1661,11 @@ TEST(rubylsp_cross_file_ar_repro) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
+    /* `user = User.find(id)` with User in another file: cross-file finder rule. */
+    bool prev = cbm_ruby_set_ar_finder_cross_file(true);
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "e2e.app.services.report", defs, 6, NULL,
                            NULL, 0, NULL, &out);
+    (void)cbm_ruby_set_ar_finder_cross_file(prev);
 
     bool full_name = false;
     bool deact = false;
@@ -2147,8 +2154,9 @@ TEST(rubylsp_cross_unseen_mixin_blocks_superclass) {
 
 /* The finder rule (`User.find` -> User, relation chains keep the model) for a
  * model declared in ANOTHER file, the usual Rails layout. It is one switch
- * (ruby_ar_finder_cross_file): on by default; off keeps the rule to models
- * declared in the file being resolved, with nothing else changed. */
+ * (ruby_ar_finder_cross_file): off by default, which keeps the rule to models
+ * declared in the file being resolved, with nothing else changed; on, it also
+ * types models from other files. */
 static bool rubylsp_ar_finder_cross_edge(void) {
     CBMLSPDef defs[2];
     cross_def(&defs[0], "test.models.user.User", "User", "Class", "test.models.user", NULL,
@@ -2168,13 +2176,9 @@ static bool rubylsp_ar_finder_cross_edge(void) {
     return edge;
 }
 
-TEST(rubylsp_cross_ar_finder_crosses_files_by_default) {
-    ASSERT(rubylsp_ar_finder_cross_edge());
-    PASS();
-}
-
-TEST(rubylsp_cross_ar_finder_same_file_only_when_switched_off) {
-    cbm_ruby_set_ar_finder_cross_file(false);
+TEST(rubylsp_cross_ar_finder_same_file_only_by_default) {
+    /* Default: a model from another file gets no finder typing, while a model
+     * declared in the file being resolved still does. */
     bool cross = rubylsp_ar_finder_cross_edge();
     const char *src = "class User < ApplicationRecord\n  def full_name\n    'x'\n  end\nend\n"
                       "class UsersController < ApplicationController\n  def show\n"
@@ -2183,9 +2187,16 @@ TEST(rubylsp_cross_ar_finder_same_file_only_when_switched_off) {
     bool same = r && find_resolved(r, "UsersController.show", "User.full_name") >= 0;
     if (r)
         cbm_free_result(r);
-    cbm_ruby_set_ar_finder_cross_file(true);
     ASSERT(!cross);
     ASSERT(same);
+    PASS();
+}
+
+TEST(rubylsp_cross_ar_finder_crosses_files_when_switched_on) {
+    bool prev = cbm_ruby_set_ar_finder_cross_file(true);
+    bool cross = rubylsp_ar_finder_cross_edge();
+    (void)cbm_ruby_set_ar_finder_cross_file(prev);
+    ASSERT(cross);
     PASS();
 }
 
@@ -2240,6 +2251,6 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_cross_mixin_shadows_superclass_across_files);
     RUN_TEST(rubylsp_cross_mixin_in_reopening_shadows_superclass);
     RUN_TEST(rubylsp_cross_unseen_mixin_blocks_superclass);
-    RUN_TEST(rubylsp_cross_ar_finder_crosses_files_by_default);
-    RUN_TEST(rubylsp_cross_ar_finder_same_file_only_when_switched_off);
+    RUN_TEST(rubylsp_cross_ar_finder_same_file_only_by_default);
+    RUN_TEST(rubylsp_cross_ar_finder_crosses_files_when_switched_on);
 }

@@ -225,8 +225,9 @@ typedef struct CBMRubyCrossRegistry {
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Test seam: turn the cross-file half of the ActiveRecord finder rule on or
- * off (see ruby_ar_finder_cross_file in ruby_lsp.c). */
-void cbm_ruby_set_ar_finder_cross_file(bool on);
+ * off (see ruby_ar_finder_cross_file in ruby_lsp.c). Returns the previous
+ * setting, so a test restores what it found rather than a fixed value. */
+bool cbm_ruby_set_ar_finder_cross_file(bool on);
 #endif
 
 /* Build the shared registry from every project def. Strings are borrowed from
