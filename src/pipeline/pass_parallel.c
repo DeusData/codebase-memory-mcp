@@ -552,6 +552,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "client_route_path", def->client_route_path);
     append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
     append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
     /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
@@ -780,6 +781,7 @@ static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
             pp_arr_field_len("param_types", def->param_types) +
             pp_str_field_len("route_path", def->route_path) +
             pp_str_field_len("route_method", def->route_method) +
+            pp_str_field_len("client_route_path", def->client_route_path) +
             pp_str_field_len("http_client", def->http_client) +
             pp_str_field_len("http_base_url", def->http_base_url);
     for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
@@ -3380,13 +3382,18 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *lsp_target = NULL;
+        /* Mirrors pass_calls.c: a Java call on a JDK/library type is never
+         * bound to a project method found by name. */
+        bool java_external = cbm_pipeline_java_external_target(lang, lsp);
         if (lsp) {
             /* Canonicalise to the gbuf node's QN so res.qualified_name matches
              * the gbuf even when the cross-file fallback had to prefix the
              * project name. */
             bool exact_external_target = call->requires_lsp_resolution &&
                                          cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
-            lsp_target = exact_external_target
+            lsp_target = java_external ? cbm_pipeline_lsp_target_node_strict(
+                                             rc->main_gbuf, rc->project_name, lsp->callee_qn, false)
+                         : exact_external_target
                              ? cbm_pipeline_lsp_target_node_strict(rc->main_gbuf, rc->project_name,
                                                                    lsp->callee_qn, allow_tail)
                              : cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
@@ -3423,7 +3430,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
-            !rust_external && !php_vendor_call) {
+            !rust_external && !php_vendor_call && !java_external) {
             /* Python LEGB fallback first (MUST match pass_calls.c). */
             res = cbm_registry_resolve_call_scoped(rc->registry, call->callee_name, module_qn,
                                                    imp_keys, imp_vals, imp_count, lang,
@@ -3510,7 +3517,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     lang == CBM_LANG_ARKTS ||
                                     /* embedded-script hosts — see pass_calls.c */
                                     lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                    /* Swift initializer calls only — see pass_calls.c */
+                                    lang == CBM_LANG_SWIFT;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;

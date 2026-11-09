@@ -4919,6 +4919,77 @@ TEST(incremental_dockerfile_edit_keeps_build_edges) {
     PASS();
 }
 
+/* Editing a Retrofit interface keeps its requests as HTTP_CALLS (#2723): the
+ * incremental routes re-extract the file and must not mint HANDLES for it.
+ * `legacy`: through the full-load route, else the closure-repair route. Returns "full=calls/handles
+ * inc=calls/handles", or NULL; *route: the route taken. */
+static char *incremental_retrofit_keep(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_retrofitkeep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    write_temp_file(tmp, "src/OrderApi.kt",
+                    "package com.acme\n\nimport retrofit2.http.GET\nimport retrofit2.http.POST\n\n"
+                    "interface OrderApi {\n"
+                    "    @GET(\"/v1/orders/{id}\")\n    suspend fun getOrder(id: String): String\n"
+                    "    @POST(\"v1/orders\")\n    suspend fun createOrder(body: String): String\n"
+                    "}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/retrofitkeep.db", tmp);
+    static const char calls[] = "SELECT COUNT(*) FROM edges e JOIN nodes r ON r.id=e.target_id "
+                                "WHERE e.type='HTTP_CALLS' AND r.label='Route' "
+                                "AND r.qualified_name IN ('__route__GET__/v1/orders/{}',"
+                                "'__route__POST__/v1/orders')";
+    static const char handles[] = "SELECT COUNT(*) FROM edges WHERE type='HANDLES'";
+    int full_calls = -1;
+    int full_handles = -1;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        full_calls = k8s_inc_count(db_path, calls);
+        full_handles = k8s_inc_count(db_path, handles);
+    }
+    write_temp_file(tmp, "src/OrderApi.kt",
+                    "package com.acme\n\nimport retrofit2.http.GET\nimport retrofit2.http.POST\n\n"
+                    "// edited\ninterface OrderApi {\n"
+                    "    @GET(\"/v1/orders/{id}\")\n    suspend fun getOrder(id: String): String\n"
+                    "    @POST(\"v1/orders\")\n    suspend fun createOrder(body: String): String\n"
+                    "}\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    char *out = NULL;
+    if (k8s_inc_index(tmp, db_path) == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "full=%d/%d inc=%d/%d", full_calls, full_handles,
+                 k8s_inc_count(db_path, calls), k8s_inc_count(db_path, handles));
+        out = strdup(buf);
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return out;
+}
+
+TEST(incremental_edit_keeps_retrofit_http_calls_issue2723) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    char *got = incremental_retrofit_keep(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2/0 inc=2/0");
+    free(got);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    got = incremental_retrofit_keep(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "full=2/0 inc=2/0");
+    free(got);
+#endif
+    PASS();
+}
+
 /* A compose file's edit replaces its build edges: the renamed image keeps
  * no edge (nor node), the new one has its edge. `legacy`: through the
  * full-load route, else the closure-repair route. Returns "old=N new=M"
@@ -9707,6 +9778,108 @@ TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
     PASS();
 }
 #endif /* !_WIN32 */
+
+#ifdef _WIN32
+/* Create or delete a real file named nul in dir, as a Git Bash redirect such
+ * as `cmd > nul` leaves behind (#2646). The plain Win32 path <dir>/nul names
+ * the NUL device, so the file is reached only through the extended-length
+ * namespace, which needs an absolute path with backslashes (CI's TEMP uses
+ * forward slashes). */
+static bool pipeline_test_nul_file(const char *dir, bool create) {
+    enum { NUL_PATH_CAP = 1024, PREFIX_LEN = 4, LEAF_LEN = 4 };
+    static const wchar_t prefix[] = L"\\\\?\\";
+    static const wchar_t leaf[] = L"\\nul";
+    wchar_t path[NUL_PATH_CAP];
+    const DWORD room = NUL_PATH_CAP - PREFIX_LEN - LEAF_LEN;
+    wchar_t *wide_dir = cbm_utf8_to_wide(dir);
+    DWORD length = wide_dir ? GetFullPathNameW(wide_dir, room, path + PREFIX_LEN, NULL) : 0;
+    free(wide_dir);
+    if (length == 0 || length >= room) {
+        return false;
+    }
+    wmemcpy(path, prefix, PREFIX_LEN);
+    wmemcpy(path + PREFIX_LEN + length, leaf, LEAF_LEN + 1);
+    if (!create) {
+        return DeleteFileW(path) != 0;
+    }
+    HANDLE file =
+        CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(file);
+    return true;
+}
+
+/* #2646: the control-file walk cannot inspect a file named nul through the
+ * plain path, and it never needs to: only directories and control files can
+ * contribute to the manifest. Listing nul in .gitignore does not help, since
+ * the walk visits every entry. */
+TEST(pipeline_semantic_manifest_skips_nul_device_file_issue2646) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_nul_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app.py", "def NulNeighbor():\n    return 1\n");
+    write_temp_file(tmp, ".gitignore", "nul\n");
+    bool created = pipeline_test_nul_file(tmp, true);
+
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = -1;
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-skip-nul", tmp, NULL, 0, NULL, 0,
+                                                  NULL, NULL, &manifest, &manifest_count);
+    bool found_gitignore = false;
+    for (int i = 0; i < manifest_count; i++) {
+        if (manifest[i].rel_path && strcmp(manifest[i].rel_path, ".gitignore") == 0) {
+            found_gitignore = true;
+        }
+    }
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    bool deleted = created && pipeline_test_nul_file(tmp, false);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(created);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(found_gitignore);
+    ASSERT_TRUE(deleted);
+    PASS();
+}
+
+/* The user-visible half of #2646: one such file made every index run return
+ * CBM_PIPELINE_ABORT_PRESERVE_DB (aborted_previous_preserved), so a new
+ * project never got an index. */
+TEST(pipeline_full_index_survives_nul_device_file_issue2646) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_index_nul_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app.py", "def NulNeighbor():\n    return 1\n");
+    write_temp_file(tmp, ".gitignore", "nul\n");
+    bool created = pipeline_test_nul_file(tmp, true);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    char project[256] = "";
+    if (pipeline) {
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(pipeline));
+        cbm_pipeline_free(pipeline);
+    }
+    int indexed = -1;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (store) {
+        indexed = named_node_count(store, project, "NulNeighbor");
+        cbm_store_close(store);
+    }
+    bool deleted = created && pipeline_test_nul_file(tmp, false);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(created);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(indexed, 1);
+    ASSERT_TRUE(deleted);
+    PASS();
+}
+#endif /* _WIN32 */
 
 /* A fully validated staged graph must be able to recover from a definitely
  * non-SQLite destination without deleting evidence or overwriting an earlier
@@ -22967,6 +23140,253 @@ TEST(pipeline_swift_cross_package_import) {
     PASS();
 }
 
+/* #2379 at graph level, as a SwiftPM package. Sources/Kit/Inits.swift is the
+ * issue's reproduction. Sources/App/Sub.swift imports the Kit target -- which
+ * sends name resolution down the import-aware path -- and calls initializers
+ * the way real code does: `super.init` to a project superclass in another
+ * target, `super.init` to a superclass outside the project, an explicit
+ * `T.init(...)` on a project type and on a type outside the project, `self.init`
+ * from an extension of a type outside the project, and an implicit `.init(...)`.
+ * Each of those can attract a false CALLS edge now that initializers are nodes. */
+static const char *const SWIFT_INIT_PACKAGE_SRC =
+    "let package = Package(\n"
+    "    name: \"Kit\",\n"
+    "    products: [.library(name: \"Kit\", targets: [\"Kit\"])],\n"
+    "    targets: [\n"
+    "        .target(name: \"Kit\", dependencies: []),\n"
+    "        .target(name: \"App\", dependencies: [\"Kit\"])\n"
+    "    ]\n"
+    ")\n";
+
+static const char *const SWIFT_INIT_INITS_SRC = "func helper() -> Int { 1 }\n"
+                                                "func other() -> Int { 2 }\n"
+                                                "\n"
+                                                "struct Box {\n"
+                                                "    let value: Int\n"
+                                                "    init() {\n"
+                                                "        value = helper()\n"
+                                                "    }\n"
+                                                "    func read() -> Int {\n"
+                                                "        other()\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "final class Holder {\n"
+                                                "    let value: Int\n"
+                                                "    init(seed: Int) {\n"
+                                                "        value = helper() + seed\n"
+                                                "    }\n"
+                                                "    convenience init() {\n"
+                                                "        self.init(seed: other())\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "enum Mode {\n"
+                                                "    case on\n"
+                                                "    init?(flag: Bool) {\n"
+                                                "        if helper() > 0 { self = .on } else { "
+                                                "return nil }\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "extension Box {\n"
+                                                "    init(raw: Int) {\n"
+                                                "        value = other()\n"
+                                                "    }\n"
+                                                "}\n";
+
+static const char *const SWIFT_INIT_BASE_SRC = "open class Base {\n"
+                                               "    public init() {}\n"
+                                               "}\n";
+
+static const char *const SWIFT_INIT_SUB_SRC = "import Kit\n"
+                                              "import UIKit\n"
+                                              "\n"
+                                              "class Sub: Base {\n"
+                                              "    override init() {\n"
+                                              "        super.init()\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "class Screen: UIViewController {\n"
+                                              "    init() {\n"
+                                              "        super.init(nibName: nil, bundle: nil)\n"
+                                              "    }\n"
+                                              "    func alert() -> UIAlertAction {\n"
+                                              "        UIAlertAction.init(title: nil, style: "
+                                              ".default)\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "extension Notification {\n"
+                                              "    init(tag: String) {\n"
+                                              "        self.init(name: Notification.Name(tag))\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "func make() -> Box {\n"
+                                              "    .init(raw: 1)\n"
+                                              "}\n"
+                                              "func explicit() -> Box {\n"
+                                              "    Box.init(raw: 2)\n"
+                                              "}\n";
+
+enum { SWIFT_INIT_EDGE_CAP = 32, SWIFT_INIT_EDGE_LEN = 192 };
+
+typedef struct {
+    int run_rc;
+    int calls;       /* CALLS edges seen; -1 if the store was not read */
+    int init_usages; /* USAGE edges into a node named init/deinit */
+    char edges[SWIFT_INIT_EDGE_CAP][SWIFT_INIT_EDGE_LEN]; /* "src -> tgt", sorted */
+} SwiftInitObservation;
+
+static int swift_init_edge_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* Qualified name relative to the project ("Inits.Box.init"). */
+static const char *swift_init_rel_qn(const char *qn, const char *project) {
+    size_t plen = strlen(project);
+    return strncmp(qn, project, plen) == 0 && qn[plen] == '.' ? qn + plen + 1 : qn;
+}
+
+static void swift_init_observe(cbm_store_t *s, const char *project, SwiftInitObservation *o) {
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    o->calls = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src = {0};
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                o->calls < SWIFT_INIT_EDGE_CAP) {
+                snprintf(o->edges[o->calls], SWIFT_INIT_EDGE_LEN, "%s -> %s",
+                         swift_init_rel_qn(src.qualified_name, project),
+                         swift_init_rel_qn(tgt.qualified_name, project));
+            }
+            o->calls++;
+            cbm_node_free_fields(&src);
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+    int kept = o->calls < SWIFT_INIT_EDGE_CAP ? o->calls : SWIFT_INIT_EDGE_CAP;
+    qsort(o->edges, (size_t)kept, sizeof(o->edges[0]), swift_init_edge_cmp);
+
+    edges = NULL;
+    count = 0;
+    o->init_usages = 0;
+    if (cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                tgt.name && (strcmp(tgt.name, "init") == 0 || strcmp(tgt.name, "deinit") == 0)) {
+                o->init_usages++;
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+}
+
+/* `pad` filler files push the run past MIN_FILES_FOR_PARALLEL so that, with
+ * `parallel`, it goes through pass_parallel.c rather than pass_calls.c. */
+static void swift_init_case(bool parallel, int pad, SwiftInitObservation *o) {
+    memset(o, 0, sizeof(*o));
+    o->run_rc = -1;
+    o->calls = -1;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return;
+    }
+    char path[512];
+    bool written = true;
+    const char *names[] = {"Package.swift", "Sources/Kit/Inits.swift", "Sources/Kit/Base.swift",
+                           "Sources/App/Sub.swift"};
+    const char *sources[] = {SWIFT_INIT_PACKAGE_SRC, SWIFT_INIT_INITS_SRC, SWIFT_INIT_BASE_SRC,
+                             SWIFT_INIT_SUB_SRC};
+    for (int i = 0; i < 4 && written; i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp, names[i]);
+        written = th_write_file(path, sources[i]) == 0;
+    }
+    for (int i = 0; i < pad && written; i++) {
+        char source[96];
+        snprintf(path, sizeof(path), "%s/Pad%02d.swift", tmp, i);
+        snprintf(source, sizeof(source), "func pad%02d() -> Int { %d }\n", i, i);
+        written = th_write_file(path, source) == 0;
+    }
+    if (written) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/swift_init.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o->run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            if (store && project) {
+                swift_init_observe(store, project, o);
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+}
+
+/* The exact CALLS set. Every initializer's own calls come from that
+ * initializer (the repro's file-level collapse is gone); Sub.init reaches
+ * Base.init in the other target and `Box.init(raw:)` reaches Box.init.
+ * UIViewController's and UIAlertAction's initializers, Notification's own and
+ * the implicit `.init(...)` are outside the project and form no edge -- in
+ * particular none to a project `init` that merely shares the name. Holder's
+ * convenience `self.init` is not a self-loop. */
+static int swift_init_assert_exact(const SwiftInitObservation *o) {
+    static const char *const expected[] = {
+        "Sources.App.Sub.Sub.init -> Sources.Kit.Base.Base.init",
+        "Sources.App.Sub.explicit -> Sources.Kit.Inits.Box.init",
+        "Sources.Kit.Inits.Box.init -> Sources.Kit.Inits.helper",
+        "Sources.Kit.Inits.Box.init -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Box.read -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Holder.init -> Sources.Kit.Inits.helper",
+        "Sources.Kit.Inits.Holder.init -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Mode.init -> Sources.Kit.Inits.helper",
+    };
+    enum { EXPECTED_CALLS = sizeof(expected) / sizeof(expected[0]) };
+    ASSERT_EQ(o->run_rc, 0);
+    ASSERT_EQ(o->init_usages, 0);
+    ASSERT_EQ(o->calls, (int)EXPECTED_CALLS);
+    for (int i = 0; i < (int)EXPECTED_CALLS; i++) {
+        ASSERT_STR_EQ(o->edges[i], expected[i]);
+    }
+    return 0;
+}
+
+TEST(pipeline_swift_init_exact_calls_sequential_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(false, 0, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
+/* Same input through pass_parallel.c: 55 fillers exceed MIN_FILES_FOR_PARALLEL. */
+TEST(pipeline_swift_init_exact_calls_parallel_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(true, 55, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
 TEST(pipeline_python_cross_module_call) {
     /* Port of TestPythonCrossModuleCallViaImport */
     const char *files[] = {"utils.py", "main.py"};
@@ -31771,6 +32191,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_swift_cross_package_import);
+    RUN_TEST(pipeline_swift_init_exact_calls_sequential_issue2379);
+    RUN_TEST(pipeline_swift_init_exact_calls_parallel_issue2379);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
     RUN_TEST(pipeline_go_type_classification);
@@ -32013,6 +32435,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
+    RUN_TEST(incremental_edit_keeps_retrofit_http_calls_issue2723);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
     RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
     RUN_TEST(incremental_image_split_change_rebuilds);
@@ -32113,6 +32536,10 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
 #ifndef _WIN32
     RUN_TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory);
+#endif
+#ifdef _WIN32
+    RUN_TEST(pipeline_semantic_manifest_skips_nul_device_file_issue2646);
+    RUN_TEST(pipeline_full_index_survives_nul_device_file_issue2646);
 #endif
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
