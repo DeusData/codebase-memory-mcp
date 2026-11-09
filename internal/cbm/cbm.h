@@ -241,6 +241,9 @@ typedef struct {
     const char **return_types;          // NULL-terminated array (NULL if none)
     const char *route_path;   // HTTP route path from decorator (e.g., "/api/users") or NULL
     const char *route_method; // HTTP method from decorator (e.g., "POST") or NULL
+    // Path a client interface method requests (Retrofit @GET("v1/x")) or NULL;
+    // route_method is then its verb.
+    const char *client_route_path;
     int complexity;           // cyclomatic complexity
     int cognitive;            // cognitive complexity (nesting-weighted)
     int loop_count;           // number of loop constructs in the body

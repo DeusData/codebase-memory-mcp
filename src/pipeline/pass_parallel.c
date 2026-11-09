@@ -562,6 +562,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "client_route_path", def->client_route_path);
     append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
     append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
     /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
@@ -791,6 +792,7 @@ static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
             pp_arr_field_len("param_types", def->param_types) +
             pp_str_field_len("route_path", def->route_path) +
             pp_str_field_len("route_method", def->route_method) +
+            pp_str_field_len("client_route_path", def->client_route_path) +
             pp_str_field_len("http_client", def->http_client) +
             pp_str_field_len("http_base_url", def->http_base_url);
     for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {

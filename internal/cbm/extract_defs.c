@@ -3603,6 +3603,105 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
     extract_route_from_annotations(a, func_node, source, spec, out_path, out_method);
 }
 
+/* The string literal an annotation argument consists of, positional or as
+ * `value = "..."`. A concatenation, a constant or a template has no statically
+ * known value, so it yields a null node rather than one of its fragments. */
+static TSNode annotation_arg_literal(TSNode arg) {
+    TSNode null_node = {0};
+    const char *kind = ts_node_type(arg);
+    if (strcmp(kind, "element_value_pair") == 0 || strcmp(kind, "value_argument") == 0) {
+        uint32_t nc = ts_node_named_child_count(arg);
+        if (nc == 0) {
+            return null_node;
+        }
+        arg = ts_node_named_child(arg, nc - SKIP_ONE);
+    }
+    if (!is_route_string_kind(ts_node_type(arg))) {
+        return null_node;
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(arg); i++) {
+        const char *ck = ts_node_type(ts_node_named_child(arg, i));
+        if (strcmp(ck, "interpolated_identifier") == 0 ||
+            strcmp(ck, "interpolated_expression") == 0 || strcmp(ck, "string_interpolation") == 0) {
+            return null_node;
+        }
+    }
+    return arg;
+}
+
+/* Java interface_declaration, or a Kotlin class_declaration spelled with the
+ * `interface` keyword (the grammar has no separate node kind for it). */
+static bool is_jvm_interface(TSNode class_node) {
+    if (ts_node_is_null(class_node)) {
+        return false;
+    }
+    const char *kind = ts_node_type(class_node);
+    if (strcmp(kind, "interface_declaration") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "class_declaration") != 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ts_node_child_count(class_node); i++) {
+        TSNode ch = ts_node_child(class_node, i);
+        if (!ts_node_is_named(ch) && strcmp(ts_node_type(ch), "interface") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Retrofit declares a client's requests as @GET("v1/orders") / @POST(...) on an
+ * interface method. JAX-RS uses the same bare verb names, but its verbs are
+ * marker annotations (the path is a sibling @Path), so a verb that carries an
+ * argument is a Retrofit request, not a served endpoint. Returns true for such
+ * a method; *out_path is its path, or NULL when the argument is not a literal.
+ * Retrofit resolves a relative path against the base URL, so it is rooted the
+ * way JAX-RS paths are; a full URL is kept as written. */
+static bool retrofit_client_route(CBMArena *a, TSNode func_node, const char *source,
+                                  const CBMLangSpec *spec, const char **out_path,
+                                  const char **out_method) {
+    *out_path = NULL;
+    *out_method = NULL;
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = find_jvm_modifiers(func_node, spec->language, wrappers, MAX_ATTR_WRAPPERS_MINUS_1);
+    wrappers[wn++] = func_node;
+    for (int w = 0; w < wn; w++) {
+        uint32_t cc = ts_node_child_count(wrappers[w]);
+        for (uint32_t ci = 0; ci < cc; ci++) {
+            TSNode child = ts_node_child(wrappers[w], ci);
+            if (!cbm_kind_in_set(child, spec->decorator_node_types)) {
+                continue;
+            }
+            TSNode name_node = annotation_name_node(child);
+            if (ts_node_is_null(name_node)) {
+                continue;
+            }
+            char *name = cbm_node_text(a, name_node, source);
+            const char *method = annotation_route_method(name);
+            if (!method || strcmp(method, name) != 0) {
+                continue;
+            }
+            TSNode args = annotation_args_node(child);
+            if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+                continue;
+            }
+            *out_method = method;
+            TSNode lit = annotation_arg_literal(ts_node_named_child(args, 0));
+            char *text = ts_node_is_null(lit) ? NULL : cbm_node_text(a, lit, source);
+            size_t len = text ? strlen(text) : 0;
+            if (len > PAIR_CHARS && (text[0] == '"' || text[0] == '\'')) {
+                char *path = cbm_arena_strndup(a, text + SKIP_CHAR, len - PAIR_CHARS);
+                *out_path = (!path || path[0] == '/' || strstr(path, "://"))
+                                ? path
+                                : cbm_arena_sprintf(a, "/%s", path);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *join_route_paths(CBMArena *a, const char *prefix, const char *path) {
     if (!path || !path[0]) {
         return prefix;
@@ -9367,6 +9466,17 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    const char *client_path = NULL;
+    const char *client_method = NULL;
+    /* Retrofit services must be interfaces; Pippo and Rapidoid put the path in
+     * @GET("/x") on a controller class, and those methods serve the route. */
+    if ((ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN) &&
+        is_jvm_interface(class_node) &&
+        retrofit_client_route(a, child, ctx->source, spec, &client_path, &client_method)) {
+        def.route_path = NULL;
+        def.client_route_path = client_path;
+        def.route_method = client_path ? client_method : NULL;
+    }
     if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN ||
                            ctx->language == CBM_LANG_SCALA)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);

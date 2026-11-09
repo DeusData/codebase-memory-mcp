@@ -268,6 +268,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_list(c, &d->return_types);
     cr_str(c, &d->route_path);
     cr_str(c, &d->route_method);
+    cr_str(c, &d->client_route_path);
     cr_blob(c, (const void **)&d->fingerprint,
             d->fingerprint_k > 0 ? (size_t)d->fingerprint_k * sizeof(uint32_t) : 0);
     cr_str(c, &d->structural_profile);
