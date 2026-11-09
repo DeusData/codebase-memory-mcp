@@ -4179,31 +4179,16 @@ static int swift_receiver_candidates(const swift_inference_t *context, const CBM
     return SWIFT_INCOMPATIBLE;
 }
 
-/* A type that only an initializer gives narrows the label match: when it has
- * no member with this name and these labels, the call keeps the label match,
- * as before initializer types were read (#2061). A constructor counts unless
- * the project does not declare its type: DispatchSemaphore() and Task {...}
- * name types it does not know, Data() one it only extends, and a label match
- * would guess at members the project does not have. */
-static bool swift_keeps_label_match(const swift_inference_t *context, swift_origin_t origin,
-                                    const char *type) {
+/* A type that only an initializer gives (a constructor call, or a call whose
+ * return type was inferred) narrows the label match: when it has no member
+ * with this name and these labels, the call keeps the label match, as before
+ * initializer types were read (#2061). That holds for every constructor type,
+ * including one the project does not declare (DispatchSemaphore(), Data()). */
+static bool swift_keeps_label_match(const swift_inference_t *context, swift_origin_t origin) {
     if (context->strict) {
         return false; /* Inferring an initializer's type: a label match is a guess. */
     }
-    if (origin != SWIFT_ORIGIN_CONSTRUCTED) {
-        return origin == SWIFT_ORIGIN_INFERRED;
-    }
-    char type_text[CBM_SZ_4K];
-    const char *qn =
-        swift_receiver_type_text(type, type_text, sizeof(type_text))
-            ? swift_receiver_qn(context->registry, context->file, context->graph, type_text,
-                                context->module_qn, context->imports, context->import_count)
-            : NULL;
-    const swift_owners_t *index = context->registry->swift_owners;
-    const swift_owner_t *owner = qn && index ? cbm_ht_get(index->by_qn, qn) : NULL;
-    /* No owner: `Foo.make()` read as a constructor names a function, whose
-     * result keeps the label match like an inferred one. */
-    return qn && (!owner || (owner->primary && owner->primary->declaration));
+    return origin == SWIFT_ORIGIN_CONSTRUCTED || origin == SWIFT_ORIGIN_INFERRED;
 }
 
 static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
@@ -4240,7 +4225,7 @@ static int swift_candidates_for_file(const swift_inference_t *context, swift_bin
                                              out_cap);
     }
     int found = swift_receiver_candidates(context, call, expression, type, member, out, out_cap);
-    if (found <= 0 && swift_keeps_label_match(context, origin, type)) {
+    if (found <= 0 && swift_keeps_label_match(context, origin)) {
         return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
                                              out_cap);
     }

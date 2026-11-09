@@ -17824,12 +17824,11 @@ TEST(pipeline_swift_try_initializer_types_receiver_issue2061) {
     return swift_call_pairs_case(files, 3, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
 }
 
-/* #2061: a project type that only a constructor call gives (`Foo()`,
- * `try Foo(...)`) narrows the label match like an inferred one: a member the
- * type has wins over a same-label member elsewhere, and a member it lacks
- * keeps the label match. An annotation or a parameter still decides alone,
- * and so does a constructor of a type the project does not declare, whether
- * it does not know the type (NSLock) or only extends it (Data). */
+/* #2061: a type that only a constructor call gives (`Foo()`, `try Foo(...)`)
+ * narrows the label match like an inferred one: a member the type has wins
+ * over a same-label member elsewhere, and a member it lacks keeps the label
+ * match, also for a type the project does not know (NSLock) or only extends
+ * (Data). An annotation or a parameter still decides alone. */
 TEST(pipeline_swift_constructor_receiver_keeps_label_match_issue2061) {
     const char *files[] = {
         "Types.swift",
@@ -17859,8 +17858,8 @@ TEST(pipeline_swift_constructor_receiver_keeps_label_match_issue2061) {
         {"Calls.tried()", "Calls.Reader.read(count:Int)=>Int", 1},
         {"Calls.annotated()", "Calls.Reader.read(count:Int)=>Int", 0},
         {"Calls.parameter(_:Store)", "Calls.Reader.read(count:Int)=>Int", 0},
-        {"Calls.external()", "Calls.Reader.read(count:Int)=>Int", 0},
-        {"Calls.extended()", "Calls.Reader.read(count:Int)=>Int", 0},
+        {"Calls.external()", "Calls.Reader.read(count:Int)=>Int", 1},
+        {"Calls.extended()", "Calls.Reader.read(count:Int)=>Int", 1},
     };
     return swift_call_pairs_case(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
 }
