@@ -4173,7 +4173,6 @@ static int swift_candidates_for_file(const swift_inference_t *context, swift_bin
                                      const CBMCall *call, const char **out, int out_cap) {
     const cbm_registry_t *r = context->registry;
     const CBMFileResult *file = context->file;
-    const cbm_gbuf_t *graph = context->graph;
     const char *module_qn = context->module_qn;
     const char **import_vals = context->imports;
     int import_count = context->import_count;
@@ -4181,6 +4180,7 @@ static int swift_candidates_for_file(const swift_inference_t *context, swift_bin
         return 0;
     }
     if (swift_call_uses_named_receiver(file, call)) {
+        const cbm_gbuf_t *graph = context->graph;
         int named = swift_named_candidates(r, graph, file, call, module_qn, import_vals,
                                            import_count, out, out_cap);
         return named == SWIFT_NO_TYPE_RECEIVER
