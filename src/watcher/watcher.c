@@ -154,6 +154,15 @@ struct cbm_watcher {
  * daemon log names the stuck project instead of only repeating the warning. */
 #define INDEX_FAIL_SUSTAINED 10
 
+/* Success cooldown (#2835): after a successful re-index the next poll waits
+ * INDEX_COOLDOWN_FACTOR x the index's own duration, counted from when the
+ * index finished, so short rebuilds spend at most ~1/(K+1) of wall time
+ * indexing one project. Sub-second indexes stay at the plain cadence. The
+ * cooldown is capped at INDEX_FAIL_CEILING_MS (5 min) so that, under
+ * continuous writes, a project never falls more than one rebuild plus five
+ * minutes behind. */
+#define INDEX_COOLDOWN_FACTOR 3
+
 /* Stale-root pruning (#286): a watched project whose root directory stays
  * missing is pruned — its cached DB is deleted and the watch entry removed.
  * Deletion is destructive (the DB can hold user-authored data such as the
@@ -175,7 +184,17 @@ struct cbm_watcher {
 
 /* ── Time helper ────────────────────────────────────────────────── */
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: nonzero freezes the watcher's scheduling clock at this value. */
+static int64_t test_clock_ns = 0;
+#endif
+
 static int64_t now_ns(void) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (test_clock_ns != 0) {
+        return test_clock_ns;
+    }
+#endif
     struct timespec ts;
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((int64_t)ts.tv_sec * NS_PER_SEC) + ts.tv_nsec;
@@ -202,6 +221,20 @@ int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures) {
      * the current constants can produce — the caller's contract is "a delay
      * that never shrinks as failures accumulate". */
     return (int)(delay < interval_ms ? interval_ms : delay);
+}
+
+int cbm_watcher_success_delay_ms(int interval_ms, int64_t index_elapsed_ms) {
+    if (interval_ms < 0) {
+        interval_ms = 0;
+    }
+    if (index_elapsed_ms <= 0) {
+        return interval_ms;
+    }
+    /* Divide instead of multiply so a huge elapsed cannot overflow. */
+    int64_t cooldown = index_elapsed_ms > INDEX_FAIL_CEILING_MS / INDEX_COOLDOWN_FACTOR
+                           ? INDEX_FAIL_CEILING_MS
+                           : index_elapsed_ms * INDEX_COOLDOWN_FACTOR;
+    return (int)(cooldown > interval_ms ? cooldown : interval_ms);
 }
 
 int cbm_watcher_poll_interval_ms(int file_count) {
@@ -1693,12 +1726,22 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy",
                  s->is_git ? "git" : "tree");
+    int delay_ms = -1;            /* < 0: use the failure-backoff cadence below */
+    int64_t anchor_ns = ctx->now; /* success re-anchors to when the index finished */
     if (ctx->w->index_fn) {
+        int64_t index_start = now_ns();
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
             s->index_failures = 0;
             commit_baselines(ctx->w, s);
+            anchor_ns = now_ns();
+            delay_ms =
+                cbm_watcher_success_delay_ms(s->interval_ms, (anchor_ns - index_start) / US_PER_MS);
+            if (delay_ms > s->interval_ms) {
+                cbm_log_info("watcher.cooldown", "project", s->project_name, "delay_ms",
+                             itoa_buf(delay_ms));
+            }
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
             cbm_log_info("watcher.index.retry", "project", s->project_name);
@@ -1721,10 +1764,12 @@ static void poll_project(const char *key, void *val, void *ud) {
         }
     }
 
-    /* Failures back off; success and busy-skip keep the adaptive cadence. */
-    s->next_poll_ns =
-        ctx->now +
-        ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS);
+    /* Success pays back the index's cost; failures back off; busy-skip keeps
+     * the adaptive cadence. */
+    if (delay_ms < 0) {
+        delay_ms = cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures);
+    }
+    s->next_poll_ns = anchor_ns + ((int64_t)delay_ms * US_PER_MS);
 }
 
 /* Callback to snapshot project state pointers into an array. */
@@ -1875,5 +1920,20 @@ int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
     int count = w->pending_free_count;
     cbm_mutex_unlock(&w->projects_lock);
     return count;
+}
+
+void cbm_watcher_test_set_clock_ns(int64_t ns) {
+    test_clock_ns = ns;
+}
+
+int64_t cbm_watcher_test_next_poll_ns(cbm_watcher_t *w, const char *project) {
+    if (!w || !project) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project);
+    int64_t next = s ? s->next_poll_ns : -1;
+    cbm_mutex_unlock(&w->projects_lock);
+    return next;
 }
 #endif
