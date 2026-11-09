@@ -1394,16 +1394,9 @@ static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result, const 
  * non-aliased path. The shared Python registry must still materialize the
  * resulting exact QN before it earns CALL_REFERENCE. */
 static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
-                                 const char *project_name, const char *local_name,
-                                 const cbm_gbuf_node_t *target) {
-    if (!target || !target->qualified_name) {
+                                 const char *local_name, const cbm_gbuf_node_t *target) {
+    if (!target || !target->qualified_name)
         return NULL;
-    }
-    // IMPORTS targets a file node; receiver types use filename-stem modules.
-    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) && target->label &&
-        strcmp(target->label, "File") == 0 && target->file_path) {
-        return cbm_pipeline_fqn_module(project_name, target->file_path);
-    }
     if (lang == CBM_LANG_KOTLIN)
         return pxc_kotlin_import_from_metadata(result, local_name);
     if (lang != CBM_LANG_PYTHON)
@@ -1573,7 +1566,7 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         /* An annotation-only import (#1277) binds no CALLS name: it gets no value. */
         bool binds = include_type_only ||
                      cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
-        char *value = binds ? pxc_import_value_qn(lang, result, project_name, local, target) : NULL;
+        char *value = binds ? pxc_import_value_qn(lang, result, local, target) : NULL;
         if (!value) {
             free(local);
             continue;
@@ -2122,6 +2115,40 @@ static void pxc_require_unambiguous_receivers(CBMFileResult *result,
     }
 }
 
+/* The C LSP compares its include list with type QNs, which live in the
+ * filename-stem module (proj.dir.foo), while a C/C++ include binds the
+ * included File node (proj.dir.foo.h.__file__). Convert only this list: the
+ * shared import map also feeds base-class, usage and write resolution and
+ * keeps its values. An include reaches a File node by its path, extension
+ * included, so the segment before __file__ is that extension; other values
+ * (Module targets) are already module QNs and pass unchanged. */
+static const char **pxc_c_include_modules(CBMArena *arena, const char **qns, int count) {
+    static const char file_suffix[] = ".__file__";
+    const size_t suffix_len = sizeof(file_suffix) - SKIP_ONE;
+    const char **modules =
+        count > 0 ? (const char **)cbm_arena_alloc(arena, (size_t)count * sizeof(*modules)) : NULL;
+    if (!modules) {
+        return qns;
+    }
+    for (int i = 0; i < count; i++) {
+        modules[i] = qns[i];
+        size_t len = qns[i] ? strlen(qns[i]) : 0;
+        if (len <= suffix_len || strcmp(qns[i] + len - suffix_len, file_suffix) != 0) {
+            continue;
+        }
+        size_t stem_len = len - suffix_len;
+        while (stem_len > 0 && qns[i][stem_len - SKIP_ONE] != '.') {
+            stem_len--;
+        }
+        char *module =
+            stem_len > SKIP_ONE ? cbm_arena_strndup(arena, qns[i], stem_len - SKIP_ONE) : NULL;
+        if (module) {
+            modules[i] = module;
+        }
+    }
+    return modules;
+}
+
 /* Run cross-file LSP for a single file inside a scratch arena that gets
  * freed when the call returns. The LSP would otherwise allocate a fresh
  * type registry + stdlib + all project defs into the supplied arena, and
@@ -2159,11 +2186,12 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
     case CBM_LANG_CPP:
     case CBM_LANG_CUDA: {
         bool cpp_mode = (lang != CBM_LANG_C);
-        /* Use the same normalized include map as the prebuilt-registry path. */
+        /* Use the same module-form include list as the prebuilt-registry path. */
+        const char **includes = pxc_c_include_modules(&scratch, imp_qns, imp_count);
         if (r->has_test_definition_owners) {
             if (!cbm_run_c_lsp_cross_with_test_owners(
                     &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, imp_names,
-                    imp_qns, imp_count, tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
+                    includes, imp_count, tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
                 cbm_pipeline_test_owner_error(r);
                 pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
                 return; /* out may be partial: never append it */
@@ -2171,7 +2199,7 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         } else {
             CBMLSPStatus status =
                 cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
-                                           def_count, imp_names, imp_qns, imp_count, tree, &out);
+                                           def_count, imp_names, includes, imp_count, tree, &out);
             if (status != CBM_LSP_COMPLETE)
                 cbm_c_lsp_record_failure(r, status);
         }
@@ -2363,11 +2391,12 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         case CBM_LANG_C:
         case CBM_LANG_CPP:
-        case CBM_LANG_CUDA:
+        case CBM_LANG_CUDA: {
+            const char **includes = pxc_c_include_modules(&scratch, imp_vals, imp_count);
             if (result->has_test_definition_owners) {
                 if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
                         &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                        imp_keys, imp_vals, imp_count, result->cached_tree, &out,
+                        imp_keys, includes, imp_count, result->cached_tree, &out,
                         CBM_SOURCE_ORIGIN_RAW, result)) {
                     cbm_pipeline_test_owner_error(result);
                     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -2376,12 +2405,13 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             } else {
                 CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
                     &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                    imp_keys, imp_vals, imp_count, result->cached_tree, &out);
+                    imp_keys, includes, imp_count, result->cached_tree, &out);
                 if (status != CBM_LSP_COMPLETE)
                     cbm_c_lsp_record_failure(result, status);
             }
             used_prebuilt = true;
             break;
+        }
         case CBM_LANG_CSHARP:
             cbm_run_cs_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
                                                imp_vals, imp_count, result->cached_tree, &out);
