@@ -401,6 +401,12 @@ typedef struct {
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python only today. Read by the
                                      // weak-local-binding guard. Default false.
+    bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
+                                     // parameter the factory of an enclosing AMD
+                                     // define([...], fn) / require([...], fn) binds to a
+                                     // dependency (#1128). Not an import (no IMPORTS
+                                     // edge): read by the same-module bound-receiver
+                                     // guard. Default false.
     bool receiver_is_self_attribute; // Python member call whose receiver is an attribute
                                      // chain rooted at self/cls but not self/cls itself
                                      // (self.compiler.apply_converters()). An object the
@@ -432,6 +438,10 @@ typedef enum {
 } CBMImportKind;
 
 typedef struct {
+    /* JS/TS: the statement binds no local name (side-effect `import './x'`,
+     * re-export, bare `require('x').y`), so local_name is the path's last segment,
+     * not a binding the file can call through (#1128). Default false. */
+    bool local_name_synthesized;
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
     const char *member;      // ES named import: the exported name the local binds (`get` in

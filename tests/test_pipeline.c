@@ -14291,6 +14291,224 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
     return n;
 }
 
+/* #1128: a JS/TS-family member call whose receiver is bound to an import or is a
+ * builtin global must not bind the function this file happens to define under
+ * the member's name. Strategy 2 (same_module) found `axios.get()` -> <module>.get
+ * by dropping the receiver, a 0.90 edge the weak-member guard deliberately
+ * keeps. One file per language the guard covers (the four JS/TS languages and
+ * the four <script> hosts), plus CommonJS and AMD in JavaScript. NEGATIVE: an
+ * ES-imported receiver, a builtin global, a CommonJS require and an AMD
+ * dependency bind nothing. POSITIVE controls that keep their edge: an
+ * object-literal method (`context.push()`, the vuejs/core codegen shape), a self
+ * receiver (`this.get()`) and CommonJS / AMD `exports.get()`. The parallel twin
+ * pads past MIN_FILES_FOR_PARALLEL and pins CBM_WORKERS so pass_parallel.c's
+ * resolver is the one exercised. */
+enum { SMR_LANGS = 8, SMR_PAD_FILES = 52 };
+
+/* CALLS edges whose source and target qualified names end in `.caller` and
+ * `.callee`. */
+static int smr_calls(cbm_store_t *s, const char *project, const char *caller, const char *callee) {
+    char src_tail[128];
+    char tgt_tail[128];
+    snprintf(src_tail, sizeof(src_tail), ".%s", caller);
+    snprintf(tgt_tail, sizeof(tgt_tail), ".%s", callee);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int hits = 0;
+    size_t cs = strlen(src_tail);
+    size_t ts = strlen(tgt_tail);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, src_tail) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, tgt_tail) == 0) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return hits;
+}
+
+static int check_same_module_bound_receiver(bool parallel) {
+    static const char *const body = "import axios from 'axios';\n"
+                                    "function get(key) { return key; }\n"
+                                    "function log(msg) { return msg; }\n"
+                                    "function push(item) { return item; }\n"
+                                    "function remoteCall(url) { return axios.get(url); }\n"
+                                    "function builtinCall(msg) { return console.log(msg); }\n"
+                                    "function literalCall(item) {\n"
+                                    "  const context = { push };\n"
+                                    "  return context.push(item);\n"
+                                    "}\n"
+                                    "function selfCall(key) { return this.get(key); }\n";
+    static const struct {
+        const char *path;
+        const char *stem;
+        const char *open;
+        const char *close;
+    } langs[SMR_LANGS] = {
+        {"src/smr_js.js", "smr_js", "", ""},
+        {"src/smr_ts.ts", "smr_ts", "", ""},
+        {"src/smr_tsx.tsx", "smr_tsx", "", ""},
+        {"src/smr_ets.ets", "smr_ets", "", ""},
+        {"src/smr_vue.vue", "smr_vue", "<template><div></div></template>\n<script>\n",
+         "</script>\n"},
+        {"src/smr_svelte.svelte", "smr_svelte", "<script>\n", "</script>\n<div></div>\n"},
+        {"src/smr_astro.astro", "smr_astro", "---\n", "---\n<div></div>\n"},
+        {"src/smr_html.html", "smr_html", "<html><body>\n<script type=\"module\">\n",
+         "</script>\n</body></html>\n"},
+    };
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_smr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < SMR_LANGS; i++) {
+        char content[1024];
+        snprintf(content, sizeof(content), "%s%s%s", langs[i].open, body, langs[i].close);
+        write_temp_file(tmp, langs[i].path, content);
+    }
+    write_temp_file(tmp, "src/smr_cjs.js",
+                    "const db = require('./database');\n"
+                    "function getObject(key) { return key; }\n"
+                    "function cjsCall(key) { return db.getObject(key); }\n"
+                    "function exportsCall(key) { return exports.getObject(key); }\n");
+    write_temp_file(tmp, "src/smr_amd.js",
+                    "define('forum/smr', ['api', 'exports'], function (api, exports) {\n"
+                    "  function get(url) { return url; }\n"
+                    "  function amdCall(url) { return api.get(url); }\n"
+                    "  function amdExports(url) { return exports.get(url); }\n"
+                    "  return { amdCall, amdExports };\n"
+                    "});\n");
+    for (int i = 0; parallel && i < SMR_PAD_FILES; i++) {
+        char name[64];
+        char pad[128];
+        snprintf(name, sizeof(name), "src/smr_pad%d.ts", i);
+        snprintf(pad, sizeof(pad), "export function smrPad%d(): number {\n  return %d;\n}\n", i, i);
+        write_temp_file(tmp, name, pad);
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        th_rmtree(tmp);
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/smr.db", tmp);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int callers[SMR_LANGS];
+    int remote[SMR_LANGS];
+    int builtin[SMR_LANGS];
+    int literal[SMR_LANGS];
+    int self_recv[SMR_LANGS];
+    int cjs_callers = -1;
+    int cjs = -1;
+    int cjs_exports = -1;
+    int amd_callers = -1;
+    int amd = -1;
+    int amd_exports = -1;
+    for (int i = 0; i < SMR_LANGS; i++) {
+        callers[i] = remote[i] = builtin[i] = literal[i] = self_recv[i] = -1;
+    }
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        for (int i = 0; i < SMR_LANGS; i++) {
+            char caller[64];
+            char target[64];
+            callers[i] = fixture_node_count(s, project, langs[i].path, "remoteCall", "Function");
+            snprintf(target, sizeof(target), "%s.get", langs[i].stem);
+            snprintf(caller, sizeof(caller), "%s.remoteCall", langs[i].stem);
+            remote[i] = smr_calls(s, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.selfCall", langs[i].stem);
+            self_recv[i] = smr_calls(s, project, caller, target);
+            snprintf(target, sizeof(target), "%s.log", langs[i].stem);
+            snprintf(caller, sizeof(caller), "%s.builtinCall", langs[i].stem);
+            builtin[i] = smr_calls(s, project, caller, target);
+            snprintf(target, sizeof(target), "%s.push", langs[i].stem);
+            snprintf(caller, sizeof(caller), "%s.literalCall", langs[i].stem);
+            literal[i] = smr_calls(s, project, caller, target);
+        }
+        cjs_callers = fixture_node_count(s, project, "src/smr_cjs.js", "cjsCall", "Function");
+        cjs = smr_calls(s, project, "smr_cjs.cjsCall", "smr_cjs.getObject");
+        cjs_exports = smr_calls(s, project, "smr_cjs.exportsCall", "smr_cjs.getObject");
+        amd_callers = fixture_node_count(s, project, "src/smr_amd.js", "amdCall", "Function");
+        amd = smr_calls(s, project, "smr_amd.amdCall", "smr_amd.get");
+        amd_exports = smr_calls(s, project, "smr_amd.amdExports", "smr_amd.get");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    for (int i = 0; i < SMR_LANGS; i++) {
+        if (callers[i] != 1 || remote[i] != 0 || builtin[i] != 0 || literal[i] != 1 ||
+            self_recv[i] != 1) {
+            printf("  %s: callers=%d remote=%d builtin=%d literal=%d self=%d\n", langs[i].path,
+                   callers[i], remote[i], builtin[i], literal[i], self_recv[i]);
+        }
+    }
+    for (int i = 0; i < SMR_LANGS; i++) {
+        ASSERT_EQ(callers[i], 1);   /* the negatives below are not vacuous */
+        ASSERT_EQ(remote[i], 0);    /* axios.get(): ES-imported receiver, no edge */
+        ASSERT_EQ(builtin[i], 0);   /* console.log(): builtin global, no edge */
+        ASSERT_EQ(literal[i], 1);   /* context.push(): object-literal method, kept */
+        ASSERT_EQ(self_recv[i], 1); /* this.get(): kept */
+    }
+    ASSERT_EQ(cjs_callers, 1);
+    ASSERT_EQ(cjs, 0);         /* db.getObject(): CommonJS require receiver, no edge */
+    ASSERT_EQ(cjs_exports, 1); /* exports.getObject(): this module, kept */
+    ASSERT_EQ(amd_callers, 1);
+    ASSERT_EQ(amd, 0);         /* api.get(): AMD dependency receiver, no edge */
+    ASSERT_EQ(amd_exports, 1); /* exports.get(): the AMD `exports` pseudo-dependency, kept */
+    PASS();
+}
+
+TEST(pipeline_tsjs_same_module_bound_receiver_not_bound) {
+    return check_same_module_bound_receiver(false);
+}
+
+TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel) {
+    return check_same_module_bound_receiver(true);
+}
+
 /* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
  * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
  * match before the service classification runs — it suppresses ONLY the plain
@@ -34051,6 +34269,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
+    RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound);
+    RUN_TEST(pipeline_tsjs_same_module_bound_receiver_not_bound_parallel);
     RUN_TEST(pipeline_python_class_body_calls_sequential);
     RUN_TEST(pipeline_python_class_body_calls_parallel);
     RUN_TEST(pipeline_python_init_scope_sequential);

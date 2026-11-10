@@ -1118,6 +1118,160 @@ static bool js_ts_family(CBMLanguage lang) {
            lang == CBM_LANG_ARKTS;
 }
 
+/* ── Same-module bound-receiver guard (#1128) ─────────────────────────────
+ * Strategy 2 (same_module) looks a callee up in its own module twice: first the
+ * whole callee (`Api.get` -> <module>.Api.get), then the name after the first
+ * separator (`axios.get` -> <module>.get). The second lookup drops the
+ * receiver, so a member call binds a module-level definition only because this
+ * file happens to define one with the member's name: `axios.get(url)` in a file
+ * with its own `function get()` became a 0.90 CALLS edge to that function. The
+ * weak-member guard above deliberately keeps same_module, so this class needs a
+ * guard of its own.
+ *
+ * Refusing every non-self receiver is wrong for this family: methods of an
+ * object literal (`const context = { push() {} }`) and functions assigned onto
+ * an object (`Translator.create = function create() {}`) are stored as plain
+ * module-level functions, so `context.push()` reaching the module's `push`
+ * through this lookup is usually right (2026-10-19 measurement on vuejs/core
+ * and NodeBB). So the binding is refused only when the caller's own source
+ * says the receiver is something else:
+ *   - an import of this file: an ES `import` (default, namespace or named) or a
+ *     CommonJS `const x = require(...)`, read from the file's import list;
+ *   - an AMD dependency: a parameter of the factory passed to
+ *     `define([...], function (dep) {...})` or `require([...], ...)`. AMD
+ *     dependencies are not imports (they mint no IMPORTS edges), so the
+ *     extractor's walk decides it per call (CBMCall.receiver_is_amd_dependency);
+ *   - a builtin global of the JS runtime (`console.log`, `Math.max`,
+ *     `JSON.parse`, `Object.keys`, `process.exit`, ...).
+ * Only the receiver-dropping lookup is refused. When the whole callee matched
+ * (`search.init()` -> <scope>.search.init: in NodeBB's chats.js that is the
+ * AMD dependency's own module) the receiver is part of what matched. A local
+ * name an import statement only synthesizes from its path (side-effect import,
+ * re-export, `require('x').y`) binds nothing and does not count.
+ * Self receivers (`this`/`super`) never reach it: the extractor leaves those
+ * calls unflagged (is_method false). CommonJS `exports.get()` and
+ * `module.exports.get()` name this module and are in neither list.
+ *
+ * It is a call-site suppressor, not a change to the strategy chain: the chain
+ * also resolves type references, field types, reads/writes, SQL lineage and
+ * the cross-LSP pass, for every language at once. Like the guards above it only
+ * marks the plain-CALLS fall-through for dropping, so service and route edges
+ * are unchanged. The language list lives here and both call sites read it
+ * through this helper, so pass_calls.c and pass_parallel.c cannot drift: the
+ * JS/TS family plus the hosts whose <script> bodies are JS/TS (the weak-member
+ * guard's set without Python). Go must never join: its receiver methods carry
+ * flat QNs that only this lookup reaches. */
+static bool same_module_receiver_guard_lang(CBMLanguage lang) {
+    return js_ts_family(lang) || lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
+           lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+}
+
+/* Builtin globals of the JS runtime (ECMAScript, browser, Node/CommonJS). Like
+ * PERL_BUILTINS a fact about the language, not about corpus fashion. MUST stay
+ * sorted ASCII-ascending for bsearch. */
+static const char *const JS_BUILTIN_GLOBALS[] = {
+    "Array",    "ArrayBuffer",    "Atomics",     "BigInt",
+    "Boolean",  "Buffer",         "DataView",    "Date",
+    "Error",    "Intl",           "JSON",        "Map",
+    "Math",     "Number",         "Object",      "Promise",
+    "Proxy",    "Reflect",        "RegExp",      "Set",
+    "String",   "Symbol",         "URL",         "WeakMap",
+    "WeakSet",  "WebAssembly",    "console",     "document",
+    "global",   "globalThis",     "history",     "localStorage",
+    "location", "navigator",      "performance", "process",
+    "require",  "sessionStorage", "window",
+};
+
+/* Identifier bytes: ASCII letters, digits, `_`, `$`, and every byte of a
+ * multi-byte UTF-8 sequence (a non-ASCII identifier is still one name). */
+enum { JS_FIRST_NON_ASCII_BYTE = 0x80 };
+
+static bool js_identifier_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '$' || c >= JS_FIRST_NON_ASCII_BYTE;
+}
+
+/* Length of the identifier that roots `callee` when a member access (`.` or
+ * `?.`) follows it, else 0: `axios.get` -> 5, `a.b.c` -> 1, `_store().get` ->
+ * 0 (a call result is not a binding). The registry splits the callee at this
+ * same first separator. */
+static size_t js_receiver_root_len(const char *callee) {
+    size_t n = 0;
+    while (js_identifier_byte((unsigned char)callee[n])) {
+        n++;
+    }
+    if (n == 0 || (callee[0] >= '0' && callee[0] <= '9')) {
+        return 0;
+    }
+    if (callee[n] == '.' || (callee[n] == '?' && callee[n + SKIP_ONE] == '.')) {
+        return n;
+    }
+    return 0;
+}
+
+static bool js_builtin_global(const char *root, size_t len) {
+    char key[CBM_SZ_32];
+    if (len >= sizeof(key)) {
+        return false; /* longer than every table entry */
+    }
+    memcpy(key, root, len);
+    key[len] = '\0';
+    return bsearch(key, JS_BUILTIN_GLOBALS,
+                   sizeof(JS_BUILTIN_GLOBALS) / sizeof(JS_BUILTIN_GLOBALS[0]),
+                   sizeof(JS_BUILTIN_GLOBALS[0]), python_builtin_member_cmp) != NULL;
+}
+
+/* Per-file scan: imports.count is a file-local number, never the corpus, so
+ * this stays O(file) per call (the Python receiver check does the same). A
+ * synthesized local (side-effect import, re-export, `require('x').y`) is the
+ * path's last segment, not a name the file binds: `require('node:stream')`
+ * must not make every `stream` parameter read as the stream module. */
+static bool receiver_bound_by_import(const CBMImportArray *imports, const char *root, size_t len) {
+    if (!imports) {
+        return false;
+    }
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (imp->local_name && !imp->local_name_synthesized &&
+            strncmp(imp->local_name, root, len) == 0 && imp->local_name[len] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when the same_module hit kept the receiver: the whole-callee lookup
+ * matched `<scope>.search.init` for `search.init()`, so the receiver is part of
+ * what matched, not dropped. That lookup is never this guard's business. */
+static bool same_module_hit_kept_receiver(const char *callee_name, const char *resolved_qn) {
+    size_t clen = strlen(callee_name);
+    size_t qlen = strlen(resolved_qn);
+    return qlen > clen && resolved_qn[qlen - clen - SKIP_ONE] == '.' &&
+           strcmp(resolved_qn + (qlen - clen), callee_name) == 0;
+}
+
+bool cbm_suppress_same_module_bound_receiver(CBMLanguage lang, bool is_method,
+                                             const char *callee_name, const char *resolved_qn,
+                                             const char *strategy,
+                                             const CBMImportArray *file_imports,
+                                             bool receiver_is_amd_dependency) {
+    if (!same_module_receiver_guard_lang(lang) || !is_method) {
+        return false;
+    }
+    if (!strategy || strcmp(strategy, "same_module") != 0) {
+        return false;
+    }
+    if (!callee_name || !resolved_qn || same_module_hit_kept_receiver(callee_name, resolved_qn)) {
+        return false;
+    }
+    size_t len = js_receiver_root_len(callee_name);
+    if (len == 0) {
+        return false; /* no identifier receiver: `_store().get`, a bare call */
+    }
+    return receiver_is_amd_dependency || js_builtin_global(callee_name, len) ||
+           receiver_bound_by_import(file_imports, callee_name, len);
+}
+
 /* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
  * in the extension table, so a .c file referencing a symbol declared in its
  * own header would otherwise read as a language boundary. */
