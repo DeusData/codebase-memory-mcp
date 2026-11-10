@@ -1752,12 +1752,13 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
 
 /* True when the first segment of the dotted chain `dotted` is one of C#'s
  * built-in type keywords (int, string, bool, ...; nint and nuint since C# 9).
- * Closed list: these words are grammar, not a naming heuristic. */
+ * Closed list: these words are grammar, not a naming heuristic. `dynamic` is
+ * not on it: the type has no static members, so `dynamic.X` is a variable
+ * named `dynamic` and stays an ordinary lower-case value root. */
 static bool cs_type_keyword_root(const char *dotted) {
     static const char *const keywords[] = {
-        "bool",   "byte", "char",  "decimal", "double", "dynamic", "float",
-        "int",    "long", "nint",  "nuint",   "object", "sbyte",   "short",
-        "string", "uint", "ulong", "ushort",  "void",
+        "bool",  "byte",   "char",  "decimal", "double", "float", "int",   "long",   "nint",
+        "nuint", "object", "sbyte", "short",   "string", "uint",  "ulong", "ushort", "void",
     };
     const char *dot = strchr(dotted, '.');
     size_t len = dot ? (size_t)(dot - dotted) : strlen(dotted);

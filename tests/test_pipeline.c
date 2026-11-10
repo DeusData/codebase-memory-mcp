@@ -21694,6 +21694,25 @@ TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
     PASS();
 }
 
+/* `dynamic` is a contextual keyword in C#, not a reserved type keyword like
+ * `int`: in receiver position (`dynamic.Invoke(...)`) it is a variable that
+ * happens to be called `dynamic`, whose type the chain does not show. In a C#
+ * file it must stay an ordinary lower-case value root, like vm.load above, so
+ * the call still binds: the control that keeps the keyword list closed to
+ * words that can only name a type. */
+TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Invoke", "tmp.Handlers.Handler.Invoke", "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "dynamic.Invoke", "tmp.Demo", NULL,
+                                                        NULL, 0, CBM_LANG_CSHARP);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.Handlers.Handler.Invoke");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
 /* An unqualified callee has no chain at all and must pass through unchanged. */
 TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
@@ -27975,6 +27994,7 @@ SUITE(pipeline) {
     RUN_TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121);
     RUN_TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121);
     RUN_TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121);
+    RUN_TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121);
     RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
