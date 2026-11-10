@@ -31,6 +31,7 @@
  * wird im Browser beantwortet und navigator.sendBeacon bleibt in der Seite.
  */
 
+import { literalPattern } from './literal-pattern.mjs';
 import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -460,7 +461,7 @@ try {
 
     // Projektwechsel nach cbm: frischer Verlauf
     await page.locator('.atlas-shell details summary', { hasText: PROJECT }).first().click();
-    const entry = page.locator('.atlas-project-results button', { has: page.locator('.atlas-project-result-name', { hasText: new RegExp(`^${CONTROL}$`) }) }).first();
+    const entry = page.locator('.atlas-project-results button', { has: page.locator('.atlas-project-result-name', { hasText: literalPattern(CONTROL, { start: true, end: true }) }) }).first();
     await entry.waitFor({ timeout: 20000 });
     await entry.click();
     const fresh = { position: '1/1', back: { disabled: true, title: 'Nothing to go back to yet' }, forward: { disabled: true, title: 'Nothing to go forward to' }, recent: [] };

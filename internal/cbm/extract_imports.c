@@ -13,7 +13,6 @@
 
 /* Local constants for magic number elimination. */
 enum {
-    USE_PREFIX_LEN = 4, /* strlen("use ") */
     MIN_WOLFRAM_CHILDREN = 2,
     /* Nested `#if` branches followed while collecting C includes. */
     C_INCLUDE_NEST_LIMIT = 64,
@@ -1742,10 +1741,36 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     if (!found) {
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        /* A side-effect import (`import './polyfills'`) binds no name. */
+        CBMImport imp = {
+            .local_name = path_last(a, path), .module_path = path, .local_name_synthesized = true};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
     return true;
+}
+
+/* The identifier a require call is bound to when no declarator holds the call
+ * itself: a lazy assignment `winston = require('winston')`, or a declarator
+ * over one member `const dns = require('dns').promises`. NULL otherwise. */
+static const char *commonjs_require_bound_name(CBMExtractCtx *ctx, TSNode parent) {
+    if (ts_node_is_null(parent)) {
+        return NULL;
+    }
+    TSNode name = {0};
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "assignment_expression") == 0) {
+        name = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+    } else if (strcmp(kind, "member_expression") == 0) {
+        TSNode declarator = ts_node_parent(parent);
+        if (!ts_node_is_null(declarator) &&
+            strcmp(ts_node_type(declarator), "variable_declarator") == 0) {
+            name = ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+        }
+    }
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0) {
+        return NULL;
+    }
+    return cbm_node_text(ctx->arena, name, ctx->source);
 }
 
 /* Handle CommonJS `require("path")` call_expression nodes.  The local name
@@ -1805,11 +1830,19 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
             local_name = cbm_node_text(a, name_node, ctx->source);
         }
     }
-    if (!local_name) {
+    /* No declarator binds the module (`require('x').y`, a destructuring, a
+     * lazy assignment or a bare side-effect require): the path's last segment
+     * stands in. It is still a real binding when the statement binds exactly
+     * that name (#1128). */
+    bool synthesized = local_name == NULL;
+    if (synthesized) {
         local_name = path_last(a, path);
+        const char *bound = commonjs_require_bound_name(ctx, parent);
+        synthesized = !(bound && local_name && strcmp(bound, local_name) == 0);
     }
 
-    CBMImport imp = {.local_name = local_name, .module_path = path};
+    CBMImport imp = {
+        .local_name = local_name, .module_path = path, .local_name_synthesized = synthesized};
     cbm_imports_push(&ctx->result->imports, a, imp);
     return true;
 }
@@ -1836,8 +1869,10 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
             if (!ts_node_is_null(src)) {
                 char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
                 if (path && path[0]) {
+                    /* A re-export binds no local name in this file. */
                     CBMImport imp = {.local_name = path_last(ctx->arena, path),
-                                     .module_path = path};
+                                     .module_path = path,
+                                     .local_name_synthesized = true};
                     cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
                 }
             }
@@ -1897,9 +1932,134 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 // --- Rust imports ---
 // use_declaration -> use_list or scoped_use_list
 
-static void parse_rust_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
+static TSNode rust_import_field(TSNode node, const char *field) {
+    return ts_node_child_by_field_name(node, field, (uint32_t)strlen(field));
+}
 
+static char *rust_import_node_text_compact(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node)) {
+        return NULL;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (end <= start) {
+        return cbm_arena_strdup(a, "");
+    }
+    char *out = (char *)cbm_arena_alloc(a, (size_t)(end - start) + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (uint32_t i = start; i < end; i++) {
+        if (!isspace((unsigned char)source[i])) {
+            out[w++] = source[i];
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
+static char *rust_import_join(CBMArena *a, const char *prefix, const char *suffix) {
+    if (!prefix || !prefix[0]) {
+        return cbm_arena_strdup(a, suffix ? suffix : "");
+    }
+    if (!suffix || !suffix[0]) {
+        return cbm_arena_strdup(a, prefix);
+    }
+    return cbm_arena_sprintf(a, "%s::%s", prefix, suffix);
+}
+
+static bool rust_import_exists(const CBMImportArray *imports, const char *local,
+                               const char *module_path) {
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local) == 0 &&
+            strcmp(imp->module_path, module_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rust_import_push(CBMExtractCtx *ctx, const char *full, const char *alias) {
+    static const char self_suffix[] = "::self";
+    CBMArena *a = ctx->arena;
+    if (!full || !full[0]) {
+        return;
+    }
+
+    const char *module_path = full;
+    size_t len = strlen(full);
+    size_t self_len = sizeof(self_suffix) - SKIP_ONE;
+    if (len > self_len && strcmp(full + len - self_len, self_suffix) == 0) {
+        module_path = cbm_arena_strndup(a, full, len - self_len);
+    }
+
+    const char *local = alias && alias[0] ? alias : path_last(a, module_path);
+    if (!local || !local[0]) {
+        return;
+    }
+    bool keyword =
+        strcmp(local, "crate") == 0 || strcmp(local, "super") == 0 || strcmp(local, "self") == 0;
+    if (keyword && (!alias || !alias[0])) {
+        return;
+    }
+    if (rust_import_exists(&ctx->result->imports, local, module_path)) {
+        return;
+    }
+
+    CBMImport imp = {.local_name = local, .module_path = module_path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+}
+
+static void rust_import_walk(CBMExtractCtx *ctx, TSNode node, const char *prefix) {
+    if (ts_node_is_null(node)) {
+        return;
+    }
+
+    CBMArena *a = ctx->arena;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "use_list") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            rust_import_walk(ctx, ts_node_named_child(node, i), prefix);
+        }
+        return;
+    }
+    if (strcmp(kind, "scoped_use_list") == 0) {
+        char *path = rust_import_node_text_compact(a, rust_import_field(node, "path"), ctx->source);
+        char *next_prefix = rust_import_join(a, prefix, path);
+        rust_import_walk(ctx, rust_import_field(node, "list"), next_prefix);
+        return;
+    }
+    if (strcmp(kind, "use_as_clause") == 0) {
+        char *path = rust_import_node_text_compact(a, rust_import_field(node, "path"), ctx->source);
+        char *alias =
+            rust_import_node_text_compact(a, rust_import_field(node, "alias"), ctx->source);
+        char *full = rust_import_join(a, prefix, path);
+        rust_import_push(ctx, full, alias);
+        return;
+    }
+    if (strcmp(kind, "use_wildcard") == 0) {
+        TSNode inner =
+            ts_node_named_child_count(node) > 0 ? ts_node_named_child(node, 0) : (TSNode){0};
+        char *path = rust_import_node_text_compact(a, inner, ctx->source);
+        char *base = rust_import_join(a, prefix, path);
+        char *full =
+            base && base[0] ? cbm_arena_sprintf(a, "%s::*", base) : cbm_arena_strdup(a, "*");
+        rust_import_push(ctx, full, NULL);
+        return;
+    }
+    if (strcmp(kind, "line_comment") == 0 || strcmp(kind, "block_comment") == 0) {
+        return;
+    }
+
+    char *path = rust_import_node_text_compact(a, node, ctx->source);
+    char *full = rust_import_join(a, prefix, path);
+    rust_import_push(ctx, full, NULL);
+}
+
+static void parse_rust_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -1911,21 +2071,7 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
             continue;
         }
 
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
-            continue;
-        }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
-
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        rust_import_walk(ctx, rust_import_field(node, "argument"), "");
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -2293,6 +2439,18 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
             continue;
         }
 
+        if (ctx->language == CBM_LANG_SWIFT) {
+            /* Attributes and scoped import kinds precede the actual module path. */
+            TSNode identifier = cbm_find_child_by_kind(node, "identifier");
+            const char *path = ts_node_is_null(identifier)
+                                   ? NULL
+                                   : cbm_node_text(ctx->arena, identifier, ctx->source);
+            if (path && path[0]) {
+                CBMImport imp = {.local_name = path_last(ctx->arena, path), .module_path = path};
+                cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+            }
+            continue;
+        }
         if (!try_generic_path_fields(ctx, node)) {
             generic_import_from_text(ctx, node);
         }

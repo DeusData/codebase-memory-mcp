@@ -44,6 +44,11 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
     "tsx": "tree-sitter/tree-sitter-typescript",
+    # vbnet: tree-sitter-vbnet + CodeGraph's real-world VB.NET patch; same
+    # routing rule as arkts -- `LICENSE` is upstream's MIT verbatim and is the
+    # file byte-verified here (local_license() takes it before the sibling
+    # LICENSE-codegraph, whose provenance MANIFEST.md records by SHA-256).
+    "vbnet": "govindbanura/tree-sitter-vbnet",
 }
 SPECIAL_NOTICE = {
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",

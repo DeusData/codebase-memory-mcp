@@ -22,9 +22,28 @@ enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 
 /* CBM_WORKER_STACK_SIZE (8 MB per worker) lives in worker_pool.h. */
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static cbm_parallel_spawn_observer_fn g_spawn_observer;
+static void *g_spawn_observer_ctx;
+
+void cbm_parallel_test_set_spawn_observer(cbm_parallel_spawn_observer_fn observer, void *ctx) {
+    g_spawn_observer = observer;
+    g_spawn_observer_ctx = ctx;
+}
+
+static void observe_spawn(int count, int helpers) {
+    if (g_spawn_observer) {
+        g_spawn_observer(count, helpers, g_spawn_observer_ctx);
+    }
+}
+#else
+#define observe_spawn(count, helpers) ((void)0)
+#endif
+
 /* ── Serial fallback ─────────────────────────────────────────────── */
 
 static void run_serial(int count, cbm_parallel_fn fn, void *ctx) {
+    observe_spawn(count, 0);
     for (int i = 0; i < count; i++) {
         fn(i, ctx);
     }
@@ -103,6 +122,7 @@ static void run_pthreads_counted(int count, cbm_parallel_fn fn, void *ctx, int n
         }
         started++;
     }
+    observe_spawn(count, started);
     int main_done = 0;
     uint64_t main_ops_before = cbm_memev_thread_ops();
     while (WP_TRUE) {
@@ -164,6 +184,7 @@ static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int nworkers)
         }
     }
 
+    observe_spawn(count, nworkers);
     /* Main thread also participates */
     while (WP_TRUE) {
         int idx = atomic_fetch_add_explicit(&next_idx, WP_STEP, memory_order_relaxed);

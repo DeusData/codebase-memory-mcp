@@ -111,7 +111,7 @@ This project implements multiple layers of security verification. Every release 
 - **All dangerous function calls** require a reviewed entry in `scripts/security-allowlist.txt`
 - **Time-bomb pattern detection** — scans for `time()`/`sleep()` near dangerous calls (could indicate delayed activation)
 - **MCP tool handler file read audit** — tracks file read count in `mcp.c` against an expected maximum (detects added file reads that could exfiltrate data through tool responses)
-- **CodeQL SAST** — static application security testing on every push (taint analysis, CWE detection, data flow tracking). Any open alert blocks the release.
+- **CodeQL SAST** — static application security testing of the C/C++, JavaScript/TypeScript, Python and GitHub Actions code (taint analysis, CWE detection, data flow tracking): a full scan on every push to main, weekly, and in every dry run and release; a first-party scan of the languages a pull request changes, with alerts reported on its changed lines. Any open alert fails the run and blocks the release.
 - **Fuzz testing** — random/mutated inputs to MCP server and Cypher parser (60 seconds per build). Catches crashes, segfaults, and memory errors that structured tests miss.
 - **Native antivirus scanning** on every platform (any detection fails the build):
   - **Windows**: Windows Defender with ML heuristics — the same engine end users run

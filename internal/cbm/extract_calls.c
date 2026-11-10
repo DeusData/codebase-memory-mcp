@@ -427,10 +427,42 @@ static char *extract_wolfram_callee(CBMArena *a, TSNode node, const char *source
 
 // Language-specific callee extraction for FP and niche languages.
 // Swift callee extraction from call/constructor expressions.
+static TSNode swift_trailing_closure_inner(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "call_expression") != 0) {
+        return (TSNode){0};
+    }
+    TSNode inner = ts_node_named_child(node, 0);
+    if (ts_node_is_null(inner) || strcmp(ts_node_type(inner), "call_expression") != 0) {
+        return (TSNode){0};
+    }
+    TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+    if (ts_node_is_null(suffix) ||
+        !ts_node_is_null(cbm_find_child_by_kind(suffix, "value_arguments")) ||
+        (ts_node_is_null(cbm_find_child_by_kind(suffix, "lambda_literal")) &&
+         ts_node_is_null(cbm_find_child_by_kind(node, "lambda_literal")))) {
+        return (TSNode){0};
+    }
+    return inner;
+}
+
+static TSNode swift_call_base(TSNode node) {
+    TSNode inner = swift_trailing_closure_inner(node);
+    while (!ts_node_is_null(inner)) {
+        node = inner;
+        inner = swift_trailing_closure_inner(node);
+    }
+    return node;
+}
+
 static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "constructor_expression") != 0) {
         return NULL;
     }
+    TSNode wrapped = swift_trailing_closure_inner(ts_node_parent(node));
+    if (!ts_node_is_null(wrapped) && ts_node_eq(wrapped, node)) {
+        return NULL;
+    }
+    node = swift_call_base(node);
     if (ts_node_named_child_count(node) > 0) {
         TSNode callee = ts_node_named_child(node, 0);
         const char *ck = ts_node_type(callee);
@@ -718,6 +750,66 @@ static bool elixir_call_head_in(TSNode call, const char *source, const char *con
            call_node_text_in(ts_node_child(call, 0), source, heads);
 }
 
+/* A definition's head declares a name; it is never a call to it. The head under
+ * a guard is not the def's first argument -- `def f(x) when g` parses its whole
+ * head as a `when` binary_operator -- so the plain node comparison below stopped
+ * recognising it, and the inner `f(x)` was recorded as a call to `f`. Under the
+ * widened span that phantom lands inside the function's own node, and cbm.c
+ * decides self-recursion by line containment, so an ordinary two-clause guarded
+ * function reported itself recursive. `recursive` is a queryable node property
+ * and seeds the cycle detection in pass_complexity, so that is a load-bearing
+ * signal, not a cosmetic one. The suppression therefore travels with the fold
+ * rather than following it.
+ *
+ * The head comes from cbm_elixir_def_head_is (helpers.c) rather than a private
+ * peel here, because three files read this same node and all three have to
+ * agree on which node is the head, or a node one of them is treating as a
+ * definition name is recorded by another as a reference to that very name:
+ *   - extract_defs.c, extract_elixir_func_def, unwraps it to NAME the
+ *     definition. It and this file disagreeing mints the phantom above.
+ *   - extract_usages.c, is_elixir_def_binding, treats an identifier inside that
+ *     head as a binding occurrence rather than a reference, which is what keeps
+ *     a head suppressed here from re-emerging as a USAGE edge: a suppression in
+ *     one extractor of the unified walk only REMOVES a phantom if the others
+ *     also decline the node. The two files ask different questions of the same
+ *     helper -- this one whether the node IS the head or a `when` wrapper above
+ *     it, that one whether the node sits INSIDE the head -- so there is one
+ *     definition of the head and they cannot drift apart. That containment
+ *     stops at the head rather than covering the whole `when` operator, which
+ *     is deliberate in the other direction: only the parameters being BOUND are
+ *     excluded, and a parameter READ in the guard is a reference, exactly as
+ *     the same read in the body is.
+ *   - extract_unified.c, compute_elixir_func_qn, resolves a def's QN to open
+ *     the function's call scope and reads the head through the same helper.
+ *     Handed the `when` operator instead it returns NULL, no scope is pushed,
+ *     and every call in a guarded body is sourced from the File rather than
+ *     from the enclosing Function. That failure is independent of the two above
+ *     because it decides edge SOURCE, not edge existence.
+ *
+ * Suppressing the head does not only delete edges; it moves metadata on edges
+ * that SURVIVE, and that is worth stating because a caller reading an edge's
+ * `line` will see a different number than before. `edges` is UNIQUE on
+ * (source, target, type), so where the def-head phantom happened to be the
+ * dedup survivor for a pair, deleting it promotes some other row for that same
+ * pair and the surviving edge takes that row's `line`.
+ *
+ * Measured by indexing one 970-file Elixir lib tree with the binary built from
+ * this commit's parent and with this one, and diffing the `edges` rows out of
+ * the two SQLite stores keyed on (source QN, target QN, type): 2,436 edges go
+ * and NONE is added -- 2,104 CALLS and 332 USAGE. Of the 119,696 edges that
+ * survive, 1,054 record a different `line`.
+ *
+ * The typespec attributes -- `@spec f(t) :: u` and the @callback / @type family
+ * -- put the declared name in a `call` node too, and are deliberately NOT
+ * suppressed here. A def head can be, because extract_usages.c already treats a
+ * def's first argument as a binding. Nothing there treats a typespec subject as
+ * one, so declining it in this walk would not remove its phantom, it would
+ * RELABEL it: handle_usages reaches the bare identifier handle_calls just
+ * declined and mints a USAGE onto the same function, which under
+ * UNIQUE(source, target, type) is a separate row that no longer collides with
+ * the real call it used to hide behind, and which pass_importance then counts.
+ * A typespec phantom has to be removed before any extractor sees it, by
+ * skipping the whole subtree in the unified walk. */
 static bool elixir_call_is_definition_role(TSNode node, const char *source) {
     static const char *const structural_heads[] = {"def", "defp", "defmacro", "defmodule", NULL};
     static const char *const function_heads[] = {"def", "defp", "defmacro", NULL};
@@ -735,7 +827,7 @@ static bool elixir_call_is_definition_role(TSNode node, const char *source) {
         TSNode signature = ts_node_named_child_count(arguments) > 0
                                ? ts_node_named_child(arguments, 0)
                                : arguments;
-        return ts_node_eq(signature, node);
+        return cbm_elixir_def_head_is(signature, node);
     }
     return false;
 }
@@ -757,7 +849,23 @@ static bool call_node_is_definition_container(CBMLanguage lang, TSNode node, con
     if (lang == CBM_LANG_AGDA && strcmp(kind, "expr") == 0) {
         return agda_expr_is_definition_role(node);
     }
-    return lang == CBM_LANG_ELIXIR && strcmp(kind, "call") == 0 &&
+    /* A guarded head is a `when` binary_operator, not a `call`, and Elixir's
+     * call node types include binary_operator -- so the head reaches this walk
+     * and must be able to answer that it is a definition. A paren-less clause
+     * (`def f when g`) has no inner call at all, so the operator node itself
+     * reaches extract_callee_name and, with no callee of its own, takes that
+     * function's last resort -- the first identifier child -- minting a phantom
+     * CALLS edge onto the very function being defined.
+     *
+     * That last resort overrides a deliberate NULL for every Elixir
+     * binary_operator extract_scripting_callee declines (`=`, `<-`, `->`, `\\`,
+     * `::`, `when`), so `def g(c \\ 2)` still emits a phantom `c` and
+     * `e = target(d)` a phantom `e`. That is the pre-existing behaviour for
+     * those operators and is untouched here: only a `when` operator is
+     * admitted, so an operator definition's own head (`def a + b`) stays an
+     * ordinary node, as it was before guards were handled at all. */
+    return lang == CBM_LANG_ELIXIR &&
+           (strcmp(kind, "call") == 0 || cbm_elixir_is_when_guard(node)) &&
            elixir_call_is_definition_role(node, source);
 }
 
@@ -2249,11 +2357,15 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
     // method is `new`.  The constructor body lives in `initialize`, so a callee
     // of "new" never resolves.  Redirect to the receiver type name so the call
     // links to the class/constructor like every other language's `new T()`.
+    // Scope-resolved receivers (`Admin::User.new`) get the same treatment —
+    // the callee carries the full constant path ("Admin::User"), whose bare
+    // leaf ("User") is what resolution joins on.
     if (lang == CBM_LANG_RUBY) {
         TSNode m = ts_node_child_by_field_name(node, TS_FIELD("method"));
         TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
         if (!ts_node_is_null(m) && !ts_node_is_null(recv) &&
-            strcmp(ts_node_type(recv), "constant") == 0) {
+            (strcmp(ts_node_type(recv), "constant") == 0 ||
+             strcmp(ts_node_type(recv), "scope_resolution") == 0)) {
             char *mt = cbm_node_text(a, m, source);
             if (mt && strcmp(mt, "new") == 0) {
                 char *rt = cbm_node_text(a, recv, source);
@@ -2486,6 +2598,7 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
     }
 }
 
+static TSNode swift_argument_value(TSNode arg);
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node, bool url_context);
 
 /* Whether a call's callee is an HTTP client or a global fetch, which selects
@@ -2584,6 +2697,26 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
         }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
+
+        if (ctx->language == CBM_LANG_SWIFT && strcmp(ak, "value_argument") == 0) {
+            TSNode first = ts_node_named_child(arg_node, 0);
+            if (!ts_node_is_null(first) &&
+                strcmp(ts_node_type(first), "value_argument_label") == 0) {
+                TSNode label = ts_node_named_child(first, 0);
+                if (ts_node_is_null(label)) {
+                    label = first;
+                }
+                ca->keyword = cbm_node_text(ctx->arena, label, ctx->source);
+                if (ca->keyword) {
+                    size_t n = strlen(ca->keyword);
+                    if (n > 0 && ca->keyword[n - SKIP_ONE] == ':') {
+                        ca->keyword = cbm_arena_strndup(ctx->arena, ca->keyword, n - SKIP_ONE);
+                    }
+                }
+            }
+            arg_node = swift_argument_value(arg_node);
+            ak = ts_node_type(arg_node);
+        }
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
             process_keyword_arg(ctx, arg_node, ca);
@@ -3890,11 +4023,85 @@ static TSNode objectscript_call_args(TSNode node) {
  * instead. A trailing closure has a call_suffix with no value_arguments, which
  * returns a null node and leaves the call without a string argument, as before. */
 static TSNode swift_call_args(TSNode node) {
+    node = swift_call_base(node);
     TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
     if (ts_node_is_null(suffix)) {
         return (TSNode){0};
     }
     return cbm_find_child_by_kind(suffix, "value_arguments");
+}
+
+/* Store one bounded trailing-closure label; closure zero is unlabelled. */
+static void swift_store_trailing_label(CBMExtractCtx *ctx, CBMCall *call, uint32_t index,
+                                       const char *label, bool has_label) {
+    if (index == 0) {
+        call->has_trailing_closure = true;
+        return;
+    }
+    if (index >= CBM_MAX_TRAILING_CLOSURES) {
+        call->trailing_closure_truncated = true;
+        return;
+    }
+    if (!call->trailing_closure_labels) {
+        size_t bytes = CBM_MAX_TRAILING_CLOSURES * sizeof(char *);
+        call->trailing_closure_labels = cbm_arena_calloc(ctx->arena, bytes);
+    }
+    if (!call->trailing_closure_labels) {
+        call->trailing_closure_truncated = true;
+        return;
+    }
+    call->trailing_closure_labels[index] = label;
+    if (has_label && !label) {
+        call->trailing_closure_truncated = true;
+    }
+}
+
+/* Swift records trailing closures on the call_suffix: the hidden
+ * _fn_call_lambda_arguments rule inlines to
+ * `lambda_literal (simple_identifier ':')*`, so every closure literal, and the
+ * label that precedes all but the first, sit flat among the suffix's children
+ * (after an optional value_arguments). Each lambda_literal is a trailing
+ * closure; a simple_identifier directly before a closure is that closure's
+ * label. Closure 0 is always unlabelled. More closures than the bounded
+ * storage marks the call truncated so the overload matcher fails closed. */
+static void swift_capture_trailing_closures(CBMExtractCtx *ctx, TSNode call_node, TSNode suffix,
+                                            CBMCall *call) {
+    if (ts_node_has_error(call_node)) {
+        call->trailing_closure_truncated = true;
+    }
+    uint32_t children = ts_node_child_count(suffix) + ts_node_child_count(call_node);
+    uint32_t closures = 0;
+    const char *pending_label = NULL;
+    bool has_pending_label = false;
+    for (uint32_t i = 0; i < children; i++) {
+        uint32_t suffix_children = ts_node_child_count(suffix);
+        TSNode child = i < suffix_children ? ts_node_child(suffix, i)
+                                           : ts_node_child(call_node, i - suffix_children);
+        if (i >= suffix_children && ts_node_start_byte(child) < ts_node_end_byte(suffix)) {
+            continue;
+        }
+        const char *kind = ts_node_type(child);
+        if (ts_node_is_missing(child) || ts_node_has_error(child)) {
+            call->trailing_closure_truncated = true;
+        }
+        if (strcmp(kind, "lambda_literal") == 0) {
+            swift_store_trailing_label(ctx, call, closures, pending_label, has_pending_label);
+            closures++;
+            pending_label = NULL;
+            has_pending_label = false;
+        } else if (strcmp(kind, "simple_identifier") == 0) {
+            if (has_pending_label) {
+                call->trailing_closure_truncated = true;
+            }
+            pending_label = cbm_node_text(ctx->arena, child, ctx->source);
+            has_pending_label = true;
+        }
+    }
+    if (has_pending_label) {
+        call->trailing_closure_truncated = true;
+    }
+    call->trailing_closure_count =
+        (uint8_t)(closures > CBM_MAX_TRAILING_CLOSURES ? CBM_MAX_TRAILING_CLOSURES : closures);
 }
 
 static bool node_has_token(TSNode node, const char *token) {
@@ -4278,6 +4485,70 @@ static TSNode language_specific_callee_leaf(CBMLanguage language, TSNode expr,
     return terminal_callee_leaf(ctx, expr);
 }
 
+/* `Base.init` for a `super.init(...)` call: Base is the first entry of the
+ * enclosing class's inheritance clause, where Swift requires the superclass to
+ * stand. The class node is carried by the walk, so no ancestor climb. NULL (no
+ * call) outside a class, without a clause, or when the entry does not read as
+ * a plain type name -- a lower-case or attributed root would pass the
+ * registry's receiver-chain check and bind by short name, which is the false
+ * edge this exists to prevent. */
+static const char *swift_superclass_init_callee(CBMExtractCtx *ctx, const WalkState *state) {
+    TSNode cls = state ? state->enclosing_class_node : (TSNode){0};
+    if (ts_node_is_null(cls) || strcmp(ts_node_type(cls), "class_declaration") != 0) {
+        return NULL;
+    }
+    TSNode spec = cbm_find_child_by_kind(cls, "inheritance_specifier");
+    char *base = ts_node_is_null(spec) ? NULL : cbm_node_text(ctx->arena, spec, ctx->source);
+    if (!base || base[0] < 'A' || base[0] > 'Z') {
+        return NULL;
+    }
+    size_t len = strcspn(base, "<"); /* Base<T> names Base */
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)base[i]) && base[i] != '_' && base[i] != '.') {
+            return NULL;
+        }
+    }
+    base[len] = '\0';
+    return cbm_arena_sprintf(ctx->arena, "%s.init", base);
+}
+
+/* True for a Swift initializer callee `T.init` (T non-empty). */
+static bool swift_callee_is_initializer(const char *callee) {
+    static const char suffix[] = ".init";
+    size_t n = callee ? strlen(callee) : 0;
+    return n > sizeof(suffix) - SKIP_ONE &&
+           strcmp(callee + n - (sizeof(suffix) - SKIP_ONE), suffix) == 0;
+}
+
+/* Swift initializer delegation (#2379). `super.init(...)` and `self.init(...)`
+ * name no type, and a lower-case receiver passes the registry's receiver-chain
+ * check, so a short-name match binds them to whichever project `init` is
+ * nearest: a nested type's, a sibling type's, or the caller's own. On
+ * Alamofire all 8 such edges were false.
+ *
+ * `super.init` is rewritten to name the superclass (`Base.init`), so the
+ * qualified strategies place it on the project's Base.init. When Base is not
+ * in the project (UIViewController, NSObject) nothing places it, and the
+ * initializer guard in handle_calls keeps a short-name guess from doing so.
+ *
+ * `self.init` delegates to another initializer of the caller's own type.
+ * Keep #2395's no-edge policy until overload-aware delegation is addressed
+ * separately; the delegated initializer can live outside the project
+ * (`extension Notification { init(...) { self.init(...) } }` calls Foundation's). */
+static const char *resolve_swift_delegating_init(CBMExtractCtx *ctx, const WalkState *state,
+                                                 const char *callee) {
+    if (ctx->language != CBM_LANG_SWIFT || !callee) {
+        return callee;
+    }
+    if (strcmp(callee, "self.init") == 0) {
+        return NULL;
+    }
+    if (strcmp(callee, "super.init") == 0) {
+        return swift_superclass_init_callee(ctx, state);
+    }
+    return callee;
+}
+
 // Produce the textual callee and the AST occurrence from one operation. The
 // generic fallback retains the former field/terminal behavior, while grammars
 // whose extractor uses a sibling, a special field, or a synthetic literal are
@@ -4288,6 +4559,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     CBMPrimaryCalleeSelection selection = {0};
     selection.name = extract_callee_name(ctx->arena, node, ctx->source, ctx->language);
     selection.name = resolve_objectscript_callee(ctx, node, state, selection.name);
+    selection.name = resolve_swift_delegating_init(ctx, state, selection.name);
     if (!selection.name || !selection.name[0]) {
         return selection;
     }
@@ -4299,7 +4571,8 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
         return selection;
     }
 
-    selection.expr = language_specific_callee_expr(ctx->language, node);
+    TSNode callee_node = ctx->language == CBM_LANG_SWIFT ? swift_call_base(node) : node;
+    selection.expr = language_specific_callee_expr(ctx->language, callee_node);
     selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};
@@ -4418,6 +4691,16 @@ static CBMInvocationDescriptor describe_emitted_primary_call(
     return descriptor;
 }
 
+/* #1128: the node that roots a JS/TS member receiver (`a` in `a.b.c()`). The
+ * walk is over this one callee's own member chain, so it stays linear in the
+ * file; a chain rooted in a call result stops at that call. */
+static TSNode js_receiver_root(TSNode obj) {
+    while (!ts_node_is_null(obj) && strcmp(ts_node_type(obj), "member_expression") == 0) {
+        obj = ts_node_child_by_field_name(obj, TS_FIELD("object"));
+    }
+    return obj;
+}
+
 CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                      WalkState *state) {
     CBMInvocationDescriptor invocation = {0};
@@ -4489,6 +4772,8 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         const char *ok = ts_node_type(obj);
                         if (strcmp(ok, "this") != 0 && strcmp(ok, "super") != 0) {
                             call.is_method = true;
+                            call.receiver_is_amd_dependency =
+                                cbm_walk_amd_dependency_binds(ctx, state, js_receiver_root(obj));
                         }
                     }
                 }
@@ -4510,6 +4795,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     strcmp(ts_node_type(gofn), "selector_expression") == 0) {
                     call.is_method = true;
                 }
+            }
+            // Swift initializer guard (#2379; same direction). Flag `T.init(...)`,
+            // as written or as a rewritten super.init. Nearly every type has an
+            // `init`, so a short-name match onto one is a guess: with a project
+            // module imported, `UIViewController.init` bound an unrelated
+            // project initializer. The registry's qualified / same-module /
+            // import strategies still place T.init when T is a project type.
+            // No other Swift call carries the flag.
+            if (ctx->language == CBM_LANG_SWIFT && swift_callee_is_initializer(call.callee_name)) {
+                call.is_method = true;
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
@@ -4537,6 +4832,23 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             if (ts_node_is_null(args) && ctx->language == CBM_LANG_SWIFT) {
                 args = swift_call_args(node);
             }
+            if (ctx->language == CBM_LANG_SWIFT) {
+                TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+                if (!ts_node_is_null(suffix)) {
+                    swift_capture_trailing_closures(ctx, node, suffix, &call);
+                }
+                uint32_t value_arg_count = 0;
+                if (!ts_node_is_null(args)) {
+                    uint32_t named_count = ts_node_named_child_count(args);
+                    for (uint32_t ai = 0; ai < named_count; ai++) {
+                        TSNode arg = ts_node_named_child(args, ai);
+                        value_arg_count += strcmp(ts_node_type(arg), "value_argument") == 0;
+                    }
+                }
+                if (value_arg_count > CBM_MAX_CALL_ARGS) {
+                    call.args_truncated = true;
+                }
+            }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);
                 /* #1146: a Laravel registration's slashless URI ('users', '')
@@ -4553,8 +4865,14 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 call.first_string_arg = route_path_with_group_prefix(ctx, node, call.callee_name,
                                                                      call.first_string_arg);
                 /* A slashless registration's string action would only be
-                 * guessed at (#1146): mint its Route without a handler. */
-                if (call.first_string_arg && call.first_string_arg[0] == '/' &&
+                 * guessed at (#1146): mint its Route without a handler. A Go
+                 * ServeMux pattern names its method or host before the slash
+                 * ("POST /v1/x", #2537) and keeps its handler. */
+                if (call.first_string_arg &&
+                    (call.first_string_arg[0] == '/' ||
+                     (ctx->language == CBM_LANG_GO &&
+                      cbm_service_pattern_mux_route_path(call.callee_name, call.first_string_arg) !=
+                          NULL)) &&
                     !(laravel_uri && php_route_action_is_string(node))) {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }

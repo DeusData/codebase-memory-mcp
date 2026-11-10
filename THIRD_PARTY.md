@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+163 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -60,8 +60,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Ten further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`) are
+- Eleven further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`, `vbnet`) are
   self-maintained forks that retain their original upstream authors' licenses —
   see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -79,7 +79,29 @@ License summary:
   ([Isopod/tree-sitter-pascal](https://github.com/Isopod/tree-sitter-pascal),
   MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
   DeusData patch that accepts non-ASCII letters in identifiers; its grammar
-  source lives in `tools/tree-sitter-pascal/`.
+  source lives in `tools/tree-sitter-pascal/`. `vbnet` is described in its own
+  section below.
+
+### tree-sitter-vbnet (with CodeGraph's real-world VB.NET patch)
+
+- **Project:** [govindbanura/tree-sitter-vbnet](https://github.com/govindbanura/tree-sitter-vbnet)
+- **License:** MIT
+- **Copyright:** (c) 2025 Govind Banura
+- **Patch:** `docs/grammars/tree-sitter-vbnet.patch` from
+  [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)
+  (CodeGraph), MIT, (c) 2026 Colby Mchenry. The patch rewrites much of the
+  grammar and adds the external scanner (`scanner.c`), so CodeGraph's license
+  text ships next to the code as `LICENSE-codegraph`.
+- **Vendored at:** `internal/cbm/vendored/grammars/vbnet/`
+- **Pinned commits:** grammar `538b7087bf80` (v0.1-beta); patch `fe7542b6f6a4`
+- **Notes:** Visual Basic .NET grammar, maintained here as a self-maintained
+  fork: the grammar source, the verbatim patch and the regeneration recipe live
+  in `tools/tree-sitter-vbnet/`, and the parser is generated in this repository
+  with tree-sitter-cli 0.25.10 (upstream checks in no generated sources). One
+  local patch of ours, (c) 2026 DeusData, makes the scanner stop at text that
+  cannot be XML (`tools/tree-sitter-vbnet/patches/xml-literal-tag-syntax.patch`).
+  The grammar is vendored ahead of VB.NET extraction (#1179); provenance hashes
+  are in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ### tree-sitter-plsql
 
@@ -121,10 +143,12 @@ License summary:
 | wyhash | `internal/cbm/vendored/wyhash/` | Unlicense (public domain) | [wangyi-fudan/wyhash](https://github.com/wangyi-fudan/wyhash) |
 
 Local modifications to these libraries are documented next to the
-vendored sources (currently only SQLite: `vendored/sqlite3/PATCHES.md`,
-raising the Unix VFS `MAX_PATHNAME` ceiling from 512 to 4096 to match
-CBM's 4 KiB path support). Patches must be reapplied on every upstream
-refresh and are covered by `scripts/vendored-checksums.txt`.
+vendored sources: `vendored/sqlite3/PATCHES.md` (raising the Unix VFS
+`MAX_PATHNAME` ceiling from 512 to 4096 to match CBM's 4 KiB path support)
+and `vendored/mimalloc/PATCHES.md` (the upstream source pin, mimalloc v3.5.3
+at commit `d4881d33`, plus the macOS decommit-recommit change and one comment
+rewording). Patches must be reapplied on every upstream refresh and are
+covered by `scripts/vendored-checksums.txt`.
 
 The graph-UI HTTP server is a first-party implementation
 (`src/ui/httpd.c` + `src/ui/http_server.c`) — no third-party HTTP library

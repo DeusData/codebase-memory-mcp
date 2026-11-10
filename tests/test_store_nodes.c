@@ -2603,6 +2603,178 @@ TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
     PASS();
 }
 
+/* Copy store_meta's shadow fingerprint for `project` into `out` ("" if absent). */
+static void coverage_shadow_fp(cbm_store_t *s, const char *project, char *out, size_t cap) {
+    out[0] = '\0';
+    char key[256];
+    snprintf(key, sizeof(key), "coverage_shadow_fp:%s", project);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT v FROM store_meta WHERE k = ?1;", -1, &stmt,
+                           NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0)) {
+        snprintf(out, cap, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* #2265: unresolved_calls rows describe files that WERE indexed, so they stay
+ * out of the "<project>::missed" graph like by-design not_indexed_* rows:
+ * (a) a project whose only rows are unresolved_calls gets no shadow graph,
+ * (b) a file with parse_partial AND unresolved_calls keeps its parse_partial
+ *     File node (the later unresolved_calls row used to replace it), and
+ * (c) the shadow fingerprint ignores unresolved_calls rows, so the skip gate
+ *     and store_meta match a project without them. */
+TEST(store_coverage_shadow_excludes_unresolved_calls) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *only = "cov-unres-only";
+    const char *mixed = "cov-unres-mixed";
+    const char *plain = "cov-unres-plain";
+    ASSERT_EQ(cbm_store_upsert_project(s, only, "/tmp/cov-unres-only"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, mixed, "/tmp/cov-unres-mixed"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, plain, "/tmp/cov-unres-plain"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, only, "src/a.go", "", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, only, "src/b.go", "", 2, 2), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, mixed, "src/both.go", "", 3, 3), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, mixed, "lib/calls.go", "", 4, 4), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, plain, "src/both.go", "", 3, 3), CBM_STORE_OK);
+
+    /* (a) Only unresolved_calls (plus a by-design row): no shadow project. */
+    cbm_coverage_row_t only_rows[] = {
+        {.rel_path = "src/a.go", .kind = "unresolved_calls", .detail = "[{\"candidate\":\"a.f\"}]"},
+        {.rel_path = "src/b.go", .kind = "unresolved_calls", .detail = "[{\"candidate\":\"b.g\"}]"},
+        {.rel_path = "vendor", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, only, only_rows, 3), CBM_STORE_OK);
+    cbm_coverage_row_t *got = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, only, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 3); /* the table keeps the evidence; only the view skips it */
+    cbm_store_free_coverage(got, n);
+    ASSERT_EQ(cbm_store_count_nodes(s, "cov-unres-only::missed"), 0);
+    cbm_project_t shadow = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "cov-unres-only::missed", &shadow), CBM_STORE_NOT_FOUND);
+    cbm_project_free_fields(&shadow);
+
+    /* (b) parse_partial + unresolved_calls on one path, and a second file
+     * with unresolved_calls only: the shadow holds exactly the parse_partial
+     * File node under src/. */
+    cbm_coverage_row_t mixed_rows[] = {
+        {.rel_path = "src/both.go", .kind = "parse_partial", .detail = "3-4"},
+        {.rel_path = "src/both.go",
+         .kind = "unresolved_calls",
+         .detail = "[{\"candidate\":\"both.h\"}]"},
+        {.rel_path = "lib/calls.go",
+         .kind = "unresolved_calls",
+         .detail = "[{\"candidate\":\"calls.k\"}]"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, mixed, mixed_rows, 3), CBM_STORE_OK);
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "cov-unres-mixed::missed", "File", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].file_path, "src/both.go");
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"kind\":\"parse_partial\""));
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"detail\":\"3-4\""));
+    ASSERT_NULL(strstr(nodes[0].properties_json, "unresolved_calls"));
+    cbm_store_free_nodes(nodes, nc);
+    nodes = NULL;
+    nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "cov-unres-mixed::missed", "Folder", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].name, "src");
+    cbm_store_free_nodes(nodes, nc);
+
+    /* (c) Same failure rows without the unresolved_calls evidence: the stored
+     * fingerprints match. */
+    cbm_coverage_row_t plain_row = {
+        .rel_path = "src/both.go", .kind = "parse_partial", .detail = "3-4"};
+    ASSERT_EQ(cbm_store_coverage_replace(s, plain, &plain_row, 1), CBM_STORE_OK);
+    char fp_mixed[128];
+    char fp_plain[128];
+    coverage_shadow_fp(s, mixed, fp_mixed, sizeof(fp_mixed));
+    coverage_shadow_fp(s, plain, fp_plain, sizeof(fp_plain));
+    ASSERT_TRUE(fp_plain[0] != '\0');
+    ASSERT_STR_EQ(fp_mixed, fp_plain);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-sha", "/tmp/coverage-sha"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-sha", "keep.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t row = {.rel_path = "keep.c", .kind = "parse_partial", .detail = "1-2"};
+
+    /* NULL indexed_checkout_sha (non-git run) persists as NULL and reads back
+     * as no identity. */
+    cbm_coverage_meta_t no_sha_meta = {
+        .generation = "gen-0",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &no_sha_meta),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_NULL(got.indexed_checkout_sha);
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Round-trip: git-run identity persists and can be overwritten by the next
+     * staged generation. */
+    cbm_coverage_meta_t sha_meta = no_sha_meta;
+    sha_meta.generation = "gen-1";
+    sha_meta.indexed_checkout_sha = "0123456789abcdef0123456789abcdef01234567";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &sha_meta),
+              CBM_STORE_OK);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "0123456789abcdef0123456789abcdef01234567");
+    ASSERT_STR_EQ(got.generation, "gen-1");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_coverage_meta_t new_meta = sha_meta;
+    new_meta.generation = "gen-2";
+    new_meta.indexed_checkout_sha = "abcdef0123456789abcdef0123456789abcdef01";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &new_meta),
+              CBM_STORE_OK);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Rollback: a failed replace must retain the prior identity + generation. */
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TRIGGER fail_sha_missed_insert BEFORE INSERT ON nodes "
+                                "WHEN NEW.project = 'coverage-sha::missed' "
+                                "BEGIN SELECT RAISE(ABORT, 'forced sha shadow failure'); END;"),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t failed_meta = new_meta;
+    failed_meta.generation = "gen-must-not-commit";
+    failed_meta.indexed_checkout_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    cbm_coverage_row_t failed_row = row;
+    failed_row.detail = "changed-to-force-shadow-rebuild";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &failed_row, 1, &failed_meta),
+              CBM_STORE_ERR);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_qn_suffix_is_literal);
     RUN_TEST(store_qn_suffix_is_unbounded);
@@ -2612,6 +2784,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(store_coverage_shadow_excludes_unresolved_calls);
+    RUN_TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);
