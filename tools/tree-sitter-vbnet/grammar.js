@@ -17,10 +17,10 @@
  *     docs/grammars/tree-sitter-vbnet.patch -> patches/tree-sitter-vbnet.patch
  *     (byte-identical, git blob 37918d81ed4e325b9f2c6cb5da2d7b9cc376a01d)
  *   This file = this 41-line header + upstream grammar.js with that patch
- *   applied; the patch also creates src/scanner.c. Verify:
- *     tail -n +42 grammar.js | git hash-object --stdin
- *   gives c9c1d85f91ae567ed24dc0eb6c1accdcd5b7d0f9, the patch's own post-image
- *   blob (pre-image 21c8523 is upstream's grammar.js at the pin).
+ *   applied (`tail -n +42 grammar.js | git hash-object --stdin` gives
+ *   c9c1d85f91ae567ed24dc0eb6c1accdcd5b7d0f9, the patch's post-image; its
+ *   pre-image 21c8523 is upstream's grammar.js at the pin). The patch also
+ *   creates src/scanner.c, which then takes patches/xml-literal-tag-syntax.patch.
  *
  * Why the patch: upstream parses textbook VB.NET but not the constructs real
  * code is made of. Unpatched, the Single literals every WinForms .Designer.vb

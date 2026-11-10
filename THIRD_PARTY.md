@@ -97,9 +97,11 @@ License summary:
 - **Notes:** Visual Basic .NET grammar, maintained here as a self-maintained
   fork: the grammar source, the verbatim patch and the regeneration recipe live
   in `tools/tree-sitter-vbnet/`, and the parser is generated in this repository
-  with tree-sitter-cli 0.25.10 (upstream checks in no generated sources). The
-  grammar is vendored ahead of VB.NET extraction (#1179); provenance hashes are
-  in `internal/cbm/vendored/grammars/MANIFEST.md`.
+  with tree-sitter-cli 0.25.10 (upstream checks in no generated sources). One
+  local patch of ours, (c) 2026 DeusData, makes the scanner stop at text that
+  cannot be XML (`tools/tree-sitter-vbnet/patches/xml-literal-tag-syntax.patch`).
+  The grammar is vendored ahead of VB.NET extraction (#1179); provenance hashes
+  are in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ### tree-sitter-plsql
 
