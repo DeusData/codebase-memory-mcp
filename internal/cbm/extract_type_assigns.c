@@ -303,7 +303,13 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
             .enclosing_func_qn = scope,
             /* No annotation: the type is the one the initializer call constructs. */
             .constructed = type_name && initializer_call && ts_node_is_null(type),
+            .decl_end_byte = ts_node_end_byte(node),
         };
+        /* A parameter's block is its function; a local's is its statements. */
+        TSNode block = ts_node_parent(node);
+        if (!ts_node_is_null(block)) {
+            assignment.scope_end_byte = ts_node_end_byte(block);
+        }
         if (initializer_call) {
             assignment.value_start_byte = ts_node_start_byte(value);
             assignment.value_end_byte = ts_node_end_byte(value);

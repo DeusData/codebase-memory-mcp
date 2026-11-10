@@ -18296,6 +18296,62 @@ TEST(pipeline_swift_constructor_receiver_keeps_label_match_issue2061) {
     return swift_call_pairs_case(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
 }
 
+/* #2436 follow-up: a block-local binding names the variable only where it is
+ * in scope. The inner `semaphore`, whose type is not inferred, ends with its
+ * block, so the outer call is typed by the outer annotation and gets no label
+ * match to Decoy.wait(). `var request = try request.asRequest()` (Alamofire's
+ * encoders) reads the parameter on its right and the new variable after it,
+ * whose call keeps its label match. Sibling blocks each type their own
+ * `store`, so neither call reaches the Decoy. */
+TEST(pipeline_swift_in_scope_binding_issue2436) {
+    const char *files[] = {
+        "Types.swift",
+        "class Decoy {\n"
+        "    func wait() {}\n"
+        "    func write(count: Int) {}\n"
+        "    func read(count: Int) {}\n"
+        "}\n"
+        "func identity<T>(_ value: T) -> T { value }\n"
+        "protocol RequestConvertible { func asRequest() throws -> Request }\n"
+        "struct Request { func validate(code: Int) {} }\n"
+        "class Store { func write(count: Int) {} }\n"
+        "class Reader { func read(count: Int) {} }\n",
+        "Calls.swift",
+        "import Foundation\n"
+        "func declaredShadow(_ flag: Bool) {\n"
+        "    let semaphore: DispatchSemaphore = DispatchSemaphore(value: 0)\n"
+        "    if flag {\n"
+        "        let semaphore = identity(DispatchSemaphore(value: 0))\n"
+        "        semaphore.signal()\n"
+        "    }\n"
+        "    semaphore.wait()\n"
+        "}\n"
+        "func encode(_ request: any RequestConvertible) throws -> Request {\n"
+        "    var request = try request.asRequest()\n"
+        "    request.validate(code: 1)\n"
+        "    return request\n"
+        "}\n"
+        "func siblings(_ flag: Bool) {\n"
+        "    if flag {\n"
+        "        let store = Store()\n"
+        "        store.write(count: 1)\n"
+        "    } else {\n"
+        "        let store = Reader()\n"
+        "        store.read(count: 2)\n"
+        "    }\n"
+        "}\n",
+    };
+    const swift_call_pair_t pairs[] = {
+        {"Calls.declaredShadow(_:Bool)", "Types.Decoy.wait()", 0},
+        {"Calls.encode(_:any RequestConvertible)=>Request", "Types.Request.validate(code:Int)", 1},
+        {"Calls.siblings(_:Bool)", "Types.Store.write(count:Int)", 1},
+        {"Calls.siblings(_:Bool)", "Types.Reader.read(count:Int)", 1},
+        {"Calls.siblings(_:Bool)", "Types.Decoy.write(count:Int)", 0},
+        {"Calls.siblings(_:Bool)", "Types.Decoy.read(count:Int)", 0},
+    };
+    return swift_call_pairs_case(files, 2, pairs, (int)(sizeof(pairs) / sizeof(pairs[0])));
+}
+
 TEST(pipeline_swift_return_identity_issue2061) {
     const char *returns[] = {"pick()=>Int", "pick()=>String"};
     return swift_declaration_identity_case(
@@ -34432,6 +34488,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_generic_return_keeps_label_match_issue2061);
     RUN_TEST(pipeline_swift_try_initializer_types_receiver_issue2061);
     RUN_TEST(pipeline_swift_constructor_receiver_keeps_label_match_issue2061);
+    RUN_TEST(pipeline_swift_in_scope_binding_issue2436);
     RUN_TEST(pipeline_swift_default_before_required_candidates_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_unresolved_issue2061);
     RUN_TEST(pipeline_swift_incompatible_overload_parallel_fallback_issue2061);
