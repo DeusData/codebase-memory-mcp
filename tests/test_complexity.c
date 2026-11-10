@@ -1375,6 +1375,72 @@ TEST(complexity_rescript_error_recovery_lexing_is_linear) {
     PASS();
 }
 
+/* ── Attribute lines in the VB.NET XML-literal scanner ───────────────────
+ * The vendored vbnet grammar (not yet routed to any file) lexes a whole VB
+ * XML literal as one external token, and its scanner is offered a '<' where a
+ * declaration or member starts. In valid VB that '<' opens an attribute block
+ * (`<Serializable()> _`), never an XML literal, but the scanner read
+ * `<Serializable` as an element start and searched the rest of the file for a
+ * closing tag before giving up: O(rest of file) per attribute, O(n^2) per
+ * file, and generated proxies put an attribute on every member. A
+ * well-formed XML tag cannot contain '(' outside a quoted value, so the scan
+ * now fails there. Work is bytes pulled through the chunked TSInput above. */
+extern const TSLanguage *tree_sitter_vbnet(void);
+
+enum { CX_VB_ATTR_COPIES = 200 };
+
+static const char CX_VB_ATTR_CLASS[] = "<Serializable()> _\n"
+                                       "Public Class Item\n"
+                                       "    <System.Runtime.Serialization.DataMember()> _\n"
+                                       "    Public Property Id As Integer\n"
+                                       "    <Obsolete(\"use Id\")> _\n"
+                                       "    Public Function Key(x As Integer) As Integer\n"
+                                       "        Return x\n"
+                                       "    End Function\n"
+                                       "End Class\n"
+                                       "\n";
+
+/* Bytes pulled while parsing `copies` copies of CX_VB_ATTR_CLASS; 0 on failure
+ * or when the tree has an ERROR node (the work must be a clean parse's). */
+static uint64_t cx_vbnet_attr_lex_work(uint32_t copies) {
+    size_t unit = sizeof(CX_VB_ATTR_CLASS) - 1;
+    uint32_t len = (uint32_t)(unit * copies);
+    char *src = malloc(len);
+    TSParser *parser = ts_parser_new();
+    uint64_t work = 0;
+    if (src && parser && ts_parser_set_language(parser, tree_sitter_vbnet())) {
+        for (uint32_t i = 0; i < copies; i++) {
+            memcpy(src + (size_t)i * unit, CX_VB_ATTR_CLASS, unit);
+        }
+        CxLexInput in = {src, len, 0};
+        TSInput input = {&in, cx_lex_read, TSInputEncodingUTF8, NULL};
+        TSTree *tree = ts_parser_parse(parser, NULL, input);
+        if (tree) {
+            if (!ts_node_has_error(ts_tree_root_node(tree))) {
+                work = in.bytes_pulled;
+            }
+            ts_tree_delete(tree);
+        }
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    free(src);
+    return work;
+}
+
+TEST(complexity_vbnet_attribute_lexing_is_linear) {
+    uint64_t base = cx_vbnet_attr_lex_work(CX_VB_ATTR_COPIES);
+    uint64_t doubled = cx_vbnet_attr_lex_work(2 * CX_VB_ATTR_COPIES);
+    double r = cx_ratio((double)doubled, (double)base);
+    printf("    vbnet attributes: lexer bytes %llu -> %llu  ratio %.2f (linear ~2, quadratic ~4)\n",
+           (unsigned long long)base, (unsigned long long)doubled, r);
+    /* Non-vacuous: a clean parse that read the input at least once. */
+    ASSERT_GTE(base, (uint64_t)(sizeof(CX_VB_ATTR_CLASS) - 1) * CX_VB_ATTR_COPIES);
+    ASSERT_TRUE(r >= CX_RATIO_LO && r <= CX_RATIO_HI);
+    PASS();
+}
+
 TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work) {
     static const char *const keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
     char *saved[2] = {NULL, NULL};
@@ -1438,6 +1504,7 @@ TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work) {
 SUITE(complexity) {
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
+    RUN_TEST(complexity_vbnet_attribute_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
     RUN_TEST(complexity_infra_resolution_is_linear);
