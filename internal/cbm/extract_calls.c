@@ -4418,6 +4418,16 @@ static CBMInvocationDescriptor describe_emitted_primary_call(
     return descriptor;
 }
 
+/* #1128: the node that roots a JS/TS member receiver (`a` in `a.b.c()`). The
+ * walk is over this one callee's own member chain, so it stays linear in the
+ * file; a chain rooted in a call result stops at that call. */
+static TSNode js_receiver_root(TSNode obj) {
+    while (!ts_node_is_null(obj) && strcmp(ts_node_type(obj), "member_expression") == 0) {
+        obj = ts_node_child_by_field_name(obj, TS_FIELD("object"));
+    }
+    return obj;
+}
+
 CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                      WalkState *state) {
     CBMInvocationDescriptor invocation = {0};
@@ -4489,6 +4499,8 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         const char *ok = ts_node_type(obj);
                         if (strcmp(ok, "this") != 0 && strcmp(ok, "super") != 0) {
                             call.is_method = true;
+                            call.receiver_is_amd_dependency =
+                                cbm_walk_amd_dependency_binds(ctx, state, js_receiver_root(obj));
                         }
                     }
                 }

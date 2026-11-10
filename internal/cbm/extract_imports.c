@@ -941,10 +941,36 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     if (!found) {
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        /* A side-effect import (`import './polyfills'`) binds no name. */
+        CBMImport imp = {
+            .local_name = path_last(a, path), .module_path = path, .local_name_synthesized = true};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
     return true;
+}
+
+/* The identifier a require call is bound to when no declarator holds the call
+ * itself: a lazy assignment `winston = require('winston')`, or a declarator
+ * over one member `const dns = require('dns').promises`. NULL otherwise. */
+static const char *commonjs_require_bound_name(CBMExtractCtx *ctx, TSNode parent) {
+    if (ts_node_is_null(parent)) {
+        return NULL;
+    }
+    TSNode name = {0};
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "assignment_expression") == 0) {
+        name = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+    } else if (strcmp(kind, "member_expression") == 0) {
+        TSNode declarator = ts_node_parent(parent);
+        if (!ts_node_is_null(declarator) &&
+            strcmp(ts_node_type(declarator), "variable_declarator") == 0) {
+            name = ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+        }
+    }
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0) {
+        return NULL;
+    }
+    return cbm_node_text(ctx->arena, name, ctx->source);
 }
 
 /* Handle CommonJS `require("path")` call_expression nodes.  The local name
@@ -1004,11 +1030,19 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
             local_name = cbm_node_text(a, name_node, ctx->source);
         }
     }
-    if (!local_name) {
+    /* No declarator binds the module (`require('x').y`, a destructuring, a
+     * lazy assignment or a bare side-effect require): the path's last segment
+     * stands in. It is still a real binding when the statement binds exactly
+     * that name (#1128). */
+    bool synthesized = local_name == NULL;
+    if (synthesized) {
         local_name = path_last(a, path);
+        const char *bound = commonjs_require_bound_name(ctx, parent);
+        synthesized = !(bound && local_name && strcmp(bound, local_name) == 0);
     }
 
-    CBMImport imp = {.local_name = local_name, .module_path = path};
+    CBMImport imp = {
+        .local_name = local_name, .module_path = path, .local_name_synthesized = synthesized};
     cbm_imports_push(&ctx->result->imports, a, imp);
     return true;
 }
@@ -1035,8 +1069,10 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
             if (!ts_node_is_null(src)) {
                 char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
                 if (path && path[0]) {
+                    /* A re-export binds no local name in this file. */
                     CBMImport imp = {.local_name = path_last(ctx->arena, path),
-                                     .module_path = path};
+                                     .module_path = path,
+                                     .local_name_synthesized = true};
                     cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
                 }
             }
