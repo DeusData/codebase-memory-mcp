@@ -25,6 +25,8 @@ class McpServer:
         self._id = 0
         self.proc = None
         self._stderr = []
+        self._stderr_thread = None
+        self._stderr_eof = False
         env = dict(os.environ)
         if cache_dir:
             env["CBM_CACHE_DIR"] = cache_dir  # isolate the graph DB location
@@ -52,11 +54,26 @@ class McpServer:
         try:
             for line in self.proc.stderr:
                 self._stderr.append(line.decode("utf-8", "replace"))
+            self._stderr_eof = True
         except Exception:
             pass
 
     def stderr_text(self):
         return "".join(self._stderr)
+
+    def stderr_complete(self, timeout):
+        """Wait for the stderr reader to reach EOF; True once it has.
+
+        Only then is stderr_text() the whole capture. False means the reader
+        is still running (some process still holds the pipe) or stopped on a
+        read error, so the text may be partial: a caller that asserts on
+        stderr must treat False as a setup failure, never as a verdict. The
+        timeout is a liveness backstop, not part of any verdict.
+        """
+        if self._stderr_thread is None:
+            return False
+        self._stderr_thread.join(timeout)
+        return not self._stderr_thread.is_alive() and self._stderr_eof
 
     def _send(self, obj):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -148,6 +165,7 @@ class McpServer:
                 self.proc.kill()
             except Exception:
                 pass
+        self._stderr_thread.join(timeout=10)
 
 
 def wait_projects_with_stats(server, timeout=90.0, poll=1.0):
