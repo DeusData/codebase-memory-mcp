@@ -12,6 +12,8 @@ that guard the daemon's PRODUCT contract under stress and misuse:
   with the SAME pid (no second daemon, no restart); ``daemon status`` reports
   the active pid; a ``--port=N`` pointing at an occupied port must not block
   the start (the UI bind is retried in the background by design).
+* ``daemon start --port=N`` while another process holds ``_config.db``'s
+  write lock waits for the daemon's UI save instead of failing the handshake.
 * ``daemon stop`` REFUSES while an MCP session is attached, lists the blocking
   client, and succeeds once the session closes.
 * Crash recovery: after a kill -9 the stale daemon state must clear, a cold
@@ -49,6 +51,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -247,6 +250,97 @@ def section_start_status_port(binary, work):
         kill_pid(daemon_pid)
 
 
+def daemon_log_contains(cache, needle):
+    try:
+        with open(os.path.join(cache, "logs", "cbm-daemon.log"), "rb") as handle:
+            return needle in handle.read()
+    except OSError:
+        return False
+
+
+def section_start_port_waits_for_settings_writer(binary, work):
+    """`daemon start --port` while another process holds _config.db's write lock.
+
+    section_start_status_port went red on CI runners: the client gave the UI
+    handshake a 1 s reply budget while the daemon was still committing the UI
+    configuration. Holding the lock makes that slow save a state the test can
+    ask for. The holder is released on EVENTS: when the client exits (it gave
+    up under the lock), or WRITER_HOLD_S after the daemon LOGGED that it waits
+    for the writer. WRITER_HOLD_S outlasts the old 1 s budget and stays inside
+    the daemon's 3 s bound for a wedged holder.
+    """
+    writer_hold_s = 1.5
+    cache = section_dirs(work, "writer")
+    daemon_pid = 0
+    holder = None
+    client = None
+    try:
+        warm = run_cli(binary, cache, ["daemon", "start"], timeout=60)
+        if warm.returncode != 0 or not pid_from(out_text(warm)):
+            raise SetupFailure("permanent daemon did not start to create _config.db "
+                               "(rc=%s):\n%s" % (warm.returncode, out_text(warm)))
+        stop = run_cli(binary, cache, ["daemon", "stop"])
+        if stop.returncode != 0 or not wait_status_not_running(binary, cache, 45):
+            print("RED: the warm-up daemon did not stop cleanly")
+            return False
+        holder = sqlite3.connect(os.path.join(cache, "_config.db"), isolation_level=None,
+                                 timeout=0)
+        holder.execute("BEGIN IMMEDIATE")
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        client = subprocess.Popen([binary, "daemon", "start", "--port=%d" % port],
+                                  env=cli_env(cache), stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        waited_at = None
+        deadline = time.monotonic() + 90
+        while client.poll() is None and time.monotonic() < deadline:
+            now = time.monotonic()
+            if waited_at is None and daemon_log_contains(cache, b"config_db.busy_wait"):
+                waited_at = now
+            if waited_at is not None and now - waited_at >= writer_hold_s:
+                break
+            time.sleep(0.05)
+        exited_under_lock = client.poll() is not None
+        # Release by CLOSING the holder: the OS drops a handle's locks when it
+        # closes, so the release cannot be refused. On Windows a COMMIT of this
+        # change-free transaction returned plain SQLITE_BUSY (code 5, no journal,
+        # client still waiting) while the daemon retried the lock: 3 of 5 full
+        # guard runs, on the test's own connection, never on the product's side.
+        holder.close()
+        holder = None
+        output, _ = client.communicate(timeout=90)
+        text = output.decode("utf-8", "replace")
+        daemon_pid = pid_from(text)
+        if exited_under_lock or client.returncode != 0 or "permanent" not in text:
+            print("RED: `daemon start --port` must wait for a settings writer, not give up "
+                  "on the UI handshake (exited_under_lock=%s rc=%s daemon_waited=%s):\n%s"
+                  % (exited_under_lock, client.returncode, waited_at is not None,
+                     excerpt(text)))
+            return False
+        stop = run_cli(binary, cache, ["daemon", "stop"])
+        if stop.returncode != 0 or not wait_status_not_running(binary, cache, 45):
+            print("RED: the daemon did not stop cleanly after the held-writer start")
+            return False
+        daemon_pid = 0
+        client = None
+        print("PASS: `daemon start --port` waits out a held settings writer and starts")
+        return True
+    finally:
+        if holder is not None:
+            holder.close()
+        if client is not None:
+            if client.poll() is None:
+                client.kill()
+                client.wait()
+            # The client may have started a daemon whose pid was never read (a
+            # failure before its output); a survivor locked the guard root's
+            # binary and failed the next run's residue cleanup.
+            run_cli(binary, cache, ["daemon", "stop"], timeout=60)
+        kill_pid(daemon_pid)
+
+
 def section_stop_refuses_busy(binary, work):
     cache = section_dirs(work, "busy")
     daemon_pid = 0
@@ -328,8 +422,13 @@ def section_crash_recovery(binary, work):
                                "(rc=%s):\n%s" % (start.returncode, out_text(start)))
         kill_pid(daemon_pid)
         if not wait_status_not_running(binary, cache, 60):
-            print("RED: after kill -9 of pid %d the stale daemon state never cleared "
-                  "(`daemon status` kept reporting it)" % daemon_pid)
+            # Print what status said: a hot settings journal left by the kill
+            # made every command fail with "could not load saved runtime
+            # settings", which a bare "kept reporting it" hid.
+            last = run_cli(binary, cache, ["daemon", "status"], timeout=30)
+            print("RED: after kill -9 of pid %d the stale daemon state never cleared; "
+                  "last `daemon status` rc=%s:\n%s"
+                  % (daemon_pid, last.returncode, excerpt(out_text(last))))
             return False
         cold = run_cli(binary, cache, ["cli", "list_projects", "{}"], timeout=90)
         if cold.returncode != 0 or "daemon start" in out_text(cold):
@@ -421,6 +520,125 @@ def section_churn_stability(binary, work):
         kill_pid(daemon_pid)
 
 
+def section_local_cleanup_waits_for_startup_gate(binary, work):
+    """A live startup owner must not turn completed local work into failure."""
+    if os.name != "nt":
+        print("SKIP: local teardown reacquires the startup gate only on Windows")
+        return True
+    import msvcrt
+
+    cache = section_dirs(work, "cleanup-contention")
+    env = cli_env(cache)
+    env["CBM_LOG_LEVEL"] = "info"
+    env["CBM_LOG_FORMAT"] = "text"
+    warm = subprocess.run([binary, "cli", "list_projects"], capture_output=True,
+                          timeout=90, env=env)
+    if warm.returncode != 0:
+        raise SetupFailure("could not initialize the private runtime:\n" + out_text(warm))
+    gates = []
+    for parent, _, files in os.walk(runtime_for(cache)):
+        if "cbm-startup-v2.lock" in files:
+            gates.append(os.path.join(parent, "cbm-startup-v2.lock"))
+    if len(gates) != 1:
+        raise SetupFailure("expected one private startup gate, got %r" % gates)
+
+    repo = os.path.join(work, "cleanup-repo")
+    os.makedirs(repo)
+    for index in range(200):
+        with open(os.path.join(repo, "unit_%d.py" % index), "w") as handle:
+            handle.write("".join("def function_%d_%d():\n    return %d\n"
+                                 % (index, item, item) for item in range(100)))
+    err_path = os.path.join(work, "cleanup-contention.stderr")
+    process = None
+    locked = False
+    traces = {}
+
+    def read_trace():
+        # The daemon supervises indexing in a worker. Worker progress goes to
+        # its own durable log; the outer CLI only reports the final response.
+        paths = [err_path]
+        log_dir = os.path.join(cache, "logs")
+        if os.path.isdir(log_dir):
+            paths.extend(os.path.join(log_dir, name) for name in os.listdir(log_dir)
+                         if name.startswith(".worker-log-"))
+        for path in paths:
+            try:
+                with open(path, "rb") as handle:
+                    traces[path] = handle.read()
+            except FileNotFoundError:
+                pass  # The supervisor removes a successful worker's log.
+        return b"\n".join(traces.values())
+
+    with open(gates[0], "r+b") as gate, open(err_path, "wb") as errors:
+        try:
+            process = subprocess.Popen(
+                [binary, "cli", "index_repository", "--progress"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=env)
+            process.stdin.write(json.dumps({"repo_path": repo, "mode": "fast"}).encode())
+            process.stdin.close()
+            process.stdin = None
+            deadline = time.monotonic() + 120
+            # Extraction is after begin_work released startup-v2. Observe that
+            # event before acquiring the real one-byte native startup lock.
+            while time.monotonic() < deadline:
+                trace = read_trace()
+                if b"msg=parallel.extract" in trace or b"msg=pass.definitions" in trace:
+                    gate.seek(0)
+                    try:
+                        msvcrt.locking(gate.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        time.sleep(0.01)
+                        continue
+                    locked = True
+                    break
+                if process.poll() is not None:
+                    raise SetupFailure("index exited before the gate collision:\n" +
+                                       excerpt(trace))
+                time.sleep(0.01)
+            if not locked:
+                raise SetupFailure("index never entered local work:\n" + excerpt(trace))
+            while time.monotonic() < deadline:
+                trace = read_trace()
+                if b"Completed index_repository (" in trace:
+                    break
+                if process.poll() is not None:
+                    print("RED: index exited while a live peer held startup-v2:\n" +
+                          excerpt(trace))
+                    return False
+                time.sleep(0.01)
+            else:
+                raise SetupFailure("CLI did not finish its work:\n" + excerpt(trace))
+            # The outer CLI flushes this completion message after receiving
+            # the worker result and closing its daemon session, immediately
+            # before local cleanup. pipeline.done is too early: worker result
+            # handling can outlast a short lock hold. Keep the gate for longer
+            # than the old 500 ms cleanup deadline after this real boundary.
+            time.sleep(1)
+            stayed_alive = process.poll() is None
+            gate.seek(0)
+            msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
+            locked = False
+            stdout, _ = process.communicate(timeout=30)
+            trace = read_trace()
+            if not stayed_alive or process.returncode != 0 or b"cleanup_timeout" in trace:
+                print("RED: completed work must wait out startup contention and exit 0 "
+                      "after release (rc=%s):\n%s" %
+                      (process.returncode, excerpt(stdout + trace)))
+                return False
+            print("PASS: completed local work waited for the live startup owner and exited 0")
+            return True
+        finally:
+            if locked:
+                gate.seek(0)
+                msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
+            if process is not None and process.poll() is None:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                               capture_output=True, timeout=30)
+                process.wait(timeout=30)
+            status = run_cli(binary, cache, ["daemon", "status"], timeout=30)
+            kill_pid(pid_from(out_text(status)))
+
+
 def section_cold_storm(binary, work):
     cache = section_dirs(work, "storm")
     results = _parallel_one_shots(binary, cache, 6)
@@ -455,9 +673,11 @@ def main():
         section_params,
         section_hook_fail_open,
         section_start_status_port,
+        section_start_port_waits_for_settings_writer,
         section_stop_refuses_busy,
         section_crash_recovery,
         section_churn_stability,
+        section_local_cleanup_waits_for_startup_gate,
         section_cold_storm,
     ]
     failed = []

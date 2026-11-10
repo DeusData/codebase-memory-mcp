@@ -8,6 +8,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include "cbm.h"     /* CBM_MACRO_QN_SUFFIX — the fence the FTS feed strips */
 #include "sqlite3.h" /* vendored/sqlite3 — raw nodes_fts MATCH probes */
 #include <stdint.h>
 #include <stdio.h>
@@ -620,6 +621,56 @@ TEST(store_schema_info) {
     PASS();
 }
 
+/* Label and edge-type counts: count DESC, tied counts in BINARY name order —
+ * the order the GROUP BY scan produced and the distinct-value walk keeps.
+ * Another project's rows must not be counted. */
+TEST(store_schema_counts_ties_in_name_order) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_project(s, "other", "/tmp/other");
+    static const char *const labels[] = {"gamma", "Delta", "alpha", "Zeta",  "Beta",
+                                         "Delta", "Zeta",  "Alpha", "gamma", "Delta"};
+    enum { NODE_COUNT = 10, LABEL_GROUPS = 6, TYPE_GROUPS = 4, EDGE_COUNT = 8 };
+    int64_t ids[NODE_COUNT];
+    for (int i = 0; i < NODE_COUNT; i++) {
+        char qn[32];
+        snprintf(qn, sizeof(qn), "test.n%d", i);
+        cbm_node_t n = {.project = "test", .label = labels[i], .name = qn, .qualified_name = qn};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_TRUE(ids[i] > 0);
+        snprintf(qn, sizeof(qn), "other.n%d", i);
+        cbm_node_t o = {.project = "other", .label = "Alpha", .name = qn, .qualified_name = qn};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &o) > 0);
+    }
+    static const char *const types[] = {"USAGE", "DEFINES", "CALLS",   "IMPORTS",
+                                        "CALLS", "DEFINES", "USAGE", "DEFINES"};
+    for (int i = 0; i < EDGE_COUNT; i++) {
+        cbm_edge_t e = {
+            .project = "test", .source_id = ids[i], .target_id = ids[i + 1], .type = types[i]};
+        ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    }
+    cbm_schema_info_t schema = {0};
+    ASSERT_EQ(cbm_store_get_schema_counts(s, "test", &schema), CBM_STORE_OK);
+    static const char *const want_labels[] = {"Delta", "Zeta", "gamma", "Alpha", "Beta", "alpha"};
+    static const int want_label_counts[] = {3, 2, 2, 1, 1, 1};
+    ASSERT_EQ(schema.node_label_count, LABEL_GROUPS);
+    for (int i = 0; i < LABEL_GROUPS; i++) {
+        ASSERT_STR_EQ(schema.node_labels[i].label, want_labels[i]);
+        ASSERT_EQ(schema.node_labels[i].count, want_label_counts[i]);
+    }
+    static const char *const want_types[] = {"DEFINES", "CALLS", "USAGE", "IMPORTS"};
+    static const int want_type_counts[] = {3, 2, 2, 1};
+    ASSERT_EQ(schema.edge_type_count, TYPE_GROUPS);
+    for (int i = 0; i < TYPE_GROUPS; i++) {
+        ASSERT_STR_EQ(schema.edge_types[i].type, want_types[i]);
+        ASSERT_EQ(schema.edge_types[i].count, want_type_counts[i]);
+    }
+    cbm_store_schema_free(&schema);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Search with exclude_labels ─────────────────────────────────── */
 
 TEST(store_search_exclude_labels) {
@@ -854,6 +905,173 @@ TEST(store_search_case_insensitive) {
     ASSERT_EQ(out2.count, 0);
     cbm_store_search_free(&out2);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Anchored name patterns: the idx_nodes_name range path ─────── */
+
+TEST(store_regex_anchored_prefix) {
+    char out[64];
+    ASSERT_EQ(cbm_regex_anchored_prefix("^schedule$", out, sizeof(out)), 8);
+    ASSERT_STR_EQ(out, "schedule");
+    ASSERT_EQ(cbm_regex_anchored_prefix("^kmalloc", out, sizeof(out)), 7);
+    ASSERT_STR_EQ(out, "kmalloc");
+    ASSERT_EQ(cbm_regex_anchored_prefix("^get_", out, sizeof(out)), 4);
+    ASSERT_STR_EQ(out, "get_");
+    ASSERT_EQ(cbm_regex_anchored_prefix("^o'neil", out, sizeof(out)), 6);
+    ASSERT_STR_EQ(out, "o'neil");
+    /* The run stops at the first operator; the prefix before it holds. */
+    ASSERT_EQ(cbm_regex_anchored_prefix("^foo.bar", out, sizeof(out)), 3);
+    ASSERT_STR_EQ(out, "foo");
+    ASSERT_EQ(cbm_regex_anchored_prefix("^foo[0-9]", out, sizeof(out)), 3);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^foo(bar)?", out, sizeof(out)), 3);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^foo$", out, sizeof(out)), 3);
+    /* A quantifier or escape after the run drops its last character. */
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abc*", out, sizeof(out)), 2);
+    ASSERT_STR_EQ(out, "ab");
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abc?", out, sizeof(out)), 2);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abc+?", out, sizeof(out)), 2);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abc{0,1}", out, sizeof(out)), 2);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abc\\.d", out, sizeof(out)), 2);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^a*", out, sizeof(out)), 0);
+    /* No provable prefix: unanchored, alternation, leading operator,
+     * non-ASCII. */
+    ASSERT_EQ(cbm_regex_anchored_prefix("schedule", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix(".*schedule", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^foo|bar", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^(foo|bar)x", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^(foo)", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^[Ff]oo", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^.foo", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^\\x", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^\xc3\xbc"
+                                        "ber",
+                                        out, sizeof(out)),
+              0);
+    ASSERT_EQ(cbm_regex_anchored_prefix("^ab\xc3\xbc", out, sizeof(out)), 2);
+    ASSERT_EQ(cbm_regex_anchored_prefix("(?i)^foo", out, sizeof(out)), 0);
+    ASSERT_EQ(cbm_regex_anchored_prefix(NULL, out, sizeof(out)), 0);
+    /* Bounded by the buffer; a quantifier right after the cut still drops. */
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abcdef", out, 4), 3);
+    ASSERT_STR_EQ(out, "abc");
+    ASSERT_EQ(cbm_regex_anchored_prefix("^abc*", out, 4), 2);
+    PASS();
+}
+
+/* Statements a search ran with the name-range predicate (SQLITE_TRACE_STMT). */
+static int anchored_trace_cb(unsigned type, void *ctx, void *stmt, void *sql) {
+    (void)stmt;
+    if (type == SQLITE_TRACE_STMT && sql && strstr((const char *)sql, "n.name >= ?")) {
+        (*(int *)ctx)++;
+    }
+    return 0;
+}
+
+/* "name#label;" per row plus the total, for comparing two searches. */
+static void anchored_search_rows(cbm_store_t *s, const cbm_search_params_t *p, int *rc,
+                                 char *buf, size_t buf_sz) {
+    cbm_search_output_t out = {0};
+    *rc = cbm_store_search(s, p, &out);
+    int len = snprintf(buf, buf_sz, "total=%d:", out.total);
+    for (int i = 0; i < out.count && len > 0 && (size_t)len < buf_sz; i++) {
+        len += snprintf(buf + len, buf_sz - (size_t)len, "%s#%s#%lld;", out.results[i].node.name,
+                        out.results[i].node.label, (long long)out.results[i].node.id);
+    }
+    cbm_store_search_free(&out);
+}
+
+/* An anchored literal pattern must return exactly what the same regex returns
+ * without the range path. Wrapping it in a group, "(^schedule$)", keeps the
+ * regex semantics but has no provable prefix, so it runs the plain scan. The
+ * names cover every letter case of the prefix, prefix-vs-substring, and the
+ * byte order the UNION ALL arms are merged in. */
+TEST(store_search_anchored_name_matches_plain_scan) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "p", "/tmp/p");
+    static const char *const names[] = {
+        "schedule",  "Schedule", "SCHEDULE", "sCHEDULE", "scheduler", "schedule_work",
+        "reschedule", "sched",   "Sched_x",  "get_name", "Get_Name",  "getname",
+        "o'neil",    "ScHeDuLe", "schedule", "zabc"};
+    enum { NAME_COUNT = 16 };
+    for (int i = 0; i < NAME_COUNT; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "p.m%d.%s", i, names[i]);
+        cbm_node_t n = {.project = "p",
+                        .label = (i % 3 == 1) ? "Class" : "Function",
+                        .name = names[i],
+                        .qualified_name = qn,
+                        .file_path = "m.c"};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    }
+    int ranged = 0;
+    sqlite3_trace_v2(cbm_store_get_db(s), SQLITE_TRACE_STMT, anchored_trace_cb, &ranged);
+
+    struct {
+        const char *pattern;
+        const char *label;
+        bool case_sensitive;
+        int limit;
+        int offset;
+        int want_total;
+    } cases[] = {
+        {"^schedule$", NULL, false, 0, 0, 6},  {"^sched", NULL, false, 0, 0, 10},
+        {"^sched", "Function", false, 0, 0, 6}, {"^SCHED", NULL, true, 0, 0, 1},
+        {"^Sched", NULL, true, 0, 0, 2},       {"^sche+dule$", NULL, false, 0, 0, 6},
+        {"^s.hedule$", NULL, false, 0, 0, 6},  {"^get_", NULL, false, 0, 0, 2},
+        {"^o'n", NULL, false, 0, 0, 1},        {"^zzz", NULL, false, 0, 0, 0},
+        {"^sched", NULL, false, 3, 2, 10},     {"^sched", NULL, false, 4, 8, 10},
+    };
+    char fast[4096];
+    char plain[4096];
+    char twin[64];
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        cbm_search_params_t p = {.project = "p",
+                                 .label = cases[c].label,
+                                 .name_pattern = cases[c].pattern,
+                                 .case_sensitive = cases[c].case_sensitive,
+                                 .limit = cases[c].limit,
+                                 .offset = cases[c].offset,
+                                 .min_degree = -1,
+                                 .max_degree = -1};
+        int rc_fast = 0;
+        int rc_plain = 0;
+        int before = ranged;
+        anchored_search_rows(s, &p, &rc_fast, fast, sizeof(fast));
+        ASSERT_EQ(ranged - before, 2); /* count + page both took the range path */
+        snprintf(twin, sizeof(twin), "(%s)", cases[c].pattern);
+        p.name_pattern = twin;
+        before = ranged;
+        anchored_search_rows(s, &p, &rc_plain, plain, sizeof(plain));
+        ASSERT_EQ(ranged - before, 0);
+        ASSERT_EQ(rc_fast, CBM_STORE_OK);
+        ASSERT_EQ(rc_plain, CBM_STORE_OK);
+        ASSERT_STR_EQ(fast, plain);
+        char want_total[32];
+        snprintf(want_total, sizeof(want_total), "total=%d:", cases[c].want_total);
+        ASSERT_EQ(strncmp(fast, want_total, strlen(want_total)), 0);
+    }
+    sqlite3_trace_v2(cbm_store_get_db(s), 0, NULL, NULL);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A regex the engine rejects fails the plain query as soon as one row reaches
+ * it ("zabc" passes the LIKE '%abc%' hint). The range path would never reach
+ * the regex (no name starts with "abc") and answer an empty page instead, so a
+ * pattern that does not compile keeps the plain query and its error. */
+TEST(store_search_anchored_invalid_regex_keeps_error) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "p", "/tmp/p");
+    cbm_node_t n = {.project = "p", .label = "Function", .name = "zabc", .qualified_name = "p.zabc"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    cbm_search_params_t p = {
+        .project = "p", .name_pattern = "^abc(", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_ERR);
+    cbm_store_search_free(&out);
     cbm_store_close(s);
     PASS();
 }
@@ -1797,6 +2015,66 @@ TEST(store_fts_rebuild_incremental_adds_only_nodes_above_watermark) {
     PASS();
 }
 
+/* A C macro's QN ends in "#macro" (CBM_MACRO_QN_SUFFIX) and `#` separates tokens, so
+ * indexing that QN as it is would give every macro node the word "macro" a second time
+ * (its label already says Macro). On redis that is 5,513 rows outscoring the two nodes
+ * that carry the word in their NAME: tre_expand_macro fell out of the 2,000-row BM25
+ * candidate window and out of the result for the query `macro`. The qualified_name
+ * column therefore gets a Macro's QN without the fence, and only a Macro's. The
+ * wholesale rebuild and the delta-merge rebuild are one writer; both are run here. */
+TEST(store_fts_macro_qn_fence_adds_no_token_c1) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "p", "/tmp/p");
+    cbm_node_t macro = {.project = "p",
+                        .label = "Macro",
+                        .name = "LIMIT",
+                        .qualified_name = "p.cfg.LIMIT" CBM_MACRO_QN_SUFFIX,
+                        .file_path = "cfg.h"};
+    cbm_node_t named = {.project = "p",
+                        .label = "Function",
+                        .name = "expandMacro",
+                        .qualified_name = "p.cfg.expandMacro",
+                        .file_path = "cfg.c"};
+    /* not a Macro: a QN that merely ends like the fence keeps all its tokens */
+    cbm_node_t other = {.project = "p",
+                        .label = "Function",
+                        .name = "odd",
+                        .qualified_name = "p.cfg.odd#macro",
+                        .file_path = "cfg.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &macro) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &named) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &other) > 0);
+
+    ASSERT_EQ(cbm_store_fts_rebuild(s, NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(fts_match_count(s, "qualified_name:LIMIT"), 1); /* the QN stays searchable */
+    ASSERT_EQ(fts_match_count(s, "label:Macro"), 1);
+    ASSERT_EQ(fts_match_count(s, "qualified_name:macro"), 1); /* `odd` alone */
+    ASSERT_EQ(fts_match_count(s, "name:Macro"), 1);           /* expandMacro, camel-split */
+
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT COALESCE(MAX(id),0) FROM nodes", -1,
+                                 &st, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int64_t watermark = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    cbm_node_t added = {.project = "p",
+                        .label = "Macro",
+                        .name = "DEPTH",
+                        .qualified_name = "p.cfg.DEPTH" CBM_MACRO_QN_SUFFIX,
+                        .file_path = "cfg.h"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &added) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(s, "p", watermark), CBM_STORE_OK);
+    ASSERT_EQ(fts_match_count(s, "qualified_name:DEPTH"), 1);
+    ASSERT_EQ(fts_match_count(s, "label:Macro"), 2);
+    ASSERT_EQ(fts_match_count(s, "qualified_name:macro"), 1); /* the delta path strips it too */
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
     RUN_TEST(store_search_by_name_pattern);
@@ -1812,6 +2090,9 @@ SUITE(store_search) {
     RUN_TEST(store_search_all);
     RUN_TEST(store_search_exclude_labels);
     RUN_TEST(store_search_case_insensitive);
+    RUN_TEST(store_regex_anchored_prefix);
+    RUN_TEST(store_search_anchored_name_matches_plain_scan);
+    RUN_TEST(store_search_anchored_invalid_regex_keeps_error);
     RUN_TEST(store_bfs_outbound);
     RUN_TEST(store_bfs_inbound);
     RUN_TEST(store_bfs_cross_service);
@@ -1820,6 +2101,7 @@ SUITE(store_search) {
     RUN_TEST(store_transaction_rollback);
     RUN_TEST(store_bulk_write_mode);
     RUN_TEST(store_schema_info);
+    RUN_TEST(store_schema_counts_ties_in_name_order);
     RUN_TEST(store_dump_to_file);
     RUN_TEST(store_hop_to_risk);
     RUN_TEST(store_build_impact_summary);
@@ -1873,4 +2155,5 @@ SUITE(store_search) {
     RUN_TEST(store_fts_rebuild_survives_malformed_properties_json);
     RUN_TEST(store_fts_rebuild_tolerates_legacy_four_column_table);
     RUN_TEST(store_fts_rebuild_incremental_adds_only_nodes_above_watermark);
+    RUN_TEST(store_fts_macro_qn_fence_adds_no_token_c1);
 }

@@ -5,10 +5,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-python3 - "$ROOT" <<'PY'
+# PR smoke runs the legs scripts/ci/select-lanes.sh selects, so the paths the
+# release-fixture smoke depends on are checked against its real decisions.
+SMOKE_DECISIONS=""
+for changed_path in install.sh install.ps1 scripts/smoke-local.sh \
+    scripts/smoke-fixture-server.py scripts/gen-third-party-notices.sh \
+    test-infrastructure/vm/vm-smoke.sh test-infrastructure/vm/windows-user-path-guard.ps1; do
+    decision=$(printf '%s\n' "$changed_path" | bash "$ROOT/scripts/ci/select-lanes.sh")
+    SMOKE_DECISIONS="$SMOKE_DECISIONS$changed_path $decision
+"
+done
+
+python3 - "$ROOT" "$SMOKE_DECISIONS" <<'PY'
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -408,17 +420,11 @@ require(
     "Phase 14 must assert update leaves the binary byte-identical",
 )
 
-for changed_path in (
-    "install\\.(sh|ps1)",
-    "scripts/smoke-local",
-    "scripts/smoke-fixture-server",
-    "scripts/gen-third-party-notices",
-    "test-infrastructure/vm/vm-smoke",
-    "windows-user-path-guard",
-):
+for line in sys.argv[2].splitlines():
+    changed_path, decision = line.split(" ", 1)
     require(
-        changed_path in pr_workflow,
-        f"PR product-change detector must include {changed_path}",
+        {"smoke-ubuntu", "smoke-mac", "smoke-win"} <= set(json.loads(decision)["lanes"]),
+        f"a change to {changed_path} must select all three PR smoke legs",
     )
 require(
     "tests/test_smoke_fixture_contract.sh" in test_driver,

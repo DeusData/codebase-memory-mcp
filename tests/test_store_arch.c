@@ -22,6 +22,7 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include "foundation/mem_core.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -275,7 +276,8 @@ TEST(arch_path_scoping) {
     ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
     ASSERT_EQ(scoped_pkg_nodes, 1);
 
-    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
+                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
 
     cbm_architecture_info_t scoped_slash;
     memset(&scoped_slash, 0, sizeof(scoped_slash));
@@ -292,6 +294,45 @@ TEST(arch_path_scoping) {
     cbm_store_architecture_free(&scoped_slash);
     cbm_store_architecture_free(&whole);
     cbm_store_architecture_free(&scoped);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* packages: count DESC, tied counts in name (BINARY) order. The aggregation
+ * runs off the label index now; a sorted GROUP BY follows the ORDER BY
+ * direction, which reversed the ties until the name tie-break was explicit. */
+TEST(arch_packages_tied_counts_in_name_order) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    static const char *const pkg_names[] = {"gamma", "alpha", "Zeta", "beta",
+                                            "Alpha", "gamma", "beta"};
+    enum { PKG_NODES = 7, PKG_GROUPS = 5 };
+    for (int i = 0; i < PKG_NODES; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "test.pkg%d.%s", i, pkg_names[i]);
+        cbm_node_t n = {.project = "test",
+                        .label = "Package",
+                        .name = pkg_names[i],
+                        .qualified_name = qn,
+                        .file_path = "pkg/manifest.toml"};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    }
+    static const char *const want_names[] = {"beta", "gamma", "Alpha", "Zeta", "alpha"};
+    static const int want_counts[] = {2, 2, 1, 1, 1};
+    const char *aspects[] = {"packages"};
+    const char *paths[] = {NULL, "pkg"}; /* unscoped and path-scoped SQL */
+    for (int p = 0; p < 2; p++) {
+        cbm_architecture_info_t info;
+        ASSERT_EQ(cbm_store_get_architecture(s, "test", paths[p], aspects, 1, &info),
+                  CBM_STORE_OK);
+        ASSERT_EQ(info.package_count, PKG_GROUPS);
+        for (int i = 0; i < PKG_GROUPS; i++) {
+            ASSERT_STR_EQ(info.packages[i].name, want_names[i]);
+            ASSERT_EQ(info.packages[i].node_count, want_counts[i]);
+        }
+        cbm_store_architecture_free(&info);
+    }
     cbm_store_close(s);
     PASS();
 }
@@ -579,6 +620,22 @@ TEST(adr_store_and_retrieve) {
     PASS();
 }
 
+TEST(adr_restore_from_graph_if_absent_memory_is_noop) {
+    /* A :memory: store keeps ADRs in the graph DB, so restore-if-absent is a
+     * well-formed no-op (returns OK) and leaves an existing ADR untouched. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(s, "test", "v1"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_restore_from_graph_if_absent(s), CBM_STORE_OK);
+    cbm_adr_t adr;
+    ASSERT_EQ(cbm_store_adr_get(s, "test", &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "v1");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(adr_upsert) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -617,6 +674,145 @@ TEST(adr_delete_not_found) {
 
     ASSERT_TRUE(cbm_store_adr_delete(s, "nonexistent") != CBM_STORE_OK);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Doc -> code candidates: a database without the table reads as "none";
+ * a replace swaps exactly one project's rows; reads go highest p first (then
+ * score) in both directions. */
+TEST(doc_candidates_replace_and_get) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_doc_candidate_t *got = NULL;
+    int n = -1;
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", NULL, 5, &got, &n),
+              CBM_STORE_NOT_FOUND);
+
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "p.secA",
+         .target_qn = "p.f2",
+         .rank = 2,
+         .score = 0.25,
+         .p = 0.36,
+         .evidence = "{\"shared_terms\":3,\"name_tokens\":0}"},
+        {.section_qn = "p.secA",
+         .target_qn = "p.f1",
+         .rank = 1,
+         .score = 0.45,
+         .p = 0.548,
+         .evidence = "{\"shared_terms\":6,\"name_tokens\":1}"},
+        {.section_qn = "p.secB",
+         .target_qn = "p.f1",
+         .rank = 1,
+         .score = 0.32,
+         .p = 0.42,
+         .evidence = ""},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", rows, 3), CBM_STORE_OK);
+    const cbm_doc_candidate_t other = {.section_qn = "q.secA",
+                                       .target_qn = "q.f9",
+                                       .rank = 1,
+                                       .score = 0.5,
+                                       .p = 0.548,
+                                       .evidence = ""};
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "q", &other, 1), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(got[0].target_qn, "p.f1");
+    ASSERT_EQ(got[0].rank, 1);
+    ASSERT_STR_EQ(got[0].evidence, "{\"shared_terms\":6,\"name_tokens\":1}");
+    ASSERT_STR_EQ(got[1].target_qn, "p.f2");
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, "p.f1", 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(got[0].section_qn, "p.secA");
+    ASSERT_STR_EQ(got[1].section_qn, "p.secB");
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, "p.f1", 1, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+
+    /* a replace drops every earlier row of the project, and only of it */
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", &rows[2], 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 0);
+    cbm_store_doc_candidates_free(got, n);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secB", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "q", "q.secA", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, "p.f1", 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 0);
+    cbm_store_doc_candidates_free(got, n);
+
+    /* exactly one of section / target */
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, NULL, 5, &got, &n), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", "p.f1", 5, &got, &n), CBM_STORE_ERR);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Whole-file candidates of a path: the rows whose target is the path's File
+ * node or a Folder holding it -- never a sibling folder sharing a name prefix
+ * (pkg/mailer, pk), a function in the file, or another project's rows. */
+TEST(doc_candidates_for_path_file_and_folders) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_doc_candidate_t *got = NULL;
+    int n = -1;
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "pkg/mail/parse.py", 5, &got, &n),
+              CBM_STORE_NOT_FOUND);
+    cbm_store_upsert_project(s, "p", "/tmp/p");
+    const struct {
+        const char *label, *qn, *path;
+    } nodes[] = {{"File", "p.pkg.mail.parse.__file__", "pkg/mail/parse.py"},
+                 {"Function", "p.pkg.mail.parse.parse_mail", "pkg/mail/parse.py"},
+                 {"Folder", "p.pkg.mail", "pkg/mail"},
+                 {"Folder", "p.pkg", "pkg"},
+                 {"Folder", "p.pkg.mailer", "pkg/mailer"},
+                 {"Folder", "p.pk", "pk"}};
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        cbm_node_t node = {.project = "p",
+                           .label = nodes[i].label,
+                           .name = nodes[i].qn,
+                           .qualified_name = nodes[i].qn,
+                           .file_path = nodes[i].path};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+    }
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "p.docs.a", .target_qn = "p.pkg.mail.parse.__file__", .p = 0.5},
+        {.section_qn = "p.docs.b", .target_qn = "p.pkg.mail", .p = 0.7},
+        {.section_qn = "p.docs.c", .target_qn = "p.pkg", .p = 0.3},
+        {.section_qn = "p.docs.d", .target_qn = "p.pkg.mailer", .p = 0.9},
+        {.section_qn = "p.docs.e", .target_qn = "p.pk", .p = 0.9},
+        {.section_qn = "p.docs.f", .target_qn = "p.pkg.mail.parse.parse_mail", .p = 0.95},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", rows, 6), CBM_STORE_OK);
+    const cbm_doc_candidate_t other = {
+        .section_qn = "q.docs.a", .target_qn = "p.pkg.mail", .p = 0.99};
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "q", &other, 1), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "pkg/mail/parse.py", 5, &got, &n),
+              CBM_STORE_OK);
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(got[0].section_qn, "p.docs.b"); /* highest p first */
+    ASSERT_STR_EQ(got[1].section_qn, "p.docs.a");
+    ASSERT_STR_EQ(got[2].section_qn, "p.docs.c");
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "pkg/mail/parse.py", 1, &got, &n),
+              CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "", 5, &got, &n), CBM_STORE_ERR);
     cbm_store_close(s);
     PASS();
 }
@@ -969,11 +1165,11 @@ static int adr_check_splice(const char *in, const char *name, const char *body,
     return 0;
 }
 
-#define CHECK_SPLICE(in, name, body, expect)                                                       \
-    do {                                                                                           \
-        if (adr_check_splice((in), (name), (body), (expect)) != 0) {                               \
-            return 1;                                                                              \
-        }                                                                                          \
+#define CHECK_SPLICE(in, name, body, expect)                         \
+    do {                                                             \
+        if (adr_check_splice((in), (name), (body), (expect)) != 0) { \
+            return 1;                                                \
+        }                                                            \
     } while (0)
 
 /* THE acceptance property. Every document below is a case where rebuilding
@@ -1088,9 +1284,9 @@ TEST(adr_splice_mixed_line_endings) {
 TEST(adr_splice_matches_headings_across_line_endings) {
     adr_name_collect_t c;
     memset(&c, 0, sizeof(c));
-    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar",
-                                    adr_collect_names, &c),
-              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar", adr_collect_names, &c),
+        CBM_STORE_OK);
     ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
 
     /* A fenced block with CRLF still hides its heading, and still closes. */
@@ -1189,6 +1385,126 @@ TEST(adr_validate_keys_empty) {
     PASS();
 }
 
+/* ── cbm_store_fetch_call_edges / cbm_store_free_call_edges tests ─ */
+
+TEST(fetch_call_edges_basic) {
+    cbm_store_t *s = setup_arch_test_store();
+    ASSERT_NOT_NULL(s);
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "test", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    /* setup_arch_test_store() wires 5 CALLS edges among Function nodes. */
+    ASSERT_EQ(count, 5);
+    ASSERT_FALSE(truncated);
+    ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(tgt);
+
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(fetch_call_edges_truncated) {
+    cbm_store_t *s = setup_arch_test_store();
+    ASSERT_NOT_NULL(s);
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = false;
+    /* Only 5 CALLS edges exist; capping at 2 must set truncated. */
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "test", 2, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(truncated);
+
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(fetch_call_edges_empty_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "empty", "/tmp/empty");
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "empty", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    ASSERT_FALSE(truncated);
+
+    /* cbm_store_free_call_edges(NULL, NULL) must not crash. */
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The two arrays cbm_store_fetch_call_edges hands out are memory-core blocks of
+ * the STORE class, and cbm_store_free_call_edges is what takes them back. Both
+ * halves are measured: the fetch adds exactly the two arrays and the paired free
+ * removes exactly those, so a raw allocation on either side fails. Thirty-six
+ * edges outgrow the initial capacity of 16, so the growth path is covered too. */
+TEST(fetch_call_edges_memory_core_ownership) {
+    enum { FN = 37 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "grow", "/tmp/grow");
+    int64_t ids[FN];
+    for (int i = 0; i < FN; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "f%d", i);
+        snprintf(qn, sizeof(qn), "grow.pkg.f%d", i);
+        cbm_node_t n = {.project = "grow",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "pkg/f.go"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_TRUE(ids[i] > 0);
+    }
+    for (int i = 0; i + 1 < FN; i++) {
+        cbm_edge_t e = {
+            .project = "grow", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+        ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    }
+
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_STORE);
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "grow", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, FN - 1);
+    ASSERT_FALSE(truncated);
+    ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(tgt);
+    /* Ordered by (source_id, target_id): growth kept every pair in place. */
+    ASSERT_EQ(src[0], ids[0]);
+    ASSERT_EQ(tgt[0], ids[1]);
+    ASSERT_EQ(src[FN - 2], ids[FN - 2]);
+    ASSERT_EQ(tgt[FN - 2], ids[FN - 1]);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_STORE), blocks + 2);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE) >=
+                bytes + 2 * (size_t)count * sizeof(int64_t));
+
+    cbm_store_free_call_edges(src, tgt);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_STORE), blocks);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Louvain tests ──────────────────────────────────────────────── */
 
 TEST(louvain_basic) {
@@ -1214,7 +1530,7 @@ TEST(louvain_basic) {
     /* Triangle and pair different */
     ASSERT_TRUE(comm[1] != comm[4]);
 
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1223,7 +1539,7 @@ TEST(louvain_empty) {
     int count = 0;
     ASSERT_EQ(cbm_louvain(NULL, 0, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 0);
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1234,7 +1550,7 @@ TEST(louvain_single_node) {
     ASSERT_EQ(cbm_louvain(nodes, 1, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 1);
     ASSERT_EQ(result[0].node_id, 42);
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1297,7 +1613,46 @@ TEST(louvain_converges) {
     }
     ASSERT_TRUE(same_count >= 8);
 
-    free(result);
+    cbm_leiden_free(result);
+    PASS();
+}
+
+/* Both the populated graph and isolated-node path return exactly one owned
+ * output block. The Louvain compatibility entry point shares this contract. */
+TEST(leiden_result_memory_core_ownership) {
+    int64_t nodes[] = {1, 2, 3};
+    cbm_louvain_edge_t edges[] = {{1, 2}, {2, 3}};
+    for (int wrapper = 0; wrapper < 2; wrapper++) {
+        for (int connected = 0; connected < 2; connected++) {
+            size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+            size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+            cbm_louvain_result_t *result = NULL;
+            int count = 0;
+            const cbm_louvain_edge_t *input = connected ? edges : NULL;
+            int edge_count = connected ? 2 : 0;
+            int rc = wrapper ? cbm_louvain(nodes, 3, input, edge_count, &result, &count)
+                             : cbm_leiden(nodes, 3, input, edge_count, 1.0, &result, &count);
+            ASSERT_EQ(rc, CBM_STORE_OK);
+            ASSERT_EQ(count, 3);
+            ASSERT_NOT_NULL(result);
+            ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+            ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) >=
+                        bytes + 3 * sizeof(*result));
+            /* Released through the exported pair, the way an FFI caller must. */
+            cbm_leiden_free(result);
+            ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+            ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
+        }
+    }
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    cbm_louvain_result_t *result = NULL;
+    int count = -1;
+    ASSERT_EQ(cbm_leiden(NULL, 0, NULL, 0, 1.0, &result, &count), CBM_STORE_OK);
+    ASSERT_NULL(result);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
     PASS();
 }
 
@@ -1431,7 +1786,7 @@ TEST(leiden_multilevel_collapses_noise) {
         }
         ASSERT_TRUE(same >= SZ - 1);
     }
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1463,8 +1818,8 @@ TEST(leiden_resolution_controls_granularity) {
     ASSERT_TRUE(n_hi > n_lo);
     ASSERT_TRUE(leiden_all_communities_connected(lo, N, edges, ne));
     ASSERT_TRUE(leiden_all_communities_connected(hi, N, edges, ne));
-    free(lo);
-    free(hi);
+    cbm_leiden_free(lo);
+    cbm_leiden_free(hi);
     PASS();
 }
 
@@ -1680,6 +2035,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_path_scoping);
+    RUN_TEST(arch_packages_tied_counts_in_name_order);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);
@@ -1693,8 +2049,11 @@ SUITE(store_arch) {
     /* ADR */
     RUN_TEST(adr_store_and_retrieve);
     RUN_TEST(adr_upsert);
+    RUN_TEST(adr_restore_from_graph_if_absent_memory_is_noop);
     RUN_TEST(adr_delete);
     RUN_TEST(adr_delete_not_found);
+    RUN_TEST(doc_candidates_replace_and_get);
+    RUN_TEST(doc_candidates_for_path_file_and_folders);
     RUN_TEST(adr_parse_sections_basic);
     RUN_TEST(adr_parse_sections_all_six);
     RUN_TEST(adr_parse_sections_non_canonical);
@@ -1727,11 +2086,18 @@ SUITE(store_arch) {
     RUN_TEST(adr_splice_refuses_unterminated_fence);
     RUN_TEST(adr_validate_keys_empty);
 
+    /* Call-edge fetch / free */
+    RUN_TEST(fetch_call_edges_basic);
+    RUN_TEST(fetch_call_edges_truncated);
+    RUN_TEST(fetch_call_edges_empty_project);
+    RUN_TEST(fetch_call_edges_memory_core_ownership);
+
     /* Louvain */
     RUN_TEST(louvain_basic);
     RUN_TEST(louvain_empty);
     RUN_TEST(louvain_single_node);
     RUN_TEST(louvain_converges);
+    RUN_TEST(leiden_result_memory_core_ownership);
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
     RUN_TEST(arch_clusters_basic);

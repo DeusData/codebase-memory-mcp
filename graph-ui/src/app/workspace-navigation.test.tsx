@@ -1,0 +1,310 @@
+// @vitest-environment jsdom
+import { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import AtlasChrome from './AtlasChrome';
+import type { AtlasChromeProps } from './AtlasChrome';
+
+let host: HTMLDivElement;
+let root: Root;
+beforeEach(() => {
+    (globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+});
+afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
+
+const makeProps = (): AtlasChromeProps => ({
+    version: 'test', chips: [], tabs: [], onSelectTab: vi.fn(), onCloseTab: vi.fn(),
+    tree: { projectName: 'sample', rows: [], cursor: 0, activePath: '', note: '',
+        onCursorChange: vi.fn(), onOpen: vi.fn(), onToggle: vi.fn(), onKeyDown: vi.fn() },
+    breadcrumb: [], children: <input aria-label="Preserved reader" defaultValue="selected source" />,
+    truncationNote: '', commandValue: '', onCommandChange: vi.fn(), commandHint: '', status: [],
+});
+
+it('offers the Galaxy workspace and reports the selected task', async () => {
+    const onWorkspaceChange = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} {...{
+        workspace: 'explore', onWorkspaceChange,
+    }} />));
+    const tabs = [...host.querySelectorAll<HTMLButtonElement>('[data-workspace-tab]')];
+    expect(tabs.map(tab => tab.textContent?.trim())).toEqual(['Explore', 'Galaxy', 'Architecture', 'ADR', 'Coverage', 'System']);
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+    await act(async () => tabs[1].click());
+    expect(onWorkspaceChange).toHaveBeenCalledWith('galaxy');
+});
+
+it.each([false, true])('navigates across only available workspaces with experimental Agents %s', async experimentalAgents => {
+    const onWorkspaceChange = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} workspace="architecture"
+        experimentalAgents={experimentalAgents} onWorkspaceChange={onWorkspaceChange} />));
+    expect(host.querySelector('[data-workspace-tab="agents"]') !== null).toBe(experimentalAgents);
+    const adr = host.querySelector('[data-workspace-tab="adr"]')!;
+    await act(async () => adr.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })));
+    expect(onWorkspaceChange).toHaveBeenCalledWith(experimentalAgents ? 'agents' : 'coverage');
+    expect(document.activeElement?.getAttribute('data-workspace-tab')).toBe(experimentalAgents ? 'agents' : 'coverage');
+});
+
+it('opens the project ADR from the main navigation', async () => {
+    const onWorkspaceChange = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} workspace="adr" onWorkspaceChange={onWorkspaceChange} />));
+    const adr = host.querySelector<HTMLButtonElement>('[data-workspace-tab="adr"]')!;
+    expect(adr.getAttribute('aria-selected')).toBe('true');
+    await act(async () => adr.click());
+    expect(onWorkspaceChange).toHaveBeenCalledWith('adr');
+});
+
+it('keeps one galaxy mounted and visible alongside chat in its own workspace', async () => {
+    const props = makeProps();
+    const galaxy = <section className="atlas-galaxy"><canvas data-testid="preserved-galaxy" /></section>;
+    const chat = <input aria-label="Graph chat draft" defaultValue="explain this entry" />;
+    await act(async () => root.render(<AtlasChrome {...props} galaxy={galaxy} chatDock={chat} workspace="explore" />));
+    const canvas = host.querySelector('canvas');
+    const draft = host.querySelector('[aria-label="Graph chat draft"]');
+    await act(async () => root.render(<AtlasChrome {...props} galaxy={galaxy} chatDock={chat} chatOpen workspace="galaxy" />));
+    expect(host.querySelectorAll('canvas')).toHaveLength(1);
+    expect(host.querySelector('canvas')).toBe(canvas);
+    expect(canvas?.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('.atlas-alternate-workspace')?.hasAttribute('hidden')).toBe(true);
+    expect(host.querySelector('[aria-label="Graph chat draft"]')).toBe(draft);
+    expect(host.querySelector('[data-testid="atlas-split-chat"]')).not.toBeNull();
+});
+
+it('keeps the chat dock mounted across collapse and workspace navigation', async () => {
+    const props = makeProps();
+    const dock = <input aria-label="Chat draft" defaultValue="keep this question" />;
+    await act(async () => root.render(<AtlasChrome {...props} chatOpen chatDock={dock} workspace="explore" />));
+    const input = host.querySelector('input[aria-label="Chat draft"]');
+    expect(host.querySelector('[data-testid="atlas-split-chat"]')).not.toBeNull();
+    await act(async () => root.render(<AtlasChrome {...props} chatOpen={false} chatDock={dock} workspace="system" />));
+    expect(host.querySelector('input[aria-label="Chat draft"]')).toBe(input);
+    expect(host.querySelector('[data-testid="atlas-split-chat"]')).toBeNull();
+});
+
+it('moves the same live galaxy below Explore chat and back into Galaxy', async () => {
+    const props = makeProps();
+    const galaxy = <section className="atlas-galaxy"><canvas /></section>;
+    const dock = <input aria-label="Local question" defaultValue="preserve me" />;
+    await act(async () => root.render(<AtlasChrome {...props} galaxy={galaxy} chatDock={dock} workspace="galaxy" />));
+    const canvas = host.querySelector('canvas');
+    const draft = host.querySelector('[aria-label="Local question"]');
+    await act(async () => root.render(<AtlasChrome {...props} galaxy={galaxy} chatDock={dock} chatOpen workspace="explore" />));
+    expect(canvas?.closest('.atlas-chat-column')).not.toBeNull();
+    expect(canvas?.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('canvas')).toBe(canvas);
+    expect(host.querySelector('[data-testid="atlas-split-chat-graph"]')).not.toBeNull();
+    await act(async () => root.render(<AtlasChrome {...props} galaxy={galaxy} chatDock={dock} chatOpen workspace="galaxy" />));
+    expect(host.querySelector('canvas')).toBe(canvas);
+    expect(canvas?.closest('.atlas-side')).not.toBeNull();
+    expect(host.querySelector('[aria-label="Local question"]')).toBe(draft);
+});
+
+it('keeps one selected-code inspector and its open details when chat opens and closes', async () => {
+    const props = makeProps();
+    const inspector = <section data-testid="selected-code"><details><summary>Calls</summary>Source-linked calls</details></section>;
+    const galaxy = <section className="atlas-galaxy"><canvas /></section>;
+    const chatDock = <input aria-label="Selection question" defaultValue="explain the selection" />;
+    const render = (chatOpen: boolean) => root.render(<AtlasChrome {...props} selectionInspector={inspector}
+        galaxy={galaxy} chatDock={chatDock} chatOpen={chatOpen} workspace="explore" />);
+    await act(async () => render(false));
+    const panel = host.querySelector('[data-testid="selected-code"]');
+    const details = panel!.querySelector('details')!;
+    const canvas = host.querySelector('canvas');
+    details.open = true;
+    expect(panel?.closest('.atlas-side')).not.toBeNull();
+    expect(panel?.closest('[hidden]')).toBeNull();
+
+    await act(async () => render(true));
+    const chatColumn = host.querySelector('.atlas-chat-column')!;
+    const draft = chatColumn.querySelector('[aria-label="Selection question"]')!;
+    expect(host.querySelectorAll('[data-testid="selected-code"]')).toHaveLength(1);
+    expect(host.querySelector('[data-testid="selected-code"]')).toBe(panel);
+    expect(details.open).toBe(true);
+    expect(panel?.closest('.atlas-chat-column')).toBe(chatColumn);
+    expect(panel?.closest('[hidden]')).toBeNull();
+    expect(canvas?.closest('.atlas-chat-column')).toBe(chatColumn);
+    expect(canvas?.closest('[hidden]')).toBeNull();
+    expect(panel!.compareDocumentPosition(draft) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(draft.compareDocumentPosition(canvas!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await act(async () => render(false));
+    expect(host.querySelector('[data-testid="selected-code"]')).toBe(panel);
+    expect(details.open).toBe(true);
+    expect(panel?.closest('.atlas-side')).not.toBeNull();
+    expect(panel?.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('canvas')).toBe(canvas);
+});
+
+it('hides selected-code context outside Explore without losing its state', async () => {
+    const props = makeProps();
+    const inspector = <input aria-label="Pinned code context" defaultValue="keep context" />;
+    await act(async () => root.render(<AtlasChrome {...props} selectionInspector={inspector} chatOpen workspace="explore" />));
+    const panel = host.querySelector('[aria-label="Pinned code context"]');
+    for (const workspace of ['galaxy', 'architecture', 'adr', 'agents', 'coverage', 'system'] as const) {
+        await act(async () => root.render(<AtlasChrome {...props} selectionInspector={inspector} chatOpen workspace={workspace} />));
+        expect(host.querySelector('[aria-label="Pinned code context"]')).toBe(panel);
+        expect(panel?.closest('[hidden]')).not.toBeNull();
+        expect(host.querySelector('.atlas-chat-column')?.hasAttribute('hidden')).toBe(false);
+    }
+    await act(async () => root.render(<AtlasChrome {...props} selectionInspector={inspector} chatOpen workspace="explore" />));
+    expect(host.querySelector('[aria-label="Pinned code context"]')).toBe(panel);
+    expect(panel?.closest('[hidden]')).toBeNull();
+});
+
+it('replaces legacy model and twin controls when selected-code context is supplied', async () => {
+    const props = { ...makeProps(), twin: <div>Legacy twin</div>, llm: <div>Legacy sidecar</div>,
+        splitTwin: <div data-testid="legacy-twin-splitter" /> };
+    await act(async () => root.render(<AtlasChrome {...props} selectionInspector={<div>Selected context</div>} />));
+    expect(host.textContent).toContain('Selected context');
+    expect(host.textContent).not.toContain('Legacy twin');
+    expect(host.textContent).not.toContain('Legacy sidecar');
+    expect(host.querySelector('[data-testid="legacy-twin-splitter"]')).toBeNull();
+
+    await act(async () => root.render(<AtlasChrome {...props} />));
+    expect(host.textContent).toContain('Legacy twin');
+    expect(host.textContent).toContain('Legacy sidecar');
+    expect(host.querySelector('[data-testid="legacy-twin-splitter"]')).not.toBeNull();
+});
+
+it.each(['ctrlKey', 'metaKey'] as const)('routes %s+K to Galaxy and focuses its dedicated search after navigation', async modifier => {
+    const onWorkspaceChange = vi.fn(); const focused = vi.fn();
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frame = callback; return 1; });
+    window.addEventListener('cbm:focus-galaxy-search', focused);
+    try {
+        await act(async () => root.render(<AtlasChrome {...makeProps()} onWorkspaceChange={onWorkspaceChange} />));
+        const reader = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]')!;
+        reader.focus();
+        const event = new KeyboardEvent('keydown', { key: 'k', [modifier]: true, bubbles: true, cancelable: true });
+        await act(async () => window.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        expect(onWorkspaceChange).toHaveBeenCalledExactlyOnceWith('galaxy');
+        expect(focused).not.toHaveBeenCalled();
+        expect(host.querySelector('dialog')).toBeNull();
+        expect(host.querySelector('[data-testid="atlas-command-input"]')).toBeNull();
+        await act(async () => frame!(0));
+        expect(focused).toHaveBeenCalledOnce();
+        expect(reader.value).toBe('selected source');
+    } finally { window.removeEventListener('cbm:focus-galaxy-search', focused); raf.mockRestore(); }
+});
+
+it('routes legacy graph search requests to the dedicated Galaxy workspace', async () => {
+    const onWorkspaceChange = vi.fn(); const focused = vi.fn();
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frame = callback; return 1; });
+    window.addEventListener('cbm:focus-galaxy-search', focused);
+    try {
+        await act(async () => root.render(<AtlasChrome {...makeProps()} onWorkspaceChange={onWorkspaceChange} />));
+        await act(async () => window.dispatchEvent(new Event('cbm:open-command-search')));
+        expect(onWorkspaceChange).toHaveBeenCalledExactlyOnceWith('galaxy');
+        await act(async () => frame!(0));
+        expect(focused).toHaveBeenCalledOnce();
+        expect(host.querySelector('dialog')).toBeNull();
+    } finally { window.removeEventListener('cbm:focus-galaxy-search', focused); raf.mockRestore(); }
+});
+
+it('shows compact reader context alongside preserved code without mounting a full impact report', async () => {
+    const props = makeProps();
+    await act(async () => root.render(<AtlasChrome {...props} workspace="explore" readerSummary={<aside aria-label="File impact">3 dependent files · 2 tests</aside>} />));
+    const reader = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]')!;
+    const summary = host.querySelector('[aria-label="File impact"]')!;
+    expect(summary.textContent).toContain('3 dependent files');
+    expect(summary.compareDocumentPosition(reader) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(reader.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('[data-testid="impact-workspace"]')).toBeNull();
+    await act(async () => root.render(<AtlasChrome {...props} workspace="explore" readerSummary={<aside aria-label="File impact">Selection · 1 dependent file</aside>} />));
+    expect(host.querySelector('[aria-label="Preserved reader"]')).toBe(reader);
+    expect(reader.value).toBe('selected source');
+    expect(host.querySelector('[aria-label="File impact"]')?.textContent).toContain('Selection');
+});
+
+it('resizes local chat by keyboard and exposes daemon navigation', async () => {
+    const onOpenSystem = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} chatOpen chatDock={<div>Local chat</div>}
+        onOpenSystem={onOpenSystem} daemonState="disconnected" />));
+    const separator = host.querySelector('[data-testid="atlas-split-chat"]')!;
+    expect(separator.getAttribute('aria-valuenow')).toBe('420');
+    await act(async () => separator.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true })));
+    expect(Number(separator.getAttribute('aria-valuenow'))).toBeGreaterThan(420);
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Open System: daemon disconnected"]')!.click());
+    expect(onOpenSystem).toHaveBeenCalledOnce();
+});
+
+it('keeps the reader mounted while showing a different workspace', async () => {
+    const props = makeProps();
+    const change = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...props} {...{
+        workspace: 'explore', onWorkspaceChange: change,
+    }} />));
+    const reader = host.querySelector('input[aria-label="Preserved reader"]');
+    await act(async () => root.render(<AtlasChrome {...props} {...{
+        workspace: 'architecture', onWorkspaceChange: change,
+        workspacePanel: <div>Architecture evidence</div>,
+    }} />));
+    expect(host.textContent).toContain('Architecture evidence');
+    expect(host.querySelector('input[aria-label="Preserved reader"]')).toBe(reader);
+    expect(host.querySelector('[data-testid="atlas-exploration-workspace"]')?.hasAttribute('hidden')).toBe(true);
+});
+
+it('keeps tools and explanation-depth controls out of the header', async () => {
+    await act(async () => root.render(<AtlasChrome {...makeProps()} workspace="explore" />));
+    const header = host.querySelector('[data-testid="atlas-header"]')!;
+    expect(header.querySelector('.atlas-tools-menu')).toBeNull();
+    expect(header.querySelector('[aria-label="Explanation depth"]')).toBeNull();
+    expect(header.querySelector('.atlas-search-action')).toBeNull();
+    expect([...header.querySelectorAll('button')].some(button => button.textContent === 'Edges')).toBe(false);
+});
+
+it('places separate agent settings and chat controls directly after the project selector', async () => {
+    const onOpenBrowserAi = vi.fn();
+    const onToggleBrowserAi = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} workspace="adr"
+        projectSwitcher={<div data-testid="project-selector">Project</div>}
+        onOpenBrowserAi={onOpenBrowserAi} onToggleBrowserAi={onToggleBrowserAi} chatOpen />));
+    const project = host.querySelector('[data-testid="project-selector"]')!;
+    const controls = project.nextElementSibling!;
+    expect(controls.getAttribute('aria-label')).toBe('Local agent');
+    const settings = controls.querySelector<HTMLButtonElement>('.atlas-browser-ai-action')!;
+    const chat = controls.querySelector<HTMLButtonElement>('[aria-label="Hide chat"]')!;
+    expect(chat.getAttribute('aria-expanded')).toBe('true');
+    await act(async () => chat.click());
+    expect(onToggleBrowserAi).toHaveBeenCalledOnce();
+    expect(onOpenBrowserAi).not.toHaveBeenCalled();
+    await act(async () => settings.click());
+    expect(onOpenBrowserAi).toHaveBeenCalledOnce();
+});
+
+it('leaves reader typing and Enter untouched by removed command handlers', async () => {
+    const onCommandChange = vi.fn(); const onCommandKeyDown = vi.fn();
+    await act(async () => root.render(<AtlasChrome {...makeProps()} onCommandChange={onCommandChange} onCommandKeyDown={onCommandKeyDown} />));
+    const reader = host.querySelector<HTMLInputElement>('[aria-label="Preserved reader"]')!;
+    reader.focus();
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    await act(async () => reader.dispatchEvent(enter));
+    expect(enter.defaultPrevented).toBe(false);
+    expect(onCommandKeyDown).not.toHaveBeenCalled();
+    expect(onCommandChange).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(reader);
+    expect(host.querySelector('dialog')).toBeNull();
+});
+
+it('keeps Explorer graph and chat draft mounted when chat folds', async () => {
+    const props = makeProps();
+    const galaxy = <section className="atlas-galaxy"><canvas /></section>;
+    const chat = <input aria-label="Folded chat draft" defaultValue="keep my question" />;
+    const render = (chatOpen: boolean) => root.render(<AtlasChrome {...props} workspace="explore" galaxy={galaxy} chatDock={chat} chatOpen={chatOpen} />);
+    await act(async () => render(false));
+    const canvas = host.querySelector('canvas');
+    const draft = host.querySelector('[aria-label="Folded chat draft"]');
+    expect(canvas?.closest('.atlas-chat-column')?.hasAttribute('hidden')).toBe(false);
+    expect(canvas?.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('[data-testid="atlas-split-chat-graph"]')).toBeNull();
+    await act(async () => render(true));
+    expect(host.querySelector('canvas')).toBe(canvas);
+    expect(host.querySelector('[data-testid="atlas-split-chat-graph"]')).not.toBeNull();
+    await act(async () => render(false));
+    expect(host.querySelector('canvas')).toBe(canvas);
+    expect(host.querySelector('[aria-label="Folded chat draft"]')).toBe(draft);
+    expect(canvas?.closest('[hidden]')).toBeNull();
+});

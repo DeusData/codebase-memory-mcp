@@ -1,0 +1,52 @@
+--- a/grammar.js
++++ b/grammar.js
+@@ -684,6 +684,9 @@
+     _jsx_child: $ => choice(
+       $.jsx_text,
+       $.html_character_reference,
++      // cbm fork (#1736): a lone '&' that does not start a complete
++      // html_character_reference is plain text, as in HTML/React.
++      alias($._jsx_lone_ampersand, $.jsx_text),
+       $._jsx_element,
+       $.jsx_expression,
+     ),
+@@ -749,6 +752,7 @@
+         repeat(choice(
+           alias($.unescaped_double_jsx_string_fragment, $.string_fragment),
+           $.html_character_reference,
++          alias($._jsx_string_lone_ampersand, $.string_fragment), // cbm fork (#1736)
+         )),
+         '"',
+       ),
+@@ -757,6 +761,7 @@
+         repeat(choice(
+           alias($.unescaped_single_jsx_string_fragment, $.string_fragment),
+           $.html_character_reference,
++          alias($._jsx_string_lone_ampersand, $.string_fragment), // cbm fork (#1736)
+         )),
+         '\'',
+       ),
+@@ -766,11 +771,21 @@
+     // We give names to the token() constructs containing a regexp
+     // so as to obtain a node in the CST.
+     //
+-    unescaped_double_jsx_string_fragment: _ => token.immediate(prec(1, /([^"&]|&[^#A-Za-z])+/)),
++    // cbm fork (#1736): '&' directly before the closing quote is excluded so the
++    // fragment cannot run past the end of the string (upstream: &[^#A-Za-z]).
++    unescaped_double_jsx_string_fragment: _ => token.immediate(prec(1, /([^"&]|&[^#A-Za-z"])+/)),
+ 
+     // same here
+-    unescaped_single_jsx_string_fragment: _ => token.immediate(prec(1, /([^'&]|&[^#A-Za-z])+/)),
++    unescaped_single_jsx_string_fragment: _ => token.immediate(prec(1, /([^'&]|&[^#A-Za-z'])+/)),
+ 
++    // cbm fork (#1736): a lone '&' that does not begin a complete
++    // html_character_reference (`?a=1&b=2`, `Tom &Jerry`). Precedence -1 keeps
++    // html_character_reference (precedence 0) winning for `&amp;` / `&#38;`; the
++    // lexer falls back to this one-character token only when no reference
++    // matches. Upstream leaves `&` + letter/`#` unmatched, producing an ERROR.
++    _jsx_lone_ampersand: _ => token(prec(-1, '&')),
++    _jsx_string_lone_ampersand: _ => token.immediate(prec(-1, '&')),
++
+     _jsx_attribute_value: $ => choice(
+       alias($._jsx_string, $.string),
+       $.jsx_expression,

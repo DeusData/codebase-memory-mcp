@@ -46,14 +46,12 @@ if [[ "$manifest_count" != "$expected" ]]; then
 fi
 
 # --- 3. Every published surface must claim exactly that number. ---
+# The #2729 messaging refresh dropped the count from docs/index.html,
+# docs/llms.txt, pkg/npm/README.md, scripts/package-release.sh and server.json;
+# section 4 below still fails if any of them states a count again unregistered.
 SURFACES=(
     README.md
-    docs/index.html
-    docs/llms.txt
-    pkg/npm/README.md
     pkg/chocolatey/codebase-memory-mcp.nuspec
-    scripts/package-release.sh
-    server.json
 )
 
 # Files that legitimately say "<N> languages" about something OTHER than the
@@ -67,6 +65,7 @@ EXEMPT=(
     'tests/repro/repro_grammar_scripting.c'    # scripting-grammar probe scope (12)
     'tests/test_grammar_probe_b.c'             # grammar probe scope (12)
     'tests/test_language_count_contract.sh'    # this file, which names the numbers above
+    'graph-ui/verification/pr-2068/audit-architecture.json' # captured README badges in the dated PR browser audit, not current support claims
     'pkg/winget/manifests/'                    # version-pinned published manifests: 0.8.1
                                                # really did ship 155, and rewriting a
                                                # released manifest would falsify it

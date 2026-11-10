@@ -1,0 +1,138 @@
+{
+  "before": {
+    "schema": 2,
+    "rows": 3286,
+    "maxId": 3819,
+    "sha256": "0a456a24cdad5a3febc96c6b6cc5d4c2f826e5c719c535eb3aede2f0c1e3216e"
+  },
+  "after": {
+    "schema": 3,
+    "oldRowsRetained": 3270,
+    "oldRowsChanged": [],
+    "oldRowsExpiredByNormalRetention": 16,
+    "expiredRows": [
+      [
+        559,
+        "2026-09-09T19:30:37.663Z",
+        1,
+        "mcp.request",
+        "level=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=6"
+      ],
+      [
+        560,
+        "2026-09-09T19:30:37.664Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=7 request_bytes=132 response_bytes=1002"
+      ],
+      [
+        561,
+        "2026-09-09T19:30:37.667Z",
+        1,
+        "mcp.request",
+        "level=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3"
+      ],
+      [
+        562,
+        "2026-09-09T19:30:37.667Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=247 response_bytes=327"
+      ],
+      [
+        563,
+        "2026-09-09T19:30:37.668Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=0 request_bytes=399 response_bytes=94"
+      ],
+      [
+        564,
+        "2026-09-09T19:30:37.674Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1038"
+      ],
+      [
+        565,
+        "2026-09-09T19:30:37.675Z",
+        1,
+        "mcp.request",
+        "level=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1"
+      ],
+      [
+        566,
+        "2026-09-09T19:30:37.676Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=1 request_bytes=191 response_bytes=76576"
+      ],
+      [
+        567,
+        "2026-09-09T19:30:37.679Z",
+        1,
+        "mcp.request",
+        "level=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2"
+      ],
+      [
+        568,
+        "2026-09-09T19:30:37.679Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=2 request_bytes=219 response_bytes=303"
+      ],
+      [
+        569,
+        "2026-09-09T19:30:37.684Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1018"
+      ],
+      [
+        570,
+        "2026-09-09T19:30:37.695Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2716"
+      ],
+      [
+        571,
+        "2026-09-09T19:30:37.703Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=244"
+      ],
+      [
+        572,
+        "2026-09-09T19:30:37.709Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1419"
+      ],
+      [
+        573,
+        "2026-09-09T19:30:37.719Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=7391"
+      ],
+      [
+        574,
+        "2026-09-09T19:30:37.727Z",
+        1,
+        "http.request",
+        "level=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2874"
+      ]
+    ],
+    "priorityRowsMissing": [],
+    "unattributedOldRows": 3270,
+    "allLevelCounts": {
+      "1": 3000,
+      "2": 245,
+      "3": 41
+    },
+    "allExpiredRowsAreInfo": true
+  },
+  "explanation": "Normal info retention is bounded to 3000. Startup and browser requests can evict the oldest normal rows. Migration itself preserves content and priority history; native isolated v2 migration test proves retention-independent preservation.",
+  "success": true
+}

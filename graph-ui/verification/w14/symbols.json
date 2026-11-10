@@ -1,0 +1,2131 @@
+{
+  "symbols": {
+    "createUser": {
+      "picked": true,
+      "file": "src/services/userService.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1099,
+          "text": "What happens here, and why does it matter to you?createUser is a function spanning 13 lines in userService.ts, from line 23 through line 35.createUser leans on shared names declared outside its own lines: User.2 callers reach createUser: registerUserRoutes and create.createUser is a function. createUser hands work to 6 other pieces of code: validateUser, ValidationError, UserEntity, listUsers, insert, and toUser. createUser reads 1 value from the environment it runs in: DB_URL. createUser can stop with 1 kind of error: ValidationError.The parts it leans on, in the order they come up:validateUserValidationErrorUserEntitylistUsersinsertNobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.1 further part is not listed here; the deeper settings show all of them.Nothing that looks like a test calls this, so no automatic check would notice a change here.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-chip",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 2045,
+          "text": "In what order does it happen, and why?createUser is a function spanning 13 lines in userService.ts, from line 23 through line 35.createUser leans on shared names declared outside its own lines: User.2 callers reach createUser: registerUserRoutes and create.createUser is a function. createUser hands work to 6 other pieces of code: validateUser, ValidationError, UserEntity, listUsers, insert, and toUser. createUser reads 1 value from the environment it runs in: DB_URL. createUser can stop with 1 kind of error: ValidationError.These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.1First it hands work to validateUser (validate.ts:19).2Then it hands work to ValidationError (validate.ts:4).3After that it hands work to UserEntity (types.ts:37).4Next it hands work to listUsers (userService.ts:18).5Then it hands work to insert (db.ts:31).6And last it hands work to toUser (userService.ts:9).Words used above, once each:call sitea place in this code where it hands work to another piece of code. The index records where each one is and what it points at.callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.raisestopping with an error instead of returning a result. The index records which error types can leave this symbol, not where they are caught.environment reada value this code takes from outside itself, such as a setting or a configuration key, rather than from what it was handed.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-step",
+            "codeatlas-twin-steps",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 1748,
+          "text": "What is actually written here?createUser is a function spanning 13 lines in userService.ts, from line 23 through line 35.createUser leans on shared names declared outside its own lines: User.2 callers reach createUser: registerUserRoutes and create.Purposeinferred?Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type.Steps?24validateUservalidate.ts:19?27ValidationErrornewvalidate.ts:4?29UserEntitynewtypes.ts:37?29listUsersuserService.ts:18?30insertdb.ts:31?35toUseruserService.ts:9?Called by?registerUserRoutesusers.ts:15?createuserService.ts:41?DATAState and config?Reads from the environmentDB_URL?Uses typesUser?DATAPulls ininferred7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.ERRORSError paths?ValidationErrorvalidate.ts:4?Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-note-errors",
+            "codeatlas-twin-note-imports",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-step",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-imports",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1605,
+          "text": "What does this cost you?createUser is a function spanning 13 lines in userService.ts, from line 23 through line 35.createUser leans on shared names declared outside its own lines: User.2 callers reach createUser: registerUserRoutes and create.How it can fail1 place to checkThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.ValidationErrorvalidate.ts:4?What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it2 places to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.registerUserRoutesusers.ts:15?createuserService.ts:41?What moves with a change15 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.Steps24validateUservalidate.ts:19?27ValidationErrornewvalidate.ts:4?29UserEntitynewtypes.ts:37?29listUsersuserService.ts:18?30insertdb.ts:31?35toUseruserService.ts:9?State and configDB_URL?User?Pulls ininsertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 2947,
+          "text": "What does this sit on, and where does our knowledge end?createUser is a function spanning 13 lines in userService.ts, from line 23 through line 35.createUser leans on shared names declared outside its own lines: User.2 callers reach createUser: registerUserRoutes and create.What it sits on11 entriesThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.util/validate.tsvalidateUser, ValidationErrorexact2 call sitesvia direct-call?src/types.tsUserEntityexact1 call sitevia construction?services/userService.tslistUsers, toUserexact2 call sitesvia direct-call?repo/db.tsinsertexact1 call sitevia direct-call?Pulls ininsertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?What carries it2 entriesWhat holds this up: the callers, and whether the outside world can reach it directly.registerUserRoutesusers.ts:15exact1 citation?createuserService.ts:41exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops8 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "getOrder": {
+      "picked": true,
+      "file": "src/services/orderService.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1320,
+          "text": "What happens here, and why does it matter to you?getOrder is a function spanning 18 lines in orderService.ts, from line 8 through line 25.getOrder leans on shared names declared outside its own lines: Order.1 callers reach getOrder: registerOrderRoutes.getOrder is a function. getOrder hands work to 2 other pieces of code: validateId and query. The index records no stopping error for getOrder.The parts it leans on, in the order they come up:validateIdqueryNobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.Nothing that looks like a test calls this, so no automatic check would notice a change here.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-chip",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1459,
+          "text": "In what order does it happen, and why?getOrder is a function spanning 18 lines in orderService.ts, from line 8 through line 25.getOrder leans on shared names declared outside its own lines: Order.1 callers reach getOrder: registerOrderRoutes.getOrder is a function. getOrder hands work to 2 other pieces of code: validateId and query. The index records no stopping error for getOrder.These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.1First it hands work to validateId (validate.ts:33).2And last it hands work to query (db.ts:17).Words used above, once each:call sitea place in this code where it hands work to another piece of code. The index records where each one is and what it points at.callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.This symbol raises no error type that the index recorded.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-step",
+            "codeatlas-twin-steps",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 1949,
+          "text": "What is actually written here?getOrder is a function spanning 18 lines in orderService.ts, from line 8 through line 25.getOrder leans on shared names declared outside its own lines: Order.1 callers reach getOrder: registerOrderRoutes.Purposeinferred?Function getOrder in orderService.ts. Makes 2 calls, touches 0 environment values, can raise 0 error types.Steps?10validateIdvalidate.ts:33?11querydb.ts:17?Called by?registerOrderRoutesorders.ts:10?DATAState and config?Uses typesOrder?DATAPulls ininferred4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Orderused here?validateIdused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.ERRORSError paths?This symbol raises no error type that the index recorded.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-errors",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-note-imports",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-step",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-imports",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1528,
+          "text": "What does this cost you?getOrder is a function spanning 18 lines in orderService.ts, from line 8 through line 25.getOrder leans on shared names declared outside its own lines: Order.1 callers reach getOrder: registerOrderRoutes.How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it1 place to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.registerOrderRoutesorders.ts:10?What moves with a change7 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.Steps10validateIdvalidate.ts:33?11querydb.ts:17?State and configOrder?Pulls ininsertused here?queryused here?Orderused here?validateIdused here?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3161,
+          "text": "What does this sit on, and where does our knowledge end?getOrder is a function spanning 18 lines in orderService.ts, from line 8 through line 25.getOrder leans on shared names declared outside its own lines: Order.1 callers reach getOrder: registerOrderRoutes.What it sits on6 entriesThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.util/validate.tsvalidateIdexact1 call sitevia direct-call?repo/db.tsqueryexact1 call sitevia direct-call?Pulls ininsertused here?queryused here?Orderused here?validateIdused here?What carries it1 entryWhat holds this up: the callers, and whether the outside world can reach it directly.registerOrderRoutesorders.ts:10exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "listUsers": {
+      "picked": true,
+      "file": "src/services/userService.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1292,
+          "text": "What happens here, and why does it matter to you?listUsers is a function spanning 3 lines in userService.ts, from line 18 through line 20.listUsers leans on shared names declared outside its own lines: User.3 callers reach listUsers: userService test, registerUserRoutes, and createUser.listUsers is a function. listUsers hands work to 1 other piece of code: query. The index records no stopping error for listUsers.The parts it leans on, in the order they come up:queryNobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.1 test calls this, so a change here would be noticed.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-chip",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1486,
+          "text": "In what order does it happen, and why?listUsers is a function spanning 3 lines in userService.ts, from line 18 through line 20.listUsers leans on shared names declared outside its own lines: User.3 callers reach listUsers: userService test, registerUserRoutes, and createUser.listUsers is a function. listUsers hands work to 1 other piece of code: query. The index records no stopping error for listUsers.These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.1First it hands work to query (db.ts:17).Words used above, once each:call sitea place in this code where it hands work to another piece of code. The index records where each one is and what it points at.callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.test callera caller that lives in test code. It is how CodeAtlas answers \"is this checked\", because this index records no test relation of its own for TypeScript.This symbol raises no error type that the index recorded.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-step",
+            "codeatlas-twin-steps",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 2047,
+          "text": "What is actually written here?listUsers is a function spanning 3 lines in userService.ts, from line 18 through line 20.listUsers leans on shared names declared outside its own lines: User.3 callers reach listUsers: userService test, registerUserRoutes, and createUser.Purposeinferred?Function listUsers in userService.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.Steps?19querydb.ts:17?Called by?test/userService.test.tstestuserService.test.ts:9?registerUserRoutesusers.ts:10?createUseruserService.ts:29?DATAState and config?Uses typesUser?DATAPulls ininferred7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.ERRORSError paths?This symbol raises no error type that the index recorded.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?1 test callertest/userService.test.tsuserService.test.ts:9?Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-errors",
+            "codeatlas-twin-note-imports",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-step",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-imports",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-text-tests",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1603,
+          "text": "What does this cost you?listUsers is a function spanning 3 lines in userService.ts, from line 18 through line 20.listUsers leans on shared names declared outside its own lines: User.3 callers reach listUsers: userService test, registerUserRoutes, and createUser.How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.What is unchecked1 place to checkWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.test/userService.test.tsuserService.test.ts:9?Who depends on it3 places to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.test/userService.test.tstestuserService.test.ts:9?registerUserRoutesusers.ts:10?createUseruserService.ts:29?What moves with a change9 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.Steps19querydb.ts:17?State and configUser?Pulls ininsertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3304,
+          "text": "What does this sit on, and where does our knowledge end?listUsers is a function spanning 3 lines in userService.ts, from line 18 through line 20.listUsers leans on shared names declared outside its own lines: User.3 callers reach listUsers: userService test, registerUserRoutes, and createUser.What it sits on8 entriesThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.repo/db.tsqueryexact1 call sitevia direct-call?Pulls ininsertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?What carries it3 entriesWhat holds this up: the callers, and whether the outside world can reach it directly.test/userService.test.tstestuserService.test.ts:9exact1 citation?registerUserRoutesusers.ts:10exact1 citation?createUseruserService.ts:29exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "query": {
+      "picked": true,
+      "file": "src/repo/db.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1230,
+          "text": "What happens here, and why does it matter to you?query is a function spanning 12 lines in db.ts. The index resolves no outgoing calls from this symbol.query leans on shared names declared outside its own lines: Row and rows.3 callers reach query: getOrder, listUsers, and hotspotScan.query is a function. The index records no outgoing call and stopping error for query.Nobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.Nothing that looks like a test calls this, so no automatic check would notice a change here.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1239,
+          "text": "In what order does it happen, and why?query is a function spanning 12 lines in db.ts. The index resolves no outgoing calls from this symbol.query leans on shared names declared outside its own lines: Row and rows.3 callers reach query: getOrder, listUsers, and hotspotScan.query is a function. The index records no outgoing call and stopping error for query.The index resolves no outgoing calls from this symbol, so it records no call order to walk through. This is only the boundary of the resolved-call reading.Words used above, once each:callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.This symbol calls nothing that the index resolved.This symbol raises no error type that the index recorded.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 1915,
+          "text": "What is actually written here?query is a function spanning 12 lines in db.ts. The index resolves no outgoing calls from this symbol.query leans on shared names declared outside its own lines: Row and rows.3 callers reach query: getOrder, listUsers, and hotspotScan.Purposeinferred?Function query in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.Steps?This symbol calls nothing that the index resolved.Called by?getOrderorderService.ts:11?listUsersuserService.ts:19?hotspotScandb.ts:44?DATAState and config?Uses typesRow?rows?DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.ERRORSError paths?This symbol raises no error type that the index recorded.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.Risksinferred?query is called from 3 places and no test caller was found, so a change here is unverified everywhere it is used.medium?Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-errors",
+            "codeatlas-twin-empty-imports",
+            "codeatlas-twin-empty-steps",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-risks",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1596,
+          "text": "What does this cost you?query is a function spanning 12 lines in db.ts. The index resolves no outgoing calls from this symbol.query leans on shared names declared outside its own lines: Row and rows.3 callers reach query: getOrder, listUsers, and hotspotScan.How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it3 places to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.getOrderorderService.ts:11?listUsersuserService.ts:19?hotspotScandb.ts:44?What moves with a change2 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.State and configRow?rows?query is called from 3 places and no test caller was found, so a change here is unverified everywhere it is used.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3212,
+          "text": "What does this sit on, and where does our knowledge end?query is a function spanning 12 lines in db.ts. The index resolves no outgoing calls from this symbol.query leans on shared names declared outside its own lines: Row and rows.3 callers reach query: getOrder, listUsers, and hotspotScan.What it sits onThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.This sits on nothing the index could resolve: no call from here reaches a file it knows. That is either a leaf or an unresolved edge, and the limits below say which of the two this index can tell apart.What carries it3 entriesWhat holds this up: the callers, and whether the outside world can reach it directly.getOrderorderService.ts:11exact1 citation?listUsersuserService.ts:19exact1 citation?hotspotScandb.ts:44exact1 citation?What it owes1 entryWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.query is called from 3 places and no test caller was found, so a change here is unverified everywhere it is used.medium?Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "toUser": {
+      "picked": true,
+      "file": "src/services/userService.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1217,
+          "text": "What happens here, and why does it matter to you?toUser is a function spanning 7 lines in userService.ts. The index resolves no outgoing calls from this symbol.toUser leans on shared names declared outside its own lines: Row and User.1 callers reach toUser: createUser.toUser is a function. The index records no outgoing call and stopping error for toUser.Nobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.Nothing that looks like a test calls this, so no automatic check would notice a change here.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1226,
+          "text": "In what order does it happen, and why?toUser is a function spanning 7 lines in userService.ts. The index resolves no outgoing calls from this symbol.toUser leans on shared names declared outside its own lines: Row and User.1 callers reach toUser: createUser.toUser is a function. The index records no outgoing call and stopping error for toUser.The index resolves no outgoing calls from this symbol, so it records no call order to walk through. This is only the boundary of the resolved-call reading.Words used above, once each:callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.This symbol calls nothing that the index resolved.This symbol raises no error type that the index recorded.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 2027,
+          "text": "What is actually written here?toUser is a function spanning 7 lines in userService.ts. The index resolves no outgoing calls from this symbol.toUser leans on shared names declared outside its own lines: Row and User.1 callers reach toUser: createUser.Purposeinferred?Function toUser in userService.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.Steps?This symbol calls nothing that the index resolved.Called by?createUseruserService.ts:35?DATAState and config?Uses typesRow?User?DATAPulls ininferred7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.ERRORSError paths?This symbol raises no error type that the index recorded.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-errors",
+            "codeatlas-twin-empty-steps",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-note-imports",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-imports",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1554,
+          "text": "What does this cost you?toUser is a function spanning 7 lines in userService.ts. The index resolves no outgoing calls from this symbol.toUser leans on shared names declared outside its own lines: Row and User.1 callers reach toUser: createUser.How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it1 place to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.createUseruserService.ts:35?What moves with a change9 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.State and configRow?User?Pulls ininsertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3127,
+          "text": "What does this sit on, and where does our knowledge end?toUser is a function spanning 7 lines in userService.ts. The index resolves no outgoing calls from this symbol.toUser leans on shared names declared outside its own lines: Row and User.1 callers reach toUser: createUser.What it sits on7 entriesThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.Pulls ininsertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?What carries it1 entryWhat holds this up: the callers, and whether the outside world can reach it directly.createUseruserService.ts:35exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "insert": {
+      "picked": true,
+      "file": "src/repo/db.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1219,
+          "text": "What happens here, and why does it matter to you?insert is a function spanning 4 lines in db.ts. The index resolves no outgoing calls from this symbol.insert leans on shared names declared outside its own lines: Row and rows.2 callers reach insert: createUser and create.insert is a function. The index records no outgoing call and stopping error for insert.Nobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.Nothing that looks like a test calls this, so no automatic check would notice a change here.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1228,
+          "text": "In what order does it happen, and why?insert is a function spanning 4 lines in db.ts. The index resolves no outgoing calls from this symbol.insert leans on shared names declared outside its own lines: Row and rows.2 callers reach insert: createUser and create.insert is a function. The index records no outgoing call and stopping error for insert.The index resolves no outgoing calls from this symbol, so it records no call order to walk through. This is only the boundary of the resolved-call reading.Words used above, once each:callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.This symbol calls nothing that the index resolved.This symbol raises no error type that the index recorded.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 1748,
+          "text": "What is actually written here?insert is a function spanning 4 lines in db.ts. The index resolves no outgoing calls from this symbol.insert leans on shared names declared outside its own lines: Row and rows.2 callers reach insert: createUser and create.Purposeinferred?Function insert in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.Steps?This symbol calls nothing that the index resolved.Called by?createUseruserService.ts:30?createorderService.ts:33?DATAState and config?Uses typesRow?rows?DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.ERRORSError paths?This symbol raises no error type that the index recorded.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-errors",
+            "codeatlas-twin-empty-imports",
+            "codeatlas-twin-empty-steps",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1449,
+          "text": "What does this cost you?insert is a function spanning 4 lines in db.ts. The index resolves no outgoing calls from this symbol.insert leans on shared names declared outside its own lines: Row and rows.2 callers reach insert: createUser and create.How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it2 places to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.createUseruserService.ts:30?createorderService.ts:33?What moves with a change2 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.State and configRow?rows?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3231,
+          "text": "What does this sit on, and where does our knowledge end?insert is a function spanning 4 lines in db.ts. The index resolves no outgoing calls from this symbol.insert leans on shared names declared outside its own lines: Row and rows.2 callers reach insert: createUser and create.What it sits onThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.This sits on nothing the index could resolve: no call from here reaches a file it knows. That is either a leaf or an unresolved edge, and the limits below say which of the two this index can tell apart.What carries it2 entriesWhat holds this up: the callers, and whether the outside world can reach it directly.createUseruserService.ts:30exact1 citation?createorderService.ts:33exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "hotspotScan": {
+      "picked": true,
+      "file": "src/repo/db.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1262,
+          "text": "What happens here, and why does it matter to you?hotspotScan is a function spanning 15 lines in db.ts, from line 39 through line 53.hotspotScan leans on shared names declared outside its own lines: Row and table.hotspotScan is a function. hotspotScan hands work to 1 other piece of code: query. The index records no stopping error for hotspotScan.The parts it leans on, in the order they come up:queryNobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.Nothing that looks like a test calls this, so no automatic check would notice a change here.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-chip",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1293,
+          "text": "In what order does it happen, and why?hotspotScan is a function spanning 15 lines in db.ts, from line 39 through line 53.hotspotScan leans on shared names declared outside its own lines: Row and table.hotspotScan is a function. hotspotScan hands work to 1 other piece of code: query. The index records no stopping error for hotspotScan.These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.1First it hands work to query (db.ts:17).Words used above, once each:call sitea place in this code where it hands work to another piece of code. The index records where each one is and what it points at.No caller of this symbol appears in what the index resolved.This symbol raises no error type that the index recorded.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-step",
+            "codeatlas-twin-steps",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 1667,
+          "text": "What is actually written here?hotspotScan is a function spanning 15 lines in db.ts, from line 39 through line 53.hotspotScan leans on shared names declared outside its own lines: Row and table.Purposeinferred?Function hotspotScan in db.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.Steps?44querydb.ts:17?Called by?No caller of this symbol appears in what the index resolved.DATAState and config?Uses typesRow?table?DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.ERRORSError paths?This symbol raises no error type that the index recorded.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-callers",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-errors",
+            "codeatlas-twin-empty-imports",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-step",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1494,
+          "text": "What does this cost you?hotspotScan is a function spanning 15 lines in db.ts, from line 39 through line 53.hotspotScan leans on shared names declared outside its own lines: Row and table.How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on itEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.Nothing in the indexed workspace calls this. Either it is reached from outside the index, or it is dead, and the index cannot tell you which of the two.What moves with a change3 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.Steps44querydb.ts:17?State and configRow?table?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3112,
+          "text": "What does this sit on, and where does our knowledge end?hotspotScan is a function spanning 15 lines in db.ts, from line 39 through line 53.hotspotScan leans on shared names declared outside its own lines: Row and table.What it sits on1 entryThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.repo/db.tsqueryexact1 call sitevia direct-call?What carries itWhat holds this up: the callers, and whether the outside world can reach it directly.Nothing carries this: no recorded caller, and nothing marking it as reachable from outside. A symbol with no carrier is either an entry the index cannot see or a piece nobody uses.What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    },
+    "validateUser": {
+      "picked": true,
+      "file": "src/util/validate.ts",
+      "levels": {
+        "vibe coder": {
+          "chars": 1337,
+          "text": "What happens here, and why does it matter to you?validateUser is a function spanning 12 lines in validate.ts, from line 19 through line 30.validateUser leans on shared names declared outside its own lines: UserInput.1 callers reach validateUser: createUser.validateUser is a function. validateUser hands work to 1 other piece of code: ValidationError. validateUser can stop with 1 kind of error: ValidationError.The parts it leans on, in the order they come up:ValidationErrorNobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.Nothing that looks like a test calls this, so no automatic check would notice a change here.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-chip",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-prose",
+            "codeatlas-twin-question",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "junior": {
+          "chars": 1523,
+          "text": "In what order does it happen, and why?validateUser is a function spanning 12 lines in validate.ts, from line 19 through line 30.validateUser leans on shared names declared outside its own lines: UserInput.1 callers reach validateUser: createUser.validateUser is a function. validateUser hands work to 1 other piece of code: ValidationError. validateUser can stop with 1 kind of error: ValidationError.These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.1First it hands work to ValidationError (validate.ts:4).Words used above, once each:call sitea place in this code where it hands work to another piece of code. The index records where each one is and what it points at.callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.raisestopping with an error instead of returning a result. The index records which error types can leave this symbol, not where they are caught.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-guided",
+            "codeatlas-twin-note",
+            "codeatlas-twin-paragraph",
+            "codeatlas-twin-question",
+            "codeatlas-twin-step",
+            "codeatlas-twin-steps",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-term",
+            "codeatlas-twin-terms",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "medior": {
+          "chars": 1789,
+          "text": "What is actually written here?validateUser is a function spanning 12 lines in validate.ts, from line 19 through line 30.validateUser leans on shared names declared outside its own lines: UserInput.1 callers reach validateUser: createUser.Purposeinferred?Function validateUser in validate.ts. Makes 1 call, touches 0 environment values, can raise 1 error type.Steps?28ValidationErrornewvalidate.ts:4?Called by?createUseruserService.ts:24?DATAState and config?Uses typesUserInput?DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.ERRORSError paths?ValidationErrorvalidate.ts:4?Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-block-data",
+            "codeatlas-twin-block-effects",
+            "codeatlas-twin-block-errors",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-empty-effects",
+            "codeatlas-twin-empty-imports",
+            "codeatlas-twin-empty-tests",
+            "codeatlas-twin-note-errors",
+            "codeatlas-twin-question",
+            "codeatlas-twin-row",
+            "codeatlas-twin-section-callers",
+            "codeatlas-twin-section-changes",
+            "codeatlas-twin-section-effects",
+            "codeatlas-twin-section-errors",
+            "codeatlas-twin-section-imports",
+            "codeatlas-twin-section-purpose",
+            "codeatlas-twin-section-runtime",
+            "codeatlas-twin-section-state",
+            "codeatlas-twin-section-steps",
+            "codeatlas-twin-section-tests",
+            "codeatlas-twin-state-marker",
+            "codeatlas-twin-step",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-text-purpose",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "senior": {
+          "chars": 1304,
+          "text": "What does this cost you?validateUser is a function spanning 12 lines in validate.ts, from line 19 through line 30.validateUser leans on shared names declared outside its own lines: UserInput.1 callers reach validateUser: createUser.How it can fail1 place to checkThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.ValidationErrorvalidate.ts:4?What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it1 place to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.createUseruserService.ts:24?What moves with a change2 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.Steps28ValidationErrornewvalidate.ts:4?State and configUserInput?built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-depends",
+            "codeatlas-twin-reader-fails",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-moves",
+            "codeatlas-twin-reader-unchecked",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        },
+        "architect": {
+          "chars": 3044,
+          "text": "What does this sit on, and where does our knowledge end?validateUser is a function spanning 12 lines in validate.ts, from line 19 through line 30.validateUser leans on shared names declared outside its own lines: UserInput.1 callers reach validateUser: createUser.What it sits on1 entryThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.util/validate.tsValidationErrorexact1 call sitevia construction?What carries it1 entryWhat holds this up: the callers, and whether the outside world can reach it directly.createUseruserService.ts:24exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops10 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.built from indexed facts and cited source lines.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+          "namesSymbol": true,
+          "marks": [
+            "codeatlas-evidence-btn",
+            "codeatlas-row-confidence",
+            "codeatlas-twin-built-provenance",
+            "codeatlas-twin-context-line",
+            "codeatlas-twin-limit",
+            "codeatlas-twin-limits",
+            "codeatlas-twin-note",
+            "codeatlas-twin-question",
+            "codeatlas-twin-reader-carried-by",
+            "codeatlas-twin-reader-debts",
+            "codeatlas-twin-reader-lead",
+            "codeatlas-twin-reader-limits",
+            "codeatlas-twin-reader-sits-on",
+            "codeatlas-twin-reader-weight",
+            "codeatlas-twin-row",
+            "codeatlas-twin-subject-line",
+            "codeatlas-twin-voice",
+            "codeatlas-twin-voice-note"
+          ]
+        }
+      }
+    }
+  },
+  "comparedWithNameMasked": true,
+  "identicalGroups": [],
+  "distinctTexts": 40,
+  "textsBeforeMeasured": 40,
+  "distinctTextsBefore": 36,
+  "nameInBody": 40,
+  "leafLeadsPositive": true,
+  "leafLeads": [
+    {
+      "symbol": "query",
+      "text": "query is a function spanning 12 lines in db.ts. The index resolves no outgoing calls from this symbol."
+    },
+    {
+      "symbol": "toUser",
+      "text": "toUser is a function spanning 7 lines in userService.ts. The index resolves no outgoing calls from this symbol."
+    },
+    {
+      "symbol": "insert",
+      "text": "insert is a function spanning 4 lines in db.ts. The index resolves no outgoing calls from this symbol."
+    }
+  ],
+  "negationsPerLeaf": 1,
+  "sharedStateNamed": true,
+  "callersNamed": 3,
+  "facetsAllRemove": true,
+  "facets": [
+    {
+      "label": "Logic",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    },
+    {
+      "label": "Calls",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    },
+    {
+      "label": "Data",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    },
+    {
+      "label": "Errors",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    },
+    {
+      "label": "Tests",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    },
+    {
+      "label": "Runtime",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    },
+    {
+      "label": "Changes",
+      "shown": true,
+      "removesSomething": true,
+      "restores": true
+    }
+  ],
+  "noEmptyDiagram": true,
+  "neverBlankOverlay": true,
+  "flows": {
+    "query": {
+      "steps": 0,
+      "svgBoxes": 0,
+      "pagerButtons": 0,
+      "reason": "The index records no call out of this symbol, so there is no sequence to draw. That is a statement about the index, not about the code."
+    },
+    "toUser": {
+      "steps": 0,
+      "svgBoxes": 0,
+      "pagerButtons": 0,
+      "reason": "The index records no call out of this symbol, so there is no sequence to draw. That is a statement about the index, not about the code."
+    },
+    "insert": {
+      "steps": 0,
+      "svgBoxes": 0,
+      "pagerButtons": 0,
+      "reason": "The index records no call out of this symbol, so there is no sequence to draw. That is a statement about the index, not about the code."
+    },
+    "createUser": {
+      "steps": 11,
+      "svgBoxes": 8,
+      "pagerButtons": 2,
+      "reason": ""
+    }
+  },
+  "importFindingIsFileLevel": true,
+  "importReadings": {
+    "getOrder": {
+      "entries": 4,
+      "findings": 0,
+      "text": "What this file pulls in: every name here is linked to a symbol in this fileuses insert from ../repo/dbused hereuses query from ../repo/dbused hereuses Order from ../typesused hereuses validateId from ../util/validateused here4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+    },
+    "toUser": {
+      "entries": 7,
+      "findings": 0,
+      "text": "What this file pulls in: every name here is linked to a symbol in this fileuses insert from ../repo/dbused hereuses query from ../repo/dbused hereuses Row from ../repo/dbused hereuses UserEntity from ../typesused hereuses User from ../typesused hereuses ValidationError from ../util/validateused hereuses validateUser from ../util/validateused here7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+    },
+    "unusedProbe": {
+      "symbol": "registerOrderRoutes",
+      "importName": "insert",
+      "sourceImportCount": 1,
+      "sourceUseCount": 0,
+      "entries": 5,
+      "findings": 1,
+      "text": "What this file pulls in: 1 name not used anywhere in this file as far as the index showsuses getOrder from ../services/orderServiceused hereinsert from ../repo/db: imported here, not used anywhere in this file as far as the index showsnot used hereuses HttpRequest from ../typesused hereuses HttpResponse from ../typesused hereuses Router from ../typesused here4 used in this file, 1 not used in it, 0 that CodeAtlas cannot check."
+    }
+  },
+  "selfRelativisingNote": false,
+  "menusDoNotOverlap": true,
+  "everyTargetStillReachable": true,
+  "shortcutsStillWork": true,
+  "helpText": "CODEATLAS HELPa reading surface over an indexed repository[esc] closeWhat this isCodeAtlasWeb reads a repository that the analysis server has indexed and explains it: the tree and the source, a twin of the symbol under the caret, a walk along the calls, the scope of a change, and the answers of a local model.Everything on this screen comes from that index or from a file the server handed over, and every panel says which of the two it is.What it cannot doThe reader is read-only: you cannot edit a file here, and what you type into it changes nothing.It cannot run code, and there is no terminal: no build, no test run, no shell, no process started from this window.It reaches no cloud. The only model it can use is a sidecar on this machine, started by hand, and it stays off until it answers.That is the shape of the product and not a missing release: this surface has no backend of its own, and the analysis server offers a read-only surface. Everything that writes, builds or executes happens where the repository lives, on the command line.The panels, and what each one answersexplorer and readerwhat is in this project, and what does this file saytwinwhat does the symbol under the caret hold, call, raise and touchflowin what order does this symbol call what it calls[w]hy am I herewhere do I start, and what is the walk from there[b]ug hunthow does the expected path into a symbol differ from the observed one[c]hange scopewhat would a change here reach, and what covers it[a]tlaswhere does this symbol sit among the others[l]ocal llmis a local model answering, and out of which context[s]ettingswhich model in your cache answers, how to get another one, and what the drawing of the graph costs on this machinecommand linewhich symbol means this: the words are matched against symbol names and their paths while you type. A line that ends with a question mark builds an answer from indexed cards and their source lines. Use the visible AI button on that answer only if you want an optional local-model wording. This line runs no commands.Every key this window listens tokeywhere it countswhat it doesalt+aanywhere, also while you typeshow or hide the galaxyalt+wanywhere, also while you typeask again where to start, and walk from therealt+banywhere, also while you typeopen the BUG hunt on the symbol in the twinalt+canywhere, also while you typeopen the change scopealt+lanywhere, also while you typeturn the local model on or offalt+ranywhere, also while you typeput every zone back to the width and height it starts withalt+sanywhere, also while you typeopen or close the settings: the model, and what the drawing costsalt+ganywhere, also while you typeturn the live agent mode on or off. Off asks the bridge nothing at all?while the command line does not have the cursoropen or close this page/while the command line does not have the cursorput the cursor in the command line, without typing the slash itselfdduring a walkdraw the flow of this step, when the step has a symbolqduring a walkleave the walkenterduring a walkgo to the next step of the walk, and finish it on the last oneleftduring a walkgo back one stepenterwhile the search window is openopen the selected hit, or ask the atlas when nothing matchedescwhile the search window is openclose the search windowupwhile the search window is openmove the selection updownwhile the search window is openmove the selection downEverything else you type goes into the command line, even when nothing has the cursor: the line takes the focus and the character lands in it, where you can see it. That is why the menu keys carry alt (option on an Apple keyboard): a bare letter is text, not a command.This table is derived from the wiring itself, not written beside it: the menu keys come from the list the window handler reads, the walk and search keys from the functions that decide what a key means. A key that stopped working could not stay in this table.Test a key combinationPress a combination now, with this page open, and read below what arrived. This is not a simulation: it is the same reading the window handler makes, from the same event.physical key (code)-character produced (key)-modifiers-already consumed-consumed by-arrived at-recognised as a menu key-nothing pressed yetRunning itIndex a project with the CLI of the analysis server, then open this page with the project name in the address (?project=<name>). This window indexes nothing itself.Start the local model with llm/start.sh class-a. It listens on the loopback address of this machine; the [l]lm card turns green as soon as it answers, and says why when it does not.Bring recorded runs in with ingest_traces on the command line. There is no importer on this surface, and the twin does not carry them: they show up on the BUG hunt hops and in the flow.The rules this surface holds itself toEvery claim comes from the index or from the file the server sent, and the panel names which.What the index does not record is named as a gap, never filled in with a plausible guess.An affordance that does nothing does not exist here: a button or a key either acts, or it is not on the screen.Where to read further, in this repositoryPLAN.mdthe plan this surface was built against, and its honesty rulesINVENTAR.mdwhat the analysis server delivers, and what it does notUPSTREAM-ASKS.mdthe gaps that were handed back to the serverdocs/adr/0001-modellwahl.mdwhy this local model and no otherverification/the proof runs: screenshots, measurements, gate reportsPaths in this repository, not links. This window is offline by design, so a link into the web would be a button that leads nowhere.",
+  "topBar": [
+    "atlas",
+    "why am I here",
+    "reset layout",
+    "local llm off",
+    "settings",
+    "g live agents off",
+    "?help"
+  ],
+  "tabBar": [
+    "flow",
+    "walk",
+    "chat",
+    "bug hunt",
+    "change scope"
+  ],
+  "menuOverlap": [],
+  "unreachable": [],
+  "noTokenLineWithoutCards": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "port": 4681,
+  "leftoverProcesses": 0,
+  "screenshotReadings": {
+    "leaf-vibe.png": {
+      "symbol": "query",
+      "level": "vibe coder",
+      "expectedLevel": "vibe coder",
+      "steps": 0,
+      "visibleTooltips": 0
+    },
+    "leaf-junior.png": {
+      "symbol": "query",
+      "level": "junior",
+      "expectedLevel": "junior",
+      "steps": 0,
+      "visibleTooltips": 0
+    }
+  },
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "ports": {
+      "serverPort": 4680,
+      "uiPort": 4681
+    },
+    "imports": {
+      "getOrder": {
+        "entries": 4,
+        "findings": 0,
+        "text": "What this file pulls in: every name here is linked to a symbol in this fileuses insert from ../repo/dbused hereuses query from ../repo/dbused hereuses Order from ../typesused hereuses validateId from ../util/validateused here4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+      },
+      "toUser": {
+        "entries": 7,
+        "findings": 0,
+        "text": "What this file pulls in: every name here is linked to a symbol in this fileuses insert from ../repo/dbused hereuses query from ../repo/dbused hereuses Row from ../repo/dbused hereuses UserEntity from ../typesused hereuses User from ../typesused hereuses ValidationError from ../util/validateused hereuses validateUser from ../util/validateused here7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+      },
+      "unusedProbe": {
+        "symbol": "registerOrderRoutes",
+        "importName": "insert",
+        "sourceImportCount": 1,
+        "sourceUseCount": 0,
+        "entries": 5,
+        "findings": 1,
+        "text": "What this file pulls in: 1 name not used anywhere in this file as far as the index showsuses getOrder from ../services/orderServiceused hereinsert from ../repo/db: imported here, not used anywhere in this file as far as the index showsnot used hereuses HttpRequest from ../typesused hereuses HttpResponse from ../typesused hereuses Router from ../typesused here4 used in this file, 1 not used in it, 0 that CodeAtlas cannot check."
+      }
+    },
+    "facetRuns": [
+      {
+        "symbol": "createUser",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "createUser",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:2 callers reach createUser: registerUserRoutes and create.",
+          "codeatlas-twin-row:createuserService.ts:41?",
+          "codeatlas-twin-row:registerUserRoutesusers.ts:15?",
+          "codeatlas-twin-section-callers:Called by?registerUserRoutesusers.ts:15?createuserService.ts:41?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "createUser",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:createUser leans on shared names declared outside its own lines: User.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-note-imports:The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-row:DB_URL?",
+          "codeatlas-twin-row:Rowused here?",
+          "codeatlas-twin-row:User?",
+          "codeatlas-twin-row:UserEntityused here?",
+          "codeatlas-twin-row:Userused here?",
+          "codeatlas-twin-row:ValidationErrorused here?",
+          "codeatlas-twin-row:insertused here?",
+          "codeatlas-twin-row:queryused here?",
+          "codeatlas-twin-row:validateUserused here?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferred7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-section-state:DATAState and config?Reads from the environmentDB_URL?Uses typesUser?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded",
+          "codeatlas-twin-text-imports:7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "createUser",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-note-errors:Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.",
+          "codeatlas-twin-row:ValidationErrorvalidate.ts:4?",
+          "codeatlas-twin-section-errors:ERRORSError paths?ValidationErrorvalidate.ts:4?Where these are handled is not visible to the index: it records where an error is raised, not where it is caught."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "createUser",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "createUser",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "createUser",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function getOrder in orderService.ts. Makes 2 calls, touches 0 environment values, can raise 0 error types.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function getOrder in orderService.ts. Makes 2 calls, touches 0 environment values, can raise 0 error types."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:1 callers reach getOrder: registerOrderRoutes.",
+          "codeatlas-twin-row:registerOrderRoutesorders.ts:10?",
+          "codeatlas-twin-section-callers:Called by?registerOrderRoutesorders.ts:10?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:getOrder leans on shared names declared outside its own lines: Order.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-note-imports:The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-row:Order?",
+          "codeatlas-twin-row:Orderused here?",
+          "codeatlas-twin-row:insertused here?",
+          "codeatlas-twin-row:queryused here?",
+          "codeatlas-twin-row:validateIdused here?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferred4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Orderused here?validateIdused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesOrder?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded",
+          "codeatlas-twin-text-imports:4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-empty-errors:This symbol raises no error type that the index recorded.",
+          "codeatlas-twin-section-errors:ERRORSError paths?This symbol raises no error type that the index recorded."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "getOrder",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function listUsers in userService.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function listUsers in userService.ts. Makes 1 call, touches 0 environment values, can raise 0 error types."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:3 callers reach listUsers: userService test, registerUserRoutes, and createUser.",
+          "codeatlas-twin-row:createUseruserService.ts:29?",
+          "codeatlas-twin-row:registerUserRoutesusers.ts:10?",
+          "codeatlas-twin-row:test/userService.test.tstestuserService.test.ts:9?",
+          "codeatlas-twin-section-callers:Called by?test/userService.test.tstestuserService.test.ts:9?registerUserRoutesusers.ts:10?createUseruserService.ts:29?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:listUsers leans on shared names declared outside its own lines: User.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-note-imports:The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-row:Rowused here?",
+          "codeatlas-twin-row:User?",
+          "codeatlas-twin-row:UserEntityused here?",
+          "codeatlas-twin-row:Userused here?",
+          "codeatlas-twin-row:ValidationErrorused here?",
+          "codeatlas-twin-row:insertused here?",
+          "codeatlas-twin-row:queryused here?",
+          "codeatlas-twin-row:validateUserused here?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferred7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesUser?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded",
+          "codeatlas-twin-text-imports:7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-empty-errors:This symbol raises no error type that the index recorded.",
+          "codeatlas-twin-section-errors:ERRORSError paths?This symbol raises no error type that the index recorded."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-row:test/userService.test.tsuserService.test.ts:9?",
+          "codeatlas-twin-section-tests:Testsinferred?1 test callertest/userService.test.tsuserService.test.ts:9?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-tests:1 test caller"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "listUsers",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function query in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function query in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:3 callers reach query: getOrder, listUsers, and hotspotScan.",
+          "codeatlas-twin-row:getOrderorderService.ts:11?",
+          "codeatlas-twin-row:hotspotScandb.ts:44?",
+          "codeatlas-twin-row:listUsersuserService.ts:19?",
+          "codeatlas-twin-section-callers:Called by?getOrderorderService.ts:11?listUsersuserService.ts:19?hotspotScandb.ts:44?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:query leans on shared names declared outside its own lines: Row and rows.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-empty-imports:The index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-row:Row?",
+          "codeatlas-twin-row:rows?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesRow?rows?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-empty-errors:This symbol raises no error type that the index recorded.",
+          "codeatlas-twin-section-errors:ERRORSError paths?This symbol raises no error type that the index recorded."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "query",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function toUser in userService.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function toUser in userService.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:1 callers reach toUser: createUser.",
+          "codeatlas-twin-row:createUseruserService.ts:35?",
+          "codeatlas-twin-section-callers:Called by?createUseruserService.ts:35?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:toUser leans on shared names declared outside its own lines: Row and User.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-note-imports:The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-row:Row?",
+          "codeatlas-twin-row:Rowused here?",
+          "codeatlas-twin-row:User?",
+          "codeatlas-twin-row:UserEntityused here?",
+          "codeatlas-twin-row:Userused here?",
+          "codeatlas-twin-row:ValidationErrorused here?",
+          "codeatlas-twin-row:insertused here?",
+          "codeatlas-twin-row:queryused here?",
+          "codeatlas-twin-row:validateUserused here?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferred7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.insertused here?queryused here?Rowused here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesRow?User?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded",
+          "codeatlas-twin-text-imports:7 used in this file, 0 not used in it, 0 that CodeAtlas cannot check."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-empty-errors:This symbol raises no error type that the index recorded.",
+          "codeatlas-twin-section-errors:ERRORSError paths?This symbol raises no error type that the index recorded."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "toUser",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function insert in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function insert in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:2 callers reach insert: createUser and create.",
+          "codeatlas-twin-row:createUseruserService.ts:30?",
+          "codeatlas-twin-row:createorderService.ts:33?",
+          "codeatlas-twin-section-callers:Called by?createUseruserService.ts:30?createorderService.ts:33?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:insert leans on shared names declared outside its own lines: Row and rows.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-empty-imports:The index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-row:Row?",
+          "codeatlas-twin-row:rows?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesRow?rows?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-empty-errors:This symbol raises no error type that the index recorded.",
+          "codeatlas-twin-section-errors:ERRORSError paths?This symbol raises no error type that the index recorded."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "insert",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function hotspotScan in db.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function hotspotScan in db.ts. Makes 1 call, touches 0 environment values, can raise 0 error types."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-callers:No caller of this symbol appears in what the index resolved.",
+          "codeatlas-twin-section-callers:Called by?No caller of this symbol appears in what the index resolved."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:hotspotScan leans on shared names declared outside its own lines: Row and table.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-empty-imports:The index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-row:Row?",
+          "codeatlas-twin-row:table?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesRow?table?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-empty-errors:This symbol raises no error type that the index recorded.",
+          "codeatlas-twin-section-errors:ERRORSError paths?This symbol raises no error type that the index recorded."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "hotspotScan",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Logic",
+        "facet": "logic",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-section-purpose:Purposeinferred?Function validateUser in validate.ts. Makes 1 call, touches 0 environment values, can raise 1 error type.",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-text-purpose:Function validateUser in validate.ts. Makes 1 call, touches 0 environment values, can raise 1 error type."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Calls",
+        "facet": "calls",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-context-line:1 callers reach validateUser: createUser.",
+          "codeatlas-twin-row:createUseruserService.ts:24?",
+          "codeatlas-twin-section-callers:Called by?createUseruserService.ts:24?"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Data",
+        "facet": "data",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-data:DATA",
+          "codeatlas-twin-block-effects:EFFECTS",
+          "codeatlas-twin-context-line:validateUser leans on shared names declared outside its own lines: UserInput.",
+          "codeatlas-twin-empty-effects:The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-empty-imports:The index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-row:UserInput?",
+          "codeatlas-twin-section-effects:EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "codeatlas-twin-section-imports:DATAPulls ininferredThe index records no dependency for this file and CodeAtlas found no import statement in it.",
+          "codeatlas-twin-section-state:DATAState and config?Uses typesUserInput?",
+          "codeatlas-twin-state-marker:inferred",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Errors",
+        "facet": "errors",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-block-errors:ERRORS",
+          "codeatlas-twin-note-errors:Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.",
+          "codeatlas-twin-row:ValidationErrorvalidate.ts:4?",
+          "codeatlas-twin-section-errors:ERRORSError paths?ValidationErrorvalidate.ts:4?Where these are handled is not visible to the index: it records where an error is raised, not where it is caught."
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Tests",
+        "facet": "tests",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-evidence-btn:?",
+          "codeatlas-twin-empty-tests:No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-section-tests:Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "codeatlas-twin-state-marker:inferred"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Runtime",
+        "facet": "runtime",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:This server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-section-runtime:Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      },
+      {
+        "symbol": "validateUser",
+        "label": "Changes",
+        "facet": "changes",
+        "shown": true,
+        "marksRemoved": [
+          "codeatlas-twin-row:The twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-section-changes:Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+          "codeatlas-twin-state-marker:not recorded"
+        ],
+        "removesSomething": true,
+        "restores": true
+      }
+    ]
+  }
+}

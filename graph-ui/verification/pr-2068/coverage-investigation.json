@@ -1,0 +1,6026 @@
+{
+  "project": "cbm-pr2068",
+  "status": {
+    "project": "cbm-pr2068",
+    "nodes": 40226,
+    "edges": 173902,
+    "status": "ready",
+    "root_path": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068",
+    "indexed_at": "2026-09-09T19:51:51Z",
+    "parse_partial": {
+      "files": [],
+      "count": 85,
+      "truncated": true,
+      "omitted": 85
+    },
+    "skipped": {
+      "files": [],
+      "count": 0,
+      "truncated": false
+    },
+    "not_indexed": {
+      "dirs": [],
+      "dirs_count": 9,
+      "files": [],
+      "files_count": 187,
+      "truncated": true,
+      "dirs_omitted": 9,
+      "files_omitted": 187
+    }
+  },
+  "coverage": {
+    "project": "cbm-pr2068",
+    "signal": "best_effort",
+    "indexed_at": "2026-09-09T19:51:51Z",
+    "metadata": {
+      "generation": "2026-09-09T19:51:51Z",
+      "index_mode": "full",
+      "recorded_at": "2026-09-09T19:51:52Z",
+      "recording_status": "complete",
+      "ignored_files_stored": 187,
+      "ignored_files_total": 187,
+      "hash_records_complete": true,
+      "coverage_version": 3,
+      "generation_matches": true
+    },
+    "paths": [],
+    "path_total": 0,
+    "path_returned": 0,
+    "path_has_more": false,
+    "scopes": [
+      {
+        "requested_scope": ".",
+        "scope": ".",
+        "total": 281,
+        "returned": 281,
+        "truncated": false,
+        "entries": [
+          {
+            "path": ".git",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "build",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "docs/graph-ui-screenshot.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/design/design.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/design/live-agents.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/dist",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "graph-ui/node_modules",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "graph-ui/src/galaxy/coverage-shadow-scene.test.tsx",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 10,
+                "end": 10
+              }
+            ]
+          },
+          {
+            "path": "graph-ui/src/galaxy/hierarchy-layout.ts",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 249,
+                "end": 249
+              }
+            ]
+          },
+          {
+            "path": "graph-ui/tsconfig.node.tsbuildinfo",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/tsconfig.tsbuildinfo",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/vendor",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/after-architecture-first.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/after-architecture-relationship.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/after-architecture.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/after-context-and-impact.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/after-project-readme.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/after-source-evidence.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/agents-browser-reload.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/agents-connection-interrupted.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/agents-daemon-restart.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/agents-hook-evidence.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/agents-reconnected.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/agents-source-navigation.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/before-agents.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/before-architecture.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/before-galaxy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/before-system.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/errors-after-galaxy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/errors-after-system.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/errors-local-diagnosis.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/errors-local-report.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/frontend-acceptance.log",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/map-e2e-failure.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/native-activity-tests.log",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/native-final-job-status-tests.log",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/native-full-tests.log",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/native-lint.log",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/research-archify-chapter.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/research-archify-overview.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/research-archify-route.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/research-gitnexus-entry.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/pr-2068/research-graphify-example-selected.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w0/spike.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10/settings-fetch.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10/settings-performance.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10/settings-switch.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10/settings.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10b/graph-collapsed.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10b/handles.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w10b/hierarchy-from-focus.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/cinema.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/contact-sheet.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/follow.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-01.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-02.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-03.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-04.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-05.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-06.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-07.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/orbit-08.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-01.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-02.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-03.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-04.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-05.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-06.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-07.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-08.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-09.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-10.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-11.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-12.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-13.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-14.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-15.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/frames/step-16.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/live-agents-cinema.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/live-agents-collapsed.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/live-agents-nobridge.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/live-agents.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/orbit-contact-sheet.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/timeline.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w11/trails.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/agents-fullscreen.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/agents-live.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/entry-dialog.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/explain-bug.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/explain-change.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/explain-chat-idle.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/explain-flow.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/explain-walk-idle.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/file-open.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/galaxy-collapsed.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/galaxy-legend.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/help.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/hierarchy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/llm-off.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/llm-on.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/search.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/settings-flat.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/settings.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/start.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/symbol-focus.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/twin-pseudocode.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12/states/walk-running.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w12a/command-overlay.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w13/level-architect.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w13/level-junior.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w13/level-medior.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w13/level-senior.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w13/level-vibe-coder.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w14/flow-empty.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w14/leaf-junior.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w14/leaf-vibe.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w14/menus.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w15/chat-ai.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w15/chat-off.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w15/flow-ai.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w15/twin-ai.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w2/app-chrome.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w2/reader-truncated.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w2/reader.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w2/twin-dense.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w2/twin.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w3/galaxy-focus.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w3/galaxy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w3/search.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/bugwizard-divergence.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/bugwizard-no-traces.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/explorer-coverage.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/flow.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/hierarchy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/impact.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/pseudocode.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/tour.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w4/why.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w5/chat.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w5/flow-overlay-depth0.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w5/flow-overlay.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w5/sidecar-off.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w5/sidecar-ready.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/01-app-open.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/02-explorer-expanded.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/03-explorer-coverage-legend.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/04-reader-open-file.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/05-reader-capped-file.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/06-search-overlay.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/07-twin-depth-3.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/08-twin-evidence.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/09-flow-overlay.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/10-flow-stepper.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/11-pseudocode.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/12-search-enter.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/13-twin-warm.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/14-galaxy-legend.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/14b-atlas-row-shortcuts.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/15-tour-step-1.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/16-tour-step-3.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/17-entry-dialog.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/18-entry-walk-hierarchy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/18b-tour-diagram.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/19-graph-mode-galaxy.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/20-bugwizard-no-traces.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/21-bugwizard-divergence.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/22-impact.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/23-sidecar-off.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/24-sidecar-ready.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/25-chat-answer.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/26-chat-citation.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/27-chat-cards.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w6/walk/28-sidecar-off-again.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/chat-answer.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/chat-resized.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/command.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/help.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/menu-uniform.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/menu.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/onechar.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w7/search-fast.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8/layout-custom.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8/layout-default.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8/layout-explain-large.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8b/collapse-words.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8b/flow-short.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8b/tooltip-open.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8b/twin-full.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8c/pseudocode-long.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w8c/pseudocode-short.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w9/galaxy-edges.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w9/hierarchy-edges.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "graph-ui/verification/w9/legend-filter.png",
+            "kind": "not_indexed_file",
+            "detail": "ignored-suffix"
+          },
+          {
+            "path": "internal/cbm/helpers.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 501,
+                "end": 501
+              }
+            ]
+          },
+          {
+            "path": "internal/cbm/lsp/generated/java_stdlib_data.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1329,
+                "end": 1329
+              }
+            ]
+          },
+          {
+            "path": "internal/cbm/preprocessor.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 39,
+                "end": 39
+              }
+            ]
+          },
+          {
+            "path": "internal/cbm/vendored",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "node_modules",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "pkg/chocolatey/tools/chocolateyInstall.ps1",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 9,
+                "end": 12
+              },
+              {
+                "start": 13,
+                "end": 13
+              },
+              {
+                "start": 14,
+                "end": 14
+              }
+            ]
+          },
+          {
+            "path": "private",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          },
+          {
+            "path": "scripts/ci/check-binary-composition.sh",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 228,
+                "end": 228
+              },
+              {
+                "start": 229,
+                "end": 229
+              }
+            ]
+          },
+          {
+            "path": "scripts/ci/clean-test-residue.ps1",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 39,
+                "end": 39
+              }
+            ]
+          },
+          {
+            "path": "scripts/setup-windows.ps1",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 113,
+                "end": 113
+              },
+              {
+                "start": 113,
+                "end": 113
+              },
+              {
+                "start": 245,
+                "end": 327
+              }
+            ]
+          },
+          {
+            "path": "scripts/smoke-invariants.sh",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 137,
+                "end": 137
+              }
+            ]
+          },
+          {
+            "path": "scripts/test-windows.ps1",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 109,
+                "end": 109
+              }
+            ]
+          },
+          {
+            "path": "src/cli/activation_transaction.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 208,
+                "end": 208
+              },
+              {
+                "start": 1426,
+                "end": 2331
+              }
+            ]
+          },
+          {
+            "path": "src/cli/agent_clients.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 118,
+                "end": 118
+              }
+            ]
+          },
+          {
+            "path": "src/cli/agent_profiles.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 67,
+                "end": 67
+              }
+            ]
+          },
+          {
+            "path": "src/cli/cli.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1,
+                "end": 13337
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_json_like.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 46,
+                "end": 46
+              },
+              {
+                "start": 47,
+                "end": 47
+              },
+              {
+                "start": 48,
+                "end": 48
+              },
+              {
+                "start": 49,
+                "end": 49
+              },
+              {
+                "start": 1363,
+                "end": 1363
+              },
+              {
+                "start": 1368,
+                "end": 1368
+              },
+              {
+                "start": 1373,
+                "end": 1373
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_json_like.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 155,
+                "end": 155
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_text_edit.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 49,
+                "end": 49
+              },
+              {
+                "start": 50,
+                "end": 50
+              },
+              {
+                "start": 51,
+                "end": 51
+              },
+              {
+                "start": 52,
+                "end": 52
+              },
+              {
+                "start": 53,
+                "end": 53
+              },
+              {
+                "start": 54,
+                "end": 54
+              },
+              {
+                "start": 348,
+                "end": 348
+              },
+              {
+                "start": 353,
+                "end": 353
+              },
+              {
+                "start": 358,
+                "end": 358
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_toml_edit.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 45,
+                "end": 45
+              },
+              {
+                "start": 46,
+                "end": 46
+              },
+              {
+                "start": 47,
+                "end": 47
+              },
+              {
+                "start": 48,
+                "end": 48
+              },
+              {
+                "start": 392,
+                "end": 392
+              },
+              {
+                "start": 397,
+                "end": 397
+              },
+              {
+                "start": 402,
+                "end": 402
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_toml_edit.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 107,
+                "end": 107
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_yaml_edit.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 625,
+                "end": 625
+              },
+              {
+                "start": 630,
+                "end": 630
+              },
+              {
+                "start": 635,
+                "end": 635
+              }
+            ]
+          },
+          {
+            "path": "src/cli/config_yaml_edit.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 126,
+                "end": 126
+              }
+            ]
+          },
+          {
+            "path": "src/cli/hook_augment.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 406,
+                "end": 406
+              },
+              {
+                "start": 431,
+                "end": 431
+              },
+              {
+                "start": 441,
+                "end": 441
+              },
+              {
+                "start": 531,
+                "end": 531
+              },
+              {
+                "start": 897,
+                "end": 897
+              }
+            ]
+          },
+          {
+            "path": "src/cypher/cypher.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 2308,
+                "end": 2308
+              },
+              {
+                "start": 2309,
+                "end": 2309
+              },
+              {
+                "start": 2463,
+                "end": 2463
+              },
+              {
+                "start": 2464,
+                "end": 2464
+              },
+              {
+                "start": 2598,
+                "end": 2598
+              }
+            ]
+          },
+          {
+            "path": "src/daemon/ipc.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 3365,
+                "end": 3365
+              },
+              {
+                "start": 3365,
+                "end": 3365
+              },
+              {
+                "start": 3365,
+                "end": 3365
+              },
+              {
+                "start": 3366,
+                "end": 3366
+              },
+              {
+                "start": 3366,
+                "end": 3366
+              },
+              {
+                "start": 3366,
+                "end": 3366
+              },
+              {
+                "start": 3367,
+                "end": 3367
+              },
+              {
+                "start": 3367,
+                "end": 3367
+              },
+              {
+                "start": 3368,
+                "end": 3368
+              },
+              {
+                "start": 3369,
+                "end": 3369
+              },
+              {
+                "start": 3370,
+                "end": 3370
+              },
+              {
+                "start": 3370,
+                "end": 3370
+              },
+              {
+                "start": 3370,
+                "end": 3370
+              },
+              {
+                "start": 3371,
+                "end": 3371
+              },
+              {
+                "start": 3371,
+                "end": 3371
+              },
+              {
+                "start": 3372,
+                "end": 3372
+              },
+              {
+                "start": 3373,
+                "end": 3373
+              },
+              {
+                "start": 3373,
+                "end": 3373
+              },
+              {
+                "start": 3374,
+                "end": 3374
+              },
+              {
+                "start": 3375,
+                "end": 3375
+              },
+              {
+                "start": 3375,
+                "end": 3375
+              },
+              {
+                "start": 3375,
+                "end": 3375
+              },
+              {
+                "start": 3376,
+                "end": 3376
+              },
+              {
+                "start": 3376,
+                "end": 3376
+              },
+              {
+                "start": 3376,
+                "end": 3376
+              },
+              {
+                "start": 3377,
+                "end": 3377
+              },
+              {
+                "start": 3377,
+                "end": 3377
+              },
+              {
+                "start": 3377,
+                "end": 3377
+              },
+              {
+                "start": 3378,
+                "end": 3378
+              },
+              {
+                "start": 3378,
+                "end": 3378
+              },
+              {
+                "start": 3379,
+                "end": 3379
+              },
+              {
+                "start": 3379,
+                "end": 3379
+              },
+              {
+                "start": 3379,
+                "end": 3379
+              },
+              {
+                "start": 3380,
+                "end": 3380
+              },
+              {
+                "start": 3380,
+                "end": 3380
+              },
+              {
+                "start": 3380,
+                "end": 3380
+              },
+              {
+                "start": 3381,
+                "end": 3381
+              },
+              {
+                "start": 3381,
+                "end": 3381
+              },
+              {
+                "start": 3381,
+                "end": 3381
+              },
+              {
+                "start": 3382,
+                "end": 3382
+              },
+              {
+                "start": 3382,
+                "end": 3382
+              },
+              {
+                "start": 3383,
+                "end": 3383
+              },
+              {
+                "start": 3384,
+                "end": 3384
+              },
+              {
+                "start": 3384,
+                "end": 3384
+              },
+              {
+                "start": 3384,
+                "end": 3384
+              },
+              {
+                "start": 3385,
+                "end": 3385
+              },
+              {
+                "start": 3385,
+                "end": 3385
+              },
+              {
+                "start": 3385,
+                "end": 3385
+              },
+              {
+                "start": 3386,
+                "end": 3386
+              },
+              {
+                "start": 3386,
+                "end": 3386
+              },
+              {
+                "start": 3386,
+                "end": 3386
+              },
+              {
+                "start": 3386,
+                "end": 3386
+              },
+              {
+                "start": 3387,
+                "end": 3387
+              },
+              {
+                "start": 3387,
+                "end": 3387
+              },
+              {
+                "start": 3388,
+                "end": 3388
+              },
+              {
+                "start": 3389,
+                "end": 3389
+              },
+              {
+                "start": 3390,
+                "end": 3390
+              },
+              {
+                "start": 3391,
+                "end": 3391
+              },
+              {
+                "start": 3391,
+                "end": 3391
+              },
+              {
+                "start": 3392,
+                "end": 3392
+              },
+              {
+                "start": 3392,
+                "end": 3392
+              }
+            ]
+          },
+          {
+            "path": "src/daemon/runtime.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 47,
+                "end": 47
+              }
+            ]
+          },
+          {
+            "path": "src/discover/discover.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 572,
+                "end": 572
+              }
+            ]
+          },
+          {
+            "path": "src/foundation/compat_thread.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 104,
+                "end": 104
+              },
+              {
+                "start": 104,
+                "end": 104
+              }
+            ]
+          },
+          {
+            "path": "src/foundation/log.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 280,
+                "end": 280
+              },
+              {
+                "start": 284,
+                "end": 284
+              },
+              {
+                "start": 297,
+                "end": 297
+              },
+              {
+                "start": 301,
+                "end": 301
+              },
+              {
+                "start": 327,
+                "end": 327
+              },
+              {
+                "start": 331,
+                "end": 331
+              }
+            ]
+          },
+          {
+            "path": "src/foundation/platform.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 470,
+                "end": 470
+              },
+              {
+                "start": 492,
+                "end": 492
+              },
+              {
+                "start": 525,
+                "end": 525
+              },
+              {
+                "start": 547,
+                "end": 547
+              }
+            ]
+          },
+          {
+            "path": "src/foundation/private_file_lock.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 616,
+                "end": 616
+              },
+              {
+                "start": 616,
+                "end": 616
+              },
+              {
+                "start": 616,
+                "end": 616
+              },
+              {
+                "start": 617,
+                "end": 617
+              },
+              {
+                "start": 617,
+                "end": 617
+              },
+              {
+                "start": 618,
+                "end": 618
+              },
+              {
+                "start": 619,
+                "end": 619
+              },
+              {
+                "start": 620,
+                "end": 620
+              },
+              {
+                "start": 620,
+                "end": 620
+              },
+              {
+                "start": 620,
+                "end": 620
+              },
+              {
+                "start": 621,
+                "end": 621
+              },
+              {
+                "start": 621,
+                "end": 621
+              },
+              {
+                "start": 622,
+                "end": 622
+              },
+              {
+                "start": 623,
+                "end": 623
+              },
+              {
+                "start": 623,
+                "end": 623
+              },
+              {
+                "start": 623,
+                "end": 623
+              },
+              {
+                "start": 624,
+                "end": 624
+              },
+              {
+                "start": 624,
+                "end": 624
+              },
+              {
+                "start": 624,
+                "end": 624
+              },
+              {
+                "start": 625,
+                "end": 625
+              },
+              {
+                "start": 625,
+                "end": 625
+              },
+              {
+                "start": 626,
+                "end": 626
+              },
+              {
+                "start": 626,
+                "end": 626
+              },
+              {
+                "start": 626,
+                "end": 626
+              },
+              {
+                "start": 627,
+                "end": 627
+              },
+              {
+                "start": 627,
+                "end": 627
+              },
+              {
+                "start": 628,
+                "end": 628
+              },
+              {
+                "start": 629,
+                "end": 629
+              },
+              {
+                "start": 629,
+                "end": 629
+              },
+              {
+                "start": 631,
+                "end": 631
+              },
+              {
+                "start": 632,
+                "end": 632
+              },
+              {
+                "start": 632,
+                "end": 632
+              },
+              {
+                "start": 634,
+                "end": 634
+              },
+              {
+                "start": 635,
+                "end": 635
+              },
+              {
+                "start": 635,
+                "end": 635
+              },
+              {
+                "start": 635,
+                "end": 635
+              },
+              {
+                "start": 636,
+                "end": 636
+              },
+              {
+                "start": 636,
+                "end": 636
+              },
+              {
+                "start": 636,
+                "end": 636
+              },
+              {
+                "start": 637,
+                "end": 637
+              },
+              {
+                "start": 637,
+                "end": 637
+              },
+              {
+                "start": 638,
+                "end": 638
+              },
+              {
+                "start": 638,
+                "end": 638
+              },
+              {
+                "start": 638,
+                "end": 638
+              },
+              {
+                "start": 638,
+                "end": 638
+              },
+              {
+                "start": 639,
+                "end": 639
+              }
+            ]
+          },
+          {
+            "path": "src/foundation/slab_alloc.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 118,
+                "end": 118
+              },
+              {
+                "start": 121,
+                "end": 121
+              },
+              {
+                "start": 124,
+                "end": 124
+              }
+            ]
+          },
+          {
+            "path": "src/git/git_context.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 181,
+                "end": 181
+              }
+            ]
+          },
+          {
+            "path": "src/mcp/compact_out.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1034,
+                "end": 1034
+              },
+              {
+                "start": 1042,
+                "end": 1042
+              },
+              {
+                "start": 1070,
+                "end": 1070
+              },
+              {
+                "start": 1079,
+                "end": 1079
+              },
+              {
+                "start": 1082,
+                "end": 1082
+              },
+              {
+                "start": 1110,
+                "end": 1110
+              },
+              {
+                "start": 1118,
+                "end": 1118
+              },
+              {
+                "start": 1153,
+                "end": 1153
+              },
+              {
+                "start": 1191,
+                "end": 1191
+              }
+            ]
+          },
+          {
+            "path": "src/mcp/mcp.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 185,
+                "end": 185
+              },
+              {
+                "start": 195,
+                "end": 195
+              },
+              {
+                "start": 4216,
+                "end": 4216
+              },
+              {
+                "start": 4362,
+                "end": 4362
+              },
+              {
+                "start": 6510,
+                "end": 6510
+              },
+              {
+                "start": 6586,
+                "end": 6586
+              },
+              {
+                "start": 7328,
+                "end": 7328
+              },
+              {
+                "start": 7969,
+                "end": 7969
+              },
+              {
+                "start": 8549,
+                "end": 8549
+              },
+              {
+                "start": 9767,
+                "end": 9767
+              },
+              {
+                "start": 11964,
+                "end": 11964
+              },
+              {
+                "start": 14848,
+                "end": 14848
+              },
+              {
+                "start": 14850,
+                "end": 14850
+              },
+              {
+                "start": 14852,
+                "end": 14852
+              },
+              {
+                "start": 16738,
+                "end": 16738
+              },
+              {
+                "start": 17140,
+                "end": 17140
+              },
+              {
+                "start": 17153,
+                "end": 17153
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/artifact.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 61,
+                "end": 61
+              },
+              {
+                "start": 64,
+                "end": 64
+              },
+              {
+                "start": 65,
+                "end": 65
+              },
+              {
+                "start": 76,
+                "end": 76
+              },
+              {
+                "start": 77,
+                "end": 77
+              },
+              {
+                "start": 635,
+                "end": 635
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_calls.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 83,
+                "end": 83
+              },
+              {
+                "start": 84,
+                "end": 84
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_complexity.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 34,
+                "end": 34
+              },
+              {
+                "start": 35,
+                "end": 35
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_cross_repo.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 96,
+                "end": 96
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_definitions.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 108,
+                "end": 108
+              },
+              {
+                "start": 109,
+                "end": 109
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_githistory.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 36,
+                "end": 36
+              },
+              {
+                "start": 37,
+                "end": 37
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_importance.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 99,
+                "end": 99
+              },
+              {
+                "start": 100,
+                "end": 100
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_k8s.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 70,
+                "end": 70
+              },
+              {
+                "start": 71,
+                "end": 71
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_lsp_cross.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 53,
+                "end": 53
+              },
+              {
+                "start": 54,
+                "end": 54
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_parallel.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 334,
+                "end": 334
+              },
+              {
+                "start": 335,
+                "end": 335
+              },
+              {
+                "start": 1413,
+                "end": 1413
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_pkgmap.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 86,
+                "end": 86
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_semantic.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 69,
+                "end": 69
+              },
+              {
+                "start": 70,
+                "end": 70
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_semantic_edges.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 298,
+                "end": 298
+              },
+              {
+                "start": 299,
+                "end": 299
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_similarity.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 75,
+                "end": 75
+              },
+              {
+                "start": 76,
+                "end": 76
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pass_usages.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 89,
+                "end": 89
+              },
+              {
+                "start": 90,
+                "end": 90
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pipeline.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 247,
+                "end": 247
+              },
+              {
+                "start": 248,
+                "end": 248
+              }
+            ]
+          },
+          {
+            "path": "src/pipeline/pipeline_incremental.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 98,
+                "end": 98
+              },
+              {
+                "start": 99,
+                "end": 99
+              },
+              {
+                "start": 1140,
+                "end": 1140
+              },
+              {
+                "start": 1229,
+                "end": 1229
+              }
+            ]
+          },
+          {
+            "path": "src/store/store.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 6764,
+                "end": 6764
+              },
+              {
+                "start": 6802,
+                "end": 6802
+              },
+              {
+                "start": 6868,
+                "end": 6868
+              },
+              {
+                "start": 7524,
+                "end": 7524
+              }
+            ]
+          },
+          {
+            "path": "src/ui/activity.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 174,
+                "end": 174
+              },
+              {
+                "start": 203,
+                "end": 203
+              }
+            ]
+          },
+          {
+            "path": "src/ui/embedded_assets.c",
+            "kind": "not_indexed_file",
+            "detail": "gitignore"
+          },
+          {
+            "path": "src/ui/http_server.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 825,
+                "end": 825
+              },
+              {
+                "start": 2841,
+                "end": 2841
+              },
+              {
+                "start": 2882,
+                "end": 2882
+              }
+            ]
+          },
+          {
+            "path": "src/ui/httpd.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 114,
+                "end": 114
+              },
+              {
+                "start": 116,
+                "end": 116
+              }
+            ]
+          },
+          {
+            "path": "src/watcher/watcher.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 344,
+                "end": 344
+              },
+              {
+                "start": 346,
+                "end": 346
+              },
+              {
+                "start": 348,
+                "end": 348
+              },
+              {
+                "start": 899,
+                "end": 899
+              }
+            ]
+          },
+          {
+            "path": "tests/fixtures/plsql/create_type_as_object_limitation.tps",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 4,
+                "end": 8
+              }
+            ]
+          },
+          {
+            "path": "tests/repro/repro_call_argument_matrix_a.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1265,
+                "end": 1265
+              }
+            ]
+          },
+          {
+            "path": "tests/repro/repro_call_argument_matrix_b.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1188,
+                "end": 1188
+              },
+              {
+                "start": 1189,
+                "end": 1189
+              },
+              {
+                "start": 1190,
+                "end": 1190
+              },
+              {
+                "start": 1191,
+                "end": 1191
+              },
+              {
+                "start": 1192,
+                "end": 1192
+              },
+              {
+                "start": 1193,
+                "end": 1193
+              },
+              {
+                "start": 1194,
+                "end": 1194
+              },
+              {
+                "start": 1195,
+                "end": 1195
+              },
+              {
+                "start": 1196,
+                "end": 1196
+              },
+              {
+                "start": 1197,
+                "end": 1197
+              },
+              {
+                "start": 1198,
+                "end": 1198
+              },
+              {
+                "start": 1199,
+                "end": 1199
+              },
+              {
+                "start": 1200,
+                "end": 1200
+              },
+              {
+                "start": 1201,
+                "end": 1201
+              },
+              {
+                "start": 1202,
+                "end": 1202
+              },
+              {
+                "start": 1203,
+                "end": 1203
+              },
+              {
+                "start": 1204,
+                "end": 1204
+              },
+              {
+                "start": 1205,
+                "end": 1205
+              },
+              {
+                "start": 1206,
+                "end": 1206
+              },
+              {
+                "start": 1207,
+                "end": 1207
+              },
+              {
+                "start": 1208,
+                "end": 1208
+              },
+              {
+                "start": 1209,
+                "end": 1209
+              },
+              {
+                "start": 1210,
+                "end": 1210
+              },
+              {
+                "start": 1211,
+                "end": 1211
+              },
+              {
+                "start": 1212,
+                "end": 1212
+              },
+              {
+                "start": 1213,
+                "end": 1213
+              },
+              {
+                "start": 1214,
+                "end": 1214
+              },
+              {
+                "start": 1215,
+                "end": 1215
+              },
+              {
+                "start": 1216,
+                "end": 1216
+              },
+              {
+                "start": 1217,
+                "end": 1217
+              },
+              {
+                "start": 1218,
+                "end": 1218
+              },
+              {
+                "start": 1219,
+                "end": 1219
+              },
+              {
+                "start": 1220,
+                "end": 1220
+              },
+              {
+                "start": 1221,
+                "end": 1221
+              },
+              {
+                "start": 1222,
+                "end": 1222
+              },
+              {
+                "start": 1223,
+                "end": 1223
+              },
+              {
+                "start": 1224,
+                "end": 1224
+              },
+              {
+                "start": 1225,
+                "end": 1225
+              },
+              {
+                "start": 1246,
+                "end": 1246
+              },
+              {
+                "start": 1247,
+                "end": 1247
+              },
+              {
+                "start": 1248,
+                "end": 1248
+              },
+              {
+                "start": 1360,
+                "end": 1360
+              }
+            ]
+          },
+          {
+            "path": "tests/repro/repro_call_node_behaviors.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 674,
+                "end": 674
+              },
+              {
+                "start": 677,
+                "end": 677
+              },
+              {
+                "start": 680,
+                "end": 680
+              },
+              {
+                "start": 683,
+                "end": 683
+              },
+              {
+                "start": 686,
+                "end": 686
+              },
+              {
+                "start": 689,
+                "end": 689
+              },
+              {
+                "start": 692,
+                "end": 692
+              }
+            ]
+          },
+          {
+            "path": "tests/test_cli.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 453,
+                "end": 453
+              },
+              {
+                "start": 469,
+                "end": 469
+              },
+              {
+                "start": 492,
+                "end": 492
+              },
+              {
+                "start": 528,
+                "end": 528
+              },
+              {
+                "start": 542,
+                "end": 542
+              },
+              {
+                "start": 585,
+                "end": 585
+              },
+              {
+                "start": 593,
+                "end": 593
+              },
+              {
+                "start": 1414,
+                "end": 1414
+              },
+              {
+                "start": 1417,
+                "end": 1417
+              },
+              {
+                "start": 1657,
+                "end": 1657
+              },
+              {
+                "start": 1662,
+                "end": 1662
+              },
+              {
+                "start": 5011,
+                "end": 5011
+              },
+              {
+                "start": 5013,
+                "end": 5013
+              },
+              {
+                "start": 5015,
+                "end": 5015
+              },
+              {
+                "start": 5046,
+                "end": 5046
+              },
+              {
+                "start": 5048,
+                "end": 5048
+              },
+              {
+                "start": 5053,
+                "end": 5053
+              },
+              {
+                "start": 5055,
+                "end": 5055
+              },
+              {
+                "start": 5057,
+                "end": 5057
+              },
+              {
+                "start": 5119,
+                "end": 5119
+              },
+              {
+                "start": 5121,
+                "end": 5121
+              },
+              {
+                "start": 5123,
+                "end": 5123
+              },
+              {
+                "start": 5468,
+                "end": 5468
+              },
+              {
+                "start": 5470,
+                "end": 5470
+              },
+              {
+                "start": 5472,
+                "end": 5472
+              },
+              {
+                "start": 5474,
+                "end": 5474
+              },
+              {
+                "start": 5486,
+                "end": 5486
+              },
+              {
+                "start": 5488,
+                "end": 5488
+              },
+              {
+                "start": 5490,
+                "end": 5490
+              },
+              {
+                "start": 5587,
+                "end": 5587
+              },
+              {
+                "start": 5589,
+                "end": 5589
+              },
+              {
+                "start": 5591,
+                "end": 5591
+              },
+              {
+                "start": 5593,
+                "end": 5593
+              },
+              {
+                "start": 7574,
+                "end": 14767
+              }
+            ]
+          },
+          {
+            "path": "tests/test_daemon_ipc.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 970,
+                "end": 970
+              },
+              {
+                "start": 970,
+                "end": 970
+              },
+              {
+                "start": 971,
+                "end": 971
+              },
+              {
+                "start": 971,
+                "end": 971
+              },
+              {
+                "start": 971,
+                "end": 971
+              }
+            ]
+          },
+          {
+            "path": "tests/test_daemon_runtime.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 4597,
+                "end": 4598
+              },
+              {
+                "start": 4599,
+                "end": 4627
+              }
+            ]
+          },
+          {
+            "path": "tests/test_index_resilience.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 194,
+                "end": 194
+              },
+              {
+                "start": 350,
+                "end": 350
+              },
+              {
+                "start": 612,
+                "end": 612
+              }
+            ]
+          },
+          {
+            "path": "tests/test_mcp.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 57,
+                "end": 57
+              },
+              {
+                "start": 1374,
+                "end": 1374
+              },
+              {
+                "start": 2604,
+                "end": 2604
+              },
+              {
+                "start": 2612,
+                "end": 2612
+              },
+              {
+                "start": 2843,
+                "end": 2843
+              },
+              {
+                "start": 8455,
+                "end": 8455
+              },
+              {
+                "start": 8490,
+                "end": 8490
+              },
+              {
+                "start": 15735,
+                "end": 15735
+              }
+            ]
+          },
+          {
+            "path": "tests/test_path_alias.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 31,
+                "end": 31
+              },
+              {
+                "start": 32,
+                "end": 32
+              }
+            ]
+          },
+          {
+            "path": "tests/test_ui.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 934,
+                "end": 934
+              },
+              {
+                "start": 985,
+                "end": 985
+              },
+              {
+                "start": 1150,
+                "end": 1150
+              },
+              {
+                "start": 1250,
+                "end": 1250
+              },
+              {
+                "start": 1340,
+                "end": 1340
+              },
+              {
+                "start": 1452,
+                "end": 1452
+              },
+              {
+                "start": 1941,
+                "end": 1941
+              },
+              {
+                "start": 1943,
+                "end": 1943
+              },
+              {
+                "start": 2034,
+                "end": 2034
+              },
+              {
+                "start": 2041,
+                "end": 2440
+              }
+            ]
+          },
+          {
+            "path": "tests/test_worker_pool.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 209,
+                "end": 209
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-arkts/src/parser.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 10713,
+                "end": 10713
+              },
+              {
+                "start": 10759,
+                "end": 10759
+              },
+              {
+                "start": 10797,
+                "end": 10797
+              },
+              {
+                "start": 10829,
+                "end": 10829
+              },
+              {
+                "start": 10863,
+                "end": 10863
+              },
+              {
+                "start": 10905,
+                "end": 10905
+              },
+              {
+                "start": 10938,
+                "end": 10938
+              },
+              {
+                "start": 10972,
+                "end": 10972
+              },
+              {
+                "start": 11001,
+                "end": 11001
+              },
+              {
+                "start": 11034,
+                "end": 11034
+              },
+              {
+                "start": 11349,
+                "end": 11349
+              },
+              {
+                "start": 11388,
+                "end": 11388
+              },
+              {
+                "start": 11425,
+                "end": 11425
+              },
+              {
+                "start": 11980,
+                "end": 11980
+              },
+              {
+                "start": 12120,
+                "end": 12120
+              },
+              {
+                "start": 286864,
+                "end": 286864
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-arkts/src/tree_sitter/alloc.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 50,
+                "end": 50
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-arkts/src/tree_sitter/array.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 160,
+                "end": 160
+              },
+              {
+                "start": 287,
+                "end": 287
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-arkts/src/tree_sitter/parser.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 282,
+                "end": 282
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-chialisp/src/parser.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 165,
+                "end": 165
+              },
+              {
+                "start": 483,
+                "end": 483
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-chialisp/src/tree_sitter/alloc.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 50,
+                "end": 50
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-chialisp/src/tree_sitter/array.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 160,
+                "end": 160
+              },
+              {
+                "start": 287,
+                "end": 287
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-chialisp/src/tree_sitter/parser.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 282,
+                "end": 282
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-form/src/parser.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1260,
+                "end": 1260
+              },
+              {
+                "start": 1308,
+                "end": 1308
+              },
+              {
+                "start": 1981,
+                "end": 1981
+              },
+              {
+                "start": 1995,
+                "end": 1995
+              },
+              {
+                "start": 2008,
+                "end": 2008
+              },
+              {
+                "start": 2021,
+                "end": 2021
+              },
+              {
+                "start": 2034,
+                "end": 2034
+              },
+              {
+                "start": 2389,
+                "end": 2389
+              },
+              {
+                "start": 21601,
+                "end": 21601
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-form/src/tree_sitter/alloc.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 50,
+                "end": 50
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-form/src/tree_sitter/array.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 310,
+                "end": 310
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-form/src/tree_sitter/parser.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 278,
+                "end": 278
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-magma/src/parser.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 1337,
+                "end": 1337
+              },
+              {
+                "start": 1348,
+                "end": 1348
+              },
+              {
+                "start": 1356,
+                "end": 1356
+              },
+              {
+                "start": 1365,
+                "end": 1365
+              },
+              {
+                "start": 1373,
+                "end": 1373
+              },
+              {
+                "start": 1472,
+                "end": 1472
+              },
+              {
+                "start": 1485,
+                "end": 1485
+              },
+              {
+                "start": 1543,
+                "end": 1543
+              },
+              {
+                "start": 1934,
+                "end": 1934
+              },
+              {
+                "start": 26330,
+                "end": 26330
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-magma/src/tree_sitter/alloc.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 50,
+                "end": 50
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-magma/src/tree_sitter/array.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 310,
+                "end": 310
+              }
+            ]
+          },
+          {
+            "path": "tools/tree-sitter-magma/src/tree_sitter/parser.h",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 278,
+                "end": 278
+              }
+            ]
+          },
+          {
+            "path": "vendored",
+            "kind": "not_indexed_dir",
+            "detail": "excluded subtree"
+          }
+        ],
+        "status": "known_gaps"
+      }
+    ],
+    "scope_total": 281,
+    "scope_returned": 281,
+    "scope_truncated": false,
+    "has_more": false,
+    "caveat": "Best-effort signal only. No recorded issue does not prove graph or source completeness; read flagged source and qualify claims when metadata is changed or unavailable."
+  },
+  "sqliteRows": [
+    [
+      ".git",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "build",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "docs/graph-ui-screenshot.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/design/design.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/design/live-agents.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/dist",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "graph-ui/node_modules",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "graph-ui/src/galaxy/coverage-shadow-scene.test.tsx",
+      "parse_partial",
+      "10-10"
+    ],
+    [
+      "graph-ui/src/galaxy/hierarchy-layout.ts",
+      "parse_partial",
+      "249-249"
+    ],
+    [
+      "graph-ui/tsconfig.node.tsbuildinfo",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/tsconfig.tsbuildinfo",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/vendor",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "graph-ui/verification/pr-2068/after-architecture-first.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/after-architecture-relationship.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/after-architecture.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/after-context-and-impact.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/after-project-readme.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/after-source-evidence.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/agents-browser-reload.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/agents-connection-interrupted.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/agents-daemon-restart.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/agents-hook-evidence.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/agents-reconnected.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/agents-source-navigation.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/before-agents.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/before-architecture.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/before-galaxy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/before-system.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/errors-after-galaxy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/errors-after-system.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/errors-local-diagnosis.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/errors-local-report.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/frontend-acceptance.log",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/verification/pr-2068/map-e2e-failure.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/native-activity-tests.log",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/verification/pr-2068/native-final-job-status-tests.log",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/verification/pr-2068/native-full-tests.log",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/verification/pr-2068/native-lint.log",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "graph-ui/verification/pr-2068/research-archify-chapter.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/research-archify-overview.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/research-archify-route.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/research-gitnexus-entry.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/pr-2068/research-graphify-example-selected.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w0/spike.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10/settings-fetch.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10/settings-performance.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10/settings-switch.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10/settings.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10b/graph-collapsed.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10b/handles.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w10b/hierarchy-from-focus.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/cinema.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/contact-sheet.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/follow.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-01.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-02.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-03.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-04.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-05.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-06.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-07.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/orbit-08.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-01.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-02.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-03.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-04.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-05.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-06.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-07.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-08.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-09.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-10.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-11.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-12.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-13.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-14.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-15.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/frames/step-16.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/live-agents-cinema.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/live-agents-collapsed.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/live-agents-nobridge.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/live-agents.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/orbit-contact-sheet.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/timeline.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w11/trails.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/agents-fullscreen.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/agents-live.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/entry-dialog.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/explain-bug.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/explain-change.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/explain-chat-idle.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/explain-flow.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/explain-walk-idle.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/file-open.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/galaxy-collapsed.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/galaxy-legend.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/help.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/hierarchy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/llm-off.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/llm-on.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/search.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/settings-flat.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/settings.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/start.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/symbol-focus.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/twin-pseudocode.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12/states/walk-running.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w12a/command-overlay.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w13/level-architect.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w13/level-junior.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w13/level-medior.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w13/level-senior.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w13/level-vibe-coder.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w14/flow-empty.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w14/leaf-junior.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w14/leaf-vibe.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w14/menus.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w15/chat-ai.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w15/chat-off.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w15/flow-ai.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w15/twin-ai.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w2/app-chrome.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w2/reader-truncated.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w2/reader.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w2/twin-dense.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w2/twin.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w3/galaxy-focus.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w3/galaxy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w3/search.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/bugwizard-divergence.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/bugwizard-no-traces.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/explorer-coverage.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/flow.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/hierarchy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/impact.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/pseudocode.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/tour.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w4/why.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w5/chat.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w5/flow-overlay-depth0.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w5/flow-overlay.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w5/sidecar-off.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w5/sidecar-ready.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/01-app-open.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/02-explorer-expanded.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/03-explorer-coverage-legend.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/04-reader-open-file.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/05-reader-capped-file.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/06-search-overlay.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/07-twin-depth-3.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/08-twin-evidence.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/09-flow-overlay.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/10-flow-stepper.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/11-pseudocode.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/12-search-enter.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/13-twin-warm.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/14-galaxy-legend.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/14b-atlas-row-shortcuts.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/15-tour-step-1.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/16-tour-step-3.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/17-entry-dialog.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/18-entry-walk-hierarchy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/18b-tour-diagram.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/19-graph-mode-galaxy.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/20-bugwizard-no-traces.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/21-bugwizard-divergence.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/22-impact.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/23-sidecar-off.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/24-sidecar-ready.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/25-chat-answer.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/26-chat-citation.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/27-chat-cards.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w6/walk/28-sidecar-off-again.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/chat-answer.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/chat-resized.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/command.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/help.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/menu-uniform.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/menu.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/onechar.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w7/search-fast.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8/layout-custom.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8/layout-default.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8/layout-explain-large.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8b/collapse-words.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8b/flow-short.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8b/tooltip-open.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8b/twin-full.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8c/pseudocode-long.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w8c/pseudocode-short.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w9/galaxy-edges.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w9/hierarchy-edges.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "graph-ui/verification/w9/legend-filter.png",
+      "not_indexed_file",
+      "ignored-suffix"
+    ],
+    [
+      "internal/cbm/helpers.c",
+      "parse_partial",
+      "501-501"
+    ],
+    [
+      "internal/cbm/lsp/generated/java_stdlib_data.c",
+      "parse_partial",
+      "1329-1329"
+    ],
+    [
+      "internal/cbm/preprocessor.h",
+      "parse_partial",
+      "39-39"
+    ],
+    [
+      "internal/cbm/vendored",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "node_modules",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "pkg/chocolatey/tools/chocolateyInstall.ps1",
+      "parse_partial",
+      "9-12,13-13,14-14"
+    ],
+    [
+      "private",
+      "not_indexed_dir",
+      "excluded subtree"
+    ],
+    [
+      "scripts/ci/check-binary-composition.sh",
+      "parse_partial",
+      "228-228,229-229"
+    ],
+    [
+      "scripts/ci/clean-test-residue.ps1",
+      "parse_partial",
+      "39-39"
+    ],
+    [
+      "scripts/setup-windows.ps1",
+      "parse_partial",
+      "113-113,113-113,245-327"
+    ],
+    [
+      "scripts/smoke-invariants.sh",
+      "parse_partial",
+      "137-137"
+    ],
+    [
+      "scripts/test-windows.ps1",
+      "parse_partial",
+      "109-109"
+    ],
+    [
+      "src/cli/activation_transaction.c",
+      "parse_partial",
+      "208-208,1426-2331"
+    ],
+    [
+      "src/cli/agent_clients.h",
+      "parse_partial",
+      "118-118"
+    ],
+    [
+      "src/cli/agent_profiles.h",
+      "parse_partial",
+      "67-67"
+    ],
+    [
+      "src/cli/cli.c",
+      "parse_partial",
+      "1-13337"
+    ],
+    [
+      "src/cli/config_json_like.c",
+      "parse_partial",
+      "46-46,47-47,48-48,49-49,1363-1363,1368-1368,1373-1373"
+    ],
+    [
+      "src/cli/config_json_like.h",
+      "parse_partial",
+      "155-155"
+    ],
+    [
+      "src/cli/config_text_edit.c",
+      "parse_partial",
+      "49-49,50-50,51-51,52-52,53-53,54-54,348-348,353-353,358-358"
+    ],
+    [
+      "src/cli/config_toml_edit.c",
+      "parse_partial",
+      "45-45,46-46,47-47,48-48,392-392,397-397,402-402"
+    ],
+    [
+      "src/cli/config_toml_edit.h",
+      "parse_partial",
+      "107-107"
+    ],
+    [
+      "src/cli/config_yaml_edit.c",
+      "parse_partial",
+      "625-625,630-630,635-635"
+    ],
+    [
+      "src/cli/config_yaml_edit.h",
+      "parse_partial",
+      "126-126"
+    ],
+    [
+      "src/cli/hook_augment.c",
+      "parse_partial",
+      "406-406,431-431,441-441,531-531,897-897"
+    ],
+    [
+      "src/cypher/cypher.c",
+      "parse_partial",
+      "2308-2308,2309-2309,2463-2463,2464-2464,2598-2598"
+    ],
+    [
+      "src/daemon/ipc.c",
+      "parse_partial",
+      "3365-3365,3365-3365,3365-3365,3366-3366,3366-3366,3366-3366,3367-3367,3367-3367,3368-3368,3369-3369,3370-3370,3370-3370,3370-3370,3371-3371,3371-3371,3372-3372,3373-3373,3373-3373,3374-3374,3375-3375,3375-3375,3375-3375,3376-3376,3376-3376,3376-3376,3377-3377,3377-3377,3377-3377,3378-3378,3378-3378,3379-3379,3379-3379,3379-3379,3380-3380,3380-3380,3380-3380,3381-3381,3381-3381,3381-3381,3382-3382,3382-3382,3383-3383,3384-3384,3384-3384,3384-3384,3385-3385,3385-3385,3385-3385,3386-3386,3386-3386,3386-3386,3386-3386,3387-3387,3387-3387,3388-3388,3389-3389,3390-3390,3391-3391,3391-3391,3392-3392,3392-3392"
+    ],
+    [
+      "src/daemon/runtime.c",
+      "parse_partial",
+      "47-47"
+    ],
+    [
+      "src/discover/discover.c",
+      "parse_partial",
+      "572-572"
+    ],
+    [
+      "src/foundation/compat_thread.c",
+      "parse_partial",
+      "104-104,104-104"
+    ],
+    [
+      "src/foundation/log.c",
+      "parse_partial",
+      "280-280,284-284,297-297,301-301,327-327,331-331"
+    ],
+    [
+      "src/foundation/platform.c",
+      "parse_partial",
+      "470-470,492-492,525-525,547-547"
+    ],
+    [
+      "src/foundation/private_file_lock.c",
+      "parse_partial",
+      "616-616,616-616,616-616,617-617,617-617,618-618,619-619,620-620,620-620,620-620,621-621,621-621,622-622,623-623,623-623,623-623,624-624,624-624,624-624,625-625,625-625,626-626,626-626,626-626,627-627,627-627,628-628,629-629,629-629,631-631,632-632,632-632,634-634,635-635,635-635,635-635,636-636,636-636,636-636,637-637,637-637,638-638,638-638,638-638,638-638,639-639"
+    ],
+    [
+      "src/foundation/slab_alloc.c",
+      "parse_partial",
+      "118-118,121-121,124-124"
+    ],
+    [
+      "src/git/git_context.c",
+      "parse_partial",
+      "181-181"
+    ],
+    [
+      "src/mcp/compact_out.c",
+      "parse_partial",
+      "1034-1034,1042-1042,1070-1070,1079-1079,1082-1082,1110-1110,1118-1118,1153-1153,1191-1191"
+    ],
+    [
+      "src/mcp/mcp.c",
+      "parse_partial",
+      "185-185,195-195,4216-4216,4362-4362,6510-6510,6586-6586,7328-7328,7969-7969,8549-8549,9767-9767,11964-11964,14848-14848,14850-14850,14852-14852,16738-16738,17140-17140,17153-17153"
+    ],
+    [
+      "src/pipeline/artifact.c",
+      "parse_partial",
+      "61-61,64-64,65-65,76-76,77-77,635-635"
+    ],
+    [
+      "src/pipeline/pass_calls.c",
+      "parse_partial",
+      "83-83,84-84"
+    ],
+    [
+      "src/pipeline/pass_complexity.c",
+      "parse_partial",
+      "34-34,35-35"
+    ],
+    [
+      "src/pipeline/pass_cross_repo.c",
+      "parse_partial",
+      "96-96"
+    ],
+    [
+      "src/pipeline/pass_definitions.c",
+      "parse_partial",
+      "108-108,109-109"
+    ],
+    [
+      "src/pipeline/pass_githistory.c",
+      "parse_partial",
+      "36-36,37-37"
+    ],
+    [
+      "src/pipeline/pass_importance.c",
+      "parse_partial",
+      "99-99,100-100"
+    ],
+    [
+      "src/pipeline/pass_k8s.c",
+      "parse_partial",
+      "70-70,71-71"
+    ],
+    [
+      "src/pipeline/pass_lsp_cross.c",
+      "parse_partial",
+      "53-53,54-54"
+    ],
+    [
+      "src/pipeline/pass_parallel.c",
+      "parse_partial",
+      "334-334,335-335,1413-1413"
+    ],
+    [
+      "src/pipeline/pass_pkgmap.c",
+      "parse_partial",
+      "86-86"
+    ],
+    [
+      "src/pipeline/pass_semantic.c",
+      "parse_partial",
+      "69-69,70-70"
+    ],
+    [
+      "src/pipeline/pass_semantic_edges.c",
+      "parse_partial",
+      "298-298,299-299"
+    ],
+    [
+      "src/pipeline/pass_similarity.c",
+      "parse_partial",
+      "75-75,76-76"
+    ],
+    [
+      "src/pipeline/pass_usages.c",
+      "parse_partial",
+      "89-89,90-90"
+    ],
+    [
+      "src/pipeline/pipeline.c",
+      "parse_partial",
+      "247-247,248-248"
+    ],
+    [
+      "src/pipeline/pipeline_incremental.c",
+      "parse_partial",
+      "98-98,99-99,1140-1140,1229-1229"
+    ],
+    [
+      "src/store/store.c",
+      "parse_partial",
+      "6764-6764,6802-6802,6868-6868,7524-7524"
+    ],
+    [
+      "src/ui/activity.c",
+      "parse_partial",
+      "174-174,203-203"
+    ],
+    [
+      "src/ui/embedded_assets.c",
+      "not_indexed_file",
+      "gitignore"
+    ],
+    [
+      "src/ui/http_server.c",
+      "parse_partial",
+      "825-825,2841-2841,2882-2882"
+    ],
+    [
+      "src/ui/httpd.h",
+      "parse_partial",
+      "114-114,116-116"
+    ],
+    [
+      "src/watcher/watcher.c",
+      "parse_partial",
+      "344-344,346-346,348-348,899-899"
+    ],
+    [
+      "tests/fixtures/plsql/create_type_as_object_limitation.tps",
+      "parse_partial",
+      "4-8"
+    ],
+    [
+      "tests/repro/repro_call_argument_matrix_a.c",
+      "parse_partial",
+      "1265-1265"
+    ],
+    [
+      "tests/repro/repro_call_argument_matrix_b.c",
+      "parse_partial",
+      "1188-1188,1189-1189,1190-1190,1191-1191,1192-1192,1193-1193,1194-1194,1195-1195,1196-1196,1197-1197,1198-1198,1199-1199,1200-1200,1201-1201,1202-1202,1203-1203,1204-1204,1205-1205,1206-1206,1207-1207,1208-1208,1209-1209,1210-1210,1211-1211,1212-1212,1213-1213,1214-1214,1215-1215,1216-1216,1217-1217,1218-1218,1219-1219,1220-1220,1221-1221,1222-1222,1223-1223,1224-1224,1225-1225,1246-1246,1247-1247,1248-1248,1360-1360"
+    ],
+    [
+      "tests/repro/repro_call_node_behaviors.c",
+      "parse_partial",
+      "674-674,677-677,680-680,683-683,686-686,689-689,692-692"
+    ],
+    [
+      "tests/test_cli.c",
+      "parse_partial",
+      "453-453,469-469,492-492,528-528,542-542,585-585,593-593,1414-1414,1417-1417,1657-1657,1662-1662,5011-5011,5013-5013,5015-5015,5046-5046,5048-5048,5053-5053,5055-5055,5057-5057,5119-5119,5121-5121,5123-5123,5468-5468,5470-5470,5472-5472,5474-5474,5486-5486,5488-5488,5490-5490,5587-5587,5589-5589,5591-5591,5593-5593,7574-14767"
+    ],
+    [
+      "tests/test_daemon_ipc.c",
+      "parse_partial",
+      "970-970,970-970,971-971,971-971,971-971"
+    ],
+    [
+      "tests/test_daemon_runtime.c",
+      "parse_partial",
+      "4597-4598,4599-4627"
+    ],
+    [
+      "tests/test_index_resilience.c",
+      "parse_partial",
+      "194-194,350-350,612-612"
+    ],
+    [
+      "tests/test_mcp.c",
+      "parse_partial",
+      "57-57,1374-1374,2604-2604,2612-2612,2843-2843,8455-8455,8490-8490,15735-15735"
+    ],
+    [
+      "tests/test_path_alias.c",
+      "parse_partial",
+      "31-31,32-32"
+    ],
+    [
+      "tests/test_ui.c",
+      "parse_partial",
+      "934-934,985-985,1150-1150,1250-1250,1340-1340,1452-1452,1941-1941,1943-1943,2034-2034,2041-2440"
+    ],
+    [
+      "tests/test_worker_pool.c",
+      "parse_partial",
+      "209-209"
+    ],
+    [
+      "tools/tree-sitter-arkts/src/parser.c",
+      "parse_partial",
+      "10713-10713,10759-10759,10797-10797,10829-10829,10863-10863,10905-10905,10938-10938,10972-10972,11001-11001,11034-11034,11349-11349,11388-11388,11425-11425,11980-11980,12120-12120,286864-286864"
+    ],
+    [
+      "tools/tree-sitter-arkts/src/tree_sitter/alloc.h",
+      "parse_partial",
+      "50-50"
+    ],
+    [
+      "tools/tree-sitter-arkts/src/tree_sitter/array.h",
+      "parse_partial",
+      "160-160,287-287"
+    ],
+    [
+      "tools/tree-sitter-arkts/src/tree_sitter/parser.h",
+      "parse_partial",
+      "282-282"
+    ],
+    [
+      "tools/tree-sitter-chialisp/src/parser.c",
+      "parse_partial",
+      "165-165,483-483"
+    ],
+    [
+      "tools/tree-sitter-chialisp/src/tree_sitter/alloc.h",
+      "parse_partial",
+      "50-50"
+    ],
+    [
+      "tools/tree-sitter-chialisp/src/tree_sitter/array.h",
+      "parse_partial",
+      "160-160,287-287"
+    ],
+    [
+      "tools/tree-sitter-chialisp/src/tree_sitter/parser.h",
+      "parse_partial",
+      "282-282"
+    ],
+    [
+      "tools/tree-sitter-form/src/parser.c",
+      "parse_partial",
+      "1260-1260,1308-1308,1981-1981,1995-1995,2008-2008,2021-2021,2034-2034,2389-2389,21601-21601"
+    ],
+    [
+      "tools/tree-sitter-form/src/tree_sitter/alloc.h",
+      "parse_partial",
+      "50-50"
+    ],
+    [
+      "tools/tree-sitter-form/src/tree_sitter/array.h",
+      "parse_partial",
+      "310-310"
+    ],
+    [
+      "tools/tree-sitter-form/src/tree_sitter/parser.h",
+      "parse_partial",
+      "278-278"
+    ],
+    [
+      "tools/tree-sitter-magma/src/parser.c",
+      "parse_partial",
+      "1337-1337,1348-1348,1356-1356,1365-1365,1373-1373,1472-1472,1485-1485,1543-1543,1934-1934,26330-26330"
+    ],
+    [
+      "tools/tree-sitter-magma/src/tree_sitter/alloc.h",
+      "parse_partial",
+      "50-50"
+    ],
+    [
+      "tools/tree-sitter-magma/src/tree_sitter/array.h",
+      "parse_partial",
+      "310-310"
+    ],
+    [
+      "tools/tree-sitter-magma/src/tree_sitter/parser.h",
+      "parse_partial",
+      "278-278"
+    ],
+    [
+      "vendored",
+      "not_indexed_dir",
+      "excluded subtree"
+    ]
+  ],
+  "partialByTopLevel": {
+    "graph-ui": 2,
+    "internal": 3,
+    "pkg": 1,
+    "scripts": 5,
+    "src": 46,
+    "tests": 12,
+    "tools": 16
+  },
+  "excludedReasons": {
+    "ignored-suffix": 179,
+    "gitignore": 8
+  },
+  "workerLogRows": [
+    [
+      393,
+      "2026-09-09T19:29:28.781Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=pipeline.route_path=full_reason=invalid_existing_db"
+    ],
+    [
+      394,
+      "2026-09-09T19:29:28.785Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=pr2068-error-fixture_path=partial.c_phase=parse_partial_reason=2-2"
+    ],
+    [
+      747,
+      "2026-09-09T19:31:26.163Z",
+      3,
+      "index.worker",
+      "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+    ],
+    [
+      811,
+      "2026-09-09T19:32:04.847Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/parser.c_phase=parse_partial_reason=10713-10713,10759-10759,10797-10797,10829-10829,10863-10863,10905-10905,10938-10938,10972-10972,11001-11001,11034-11034,11349-11349,11388-11388,11425-11425,11980-11980,12120-12120,286864-286864"
+    ],
+    [
+      812,
+      "2026-09-09T19:32:04.847Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/cli.c_phase=parse_partial_reason=1-13337"
+    ],
+    [
+      813,
+      "2026-09-09T19:32:04.847Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/daemon/ipc.c_phase=parse_partial_reason=3365-3365,3365-3365,3365-3365,3366-3366,3366-3366,3366-3366,3367-3367,3367-3367,3368-3368,3369-3369,3370-3370,3370-3370,3370-3370,3371-3371,3371-3371,3372-3372,3373-3373,3373-3373,3374-3374,3375-3375,3375-3375,3375-3375,3376-3376,3376-3376,3376-3376,3377-3377,3377-3377,3377-3377,3378-3378,3378-3378,3379-3379,3379-3379,3379-3379,3380-3380,3380-3380,3380-3380,3381-3381,3381-3381,3381-3381,3382-3382,3382-3382,3383-3383,3384-3384,3384-3384,3384-3384,3385-3385,3385-3385,3385-3385,3386-3386,3386-3386,3386-3386,3386-3386,3387-3387,3387-3387,3388-3388,3389-3389,3390-3390,3391-3391,3391-3391,3392-3392,3392-3392"
+    ],
+    [
+      814,
+      "2026-09-09T19:32:04.847Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/activation_transaction.c_phase=parse_partial_reason=208-208,1426-2331"
+    ],
+    [
+      815,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/hook_augment.c_phase=parse_partial_reason=406-406,431-431,441-441,531-531,897-897"
+    ],
+    [
+      816,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_cross_repo.c_phase=parse_partial_reason=96-96"
+    ],
+    [
+      817,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_calls.c_phase=parse_partial_reason=83-83,84-84"
+    ],
+    [
+      818,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_k8s.c_phase=parse_partial_reason=70-70,71-71"
+    ],
+    [
+      819,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_worker_pool.c_phase=parse_partial_reason=209-209"
+    ],
+    [
+      820,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      821,
+      "2026-09-09T19:32:04.848Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_daemon_ipc.c_phase=parse_partial_reason=970-970,970-970,971-971,971-971,971-971"
+    ],
+    [
+      822,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_parallel.c_phase=parse_partial_reason=334-334,335-335,1413-1413"
+    ],
+    [
+      823,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/repro/repro_call_argument_matrix_b.c_phase=parse_partial_reason=1188-1188,1189-1189,1190-1190,1191-1191,1192-1192,1193-1193,1194-1194,1195-1195,1196-1196,1197-1197,1198-1198,1199-1199,1200-1200,1201-1201,1202-1202,1203-1203,1204-1204,1205-1205,1206-1206,1207-1207,1208-1208,1209-1209,1210-1210,1211-1211,1212-1212,1213-1213,1214-1214,1215-1215,1216-1216,1217-1217,1218-1218,1219-1219,1220-1220,1221-1221,1222-1222,1223-1223,1224-1224,1225-1225,1246-1246,1247-1247,1248-1248,1360-1360"
+    ],
+    [
+      824,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=internal/cbm/helpers.c_phase=parse_partial_reason=501-501"
+    ],
+    [
+      825,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/artifact.c_phase=parse_partial_reason=61-61,64-64,65-65,76-76,77-77,635-635"
+    ],
+    [
+      826,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/discover/discover.c_phase=parse_partial_reason=572-572"
+    ],
+    [
+      827,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=graph-ui/src/galaxy/hierarchy-layout.ts_phase=parse_partial_reason=249-249"
+    ],
+    [
+      828,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_usages.c_phase=parse_partial_reason=89-89,90-90"
+    ],
+    [
+      829,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/log.c_phase=parse_partial_reason=280-280,284-284,297-297,301-301,327-327,331-331"
+    ],
+    [
+      830,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/git/git_context.c_phase=parse_partial_reason=181-181"
+    ],
+    [
+      831,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/test-windows.ps1_phase=parse_partial_reason=109-109"
+    ],
+    [
+      832,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_json_like.h_phase=parse_partial_reason=155-155"
+    ],
+    [
+      833,
+      "2026-09-09T19:32:04.849Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/tree_sitter/parser.h_phase=parse_partial_reason=278-278"
+    ],
+    [
+      834,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/agent_profiles.h_phase=parse_partial_reason=67-67"
+    ],
+    [
+      835,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      836,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_yaml_edit.c_phase=parse_partial_reason=625-625,630-630,635-635"
+    ],
+    [
+      837,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_pkgmap.c_phase=parse_partial_reason=86-86"
+    ],
+    [
+      838,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/mcp/compact_out.c_phase=parse_partial_reason=1034-1034,1042-1042,1070-1070,1079-1079,1082-1082,1110-1110,1118-1118,1153-1153,1191-1191"
+    ],
+    [
+      839,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_semantic.c_phase=parse_partial_reason=69-69,70-70"
+    ],
+    [
+      840,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/platform.c_phase=parse_partial_reason=470-470,492-492,525-525,547-547"
+    ],
+    [
+      841,
+      "2026-09-09T19:32:04.850Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_path_alias.c_phase=parse_partial_reason=31-31,32-32"
+    ],
+    [
+      842,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/ui/httpd.h_phase=parse_partial_reason=114-114,116-116"
+    ],
+    [
+      843,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=internal/cbm/preprocessor.h_phase=parse_partial_reason=39-39"
+    ],
+    [
+      844,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      845,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/parser.c_phase=parse_partial_reason=1260-1260,1308-1308,1981-1981,1995-1995,2008-2008,2021-2021,2034-2034,2389-2389,21601-21601"
+    ],
+    [
+      846,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=internal/cbm/lsp/generated/java_stdlib_data.c_phase=parse_partial_reason=1329-1329"
+    ],
+    [
+      847,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/watcher/watcher.c_phase=parse_partial_reason=344-344,346-346,348-348,899-899"
+    ],
+    [
+      848,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_index_resilience.c_phase=parse_partial_reason=194-194,350-350,612-612"
+    ],
+    [
+      849,
+      "2026-09-09T19:32:04.851Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_githistory.c_phase=parse_partial_reason=36-36,37-37"
+    ],
+    [
+      850,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/tree_sitter/array.h_phase=parse_partial_reason=310-310"
+    ],
+    [
+      851,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      852,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=pkg/chocolatey/tools/chocolateyInstall.ps1_phase=parse_partial_reason=9-12,13-13,14-14"
+    ],
+    [
+      853,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_cli.c_phase=parse_partial_reason=453-453,469-469,492-492,528-528,542-542,585-585,593-593,1414-1414,1417-1417,1657-1657,1662-1662,5011-5011,5013-5013,5015-5015,5046-5046,5048-5048,5053-5053,5055-5055,5057-5057,5119-5119,5121-5121,5123-5123,5468-5468,5470-5470,5472-5472,5474-5474,5486-5486,5488-5488,5490-5490,5587-5587,5589-5589,5591-5591,5593-5593,7574-14767"
+    ],
+    [
+      854,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/daemon/runtime.c_phase=parse_partial_reason=47-47"
+    ],
+    [
+      855,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pipeline_incremental.c_phase=parse_partial_reason=98-98,99-99,1140-1140,1229-1229"
+    ],
+    [
+      856,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_ui.c_phase=parse_partial_reason=934-934,985-985,1150-1150,1250-1250,1340-1340,1452-1452,1941-1941,1943-1943,2034-2034,2041-2440"
+    ],
+    [
+      857,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_semantic_edges.c_phase=parse_partial_reason=298-298,299-299"
+    ],
+    [
+      858,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/repro/repro_call_node_behaviors.c_phase=parse_partial_reason=674-674,677-677,680-680,683-683,686-686,689-689,692-692"
+    ],
+    [
+      859,
+      "2026-09-09T19:32:04.852Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/ui/activity.c_phase=parse_partial_reason=174-174,203-203"
+    ],
+    [
+      860,
+      "2026-09-09T19:32:04.855Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/tree_sitter/parser.h_phase=parse_partial_reason=282-282"
+    ],
+    [
+      861,
+      "2026-09-09T19:32:04.855Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/mcp/mcp.c_phase=parse_partial_reason=185-185,195-195,4216-4216,4362-4362,6510-6510,6586-6586,7328-7328,7969-7969,8549-8549,9767-9767,11964-11964,14848-14848,14850-14850,14852-14852,16738-16738,17140-17140,17153-17153"
+    ],
+    [
+      862,
+      "2026-09-09T19:32:04.855Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_json_like.c_phase=parse_partial_reason=46-46,47-47,48-48,49-49,1363-1363,1368-1368,1373-1373"
+    ],
+    [
+      863,
+      "2026-09-09T19:32:04.856Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_importance.c_phase=parse_partial_reason=99-99,100-100"
+    ],
+    [
+      864,
+      "2026-09-09T19:32:04.856Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_similarity.c_phase=parse_partial_reason=75-75,76-76"
+    ],
+    [
+      865,
+      "2026-09-09T19:32:04.856Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/setup-windows.ps1_phase=parse_partial_reason=113-113,113-113,245-327"
+    ],
+    [
+      866,
+      "2026-09-09T19:32:04.856Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_complexity.c_phase=parse_partial_reason=34-34,35-35"
+    ],
+    [
+      867,
+      "2026-09-09T19:32:04.856Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_toml_edit.h_phase=parse_partial_reason=107-107"
+    ],
+    [
+      868,
+      "2026-09-09T19:32:04.856Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=graph-ui/src/galaxy/coverage-shadow-scene.test.tsx_phase=parse_partial_reason=10-10"
+    ],
+    [
+      869,
+      "2026-09-09T19:32:04.857Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_mcp.c_phase=parse_partial_reason=57-57,1374-1374,2604-2604,2612-2612,2843-2843,8455-8455,8490-8490,15735-15735"
+    ],
+    [
+      870,
+      "2026-09-09T19:32:04.857Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/ui/http_server.c_phase=parse_partial_reason=825-825,2841-2841,2882-2882"
+    ],
+    [
+      871,
+      "2026-09-09T19:32:04.857Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_lsp_cross.c_phase=parse_partial_reason=53-53,54-54"
+    ],
+    [
+      872,
+      "2026-09-09T19:32:04.857Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_text_edit.c_phase=parse_partial_reason=49-49,50-50,51-51,52-52,53-53,54-54,348-348,353-353,358-358"
+    ],
+    [
+      873,
+      "2026-09-09T19:32:04.857Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/smoke-invariants.sh_phase=parse_partial_reason=137-137"
+    ],
+    [
+      874,
+      "2026-09-09T19:32:04.857Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/slab_alloc.c_phase=parse_partial_reason=118-118,121-121,124-124"
+    ],
+    [
+      875,
+      "2026-09-09T19:32:04.870Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/tree_sitter/parser.h_phase=parse_partial_reason=282-282"
+    ],
+    [
+      876,
+      "2026-09-09T19:32:04.870Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_yaml_edit.h_phase=parse_partial_reason=126-126"
+    ],
+    [
+      877,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/ci/clean-test-residue.ps1_phase=parse_partial_reason=39-39"
+    ],
+    [
+      878,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_daemon_runtime.c_phase=parse_partial_reason=4597-4598,4599-4627"
+    ],
+    [
+      879,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_toml_edit.c_phase=parse_partial_reason=45-45,46-46,47-47,48-48,392-392,397-397,402-402"
+    ],
+    [
+      880,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pipeline.c_phase=parse_partial_reason=247-247,248-248"
+    ],
+    [
+      881,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/private_file_lock.c_phase=parse_partial_reason=616-616,616-616,616-616,617-617,617-617,618-618,619-619,620-620,620-620,620-620,621-621,621-621,622-622,623-623,623-623,623-623,624-624,624-624,624-624,625-625,625-625,626-626,626-626,626-626,627-627,627-627,628-628,629-629,629-629,631-631,632-632,632-632,634-634,635-635,635-635,635-635,636-636,636-636,636-636,637-637,637-637,638-638,638-638,638-638,638-638,639-639"
+    ],
+    [
+      882,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/ci/check-binary-composition.sh_phase=parse_partial_reason=228-228,229-229"
+    ],
+    [
+      883,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/tree_sitter/array.h_phase=parse_partial_reason=310-310"
+    ],
+    [
+      884,
+      "2026-09-09T19:32:04.871Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/tree_sitter/array.h_phase=parse_partial_reason=160-160,287-287"
+    ],
+    [
+      885,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/agent_clients.h_phase=parse_partial_reason=118-118"
+    ],
+    [
+      886,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/fixtures/plsql/create_type_as_object_limitation.tps_phase=parse_partial_reason=4-8"
+    ],
+    [
+      887,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/parser.c_phase=parse_partial_reason=1337-1337,1348-1348,1356-1356,1365-1365,1373-1373,1472-1472,1485-1485,1543-1543,1934-1934,26330-26330"
+    ],
+    [
+      888,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/store/store.c_phase=parse_partial_reason=6764-6764,6802-6802,6868-6868,7524-7524"
+    ],
+    [
+      889,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cypher/cypher.c_phase=parse_partial_reason=2308-2308,2309-2309,2463-2463,2464-2464,2598-2598"
+    ],
+    [
+      890,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/repro/repro_call_argument_matrix_a.c_phase=parse_partial_reason=1265-1265"
+    ],
+    [
+      891,
+      "2026-09-09T19:32:04.872Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_definitions.c_phase=parse_partial_reason=108-108,109-109"
+    ],
+    [
+      892,
+      "2026-09-09T19:32:04.873Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/parser.c_phase=parse_partial_reason=165-165,483-483"
+    ],
+    [
+      893,
+      "2026-09-09T19:32:04.873Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/tree_sitter/array.h_phase=parse_partial_reason=160-160,287-287"
+    ],
+    [
+      894,
+      "2026-09-09T19:32:04.873Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/tree_sitter/parser.h_phase=parse_partial_reason=278-278"
+    ],
+    [
+      895,
+      "2026-09-09T19:32:04.873Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/compat_thread.c_phase=parse_partial_reason=104-104,104-104"
+    ],
+    [
+      1538,
+      "2026-09-09T19:42:36.325Z",
+      3,
+      "index.worker",
+      "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+    ],
+    [
+      1608,
+      "2026-09-09T19:42:41.481Z",
+      3,
+      "index.worker",
+      "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+    ],
+    [
+      2124,
+      "2026-09-09T19:51:43.286Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/parser.c_phase=parse_partial_reason=10713-10713,10759-10759,10797-10797,10829-10829,10863-10863,10905-10905,10938-10938,10972-10972,11001-11001,11034-11034,11349-11349,11388-11388,11425-11425,11980-11980,12120-12120,286864-286864"
+    ],
+    [
+      2125,
+      "2026-09-09T19:51:43.291Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/cli.c_phase=parse_partial_reason=1-13337"
+    ],
+    [
+      2126,
+      "2026-09-09T19:51:43.291Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_daemon_ipc.c_phase=parse_partial_reason=970-970,970-970,971-971,971-971,971-971"
+    ],
+    [
+      2127,
+      "2026-09-09T19:51:43.291Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_yaml_edit.c_phase=parse_partial_reason=625-625,630-630,635-635"
+    ],
+    [
+      2128,
+      "2026-09-09T19:51:43.291Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=internal/cbm/helpers.c_phase=parse_partial_reason=501-501"
+    ],
+    [
+      2129,
+      "2026-09-09T19:51:43.291Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/repro/repro_call_argument_matrix_a.c_phase=parse_partial_reason=1265-1265"
+    ],
+    [
+      2130,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/smoke-invariants.sh_phase=parse_partial_reason=137-137"
+    ],
+    [
+      2131,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/mcp/compact_out.c_phase=parse_partial_reason=1034-1034,1042-1042,1070-1070,1079-1079,1082-1082,1110-1110,1118-1118,1153-1153,1191-1191"
+    ],
+    [
+      2132,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_usages.c_phase=parse_partial_reason=89-89,90-90"
+    ],
+    [
+      2133,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_path_alias.c_phase=parse_partial_reason=31-31,32-32"
+    ],
+    [
+      2134,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/compat_thread.c_phase=parse_partial_reason=104-104,104-104"
+    ],
+    [
+      2135,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=graph-ui/src/galaxy/coverage-shadow-scene.test.tsx_phase=parse_partial_reason=10-10"
+    ],
+    [
+      2136,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cypher/cypher.c_phase=parse_partial_reason=2308-2308,2309-2309,2463-2463,2464-2464,2598-2598"
+    ],
+    [
+      2137,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/daemon/runtime.c_phase=parse_partial_reason=47-47"
+    ],
+    [
+      2138,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_lsp_cross.c_phase=parse_partial_reason=53-53,54-54"
+    ],
+    [
+      2139,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/repro/repro_call_argument_matrix_b.c_phase=parse_partial_reason=1188-1188,1189-1189,1190-1190,1191-1191,1192-1192,1193-1193,1194-1194,1195-1195,1196-1196,1197-1197,1198-1198,1199-1199,1200-1200,1201-1201,1202-1202,1203-1203,1204-1204,1205-1205,1206-1206,1207-1207,1208-1208,1209-1209,1210-1210,1211-1211,1212-1212,1213-1213,1214-1214,1215-1215,1216-1216,1217-1217,1218-1218,1219-1219,1220-1220,1221-1221,1222-1222,1223-1223,1224-1224,1225-1225,1246-1246,1247-1247,1248-1248,1360-1360"
+    ],
+    [
+      2140,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_index_resilience.c_phase=parse_partial_reason=194-194,350-350,612-612"
+    ],
+    [
+      2141,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_k8s.c_phase=parse_partial_reason=70-70,71-71"
+    ],
+    [
+      2142,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_importance.c_phase=parse_partial_reason=99-99,100-100"
+    ],
+    [
+      2143,
+      "2026-09-09T19:51:43.292Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_similarity.c_phase=parse_partial_reason=75-75,76-76"
+    ],
+    [
+      2144,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/test-windows.ps1_phase=parse_partial_reason=109-109"
+    ],
+    [
+      2145,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/setup-windows.ps1_phase=parse_partial_reason=113-113,113-113,245-327"
+    ],
+    [
+      2146,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/ci/clean-test-residue.ps1_phase=parse_partial_reason=39-39"
+    ],
+    [
+      2147,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/agent_profiles.h_phase=parse_partial_reason=67-67"
+    ],
+    [
+      2148,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_daemon_runtime.c_phase=parse_partial_reason=4597-4598,4599-4627"
+    ],
+    [
+      2149,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/artifact.c_phase=parse_partial_reason=61-61,64-64,65-65,76-76,77-77,635-635"
+    ],
+    [
+      2150,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_text_edit.c_phase=parse_partial_reason=49-49,50-50,51-51,52-52,53-53,54-54,348-348,353-353,358-358"
+    ],
+    [
+      2151,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/tree_sitter/array.h_phase=parse_partial_reason=310-310"
+    ],
+    [
+      2152,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_worker_pool.c_phase=parse_partial_reason=209-209"
+    ],
+    [
+      2153,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_yaml_edit.h_phase=parse_partial_reason=126-126"
+    ],
+    [
+      2154,
+      "2026-09-09T19:51:43.293Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      2155,
+      "2026-09-09T19:51:43.294Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_mcp.c_phase=parse_partial_reason=57-57,1374-1374,2604-2604,2612-2612,2843-2843,8455-8455,8490-8490,15735-15735"
+    ],
+    [
+      2156,
+      "2026-09-09T19:51:43.294Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_toml_edit.c_phase=parse_partial_reason=45-45,46-46,47-47,48-48,392-392,397-397,402-402"
+    ],
+    [
+      2157,
+      "2026-09-09T19:51:43.294Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_ui.c_phase=parse_partial_reason=934-934,985-985,1150-1150,1250-1250,1340-1340,1452-1452,1941-1941,1943-1943,2034-2034,2041-2440"
+    ],
+    [
+      2158,
+      "2026-09-09T19:51:43.294Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_calls.c_phase=parse_partial_reason=83-83,84-84"
+    ],
+    [
+      2159,
+      "2026-09-09T19:51:43.294Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/git/git_context.c_phase=parse_partial_reason=181-181"
+    ],
+    [
+      2160,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/tree_sitter/array.h_phase=parse_partial_reason=160-160,287-287"
+    ],
+    [
+      2161,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_toml_edit.h_phase=parse_partial_reason=107-107"
+    ],
+    [
+      2162,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      2163,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=pkg/chocolatey/tools/chocolateyInstall.ps1_phase=parse_partial_reason=9-12,13-13,14-14"
+    ],
+    [
+      2164,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/mcp/mcp.c_phase=parse_partial_reason=185-185,195-195,4216-4216,4362-4362,6510-6510,6586-6586,7328-7328,7969-7969,8549-8549,9767-9767,11964-11964,14848-14848,14850-14850,14852-14852,16738-16738,17140-17140,17153-17153"
+    ],
+    [
+      2165,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=internal/cbm/lsp/generated/java_stdlib_data.c_phase=parse_partial_reason=1329-1329"
+    ],
+    [
+      2166,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_semantic_edges.c_phase=parse_partial_reason=298-298,299-299"
+    ],
+    [
+      2167,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_definitions.c_phase=parse_partial_reason=108-108,109-109"
+    ],
+    [
+      2168,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/log.c_phase=parse_partial_reason=280-280,284-284,297-297,301-301,327-327,331-331"
+    ],
+    [
+      2169,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_json_like.h_phase=parse_partial_reason=155-155"
+    ],
+    [
+      2170,
+      "2026-09-09T19:51:43.295Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/tree_sitter/parser.h_phase=parse_partial_reason=278-278"
+    ],
+    [
+      2171,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/tree_sitter/parser.h_phase=parse_partial_reason=282-282"
+    ],
+    [
+      2172,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      2173,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pipeline_incremental.c_phase=parse_partial_reason=98-98,99-99,1140-1140,1229-1229"
+    ],
+    [
+      2174,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/config_json_like.c_phase=parse_partial_reason=46-46,47-47,48-48,49-49,1363-1363,1368-1368,1373-1373"
+    ],
+    [
+      2175,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_pkgmap.c_phase=parse_partial_reason=86-86"
+    ],
+    [
+      2176,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/hook_augment.c_phase=parse_partial_reason=406-406,431-431,441-441,531-531,897-897"
+    ],
+    [
+      2177,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/private_file_lock.c_phase=parse_partial_reason=616-616,616-616,616-616,617-617,617-617,618-618,619-619,620-620,620-620,620-620,621-621,621-621,622-622,623-623,623-623,623-623,624-624,624-624,624-624,625-625,625-625,626-626,626-626,626-626,627-627,627-627,628-628,629-629,629-629,631-631,632-632,632-632,634-634,635-635,635-635,635-635,636-636,636-636,636-636,637-637,637-637,638-638,638-638,638-638,638-638,639-639"
+    ],
+    [
+      2178,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/watcher/watcher.c_phase=parse_partial_reason=344-344,346-346,348-348,899-899"
+    ],
+    [
+      2179,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/discover/discover.c_phase=parse_partial_reason=572-572"
+    ],
+    [
+      2180,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/repro/repro_call_node_behaviors.c_phase=parse_partial_reason=674-674,677-677,680-680,683-683,686-686,689-689,692-692"
+    ],
+    [
+      2181,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=graph-ui/src/galaxy/hierarchy-layout.ts_phase=parse_partial_reason=249-249"
+    ],
+    [
+      2182,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/slab_alloc.c_phase=parse_partial_reason=118-118,121-121,124-124"
+    ],
+    [
+      2183,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/ui/httpd.h_phase=parse_partial_reason=114-114,116-116"
+    ],
+    [
+      2184,
+      "2026-09-09T19:51:43.296Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=internal/cbm/preprocessor.h_phase=parse_partial_reason=39-39"
+    ],
+    [
+      2185,
+      "2026-09-09T19:51:43.297Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/tree_sitter/alloc.h_phase=parse_partial_reason=50-50"
+    ],
+    [
+      2186,
+      "2026-09-09T19:51:43.297Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-magma/src/parser.c_phase=parse_partial_reason=1337-1337,1348-1348,1356-1356,1365-1365,1373-1373,1472-1472,1485-1485,1543-1543,1934-1934,26330-26330"
+    ],
+    [
+      2187,
+      "2026-09-09T19:51:43.297Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/store/store.c_phase=parse_partial_reason=6764-6764,6802-6802,6868-6868,7524-7524"
+    ],
+    [
+      2188,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_parallel.c_phase=parse_partial_reason=334-334,335-335,1413-1413"
+    ],
+    [
+      2189,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/ui/http_server.c_phase=parse_partial_reason=825-825,2841-2841,2882-2882"
+    ],
+    [
+      2190,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_cross_repo.c_phase=parse_partial_reason=96-96"
+    ],
+    [
+      2191,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=scripts/ci/check-binary-composition.sh_phase=parse_partial_reason=228-228,229-229"
+    ],
+    [
+      2192,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/ui/activity.c_phase=parse_partial_reason=174-174,203-203"
+    ],
+    [
+      2193,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/parser.c_phase=parse_partial_reason=165-165,483-483"
+    ],
+    [
+      2194,
+      "2026-09-09T19:51:43.307Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/parser.c_phase=parse_partial_reason=1260-1260,1308-1308,1981-1981,1995-1995,2008-2008,2021-2021,2034-2034,2389-2389,21601-21601"
+    ],
+    [
+      2195,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/daemon/ipc.c_phase=parse_partial_reason=3365-3365,3365-3365,3365-3365,3366-3366,3366-3366,3366-3366,3367-3367,3367-3367,3368-3368,3369-3369,3370-3370,3370-3370,3370-3370,3371-3371,3371-3371,3372-3372,3373-3373,3373-3373,3374-3374,3375-3375,3375-3375,3375-3375,3376-3376,3376-3376,3376-3376,3377-3377,3377-3377,3377-3377,3378-3378,3378-3378,3379-3379,3379-3379,3379-3379,3380-3380,3380-3380,3380-3380,3381-3381,3381-3381,3381-3381,3382-3382,3382-3382,3383-3383,3384-3384,3384-3384,3384-3384,3385-3385,3385-3385,3385-3385,3386-3386,3386-3386,3386-3386,3386-3386,3387-3387,3387-3387,3388-3388,3389-3389,3390-3390,3391-3391,3391-3391,3392-3392,3392-3392"
+    ],
+    [
+      2196,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/activation_transaction.c_phase=parse_partial_reason=208-208,1426-2331"
+    ],
+    [
+      2197,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_semantic.c_phase=parse_partial_reason=69-69,70-70"
+    ],
+    [
+      2198,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_githistory.c_phase=parse_partial_reason=36-36,37-37"
+    ],
+    [
+      2199,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/foundation/platform.c_phase=parse_partial_reason=470-470,492-492,525-525,547-547"
+    ],
+    [
+      2200,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-chialisp/src/tree_sitter/array.h_phase=parse_partial_reason=160-160,287-287"
+    ],
+    [
+      2201,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/tree_sitter/parser.h_phase=parse_partial_reason=278-278"
+    ],
+    [
+      2202,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-arkts/src/tree_sitter/parser.h_phase=parse_partial_reason=282-282"
+    ],
+    [
+      2203,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pass_complexity.c_phase=parse_partial_reason=34-34,35-35"
+    ],
+    [
+      2204,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/test_cli.c_phase=parse_partial_reason=453-453,469-469,492-492,528-528,542-542,585-585,593-593,1414-1414,1417-1417,1657-1657,1662-1662,5011-5011,5013-5013,5015-5015,5046-5046,5048-5048,5053-5053,5055-5055,5057-5057,5119-5119,5121-5121,5123-5123,5468-5468,5470-5470,5472-5472,5474-5474,5486-5486,5488-5488,5490-5490,5587-5587,5589-5589,5591-5591,5593-5593,7574-14767"
+    ],
+    [
+      2205,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/pipeline/pipeline.c_phase=parse_partial_reason=247-247,248-248"
+    ],
+    [
+      2206,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tools/tree-sitter-form/src/tree_sitter/array.h_phase=parse_partial_reason=310-310"
+    ],
+    [
+      2207,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=src/cli/agent_clients.h_phase=parse_partial_reason=118-118"
+    ],
+    [
+      2208,
+      "2026-09-09T19:51:43.308Z",
+      2,
+      "index.worker",
+      "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=cbm-pr2068_path=tests/fixtures/plsql/create_type_as_object_limitation.tps_phase=parse_partial_reason=4-8"
+    ],
+    [
+      2263,
+      "2026-09-09T19:51:56.237Z",
+      3,
+      "index.worker",
+      "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+    ],
+    [
+      2283,
+      "2026-09-09T19:52:00.225Z",
+      3,
+      "index.worker",
+      "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+    ]
+  ],
+  "updatedClientRealPagination": {
+    "at": "2026-09-09T20:06:06.974Z",
+    "calls": [
+      {
+        "project": "cbm-pr2068",
+        "offset": 0,
+        "requestedLimit": 1000,
+        "verificationLimit": 100
+      },
+      {
+        "project": "cbm-pr2068",
+        "offset": 100,
+        "requestedLimit": 1000,
+        "verificationLimit": 100
+      },
+      {
+        "project": "cbm-pr2068",
+        "offset": 200,
+        "requestedLimit": 1000,
+        "verificationLimit": 100
+      }
+    ],
+    "rows": 281,
+    "listingComplete": true,
+    "truncations": [],
+    "counts": {
+      "partial": 85,
+      "skipped": 0,
+      "notIndexedDirs": 9,
+      "notIndexedFiles": 187,
+      "scopeEntries": 281
+    },
+    "generation": "2026-09-09T19:51:51Z",
+    "pages": [
+      {
+        "returned": 100,
+        "total": 281,
+        "hasMore": true,
+        "nextOffset": 100
+      },
+      {
+        "returned": 100,
+        "total": 281,
+        "hasMore": true,
+        "nextOffset": 200
+      },
+      {
+        "returned": 81,
+        "total": 281,
+        "hasMore": false
+      }
+    ]
+  },
+  "workerLogSummary": {
+    "retainedWorkerRows": 177,
+    "warnings": 172,
+    "realProjectPartialWarnings": 170,
+    "distinctRealProjectPartialMessages": 85,
+    "occurrenceCounts": {
+      "2": 85
+    },
+    "otherWarnings": [
+      [
+        393,
+        "2026-09-09T19:29:28.781Z",
+        2,
+        "index.worker",
+        "level=warn msg=index.worker record=level=warn_msg=pipeline.route_path=full_reason=invalid_existing_db"
+      ],
+      [
+        394,
+        "2026-09-09T19:29:28.785Z",
+        2,
+        "index.worker",
+        "level=warn msg=index.worker record=level=warn_msg=index.file.diagnostic_project=pr2068-error-fixture_path=partial.c_phase=parse_partial_reason=2-2"
+      ]
+    ],
+    "workerErrorCount": 5
+  }
+}

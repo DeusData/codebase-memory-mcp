@@ -1,0 +1,31 @@
+{
+  "started": "2026-09-09T21:43:44.787Z",
+  "project": "cbm-pr2068",
+  "origin": "http://127.0.0.1:9749",
+  "actions": [],
+  "requests": [],
+  "externalRequests": [],
+  "failedRequests": [],
+  "pageErrors": [],
+  "screenshots": [],
+  "wroteClientConfiguration": false,
+  "launchedClientOrLlm": false,
+  "injectedEvents": false,
+  "clientConfigurationBefore": [
+    {
+      "path": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068/.claude/settings.local.json",
+      "absent": true
+    },
+    {
+      "path": "/Users/bernhard/.claude/settings.json",
+      "size": 1005,
+      "mtimeMs": 1788961887461.606
+    },
+    {
+      "path": "/Users/bernhard/.codex/config.toml",
+      "size": 7478,
+      "mtimeMs": 1788978557317.07
+    }
+  ],
+  "failure": "TypeError: fetch failed\n    at node:internal/deps/undici/undici:13510:13\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    at async json (file:///private/tmp/cbm-pr2068-before-c9eic3xv/final-agent-boundary.mjs:13:47)\n    at async file:///private/tmp/cbm-pr2068-before-c9eic3xv/final-agent-boundary.mjs:22:25"
+}

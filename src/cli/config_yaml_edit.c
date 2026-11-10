@@ -2589,6 +2589,10 @@ typedef struct {
     bool identity_found;
     size_t identity_start;
     size_t identity_end;
+    /* The missing rest of the path begins under a `parent: {}` header. */
+    bool parent_inline_empty;
+    size_t parent_line;
+    size_t parent_colon;
 } yaml_mapping_sequence_target_t;
 
 static void yaml_sequence_key_vec_free(yaml_sequence_key_vec_t *keys) {
@@ -2698,8 +2702,28 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
     return quote != '\0' ? YAML_MATCH : 0;
 }
 
-static int yaml_sequence_validate_document(const yaml_doc_t *doc) {
-    for (size_t i = 0U; i < doc->line_count; i++) {
+/* Validates only the top-level section the edit descends into. The root
+ * mapping itself was already validated when the document was parsed, so the
+ * section boundaries are sound; every OTHER top-level section is opaque user
+ * content, the same contract the mapping-entry editor applies. Validating the
+ * whole document refused the stock Hermes config for flow sequences such as
+ * `cli: [hermes-cli]` under `platform_toolsets:`, which the hook edit never
+ * reads or rewrites (#2209). An absent root key means the sequence is appended
+ * as a new top-level section, which touches no existing line. */
+static int yaml_sequence_validate_document(const yaml_doc_t *doc, const char *root_key,
+                                           size_t root_key_len) {
+    bool found = false;
+    size_t section_line = 0U;
+    size_t section_colon = 0U;
+    if (yaml_find_unique_key(doc, 0U, root_key, root_key_len, &found, &section_line,
+                             &section_colon) != 0) {
+        return YAML_ERROR;
+    }
+    if (!found) {
+        return 0;
+    }
+    size_t section_end = yaml_top_level_section_end(doc, section_line);
+    for (size_t i = section_line; i < section_end; i++) {
         const yaml_line_t *line = &doc->lines[i];
         if (line->blank || line->comment || line->dquote_cont) {
             continue;
@@ -2942,12 +2966,43 @@ static int yaml_sequence_parse_block(const yaml_doc_t *doc, size_t begin_line, s
     return 0;
 }
 
+/* `section: {}` is how the mapping-entry editor writes a section it emptied
+ * (yaml_build_last_mapping_entry_removal), and its upsert accepts it back. On
+ * a PARENT of the sequence path it is that same empty mapping, so the rest of
+ * the path is missing beneath it: removal is a no-op and upsert expands the
+ * header in place. The Hermes remover leaves `hooks: {}` whenever our hook was
+ * the only entry. The sequence key itself holding `{}`, any other flow value,
+ * and content nested under the inline mapping stay refused. */
+static int yaml_sequence_target_empty_parent(const yaml_doc_t *doc, size_t key_line, size_t colon,
+                                             size_t child_end, size_t next_depth,
+                                             size_t sequence_path_len,
+                                             yaml_mapping_sequence_target_t *target) {
+    bool inline_empty = false;
+    if (next_depth >= sequence_path_len ||
+        yaml_tail_is_explicit_empty_mapping(doc->data, colon, doc->lines[key_line].text_end,
+                                            &inline_empty) != 0 ||
+        !inline_empty) {
+        return YAML_ERROR;
+    }
+    for (size_t i = key_line + YAML_UNIT; i < child_end; i++) {
+        if (!doc->lines[i].blank && !doc->lines[i].comment) {
+            return YAML_ERROR;
+        }
+    }
+    target->missing_index = next_depth;
+    target->insert_offset = yaml_sequence_line_offset(doc, child_end);
+    target->parent_inline_empty = true;
+    target->parent_line = key_line;
+    target->parent_colon = colon;
+    return 0;
+}
+
 static int yaml_sequence_analyze(const yaml_doc_t *doc, const char *const *sequence_path,
                                  const size_t *path_lengths, size_t sequence_path_len,
                                  const char *identity_key, const char *identity_value,
                                  yaml_mapping_sequence_target_t *target) {
     memset(target, 0, sizeof(*target));
-    if (yaml_sequence_validate_document(doc) != 0) {
+    if (yaml_sequence_validate_document(doc, sequence_path[0], path_lengths[0]) != 0) {
         return YAML_ERROR;
     }
     size_t parent_begin = 0U;
@@ -2973,10 +3028,11 @@ static int yaml_sequence_analyze(const yaml_doc_t *doc, const char *const *seque
             return 0;
         }
         const yaml_line_t *header = &doc->lines[key_line];
-        if (!yaml_tail_is_empty(doc->data, colon, header->text_end)) {
-            return YAML_ERROR;
-        }
         size_t child_end = yaml_sequence_nested_end(doc, key_line, parent_end);
+        if (!yaml_tail_is_empty(doc->data, colon, header->text_end)) {
+            return yaml_sequence_target_empty_parent(doc, key_line, colon, child_end,
+                                                     depth + YAML_UNIT, sequence_path_len, target);
+        }
         if (depth + YAML_UNIT == sequence_path_len) {
             target->sequence_found = true;
             target->missing_index = sequence_path_len;
@@ -3075,13 +3131,52 @@ static int yaml_sequence_validate_canonical(const char *canonical_item, size_t c
     return result;
 }
 
+/* Copies the document up to insert_offset with the `parent: {}` header turned
+ * into a block header `parent:`, exactly as
+ * yaml_build_inline_empty_mapping_section_add does for a mapping section: a
+ * trailing comment and the line ending are kept. */
+static int yaml_sequence_append_expanded_parent(yaml_buf_t *out, const yaml_doc_t *doc,
+                                                const yaml_mapping_sequence_target_t *target) {
+    if (target->parent_line >= doc->line_count) {
+        return YAML_ERROR;
+    }
+    const yaml_line_t *header = &doc->lines[target->parent_line];
+    size_t comment = 0U;
+    if (target->insert_offset < header->end ||
+        yaml_find_comment(doc->data, target->parent_colon + YAML_UNIT, header->text_end,
+                          &comment) != 0 ||
+        yaml_buf_append(out, doc->data, target->parent_colon + YAML_UNIT) != 0) {
+        return YAML_ERROR;
+    }
+    size_t kept_tail = header->text_end;
+    if (comment < header->text_end) {
+        if (yaml_buf_append_char(out, ' ') != 0) {
+            return YAML_ERROR;
+        }
+        kept_tail = comment;
+    }
+    if (yaml_buf_append(out, doc->data + kept_tail, header->end - kept_tail) != 0 ||
+        yaml_buf_append(out, doc->data + header->end, target->insert_offset - header->end) != 0 ||
+        (out->len > 0U && out->data[out->len - YAML_UNIT] != '\n' &&
+         yaml_buf_append(out, doc->eol, doc->eol_len) != 0)) {
+        return YAML_ERROR;
+    }
+    return 0;
+}
+
 static int yaml_sequence_build_insert(yaml_buf_t *out, const yaml_doc_t *doc,
                                       const yaml_mapping_sequence_target_t *target,
                                       const char *const *sequence_path, const size_t *path_lengths,
                                       size_t sequence_path_len, const yaml_buf_t *rendered_item) {
-    if (target->insert_offset > doc->len ||
-        yaml_buf_append(out, doc->data, target->insert_offset) != 0 ||
-        yaml_append_separator_if_needed(out, doc, target->insert_offset) != 0) {
+    if (target->insert_offset > doc->len) {
+        return YAML_ERROR;
+    }
+    if (target->parent_inline_empty) {
+        if (yaml_sequence_append_expanded_parent(out, doc, target) != 0) {
+            return YAML_ERROR;
+        }
+    } else if (yaml_buf_append(out, doc->data, target->insert_offset) != 0 ||
+               yaml_append_separator_if_needed(out, doc, target->insert_offset) != 0) {
         return YAML_ERROR;
     }
     if (!target->sequence_found) {

@@ -3,6 +3,7 @@
  */
 #include "log.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -53,9 +54,8 @@ bool cbm_log_crash_durable(void) {
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
-    /* getenv() is safe here: this runs at startup before any thread is created,
-     * so there is no concurrent setenv() to race against. */
-    const char *raw = getenv("CBM_LOG_LEVEL");
+    /* Resolve the immutable startup override before the inherited environment. */
+    const char *raw = cbm_runtime_getenv("CBM_LOG_LEVEL");
     if (raw && raw[0] != '\0') {
         /* Textual form, case-insensitive. Index of each name == its enum value. */
         static const char *const names[] = {"debug", "info", "warn", "error", "none"};
@@ -85,7 +85,7 @@ void cbm_log_init_from_env(void) {
     /* Unrecognised value: leave the level unchanged (fail-open). */
 
 parse_format:;
-    const char *fmt = getenv("CBM_LOG_FORMAT");
+    const char *fmt = cbm_runtime_getenv("CBM_LOG_FORMAT");
     if (fmt && fmt[0] != '\0') {
         char lower_fmt[8];
         size_t i = 0;
@@ -363,17 +363,29 @@ static void copy_path_without_query(const char *path, char *out, size_t outsz) {
 }
 
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
-                         int64_t duration_us) {
+                         int64_t duration_us, int64_t handler_duration_us,
+                         int64_t response_serialization_us, bool cancelled, bool timed_out) {
     char duration_ms[CBM_SZ_32];
+    char handler_duration_ms[CBM_SZ_32];
+    char response_serialization_ms[CBM_SZ_32];
     snprintf(duration_ms, sizeof(duration_ms), "%" PRId64, duration_us / 1000);
+    snprintf(handler_duration_ms, sizeof(handler_duration_ms), "%" PRId64,
+             handler_duration_us / 1000);
+    snprintf(response_serialization_ms, sizeof(response_serialization_ms), "%" PRId64,
+             response_serialization_us / 1000);
+    const char *status = timed_out ? "timeout" : (is_error ? "error" : "ok");
     if (tool_name && tool_name[0] != '\0') {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "tool", tool_name, "status",
-                is_error ? "error" : "ok", "duration_ms", duration_ms, NULL);
+                "method", method ? method : "", "tool", tool_name, "status", status, "duration_ms",
+                duration_ms, "handler_duration_ms", handler_duration_ms,
+                "response_serialization_ms", response_serialization_ms, "cancelled",
+                cancelled ? "true" : "false", "timed_out", timed_out ? "true" : "false", NULL);
     } else {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "status", is_error ? "error" : "ok", "duration_ms",
-                duration_ms, NULL);
+                "method", method ? method : "", "status", status, "duration_ms", duration_ms,
+                "handler_duration_ms", handler_duration_ms, "response_serialization_ms",
+                response_serialization_ms, "cancelled", cancelled ? "true" : "false", "timed_out",
+                timed_out ? "true" : "false", NULL);
     }
 }
 

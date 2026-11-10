@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # codebase-memory-mcp setup script (macOS + Linux)
-# Default: download pre-built binary from GitHub Release
+# Default: install the latest pre-built binary through install.sh
 # --from-source: build from source (requires Go + C compiler)
 
 REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_NAME="codebase-memory-mcp"
 SOURCE_DIR="$HOME/.local/share/codebase-memory-mcp"
-CLEANUP_DIR=""  # set by download_binary for EXIT trap
+CLEANUP_DIR=""  # set by install_release for EXIT trap
 
 # --- Colors ---
 
@@ -43,43 +43,13 @@ for arg in "$@"; do
         --help|-h)
             echo "Usage: $0 [--from-source]"
             echo ""
-            echo "  Default:        Download pre-built binary from GitHub Release"
+            echo "  Default:        Download the pre-built binary through install.sh"
             echo "  --from-source:  Clone and build from source (requires Go 1.23+ and a C compiler)"
             exit 0
             ;;
         *) die "Unknown argument: $arg" ;;
     esac
 done
-
-# --- Platform detection ---
-
-detect_platform() {
-    local os arch
-    os=$(uname -s)
-    arch=$(uname -m)
-
-    case "$os" in
-        Darwin) os="darwin" ;;
-        Linux)  os="linux" ;;
-        *)      die "Unsupported OS: $os. Use WSL2 on Windows." ;;
-    esac
-
-    case "$arch" in
-        arm64|aarch64) arch="arm64" ;;
-        x86_64|amd64)
-            # On macOS, uname -m returns x86_64 under Rosetta even on Apple Silicon.
-            # Check the actual hardware to pick the right binary.
-            if [ "$os" = "darwin" ] && sysctl -n hw.optional.arm64 2>/dev/null | grep -q '1'; then
-                arch="arm64"
-            else
-                arch="amd64"
-            fi
-            ;;
-        *)             die "Unsupported architecture: $arch" ;;
-    esac
-
-    echo "${os}-${arch}"
-}
 
 # --- Prerequisite checks ---
 
@@ -133,46 +103,74 @@ check_git() {
     ok "Git found"
 }
 
-# --- Download binary ---
+# --- Download + install through install.sh ---
+#
+# install.sh is the one implementation of "fetch a release and install it": it
+# downloads checksums.txt next to the archive, verifies the archive's SHA-256
+# against it, checks the archive layout, and only then runs the binary's own
+# `install`. This script used to carry a second copy of that download,
+# which did not keep up with the installer. It now fetches install.sh from the
+# same origin and branch it is itself served from and hands over to it, so
+# there is exactly one install path.
+#
+# CBM_DOWNLOAD_URL (the installers' download-base override, for local testing)
+# also moves the installer fetch: install.sh is then taken from
+# "$CBM_DOWNLOAD_URL/install.sh".
 
-fetch() {
-    local url="$1" tool="$2"
-    if [ "$tool" = "curl" ]; then
-        curl -fsSL "$url"
+INSTALLER_URL="https://raw.githubusercontent.com/${REPO}/main/install.sh"
+if [ -n "${CBM_DOWNLOAD_URL:-}" ]; then
+    INSTALLER_URL="${CBM_DOWNLOAD_URL%/}/install.sh"
+fi
+
+# Same transport rule as install.sh: HTTPS everywhere; plain HTTP only for an
+# exact loopback authority (the local test fixture), with redirects disabled
+# there so a fixture cannot bounce the fetch to the network.
+is_loopback_http_url() {
+    [[ "$1" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?\#].*)?$ ]]
+}
+
+fetch_installer() {
+    local url="$1" destination="$2" tool="$3"
+    if is_loopback_http_url "$url"; then
+        if [ "$tool" = "curl" ]; then
+            curl -fsS --noproxy '*' --proto '=http' -o "$destination" "$url"
+        else
+            wget -q --no-proxy --max-redirect=0 -O "$destination" "$url"
+        fi
+    elif [[ "$url" == https://* ]]; then
+        if [ "$tool" = "curl" ]; then
+            curl -fsSL --max-redirs 5 --proto '=https' --proto-redir '=https' \
+                -o "$destination" "$url"
+        else
+            wget -q --https-only --max-redirect=5 -O "$destination" "$url"
+        fi
     else
-        wget -qO- "$url"
+        die "Refusing non-HTTPS installer URL: $url"
     fi
 }
 
-download_binary() {
-    local platform="$1" tool="$2"
+install_release() {
+    local tool="$1"
 
     echo ""
-    echo "${BOLD}Fetching latest release...${RESET}"
-    local tag
-    tag=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" "$tool" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')
-
-    if [ -z "$tag" ]; then
-        die "Could not determine latest release. Check https://github.com/${REPO}/releases"
-    fi
-    ok "Latest release: $tag"
-
-    local asset="codebase-memory-mcp-${platform}.tar.gz"
-    local url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
-
-    echo "${BOLD}Downloading ${asset}...${RESET}"
+    echo "${BOLD}Fetching install.sh...${RESET}"
     CLEANUP_DIR=$(mktemp -d)
     trap 'rm -rf "$CLEANUP_DIR"' EXIT
-    local tmpdir="$CLEANUP_DIR"
+    local installer="$CLEANUP_DIR/install.sh"
 
-    fetch "$url" "$tool" > "${tmpdir}/${asset}"
-    tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
+    fetch_installer "$INSTALLER_URL" "$installer" "$tool" ||
+        die "Could not fetch install.sh from ${INSTALLER_URL}"
+    [ -s "$installer" ] || die "Fetched an empty install.sh from ${INSTALLER_URL}"
+    ok "install.sh fetched"
 
-    mkdir -p "$INSTALL_DIR"
-    mv "${tmpdir}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-
-    ok "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
+    echo ""
+    echo "${BOLD}Installing through install.sh...${RESET}"
+    # The installer configures nothing (--skip-config): agent configuration
+    # stays this script's interactive step below. stdin is detached so that,
+    # when this script itself arrives through `curl | bash`, nothing the
+    # installer runs can read the rest of this script as its input.
+    bash "$installer" --dir "$INSTALL_DIR" --skip-config </dev/null ||
+        die "install.sh failed (see the messages above)"
 }
 
 # --- Build from source ---
@@ -297,11 +295,9 @@ echo ""
 if [ "$FROM_SOURCE" = true ]; then
     build_from_source
 else
-    platform=$(detect_platform)
-    ok "Platform: ${platform}"
     tool=$(check_download_tool)
     ok "Download tool: ${tool}"
-    download_binary "$platform" "$tool"
+    install_release "$tool"
 fi
 
 # Verify binary

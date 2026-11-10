@@ -93,6 +93,14 @@ size_t cbm_mem_budget(void);
  * Never call from production code. */
 void cbm_mem_set_budget_for_tests(size_t bytes);
 
+/* TEST HOOK: pin cbm_mem_charged() (and so cbm_mem_over_budget()) to `bytes`;
+ * 0 restores the live reading. The charge is the process footprint, which a
+ * test cannot steer, so a gate keyed to it ("extraction ended just under the
+ * spill latch", #2184) is otherwise untestable. A pinned reading does not move
+ * cbm_mem_peak_charged(). Callers restore 0 before their assertions. Never call
+ * from production code. */
+void cbm_mem_set_charged_for_tests(size_t bytes);
+
 /* Returns true if current RSS exceeds the budget. */
 bool cbm_mem_over_budget(void);
 

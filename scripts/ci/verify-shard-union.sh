@@ -8,24 +8,56 @@
 # For every leg it asserts: all shards agree on the shard count, indices form
 # exactly 1..n, every shard saw the same full suite list, and the UNION of the
 # shard slices equals that list — a rename/re-shard can never silently drop a
-# suite (gate-quality loss) without failing here.
+# suite (gate-quality loss) without failing here. A narrowed leg (PR CI test
+# selection) records the selected list and its selection_sha256; all shards
+# must agree on that too.
 #
-# Usage: scripts/ci/verify-shard-union.sh <manifests-dir>
+# No manifests at all is a failure — unless the PR's lane selection (--lanes,
+# the JSON list from scripts/ci/select-lanes.sh) holds no test leg, in which
+# case no leg ran by design. Without --lanes (or with "all": dry run,
+# release) every leg is expected, exactly as before lane selection.
+#
+# Usage: scripts/ci/verify-shard-union.sh <manifests-dir> [--lanes <json-list>|all]
 set -eu
 
 case "${1:-}" in
 -h | --help)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
 
 MANIFEST_DIR="${1:?usage: verify-shard-union.sh <manifests-dir> (see --help)}"
+LANES=all
+if [ "${2:-}" = "--lanes" ]; then
+    LANES="${3:-}"
+elif [ -n "${2:-}" ]; then
+    echo "verify-shard-union.sh: unknown argument '$2'. Please consult --help." >&2
+    exit 2
+fi
+case "$LANES" in
+all | \[*\]) ;;
+*)
+    echo "verify-shard-union.sh: --lanes must be 'all' or a JSON list. Please consult --help." >&2
+    exit 2
+    ;;
+esac
 
-files=$(find "$MANIFEST_DIR" -name shard-manifest.txt | sort)
+files=""
+if [ -d "$MANIFEST_DIR" ]; then
+    files=$(find "$MANIFEST_DIR" -name shard-manifest.txt | sort)
+fi
 if [ -z "$files" ]; then
-    echo "FAIL: no shard manifests were uploaded" >&2
-    exit 1
+    # The test legs are the sharded ones: unix-* and windows (matched with its
+    # quotes, so the windows-guards lane never reads as the windows leg).
+    case "$LANES" in
+    all | *\"unix-* | *\"windows\"*)
+        echo "FAIL: no shard manifests were uploaded" >&2
+        exit 1
+        ;;
+    esac
+    echo "OK: no test leg was selected ($LANES) — no manifests expected"
+    exit 0
 fi
 rc=0
 for leg in $(grep -h '^leg=' $files | sort -u | sed 's/^leg=//'); do
@@ -48,9 +80,19 @@ for leg in $(grep -h '^leg=' $files | sort -u | sed 's/^leg=//'); do
         rc=1
         continue
     fi
+    # A narrowed leg: every shard must have applied the same test selection
+    # (two selections can name the same suites and different tests).
+    sel_sha=$(for f in $leg_files; do
+        grep -h '^selection_sha256=' "$f" || echo "selection_sha256=none"
+    done | sort -u)
+    if [ "$(printf '%s\n' "$sel_sha" | wc -l)" -ne 1 ]; then
+        echo "FAIL: $leg shards applied different test selections" >&2
+        rc=1
+        continue
+    fi
     union_sha=$(for f in $leg_files; do
         sed -n '/^--- slice ---$/,$p' "$f" | tail -n +2
-    done | sort | sha256sum | awk '{print $1}')
+    done | sort | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')
     if [ "$union_sha" != "$list_sha" ]; then
         echo "FAIL: $leg union of shard slices != full suite list (GATE-QUALITY LOSS)" >&2
         rc=1

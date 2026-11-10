@@ -60,6 +60,13 @@ void cbm_closedir(cbm_dir_t *d);
 /* ── Portable popen/pclose ────────────────────────────────────── */
 
 FILE *cbm_popen(const char *cmd, const char *mode);
+
+/* Read-mode cbm_popen for a `git ...` command line: the child environment
+ * omits git's repository-local variables (foundation/git_env.h), so an
+ * inherited GIT_DIR/GIT_WORK_TREE/... can never override `git -C <repo>`.
+ * The caller's own environment is untouched. Close with cbm_pclose. */
+FILE *cbm_popen_git(const char *cmd);
+
 int cbm_pclose(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */

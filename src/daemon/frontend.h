@@ -4,13 +4,30 @@
 #ifndef CBM_DAEMON_FRONTEND_H
 #define CBM_DAEMON_FRONTEND_H
 
+#include "daemon/bootstrap.h"
 #include "daemon/runtime.h"
 #include "daemon/version_cohort.h"
+#include "mcp/mcp.h"
 
 #include <stdbool.h>
 #include <stdio.h>
 
 typedef struct cbm_daemon_maintenance_monitor cbm_daemon_maintenance_monitor_t;
+
+/* Connection settings replayed when the authenticated daemon is replaced.
+ * Background activation
+ * from initialize is not restored here.
+ * Pointer fields are borrowed for the complete frontend
+ * call. */
+typedef struct {
+    cbm_daemon_bootstrap_config_t bootstrap;
+    const char *session_root;
+    const char *allowed_root;
+    cbm_mcp_tool_profile_t tool_profile;
+    uint8_t ui_update_mask;
+    bool ui_enabled;
+    int ui_port;
+} cbm_daemon_frontend_session_config_t;
 
 /* Called once when install/update/uninstall requests an active local command
  * to stop cooperatively. Returning false does not authorize the command to
@@ -28,6 +45,12 @@ bool cbm_daemon_frontend_is_cancellation_notification(const char *message);
  * cancellation. */
 bool cbm_daemon_frontend_cancellation_matches_request(const char *message, int64_t active_id,
                                                       const char *active_id_str);
+
+/* The JSON-RPC error message answered for a cancelled request (#2144). A
+ * cancelled index_repository call is usually a client deadline on a long
+ * index, so its reply names the async alternative; every other request keeps
+ * the plain message. Returns a static string free of JSON metacharacters. */
+const char *cbm_daemon_frontend_cancelled_error_message(const char *request_message);
 
 /* Start a temporary observer for a one-shot local CLI command or physical
  * supervised worker. manager and cancel_context are borrowed until stop. On
@@ -52,6 +75,14 @@ bool cbm_daemon_frontend_test_monitor_waiting(void);
 uint64_t cbm_daemon_frontend_test_monitor_observations(void);
 uint64_t cbm_daemon_frontend_test_worker_observations(void);
 uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
+/* Counts matching cancellations marked under the frontend mutex.
+ * Tests snapshot this monotonic
+ * count before sending a notification. */
+uint64_t cbm_daemon_frontend_test_routed_cancellations(void);
+/* Budget in ms that the most recent session replay gave its context and UI
+ * settings requests. Recovery tests use distinct connect and startup budgets
+ * and compare. */
+uint32_t cbm_daemon_frontend_test_replay_timeout_ms(void);
 #endif
 
 /* Takes ownership of client and borrows cohort_manager for the complete call.
@@ -60,9 +91,12 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
  * either thread is blocked in stdio, requests cooperative cancellation for the
  * exact active request, and then bounds process exit. Kernel IPC close cancels
  * only this session's daemon work. EOF/parse failure closes the authenticated
- * session. An unexpected daemon transport failure likewise terminates the
+ * session. A transport failure before the application frame is sent replaces
+ * the daemon client and retries once. Sent or repeated failures terminate the
  * process so an agent waiting with stdin still open observes server EOF. */
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
-                                cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out);
+                                cbm_version_cohort_manager_t *cohort_manager,
+                                const cbm_daemon_frontend_session_config_t *session, FILE *in,
+                                FILE *out);
 
 #endif /* CBM_DAEMON_FRONTEND_H */

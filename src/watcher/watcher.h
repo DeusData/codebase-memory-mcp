@@ -4,6 +4,7 @@
  * Polls indexed projects for git changes (HEAD movement or dirty working tree)
  * and triggers re-indexing via a callback. Uses adaptive polling intervals
  * based on project size (5s base + 1s per 500 files, capped at 60s).
+ * Non-git roots are not polled unless cbm_watcher_set_poll_non_git() opts in.
  *
  * Depends on: foundation, store (for project metadata)
  */
@@ -59,6 +60,17 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
                                             cbm_watcher_project_mutation_end_fn end,
                                             cbm_watcher_project_pruned_fn pruned, void *context);
 
+/* Opt in to polling NON-GIT project roots (#1948; default off — non-git roots
+ * are not watched). When on, a non-git root is polled on the same adaptive
+ * cadence by a tree signature: the indexer's own discovery walk (same skip
+ * lists, .gitignore and .cbmignore rules), folded over each file's (relative
+ * path, size, mtime). A changed signature triggers index_fn; the first poll
+ * after baseline reindexes once, since nothing records which tree state the
+ * index holds. Paths discovery skips — including cbm's own .codebase-memory
+ * artifact directory and cache directory — never change the signature.
+ * Read at each project's baseline, so set it before registering projects. */
+void cbm_watcher_set_poll_non_git(cbm_watcher_t *w, bool enabled);
+
 /* ── Watch list management ──────────────────────────────────────── */
 
 /* Add a project to the watch list. root_path is copied. Returns true only when
@@ -79,6 +91,13 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
  * Returns the number of projects that were reindexed. */
 int cbm_watcher_poll_once(cbm_watcher_t *w);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: read one project's committed/pending dirty-state signatures so
+ * failing assertions can self-diagnose (see the definition for why). */
+int cbm_watcher_test_dirty_sigs(cbm_watcher_t *w, const char *project, uint64_t *last_out,
+                                uint64_t *pending_out);
+#endif
+
 /* Run the blocking poll loop. Polls every base_interval_ms until
  * cbm_watcher_stop() is called. Returns 0 on clean shutdown. */
 int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
@@ -86,7 +105,17 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);
 
-/* ── Introspection (for testing) ────────────────────────────────── */
+/* ── Introspection ─────────────────────────────────────────────── */
+
+typedef struct {
+    bool registered; /* this project's physical registration exists */
+    bool running;    /* run loop entered and stop has not been requested */
+} cbm_watcher_project_status_t;
+
+/* Thread-safe snapshot with a constant-time registry lookup. A NULL watcher
+ * reports both fields false; a NULL project reports only the run-loop state.
+ * Registrations can remain present after the watcher has stopped. */
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w, const char *project_name);
 
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
@@ -116,7 +145,36 @@ int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name);
  * otherwise unobservable — cbm_watcher_free frees the same list, so a poll
  * that stopped draining would neither crash nor leak. Test builds only. */
 int cbm_watcher_test_pending_free_count(cbm_watcher_t *w);
+
+/* Test seam: freeze the watcher's monotonic scheduling clock at `ns`
+ * (nonzero), or restore the real clock (0). Process-global; single-threaded
+ * tests only. Lets a test advance time inside index_fn without sleeping. */
+void cbm_watcher_test_set_clock_ns(int64_t ns);
+
+/* Test seam: a project's scheduled next poll (monotonic ns), read under
+ * projects_lock; -1 when it is not watched. */
+int64_t cbm_watcher_test_next_poll_ns(cbm_watcher_t *w, const char *project);
 #endif
+
+/* Per-project watch status, for index_status (#2167). */
+typedef enum {
+    CBM_WATCHER_STRATEGY_PENDING = 0, /* registered; first poll not done yet */
+    CBM_WATCHER_STRATEGY_GIT = 1,     /* git HEAD + dirty-state polling */
+    CBM_WATCHER_STRATEGY_NONE = 2,    /* not a git project: never polled */
+    CBM_WATCHER_STRATEGY_TREE = 3,    /* not a git project: file-tree polling (watch_non_git) */
+} cbm_watcher_strategy_t;
+
+typedef struct {
+    cbm_watcher_strategy_t strategy;
+    int poll_interval_ms;     /* current adaptive cadence */
+    int64_t last_scan_unix_s; /* wall clock of the last completed scan; 0 = none */
+} cbm_watcher_project_info_t;
+
+/* Return true when project_name is physically watched and fill *out with its
+ * published status; false (and *out zeroed) otherwise. Safe to call while the
+ * poll loop runs: the fields are published atomically by the poll path. */
+bool cbm_watcher_project_info(cbm_watcher_t *w, const char *project_name,
+                              cbm_watcher_project_info_t *out);
 
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
@@ -145,6 +203,15 @@ int cbm_watcher_poll_interval_ms(int file_count);
  *
  * Negative inputs are treated as zero. */
 int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures);
+
+/* Return the delay (ms) before the next poll after a SUCCESSFUL re-index that
+ * took `index_elapsed_ms`: max(interval_ms, INDEX_COOLDOWN_FACTOR (3) x
+ * index_elapsed_ms), with the cooldown term capped at INDEX_FAIL_CEILING_MS
+ * (5 min). The caller counts it from when the index finished, so short
+ * rebuilds spend at most ~1/4 of wall time indexing a project; sub-second
+ * indexes keep `interval_ms`.
+ * Never below `interval_ms`; overflow-safe; negative inputs act as zero. */
+int cbm_watcher_success_delay_ms(int interval_ms, int64_t index_elapsed_ms);
 
 /* Classify a stat() errno observed on a watched project root: returns true
  * only for values that mean the root itself is gone (ENOENT, ENOTDIR) and

@@ -20,6 +20,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../src/foundation/compat_thread.h"
+#include <stdatomic.h>
 
 static void tsc_cleanup_db(const char *db_path) {
     char sidecar[512];
@@ -426,7 +428,70 @@ TEST(remove_db_sidecars_rejects_truncated_suffix_path) {
     PASS();
 }
 
+/* The first read of a query connection on an idle WAL DB runs WAL recovery,
+ * rebuilding the shared wal-index header; another connection of this process
+ * opening at the same moment read that header lock-free (TSan, three CI
+ * sightings: walTryBeginRead vs walIndexRecover from concurrent
+ * index_repository requests). A query open's first access is therefore one
+ * process-wide section, SQLite's SQLITE_MUTEX_STATIC_APP1. With opener A held
+ * inside it, the section must not be free.
+ * Windows: SQLite's sqlite3_mutex_try reports BUSY unconditionally without
+ * SQLITE_WIN32_MUTEX_TRYENTER, so there the assertion cannot go RED; the
+ * mutex is the same code on every platform and the RED proof is POSIX. */
+typedef struct {
+    const char *path;
+    atomic_int inside;
+    atomic_int release;
+} tsc_first_access_t;
+
+static void tsc_first_access_hold(void *ctx) {
+    tsc_first_access_t *p = ctx;
+    atomic_store_explicit(&p->inside, 1, memory_order_release);
+    while (!atomic_load_explicit(&p->release, memory_order_acquire)) {}
+}
+
+static void *tsc_first_access_open(void *arg) {
+    tsc_first_access_t *p = arg;
+    cbm_store_t *s = cbm_store_open_path_query(p->path);
+    if (s) {
+        cbm_store_close(s);
+    }
+    return NULL;
+}
+
+TEST(store_query_first_access_is_one_process_section) {
+    char *dir = th_mktempdir("cbm_first_access");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/g.db", dir);
+    cbm_store_t *w = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(w);
+    cbm_store_close(w);
+
+    tsc_first_access_t p = {.path = db};
+    atomic_init(&p.inside, 0);
+    atomic_init(&p.release, 0);
+    cbm_store_query_first_access_hook_for_testing(tsc_first_access_hold, &p);
+    cbm_thread_t opener;
+    ASSERT_EQ(cbm_thread_create(&opener, 0, tsc_first_access_open, &p), 0);
+    while (!atomic_load_explicit(&p.inside, memory_order_acquire)) {}
+    sqlite3_mutex *section = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP1);
+    int try_rc = sqlite3_mutex_try(section);
+    if (try_rc == SQLITE_OK) {
+        sqlite3_mutex_leave(section);
+    }
+    atomic_store_explicit(&p.release, 1, memory_order_release);
+    (void)cbm_thread_join(&opener);
+    cbm_store_query_first_access_hook_for_testing(NULL, NULL);
+    tsc_cleanup_db(db);
+    th_rmtree(dir);
+
+    ASSERT_EQ(try_rc, SQLITE_BUSY);
+    PASS();
+}
+
 SUITE(store_checkpoint) {
+    RUN_TEST(store_query_first_access_is_one_process_section);
     RUN_TEST(checkpoint_does_not_truncate_wal);
     RUN_TEST(seal_for_atomic_publish_makes_main_file_self_contained);
     RUN_TEST(seal_for_atomic_publish_fails_closed_while_reader_pins_wal);
