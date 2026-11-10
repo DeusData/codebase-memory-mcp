@@ -395,9 +395,47 @@ static const CBMType *kt_unwrap_nullable(const CBMType *t) {
     return t;
 }
 
+/* A kotlin.Any member (toString / equals / hashCode) resolved on a stdlib or
+ * JDK type -- `count.toString()` on `val count: Int` binds kotlin.Int.toString
+ * from the stdlib seed. That target has no graph node, so the call join fell
+ * back to a name guess and bound the call to whichever project class declares
+ * a same-named override (#1555: detekt `defaultValue.toString()` ->
+ * Entity.toString). The member is the universal kotlin.Any one, an external
+ * builtin node: emit that, no project edge. `kotlin.` and `java.` are reserved
+ * packages (the compilers reject project declarations in them), so the prefix
+ * proves the owner is not a project type; project QNs in this resolver are
+ * package-spelled and keep their declared override. */
+static bool kt_is_any_member(const char *name) {
+    return strcmp(name, "toString") == 0 || strcmp(name, "equals") == 0 ||
+           strcmp(name, "hashCode") == 0;
+}
+
+static const char *kt_external_any_member(KotlinLSPContext *ctx, const char *callee_qn) {
+    const char *dot = strrchr(callee_qn, '.');
+    if (!dot || !kt_is_any_member(dot + 1)) {
+        return NULL;
+    }
+    if (strncmp(callee_qn, "kotlin.Any.", strlen("kotlin.Any.")) == 0) {
+        return NULL; /* already the builtin */
+    }
+    if (strncmp(callee_qn, "kotlin.", strlen("kotlin.")) != 0 &&
+        strncmp(callee_qn, "java.", strlen("java.")) != 0) {
+        return NULL; /* a project override: a real node */
+    }
+    return kt_join_dot(ctx->arena, "kotlin.Any", dot + 1);
+}
+
 /* Append a typed resolution result to the output array. */
 static void kt_emit_resolved_kind(KotlinLSPContext *ctx, const char *callee_qn,
                                   const char *strategy, float confidence, CBMResolvedKind kind) {
+    if (kind == CBM_RESOLVED_INVOCATION && callee_qn) {
+        const char *any_qn = kt_external_any_member(ctx, callee_qn);
+        if (any_qn) {
+            callee_qn = any_qn;
+            strategy = "lsp_kt_any";
+            confidence = confidence < KT_CONF_PARTIAL ? confidence : KT_CONF_PARTIAL;
+        }
+    }
     if (ctx->debug) {
         fprintf(stderr, "[kotlin_lsp] EMIT %s -> %s [%s %.2f] (resolved_calls=%p enc=%s)\n",
                 ctx->enclosing_func_qn ? ctx->enclosing_func_qn : "(null)",
@@ -1127,20 +1165,26 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
      * package/import/bare/default-import lookups miss, so it never overrides a
      * more specific match; in the per-file pass the registry holds just this
      * file's defs, so the candidate is the file's own sole top-level fun. */
-    if (ctx->registry && ctx->registry->funcs) {
+    /* The cross-file walk runs on an own-file overlay chained to the cross
+     * registry (#1555), so the candidates span the whole chain; a function
+     * registered in both layers under one QN is one candidate. */
+    {
         const char *only_qn = NULL;
         int matches = 0;
-        for (int i = 0; i < ctx->registry->func_count && matches < 2; i++) {
-            const CBMRegisteredFunc *f = &ctx->registry->funcs[i];
-            if (!f->qualified_name || !f->short_name) {
-                continue;
-            }
-            if (f->receiver_type) { /* method / extension — not a bare top-level fun */
-                continue;
-            }
-            if (strcmp(f->short_name, name) == 0) {
-                only_qn = f->qualified_name;
-                matches++;
+        for (const CBMTypeRegistry *r = ctx->registry; r && matches < 2; r = r->fallback) {
+            for (int i = 0; r->funcs && i < r->func_count && matches < 2; i++) {
+                const CBMRegisteredFunc *f = &r->funcs[i];
+                if (!f->qualified_name || !f->short_name) {
+                    continue;
+                }
+                if (f->receiver_type) { /* method / extension — not a bare top-level fun */
+                    continue;
+                }
+                if (strcmp(f->short_name, name) == 0 &&
+                    !(only_qn && strcmp(only_qn, f->qualified_name) == 0)) {
+                    only_qn = f->qualified_name;
+                    matches++;
+                }
             }
         }
         if (matches == 1 && only_qn) {
@@ -1335,6 +1379,22 @@ const CBMRegisteredFunc *kotlin_lookup_method(KotlinLSPContext *ctx, const char 
         const CBMRegisteredFunc *rf =
             cbm_registry_lookup_method_aliased(ctx->registry, cur_qn, method_name);
         if (rf) {
+            /* A member wins over an extension of the same name (Kotlin
+             * resolution). The file's own extension functions carry the
+             * extended class as receiver_type, so the receiver lookup can
+             * return `fun Builder.add(..)` for a call meant for the member
+             * `Builder.add`; the member's QN nests under the class. */
+            size_t cur_len = strlen(cur_qn);
+            bool is_member = rf->qualified_name &&
+                             strncmp(rf->qualified_name, cur_qn, cur_len) == 0 &&
+                             rf->qualified_name[cur_len] == '.';
+            if (!is_member) {
+                const CBMRegisteredFunc *member = cbm_registry_lookup_func(
+                    ctx->registry, kt_join_dot(ctx->arena, cur_qn, method_name));
+                if (member) {
+                    return member;
+                }
+            }
             return rf;
         }
 
@@ -2907,6 +2967,37 @@ out:
     return result ? result : cbm_type_unknown();
 }
 
+/* `handshake()` inside a class whose constructor declares `private val
+ * handshake: Handshake?` next to `override fun handshake()` (okhttp
+ * RealConnection): the property is in the method scope (class fields are bound
+ * there), but a value of a known type without an `invoke` operator is no call
+ * candidate, so Kotlin resolves the call to the member function. Once #1555
+ * typed the class's constructor vals, the lexical-shadow rule below failed
+ * such calls closed and they fell to a name guess. An unknown or callable
+ * binding still shadows, as before. */
+static bool kt_value_binding_yields_to_member(KotlinLSPContext *ctx, const CBMType *bound,
+                                              const char *name) {
+    if (!bound || cbm_type_is_unknown(bound) || bound->kind == CBM_TYPE_CALLABLE ||
+        bound->kind == CBM_TYPE_FUNC || !ctx->this_type || cbm_type_is_unknown(ctx->this_type)) {
+        return false;
+    }
+    const CBMType *value = kt_unwrap_nullable(bound);
+    const char *value_qn = kt_type_qn_of(value);
+    if (value_qn && kotlin_lookup_method(ctx, value_qn, "invoke")) {
+        return false; /* an invokable value: the call may be `value.invoke()` */
+    }
+    const char *this_qn = kt_type_qn_of(ctx->this_type);
+    if (!this_qn) {
+        return false;
+    }
+    const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, this_qn, name);
+    if (!rf || !rf->qualified_name) {
+        return false;
+    }
+    size_t len = strlen(this_qn);
+    return strncmp(rf->qualified_name, this_qn, len) == 0 && rf->qualified_name[len] == '.';
+}
+
 static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TSNode call_node,
                                                        const char *callee_text) {
     /* callee_text is a bare identifier — it may be:
@@ -2944,7 +3035,10 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
             bound->data.func.return_types[0]) {
             return bound->data.func.return_types[0];
         }
-        return cbm_type_unknown();
+        if (!kt_value_binding_yields_to_member(ctx, bound, callee_text)) {
+            return cbm_type_unknown();
+        }
+        /* A known non-invokable value yields to the member function: step 1. */
     }
 
     /* 1. `this`-method dispatch: if we're inside a class method or DSL
@@ -2954,6 +3048,37 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
         const char *this_qn = kt_type_qn_of(ctx->this_type);
         if (this_qn) {
             const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, this_qn, callee_text);
+            if (rf && rf->qualified_name) {
+                kt_emit_resolved_at(ctx, rf->qualified_name, "lsp_kt_this", KT_CONF_THIS,
+                                    call_node);
+                if (rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
+                    rf->signature->data.func.return_types &&
+                    rf->signature->data.func.return_types[0]) {
+                    return rf->signature->data.func.return_types[0];
+                }
+                return cbm_type_unknown();
+            }
+        }
+    }
+
+    /* 1b. Implicit receivers form a chain, innermost first: inside a lambda
+     * whose receiver (or `it` type, which kt_process_lambda also installs as
+     * `this`) is another type, and inside a member extension whose extension
+     * receiver is another type, the enclosing class's members stay callable
+     * bare. Once #1555 typed more receivers, `repo.let { ping() }` resolved
+     * against Repo only and fell to a name guess. A call naming a class is a
+     * constructor call, left to step 2 (a secondary constructor is registered
+     * as a same-named member and would otherwise be taken for a method). */
+    const char *ctor_cls = kotlin_resolve_class_name(ctx, callee_text);
+    bool is_ctor_call =
+        ctor_cls && ctx->registry && cbm_registry_lookup_type(ctx->registry, ctor_cls) != NULL;
+    if (ctx->enclosing_class_qn && !is_ctor_call) {
+        const char *this_qn = (ctx->this_type && !cbm_type_is_unknown(ctx->this_type))
+                                  ? kt_type_qn_of(ctx->this_type)
+                                  : NULL;
+        if (!this_qn || strcmp(this_qn, ctx->enclosing_class_qn) != 0) {
+            const CBMRegisteredFunc *rf =
+                kotlin_lookup_method(ctx, ctx->enclosing_class_qn, callee_text);
             if (rf && rf->qualified_name) {
                 kt_emit_resolved_at(ctx, rf->qualified_name, "lsp_kt_this", KT_CONF_THIS,
                                     call_node);
@@ -4533,6 +4658,11 @@ void kotlin_lsp_process_file(KotlinLSPContext *ctx, TSNode root) {
 
     /* 2. Collect top-level definitions for intra-file resolution. */
     kt_collect_top_level_decls(ctx, root);
+    /* Cross-file: index the own-file overlay now that its declarations are
+     * in; later additions stay visible through the post-finalize tail. */
+    if (ctx->overlay_index_arena && ctx->registry) {
+        cbm_registry_finalize_into((CBMTypeRegistry *)ctx->registry, ctx->overlay_index_arena);
+    }
 
     /* 3. Walk for call resolution. */
     kt_walk_top_level_for_resolution(ctx, root, NULL);
@@ -5436,12 +5566,24 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
         project_name = module_qn;
     }
 
+    /* Own-file overlay (#1555). The cross registry above already holds this
+     * file's classes, built from extraction defs whose properties carry no
+     * type (primary-constructor vals none at all). The walk re-registers each
+     * class from the AST with typed fields; registered into `reg` under the
+     * same QN that entry was shadowed by the earlier one, so every
+     * `repository.inserir()` on an injected property fell to the name guess.
+     * In an overlay checked first, the AST entry wins. */
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, arena);
+    overlay.fallback = &reg;
+
     KotlinLSPContext ctx;
     /* Match the per-file pass: until a source package declaration overrides
      * it, the path-derived module is the callable-QN prefix. This preserves
      * exact caller identity for default-package functions across files. */
-    kotlin_lsp_init(&ctx, arena, source, source_len, &reg, module_qn ? module_qn : "",
+    kotlin_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn ? module_qn : "",
                     module_qn ? module_qn : "", project_name, /*rel_path=*/NULL, out);
+    ctx.overlay_index_arena = &idx_arena;
 
     /* Unique short type name -> registered QN, for receiver annotations that
      * name a type defined in another file without an import. Two types

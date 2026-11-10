@@ -329,6 +329,9 @@ static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_
             continue;
         }
         if (seg_len == FQN_DOTDOT_LEN && seg_start[0] == '.' && seg_start[FQN_SEP_LEN] == '.') {
+            if (!buf[0]) {
+                return NULL;
+            }
             path_pop_segment(buf);
             continue;
         }
@@ -353,6 +356,30 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
         return resolve_python_relative(buf, sizeof(buf), module_path);
     }
     return resolve_js_relative(buf, sizeof(buf), module_path);
+}
+
+size_t cbm_pipeline_fqn_symbol_prefix_len(const char *project, const char *rel_path) {
+    if (!project) {
+        return 0;
+    }
+    char path[FQN_PATH_BUF];
+    int n = snprintf(path, sizeof(path), "%s", rel_path ? rel_path : "");
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return 0;
+    }
+    cbm_normalize_path_sep(path);
+    strip_file_extension(path);
+    const char *segments[CBM_SZ_256];
+    int seg_count = 0;
+    segments[seg_count++] = project;
+    seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
+    /* Any symbol name: the prefix cbm_pipeline_fqn_compute puts before it. */
+    strip_init_or_index(segments, &seg_count, "symbol");
+    size_t total = 0;
+    for (int i = 0; i < seg_count; i++) {
+        total += strlen(segments[i]) + (i > 0 ? FQN_SEP_LEN : 0);
+    }
+    return total;
 }
 
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {

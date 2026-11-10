@@ -83,6 +83,17 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
+/* As cbm_pxc_build_import_map (which is include_type_only = false, the CALLS
+ * map), but with include_type_only also binding annotation-only imports
+ * (Python `if TYPE_CHECKING:`), for the consumers that resolve annotations:
+ * the Python LSP and the cross-file base/field-type resolution (#1277). */
+int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
+                                const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+                                bool include_type_only, const char ***out_keys,
+                                const char ***out_vals, int *out_count);
+/* True when the file records an annotation-only import (the LSP map then
+ * differs from the CALLS map and must be built separately). */
+bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result);
 
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 
@@ -205,10 +216,14 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count);
 
+/* rel_path: the file's repo-relative path. Go needs it to name the file's
+ * init() functions as the def extractor does (#1910); cbm_pxc_run_one passes
+ * NULL (Go init() callers then stay flat). */
 void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
-                                       int source_len, const char *module_qn, CBMLSPDef *defs,
-                                       int def_count, const char **imp_names, const char **imp_qns,
-                                       int imp_count, const CBMPHPImportBindings *bindings);
+                                       int source_len, const char *module_qn, const char *rel_path,
+                                       CBMLSPDef *defs, int def_count, const char **imp_names,
+                                       const char **imp_qns, int imp_count,
+                                       const CBMPHPImportBindings *bindings);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,

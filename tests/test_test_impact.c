@@ -274,6 +274,33 @@ TEST(test_model_marks_what_is_under_a_condition) {
     PASS();
 }
 
+/* A runner registration under a condition means some builds lack the suite.
+ * A suite registered twice is conditional only when every site is. */
+TEST(test_model_marks_runner_suites_registered_under_a_condition) {
+    static const tm_source_t src[] = {{"tests/test_main.c", "int main(void) {\n"
+                                                            "    RUN_SELECTED_SUITE(always);\n"
+                                                            "#if defined(COV) && !defined(_WIN32)\n"
+                                                            "    RUN_SELECTED_SUITE(guarded);\n"
+                                                            "    RUN_SELECTED_SUITE(twice);\n"
+                                                            "#endif\n"
+                                                            "    RUN_SELECTED_SUITE(twice);\n"
+                                                            "    return 0;\n"
+                                                            "}\n"}};
+    cbm_test_model_t *m = model_of(src, 1);
+    ASSERT_NOT_NULL(m);
+    int n = 0;
+    const cbm_test_runner_suite_t *suites = cbm_test_model_runner_suites(m, &n);
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(suites[0].name, "always");
+    ASSERT_FALSE(suites[0].conditional);
+    ASSERT_STR_EQ(suites[1].name, "guarded");
+    ASSERT_TRUE(suites[1].conditional);
+    ASSERT_STR_EQ(suites[2].name, "twice");
+    ASSERT_FALSE(suites[2].conditional);
+    cbm_test_model_free(m);
+    PASS();
+}
+
 /* Both branches of an #if may open the same block. Counting both braces would
  * leave the scanner one level deep for the rest of the file, and every later
  * test and suite would be missed. */
@@ -1688,6 +1715,92 @@ TEST(test_selection_inventory_ambiguity_and_conditionals_use_whole_suite) {
     PASS();
 }
 
+/* A suite the runner registers only under a preprocessor condition is absent
+ * from some builds, so however it is selected it must carry CONDITIONAL: the
+ * runner that lacks it then tolerates its absence. Its cases and registrations
+ * are unconditional here, so only the runner registration can say so. */
+TEST(test_selection_conditionally_registered_suite_is_conditional_on_every_path) {
+    /* A map covers every function it lists, so the changed one (0) is covered
+     * by the setup of a suite no runner registers: alpha's own rows stay
+     * quiet and each variant reaches alpha by its one path. */
+    static const char *quiet_rows = "alpha:*\tcomplete\t\t1\nalpha:stat\tcomplete\t\t1\n"
+                                    "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\n"
+                                    "alpha:quiet\tcomplete\t\t1\nomega:*\tcomplete\t\t0\n";
+    struct {
+        const char *rows;
+        bool admitted;
+        bool reached, changed, rule;
+        unsigned path;
+    } variants[] = {
+        {"alpha:*\tincomplete\tlost setup\t1\nalpha:stat\tcomplete\t\t1\n"
+         "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\nalpha:quiet\tcomplete\t\t1\n"
+         "omega:*\tcomplete\t\t0\n",
+         true, false, false, false, CBM_TEST_SELECT_SETUP_UNKNOWN},
+        {"alpha:*\tcomplete\t\t0\nalpha:stat\tcomplete\t\t1\n"
+         "alpha:cov\tcomplete\t\t1\nalpha:changed\tcomplete\t\t1\nalpha:quiet\tcomplete\t\t1\n",
+         true, false, false, false, CBM_TEST_SELECT_SETUP_HIT},
+        {quiet_rows, true, true, false, false, CBM_TEST_SELECT_STATIC},
+        {quiet_rows, true, false, true, false, CBM_TEST_SELECT_CHANGED},
+        {quiet_rows, true, false, false, true, CBM_TEST_SELECT_RULE},
+        {quiet_rows, false, false, false, false, CBM_TEST_SELECT_ARTIFACT_REJECTED},
+        /* One covered case alone would otherwise name `alpha:cov`. */
+        {"alpha:*\tcomplete\t\t1\nalpha:stat\tcomplete\t\t1\n"
+         "alpha:cov\tcomplete\t\t0\nalpha:changed\tcomplete\t\t1\nalpha:quiet\tcomplete\t\t1\n",
+         true, false, false, false, CBM_TEST_SELECT_COVERAGE},
+    };
+    const char *runners[] = {
+        "void main(void) {\n#if defined(FEATURE) && !defined(_WIN32)\nRUN_SELECTED_SUITE(alpha);\n"
+        "#endif\n}\n",
+        "void main(void) { RUN_SELECTED_SUITE(alpha); }\n",
+    };
+    for (int r = 0; r < 2; r++) {
+        char source[1024];
+        snprintf(source, sizeof(source),
+                 "TEST(stat) {}\nTEST(cov) {}\nTEST(changed) {}\nTEST(quiet) {}\n"
+                 "SUITE(alpha) { RUN_TEST(stat); RUN_TEST(cov); RUN_TEST(changed); "
+                 "RUN_TEST(quiet); }\n%s",
+                 runners[r]);
+        cbm_test_model_t *model = selection_model(source);
+        ASSERT_NOT_NULL(model);
+        for (int i = 0; i < (int)(sizeof(variants) / sizeof(variants[0])); i++) {
+            cbm_coverage_map_t *map = selection_map(variants[i].rows);
+            ASSERT_NOT_NULL(map);
+            cbm_test_reach_t reach[] = SELECTION_REACH;
+            for (int k = 0; k < 4; k++)
+                reach[k].reached = reach[k].changed = false;
+            int changed[] = {0};
+            cbm_test_suite_trigger_t trigger = {.suite = "alpha",
+                                                .reached = variants[i].reached,
+                                                .changed = variants[i].changed,
+                                                .rule = variants[i].rule};
+            cbm_test_selection_input_t input = selection_input(model, map, reach, changed);
+            input.coverage_admitted = variants[i].admitted;
+            input.suite_triggers = &trigger;
+            input.suite_trigger_count = 1;
+            cbm_test_selection_t *result = cbm_test_select(&input);
+            ASSERT_NOT_NULL(result);
+            ASSERT_EQ(cbm_test_selection_run_all(result), 0);
+            int count;
+            const cbm_test_selected_suite_t *suites = cbm_test_selection_suites(result, &count);
+            ASSERT_EQ(count, 1);
+            ASSERT_TRUE(suites[0].reasons & variants[i].path);
+            if (r == 0) {
+                ASSERT_TRUE(suites[0].whole);
+                ASSERT_TRUE(suites[0].reasons & CBM_TEST_SELECT_CONDITIONAL);
+                cbm_test_selection_cases(result, &count);
+                ASSERT_EQ(count, 0);
+            } else {
+                /* Registered in every build: the strict contract stays. */
+                ASSERT_FALSE(suites[0].reasons & CBM_TEST_SELECT_CONDITIONAL);
+            }
+            cbm_test_selection_free(result);
+            cbm_coverage_map_free(map);
+        }
+        cbm_test_model_free(model);
+    }
+    PASS();
+}
+
 /* Uncertainty is scoped to the file it was found in. A file the model cannot
  * read with certainty, but which defines its own suite, makes that suite
  * uncertain (it can only run whole) and leaves every other suite narrowable.
@@ -2560,6 +2673,42 @@ TEST(test_policy_config_change_runs_all) {
     ASSERT_TRUE(cbm_test_policy_match_path(policy, ".codebase-memory.json", &rule));
     ASSERT_EQ(rule->action, CBM_TEST_RULE_RUN_ALL);
     cbm_test_policy_free(policy);
+    PASS();
+}
+
+TEST(test_policy_repository_rules_map_every_kind_of_path) {
+    /* This repository's own rules: a path no rule maps runs every test (unmapped_files), so
+     * each kind of tracked file has a rule, and only real build inputs run everything. */
+    cbm_test_config_t *config = cbm_test_config_load(".codebase-memory.json", false);
+    ASSERT_NOT_NULL(config);
+    cbm_test_policy_t *policy = cbm_test_policy_new(config);
+    ASSERT_NOT_NULL(policy);
+    static const char *const cases[][2] = {
+        {"graph-ui/package.json", "repo-data"},
+        {"graph-ui/src/main.tsx", "repo-data"},
+        {"tools/tree-sitter-pascal/src/parser.c", "repo-data"},
+        {"tests/fuzz/corpus/cypher/match.seed", "repo-data"},
+        {"flake.nix", "repo-data"},
+        {"DCO", "repo-data"},
+        {"server.json", "repo-data"},
+        {"scripts/security-ui.sh", "repo-data"},
+        {"tests/test_windows_preflight_contract.ps1", "contracts"},
+        {".gitattributes", "build"},
+        {"scripts/build.sh", "build"},
+        {"Makefile.cbm", "builtin:build"},
+        {"tests/test_main.c", "harness"},
+        {"src/mcp/test_impact_engine.c", "engine"},
+        {"src/pipeline/pipeline.c", NULL},
+        {"src/server.json", NULL},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (!policy_matches(policy, cases[i][0], cases[i][1])) {
+            printf("  %s: expected rule %s\n", cases[i][0], cases[i][1] ? cases[i][1] : "(none)");
+            FAIL("repository rule mapping");
+        }
+    }
+    cbm_test_policy_free(policy);
+    cbm_test_config_free(config);
     PASS();
 }
 
@@ -3748,6 +3897,7 @@ SUITE(test_impact) {
     RUN_TEST(test_policy_defaults_and_first_match_before_target_resolution);
     RUN_TEST(test_policy_coverage_compatibility_paths_are_strict);
     RUN_TEST(test_policy_config_change_runs_all);
+    RUN_TEST(test_policy_repository_rules_map_every_kind_of_path);
     RUN_TEST(test_policy_lanes_and_semantic_perf_membership);
     RUN_TEST(test_policy_globs_braces_escapes_and_directory_boundaries);
     RUN_TEST(test_policy_rejects_invalid_consumed_fields_without_changing_seed_loader);
@@ -3767,6 +3917,7 @@ SUITE(test_impact) {
     RUN_TEST(test_selection_setup_and_rejected_artifacts_select_whole_suites);
     RUN_TEST(test_selection_incomplete_global_evidence_never_narrows);
     RUN_TEST(test_selection_inventory_ambiguity_and_conditionals_use_whole_suite);
+    RUN_TEST(test_selection_conditionally_registered_suite_is_conditional_on_every_path);
     RUN_TEST(test_model_uncertainty_is_scoped_to_the_suites_of_its_file);
     RUN_TEST(test_model_only_code_continuations_are_uncertain);
     RUN_TEST(test_selection_scoped_uncertainty_runs_only_its_suite_whole);
@@ -3797,6 +3948,7 @@ SUITE(test_impact) {
     RUN_TEST(test_model_ignores_comments_and_literals);
     RUN_TEST(test_model_reads_suites_written_as_functions);
     RUN_TEST(test_model_marks_what_is_under_a_condition);
+    RUN_TEST(test_model_marks_runner_suites_registered_under_a_condition);
     RUN_TEST(test_model_keeps_brace_depth_across_else_branches);
     RUN_TEST(test_model_resolves_registrations_in_their_own_file);
     RUN_TEST(test_model_marks_suites_that_register_through_a_macro);

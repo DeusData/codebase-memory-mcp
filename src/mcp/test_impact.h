@@ -71,6 +71,9 @@ typedef struct {
     bool perf;
     const char *file; /* the runner file that registers it */
     int line;
+    /* Every site registers it under a preprocessor condition: some builds do
+     * not register this suite at all. */
+    bool conditional;
 } cbm_test_runner_suite_t;
 
 typedef struct cbm_test_model cbm_test_model_t;
@@ -515,6 +518,11 @@ typedef struct {
     const char *const *lanes;
     int lane_count;
     int key_segment; /* zero-based path_segment:N; -1 for other actions */
+    /* referencing_tests only. key_path: the key is the changed path itself (no
+     * parent directories). unreferenced_ignore: a changed path no test names
+     * selects nothing instead of running everything. */
+    bool key_path;
+    bool unreferenced_ignore;
     bool builtin;
 } cbm_test_rule_t;
 

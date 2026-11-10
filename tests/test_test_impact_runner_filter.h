@@ -12,6 +12,7 @@ typedef struct {
     const char *test;
     bool whole;
     bool mixed;
+    bool sole; /* no unselected rf_quiet suite: the spec's suites are the whole lane */
 } rf_spec_t;
 
 typedef struct {

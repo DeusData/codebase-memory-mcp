@@ -587,6 +587,23 @@ static bool tp_key_segment(yyjson_val *value, int *segment) {
     return true;
 }
 
+/* `unreferenced` of a referencing_tests rule: absent or "run_all" keeps the
+ * fail-safe default (a path no test names runs everything); "ignore" lets it
+ * select nothing — for data no test can depend on without naming it. */
+static bool tp_unreferenced(yyjson_val *value, bool *ignore) {
+    *ignore = false;
+    if (!value)
+        return true;
+    const char *text = tp_string(value, NULL);
+    if (!text)
+        return false;
+    if (strcmp(text, "ignore") == 0) {
+        *ignore = true;
+        return true;
+    }
+    return strcmp(text, "run_all") == 0;
+}
+
 static const char *const tp_build_paths[] = {
     "Makefile*", "CMakeLists.txt", "*.cmake",        "meson.build", "BUILD*",
     "WORKSPACE", "package*.json",  "go.mod",         "go.sum",      "Cargo.*",
@@ -626,6 +643,7 @@ static bool tp_parse_rule(cbm_test_policy_t *policy, yyjson_val *value, int inde
     yyjson_val *lanes = tp_field(value, "lanes", &valid);
     yyjson_val *suites = tp_field(value, "suites", &valid);
     yyjson_val *key = tp_field(value, "key", &valid);
+    yyjson_val *unreferenced = tp_field(value, "unreferenced", &valid);
     const char *id_text = tp_string(id, NULL), *action_text = tp_string(action, NULL);
     if (!valid || !id_text || !action_text)
         return false;
@@ -646,26 +664,33 @@ static bool tp_parse_rule(cbm_test_policy_t *policy, yyjson_val *value, int inde
         return false;
     if (strcmp(action_text, "run_all") == 0) {
         rule->action = CBM_TEST_RULE_RUN_ALL;
-        return !lanes && !suites && !key;
+        return !lanes && !suites && !key && !unreferenced;
     }
     if (strcmp(action_text, "ignore") == 0) {
         rule->action = CBM_TEST_RULE_IGNORE;
-        return !lanes && !suites && !key;
+        return !lanes && !suites && !key && !unreferenced;
     }
     if (strcmp(action_text, "lanes") == 0) {
         rule->action = CBM_TEST_RULE_LANES;
-        return !suites && !key &&
+        return !suites && !key && !unreferenced &&
                tp_string_array(policy, lanes, true, &rule->lanes, &rule->lane_count, NULL, false);
     }
     if (strcmp(action_text, "suites") == 0) {
         rule->action = CBM_TEST_RULE_SUITES;
-        return !lanes && !key &&
+        return !lanes && !key && !unreferenced &&
                tp_string_array(policy, suites, true, &rule->suites, &rule->suite_count,
                                &matchers->suites, true);
     }
     if (strcmp(action_text, "referencing_tests") == 0) {
         rule->action = CBM_TEST_RULE_REFERENCING_TESTS;
-        return !lanes && !suites && tp_key_segment(key, &rule->key_segment);
+        if (lanes || suites || !tp_unreferenced(unreferenced, &rule->unreferenced_ignore))
+            return false;
+        const char *key_text = tp_string(key, NULL);
+        if (key_text && strcmp(key_text, "path") == 0) {
+            rule->key_path = true;
+            return true;
+        }
+        return tp_key_segment(key, &rule->key_segment);
     }
     return false;
 }

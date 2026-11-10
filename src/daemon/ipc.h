@@ -76,6 +76,19 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io);
 void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener);
 
+/* Heartbeat for the daemon's long-lived runtime artifacts: refresh the held
+ * lifetime reservation, the listener's participant guard (if it owns one),
+ * external_guard (optional, a guard the caller retains beside this listener)
+ * and the published identity marker so an age-based temp cleaner never
+ * deletes them (#2178). Returns 1 when all were refreshed, 0 once any no
+ * longer names the file this listener owns (a lost lifetime file lets a peer
+ * start a second generation; a lost identity marker makes listener close
+ * leave the socket pair behind), and -1 when a still-valid file could not be
+ * refreshed (transient). Only the thread that closes the listener may call it
+ * while the listener is open. */
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard);
+
 /* Create or validate one private current-user directory at an already
  * canonical local path. Ancestors are handle-validated without mutation:
  * POSIX permits only root/current-user owners and no group/other write (apart
@@ -290,6 +303,10 @@ bool cbm_daemon_ipc_startup_lock_release(cbm_daemon_ipc_startup_lock_t **lock_io
 int cbm_daemon_ipc_participant_guard_try_join(const cbm_daemon_ipc_endpoint_t *endpoint,
                                               cbm_daemon_ipc_participant_guard_t **guard_out);
 bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t **guard_io);
+/* Same heartbeat contract and 1/0/-1 result as cbm_daemon_ipc_listener_touch,
+ * for a guard the caller retains itself. */
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard);
 
 /* Standalone CLI work joins the legacy-compatible current participant group
  * without becoming a daemon client. Acquisition retains startup-v2 only for
@@ -320,7 +337,13 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
  * Windows teardown reacquires startup-v2 and the legacy mutex, releases group
  * SH, closes this participant's sentinel last, then releases mutex and v2.
  * Success consumes and clears *transition_io; a retryable native cleanup
- * failure returns false and retains it. */
+ * failure or startup-gate contention returns false and retains it. */
 bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io);
+/* Nonblocking release: 1 consumes and clears *transition_io (also when already
+ * empty), 0 retains it while another startup owns a required gate, and -1
+ * retains it on an unsafe/native I/O failure. A NULL transition_io is invalid.
+ * Callers can give healthy contention its own wait policy without extending
+ * the deadline for repeated native cleanup failures. */
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io);
 
 #endif /* CBM_DAEMON_IPC_H */

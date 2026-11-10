@@ -115,8 +115,9 @@
  * does (".ts" → TypeScript, ".tsx" → TSX). Returns 0 on PASS (GREEN), non-zero
  * on FAIL (RED) — the redness is the documented per-pass status.
  */
-static int assert_lsp_strategy_files(const RFile *files, int nfiles,
-                                     const char *strategy) {
+static int assert_lsp_strategy_files_expected(const RFile *files, int nfiles,
+                                              const char *strategy,
+                                              int expected_module_sourced) {
     RProj lp;
     cbm_store_t *store = rh_index_files(&lp, files, nfiles);
     if (!store) {
@@ -135,12 +136,13 @@ static int assert_lsp_strategy_files(const RFile *files, int nfiles,
 
     int rc = 0;
 
-    /* (a) callable-sourcing floor: zero Module/File-sourced CALLS edges. */
-    if (module_sourced != 0) {
+    /* (a) keep module-sourced calls explicit so top-level constructors are
+     * allowed only in fixtures that expect them. */
+    if (module_sourced != expected_module_sourced) {
         printf("  %sFAIL%s %s:%d: strategy %s: %d Module-sourced CALLS "
-               "(expected 0)\n",
+               "(expected %d)\n",
                tf_red(), tf_reset(), __FILE__, __LINE__, strategy,
-               module_sourced);
+               module_sourced, expected_module_sourced);
         rc = 1;
     }
     /* There must be a callable-sourced CALLS edge, else the fixture produced no
@@ -163,6 +165,11 @@ static int assert_lsp_strategy_files(const RFile *files, int nfiles,
 
     rh_cleanup(&lp, store);
     return rc;
+}
+
+static int assert_lsp_strategy_files(const RFile *files, int nfiles,
+                                     const char *strategy) {
+    return assert_lsp_strategy_files_expected(files, nfiles, strategy, 0);
 }
 
 /* Single-file convenience wrapper. */
@@ -297,6 +304,22 @@ static const RFile kTsImport[] = {
      "function caller(v: number): number { return helper(v); }\n"},
 };
 
+/* Keep the module-level inferred receiver shape from issue #1974: a local
+ * initialized from an imported constructor is used by a later function.
+ */
+static const RFile kTsInferredImportedMethod[] = {
+    {"store.ts",
+     "export class WidgetStore {\n"
+     "    findById(id: string): string { return id; }\n"
+     "}\n"},
+    {"service.ts",
+     "import { WidgetStore } from \"./store\";\n"
+     "const inferred = new WidgetStore();\n"
+     "function load(id: string): string {\n"
+     "    return inferred.findById(id);\n"
+     "}\n"},
+};
+
 /* lsp_ts_jsx — <Comp/> JSX element whose tag is a module-local component
  * function (ts_lsp.c:2643-2647). TSX only (jsx_mode); the tag's first letter is
  * uppercase so it is NOT treated as an intrinsic HTML element; it resolves via
@@ -370,6 +393,14 @@ TEST(repro_lsp_ts_import) {
         "lsp_ts_import");
 }
 
+TEST(repro_lsp_ts_inferred_import_module_receiver) {
+    return assert_lsp_strategy_files_expected(
+        kTsInferredImportedMethod,
+        (int)(sizeof(kTsInferredImportedMethod) /
+              sizeof(kTsInferredImportedMethod[0])),
+        "lsp_ts_method", 1);
+}
+
 TEST(repro_lsp_ts_jsx) {
     return assert_lsp_strategy("app.tsx", kTsxJsx, "lsp_ts_jsx");
 }
@@ -403,6 +434,7 @@ SUITE(repro_lsp_ts) {
     RUN_TEST(repro_lsp_ts_method);
     RUN_TEST(repro_lsp_ts_namespace);
     RUN_TEST(repro_lsp_ts_import);
+    RUN_TEST(repro_lsp_ts_inferred_import_module_receiver);
     RUN_TEST(repro_lsp_ts_jsx);
     RUN_TEST(repro_lsp_ts_jsx_import);
     RUN_TEST(repro_lsp_ts_default);

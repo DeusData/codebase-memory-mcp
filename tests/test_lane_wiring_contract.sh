@@ -126,12 +126,17 @@ m = re.search(r"(?ms)^      test_selection:\n(.*?)(?=^      \S|^\S|\Z)", text("_
 require(m is not None and re.search(r"(?m)^        default: ''$", m.group(1)) is not None,
         "_test.yml must declare a test_selection input defaulting to '' (every test)")
 readers = sorted(job for job, body in test_wf.items() if "inputs.test_selection" in body)
-require(readers == ["test-unix", "test-windows"],
-        f"only test-unix and test-windows may read test_selection, found {readers}")
-for job in ("test-unix", "test-windows"):
-    require("CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && " in test_wf.get(job, ""),
-            f"_test.yml {job} must hand the selection to scripts/test.sh as CBM_TEST_SELECTION_DIR "
-            f"only when one was passed")
+# Only the Linux x86_64 leg narrows (user decision 2026-10-16): the coverage comes from
+# the Linux x86_64 producer, so arm64, macOS and Windows legs run every test.
+require(readers == ["test-unix"], f"only test-unix may read test_selection, found {readers}")
+unix = test_wf.get("test-unix", "")
+linux_x64 = "inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64'"
+require(f"if: ${{{{ {linux_x64} }}}}" in unix and
+        f"CBM_TEST_SELECTION_DIR: ${{{{ {linux_x64} && " in unix,
+        "_test.yml test-unix must fetch the selection and hand it to scripts/test.sh as "
+        "CBM_TEST_SELECTION_DIR only on Linux x86_64 and only when one was passed")
+require("CBM_TEST_SELECTION_DIR: ''" in test_wf.get("test-windows", ""),
+        "_test.yml test-windows must run every test (CBM_TEST_SELECTION_DIR: '')")
 select = pr.get("select-tests", "")
 require(re.search(r"(?m)^    if: \$\{\{ vars\.TEST_IMPACT_MODE == 'gate' \}\}$", select) is not None,
         "pr.yml select-tests must run only when vars.TEST_IMPACT_MODE == 'gate'")
@@ -151,10 +156,10 @@ require("test_selection: ${{ needs.select-tests.result == 'success' && "
 MATRIX = {"unix-x86": "_test.yml", "unix-arm64": "_test.yml", "unix-macos14": "_test.yml",
           "unix-macos-intel": "_test.yml", "windows": "_test.yml", "tsan-x86": "_test.yml",
           "tsan-arm": "_test.yml", "tsan-mac": "_test.yml", "smoke-ubuntu": "pr.yml",
-          "smoke-mac": "pr.yml", "smoke-win": "pr.yml"}
+          "smoke-mac": "pr.yml", "smoke-win": "pr.yml", "codeql-cpp": "pr.yml",
+          "codeql-js": "pr.yml", "codeql-py": "pr.yml", "codeql-actions": "pr.yml"}
 SINGLE = {"lint": ("_lint.yml", "lint"), "lint-mem": ("_lint.yml", "lint-mem"),
           "license-gate": ("_security.yml", "license-gate"),
-          "codeql-gate": ("_security.yml", "codeql-gate"),
           "pkg-wrappers": ("_test.yml", "test-package-wrappers"),
           "diag": ("_test.yml", "test-diag"), "msan": ("_test.yml", "test-msan"),
           "lsan-macos": ("_test.yml", "test-lsan-macos"),

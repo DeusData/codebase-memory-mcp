@@ -46,29 +46,46 @@ static bool rf_model(rf_fixture_t *fixture, const rf_spec_t *spec) {
         !cbm_test_model_add_source(fixture->model, "tests/rf_whole.c", other, sizeof(other) - 1)) {
         return false;
     }
+    /* A lane member the change does not reach keeps a whole-suite selection narrowed. */
+    static const char quiet[] = "TEST(rf_quiet) {}\nSUITE(rf_quiet) { RUN_TEST(rf_quiet); }\n"
+                                "void quiet_main(void) { RUN_SELECTED_SUITE(rf_quiet); }\n";
+    if (!spec->sole &&
+        !cbm_test_model_add_source(fixture->model, "tests/rf_quiet.c", quiet, sizeof(quiet) - 1)) {
+        return false;
+    }
     return cbm_test_model_finish(fixture->model) && cbm_test_model_complete(fixture->model);
 }
 
 static bool rf_selection(rf_fixture_t *fixture, const rf_spec_t *spec) {
     char rows[4096];
-    int count = snprintf(rows, sizeof(rows),
-                         "%s:*\tcomplete\t\t1\n%s:%s\tcomplete\t\t0\n"
-                         "%s:rf_spare\tcomplete\t\t1\n%s",
-                         spec->suite, spec->suite, spec->test, spec->suite,
-                         spec->mixed ? "str_intern:*\tcomplete\t\t1\n"
-                                       "str_intern:rf_other\tcomplete\t\t1\n"
-                                     : "");
+    int count =
+        snprintf(rows, sizeof(rows),
+                 "%s:*\tcomplete\t\t1\n%s:%s\tcomplete\t\t0\n"
+                 "%s:rf_spare\tcomplete\t\t1\n%s%s",
+                 spec->suite, spec->suite, spec->test, spec->suite,
+                 spec->mixed ? "str_intern:*\tcomplete\t\t1\n"
+                               "str_intern:rf_other\tcomplete\t\t1\n"
+                             : "",
+                 spec->sole ? "" : "rf_quiet:*\tcomplete\t\t1\nrf_quiet:rf_quiet\tcomplete\t\t1\n");
     static const char functions[] = "0\tsrc/changed.c\tchanged\n1\tsrc/quiet.c\tquiet\n";
     if (count < 0 || (size_t)count >= sizeof(rows)) {
         return false;
     }
     fixture->coverage =
         cbm_coverage_map_parse(functions, sizeof(functions) - 1, rows, (size_t)count);
-    cbm_test_reach_t reach[] = {
+    cbm_test_reach_t reach[4] = {
         {.file = "tests/rf_subject.c", .test = spec->test, .mapped = true, .reached = true},
         {.file = "tests/rf_subject.c", .test = "rf_spare", .mapped = true},
-        {.file = "tests/rf_whole.c", .test = "rf_other", .mapped = true},
     };
+    size_t reach_count = 2;
+    if (spec->mixed) {
+        reach[reach_count++] =
+            (cbm_test_reach_t){.file = "tests/rf_whole.c", .test = "rf_other", .mapped = true};
+    }
+    if (!spec->sole) {
+        reach[reach_count++] =
+            (cbm_test_reach_t){.file = "tests/rf_quiet.c", .test = "rf_quiet", .mapped = true};
+    }
     cbm_test_suite_trigger_t trigger = {.suite = spec->mixed ? "str_intern" : spec->suite,
                                         .reached = true};
     const int changed = 0;
@@ -76,7 +93,7 @@ static bool rf_selection(rf_fixture_t *fixture, const rf_spec_t *spec) {
         .model = fixture->model,
         .coverage = fixture->coverage,
         .reach = reach,
-        .reach_count = spec->mixed ? 3 : 2,
+        .reach_count = reach_count,
         .suite_triggers = &trigger,
         .suite_trigger_count = spec->whole || spec->mixed ? 1 : 0,
         .changed_function_ids = &changed,

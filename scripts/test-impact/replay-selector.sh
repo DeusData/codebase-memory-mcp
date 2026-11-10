@@ -63,7 +63,7 @@ import sys
 fixtures, decisions_path = sys.argv[1:3]
 TIERS = ["T0a-docs", "T0b-nonproduct", "T1-tests", "T2-extract", "T3-mid",
          "T4-platform", "T5-core"]
-DEVIATIONS = {"makefile-by-name"}
+DEVIATIONS = {"makefile-by-name", "read-by-tests"}
 
 
 def rows(name, width):

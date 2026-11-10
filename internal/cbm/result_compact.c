@@ -268,6 +268,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_list(c, &d->return_types);
     cr_str(c, &d->route_path);
     cr_str(c, &d->route_method);
+    cr_str(c, &d->client_route_path);
     cr_blob(c, (const void **)&d->fingerprint,
             d->fingerprint_k > 0 ? (size_t)d->fingerprint_k * sizeof(uint32_t) : 0);
     cr_str(c, &d->structural_profile);
@@ -276,9 +277,11 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->http_client);
     cr_str(c, &d->http_base_url);
     cr_str(c, &d->variants);
+    cr_str(c, &d->call_selector);
     cr_list(c, &d->extra_props);
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
+    cr_str(c, &d->alias_target);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -302,6 +305,12 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         call->args = NULL;
         call->arg_count = 0;
     }
+    /* Swift trailing-closure labels are a bounded counted string list. */
+    int labels = call->trailing_closure_count;
+    if (labels > CBM_MAX_TRAILING_CLOSURES) {
+        labels = CBM_MAX_TRAILING_CLOSURES;
+    }
+    cr_counted_list(c, &call->trailing_closure_labels, labels);
 }
 
 /* Facts have counted lists, not sentinel arrays. Bail before touching a failed

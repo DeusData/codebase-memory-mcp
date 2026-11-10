@@ -181,6 +181,19 @@ typedef struct CBMTypeRegistry {
     CBMRegistryTypeQNEntry *type_qn_sorted;
     int type_qn_sorted_count;
     int type_qn_sorted_upto;
+
+    /* Module namespaces (Python re-exports). module_qns: every module symbol
+     * scope with definitions or namespace facts, sorted (strcmp). export_keys /
+     * export_targets: `module.name` -> the definition QN the module's imports
+     * bind that name to (re-exports), sorted by key. Built once by the language
+     * builder after finalize and before the seal; lookups are binary searches
+     * and never mutate. Separate from the func/type arrays by design: a
+     * re-export is an alias of a definition, never a definition of its own. */
+    const char **module_qns;
+    int module_count;
+    const char **export_keys;
+    const char **export_targets;
+    int export_count;
 } CBMTypeRegistry;
 
 // Initialize a registry.
@@ -228,6 +241,13 @@ const CBMRegisteredFunc *cbm_registry_lookup_func(const CBMTypeRegistry *reg,
 // package_qn is the package prefix (e.g., "proj.pkg").
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name);
+
+// Module-namespace lookups (CBMTypeRegistry.module_qns / export_keys); both
+// chain to reg->fallback. cbm_registry_lookup_export returns the definition QN
+// `module_qn.name` is re-exported as, or NULL.
+bool cbm_registry_is_module(const CBMTypeRegistry *reg, const char *module_qn);
+const char *cbm_registry_lookup_export(const CBMTypeRegistry *reg, const char *module_qn,
+                                       const char *name);
 
 /* Build in an arena that outlives every use (owner arena for shared registries,
  * walk scratch for per-file registries). QN strings and registered identities

@@ -306,6 +306,22 @@ static void rust_strip_turbofish(char *path) {
     *write = '\0';
 }
 
+/* In place: `Gen<T>` -> `Gen`, `foo::Bar<'a, T>` -> `foo::Bar` (#763). An
+ * impl's self type keeps its generic arguments in the source text, but every
+ * def-side QN (a method's receiver, the extractor's call scope) strips them.
+ * Unstripped, the LSP's caller QN, `self`/`Self` dispatch and the return-type
+ * harvest never matched a generic impl's methods. Text starting with `<` (a
+ * qualified path) is left alone. Safe on NULL. */
+static void rust_strip_impl_type_args(char *type_text) {
+    if (!type_text) {
+        return;
+    }
+    char *lt = strchr(type_text, '<');
+    if (lt && lt > type_text) {
+        *lt = '\0';
+    }
+}
+
 /* Look up a `use` alias and return its fully-qualified module path,
  * or NULL if absent. The returned pointer aliases into the use map. */
 static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name) {
@@ -4128,6 +4144,32 @@ static bool rust_qn_has_suffix(const char *qualified_name, const char *suffix) {
            (qn_len == suffix_len || qualified_name[qn_len - suffix_len - 1U] == '.');
 }
 
+/* True when the segment that qualifies a call path's tail names a TYPE:
+ * `Store::new`, `Self::helper`, `T::default`, `<T as Tr>::f` (turbofish is
+ * already stripped, so a `>` before the last `::` closes a qualified path).
+ * Such a call is an associated function, never a free function, so the
+ * free-function short-name fallbacks must not bind it: with a project-wide
+ * unique free `new`/`write`, `Store::new()` landed on that function and the
+ * LSP row pre-empted the registry's correct `Store.new`. Module segments are
+ * snake_case, so an ASCII-uppercase initial is a type. `tail` must point just
+ * past the path's last `::`, or equal `path` when there is none. */
+static bool rust_path_qualifier_is_type(const char *path, const char *tail) {
+    if (!path || !tail || tail - path < 3) {
+        return false;
+    }
+    const char *seg_end = tail - 2; /* the last "::" */
+    if (seg_end[-1] == '>') {
+        return true;
+    }
+    const char *seg = path;
+    for (const char *p = path; p + 1 < seg_end; p++) {
+        if (p[0] == ':' && p[1] == ':') {
+            seg = p + 2;
+        }
+    }
+    return seg < seg_end && seg[0] >= 'A' && seg[0] <= 'Z';
+}
+
 /* Resolve only an exact identifier/scoped-path value. No branch, closure, or
  * other composite expression enters this helper. A suffix fallback is admitted
  * only for a qualified import path and only when it identifies one free func. */
@@ -4514,6 +4556,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         } else {
             tail = path;
         }
+        /* `Type::f` is an associated function: the two free-function
+         * fallbacks below never bind it (see rust_path_qualifier_is_type). */
+        const bool assoc_call = rust_path_qualifier_is_type(path, tail);
 
         /* Cross-crate workspace-member resolution (#56): when the call
          * path's head is a declared Cargo workspace member (e.g.
@@ -4524,7 +4569,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * MEMBER crate by matching the registered QN's `.<member>.`
          * path segment plus the call tail. Requires a parsed manifest
          * (threaded through pass_lsp_cross.c); NULL manifest skips this. */
-        if (ctx->cargo_manifest && tail && *tail) {
+        if (!assoc_call && ctx->cargo_manifest && tail && *tail) {
             const char *head_sep = strstr(path, "::");
             if (head_sep && head_sep > path) {
                 char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(head_sep - path));
@@ -4568,7 +4613,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * foo; use foo::bar; bar()` a chance to resolve when the
          * intermediate module wasn't tracked through an explicit
          * use-map entry. */
-        if (tail && *tail && ctx->module_qn) {
+        if (!assoc_call && tail && *tail && ctx->module_qn) {
             /* Crate prefix is the first dotted segment of module_qn after
              * the project name, but for simplicity we just match on
              * "starts with first dot-segment". */
@@ -5245,6 +5290,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     char *type_text = rust_node_text(ctx, type_node);
     if (!type_text)
         return;
+    rust_strip_impl_type_args(type_text);
 
     /* Detect blanket impl: `impl<T: Trait> ForeignTrait for T { ... }`
      * where type_text is a name that appears in the impl's type
@@ -5999,6 +6045,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (ts_node_is_null(type_node) || ts_node_is_null(body))
                 continue;
             char *type_name = cbm_node_text(arena, type_node, source);
+            rust_strip_impl_type_args(type_name);
             if (!type_name || !type_name[0])
                 continue;
             const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
@@ -6323,7 +6370,10 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
  * read-only, and shared across every Rust file's resolve (mirrors C/py/cs/ts).
  * Converts the pipeline's CBMLSPDef into CBMRustLSPDef inline (same field copy as
  * pass_lsp_cross.c's pxc_lspdefs_to_rust, including proven trait provenance).
- * module_qn=NULL is byte-identical because all_defs always carry def_module_qn. */
+ * module_qn=NULL is byte-identical because all_defs always carry def_module_qn.
+ * all_defs is mixed-language: only Rust defs are registered, exactly like the
+ * per-file conversion, so a Perl `new` or a C function can never become the
+ * target of a Rust call (the Go builder filters the same way). */
 CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count) {
     if (!arena)
         return NULL;
@@ -6331,29 +6381,34 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     if (!reg)
         return NULL;
     CBMRustLSPDef *rdefs = NULL;
+    int n = 0;
     if (def_count > 0) {
         rdefs = (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
         if (!rdefs)
             return NULL;
         for (int i = 0; i < def_count; i++) {
-            rdefs[i].qualified_name = defs[i].qualified_name;
-            rdefs[i].short_name = defs[i].short_name;
-            rdefs[i].label = defs[i].label;
-            rdefs[i].receiver_type = defs[i].receiver_type;
-            rdefs[i].def_module_qn = defs[i].def_module_qn;
-            rdefs[i].return_types = defs[i].return_types;
-            rdefs[i].embedded_types = defs[i].embedded_types;
-            rdefs[i].field_defs = defs[i].field_defs;
-            rdefs[i].method_names_str = defs[i].method_names_str;
-            rdefs[i].signature_param_types = defs[i].signature_param_types;
-            rdefs[i].signature_param_count = defs[i].signature_param_count;
-            rdefs[i].trait_qn = defs[i].trait_qn;
-            rdefs[i].is_interface = defs[i].is_interface;
-            rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
-            rdefs[i].is_abstract = defs[i].is_abstract;
+            if (defs[i].lang != CBM_LANG_RUST) {
+                continue;
+            }
+            rdefs[n].qualified_name = defs[i].qualified_name;
+            rdefs[n].short_name = defs[i].short_name;
+            rdefs[n].label = defs[i].label;
+            rdefs[n].receiver_type = defs[i].receiver_type;
+            rdefs[n].def_module_qn = defs[i].def_module_qn;
+            rdefs[n].return_types = defs[i].return_types;
+            rdefs[n].embedded_types = defs[i].embedded_types;
+            rdefs[n].field_defs = defs[i].field_defs;
+            rdefs[n].method_names_str = defs[i].method_names_str;
+            rdefs[n].signature_param_types = defs[i].signature_param_types;
+            rdefs[n].signature_param_count = defs[i].signature_param_count;
+            rdefs[n].trait_qn = defs[i].trait_qn;
+            rdefs[n].is_interface = defs[i].is_interface;
+            rdefs[n].is_rust_impl_relation = defs[i].is_rust_impl_relation;
+            rdefs[n].is_abstract = defs[i].is_abstract;
+            n++;
         }
     }
-    rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL);
+    rust_populate_cross_registry(reg, arena, n > 0 ? rdefs : NULL, n, /*module_qn=*/NULL);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }

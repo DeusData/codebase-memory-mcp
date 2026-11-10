@@ -78,6 +78,7 @@ typedef struct {
      * suite-budget kills on every non-M4 venue). */
     const char *prev_enclosing_func_qn;
     const char *prev_enclosing_class_qn;
+    TSNode prev_enclosing_class_node;
     CBMInvocationKind prev_invocation_kind;
     TSNode prev_callee_expr;
     TSNode prev_callee_leaf;
@@ -133,6 +134,7 @@ typedef struct {
 typedef struct {
     const char *enclosing_func_qn;      // current function QN (module_qn at top level)
     const char *enclosing_class_qn;     // current class QN (NULL outside class)
+    TSNode enclosing_class_node;        // that class scope's node (null when not known)
     const TSTreeCursor *current_cursor; // unified walk cursor at the current node
     TSTreeCursor *occurrence_cursor;    // reusable parent-preserving classifier cursor
     CBMInvocationKind invocation_kind;  // exact active invocation/reference role

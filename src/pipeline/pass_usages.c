@@ -213,6 +213,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
+        bool property_read = false;
         if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
@@ -225,6 +226,13 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 tgt = cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
                                                    semantic_reference->callee_qn, allow_tail);
+                if (!cbm_pipeline_reference_target_admissible(semantic_reference, tgt)) {
+                    /* a property read: the name fallback below may still bind the
+                     * property's own node, never a callable */
+                    tgt = NULL;
+                    semantic_reference = NULL;
+                    property_read = true;
+                }
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
             }
         }
@@ -275,14 +283,22 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
-            /* #1942/#1962: a bare Go reference can never denote a struct
-             * field; the member half of a selector may. */
-            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
-                                                      tgt->label)) {
+            /* #1942/#1962/#2666: a bare Go or C reference can never denote
+             * a struct field; the member half of a selector may. */
+            if (tgt && cbm_suppress_bare_field_ref(lang, usage->is_member_access, tgt->label)) {
+                continue;
+            }
+            /* A bare Go `init` names a local, never a package init or an init
+             * method (cbm_go_suppress_bare_init_bind). Mirrors pass_parallel.c. */
+            if (tgt && cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      usage->ref_name, res.strategy, tgt->label)) {
                 continue;
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
+                continue;
+            }
+            if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
                 continue;
             }
         }
@@ -405,9 +421,16 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
-        /* #1942/#1962: a bare Go reference can never denote a struct field;
-         * a selector-LHS write (`t.err = x`) may bind it. */
-        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
+        /* #1942/#1962/#2666: a bare Go or C reference can never denote a
+         * struct field; a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_suppress_bare_field_ref(lang, rw->is_member_access, tgt->label)) {
+            continue;
+        }
+        /* `init := func(...)`: a bare Go `init` names a local, never a package
+         * init or an init method (cbm_go_suppress_bare_init_bind). Mirrors
+         * pass_parallel.c. */
+        if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, rw->is_member_access, rw->var_name,
+                                           res.strategy, tgt->label)) {
             continue;
         }
 

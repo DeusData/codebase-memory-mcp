@@ -101,6 +101,12 @@ TEST(subprocess_outcome_str) {
     PASS();
 }
 
+TEST(subprocess_tree_rss_sum_saturates_on_overflow) {
+    const uint64_t values[] = {UINT64_MAX - 4, 4, 1};
+    ASSERT_EQ(cbm_subprocess_rss_sum_for_testing(values, 3), UINT64_MAX);
+    PASS();
+}
+
 /* ── Layer 2: real spawn/reap (POSIX) ─────────────────────────────────────── */
 
 extern const char *cbm_test_program_path;
@@ -799,6 +805,162 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
     ASSERT_TRUE(result.tree_quiesced);
     PASS();
 #endif
+}
+
+/* ── Process-tree memory probe (every platform) ─────────────────────────────
+ * The test runner's __cbm_rss_tree_root role starts one __cbm_rss_tree_hold
+ * descendant that touches a controlled allocation and then publishes its pid.
+ * Waits below have no deadline: they end when the descendant is ready or the
+ * tree stops running, so the outcome, not a timer, decides the verdict. */
+
+#ifdef _WIN32
+#define RSS_TREE_FAULT_GONE ERROR_INVALID_PARAMETER /* no process with that id any more */
+#define RSS_TREE_FAULT_LIVE ERROR_ACCESS_DENIED     /* a member we may not open */
+#elif defined(__APPLE__)
+#define RSS_TREE_FAULT_GONE ESRCH
+#define RSS_TREE_FAULT_LIVE EPERM
+#else
+#define RSS_TREE_FAULT_GONE ENOENT
+#define RSS_TREE_FAULT_LIVE EACCES
+#endif
+
+#define RSS_TREE_MIB UINT64_C(1048576)
+
+typedef struct {
+    bool spawned;
+    bool ready;
+    cbm_proc_tree_rss_status_t status;
+    uint64_t rss;
+    bool quiesced;
+    cbm_proc_tree_rss_status_t final_status;
+    uint64_t final_rss;
+} rss_tree_sample_t;
+
+static void rss_tree_pause(void) {
+    cbm_usleep(10000); /* poll interval only; nothing here is a deadline */
+}
+
+static bool rss_tree_wait_ready(const char *ready_path, cbm_subprocess_t *process) {
+    for (;;) {
+        FILE *ready = cbm_fopen(ready_path, "rb");
+        if (ready) {
+            long pid = 0;
+            int fields = fscanf(ready, "%ld", &pid);
+            (void)fclose(ready);
+            if (fields == 1 && pid > 0) {
+                return true;
+            }
+        }
+        cbm_proc_result_t ignored;
+        if (cbm_subprocess_poll(process, &ignored) != CBM_PROC_POLL_RUNNING) {
+            return false;
+        }
+        rss_tree_pause();
+    }
+}
+
+static bool rss_tree_finish(cbm_subprocess_t *process, rss_tree_sample_t *sample) {
+    (void)cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result;
+    for (;;) {
+        cbm_proc_poll_t state = cbm_subprocess_poll(process, &result);
+        if (state == CBM_PROC_POLL_TERMINAL) {
+            break;
+        }
+        if (state == CBM_PROC_POLL_ERROR) {
+            return false;
+        }
+        rss_tree_pause();
+    }
+    sample->final_status = cbm_subprocess_tree_rss_bytes(process, &sample->final_rss);
+    cbm_subprocess_destroy(process);
+    return result.tree_quiesced;
+}
+
+/* Measure one tree whose descendant holds `mib` MiB, with every non-root
+ * member's measurement failing with `member_fault` (0 = real calls). */
+static rss_tree_sample_t rss_tree_sample(int mib, int member_fault) {
+    rss_tree_sample_t sample = {.status = CBM_PROC_TREE_RSS_ERROR,
+                                .final_status = CBM_PROC_TREE_RSS_ERROR,
+                                .final_rss = UINT64_MAX};
+    const char *made = th_mktempdir("cbm_rss_tree");
+    char dir[256];
+    char ready_path[300];
+    char mib_text[16];
+    if (!made || snprintf(dir, sizeof(dir), "%s", made) >= (int)sizeof(dir) ||
+        snprintf(ready_path, sizeof(ready_path), "%s/ready", dir) >= (int)sizeof(ready_path)) {
+        return sample;
+    }
+    (void)snprintf(mib_text, sizeof(mib_text), "%d", mib);
+    const char *argv[] = {cbm_test_program_path, "__cbm_rss_tree_root", ready_path, mib_text,
+                          NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = cbm_test_program_path;
+    opts.argv = argv;
+    opts.cancel_grace_ms = 100;
+    cbm_subprocess_t *process = NULL;
+    sample.spawned = cbm_subprocess_spawn(&opts, &process) == 0;
+    if (sample.spawned) {
+        sample.ready = rss_tree_wait_ready(ready_path, process);
+        if (sample.ready) {
+            cbm_subprocess_tree_rss_fault_members_for_testing(member_fault);
+            sample.status = cbm_subprocess_tree_rss_bytes(process, &sample.rss);
+            cbm_subprocess_tree_rss_fault_members_for_testing(0);
+        }
+        sample.quiesced = rss_tree_finish(process, &sample);
+    }
+    th_cleanup(dir);
+    return sample;
+}
+
+/* Only the DESCENDANT allocates, so the difference between two otherwise
+ * identical trees is memory the probe can only have counted by measuring past
+ * the root. 128 MiB touched against a 96 MiB floor leaves room for allocator
+ * and page-rounding noise and none for a root-only total. */
+TEST(subprocess_tree_rss_measures_contained_descendants) {
+    rss_tree_sample_t idle = rss_tree_sample(0, 0);
+    rss_tree_sample_t loaded = rss_tree_sample(128, 0);
+    if (loaded.status == CBM_PROC_TREE_RSS_OK && idle.status == CBM_PROC_TREE_RSS_OK) {
+        printf("    tree rss: idle=%llu MiB loaded=%llu MiB\n",
+               (unsigned long long)(idle.rss / RSS_TREE_MIB),
+               (unsigned long long)(loaded.rss / RSS_TREE_MIB));
+    }
+    ASSERT_TRUE(idle.spawned);
+    ASSERT_TRUE(idle.ready);
+    ASSERT_EQ(idle.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(idle.rss > 0);
+    ASSERT_TRUE(loaded.spawned);
+    ASSERT_TRUE(loaded.ready);
+    ASSERT_EQ(loaded.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(loaded.rss >= idle.rss + 96 * RSS_TREE_MIB);
+    ASSERT_TRUE(idle.quiesced);
+    ASSERT_TRUE(loaded.quiesced);
+    ASSERT_EQ(loaded.final_status, CBM_PROC_TREE_RSS_EMPTY);
+    ASSERT_EQ(loaded.final_rss, 0);
+    PASS();
+}
+
+/* A live member the platform will not let us measure must fail the probe: a
+ * total without it would under-report the tree. */
+TEST(subprocess_tree_rss_fails_when_a_live_member_cannot_be_measured) {
+    rss_tree_sample_t sample = rss_tree_sample(0, RSS_TREE_FAULT_LIVE);
+    ASSERT_TRUE(sample.spawned);
+    ASSERT_TRUE(sample.ready);
+    ASSERT_EQ(sample.status, CBM_PROC_TREE_RSS_ERROR);
+    ASSERT_TRUE(sample.quiesced);
+    PASS();
+}
+
+/* A member that exited between the listing and its measurement holds nothing:
+ * it is skipped and the rest of the tree (here the root) is still measured. */
+TEST(subprocess_tree_rss_skips_a_member_that_exited_mid_probe) {
+    rss_tree_sample_t sample = rss_tree_sample(0, RSS_TREE_FAULT_GONE);
+    ASSERT_TRUE(sample.spawned);
+    ASSERT_TRUE(sample.ready);
+    ASSERT_EQ(sample.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(sample.rss > 0);
+    ASSERT_TRUE(sample.quiesced);
+    PASS();
 }
 
 TEST(subprocess_natural_completion_is_cached_across_polls) {
@@ -1784,18 +1946,23 @@ static void sp_stdout_payload(unsigned char bytes[SP_STDOUT_BYTES]) {
     bytes[SP_STDOUT_BYTES - 1] = 'Z'; /* final byte has no newline */
 }
 
-/* Called before normal harness setup. Normal entry remembers argv[0], whose
- * storage lasts through main; the private exact argv grammar never runs suites. */
+/* Normal entry (test_main.c) remembers the runner image, whose storage lasts
+ * through main. */
+void tf_subprocess_set_binary(const char *path);
+void tf_subprocess_set_binary(const char *path) {
+    sp_stdout_test_binary = path;
+}
+
+/* Runner roles (test_main.c's role table), before normal harness setup; the
+ * private exact argv grammar never runs suites. */
 static int sp_stdin_probe(int argc, char **argv);
-const char *tf_runner_image(int argc, char **argv); /* test_main.c */
-int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv);
-int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv) {
-    if (argc >= 2 && argv && strcmp(argv[1], "__cbm_subprocess_stdin_probe") == 0)
-        return sp_stdin_probe(argc, argv);
-    if (argc < 2 || !argv || strcmp(argv[1], "__cbm_subprocess_stdout_probe") != 0) {
-        sp_stdout_test_binary = tf_runner_image(argc, argv);
-        return -1;
-    }
+int tf_role_subprocess_stdin_probe(int argc, char **argv);
+int tf_role_subprocess_stdin_probe(int argc, char **argv) {
+    return sp_stdin_probe(argc, argv);
+}
+
+int tf_role_subprocess_stdout_probe(int argc, char **argv);
+int tf_role_subprocess_stdout_probe(int argc, char **argv) {
     if (argc != 4 || (strcmp(argv[2], "binary") != 0 && strcmp(argv[2], "text") != 0 &&
                       strcmp(argv[2], "empty") != 0))
         return 91;
@@ -2630,6 +2797,7 @@ SUITE(subprocess) {
 #ifndef _WIN32
     RUN_TEST(subprocess_environment_path_preserves_caller_lookup);
 #endif
+    RUN_TEST(subprocess_tree_rss_sum_saturates_on_overflow);
     RUN_TEST(subprocess_run_clean);
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_child_exited_before_group_check);
@@ -2643,6 +2811,9 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
     RUN_TEST(subprocess_spawn_returns_while_child_is_running);
+    RUN_TEST(subprocess_tree_rss_measures_contained_descendants);
+    RUN_TEST(subprocess_tree_rss_fails_when_a_live_member_cannot_be_measured);
+    RUN_TEST(subprocess_tree_rss_skips_a_member_that_exited_mid_probe);
     RUN_TEST(subprocess_natural_completion_is_cached_across_polls);
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);

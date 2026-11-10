@@ -996,6 +996,18 @@ TEST(sw_publish_preserves_live_reader) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+TEST(sw_page_offsets_do_not_wrap_past_4gib) {
+    /* A 32-bit long offset wraps negative at 2 GiB and back to 0 at 4 GiB: on
+     * Windows a staging DB stopped at exactly 4 GiB with its first pages
+     * overwritten, and publish failed with persist_failed (#2399). */
+    ASSERT_EQ(cbm_writer_page_offset(1), 0);
+    ASSERT_EQ(cbm_writer_page_offset(2), 65536);
+    ASSERT_EQ(cbm_writer_page_offset(32769), INT64_C(2147483648));
+    ASSERT_EQ(cbm_writer_page_offset(65537), INT64_C(4294967296));
+    ASSERT_EQ(cbm_writer_page_offset(UINT32_MAX), (int64_t)(UINT32_MAX - 1) * 65536);
+    PASS();
+}
+
 TEST(sw_open_truncated_path_names_its_reason) {
     /* final_path is a fixed 4K buffer and make_writer_temp_path only fails by
      * truncation. Neither sets an errno of its own, so without naming one the
@@ -1065,6 +1077,7 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_publish_failure_preserves_destination_sidecars);
     RUN_TEST(sw_publish_supports_non_ascii_path);
     RUN_TEST(sw_publish_preserves_live_reader);
+    RUN_TEST(sw_page_offsets_do_not_wrap_past_4gib);
     RUN_TEST(sw_open_truncated_path_names_its_reason);
     RUN_TEST(sw_publish_failure_reports_the_rename_not_the_cleanup);
 }

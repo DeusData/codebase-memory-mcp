@@ -78,7 +78,7 @@ static int tic_usage(void) {
                   "       codebase-memory-mcp test-impact select --repo DIR --base REF\n"
                   "           [--config FILE] [--artifact BUNDLE --artifact-commit SHA\n"
                   "           --artifact-verified] [--platform LABEL] [--work DIR]\n"
-                  "           [--deadline-s N]\n");
+                  "           [--deadline-s N] [--vetoed-out FILE]\n");
     return 2;
 }
 
@@ -125,6 +125,7 @@ static int tic_publish(int argc, char **argv) {
 static int tic_select(int argc, char **argv) {
     const char *repo = NULL, *base = NULL, *config = NULL, *artifact = NULL;
     const char *artifact_commit = NULL, *platform = NULL, *work = NULL, *deadline = NULL;
+    const char *vetoed_path = NULL;
     bool verified = false;
     const tic_option_t options[] = {{"--repo", &repo, NULL},
                                     {"--base", &base, NULL},
@@ -134,7 +135,8 @@ static int tic_select(int argc, char **argv) {
                                     {"--artifact-verified", NULL, &verified},
                                     {"--platform", &platform, NULL},
                                     {"--work", &work, NULL},
-                                    {"--deadline-s", &deadline, NULL}};
+                                    {"--deadline-s", &deadline, NULL},
+                                    {"--vetoed-out", &vetoed_path, NULL}};
     if (!tic_parse(argc, argv, options, sizeof(options) / sizeof(options[0])) || !repo || !base) {
         return tic_usage();
     }
@@ -153,6 +155,10 @@ static int tic_select(int argc, char **argv) {
                                          .artifact_commit = artifact_commit,
                                          .artifact_verified = verified,
                                          .platform = platform};
+    cbm_test_result_t *vetoed = NULL;
+    if (vetoed_path) {
+        request.vetoed_out = &vetoed;
+    }
     cbm_test_result_t *result = NULL;
     char diagnostic[512] = "";
     cbm_test_impact_status_t status =
@@ -162,12 +168,24 @@ static int tic_select(int argc, char **argv) {
     }
     if (status != CBM_TEST_IMPACT_OK) {
         (void)fprintf(stderr, "test-impact select: status %d\n", (int)status);
+        cbm_test_result_free(vetoed);
         return 1;
     }
     size_t length = 0;
     const char *json = cbm_test_result_json(result, &length);
     bool ok = json && fwrite(json, 1, length, stdout) == length && fputc('\n', stdout) != EOF;
     cbm_test_result_free(result);
+    /* The selection the runner-main veto discarded: a CI diagnostic, written
+     * only when the veto alone made the answer run-all. */
+    if (ok && vetoed) {
+        const char *text = cbm_test_result_json(vetoed, &length);
+        FILE *f = text ? cbm_fopen(vetoed_path, "wb") : NULL;
+        ok = f && fwrite(text, 1, length, f) == length && fputc('\n', f) != EOF;
+        if (f && fclose(f) != 0) {
+            ok = false;
+        }
+    }
+    cbm_test_result_free(vetoed);
     return ok ? 0 : 1;
 }
 

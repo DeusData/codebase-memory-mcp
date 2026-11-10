@@ -44,6 +44,7 @@ int tf_deselected_count = 0;
 #include <windows.h>
 #include "foundation/win_utf8.h" /* cbm_module_path_utf8 — the runner's own image */
 #else
+#include <sys/wait.h> /* waitpid: the process-tree probe root */
 #include <unistd.h>
 #ifdef __APPLE__
 #include <fcntl.h>
@@ -454,10 +455,12 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         FILE *ready = marker ? cbm_fopen(marker, "wb") : NULL;
         if (ready) {
             (void)fprintf(
-                ready, "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\n",
+                ready,
+                "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\nfence=%s\n",
                 getenv("CBM_INDEX_SINGLE_THREAD") ? getenv("CBM_INDEX_SINGLE_THREAD") : "", marker,
                 getenv("CBM_INDEX_QUARANTINE_FILE") ? getenv("CBM_INDEX_QUARANTINE_FILE") : "",
-                cbm_mem_budget(), descendant);
+                cbm_mem_budget(), descendant,
+                cbm_index_worker_publish_fence() ? cbm_index_worker_publish_fence() : "");
             (void)fclose(ready);
         }
         (void)fprintf(stderr, "async worker hang-tree probe\n");
@@ -508,6 +511,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
+    cbm_index_set_worker_publish_fence(invocation.publish_fence_file);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
     cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
@@ -1802,6 +1806,7 @@ extern void suite_php_lsp(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
 extern void suite_perl_lsp(void);
+extern void suite_ruby_lsp(void);
 extern void suite_scope(void);
 extern void suite_type_rep(void);
 extern void suite_py_lsp(void);
@@ -1811,7 +1816,9 @@ extern void suite_py_lsp_scale(void);
 extern void suite_ts_lsp(void);
 extern void suite_java_lsp(void);
 extern void suite_java_lsp_coverage(void);
+extern void suite_java_typed_calls(void);
 extern void suite_kotlin_lsp(void);
+extern void suite_kotlin_typed_calls(void);
 extern void suite_rust_lsp(void);
 extern void suite_store_arch(void);
 extern void suite_architecture_projection(void);
@@ -1907,10 +1914,14 @@ extern void suite_dump_verify_io(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
-/* Native subprocess capture probe; implemented with its tests. */
-extern int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv);
+/* Runner roles and the runner-image bindings implemented with their tests. */
+extern int tf_role_subprocess_stdin_probe(int argc, char **argv);
+extern int tf_role_subprocess_stdout_probe(int argc, char **argv);
+extern void tf_subprocess_set_binary(const char *path);
 extern void tf_test_impact_runner_filter_set_binary(const char *path);
-extern int tf_maybe_run_git_facts_diff_probe(int argc, char **argv);
+extern int tf_role_git_facts_diff_probe(int argc, char **argv);
+extern int tf_role_git_facts_hostile_diff_probe(int argc, char **argv);
+extern void tf_test_impact_git_set_binary(const char *path);
 
 /* The runner's own image, for the tests that start or copy it again. argv[0]
  * is the caller's spelling, and a Windows parent that found the runner by
@@ -1934,35 +1945,339 @@ const char *tf_runner_image(int argc, char **argv) {
     return argc > 0 && argv ? argv[0] : NULL;
 }
 
-const char *cbm_test_program_path;
-
-int main(int argc, char **argv) {
-    cbm_test_program_path = tf_runner_image(argc, argv);
-    if (argc >= 4 && argc % 2 == 0 && strcmp(argv[1], "__cbm_env_values") == 0) {
-        for (int i = 2; i < argc; i += 2) {
-            const char *value = getenv(argv[i]);
-            if (!value || strcmp(value, argv[i + 1]) != 0) {
-                return 61;
-            }
-        }
-        return 0;
+static int tf_role_env_values(int argc, char **argv) {
+    if (argc < 4 || argc % 2 != 0) {
+        return -1;
     }
-    if (argc >= 5 && strcmp(argv[1], "__cbm_env_isolation") == 0) {
-        const char *value = getenv(argv[2]);
-        if (!value || strcmp(value, argv[3]) != 0) {
+    for (int i = 2; i < argc; i += 2) {
+        const char *value = getenv(argv[i]);
+        if (!value || strcmp(value, argv[i + 1]) != 0) {
             return 61;
         }
-        for (int i = 4; i < argc; i++) {
-            if (getenv(argv[i])) {
-                return 62;
-            }
+    }
+    return 0;
+}
+
+static int tf_role_env_isolation(int argc, char **argv) {
+    if (argc < 5) {
+        return -1;
+    }
+    const char *value = getenv(argv[2]);
+    if (!value || strcmp(value, argv[3]) != 0) {
+        return 61;
+    }
+    for (int i = 4; i < argc; i++) {
+        if (getenv(argv[i])) {
+            return 62;
         }
-        return 0;
+    }
+    return 0;
+}
+
+/* Process-tree memory probe coverage (test_subprocess.c). The root starts ONE
+ * descendant that charges a controlled amount of memory, so a tree total can
+ * be checked against an allocation only a descendant holds. The descendant
+ * publishes its pid by an atomic rename once every page is touched, then
+ * blocks until it is killed. The root exits when its descendant dies, so a
+ * failed setup ends the tree instead of leaving the test waiting. */
+static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
+    char *end = NULL;
+    long mib = strtol(mib_text, &end, 10);
+    if (!end || *end != '\0' || mib < 0 || mib > 1024) {
+        return 81;
+    }
+    size_t bytes = (size_t)mib * 1024U * 1024U;
+    unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
+    if (bytes > 0 && !block) {
+        return 82;
+    }
+    if (block) {
+        memset(block, 0xA5, bytes);
+    }
+    char staged[1024];
+    int length = snprintf(staged, sizeof(staged), "%s.tmp", ready_path);
+    FILE *ready = length > 0 && (size_t)length < sizeof(staged) ? cbm_fopen(staged, "wb") : NULL;
+    if (!ready) {
+        return 83;
+    }
+#ifdef _WIN32
+    (void)fprintf(ready, "%lu\n", (unsigned long)GetCurrentProcessId());
+#else
+    (void)fprintf(ready, "%ld\n", (long)getpid());
+#endif
+    if (fclose(ready) != 0 || rename(staged, ready_path) != 0) {
+        return 84;
+    }
+    volatile unsigned char keep = block ? block[bytes - 1] : 0;
+    (void)keep;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(INFINITE);
+#else
+        (void)pause();
+#endif
+    }
+}
+
+static int tf_role_rss_tree_hold(int argc, char **argv) {
+    return argc == 4 ? tf_rss_tree_hold(argv[2], argv[3]) : -1;
+}
+
+static int tf_role_rss_tree_root(int argc, char **argv) {
+    if (argc != 4) {
+        return -1;
+    }
+#ifdef _WIN32
+    char *self = cbm_module_path_utf8();
+    const char *child_argv[] = {self, "__cbm_rss_tree_hold", argv[2], argv[3], NULL};
+    char command_line[8192];
+    bool built = self && cbm_build_win_cmdline(command_line, sizeof(command_line), child_argv);
+    wchar_t *wide_self = built ? cbm_utf8_to_wide(self) : NULL;
+    wchar_t *wide_command = built ? cbm_utf8_to_wide(command_line) : NULL;
+    STARTUPINFOW startup;
+    ZeroMemory(&startup, sizeof(startup));
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child;
+    ZeroMemory(&child, sizeof(child));
+    /* The child joins this process's Job Object by default, which is the tree
+     * the probe under test enumerates. */
+    BOOL started = wide_self && wide_command &&
+                   CreateProcessW(wide_self, wide_command, NULL, NULL, FALSE, 0, NULL, NULL,
+                                  &startup, &child);
+    free(wide_self);
+    free(wide_command);
+    free(self);
+    if (!started) {
+        return 85;
+    }
+    CloseHandle(child.hThread);
+    (void)WaitForSingleObject(child.hProcess, INFINITE);
+    CloseHandle(child.hProcess);
+#else
+    pid_t child = fork();
+    if (child < 0) {
+        return 85;
+    }
+    if (child == 0) {
+        _exit(tf_rss_tree_hold(argv[2], argv[3]));
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+#endif
+    return 86; /* the descendant ended: end the tree */
+}
+
+/* Installation tests use this executable as a structurally real candidate.
+ * Mirror the production binary's minimal verification contract. */
+static int tf_role_version(int argc, char **argv) {
+    (void)argv;
+    if (argc != 2) {
+        return -1;
+    }
+    (void)puts("codebase-memory-mcp test-runner");
+    return 0;
+}
+
+static int tf_role_build_config(int argc, char **argv) {
+    (void)argv;
+    if (argc != 2) {
+        return -1;
+    }
+#ifdef _WIN32
+    if (_setmode(cbm_fileno(stdout), _O_BINARY) == -1) {
+        fprintf(stderr, "failed to set build-config stdout to binary mode\n");
+        return 2;
+    }
+#endif
+#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+    const int sanitized = 1;
+#else
+    const int sanitized = 0;
+#endif
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    const int test_seams = 1;
+#else
+    const int test_seams = 0;
+#endif
+    (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
+    return 0;
+}
+
+/* #1830 userns smoke probe -- see the test that spawns it.
+ *
+ * The ancestor overflow uid is derived ONCE per process (pthread_once in
+ * src/daemon/ipc.c) from /proc/self/uid_map. That file is not immutable:
+ * unshare(CLONE_NEWUSER) is exactly what changes it, and pthread_once state
+ * survives fork(). A forked child therefore keeps the HOST answer and never
+ * re-derives inside its new namespace, so a fork-only smoke test refuses and
+ * cannot pass once anything earlier in the suite has primed the cache --
+ * seven call sites do. Re-exec into this probe so the decision is made by a
+ * process that STARTED inside the namespace, which is the production shape
+ * the test means to cover. */
+static int tf_role_userns_secure_probe(int argc, char **argv) {
+#if defined(__linux__) && defined(CBM_ENABLE_TEST_SEAMS)
+    if (argc == 3) {
+        /* _exit, not return: this process exists to answer ONE boolean. A
+         * return runs the atexit chain, and the runner is built with
+         * -fsanitize=address, so a future leak anywhere in the prologue would
+         * exit 23 and read as a security verdict on a test that has none. */
+        _exit(cbm_daemon_ipc_private_directory_secure(argv[2]) ? 0 : 1);
+    }
+#endif
+    (void)argc;
+    (void)argv;
+    return -1;
+}
+
+/* The runner's subprocess roles: a test spawns this binary with argv[1] = the
+ * literal, and main hands over to the handler at the entry's phase. A handler
+ * returns the process's exit code, or -1 to let main continue.
+ *
+ * The test-impact engine reads this table (src/mcp/test_impact_engine_reach.c):
+ * a change only a role reaches runs the tests that name the role's literal,
+ * while one that reaches main itself runs every test. So every role main can
+ * enter by its argv[1] belongs here, and each entry stays on one line (phase,
+ * quoted literal, handler name) -- hence clang-format off. */
+typedef enum {
+    TF_PHASE_RAW,       /* before anything else touches the process */
+    TF_PHASE_GIT_CLEAN, /* after the caller's git environment is cleared */
+    TF_PHASE_INSTALL,   /* installation-candidate answers */
+    TF_PHASE_SEAMED,    /* after the spill and build-fingerprint pins */
+    TF_PHASE_WORKER,    /* after the fingerprint capture; the literal anywhere in argv */
+    TF_PHASE_SPAWNER,   /* never dispatched: one more literal a spawner names */
+} tf_phase_t;
+
+typedef struct {
+    tf_phase_t phase;
+    const char *literal;
+    int (*run)(int argc, char **argv);
+} tf_role_t;
+
+#define TF_ROLE(phase, literal, handler) {phase, literal, handler}
+
+// clang-format off
+static const tf_role_t tf_roles[] = {
+    TF_ROLE(TF_PHASE_RAW, "__cbm_env_values", tf_role_env_values),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_env_isolation", tf_role_env_isolation),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_root", tf_role_rss_tree_root),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_hold", tf_role_rss_tree_hold),
+    TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdin_probe", tf_role_subprocess_stdin_probe),
+    TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdout_probe", tf_role_subprocess_stdout_probe),
+    TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_git_facts_diff_probe", tf_role_git_facts_diff_probe),
+    TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_git_facts_hostile_diff_probe", tf_role_git_facts_hostile_diff_probe),
+    TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_windows_memory_limit_probe", tf_maybe_run_windows_memory_limit_probe),
+    TF_ROLE(TF_PHASE_INSTALL, "--version", tf_role_version),
+    TF_ROLE(TF_PHASE_INSTALL, "--build-config", tf_role_build_config),
+    TF_ROLE(TF_PHASE_SEAMED, "--userns-secure-probe", tf_role_userns_secure_probe),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_mcp_idxfailclosed_probe", tf_maybe_run_mcp_idxfailclosed_probe),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_image_holder", tf_maybe_run_runtime_image_holder),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_hello_client", tf_maybe_run_runtime_hello_client),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_activation_client", tf_maybe_run_runtime_activation_client),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_mapped_hello_client", tf_maybe_run_runtime_mapped_hello_client),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_version_cohort_crash_holder", tf_maybe_run_version_cohort_crash_holder),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_daemon_ipc_lock_probe", tf_maybe_run_daemon_ipc_lock_probe),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_deleted_self_probe", tf_maybe_run_deleted_self_probe),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_sockprobe", tf_maybe_run_socket_probe),
+    /* The supervised index worker (`<self> cli --index-worker ...`): production
+     * code starts it only where a test re-enables the supervisor, which main
+     * pins off for every test process, so a spawner names one of the two. */
+    TF_ROLE(TF_PHASE_WORKER, "--index-worker", tf_maybe_run_index_worker),
+    TF_ROLE(TF_PHASE_SPAWNER, "CBM_INDEX_SUPERVISOR", tf_maybe_run_index_worker),
+    /* The blocking-git probe: argv[0] (this runner copied as git) enters it, so
+     * main calls it directly; a spawner sets the marker it writes. */
+    TF_ROLE(TF_PHASE_SPAWNER, "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE", tf_maybe_run_blocking_git_probe),
+};
+// clang-format on
+
+/* Whether argv enters the role: argv[1] is its literal, or, for the index
+ * worker, any argument is (its own parser refuses a misplaced flag loudly). */
+static bool tf_role_named(tf_phase_t phase, int argc, char **argv, const char *literal) {
+    if (phase != TF_PHASE_WORKER) {
+        return strcmp(argv[1], literal) == 0;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], literal) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Hands over to the role argv names, if this phase has it: its exit code, or
+ * -1 (no role here, or its handler let main continue). */
+static int tf_role_dispatch(tf_phase_t phase, int argc, char **argv) {
+    if (argc < 2 || !argv || !argv[1]) {
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof(tf_roles) / sizeof(tf_roles[0]); i++) {
+        if (tf_roles[i].phase != phase || !tf_role_named(phase, argc, argv, tf_roles[i].literal)) {
+            continue;
+        }
+        int rc = tf_roles[i].run(argc, argv);
+        if (rc >= 0) {
+            return rc;
+        }
+    }
+    return -1;
+}
+
+const char *cbm_test_program_path;
+
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define TF_MSAN_MIMALLOC_OUTPUT 1
+#endif
+#endif
+
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+#include <mimalloc.h>
+#include <sanitizer/msan_interface.h>
+
+/* MSan lane only. mimalloc is deliberately left uninstrumented there
+ * (build/msan/mimalloc.o is compiled without -fsanitize=memory), so MSan never
+ * sees it write its own stack. Its text output is the one place those stack
+ * bytes reach an MSan interceptor: a message formatted in a mimalloc stack
+ * buffer arrives at fputs still carrying the shadow an earlier instrumented
+ * frame left there, and MSan reports initialized bytes as uninitialized.
+ * mimalloc 3.5.3 prints an arena-alignment fallback warning on the x86-64 MSan
+ * lane, which tripped this in the mem suite. Routing mimalloc's output through
+ * this handler marks the finished text initialized before it reaches fputs. */
+static bool tf_msan_mi_output_live;
+
+static void tf_msan_mi_output(const char *msg, void *arg) {
+    (void)arg;
+    /* Registering replays mimalloc's delayed-output buffer into the handler.
+     * Its constructor already wrote all of that to stderr before main, so the
+     * replay would only repeat it behind a stray newline: skip it. */
+    if (!tf_msan_mi_output_live || !msg) {
+        return;
+    }
+    /* Mark the text initialized before reading even its first byte. */
+    __msan_unpoison_string(msg);
+    if (!msg[0]) {
+        return;
+    }
+    (void)fputs(msg, stderr);
+}
+#endif
+
+int main(int argc, char **argv) {
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+    mi_register_output(tf_msan_mi_output, NULL);
+    tf_msan_mi_output_live = true;
+#endif
+    cbm_test_program_path = tf_runner_image(argc, argv);
+    int role_rc = tf_role_dispatch(TF_PHASE_RAW, argc, argv);
+    if (role_rc >= 0) {
+        return role_rc;
     }
     /* #2003: never let a caller's GIT_DIR/GIT_INDEX_FILE/... redirect fixture
      * git commands at the caller's real repository. */
     th_clear_git_repo_env();
     tf_test_impact_runner_filter_set_binary(tf_runner_image(argc, argv));
+    tf_subprocess_set_binary(tf_runner_image(argc, argv));
+    tf_test_impact_git_set_binary(tf_runner_image(argc, argv));
 #ifdef CBM_TEST_COVERAGE
     tf_coverage_process_init();
 #ifndef _WIN32
@@ -1972,47 +2287,19 @@ int main(int argc, char **argv) {
     }
 #endif
 #endif
-    int stdout_probe_rc = tf_maybe_run_subprocess_stdout_probe(argc, argv);
-    if (stdout_probe_rc >= 0) {
-        return stdout_probe_rc;
+    role_rc = tf_role_dispatch(TF_PHASE_GIT_CLEAN, argc, argv);
+    if (role_rc >= 0) {
+        return role_rc;
     }
-    int git_facts_probe_rc = tf_maybe_run_git_facts_diff_probe(argc, argv);
-    if (git_facts_probe_rc >= 0) {
-        return git_facts_probe_rc;
-    }
-    int memory_limit_probe_rc = tf_maybe_run_windows_memory_limit_probe(argc, argv);
-    if (memory_limit_probe_rc >= 0) {
-        return memory_limit_probe_rc;
-    }
+    /* argv[0] (this runner copied as git) enters the blocking-git probe, not
+     * argv[1], so main calls it here; tf_roles names its spawners. */
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
         return blocking_git_rc;
     }
-    /* Installation tests use this executable as a structurally real candidate.
-     * Mirror the production binary's minimal verification contract. */
-    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        (void)puts("codebase-memory-mcp test-runner");
-        return 0;
-    }
-    if (argc == 2 && strcmp(argv[1], "--build-config") == 0) {
-#ifdef _WIN32
-        if (_setmode(cbm_fileno(stdout), _O_BINARY) == -1) {
-            fprintf(stderr, "failed to set build-config stdout to binary mode\n");
-            return 2;
-        }
-#endif
-#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
-        const int sanitized = 1;
-#else
-        const int sanitized = 0;
-#endif
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-        const int test_seams = 1;
-#else
-        const int test_seams = 0;
-#endif
-        (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
-        return 0;
+    role_rc = tf_role_dispatch(TF_PHASE_INSTALL, argc, argv);
+    if (role_rc >= 0) {
+        return role_rc;
     }
     /* A test's verdict is a pure function of code, test, platform and seed --
      * never of how full this machine's disk is. The spill store refuses to open
@@ -2033,64 +2320,11 @@ int main(int argc, char **argv) {
         (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
                          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
     }
-    /* #1830 userns smoke probe -- see the test that spawns it.
-     *
-     * The ancestor overflow uid is derived ONCE per process (pthread_once in
-     * src/daemon/ipc.c) from /proc/self/uid_map. That file is not immutable:
-     * unshare(CLONE_NEWUSER) is exactly what changes it, and pthread_once state
-     * survives fork(). A forked child therefore keeps the HOST answer and never
-     * re-derives inside its new namespace, so a fork-only smoke test refuses and
-     * cannot pass once anything earlier in the suite has primed the cache --
-     * seven call sites do. Re-exec into this probe so the decision is made by a
-     * process that STARTED inside the namespace, which is the production shape
-     * the test means to cover. */
-#if defined(__linux__) && defined(CBM_ENABLE_TEST_SEAMS)
-    if (argc == 3 && strcmp(argv[1], "--userns-secure-probe") == 0) {
-        /* _exit, not return: this process exists to answer ONE boolean. A
-         * return runs the atexit chain, and the runner is built with
-         * -fsanitize=address, so a future leak anywhere in the prologue would
-         * exit 23 and read as a security verdict on a test that has none. */
-        _exit(cbm_daemon_ipc_private_directory_secure(argv[2]) ? 0 : 1);
-    }
-#endif
-    int mcp_idxfailclosed_rc = tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
-    if (mcp_idxfailclosed_rc >= 0) {
-        return mcp_idxfailclosed_rc;
-    }
-    int runtime_image_rc = tf_maybe_run_runtime_image_holder(argc, argv);
-    if (runtime_image_rc >= 0) {
-        return runtime_image_rc;
-    }
-    int runtime_hello_rc = tf_maybe_run_runtime_hello_client(argc, argv);
-    if (runtime_hello_rc >= 0) {
-        return runtime_hello_rc;
-    }
-    int runtime_activation_rc = tf_maybe_run_runtime_activation_client(argc, argv);
-    if (runtime_activation_rc >= 0) {
-        return runtime_activation_rc;
-    }
-    int runtime_mapped_hello_rc = tf_maybe_run_runtime_mapped_hello_client(argc, argv);
-    if (runtime_mapped_hello_rc >= 0) {
-        return runtime_mapped_hello_rc;
-    }
-    int cohort_crash_rc = tf_maybe_run_version_cohort_crash_holder(argc, argv);
-    if (cohort_crash_rc >= 0) {
-        return cohort_crash_rc;
-    }
-    int daemon_ipc_probe_rc = tf_maybe_run_daemon_ipc_lock_probe(argc, argv);
-    if (daemon_ipc_probe_rc >= 0) {
-        return daemon_ipc_probe_rc;
-    }
-    int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
-    if (deleted_self_rc >= 0) {
-        return deleted_self_rc;
-    }
-
-    /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
-     * inheritable socket handle crossed into this child and exit before any suite. */
-    int probe_rc = tf_maybe_run_socket_probe(argc, argv);
-    if (probe_rc >= 0) {
-        return probe_rc;
+    /* Roles that run after those pins: the #1830 userns probe, the daemon and
+     * runtime clients and holders, the #798 socket-isolation probe (tf_roles). */
+    role_rc = tf_role_dispatch(TF_PHASE_SEAMED, argc, argv);
+    if (role_rc >= 0) {
+        return role_rc;
     }
 
     /* Capture once so the parent tests and any re-exec'd worker bind to this
@@ -2100,9 +2334,9 @@ int main(int argc, char **argv) {
 
     /* #832: if spawned as a supervised index worker, do the real work and exit
      * before any suite runs (see tf_maybe_run_index_worker). */
-    int worker_rc = tf_maybe_run_index_worker(argc, argv);
-    if (worker_rc >= 0) {
-        return worker_rc;
+    role_rc = tf_role_dispatch(TF_PHASE_WORKER, argc, argv);
+    if (role_rc >= 0) {
+        return role_rc;
     }
 
     /* #845 belt-and-suspenders: this binary EMBEDS cbm_mcp_handle_tool. The
@@ -2303,8 +2537,10 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
     RUN_SELECTED_SUITE(perl_lsp);
+    RUN_SELECTED_SUITE(ruby_lsp);
     RUN_SELECTED_SUITE(py_lsp);
     RUN_SELECTED_SUITE(kotlin_lsp);
+    RUN_SELECTED_SUITE(kotlin_typed_calls);
     RUN_SELECTED_SUITE(rust_lsp);
     RUN_SELECTED_SUITE_PERF(py_lsp_bench);
     RUN_SELECTED_SUITE(py_lsp_stress);
@@ -2312,6 +2548,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(ts_lsp);
     RUN_SELECTED_SUITE(java_lsp);
     RUN_SELECTED_SUITE(java_lsp_coverage);
+    RUN_SELECTED_SUITE(java_typed_calls);
 
     /* Architecture + ADR + Louvain */
     RUN_SELECTED_SUITE(store_arch);

@@ -495,7 +495,9 @@ static void te_receipt(te_ctx_t *c, cbm_test_result_receipt_t *r,
     te_artifact_receipt(c, &r->coverage, te_oid);
 }
 
-static cbm_test_impact_status_t te_answer(te_ctx_t *c, cbm_test_result_t **out) {
+/* mask_runner: the answer without the RUNNER_REACHED fallback (the CI's view
+ * of what the veto discarded; see cbm_test_impact_request_t.vetoed_out). */
+static cbm_test_impact_status_t te_answer(te_ctx_t *c, cbm_test_result_t **out, bool mask_runner) {
     cbm_test_result_rule_match_t *matches =
         cbm_arena_calloc(&c->arena, (size_t)(c->match_count + 1) * sizeof(*matches));
     if (!matches) {
@@ -517,6 +519,23 @@ static cbm_test_impact_status_t te_answer(te_ctx_t *c, cbm_test_result_t **out) 
         return CBM_TEST_IMPACT_OOM;
     }
     bool with_selection = c->selection && comparison == CBM_TEST_RESULT_COMPARISON_CHANGED;
+    const cbm_test_result_fallback_t *fallbacks = c->fallbacks;
+    size_t fallback_count = (size_t)c->fallback_count;
+    cbm_test_result_fallback_t *kept = NULL;
+    if (mask_runner) {
+        kept = cbm_arena_calloc(&c->arena, (fallback_count + 1) * sizeof(*kept));
+        if (!kept) {
+            return CBM_TEST_IMPACT_OOM;
+        }
+        size_t n = 0;
+        for (size_t i = 0; i < fallback_count; i++) {
+            if (c->fallbacks[i] != CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED) {
+                kept[n++] = c->fallbacks[i];
+            }
+        }
+        fallbacks = kept;
+        fallback_count = n;
+    }
     cbm_test_result_input_t input = {
         .comparison = comparison,
         .selection = with_selection ? c->selection : NULL,
@@ -527,8 +546,8 @@ static cbm_test_impact_status_t te_answer(te_ctx_t *c, cbm_test_result_t **out) 
         .matched_rules = comparison == CBM_TEST_RESULT_COMPARISON_EMPTY ? NULL : matches,
         .matched_rule_count =
             comparison == CBM_TEST_RESULT_COMPARISON_EMPTY ? 0 : (size_t)c->match_count,
-        .fallbacks = c->fallbacks,
-        .fallback_count = (size_t)c->fallback_count,
+        .fallbacks = fallbacks,
+        .fallback_count = fallback_count,
         .warnings = c->warnings,
         .warning_count = (size_t)c->warning_count,
         .receipt = &receipt};
@@ -615,10 +634,25 @@ static void *te_job_main(void *arg) {
         .rq = job->request, .diagnostic = job->diagnostic, .diagnostic_len = job->diagnostic_len};
     cbm_arena_init(&c.arena);
     te_steps(&c);
-    cbm_test_impact_status_t status = c.oom ? CBM_TEST_IMPACT_OOM : te_answer(&c, job->out);
+    cbm_test_impact_status_t status = c.oom ? CBM_TEST_IMPACT_OOM : te_answer(&c, job->out, false);
+    cbm_test_result_t **vetoed = job->request->vetoed_out;
+    if (vetoed) {
+        *vetoed = NULL;
+        bool runner_veto_only =
+            c.fallback_count == 1 && c.fallbacks[0] == CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED;
+        if (status == CBM_TEST_IMPACT_OK && runner_veto_only && c.selection &&
+            te_answer(&c, vetoed, true) != CBM_TEST_IMPACT_OK) {
+            cbm_test_result_free(*vetoed); /* a diagnostic only: never fails the answer */
+            *vetoed = NULL;
+        }
+    }
     if (!c.oom && cbm_now_ms() > job->request->deadline_ms && status == CBM_TEST_IMPACT_OK) {
         cbm_test_result_free(*job->out);
         *job->out = NULL;
+        if (vetoed) {
+            cbm_test_result_free(*vetoed);
+            *vetoed = NULL;
+        }
         status = CBM_TEST_IMPACT_CANCELLED;
     }
     te_free(&c);

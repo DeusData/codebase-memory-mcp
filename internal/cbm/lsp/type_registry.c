@@ -964,6 +964,64 @@ const CBMRegisteredFunc *cbm_registry_lookup_method_aliased(const CBMTypeRegistr
     return NULL;
 }
 
+/* Binary search of a sorted string array; -1 when absent. The key is `prefix`
+ * alone (name == NULL) or `prefix.name`, compared without building it. */
+static int registry_bsearch_qn(const char *const *arr, int count, const char *prefix,
+                               const char *name) {
+    size_t prefix_len = strlen(prefix);
+    int lo = 0;
+    int hi = count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const char *s = arr[mid];
+        int cmp = strncmp(s, prefix, prefix_len);
+        if (cmp == 0) {
+            const char *rest = s + prefix_len;
+            if (!name) {
+                cmp = *rest ? 1 : 0;
+            } else if (*rest != '.') {
+                cmp = (unsigned char)*rest - (unsigned char)'.';
+            } else {
+                cmp = strcmp(rest + 1, name);
+            }
+        }
+        if (cmp == 0)
+            return mid;
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return -1;
+}
+
+bool cbm_registry_is_module(const CBMTypeRegistry *reg, const char *module_qn) {
+    if (!module_qn)
+        return false;
+    for (const CBMTypeRegistry *r = reg; r; r = r->fallback) {
+        CBM_LSP_WORK(1);
+        if (r->module_qns &&
+            registry_bsearch_qn(r->module_qns, r->module_count, module_qn, NULL) >= 0)
+            return true;
+    }
+    return false;
+}
+
+const char *cbm_registry_lookup_export(const CBMTypeRegistry *reg, const char *module_qn,
+                                       const char *name) {
+    if (!module_qn || !name)
+        return NULL;
+    for (const CBMTypeRegistry *r = reg; r; r = r->fallback) {
+        CBM_LSP_WORK(1);
+        if (!r->export_keys)
+            continue;
+        int i = registry_bsearch_qn(r->export_keys, r->export_count, module_qn, name);
+        if (i >= 0)
+            return r->export_targets[i];
+    }
+    return NULL;
+}
+
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name) {
     if (!reg || !package_qn || !name)

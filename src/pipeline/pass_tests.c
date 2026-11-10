@@ -28,6 +28,7 @@ enum {
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
+#include "discover/discover.h"
 #include "foundation/log.h"
 
 #include <stdio.h>
@@ -208,6 +209,48 @@ static char *test_to_prod_path(const char *test_path) {
     return NULL;
 }
 
+/* #1548: a def declared inside a Python test function (a closure, a local
+ * helper, a method of a test-local class) is that test's own code, extracted
+ * as a node of its own. Its calls exercise the target on the test's behalf, so
+ * TESTS is attributed to the nearest enclosing test function of the same file
+ * (QN prefix walk). Before #1548 those calls hung on the test FILE node, whose
+ * name passes the test-name check. NULL when no enclosing test function exists
+ * (a helper nested in a non-test function stays without TESTS, like a
+ * module-level helper). */
+static const cbm_gbuf_node_t *enclosing_python_test_func(const cbm_gbuf_t *gb,
+                                                         const cbm_gbuf_node_t *src) {
+    if (!src->qualified_name || !src->file_path || !src->label ||
+        (strcmp(src->label, "Function") != 0 && strcmp(src->label, "Method") != 0)) {
+        return NULL;
+    }
+    const char *slash = strrchr(src->file_path, '/');
+    if (cbm_language_for_filename(slash ? slash + SKIP_ONE : src->file_path) != CBM_LANG_PYTHON) {
+        return NULL;
+    }
+    char scope[CBM_SZ_512];
+    size_t len = strlen(src->qualified_name);
+    if (len >= sizeof(scope)) {
+        return NULL;
+    }
+    memcpy(scope, src->qualified_name, len + SKIP_ONE);
+    for (char *dot = strrchr(scope, '.'); dot; dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        const cbm_gbuf_node_t *outer = cbm_gbuf_find_by_qn(gb, scope);
+        if (!outer) {
+            continue;
+        }
+        if (!outer->file_path || strcmp(outer->file_path, src->file_path) != 0) {
+            return NULL; /* left the file: no enclosing test function */
+        }
+        if (outer->label &&
+            (strcmp(outer->label, "Function") == 0 || strcmp(outer->label, "Method") == 0) &&
+            cbm_is_test_func_name(outer->name)) {
+            return outer;
+        }
+    }
+    return NULL;
+}
+
 /* Create TESTS edges from test functions to production functions via CALLS edges. */
 static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
     int count = 0;
@@ -238,11 +281,15 @@ static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
+        const cbm_gbuf_node_t *test_src = src;
         if (!cbm_is_test_func_name(src->name)) {
-            continue;
+            test_src = enclosing_python_test_func(ctx->gbuf, src);
+            if (!test_src) {
+                continue;
+            }
         }
 
-        cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, "TESTS", "{}");
+        cbm_gbuf_insert_edge(ctx->gbuf, test_src->id, tgt->id, "TESTS", "{}");
         count++;
     }
     return count;

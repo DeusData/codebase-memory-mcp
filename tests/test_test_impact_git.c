@@ -50,37 +50,46 @@ static bool gf_write(const char *path, const void *bytes, size_t length) {
     return ok;
 }
 
-/* Native executable fixture for Git's optional diff/textconv command. Extra
- * arguments added by Git are deliberately ignored. Normal harness entry keeps
- * argv[0] for a private executable copy; neither mode changes the environment. */
-const char *tf_runner_image(int argc, char **argv); /* test_main.c */
-int tf_maybe_run_git_facts_diff_probe(int argc, char **argv);
-int tf_maybe_run_git_facts_diff_probe(int argc, char **argv) {
-    if (argc >= 2 && argv && strcmp(argv[1], "__cbm_git_facts_diff_probe") == 0) {
-        return argc >= 3 && gf_write(argv[2], "invoked\n", 8) ? 0 : 96;
+/* Normal harness entry (test_main.c) keeps the runner image for a private
+ * executable copy. */
+void tf_test_impact_git_set_binary(const char *path);
+void tf_test_impact_git_set_binary(const char *path) {
+    gf_runner_binary = path;
+}
+
+/* Runner role (test_main.c's role table): the native executable fixture for
+ * Git's optional diff/textconv command. Extra arguments added by Git are
+ * deliberately ignored; the environment is left unchanged. */
+int tf_role_git_facts_diff_probe(int argc, char **argv);
+int tf_role_git_facts_diff_probe(int argc, char **argv) {
+    return argc >= 3 && gf_write(argv[2], "invoked\n", 8) ? 0 : 96;
+}
+
+/* Runner role: only this isolated child mutates its environment, before
+ * harness threads start, and returns -1 so main re-enters the existing
+ * exact-diff test; the parent process remains untouched. An inherited
+ * CBM_TEST_ONLY_FILE (a narrowed CI run) is cleared: the runner unions it with
+ * CBM_TEST_ONLY, and one naming this suite would re-run the spawning test,
+ * which spawns again. An inherited CBM_TEST_COVERAGE_DIR (a coverage-map run)
+ * is cleared too: with it the child would start a coverage run of its own,
+ * which refuses the per-test LLVM_PROFILE_FILE it inherits. Without it the
+ * child's profile goes to that file, credited to the spawning test like any
+ * other child process. */
+int tf_role_git_facts_hostile_diff_probe(int argc, char **argv);
+int tf_role_git_facts_hostile_diff_probe(int argc, char **argv) {
+    if (argc != 2) {
+        return -1;
     }
-    if (argc == 2 && argv && strcmp(argv[1], "__cbm_git_facts_hostile_diff_probe") == 0) {
-        /* Only this isolated child mutates its environment, before harness threads start.
-         * Re-enter the existing exact-diff test; the parent process remains untouched.
-         * An inherited CBM_TEST_ONLY_FILE (a narrowed CI run) is cleared: the runner
-         * unions it with CBM_TEST_ONLY, and one naming this suite would re-run the
-         * spawning test, which spawns again. An inherited CBM_TEST_COVERAGE_DIR (a
-         * coverage-map run) is cleared too: with it the child would start a coverage
-         * run of its own, which refuses the per-test LLVM_PROFILE_FILE it inherits.
-         * Without it the child's profile goes to that file, credited to the spawning
-         * test like any other child process. */
-        if (cbm_setenv("GIT_DIFF_OPTS", "--unified=999", 1) != 0 ||
-            cbm_setenv("CBM_TEST_ONLY_FILE", "", 1) != 0 ||
-            cbm_unsetenv("CBM_TEST_COVERAGE_DIR") != 0 ||
-            cbm_setenv(
-                "CBM_TEST_ONLY",
-                "test_impact_git:test_git_facts_diff_uses_merge_base_zero_context_and_nul_metadata",
-                1) != 0) {
-            return 96;
-        }
-        argv[1] = "test_impact_git";
+    if (cbm_setenv("GIT_DIFF_OPTS", "--unified=999", 1) != 0 ||
+        cbm_setenv("CBM_TEST_ONLY_FILE", "", 1) != 0 ||
+        cbm_unsetenv("CBM_TEST_COVERAGE_DIR") != 0 ||
+        cbm_setenv(
+            "CBM_TEST_ONLY",
+            "test_impact_git:test_git_facts_diff_uses_merge_base_zero_context_and_nul_metadata",
+            1) != 0) {
+        return 96;
     }
-    gf_runner_binary = tf_runner_image(argc, argv);
+    argv[1] = "test_impact_git";
     return -1;
 }
 

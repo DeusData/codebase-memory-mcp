@@ -30,13 +30,19 @@
 #          replay's single process).
 #        scripts/ci/select-lanes.sh --list-lanes
 #          Every lane name, one per line (the universe ci-ok checks against).
+#        scripts/ci/select-lanes.sh --codeql-scope LANGUAGE [FILE]
+#          The paths of FILE (default stdin) in that CodeQL language's PR
+#          scope (c-cpp, javascript-typescript, python, actions), one per line.
+#          The codeql-* lanes are selected by these scopes; the interpreted
+#          ones follow .github/codeql/codeql-config.yml (paths/paths-ignore).
 # Exit: 0 = decided · 2 = usage error.
 set -euo pipefail
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
 
 FORMAT=json
 MODE="select"
+CODEQL_LANGUAGE=""
 INPUT=""
 EXPECT=""
 while [ $# -gt 0 ]; do
@@ -56,6 +62,11 @@ while [ $# -gt 0 ]; do
         [ $# -gt 1 ] && shift
         ;;
     --list-lanes) MODE="list" ;;
+    --codeql-scope)
+        MODE="codeql-scope"
+        CODEQL_LANGUAGE="${2:-}"
+        [ $# -gt 1 ] && shift
+        ;;
     --expect-files)
         # An empty value (a workflow whose count went missing) must fail
         # loudly, never quietly skip the truncation check.
@@ -101,20 +112,29 @@ fi
 
 # The heredoc below is the program, so stdin input is staged in a file first.
 STAGED=""
-if [ "$MODE" = select ] && [ -z "$INPUT" ]; then
+case "$MODE:$CODEQL_LANGUAGE" in
+codeql-scope:c-cpp | codeql-scope:javascript-typescript | codeql-scope:python | codeql-scope:actions | select:* | batch:* | list:*) ;;
+*)
+    echo "select-lanes.sh: --codeql-scope takes c-cpp, javascript-typescript, python or actions. Please consult --help." >&2
+    exit 2
+    ;;
+esac
+if { [ "$MODE" = select ] || [ "$MODE" = codeql-scope ]; } && [ -z "$INPUT" ]; then
     STAGED=$(mktemp "${TMPDIR:-/tmp}/cbm-select-lanes.XXXXXX")
     trap 'rm -f "$STAGED"' EXIT
     cat >"$STAGED"
     INPUT="$STAGED"
 fi
 
-python3 - "$MODE" "$FORMAT" "$INPUT" "$EXPECT" <<'PY'
+CODEQL_CONFIG="$(cd "$(dirname "$0")/../.." && pwd)/.github/codeql/codeql-config.yml"
+python3 - "$MODE" "$FORMAT" "$INPUT" "$EXPECT" "$CODEQL_CONFIG" "$CODEQL_LANGUAGE" <<'PY'
 import json
 import re
 import sys
 
 mode, fmt, source = sys.argv[1:4]
 expect = int(sys.argv[4]) if sys.argv[4] else None
+codeql_config, codeql_language = sys.argv[5:7]
 
 # ── Path -> category (first matching rule wins; order is part of the rule) ──
 GATE_WORKFLOWS = {"pr.yml", "_test.yml", "_lint.yml", "_security.yml",
@@ -123,20 +143,53 @@ BUILD = {"Makefile.cbm", "scripts/test.sh", "scripts/run-tests-parallel.sh",
          "scripts/env.sh", "scripts/build.sh", "scripts/clean.sh",
          "scripts/path-safety.sh", "scripts/test-runtime.sh", "scripts/msan.sh",
          "scripts/lint.sh", ".clang-format", ".clang-tidy",
-         "scripts/vendored-checksums.txt"}
+         "scripts/vendored-checksums.txt", "scripts/run-test-wave.py",
+         "scripts/embed-frontend.sh"}
 SMOKE = {"scripts/smoke-test.sh", "scripts/smoke-local.sh",
          "scripts/smoke-fixture-server.py", "scripts/smoke-invariants.sh",
          "test-infrastructure/vm/vm-smoke.sh",
          "test-infrastructure/vm/windows-user-path-guard.ps1",
-         "scripts/test-windows.ps1", "scripts/smoke-wrappers.sh"}
+         "scripts/test-windows.ps1", "scripts/smoke-wrappers.sh",
+         "scripts/security-fuzz.sh", "scripts/security-fuzz-random.sh",
+         "scripts/security-install.sh", "scripts/security-network.sh",
+         "scripts/security-strings.sh", "scripts/test_mcp_interactive.py"}
 LINT_CONFIG = {"scripts/memory-core-baseline.txt", "scripts/lint-memory-core.py",
-               "scripts/hooks/pre-commit"}
+               "scripts/hooks/pre-commit", ".cppcheck", "scripts/check-no-test-skips.sh",
+               "scripts/check-nolint-whitelist.sh", "scripts/lint-mem-gate.py",
+               "scripts/lint-mem-whitelist.txt", "scripts/lint-tidy-diff.sh"}
+# Local tools and release-only jobs: no PR lane runs them.
 NON_GATING = {"scripts/package-release.sh", "scripts/benchmark-index.sh",
               "scripts/benchmark-search-graph.sh", "scripts/benchmark-streaming.py",
-              "scripts/soak-test.sh", ".cbmignore", ".node-version", "flake.nix"}
-PKG_FILES = {"install.sh", "install.ps1", "server.json", "package.json", "manifest.json"}
+              "scripts/soak-test.sh", ".cbmignore", ".node-version", "flake.nix",
+              "flake.lock", "scripts/soak-legs.sh", "scripts/repro.sh",
+              "scripts/audit-grammar-security.sh", "scripts/check-dco.sh",
+              "scripts/check-lsp-originality.sh", "scripts/clone-bench-repos.sh",
+              "scripts/extract_nomic_vectors.py", "scripts/gen-pdf-unicode.py",
+              "scripts/gen-py-stdlib.py", "scripts/generate-lang-code.py",
+              "scripts/new-languages.json", "scripts/git-hooks/commit-msg",
+              "scripts/install-git-hooks.sh", "scripts/sanitizer-coverage-map.py",
+              "scripts/sanitizer-map.json", "scripts/test_mcp_rapid_init.py",
+              "scripts/vendor-grammar.sh"}
+# The license-gate lane runs these (and only that lane).
+LICENSE_TOOLS = {"scripts/license-gate.sh", "scripts/license-gate-check.py",
+                 "scripts/license-gate-check-npm.py", "scripts/license-policy.json",
+                 "scripts/ui_browser_licenses.py"}
+# security-static runs these; it runs on every PR (ALWAYS).
+SECURITY_TOOLS = {"scripts/security-audit.sh", "scripts/security-allowlist.txt",
+                  "scripts/security-network-source-audit.py", "scripts/security-ui.sh"}
+# Repository files C tests read: the test legs run (a docs-only tier runs no C
+# suite, so test_cli's README/site contract would never see a README change).
+READ_BY_TESTS = {"scripts/security-vendored.sh", ".codebase-memory.json", "README.md",
+                 "docs/index.html", "docs/llms.txt", "pkg/npm/README.md"}
+# The test legs' failure report (tests/test_failure_report_contract.sh).
+TEST_REPORT = {"scripts/suite-failure-report.sh"}
+# The release notices ship inside every archive.
+PKG_SCRIPTS = {"scripts/gen-third-party-notices.sh", "scripts/gen-ui-licenses.py"}
+PKG_FILES = {"install.sh", "install.ps1", "server.json", "package.json", "manifest.json",
+             "Formula"}
 DOC_SUFFIXES = (".md", ".png", ".svg", ".jpg", ".gif", ".txt")
-DOC_FILES = {"LICENSE", "CODEOWNERS", ".gitignore", ".gitattributes"}
+DOC_FILES = {"LICENSE", "CODEOWNERS", ".gitignore", ".gitattributes", "DCO",
+             ".gitleaksignore", "glama.json"}
 
 
 def category(path):
@@ -159,6 +212,8 @@ def category(path):
         return "grammar"
     if path.startswith(".github/workflows/"):
         return "ci-gate" if base in GATE_WORKFLOWS else "ci-other"
+    if path.startswith(".github/codeql/"):
+        return "ci-gate"
     if path.startswith(".github/"):
         if path.endswith(".md") or ("ISSUE_TEMPLATE" in path and path.endswith((".yml", ".yaml"))):
             return "docs"
@@ -169,6 +224,18 @@ def category(path):
         return "build"
     if path in SMOKE:
         return "smoke"
+    if path in LICENSE_TOOLS:
+        return "license-tools"
+    if path in SECURITY_TOOLS:
+        return "security-tools"
+    if path in READ_BY_TESTS:
+        return "test"
+    if path in TEST_REPORT:
+        return "test-contract"
+    if path in PKG_SCRIPTS:
+        return "pkg"
+    if path.startswith("scripts/") and path.endswith(".md"):
+        return "docs"
     if path.startswith("tests/fixtures/"):
         return "test"
     if path.startswith("tests/windows/"):
@@ -213,7 +280,8 @@ MID = {"pipeline", "mcp", "store", "cypher", "discover", "git", "graph_buffer",
 PLATFORM = {"daemon", "cli", "watcher", "ui", "foundation", "smoke", "pkg", "test-win"}
 CORE = {"mem-core", "build", "vendored", "ci-gate", "other", "scripts-other"}
 LOWER = {"test", "test-contract", "fuzz", "ui-frontend", "ci-other",
-         "local-infra", "docs", "lint-cfg", "memwaste-tools"}
+         "local-infra", "docs", "lint-cfg", "memwaste-tools", "license-tools",
+         "security-tools"}
 
 
 def normalized(cat):
@@ -240,17 +308,23 @@ def tier_of(cats):
         return "T2-extract"
     if cats & {"test", "test-contract", "fuzz"}:
         return "T1-tests"
-    if cats & {"ui-frontend", "ci-other", "local-infra", "lint-cfg", "memwaste-tools"}:
+    if cats & {"ui-frontend", "ci-other", "local-infra", "lint-cfg", "memwaste-tools",
+               "license-tools", "security-tools"}:
         return "T0b-nonproduct"
     return "T0a-docs"
 
 
 # ── Tier -> lanes (R1) ──
-FULL = {"codeql-gate", "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
+# The PR CodeQL scans, one lane per language (pr.yml's `codeql` matrix). Each
+# is selected by a change in its scope (codeql_scope below) and, like every
+# lane, by any full run: an undeterminable diff scans every language.
+CODEQL_LANES = {"c-cpp": "codeql-cpp", "javascript-typescript": "codeql-js",
+                "python": "codeql-py", "actions": "codeql-actions"}
+FULL = {"diag", "license-gate", "lint", "lint-mem", "lsan-macos",
         "memwaste", "msan", "pkg-wrappers", "security-static", "shard-completeness",
         "smoke-mac", "smoke-ubuntu", "smoke-win", "tsan-arm", "tsan-mac", "tsan-x86",
         "unix-arm64", "unix-macos-intel", "unix-macos14", "unix-x86", "windows",
-        "windows-guards"}
+        "windows-guards"} | set(CODEQL_LANES.values())
 UNIVERSE = FULL | {"contracts"}   # contracts: the T0a/T0b job; every test leg runs them too
 LINT = {"lint", "lint-mem"}
 CORE_LEGS = {"unix-x86", "unix-macos14", "windows", "shard-completeness"}
@@ -261,16 +335,16 @@ R1 = {
     # The contract steps police test-infrastructure/ and lint config too.
     "T0b-nonproduct": LINT | {"contracts"},
     "T1-tests": LINT | CORE_LEGS,
-    "T2-extract": LINT | CORE_LEGS | {"codeql-gate", "tsan-x86", "smoke-ubuntu"},
-    "T3-mid": LINT | CORE_LEGS | {"codeql-gate", "tsan-x86", "smoke-ubuntu"},
-    "T4-platform": FULL - {"msan", "diag", "memwaste"},
+    "T2-extract": LINT | CORE_LEGS | {"tsan-x86", "smoke-ubuntu"},
+    "T3-mid": LINT | CORE_LEGS | {"tsan-x86", "smoke-ubuntu"},
+    "T4-platform": FULL - {"msan", "diag", "memwaste"} - set(CODEQL_LANES.values()),
     "T5-core": FULL,
 }
 # Category add-ons: (categories, lanes). pkg adds nothing to a docs-only set
 # because a pkg path is never docs-only (it lifts the tier to T4).
 ADD_ONS = [
     ({"pkg"}, {"pkg-wrappers", "smoke-ubuntu", "smoke-mac", "smoke-win"}),
-    ({"vendored", "pkg", "ci-gate", "build"}, {"license-gate"}),
+    ({"vendored", "pkg", "ci-gate", "build", "license-tools"}, {"license-gate"}),
     ({"ui-frontend"}, {"windows-guards", "smoke-ubuntu"}),
     ({"memwaste-tools", "mem-core"}, {"memwaste"}),
     ({"test-win"}, {"windows", "windows-guards"}),
@@ -279,6 +353,73 @@ ADD_ONS = [
 ]
 HARNESS = {"scripts/test.sh", "scripts/run-tests-parallel.sh", "scripts/run-test-wave.py",
            "tests/test_main.c", "tests/test_framework.h"}
+
+
+# ── CodeQL PR scope (the codeql-* lanes) ──
+# c-cpp: any C/C++ the production build can compile -- first-party AND
+# vendored (a vendored-only change is scanned: codeql.yml traces the vendored
+# files a PR changes). Tests are not in the analysed build.
+# Interpreted languages: their extensions inside the CodeQL config's
+# paths minus paths-ignore (.github/codeql/codeql-config.yml, read below).
+# A change to the CodeQL machinery itself scans every language (fail closed);
+# those paths are full runs anyway, this keeps that true if a tier moves.
+CODEQL_C_EXT = (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".inc")
+CODEQL_C_ROOTS = ("src/", "internal/", "vendored/")
+CODEQL_EXT = {"javascript-typescript": (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
+                                        ".mts", ".cts", ".vue", ".html", ".htm"),
+              "python": (".py",)}
+CODEQL_FAIL_CLOSED_PREFIXES = (".github/workflows/", ".github/codeql/")
+CODEQL_FAIL_CLOSED = {"Makefile.cbm", "scripts/build.sh", "scripts/ci/select-lanes.sh",
+                      "scripts/ci/codeql-retrace-vendored.sh"}
+
+
+def config_lists(path):
+    """paths / paths-ignore of the CodeQL config: `key:` then `  - item` lines.
+    None when the file is unreadable -- every interpreted scope then matches
+    by extension alone (fail closed)."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return None
+    lists, key = {"paths": [], "paths-ignore": []}, None
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z-]+):\s*$", line)
+        if m:
+            key = m.group(1) if m.group(1) in lists else None
+            continue
+        m = re.match(r"^\s+-\s+['\"]?([^'\"#]+?)['\"]?\s*$", line)
+        if m and key:
+            lists[key].append(m.group(1).rstrip("/"))
+        elif not line.startswith((" ", "\t")):
+            key = None
+    return lists
+
+
+CODEQL_PATHS = config_lists(codeql_config)
+
+
+def under(path, prefixes):
+    return any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def codeql_fail_closed(path):
+    return path in CODEQL_FAIL_CLOSED or path.startswith(CODEQL_FAIL_CLOSED_PREFIXES)
+
+
+def codeql_scope(language, path):
+    if codeql_fail_closed(path):
+        return True
+    if language == "c-cpp":
+        return path.startswith(CODEQL_C_ROOTS) and path.endswith(CODEQL_C_EXT)
+    if CODEQL_PATHS is not None and (not under(path, CODEQL_PATHS["paths"])
+                                     or under(path, CODEQL_PATHS["paths-ignore"])):
+        return False
+    if language == "actions":
+        return path.startswith(".github/workflows/") or \
+            path.rsplit("/", 1)[-1] in ("action.yml", "action.yaml")
+    return path.endswith(CODEQL_EXT[language])
 
 
 def triggers(path, cat):
@@ -333,6 +474,12 @@ def select(paths, expect=None):
             lanes = lanes | extra
     if lanes & TEST_LEGS:
         lanes = lanes | {"shard-completeness"}
+    for language, lane in sorted(CODEQL_LANES.items()):
+        hits = [p for p in paths if codeql_scope(language, p)]
+        if hits and lane not in lanes:
+            more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+            reasons.append(f"codeql {language}: {hits[0]}{more}")
+            lanes = lanes | {lane}
     for trigger, hits in by_trigger.items():
         more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
         reasons.append(f"full: {trigger}: {hits[0]}{more}")
@@ -360,6 +507,10 @@ def read_paths(path):
 
 if mode == "list":
     print("\n".join(sorted(UNIVERSE)))
+elif mode == "codeql-scope":
+    scoped = sorted({p for p in read_paths(source) if p and codeql_scope(codeql_language, p)})
+    if scoped:
+        print("\n".join(scoped))
 elif mode == "batch":
     with open(source, encoding="utf-8") as fh:
         for line in fh:
