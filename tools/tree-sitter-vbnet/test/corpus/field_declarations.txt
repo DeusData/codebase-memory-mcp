@@ -1,0 +1,290 @@
+================================================================================
+Simple field declaration with string literal
+================================================================================
+
+Public Class Test
+    Private Const SimpleString As String = "Hello World"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (string_literal)))))
+
+================================================================================
+Field declaration with string concatenation on same line
+================================================================================
+
+Public Class Test
+    Private Const ConcatString As String = "Hello" & "World"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (string_literal)
+          right: (string_literal))))))
+
+================================================================================
+Field declaration with string concatenation using line continuation
+================================================================================
+
+Public Class Test
+    Private Const MultiLineString As String = "First Line" & _
+                                              "Second Line"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (string_literal)
+          right: (string_literal))))))
+
+================================================================================
+Field declaration with multiple line continuations
+================================================================================
+
+Public Class Test
+    Private Const SqlQuery As String = "SELECT " & _
+                                       "    Column1, " & _
+                                       "    Column2, " & _
+                                       "    Column3 " & _
+                                       "FROM TableName"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (binary_expression
+            left: (binary_expression
+              left: (binary_expression
+                left: (string_literal)
+                right: (string_literal))
+              right: (string_literal))
+            right: (string_literal))
+          right: (string_literal))))))
+
+================================================================================
+Field declaration with line continuation without underscore (should fail)
+================================================================================
+
+Public Class Test
+    Private Const BadString As String = "First" &
+                                        "Second"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (string_literal)
+          right: (string_literal))))))
+
+================================================================================
+Complex multi-line string concatenation
+================================================================================
+
+Public Class Example
+    Private Const LongString As String = "DEFINE " & _
+                                        "      Field1 AS [Type1], " & _
+                                        "      Field2 AS [Type2], " & _
+                                        "      Field3 AS [Type3]; " & _
+                                        "  SELECT " & _
+                                        "      Column1 AS Alias1, " & _
+                                        "      Column2 AS Alias2 " & _
+                                        "  FROM " & _
+                                        "      SourceTable"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (binary_expression
+            left: (binary_expression
+              left: (binary_expression
+                left: (binary_expression
+                  left: (binary_expression
+                    left: (binary_expression
+                      left: (binary_expression
+                        left: (string_literal)
+                        right: (string_literal))
+                      right: (string_literal))
+                    right: (string_literal))
+                  right: (string_literal))
+                right: (string_literal))
+              right: (string_literal))
+            right: (string_literal))
+          right: (string_literal))))))
+
+================================================================================
+Multiple field declarations with line continuations
+================================================================================
+
+Public Class Test
+    Private Const String1 As String = "Part1" & _
+                                      "Part2"
+
+    Private Const String2 As String = "Another" & _
+                                      "String" & _
+                                      "Here"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (string_literal)
+          right: (string_literal))))
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (binary_expression
+            left: (string_literal)
+            right: (string_literal))
+          right: (string_literal))))))
+
+================================================================================
+Field declaration with line continuation and spaces
+================================================================================
+
+Public Class Test
+    Private Const TestString As String = "Line1" & _
+                                         "Line2" &   _
+                                         "Line3"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (binary_expression
+            left: (string_literal)
+            right: (string_literal))
+          right: (string_literal))))))
+
+================================================================================
+Very long concatenated string constant
+================================================================================
+
+Public Class DataAccess
+    Private Const QueryTemplate As String = "BEGIN TRANSACTION; " & _
+                                           "INSERT INTO Table1 VALUES (@param1); " & _
+                                           "INSERT INTO Table2 VALUES (@param2); " & _
+                                           "UPDATE Table3 SET Column = @param3; " & _
+                                           "DELETE FROM Table4 WHERE Id = @param4; " & _
+                                           "COMMIT TRANSACTION;"
+End Class
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    modifiers: (member_modifier)
+    name: (identifier)
+    body: (field_declaration
+      modifiers: (member_modifier)
+      modifiers: (member_modifier)
+      (variable_declarator
+        name: (identifier)
+        (as_clause
+          declared_type: (predefined_type))
+        initializer: (binary_expression
+          left: (binary_expression
+            left: (binary_expression
+              left: (binary_expression
+                left: (binary_expression
+                  left: (string_literal)
+                  right: (string_literal))
+                right: (string_literal))
+              right: (string_literal))
+            right: (string_literal))
+          right: (string_literal))))))

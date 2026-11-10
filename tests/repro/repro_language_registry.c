@@ -221,6 +221,7 @@ static const LanguageCapabilityEntry LANGUAGE_CAPABILITIES[CBM_LANG_COUNT] = {
     DOCUMENT(ASCIIDOC),
     NO_CALL(OPENAPI), /* the JSON grammar; its operations are Routes, no calls */
     DOCUMENT(DIAGRAM),
+    CALL_WITH_REFERENCE_VOCAB(VISUALBASIC),
 };
 
 #undef CALL_WITH_REFERENCE_VOCAB
@@ -311,7 +312,7 @@ TEST(repro_language_capability_ledger_covers_every_enum) {
         }
     }
 
-    if (counts[CAP_CALL_WITH_REFERENCE_VOCAB] != 88 ||
+    if (counts[CAP_CALL_WITH_REFERENCE_VOCAB] != 89 ||
         counts[CAP_CALL_WITHOUT_REFERENCE_VOCAB] != 27 || counts[CAP_NO_CALL] != 50 ||
         counts[CAP_TRANSFORM_ONLY] != 1 || counts[CAP_UNSUPPORTED] != 1 ||
         counts[CAP_DOCUMENT] != 3) {
@@ -331,8 +332,8 @@ TEST(repro_language_capability_ledger_covers_every_enum) {
 TEST(repro_call_argument_matrices_equal_call_capability_ledger) {
     enum {
         EXPECTED_MATRIX_A_ROWS = 68,
-        EXPECTED_MATRIX_B_ROWS = 49,
-        EXPECTED_CALL_CAPABLE_LANGUAGES = 115,
+        EXPECTED_MATRIX_B_ROWS = 50,
+        EXPECTED_CALL_CAPABLE_LANGUAGES = 116,
         EXPECTED_NON_CALL_LANGUAGES =
             55, /* 50 no-call + transform-only + unsupported + PDF, AsciiDoc, Diagram */
         EXPECTED_NON_CALL_DOMAIN_CONTROLS = 2,
