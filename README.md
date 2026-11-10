@@ -7,7 +7,7 @@
 [![MCP tools](https://img.shields.io/badge/MCP_tools-17-blue)](#mcp-tools)
 [![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-type_resolution-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agent_surfaces-46-purple)](https://github.com/DeusData/codebase-memory-mcp)
 [![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/DeusData/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
@@ -20,7 +20,7 @@
 
 Give your coding agent structural context through [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), or query the graph directly from the CLI. **The MCP server is the core of the project.** Its optional visual companion, **CBM Lens, is in open beta (v0.0.1)**, with a source reader, architecture maps, the Galaxy graph, coverage diagnostics, architecture decisions, and local code chat.
 
-The native C backend exposes **17 MCP tools**, parses [languages and file formats](#language-support) with vendored grammars, and adds [Hybrid LSP](#hybrid-lsp) type resolution for supported languages. The installer supports **45 automatic or conditional client integrations**, including client configuration, skills, agent profiles, and applicable hooks. Indexing and graph queries need no hosted service or API key. Focused graph queries can reduce repeated file reads and token use; see the [measured results](#performance).
+The native C backend exposes **17 MCP tools**, parses [languages and file formats](#language-support) with vendored grammars, and adds [Hybrid LSP](#hybrid-lsp) type resolution for supported languages. The installer supports **46 automatic or conditional client integrations**, including client configuration, skills, agent profiles, and applicable hooks. Indexing and graph queries need no hosted service or API key. Focused graph queries can reduce repeated file reads and token use; see the [measured results](#performance).
 
 [Quick start](#quick-start) · [Capabilities](#features) · [Documentation](#documentation-connected-to-code) · [Infrastructure](#infrastructure-and-deployment) · [Smart CI](#smart-ci-and-test-impact) · [Explore CBM Lens](#cbm-lens-beta-code-visualization-and-source-navigation) · [Agent setup](#agent-setup-skills-profiles-and-hooks) · [MCP tools](#mcp-tools)
 
@@ -145,6 +145,8 @@ Installation also equips supported coding agents to use the graph in daily work.
 
 Hook augmentation is context-only and fail-open: it does not replace or block the requested tool call. Features vary by client and platform; some clients use durable instructions or a parent-agent handoff instead of hooks or direct subagent MCP access. Codex users review and trust installed hooks through `/hooks`. See [Multi-Agent Support](#multi-agent-support) and [Sessions, compaction, and subagents](#sessions-compaction-and-subagents) for exact support and activation requirements.
 
+Hooks are enabled by default. Run `codebase-memory-mcp install --no-hooks` to remove CBM-managed hooks while keeping MCP registration and other integration files; the choice persists for later installs and updates. Run `codebase-memory-mcp install --hooks` to re-enable them, or inspect the current preference with `codebase-memory-mcp config get install_hooks`.
+
 ### Session Coordination Daemon
 
 CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and a session-managed daemon stops after the final session. A daemon started with `daemon start` remains running until stopped. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
@@ -253,15 +255,17 @@ Enable automatic indexing on MCP session start:
 codebase-memory-mcp config set auto_index true
 ```
 
-`auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched independently through `auto_watch` (on by default), subject to the session rules below.
+`auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched through `auto_watch` (on by default), subject to its global setting and session ownership.
 
-The watcher follows MCP sessions: it watches the project each open MCP session is rooted in (the client's working directory) and stops when the last session for that project closes. A repository indexed with `cli index_repository`, or indexed from a session rooted somewhere else, is not watched; re-run `index_repository` after changing it. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
+Each initialized, long-lived MCP session can register its root project when it connects and any target from a successful `index_repository` call, including custom project names and roots in another worktree. While `auto_watch` is enabled, these watches belong to the registering sessions and remain while at least one owning session is connected; closing the last owner removes the watch. Under a daemon started with `daemon start` a watch outlives its last owning session: the project stays watched and is re-indexed in the background when it changes, until that daemon stops, the project is deleted, its directory disappears, or `auto_watch` is set to `false`. An async index registers its target only after success and while its requesting session remains connected. CLI indexing and failed MCP indexes do not register watches. Global `auto_watch` controls registration and removes all watches on the next refresh or registration request when set to `false`. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
 
-Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher; useful when working across many projects and you want each session contained to explicit indexing.
+Watcher registration is controlled globally by `auto_watch` (default `true`). On the next refresh or registration request, `true` allows MCP sessions to register their root on connect and their successful `index_repository` targets; `false` removes all watches. CLI indexing and failed MCP indexes do not add watches.
 
-To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which is consulted per session, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
+To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which takes effect on the next refresh or registration request, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
 The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
+
+Linked git worktrees are indexed as their own projects by default. Set `config set ignore_worktrees true` to skip them on the automatic paths — useful when short-lived `git worktree add` checkouts would otherwise each leave behind a permanent index of the same repository. An explicit `index_repository` call on a worktree is then refused unless you pass `index_worktree=true`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#ignore_worktrees).
 
 ### Keeping Up to Date
 
@@ -402,7 +406,7 @@ In this repository, test narrowing is wired to the Linux x86_64 test leg when `T
 
 ### Distribution & operation
 - **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes in the project an MCP session is working in and re-indexes it automatically (other indexed repos: re-run `index_repository`)
+- **Auto-sync**: Background watcher detects file changes in projects registered by active MCP sessions, including successful explicit `index_repository` targets, and re-indexes them automatically.
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph --project my-project --name-pattern ".*Handler.*"`
 - **Available on**: npm, PyPI, Homebrew, Scoop, AUR, `go install`
@@ -578,6 +582,30 @@ Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-
 You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ```
 
+### Install via Claude Code plugin
+
+This repository is also a Claude Code plugin marketplace, so you can find and
+add the server from inside Claude Code:
+
+```bash
+claude plugin marketplace add DeusData/codebase-memory-mcp
+claude plugin install codebase-memory@codebase-memory
+```
+
+The plugin registers the MCP server only. It starts the server with
+`npx -y codebase-memory-mcp@<version>`, pinned to the current release; the first
+start downloads that release's binary through the npm package, which verifies
+it against the release checksums. The skill, the three graph agents and the
+context hooks are not part of the plugin: they come from
+`codebase-memory-mcp install`.
+
+Use one or the other. `install` registers the same server for Claude Code, so
+with both you run it twice, under two tool namespaces
+(`mcp__codebase-memory-mcp__*` and
+`mcp__plugin_codebase-memory_codebase-memory-mcp__*`). Choose `install` for the
+full Claude Code setup; choose the plugin to add just the server without
+running an installer.
+
 ### Build from Source
 
 <details>
@@ -592,6 +620,8 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 | **Node.js 22+ and npm** | `node --version` and `npm --version` | Required for `--with-ui` |
 
 </details>
+
+> **Contributor checks need a few extra tools.** `scripts/test.sh` requires `zip`, `python3`, and `curl`. `scripts/lint.sh` requires `cppcheck`, `clang-format`, and `clang-tidy`; `scripts/lint.sh --ci`, which is what CI runs, skips `clang-tidy`.
 
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
@@ -671,7 +701,7 @@ Restart your agent. Verify with `/mcp`; you should see `codebase-memory-mcp` wit
 
 ## Multi-Agent Support
 
-`install` configures **45 supported automatic/conditional client surfaces**: 39 detected automatically and 6
+`install` configures **46 supported automatic/conditional client surfaces**: 40 detected automatically and 6
 conditional or explicit. “Conditional” means the installer writes only when the
 documented platform or an explicit, already-existing config path proves the
 target is active. It never flips experimental feature flags, enables plugins,
@@ -694,15 +724,15 @@ overwrite user-modified agents.
 
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
-| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
-| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, skill, three read-only agents; `SessionStart` + `SubagentStart` |
+| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, post-`Read` coverage, and a drift note after repeated searches without a graph call |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, `~/.agents/skills/codebase-memory/SKILL.md`, three read-only agents; `SessionStart` + `SubagentStart`, `PreToolUse` graph lookup for `Bash` searches |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
-| OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
+| OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection on OpenCode 1.18.x |
 | Antigravity | Detected | `.gemini/config/mcp_config.json` | `.gemini/GEMINI.md` |
 | Aider | Detected | none | `CONVENTIONS.md` via `.aider.conf.yml` |
 | KiloCode | Detected | `.config/kilo/kilo.jsonc` | Rule + three graph-tool subagents with deny-by-default permissions |
-| VS Code | Detected | platform `Code/User/mcp.json` | `~/.copilot/skills`, three read-only agents, `sessionStart` + `subagentStart` |
+| VS Code | Detected | platform `Code/User/mcp.json` | `~/.copilot/skills`, three read-only agents, `sessionStart` + `subagentStart`, post-search `PostToolUse` graph lookup |
 | Cursor | Detected | `.cursor/mcp.json` | Skill + three read-only parent-handoff agents; context hooks withheld because session injection races and `readonly` blocks MCP |
 | Windsurf | Detected | `~/.codeium/windsurf/mcp_config.json` | Always-on `global_rules.md` |
 | Augment / Auggie | Detected | `~/.augment/settings.json` | Rule, three read-only handoff subagents, `SessionStart` + post-`view` coverage |
@@ -714,7 +744,7 @@ overwrite user-modified agents.
 | Cline | Detected | `~/.cline/mcp.json` + `${CLINE_DATA_DIR:-~/.cline/data}/settings/cline_mcp_settings.json` | Rule + skill; automatic file hooks withheld because they auto-activate and their output is not reliably consumed; child agents cannot use MCP |
 | Warp | Detected, skill only | UI, Warp Drive, or per invocation (manual) | Shared `~/.agents/skills/codebase-memory/SKILL.md` |
 | Qwen Code | Detected | `.qwen/settings.json` | `QWEN.md`, skill, three explicit read/graph-tool agents; `SessionStart`, `SubagentStart`, and post-`ReadFile` coverage |
-| GitHub Copilot CLI | Detected | `$COPILOT_HOME/mcp-config.json` | Instructions, skill, three read-only agents; `sessionStart` + `subagentStart` |
+| GitHub Copilot CLI | Detected | `$COPILOT_HOME/mcp-config.json` | Instructions, skill, three read-only agents; `sessionStart` + `subagentStart`, post-search `PostToolUse` graph lookup |
 | Factory Droid | Detected | `.factory/mcp.json` | `AGENTS.md`, skill, three droids with exact per-tier graph-tool lists (without additive whole-server exposure); `SessionStart` + post-`Read` coverage on macOS/Linux, withheld on Windows |
 | Crush | Detected | `.config/crush/crush.json` | Managed context path with explicit parent-to-child handoff |
 | Goose | Detected | `.config/goose/config.yaml` | `.goosehints` |
@@ -738,12 +768,18 @@ overwrite user-modified agents.
 | Pi | Detected | none | `~/.pi/agent/AGENTS.md` + skill; MCP/subagents require an explicit reviewed extension |
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Oh My Pi (omp) | Detected | Effective agent directory (`OMP_PROFILE` / `PI_CODING_AGENT_DIR`; default `~/.omp/agent/mcp.json`) | Skill and three direct-MCP graph-tool subagents (Scout/Verify/Auditor); preserves user `AGENTS.md` |
+| agentty | Detected | `~/.agentty/mcp.json` (overridden by `$AGENTTY_MCP_CONFIG`) | Skill in `~/.agentty/skills` (Claude-compatible SKILL.md) |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
 
 For Codex, install keeps only a tiny managed activation pointer in global
 `$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory` skill.
 Fresh installs create the pointer, upgrades replace the legacy full managed block while preserving
 all user-owned bytes, and uninstall removes only the managed pointer.
+Skill placement follows the cross-client user skill root and does not follow
+`CODEX_HOME`. On upgrade, the installer migrates an installer-owned legacy
+`$CODEX_HOME/skills/codebase-memory/SKILL.md` only after verifying the canonical
+copy. Modified or foreign files are preserved; `--force` explicitly authorizes
+replacement before migration.
 
 ### Sessions, compaction, and subagents
 
@@ -751,7 +787,14 @@ Hooks installed by this project are fail-open and context-only. Claude Code's
 `PreToolUse` observes `Grep`/`Glob`/`Bash` and injects matching graph symbols as
 `additionalContext`; `PostToolUse` on `Read` adds targeted coverage context when
 the graph could not fully parse or index that file. It never denies or replaces
-the requested tool call.
+the requested tool call. Codex CLI's `PreToolUse` on `Bash` gives its shell
+searches the same context. GitHub Copilot CLI and VS Code's Copilot runtime get
+it after the search: their `preToolUse` can only decide permissions, so a
+`PostToolUse` entry for `Bash`, `Grep` and `Glob` appends the graph symbols to
+the tool result. In Claude Code, once a session has run three searches with no
+codebase-memory-mcp tool call, the next augmentation adds one line saying so;
+the next note comes after six searches, then twelve. Claude's `PostToolUse`
+entry also matches the graph tools, and a graph tool call resets the count.
 
 Claude Code, Codex CLI, Qwen Code, GitHub Copilot CLI, and VS Code's Copilot
 runtime receive paired session/subagent context where the vendor exposes a
@@ -873,9 +916,9 @@ Tools requiring arguments accept JSON piped on stdin. Tools with only optional a
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh only while it is the project of an open MCP session; repos indexed from the CLI or from another project's session need a re-run (`index_status` shows `watch`). Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
+| `index_repository` | Index a repository into the graph. A successful call from an active MCP session registers the target for auto-sync while that session remains connected (under `daemon start`, also after it disconnects), subject to the global `auto_watch` setting; CLI calls do not register watches. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List indexed projects with paging; use `detail: "stats"` for node/edge counts and database sizes. |
-| `delete_project` | Remove a project and all its graph data. |
+| `delete_project` | Remove a project and all its graph data, including its ADR sidecar (`<db>.adr.db`). |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
 
@@ -927,6 +970,16 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 `manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
 
+`trace_path` exposes the start nodes' stored `self_recursive` (direct recursion)
+and `recursive` (direct recursion or a call-graph cycle) signals in both tree and
+JSON output. Across multiple start nodes, a flag is `true` if any records true,
+`false` if all record false, and `null` otherwise (including missing legacy
+metadata). These are static-analysis signals, not counts of resolved self-calls.
+Static `CALLS` indexing omits direct self-call edges; traces that include `CALLS` state
+`self_call_policy: omitted`. Caller/callee totals still count graph-reachable
+nodes, so a recursive function can have zero callees. Recursion metadata remains
+visible on continuation pages and when an output budget prevents rows from fitting.
+
 ## Graph Data Model
 
 ### Node Labels
@@ -967,16 +1020,19 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
-codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set auto_watch false          # remove/disable all background watches (default: true)
+codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree charged-memory limit
+codebase-memory-mcp config set index_max_duration_seconds 3600 # optional per-request duration
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+The four `index_max_*` settings default to `off`. Exceeding one fails the complete
 index attempt rather than publishing a partial graph; an existing serving index
 is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
@@ -1029,6 +1085,8 @@ Project config overrides global for conflicting extensions. An entry whose langu
 SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
 
 ## Troubleshooting
+
+Windows users: see [Windows troubleshooting](docs/WINDOWS_TROUBLESHOOTING.md) for versioned known issues and workarounds.
 
 | Problem | Fix |
 |---------|-----|
@@ -1090,7 +1148,7 @@ src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   daemon/             Per-account session coordination, IPC, lifecycle, shared jobs/watchers
   mcp/                MCP server (17 tools, JSON-RPC 2.0, session detection, auto-index)
-  cli/                Install/uninstall/update/config (45 client surfaces, hooks, instructions)
+  cli/                Install/uninstall/update/config (46 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor

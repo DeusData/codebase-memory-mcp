@@ -388,6 +388,7 @@ static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *stra
             strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
             strcmp(strategy, "lsp_dict_dispatch") == 0 ||
             strcmp(strategy, "lsp_import_alias") == 0 ||
+            strcmp(strategy, "lsp_constructor_init") == 0 ||
             strcmp(strategy, "php_method_dynamic") == 0);
 }
 
@@ -633,6 +634,18 @@ static inline bool cbm_pipeline_kotlin_external_target(CBMLanguage lang, const c
     return strncmp(callee_qn, "kotlin.", strlen("kotlin.")) == 0 ||
            strncmp(callee_qn, "java.", strlen("java.")) == 0 ||
            strncmp(callee_qn, "javax.", strlen("javax.")) == 0;
+}
+
+/* Java: the LSP typed the receiver as a type OUTSIDE the project (a JDK or
+ * library class, `lsp_external`), so the callee is `java.util.Optional.map`
+ * and no project method. Without this gate the tail/unique-leaf node policy
+ * and then the textual registry bound such a call to whatever project method
+ * shares the leaf (`Optional.map` -> `Filters.map`). Such a call gets no
+ * CALLS edge, as #2053 does for Rust. Pure; unit-tested. */
+static inline bool cbm_pipeline_java_external_target(CBMLanguage lang, const CBMResolvedCall *lsp) {
+    return lang == CBM_LANG_JAVA && lsp && lsp->strategy &&
+           strcmp(lsp->strategy, "lsp_external") == 0 && lsp->callee_qn &&
+           strchr(lsp->callee_qn, '.') != NULL;
 }
 
 /* Rust (#2053): true when the Rust LSP positively resolved a call to a
@@ -1281,10 +1294,18 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
         if (strcmp(cand->label, "Function") != 0 && strcmp(cand->label, "Method") != 0) {
             continue;
         }
-        if (!unique_callable) {
-            unique_callable = cand;
-        } else if (unique_callable->id != cand->id) {
-            callable_ambiguous = true;
+        /* A generated member (a Java record's implicit accessor) is registered
+         * by qualified name only: it joins through its owner's Class.method
+         * tail below, never on its leaf name alone -- `Objects.nonNull(x)` is
+         * no call of some record's nonNull(). Nor does it make a same-named
+         * callable ambiguous: the leaf fallback sees the graph as if it were
+         * not there. */
+        if (!cbm_node_props_generated(cand->properties_json)) {
+            if (!unique_callable) {
+                unique_callable = cand;
+            } else if (unique_callable->id != cand->id) {
+                callable_ambiguous = true;
+            }
         }
         if (!cbm_pipeline_qn_class_method_tail_eq(cand->qualified_name, callee_tail)) {
             continue;

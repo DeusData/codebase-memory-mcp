@@ -908,7 +908,8 @@ static void *runtime_application_client_request_thread(void *opaque) {
     call->status = call->tagged
                        ? cbm_daemon_runtime_client_application_request_tagged(
                              call->client, call->request_token, call->request, call->request_length,
-                             &call->response, &call->response_length, RUNTIME_TEST_TIMEOUT_MS)
+                             &call->response, &call->response_length, NULL,
+                             RUNTIME_TEST_TIMEOUT_MS)
                        : cbm_daemon_runtime_client_application_request(
                              call->client, call->request, call->request_length, &call->response,
                              &call->response_length, RUNTIME_TEST_TIMEOUT_MS);
@@ -1272,6 +1273,20 @@ static bool runtime_test_fixture_start_failed(const char *tag, const char *stage
 
 static bool runtime_test_fixture_permanent = false;
 
+typedef struct {
+    cbm_version_cohort_manager_t *manager;
+    cbm_version_cohort_lease_t *lease;
+    cbm_daemon_ipc_participant_guard_t *guard;
+    cbm_version_cohort_daemon_claim_t *claim;
+    bool held;
+} runtime_test_coordination_t;
+
+/* When set, the fixture takes the host's coordination handles in the host's
+ * order before starting the service: cohort admission refuses once a
+ * generation is already serving. Unlike the host's start_reserved, the
+ * fixture's convenience start also joins a service-owned participant guard. */
+static runtime_test_coordination_t *runtime_test_fixture_coordination = NULL;
+
 static bool runtime_test_fixture_start_configured(
     runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
     uint32_t max_clients, uint64_t lease_timeout_ms,
@@ -1327,6 +1342,19 @@ static bool runtime_test_fixture_start_configured(
     if (application) {
         config.application = *application;
     }
+    runtime_test_coordination_t *coordination = runtime_test_fixture_coordination;
+    if (coordination) {
+        cbm_daemon_conflict_t conflict;
+        coordination->manager = cbm_version_cohort_manager_new(fixture->endpoint);
+        coordination->held =
+            coordination->manager &&
+            cbm_version_cohort_acquire(coordination->manager, identity, cbm_now_ms() + 5000,
+                                       &coordination->lease, &conflict) == CBM_VERSION_COHORT_OK &&
+            cbm_daemon_ipc_participant_guard_try_join(fixture->endpoint, &coordination->guard) ==
+                1 &&
+            cbm_version_cohort_daemon_claim_acquire(coordination->manager, &coordination->claim) ==
+                CBM_VERSION_COHORT_OK;
+    }
     fixture->service = cbm_daemon_runtime_service_start(&config);
     if (!fixture->service) {
         return runtime_test_fixture_start_failed(tag, "service-start",
@@ -1378,6 +1406,110 @@ TEST(daemon_runtime_convenience_service_owns_participant_guard) {
     ASSERT_TRUE(freed);
     ASSERT_EQ(released, 0);
     PASS();
+}
+
+#ifndef _WIN32
+/* The runtime's threads log concurrently while the loop stops the service, so
+ * the sink only sets flags. */
+static atomic_bool runtime_test_coordination_lost_logged;
+static atomic_bool runtime_test_window_expired_logged;
+
+static void runtime_test_lifetime_log_sink(const char *line) {
+    /* Substrings, not key=value spelling, so text and JSON formats both match. */
+    if (line && strstr(line, "daemon.lifetime_end") && strstr(line, "coordination_file_lost") &&
+        strstr(line, "cohort_lease")) {
+        atomic_store(&runtime_test_coordination_lost_logged, true);
+    }
+    if (line && strstr(line, "initial_window_expired")) {
+        atomic_store(&runtime_test_window_expired_logged, true);
+    }
+}
+#endif
+
+/* #2178: the host lifetime loop must refresh every held coordination file on
+ * its tick and stop the generation once one is lost. The claim marker is aged
+ * and the cohort lifetime lock unlinked: the tick must refresh the marker
+ * through its held handle, name the lease (touched after the claim) as lost,
+ * and stop the runtime. */
+TEST(daemon_runtime_host_loop_stops_on_coordination_file_loss) {
+#ifdef _WIN32
+    SKIP_PLATFORM("unlinking a held lock file is POSIX behavior");
+#else
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    identity.cache_fingerprint = RUNTIME_CACHE_A; /* cohort admission requires one */
+    runtime_test_fixture_t fixture;
+    runtime_test_coordination_t coordination = {0};
+    runtime_test_fixture_coordination = &coordination;
+    bool started = runtime_test_fixture_start(&fixture, "coordination-loss", &identity);
+    runtime_test_fixture_coordination = NULL;
+    bool held = coordination.held;
+
+    char marker[RUNTIME_TEST_PATH_CAP];
+    char lifetime[RUNTIME_TEST_PATH_CAP];
+    int marker_written = snprintf(marker, sizeof(marker), "%s/cbm-version-cohort-daemon-v1.lock",
+                                  fixture.runtime_dir);
+    int lifetime_written = snprintf(lifetime, sizeof(lifetime),
+                                    "%s/cbm-version-cohort-lifetime-v1.lock", fixture.runtime_dir);
+    const time_t stale = 1000000000;
+    struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+    bool staged = held && marker_written > 0 && marker_written < (int)sizeof(marker) &&
+                  lifetime_written > 0 && lifetime_written < (int)sizeof(lifetime) &&
+                  utimensat(AT_FDCWD, marker, stale_times, 0) == 0 && unlink(lifetime) == 0;
+
+    bool loop_ok = false;
+    if (staged) {
+        atomic_store(&runtime_test_coordination_lost_logged, false);
+        atomic_store(&runtime_test_window_expired_logged, false);
+        CBMLogLevel previous_log_level = cbm_log_get_level();
+        cbm_log_set_level(CBM_LOG_INFO);
+        cbm_log_set_sink(runtime_test_lifetime_log_sink);
+        loop_ok = cbm_daemon_host_wait_for_lifetime_for_test(fixture.service, fixture.endpoint,
+                                                             coordination.lease, coordination.claim,
+                                                             coordination.guard);
+        cbm_log_set_sink(NULL);
+        cbm_log_set_level(previous_log_level);
+    }
+    cbm_daemon_runtime_service_state_t state =
+        started ? cbm_daemon_runtime_service_state(fixture.service)
+                : CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    struct stat marker_status = {0};
+    bool marker_refreshed = staged && stat(marker, &marker_status) == 0 &&
+                            marker_status.st_mtime > stale && marker_status.st_atime > stale;
+
+    /* Host teardown order: service first, then guard, claim and lease. Every
+     * handle references the endpoint, which the fixture frees. */
+    if (started && state != CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
+        (void)cbm_daemon_runtime_service_stop(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (fixture.service && cbm_daemon_runtime_service_free(fixture.service)) {
+        fixture.service = NULL;
+    }
+    (void)cbm_daemon_ipc_participant_guard_release(&coordination.guard);
+    while (coordination.claim && cbm_version_cohort_daemon_claim_release(&coordination.claim) !=
+                                     CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (coordination.lease &&
+           cbm_version_cohort_lease_release(&coordination.lease) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (coordination.manager &&
+           cbm_version_cohort_manager_free(&coordination.manager) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(staged);
+    ASSERT_TRUE(loop_ok);
+    ASSERT_EQ(state, CBM_DAEMON_RUNTIME_SERVICE_EXITED);
+    ASSERT_TRUE(marker_refreshed);
+    ASSERT_TRUE(atomic_load(&runtime_test_coordination_lost_logged));
+    ASSERT_FALSE(atomic_load(&runtime_test_window_expired_logged));
+    PASS();
+#endif
 }
 
 static bool runtime_test_fixture_start_application(runtime_test_fixture_t *fixture, const char *tag,
@@ -3455,7 +3587,7 @@ TEST(daemon_runtime_presend_request_cancel_is_sticky_and_nonterminal) {
         cancel = cbm_daemon_runtime_client_application_cancel(client, request_token);
         cancelled_status = cbm_daemon_runtime_client_application_request_tagged(
             client, request_token, blocking_request, (uint32_t)sizeof(blocking_request),
-            &cancelled_response, &cancelled_response_length, RUNTIME_TEST_TIMEOUT_MS);
+            &cancelled_response, &cancelled_response_length, NULL, RUNTIME_TEST_TIMEOUT_MS);
     }
     if (cancelled_status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
         next_status = cbm_daemon_runtime_client_application_request(
@@ -3512,8 +3644,10 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     bool first_reserved = false;
     bool duplicate_reservation_rejected = false;
     bool first_exact = false;
+    bool first_sent = false;
     bool second_reserved = false;
     bool second_exact = false;
+    bool second_sent = false;
     bool closed = false;
     bool exited = false;
 
@@ -3533,7 +3667,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
         cbm_daemon_runtime_application_status_t status =
             cbm_daemon_runtime_client_application_request_tagged(
                 client, first_token, first_request, (uint32_t)sizeof(first_request), &response,
-                &response_length, RUNTIME_TEST_TIMEOUT_MS);
+                &response_length, &first_sent, RUNTIME_TEST_TIMEOUT_MS);
         first_exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
                       response_length == sizeof(first_request) && response &&
                       memcmp(response, first_request, sizeof(first_request)) == 0;
@@ -3549,7 +3683,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
         cbm_daemon_runtime_application_status_t status =
             cbm_daemon_runtime_client_application_request_tagged(
                 client, second_token, second_request, (uint32_t)sizeof(second_request), &response,
-                &response_length, RUNTIME_TEST_TIMEOUT_MS);
+                &response_length, &second_sent, RUNTIME_TEST_TIMEOUT_MS);
         second_exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
                        response_length == sizeof(second_request) && response &&
                        memcmp(response, second_request, sizeof(second_request)) == 0;
@@ -3568,9 +3702,11 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     ASSERT_TRUE(first_reserved);
     ASSERT_TRUE(duplicate_reservation_rejected);
     ASSERT_TRUE(first_exact);
+    ASSERT_TRUE(first_sent);
     ASSERT_TRUE(second_reserved);
     ASSERT_EQ(second_token, first_token + 1U);
     ASSERT_TRUE(second_exact);
+    ASSERT_TRUE(second_sent);
     ASSERT_TRUE(closed);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.requests), 2);
@@ -3670,6 +3806,10 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
     uint8_t *response = NULL;
     uint32_t response_length = 0;
     cbm_daemon_runtime_application_status_t status = CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    cbm_daemon_runtime_application_token_t request_token =
+        CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    bool token_reserved = false;
+    bool request_sent = true;
     bool close_begun = false;
     bool duplicate_begin_rejected = false;
     bool close_acknowledged = false;
@@ -3680,6 +3820,8 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
                                                    RUNTIME_TEST_TIMEOUT_MS, &result);
     }
     if (client) {
+        token_reserved =
+            cbm_daemon_runtime_client_application_token_reserve(client, &request_token);
         close_begun = cbm_daemon_runtime_client_close_begin(client);
         duplicate_begin_rejected = close_begun && !cbm_daemon_runtime_client_close_begin(client);
     }
@@ -3687,9 +3829,9 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
         /* Deterministically models the frontend boundary where close begins
          * after a worker claims an item but before it enters the runtime API.
          * The retained allocation must reject the call without touching IPC. */
-        status = cbm_daemon_runtime_client_application_request(
-            client, request, (uint32_t)sizeof(request), &response, &response_length,
-            RUNTIME_TEST_TIMEOUT_MS);
+        status = cbm_daemon_runtime_client_application_request_tagged(
+            client, request_token, request, (uint32_t)sizeof(request), &response, &response_length,
+            &request_sent, RUNTIME_TEST_TIMEOUT_MS);
         close_acknowledged =
             cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS);
         client = NULL;
@@ -3707,11 +3849,13 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
     runtime_test_fixture_finish(&fixture);
 
     ASSERT_TRUE(started);
+    ASSERT_TRUE(token_reserved);
     ASSERT_TRUE(close_begun);
     ASSERT_TRUE(duplicate_begin_rejected);
     ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR);
     ASSERT_NULL(response);
     ASSERT_EQ(response_length, 0);
+    ASSERT_FALSE(request_sent);
     ASSERT_TRUE(close_acknowledged);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.opened), 1);
@@ -5288,6 +5432,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path);
 #endif
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
+    RUN_TEST(daemon_runtime_host_loop_stops_on_coordination_file_loss);
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
     RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);

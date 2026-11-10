@@ -725,6 +725,44 @@ TEST(config_text_write_owned_document_if_unchanged_rejects_stale_snapshot) {
     PASS();
 }
 
+/* #2204: the generated OpenCode module must not be appended to a file the user
+ * owns. The probe separates "may be written" (absent, whitespace-only, or
+ * already carrying our markers) from "the user's file" (content, no markers) so
+ * the installer can leave it alone instead of producing an unparseable hybrid. */
+TEST(config_text_managed_block_status_reports_foreign_module) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    const char whitespace[] = "  \n\t\n";
+    const char foreign[] = "import { spawn } from 'node:child_process';\n"
+                           "export default { id: 'codebase-memory-augment', setup() {} };\n";
+    const char unbalanced[] = CTE_BEGIN "\nowned\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+
+    /* No file yet, an empty file, and a whitespace-only file are all writable. */
+    ASSERT_EQ(cbm_text_managed_block_status(path, CTE_BEGIN, CTE_END), 0);
+    ASSERT_EQ(cte_write_bytes(path, "", 0U), 0);
+    ASSERT_EQ(cbm_text_managed_block_status(path, CTE_BEGIN, CTE_END), 0);
+    ASSERT_EQ(cte_write_bytes(path, whitespace, sizeof(whitespace) - 1U), 0);
+    ASSERT_EQ(cbm_text_managed_block_status(path, CTE_BEGIN, CTE_END), 0);
+
+    /* Our own block refreshes in place, so it is writable too. */
+    ASSERT_EQ(cbm_text_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned"), 0);
+    ASSERT_EQ(cbm_text_managed_block_status(path, CTE_BEGIN, CTE_END), 0);
+
+    /* A hand-ported module with no markers is the user's: refuse, never append. */
+    ASSERT_EQ(cte_write_bytes(path, foreign, sizeof(foreign) - 1U), 0);
+    ASSERT_EQ(cbm_text_managed_block_status(path, CTE_BEGIN, CTE_END), 1);
+
+    /* Unbalanced markers and malformed marker arguments are unsafe states. */
+    ASSERT_EQ(cte_write_bytes(path, unbalanced, sizeof(unbalanced) - 1U), 0);
+    ASSERT_EQ(cbm_text_managed_block_status(path, CTE_BEGIN, CTE_END), -1);
+    ASSERT_EQ(cbm_text_managed_block_status(path, "same", "same"), -1);
+    ASSERT_EQ(cbm_text_managed_block_status(NULL, CTE_BEGIN, CTE_END), -1);
+
+    th_cleanup(dir);
+    PASS();
+}
+
 SUITE(config_text_edit) {
     RUN_TEST(config_text_managed_insert_preserves_bom_comments_and_is_idempotent);
     RUN_TEST(config_text_managed_replace_preserves_crlf_surroundings);
@@ -732,6 +770,7 @@ SUITE(config_text_edit) {
     RUN_TEST(config_text_managed_remove_preserves_user_bytes);
     RUN_TEST(config_text_managed_malformed_markers_fail_closed);
     RUN_TEST(config_text_managed_rejects_unsafe_markers_and_owned_content);
+    RUN_TEST(config_text_managed_block_status_reports_foreign_module);
     RUN_TEST(config_text_owned_document_write_remove_exact_only);
     RUN_TEST(config_text_owned_document_migrates_exact_releases_only);
     RUN_TEST(config_text_rejects_invalid_utf8_and_controls);

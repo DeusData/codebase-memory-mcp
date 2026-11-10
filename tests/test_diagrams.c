@@ -329,6 +329,42 @@ TEST(diagrams_plantuml) {
     PASS();
 }
 
+/* #2818: a sequence message to or from the diagram edge (`A ->: x`, `A <-: x`,
+ * `[-> A: x`) and a declaration with an unclosed bracket have no operand id;
+ * they used to read an uninitialized one and crash the index worker. The
+ * declaration sits in its own diagram: a `class` line makes a diagram a class
+ * diagram, where `->` is an arrow rather than a sequence message. */
+TEST(diagrams_plantuml_edge_messages) {
+    CBMFileResult *r = dg_file("@startuml\n"
+                               "participant Alice\n"
+                               "Alice ->: out\n"
+                               "Alice <-: in\n"
+                               "[-> Alice: from the edge\n"
+                               "Alice -> Bob : hello\n"
+                               "@enduml\n"
+                               "@startuml\n"
+                               "class [Unclosed\n"
+                               "@enduml\n",
+                               "docs/edge.puml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(dg_prop(dg_def(r, "edge#diagram-1"), "diagram_kind"), "sequence");
+    ASSERT_STR_EQ(dg_prop(dg_def(r, "edge#diagram-2"), "diagram_kind"), "class");
+    ASSERT_NOT_NULL(dg_def(r, "edge#diagram-1.Alice"));
+    ASSERT_NOT_NULL(dg_def(r, "edge#diagram-1.Bob"));
+    ASSERT_EQ(r->diagram_arrows.count, 1);
+    ASSERT_EQ(dg_arrows(r, "#diagram-1.Alice", "#diagram-1.Bob", "message", "hello"), 1);
+    int elements = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *label = r->defs.items[i].label;
+        if (label && strcmp(label, "DiagramElement") == 0) {
+            elements++;
+        }
+    }
+    ASSERT_EQ(elements, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(diagrams_dot) {
     CBMFileResult *r =
         dg_file("digraph G {\n"
@@ -1101,6 +1137,7 @@ SUITE(diagrams) {
     RUN_TEST(diagrams_mermaid_kinds);
     RUN_TEST(diagrams_other_fences);
     RUN_TEST(diagrams_plantuml);
+    RUN_TEST(diagrams_plantuml_edge_messages);
     RUN_TEST(diagrams_dot);
     RUN_TEST(diagrams_d2);
     RUN_TEST(diagrams_drawio);

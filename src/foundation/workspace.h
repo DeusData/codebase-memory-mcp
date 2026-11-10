@@ -25,7 +25,9 @@
 
 typedef enum {
     CBM_WS_ALLOW = 0,
-    /* Fewer path components than the platform minimum — e.g. "/etc", "/home". */
+    /* Fewer path components than the platform minimum — e.g. "/etc", "/home".
+     * Lifted only for one exact path by a recorded broad approval
+     * (allow-root --approve-broad), never by a manifest or a tool call. */
     CBM_WS_DENY_TOO_SHALLOW,
     /* A filesystem root, a drive root, a UNC share root, or a path that is or
      * contains the cbm cache directory. Never overridable. */
@@ -42,8 +44,10 @@ cbm_ws_verdict_t cbm_workspace_classify_root(const char *canonical_path, const c
 /* Stable, human-facing reason for a verdict. Never NULL. */
 const char *cbm_workspace_verdict_reason(cbm_ws_verdict_t verdict);
 
-/* True when an explicit human action may override this verdict. Absolute denials
- * and shallow paths are never overridable; sensitive ones are. */
+/* True when a sensitive approval (allow-root --approve-sensitive) may override
+ * this verdict. Absolute denials never are. A shallow path is not overridable
+ * in this sense either: only an exact broad approval lifts it, see
+ * cbm_workspace_grant_add. */
 bool cbm_workspace_verdict_is_overridable(cbm_ws_verdict_t verdict);
 
 /* Number of path components below the volume root, ignoring repeated and
@@ -81,11 +85,13 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path);
 bool cbm_workspace_grant_path(const char *cache_dir, char *out, size_t out_sz);
 
 /* Record canonical_path as an allowed root. approve_sensitive records an explicit
- * human override for a CBM_WS_DENY_SENSITIVE path; absolute denials and shallow
- * paths are never grantable. Returns false and fills err on refusal. */
+ * human override for a CBM_WS_DENY_SENSITIVE path; approve_broad records one for a
+ * CBM_WS_DENY_TOO_SHALLOW path. Each flag lifts only its own verdict, and only
+ * for exactly this path. Absolute denials are never grantable. Returns false and
+ * fills err on refusal. */
 bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
-                             const char *canonical_path, bool approve_sensitive, char *err,
-                             size_t err_sz);
+                             const char *canonical_path, bool approve_sensitive, bool approve_broad,
+                             char *err, size_t err_sz);
 
 /* Newline-separated granted roots into out. True when at least one exists. */
 bool cbm_workspace_grant_list(const char *cache_dir, char *out, size_t out_sz);

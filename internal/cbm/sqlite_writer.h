@@ -90,4 +90,8 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
                         CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,
                         int vector_count, CBMDumpTokenVec *token_vecs, int token_vec_count);
 
+// Byte offset of 1-based page `page_num` in the output file. 64-bit on every
+// platform, so databases larger than 2 GiB are addressed correctly on Windows.
+int64_t cbm_writer_page_offset(uint32_t page_num);
+
 #endif // CBM_SQLITE_WRITER_H

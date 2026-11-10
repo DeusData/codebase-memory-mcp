@@ -49,7 +49,7 @@ t1_jobs() { # the jobs of a green T1 run; $1 = conclusion of the x86 leg
     job "lint / lint-mem" success
     job "test / setup-matrix" success
     job "test / test-unix (ubuntu-latest, gcc, g++, unix-x86, 1/1)" "$1"
-    job "test / test-unix (macos-14, cc, c++, unix-macos14, 1/1)" success
+    job "test / test-unix (macos-15, cc, c++, unix-macos14, 1/1)" success
     job "test / test-windows (windows-latest, CLANG64, x86_64, windows, 1/1)" success
     job "test / test-windows-guards" skipped
     job "test / test-package-wrappers" skipped
@@ -116,7 +116,7 @@ gate "a selection without the job list is red" 1 "$NEEDS_OK" "$T1" "$WORK/does-n
     job "lint / lint" success
     job "lint / lint-mem" success
     job "test / test-windows-guards" success
-    job "pr-smoke (macos-14, smoke-mac)" success
+    job "pr-smoke (macos-15, smoke-mac)" success
 } >"$WORK/guards-only"
 gate "windows-guards is not the windows leg" 1 "$NEEDS_OK" '["lint","lint-mem","security-static","windows"]' "$WORK/guards-only"
 gate "pr-smoke matrix name maps to its lane" 0 "$NEEDS_OK" '["lint","lint-mem","security-static","smoke-mac","windows-guards"]' "$WORK/guards-only"

@@ -141,6 +141,12 @@ static bool bootstrap_worker_argv_exact(int argc, char *const argv[]) {
         }
         next += 2;
     }
+    if (next < argc && bootstrap_arg_is(argv[next], "--index-worker-publish-fence")) {
+        if (next + 1 >= argc || !argv[next + 1] || !argv[next + 1][0]) {
+            return false;
+        }
+        next += 2;
+    }
     return next == argc;
 }
 

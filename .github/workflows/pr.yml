@@ -67,8 +67,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Build this checkout's engine
+        timeout-minutes: 20
         run: |
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
           scripts/build.sh CC=gcc CXX=g++
       - name: Select the tests
         id: select
@@ -77,7 +78,7 @@ jobs:
         run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
       - name: Upload the selection
         if: ${{ steps.select.outputs.selection == 'narrowed' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection
@@ -87,7 +88,7 @@ jobs:
       # for the vetoes, never read by a test leg.
       - name: Upload the vetoed selection
         if: ${{ !cancelled() && steps.select.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-selection-vetoed
           path: ${{ runner.temp }}/test-impact/selection-vetoed.json
@@ -175,7 +176,7 @@ jobs:
           cat "$RUNNER_TEMP/selection.txt" >> "$GITHUB_OUTPUT"
           # pr-smoke's legs, each tagged with its lane (kept in the job name,
           # where ci-ok reads it back); the job gets the selected ones.
-          SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-14","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
+          SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-15","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
           LANES=$(sed -n 's/^lanes=//p' "$RUNNER_TEMP/selection.txt")
           echo "smoke={\"include\":$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$SMOKE")}" >> "$GITHUB_OUTPUT"
           # The CodeQL legs, tagged the same way (codeql.yml's full matrix has
@@ -211,13 +212,14 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev ccache
 
       - name: Install ccache (macOS)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
         run: command -v ccache >/dev/null 2>&1 || brew install ccache
 
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         if: matrix.os == 'windows-latest'
         with:
           msystem: CLANG64
@@ -254,7 +256,7 @@ jobs:
           SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Build prod + smoke (macOS)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
         run: |
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp
@@ -318,8 +320,9 @@ jobs:
         run: scripts/ci/test-impact-shadow.sh --fetch-release "$RUNNER_TEMP/cbm-bin"
       - name: Build the binary from this checkout (download failed)
         if: ${{ steps.release.outcome == 'failure' }}
+        timeout-minutes: 20
         run: |
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
           scripts/build.sh CC=gcc CXX=g++
           mkdir -p "$RUNNER_TEMP/cbm-bin"
           cp build/c/codebase-memory-mcp "$RUNNER_TEMP/cbm-bin/"
@@ -329,8 +332,9 @@ jobs:
       # released binary predates it, so the checkout is built either way.
       - name: Build this checkout's engine
         if: ${{ steps.release.outcome != 'failure' }}
+        timeout-minutes: 20
         run: |
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
           scripts/build.sh CC=gcc CXX=g++
       - name: Select with the team artifact (engine shadow)
         env:
@@ -338,7 +342,7 @@ jobs:
         run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact"
       - name: Upload the prediction
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-impact-prediction
           path: |
