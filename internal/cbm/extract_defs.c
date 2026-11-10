@@ -1,4 +1,5 @@
 #include "cbm.h"
+#include "callable_sig.h"
 #include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
 #include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
@@ -7249,6 +7250,21 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_test = rust_def_is_test(def.decorators);
     }
 
+    if (ctx->language == CBM_LANG_SWIFT) {
+        if (!def.qualified_name) {
+            return;
+        }
+        const char *sig = cbm_callable_sig(a, func_node, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(a, "%s%s", def.qualified_name, sig) : NULL;
+        if (qualified) {
+            def.qn_sig_off = (uint32_t)strlen(def.qualified_name);
+            def.qualified_name = qualified;
+        }
+        def.param_default_mask =
+            cbm_swift_default_mask(func_node, ctx->source, &def.selector_param_count);
+        def.call_selector = cbm_swift_selector(ctx->arena, func_node, ctx->source);
+    }
+
     // C++/CUDA: GoogleTest macros are test functions (#1266).
     if (is_gtest || def.test_role == CBM_TEST_ROLE_CASE) {
         def.is_test = true;
@@ -8899,6 +8915,22 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (ctx->language == CBM_LANG_CSHARP && !ctx->enclosing_class_qn) {
         def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
     }
+    if (ctx->language == CBM_LANG_SWIFT && ctx->module_qn) {
+        TSNode kind_node = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
+        size_t module_len = strlen(ctx->module_qn);
+        if (strncmp(class_qn, ctx->module_qn, module_len) == 0 && class_qn[module_len] == '.') {
+            const char **props = cbm_arena_alloc(a, (PAIR_LEN + SKIP_ONE) * sizeof(*props));
+            if (props) {
+                props[0] =
+                    !ts_node_is_null(kind_node) && strcmp(ts_node_type(kind_node), "extension") == 0
+                        ? "swift_extension"
+                        : "swift_type_path";
+                props[1] = class_qn + module_len + 1;
+                props[2] = NULL;
+                def.extra_props = props;
+            }
+        }
+    }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     // Go identity alias `type A = B` (#2033): keep the aliased type text so the
     // cross-file registries can set alias_of. A defined type `type A B` is a
@@ -9364,6 +9396,20 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     memset(&def, 0, sizeof(def));
     def.name = name;
     def.qualified_name = method_qn;
+    if (ctx->language == CBM_LANG_SWIFT) {
+        if (!method_qn) {
+            return;
+        }
+        const char *sig = cbm_callable_sig(a, child, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(a, "%s%s", method_qn, sig) : NULL;
+        if (qualified) {
+            def.qn_sig_off = (uint32_t)strlen(method_qn);
+            def.qualified_name = qualified;
+        }
+        def.param_default_mask =
+            cbm_swift_default_mask(child, ctx->source, &def.selector_param_count);
+        def.call_selector = cbm_swift_selector(ctx->arena, child, ctx->source);
+    }
     def.label = "Method";
     def.file_path = ctx->rel_path;
     def.parent_class = class_qn;

@@ -1,6 +1,7 @@
 #include "extract_unified.h"
 #include "arena.h" // cbm_arena_sprintf
 #include "cbm.h"   // CBMExtractCtx
+#include "callable_sig.h"
 #include "helpers.h"
 #include "extract_url_fold.h" // cbm_url_fold_record_constant (#706, #1147)
 #include "lang_specs.h"       // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
@@ -1167,6 +1168,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * an in-body call sources to a QN one or more segments short of the def, and
      * the edge is dropped at write. */
     const char *qn_name = name;
+    if (ctx->language == CBM_LANG_SWIFT) {
+        const char *sig = cbm_callable_sig(ctx->arena, node, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(ctx->arena, "%s%s", name, sig) : NULL;
+        if (qualified) {
+            qn_name = qualified;
+        }
+    }
     if (ctx->language == CBM_LANG_NIX) {
         qn_name = cbm_nix_qn_name(ctx->arena, node, ctx->source, name);
         if (!qn_name || !qn_name[0]) {

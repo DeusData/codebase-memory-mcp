@@ -371,6 +371,7 @@ static bool semantic_manifest_package_control(const char *name) {
            strcmp(name, "composer.json") == 0 || strcmp(name, "pubspec.yaml") == 0 ||
            strcmp(name, "pom.xml") == 0 || strcmp(name, "build.gradle") == 0 ||
            strcmp(name, "build.gradle.kts") == 0 || strcmp(name, "mix.exs") == 0 ||
+           strcmp(name, "Package.swift") == 0 ||
            (len >= 8 && strcmp(name + len - 8, ".gemspec") == 0);
 }
 
@@ -1397,6 +1398,30 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
                             : 0;
     cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
                                     lang, prefix_len);
+    if (node->properties_json) {
+        const char *mask = strstr(node->properties_json, "\"param_default_mask\":\"");
+        const char *count = strstr(node->properties_json, "\"selector_param_count\":");
+        if (mask && count) {
+            mask += strlen("\"param_default_mask\":\"");
+            count += strlen("\"selector_param_count\":");
+            char *mask_end = NULL;
+            char *count_end = NULL;
+            unsigned long long defaults = strtoull(mask, &mask_end, CBM_HEX_BASE);
+            unsigned long params = strtoul(count, &count_end, CBM_DECIMAL_BASE);
+            if (mask_end == mask + CBM_SZ_16 && *mask_end == '"' && count_end != count &&
+                params <= UINT8_MAX) {
+                yyjson_doc *doc =
+                    yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+                if (doc) {
+                    const char *selector =
+                        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "call_selector"));
+                    cbm_registry_set_swift_signature(seed->registry, node->qualified_name,
+                                                     (uint64_t)defaults, (uint8_t)params, selector);
+                    yyjson_doc_free(doc);
+                }
+            }
+        }
+    }
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with
@@ -2928,6 +2953,67 @@ static const char *closure_python_namespace_decline(const char *stored_json,
     return change > 0 ? "python_namespace_changed" : NULL;
 }
 
+static bool closure_is_swift_manifest(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return strcmp(slash ? slash + SKIP_ONE : path, "Package.swift") == 0;
+}
+
+static const cbm_file_hash_t *closure_next_swift_manifest(const cbm_file_hash_t *rows, int count,
+                                                          int *cursor) {
+    while (*cursor < count) {
+        const cbm_file_hash_t *row = &rows[(*cursor)++];
+        if (closure_is_swift_manifest(row->rel_path)) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+static bool closure_manifest_rows_valid(const cbm_file_hash_t *rows, int count) {
+    if (count < 0 || (count > 0 && !rows)) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!rows[i].rel_path || !rows[i].sha256) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool closure_metadata_current(bool metadata_current, const cbm_file_hash_t *stored,
+                                     int stored_count, const cbm_file_hash_t *fresh,
+                                     int fresh_count) {
+    if (!metadata_current || !closure_manifest_rows_valid(stored, stored_count) ||
+        !closure_manifest_rows_valid(fresh, fresh_count)) {
+        return false;
+    }
+    CBMHashTable *by_path = cbm_ht_create(CBM_SZ_64);
+    if (!by_path) {
+        return false;
+    }
+    int new_cursor = 0;
+    int new_count = 0;
+    const cbm_file_hash_t *row = closure_next_swift_manifest(fresh, fresh_count, &new_cursor);
+    while (row) {
+        cbm_ht_set(by_path, row->rel_path, (void *)row->sha256);
+        new_count++;
+        row = closure_next_swift_manifest(fresh, fresh_count, &new_cursor);
+    }
+    bool current = cbm_ht_count(by_path) == (uint32_t)new_count;
+    int old_cursor = 0;
+    int old_count = 0;
+    row = closure_next_swift_manifest(stored, stored_count, &old_cursor);
+    while (current && row) {
+        const char *sha = cbm_ht_get(by_path, row->rel_path);
+        current = sha && strcmp(sha, row->sha256) == 0;
+        old_count++;
+        row = closure_next_swift_manifest(stored, stored_count, &old_cursor);
+    }
+    cbm_ht_free(by_path);
+    return current && old_count == new_count;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -4108,6 +4194,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * files plus the recorded consumers of any changed SURFACE; every
          * uncertain case declines inside the planner, making the pre-plan
          * behaviour (full rebuild) the unconditional fallback. */
+        /* Package.swift is also discovered source, but its target paths are
+         * global resolution inputs, not a file-local declaration surface.
+         * Compare their SwiftPM subsets before allowing any source-only
+         * closure repair, independently of database row order. */
+        metadata_current = closure_metadata_current(metadata_current, stored, stored_count,
+                                                    baseline_manifest, baseline_count);
         if (metadata_current &&
             closure_try_plan(p, store, project, files, file_count, stored, stored_count,
                              baseline_manifest, baseline_count, &closure_plan)) {

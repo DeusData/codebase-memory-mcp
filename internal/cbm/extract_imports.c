@@ -2403,6 +2403,18 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
             continue;
         }
 
+        if (ctx->language == CBM_LANG_SWIFT) {
+            /* Attributes and scoped import kinds precede the actual module path. */
+            TSNode identifier = cbm_find_child_by_kind(node, "identifier");
+            const char *path = ts_node_is_null(identifier)
+                                   ? NULL
+                                   : cbm_node_text(ctx->arena, identifier, ctx->source);
+            if (path && path[0]) {
+                CBMImport imp = {.local_name = path_last(ctx->arena, path), .module_path = path};
+                cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+            }
+            continue;
+        }
         if (!try_generic_path_fields(ctx, node)) {
             generic_import_from_text(ctx, node);
         }
