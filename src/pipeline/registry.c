@@ -3657,14 +3657,24 @@ static int swift_binding_rank(const char *binding, const char *scope, const char
     return 0;
 }
 
+/* A block-local binding names the variable only where it is in scope: after
+ * its declaration and inside its block. `var request = try request.make()`
+ * reads the parameter on its right-hand side and the new variable after it. */
 static int swift_assignment_rank(const CBMTypeAssign *assignment, const char *name,
-                                 const char *scope, const char *class_qn, const char *module_qn,
+                                 const CBMCall *call, const char *class_qn, const char *module_qn,
                                  bool field) {
     if (!assignment->var_name || !assignment->enclosing_func_qn ||
         strcmp(assignment->var_name, name) != 0) {
         return 0;
     }
-    return swift_binding_rank(assignment->enclosing_func_qn, scope, class_qn, module_qn, field);
+    int rank = swift_binding_rank(assignment->enclosing_func_qn, call->enclosing_func_qn, class_qn,
+                                  module_qn, field);
+    if (rank == SWIFT_SCOPE_LOCAL && assignment->scope_end_byte &&
+        (call->site_start_byte < assignment->decl_end_byte ||
+         call->site_start_byte >= assignment->scope_end_byte)) {
+        return 0;
+    }
+    return rank;
 }
 
 static int swift_cached_binding(const swift_binding_work_t *work, const CBMTypeAssign *assignment) {
@@ -3698,17 +3708,33 @@ typedef enum {
     SWIFT_ORIGIN_INFERRED
 } swift_origin_t;
 
-/* Conflicting block-local bindings ("") select no same-name method on either
+/* Of the block-local bindings in scope at the call, the innermost block's: a
+ * local shadows a same-name local of an enclosing block, and a parameter,
+ * whose block is its whole function. Zero when no binding records a block. */
+static uint32_t swift_innermost_block(const CBMFileResult *file, const char *name,
+                                      const CBMCall *call) {
+    uint32_t block = 0;
+    for (int i = 0; i < file->type_assigns.count; i++) {
+        const CBMTypeAssign *a = &file->type_assigns.items[i];
+        if (a->scope_end_byte && (!block || a->scope_end_byte < block) &&
+            swift_assignment_rank(a, name, call, NULL, NULL, false) == SWIFT_SCOPE_LOCAL) {
+            block = a->scope_end_byte;
+        }
+    }
+    return block;
+}
+
+/* Conflicting bindings of one block ("") select no same-name method on either
  * type. A binding whose initializer type could not be inferred leaves the
  * receiver unknown (NULL), so the call keeps the label match (#2061). */
 static const char *swift_binding_type(const swift_inference_t *context, swift_binding_work_t *work,
-                                      const char *name, const char *scope, const char *class_qn,
+                                      const char *name, const CBMCall *call, const char *class_qn,
                                       const char *module_qn, bool field, swift_origin_t *origin) {
     const CBMFileResult *file = context->file;
     int best = 0;
     for (int i = 0; i < file->type_assigns.count; i++) {
         const CBMTypeAssign *a = &file->type_assigns.items[i];
-        int rank = swift_assignment_rank(a, name, scope, class_qn, module_qn, field);
+        int rank = swift_assignment_rank(a, name, call, class_qn, module_qn, field);
         if (rank > best) {
             best = rank;
         }
@@ -3717,11 +3743,13 @@ static const char *swift_binding_type(const swift_inference_t *context, swift_bi
     if (!best) {
         return NULL;
     }
+    uint32_t block = best == SWIFT_SCOPE_LOCAL ? swift_innermost_block(file, name, call) : 0;
     const char *type = NULL;
     bool unknown = false;
     for (int i = 0; i < file->type_assigns.count; i++) {
         const CBMTypeAssign *a = &file->type_assigns.items[i];
-        if (swift_assignment_rank(a, name, scope, class_qn, module_qn, field) != best) {
+        if (swift_assignment_rank(a, name, call, class_qn, module_qn, field) != best ||
+            (block && a->scope_end_byte && a->scope_end_byte != block)) {
             continue;
         }
         const char *candidate = a->type_name;
@@ -3775,13 +3803,13 @@ static const char *swift_file_receiver(const swift_inference_t *context, swift_b
             return class_qn;
         }
         *dot = '\0';
-        const char *type = swift_binding_type(context, work, *member, call->enclosing_func_qn,
-                                              class_qn, module_qn, true, origin);
+        const char *type =
+            swift_binding_type(context, work, *member, call, class_qn, module_qn, true, origin);
         *member = dot + SKIP_ONE;
         return type;
     }
-    const char *type = swift_binding_type(context, work, expression, call->enclosing_func_qn,
-                                          class_qn, module_qn, false, origin);
+    const char *type =
+        swift_binding_type(context, work, expression, call, class_qn, module_qn, false, origin);
     if (*origin == SWIFT_ORIGIN_NONE && isupper((unsigned char)expression[0])) {
         *origin = SWIFT_ORIGIN_DECLARED;
         return expression;

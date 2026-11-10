@@ -582,6 +582,8 @@ typedef struct {
     const char *enclosing_func_qn; // enclosing function, class, or module QN
     uint32_t value_start_byte;     // Swift call initializer span; type_name may be unknown
     uint32_t value_end_byte;       // exclusive; zero when no initializer call was recorded
+    uint32_t decl_end_byte;        // Swift: the binding is in scope from the end of its
+    uint32_t scope_end_byte;       // declaration to the end of its block; zero = unknown
     bool constructed;              // Swift: type_name is the type the initializer call
                                    // constructs (`Foo(...)`), not an annotation or parameter
 } CBMTypeAssign;
