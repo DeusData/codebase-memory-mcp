@@ -5051,6 +5051,65 @@ TEST(daemon_runtime_process_fingerprint_hashes_own_image_once_per_process) {
     PASS();
 }
 
+#if defined(__APPLE__) || defined(__linux__)
+/* Only this process's own image is cached. The peer here is this very runner
+ * spawned in holder mode, so its image has exactly the file identity the own
+ * image is cached under: a cache keyed on that identity alone would answer for
+ * the peer. A peer must be hashed on every fingerprint, before and after the
+ * own image is cached, while the own image still costs one hash. */
+TEST(daemon_runtime_process_fingerprint_caches_only_own_image) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    char image_path[RUNTIME_TEST_PATH_CAP] = {0};
+    char peer_first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char peer_second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char own_first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char own_second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char peer_after_own[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    int release_fd = -1;
+    bool setup = runtime_test_self_image_path(image_path);
+    pid_t child = setup ? runtime_test_spawn_blocked_executable(image_path, &release_fd) : -1;
+    setup = setup && child > 0;
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool peer_first_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_first);
+    bool peer_second_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_second);
+    int hashes_after_peer = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool own_first_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), own_first);
+    bool own_second_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), own_second);
+    int hashes_after_own = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool peer_after_own_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_after_own);
+    int hashes_after_peer_again = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    runtime_test_stop_blocked_executable(child, release_fd);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(peer_first_ok);
+    ASSERT_TRUE(peer_second_ok);
+    ASSERT_TRUE(own_first_ok);
+    ASSERT_TRUE(own_second_ok);
+    ASSERT_TRUE(peer_after_own_ok);
+    ASSERT_STR_EQ(peer_first, digest);
+    ASSERT_STR_EQ(peer_second, digest);
+    ASSERT_STR_EQ(own_first, digest);
+    ASSERT_STR_EQ(own_second, digest);
+    ASSERT_STR_EQ(peer_after_own, digest);
+    /* Each peer fingerprint pays its own hash: a peer is never cached. */
+    ASSERT_EQ(hashes_after_peer, 2);
+    /* The own image is hashed once, then served from the cache. */
+    ASSERT_EQ(hashes_after_own, 3);
+    /* The cached own entry never answers for the peer's identical file. */
+    ASSERT_EQ(hashes_after_peer_again, 4);
+    PASS();
+}
+#endif
+
 TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
     static const uint8_t request[] = {'b', 'l', 'o', 'c', 'k'};
     cbm_daemon_build_identity_t identity =
@@ -5248,6 +5307,9 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll);
     RUN_TEST(daemon_runtime_fingerprint_cache_skips_image_changed_under_hash);
     RUN_TEST(daemon_runtime_process_fingerprint_hashes_own_image_once_per_process);
+#if defined(__APPLE__) || defined(__linux__)
+    RUN_TEST(daemon_runtime_process_fingerprint_caches_only_own_image);
+#endif
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
