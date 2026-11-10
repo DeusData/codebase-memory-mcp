@@ -34,10 +34,10 @@ class WrapperWatchdogTest(unittest.TestCase):
 
         def start(command, **options):
             nonlocal child
-            child = real_popen(command, stdout=subprocess.PIPE, **options)
+            child = real_popen(command, stdout=subprocess.PIPE, text=True, **options)
             ready = queue.Queue()
             threading.Thread(target=lambda: ready.put(child.stdout.readline()), daemon=True).start()
-            self.assertEqual(ready.get(timeout=30), b"ready\n")
+            self.assertEqual(ready.get(timeout=30), "ready\n")
             real_wait = child.wait
             expired = False
 
@@ -59,7 +59,8 @@ class WrapperWatchdogTest(unittest.TestCase):
                     mock.patch.object(runner.sys, "stderr"):
                 self.assertEqual(runner.run([
                     sys.executable, "-u", "-c",
-                    "import threading; print('ready', flush=True); threading.Event().wait()",
+                    "import sys, threading; sys.stdout.buffer.write(b'ready\\r\\n'); "
+                    "sys.stdout.buffer.flush(); threading.Event().wait()",
                 ]), 124)
                 self.assertIsNotNone(child.poll())
         finally:
