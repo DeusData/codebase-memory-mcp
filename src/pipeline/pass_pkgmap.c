@@ -2475,6 +2475,494 @@ static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *
     return found;
 }
 
+/* The first import-targetable node the module path in `work` names, trying
+ * successively shorter parent paths while a cut keeps at least `keep` bytes
+ * (Strategy 4 below, and the Rust crate tree). rust_tree: `work` is a
+ * repository path inside a Rust crate, naming work.rs or work/mod.rs
+ * directly, so no module resolver is involved. */
+static const cbm_gbuf_node_t *resolve_module_prefixes(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel,
+                                                      const char *source_file_qn, char *work,
+                                                      size_t keep, bool rust_tree, bool php_only) {
+    for (;;) {
+        for (int form = 0; form < (rust_tree ? PAIR_LEN : SKIP_ONE); form++) {
+            char mod_rs[PKGMAP_PATH_BUF];
+            int len = form ? snprintf(mod_rs, sizeof(mod_rs), "%s/mod", work) : 0;
+            if (len < 0 || (size_t)len >= sizeof(mod_rs)) {
+                continue;
+            }
+            const char *path = form ? mod_rs : work;
+            char *rqn = rust_tree ? cbm_pipeline_fqn_module(ctx->project_name, path)
+                                  : cbm_pipeline_resolve_module(ctx, source_rel, path);
+            const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
+            free(rqn);
+            if (n && (!php_only || node_in_php_file(n)) && import_targetable_label(n->label) &&
+                (!source_file_qn || !n->qualified_name ||
+                 strcmp(n->qualified_name, source_file_qn) != 0)) {
+                return n;
+            }
+        }
+        char *sl = strrchr(work, '/');
+        if (!sl || (size_t)(sl - work) < keep) {
+            return NULL;
+        }
+        *sl = '\0';
+    }
+}
+
+/* ── Rust `use` paths resolve inside one crate ─────────────────────── */
+
+/* A Rust `use` path names an item of exactly one crate: `crate::` is the
+ * importing crate's root module, `self::`/`super::` are relative to the
+ * importing file's module, a workspace member's crate name is that member, a
+ * child module of the importing module is that module, and anything else
+ * (std, core, a dependency) is outside the repository. The generic strategies
+ * below instead matched the last segment against every same-named definition
+ * in the project and took the smallest QN: in a Cargo workspace,
+ * `crate::util::helper` bound a SIBLING crate's util::helper, and
+ * `serde_json::json` bound the project's own `json` function. The crate of a
+ * file is its nearest Cargo.toml; without one the generic strategies stay. */
+
+enum {
+    RUST_USE_MAX_SEGS = 64,
+    RUST_USE_CANDS = 8,
+    RUST_RS_EXT_LEN = 3,       /* strlen(".rs") */
+    RUST_MOD_TAIL_LEN = 4,     /* strlen("/mod") */
+    RUST_KEYWORD_LEN = 3,      /* strlen("pub") == strlen("use") */
+    RUST_SELF_LEN = 4,         /* strlen("self") */
+    RUST_NON_ASCII_MIN = 0x80, /* identifiers admit any byte >= 0x80 */
+};
+
+typedef enum {
+    RUST_USE_UNSCOPED = 0, /* no crate known for the importer: generic strategies */
+    RUST_USE_NO_TARGET,    /* an external crate, or a path above the crate root */
+    RUST_USE_SCOPED,       /* resolved inside one crate's module tree */
+} rust_use_kind_t;
+
+typedef struct {
+    char buf[PKGMAP_PATH_BUF]; /* the segments, NUL-separated */
+    const char *seg[RUST_USE_MAX_SEGS];
+    int n;
+    bool glob;   /* trailing `::*` */
+    bool global; /* leading `::`: an extern crate */
+} rust_path_t;
+
+typedef struct {
+    const char *name; /* a written segment of the path */
+    size_t mod_len;   /* bytes of the path naming the modules above it */
+    int nmod;         /* segments in those bytes */
+} rust_cand_t;
+
+typedef struct {
+    rust_path_t p;
+    char root[PKGMAP_PATH_BUF]; /* module root of the crate target ("crates/x/src") */
+    char path[PKGMAP_PATH_BUF]; /* module path inside root, '/'-joined, written segments last */
+    bool has_leaf;              /* cands[0] is the named item (no glob) */
+    rust_cand_t cands[RUST_USE_CANDS]; /* the written segments, innermost first */
+    int ncands;
+} rust_use_t;
+
+static bool rust_ident_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c >= RUST_NON_ASCII_MIN;
+}
+
+static const char *rust_skip_ws(const char *p) {
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return p;
+}
+
+/* Skip a `pub`, `pub(crate)`, `pub(in path)` visibility and a `use` keyword
+ * that an import's text may still carry. */
+static const char *rust_skip_use_prefix(const char *p) {
+    p = rust_skip_ws(p);
+    if (strncmp(p, "pub", RUST_KEYWORD_LEN) == 0 &&
+        !rust_ident_byte((unsigned char)p[RUST_KEYWORD_LEN])) {
+        p = rust_skip_ws(p + RUST_KEYWORD_LEN);
+        if (*p == '(') {
+            const char *close = strchr(p, ')');
+            p = close ? rust_skip_ws(close + SKIP_ONE) : p;
+        }
+    }
+    if (strncmp(p, "use", RUST_KEYWORD_LEN) == 0 && isspace((unsigned char)p[RUST_KEYWORD_LEN])) {
+        p = rust_skip_ws(p + RUST_KEYWORD_LEN);
+    }
+    return p;
+}
+
+/* The written path of an import as text: a group `a::{B, C}` stands for its
+ * first member (as import_candidate_symbol does), ` as alias` is dropped. */
+static bool rust_path_text(const char *module_path, char *out, size_t outsz) {
+    const char *p = rust_skip_use_prefix(module_path);
+    const char *brace = strchr(p, '{');
+    int n;
+    if (!brace) {
+        n = snprintf(out, outsz, "%s", p);
+    } else {
+        const char *m = rust_skip_ws(brace + SKIP_ONE);
+        size_t mlen = strcspn(m, ",}{");
+        while (mlen > 0 &&
+               (isspace((unsigned char)m[mlen - SKIP_ONE]) || m[mlen - SKIP_ONE] == ':')) {
+            mlen--;
+        }
+        bool self_member = mlen == RUST_SELF_LEN && strncmp(m, "self", RUST_SELF_LEN) == 0;
+        if (mlen == 0 || self_member) {
+            n = snprintf(out, outsz, "%.*s", (int)(brace - p), p);
+        } else {
+            n = snprintf(out, outsz, "%.*s%.*s", (int)(brace - p), p, (int)mlen, m);
+        }
+    }
+    if (n < 0 || (size_t)n >= outsz) {
+        return false;
+    }
+    char *as = strstr(out, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    return true;
+}
+
+/* Split a Rust use path into its segments. False when the text is no plain
+ * path (an unparsed form keeps the generic strategies). */
+static bool rust_path_split(const char *module_path, rust_path_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!module_path || !rust_path_text(module_path, out->buf, sizeof(out->buf))) {
+        return false;
+    }
+    char *p = (char *)rust_skip_ws(out->buf);
+    size_t len = strlen(p);
+    while (len > 0 && (isspace((unsigned char)p[len - SKIP_ONE]) || p[len - SKIP_ONE] == ':')) {
+        p[--len] = '\0';
+    }
+    if (len > 0 && p[len - SKIP_ONE] == '*') {
+        out->glob = true;
+        p[--len] = '\0';
+        while (len > 0 && (isspace((unsigned char)p[len - SKIP_ONE]) || p[len - SKIP_ONE] == ':')) {
+            p[--len] = '\0';
+        }
+    }
+    if (p[0] == ':' && p[SKIP_ONE] == ':') {
+        out->global = true;
+        p += PAIR_LEN;
+    }
+    while (*p) {
+        p = (char *)rust_skip_ws(p);
+        if (strncmp(p, "r#", PAIR_LEN) == 0) {
+            p += PAIR_LEN;
+        }
+        char *start = p;
+        while (rust_ident_byte((unsigned char)*p)) {
+            p++;
+        }
+        char *end = p;
+        p = (char *)rust_skip_ws(p);
+        if (end == start || out->n >= RUST_USE_MAX_SEGS) {
+            return false;
+        }
+        if (*p == ':' && p[SKIP_ONE] == ':') {
+            p += PAIR_LEN;
+        } else if (*p) {
+            return false;
+        }
+        *end = '\0';
+        out->seg[out->n++] = start;
+    }
+    return out->n > 0;
+}
+
+/* The directory of the nearest Cargo.toml above source_rel ("" = the
+ * repository root). False when no manifest is indexed above the file. */
+static bool rust_crate_dir(const cbm_pipeline_ctx_t *ctx, const char *source_rel, char *out,
+                           size_t outsz) {
+    int n = snprintf(out, outsz, "%s", source_rel);
+    if (n < 0 || (size_t)n >= outsz) {
+        return false;
+    }
+    for (;;) {
+        char *slash = strrchr(out, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            out[0] = '\0';
+        }
+        char manifest[PKGMAP_PATH_BUF];
+        n = snprintf(manifest, sizeof(manifest), "%s%sCargo.toml", out, out[0] ? "/" : "");
+        if (n > 0 && (size_t)n < sizeof(manifest) &&
+            cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, manifest)) {
+            return true;
+        }
+        if (!slash) {
+            return false;
+        }
+    }
+}
+
+/* The module root of the crate target holding source_rel in the package at
+ * crate_dir: the package's first directory on the way down (src/ for the
+ * library and binaries, tests/, benches/, examples/), or crate_dir itself
+ * for a file directly in it (build.rs, a crate root: *is_root = true). */
+static bool rust_module_root(const char *source_rel, const char *crate_dir, char *out, size_t outsz,
+                             bool *is_root) {
+    size_t dl = strlen(crate_dir);
+    const char *slash = strchr(source_rel + (dl ? dl + SKIP_ONE : 0), '/');
+    size_t n = slash ? (size_t)(slash - source_rel) : dl;
+    if (n >= outsz) {
+        return false;
+    }
+    memcpy(out, source_rel, n);
+    out[n] = '\0';
+    *is_root = !slash;
+    return true;
+}
+
+/* root/rel, or rel when root is the repository root (""). */
+static bool rust_join(char *out, size_t outsz, const char *root, const char *rel) {
+    int n = snprintf(out, outsz, "%s%s%s", root, root[0] ? "/" : "", rel);
+    return n > 0 && (size_t)n < outsz;
+}
+
+/* The module path of the Rust file at path inside root, '/'-joined:
+ * root/a/b.rs and root/a/b/mod.rs are "a/b", root/lib.rs and root/main.rs
+ * are "". False when path is no .rs file under root. */
+static bool rust_file_module(const char *path, const char *root, char *out, size_t outsz) {
+    size_t rl = strlen(root);
+    if (!path || (rl && (strncmp(path, root, rl) != 0 || path[rl] != '/'))) {
+        return false;
+    }
+    const char *rel = path + (rl ? rl + SKIP_ONE : 0);
+    size_t n = strlen(rel);
+    if (n <= RUST_RS_EXT_LEN || strcmp(rel + n - RUST_RS_EXT_LEN, ".rs") != 0 ||
+        n - RUST_RS_EXT_LEN >= outsz) {
+        return false;
+    }
+    n -= RUST_RS_EXT_LEN;
+    memcpy(out, rel, n);
+    out[n] = '\0';
+    if (strcmp(out, "lib") == 0 || strcmp(out, "main") == 0 || strcmp(out, "mod") == 0) {
+        out[0] = '\0';
+    } else if (n > RUST_MOD_TAIL_LEN && strcmp(out + n - RUST_MOD_TAIL_LEN, "/mod") == 0) {
+        out[n - RUST_MOD_TAIL_LEN] = '\0';
+    }
+    return true;
+}
+
+/* The module root of the workspace member whose crate name is `name` (a
+ * Cargo package name spells '_' as '-' too). False when no member of that
+ * name has a Rust library root in the graph. */
+static bool rust_member_root(const cbm_pipeline_ctx_t *ctx, const char *name, char *out,
+                             size_t outsz) {
+    CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (!pkgmap) {
+        return false;
+    }
+    const char *qn = (const char *)cbm_ht_get(pkgmap, name);
+    char dashed[CBM_SZ_256];
+    int dn = qn || !strchr(name, '_') ? -1 : snprintf(dashed, sizeof(dashed), "%s", name);
+    if (dn > 0 && (size_t)dn < sizeof(dashed)) {
+        for (char *c = dashed; *c; c++) {
+            *c = *c == '_' ? '-' : *c;
+        }
+        qn = (const char *)cbm_ht_get(pkgmap, dashed);
+    }
+    const cbm_gbuf_node_t *lib = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    const char *fp = lib ? lib->file_path : NULL;
+    const char *slash = fp ? strrchr(fp, '/') : NULL;
+    if (!slash || !ends_with(fp, ".rs") || (size_t)(slash - fp) >= outsz) {
+        return false;
+    }
+    memcpy(out, fp, (size_t)(slash - fp));
+    out[slash - fp] = '\0';
+    return true;
+}
+
+/* Whether `name` is a child module of the module at root/own: a file
+ * root/own/name.rs or root/own/name/mod.rs is indexed. */
+static bool rust_child_module(const cbm_pipeline_ctx_t *ctx, const char *root, const char *own,
+                              const char *name) {
+    static const char *const tails[] = {".rs", "/mod.rs"};
+    char dir[PKGMAP_PATH_BUF];
+    if (!rust_join(dir, sizeof(dir), root, own)) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
+        char rel[PKGMAP_PATH_BUF];
+        int n = snprintf(rel, sizeof(rel), "%s%s%s%s", dir, dir[0] ? "/" : "", name, tails[i]);
+        if (n > 0 && (size_t)n < sizeof(rel) &&
+            cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, rel)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Append the segments seg[from..n) to u->path and record each one with the
+ * module path above it. False when nothing is named. */
+static bool rust_use_finish(rust_use_t *u, int from) {
+    if (!u->p.glob && from >= u->p.n) {
+        return false; /* `use super;`, `use crate::{self}`: no item */
+    }
+    size_t len = strlen(u->path);
+    int nseg = len ? SKIP_ONE : 0;
+    for (size_t i = 0; i < len; i++) {
+        nseg += u->path[i] == '/';
+    }
+    rust_cand_t seen[RUST_USE_MAX_SEGS];
+    int nseen = 0;
+    for (int i = from; i < u->p.n; i++) {
+        seen[nseen++] = (rust_cand_t){u->p.seg[i], len, nseg++};
+        int n = snprintf(u->path + len, sizeof(u->path) - len, "%s%s", len ? "/" : "", u->p.seg[i]);
+        if (n < 0 || (size_t)n >= sizeof(u->path) - len) {
+            return false;
+        }
+        len += (size_t)n;
+    }
+    u->has_leaf = !u->p.glob;
+    u->ncands = 0;
+    for (int i = nseen - SKIP_ONE; i >= 0 && u->ncands < RUST_USE_CANDS; i--) {
+        u->cands[u->ncands++] = seen[i];
+    }
+    return true;
+}
+
+/* Classify one Rust import of source_rel and, for SCOPED, fill *u. */
+static rust_use_kind_t rust_use_scope(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                      const char *module_path, rust_use_t *u) {
+    char crate_dir[PKGMAP_PATH_BUF];
+    char own[PKGMAP_PATH_BUF] = "";
+    bool is_root = false;
+    if (!source_rel || !rust_path_split(module_path, &u->p) ||
+        !rust_crate_dir(ctx, source_rel, crate_dir, sizeof(crate_dir)) ||
+        !rust_module_root(source_rel, crate_dir, u->root, sizeof(u->root), &is_root) ||
+        (!is_root && !rust_file_module(source_rel, u->root, own, sizeof(own)))) {
+        return RUST_USE_UNSCOPED;
+    }
+    u->path[0] = '\0';
+    u->ncands = 0;
+    const char *head = u->p.seg[0];
+    int from = SKIP_ONE;
+    if (!u->p.global && strcmp(head, "crate") == 0) {
+        /* the crate root: path starts empty */
+    } else if (!u->p.global && strcmp(head, "self") == 0) {
+        snprintf(u->path, sizeof(u->path), "%s", own);
+    } else if (!u->p.global && strcmp(head, "super") == 0) {
+        snprintf(u->path, sizeof(u->path), "%s", own);
+        for (from = 0; from < u->p.n && strcmp(u->p.seg[from], "super") == 0; from++) {
+            if (!u->path[0]) {
+                return RUST_USE_NO_TARGET; /* above the crate root */
+            }
+            char *up = strrchr(u->path, '/');
+            *(up ? up : u->path) = '\0';
+        }
+    } else if (!u->p.global && rust_child_module(ctx, u->root, own, head)) {
+        snprintf(u->path, sizeof(u->path), "%s", own);
+        from = 0;
+    } else if (!rust_member_root(ctx, head, u->root, sizeof(u->root))) {
+        return RUST_USE_NO_TARGET; /* std, core, a dependency */
+    }
+    return rust_use_finish(u, from) ? RUST_USE_SCOPED : RUST_USE_NO_TARGET;
+}
+
+/* How well a definition in the module cand_mod fits the module path
+ * want[0..want_len): leading segments in common, and segments it adds. */
+static void rust_module_fit(const char *cand_mod, const char *want, size_t want_len, int *common,
+                            int *extra) {
+    *common = 0;
+    *extra = 0;
+    const char *a = cand_mod;
+    size_t bi = 0;
+    bool diverged = false;
+    while (*a) {
+        size_t al = strcspn(a, "/");
+        size_t bl = 0;
+        while (bi + bl < want_len && want[bi + bl] != '/') {
+            bl++;
+        }
+        if (!diverged && bi < want_len && al == bl && strncmp(a, want + bi, al) == 0) {
+            (*common)++;
+            bi += bl + (bi + bl < want_len ? SKIP_ONE : 0);
+        } else {
+            diverged = true;
+            (*extra)++;
+        }
+        a += al + (a[al] ? SKIP_ONE : 0);
+    }
+}
+
+typedef struct {
+    const cbm_gbuf_node_t *node;
+    int extra; /* module segments below the named module */
+} rust_pick_t;
+
+/* The definition named c->name inside the module subtree the path names above
+ * it (the module itself or a submodule that re-exports through it): fewest
+ * extra segments, then smallest QN. type_only: a segment before the last
+ * names a module or a type, never a function. */
+static rust_pick_t rust_use_pick(const cbm_pipeline_ctx_t *ctx, const char *source_file_qn,
+                                 const rust_use_t *u, const rust_cand_t *c, bool type_only) {
+    rust_pick_t best = {NULL, 0};
+    const cbm_gbuf_node_t **hits = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_by_name(ctx->gbuf, c->name, &hits, &n) != 0 || !hits) {
+        return best;
+    }
+    for (int i = 0; i < n; i++) {
+        const cbm_gbuf_node_t *cand = hits[i];
+        char cand_mod[PKGMAP_PATH_BUF];
+        if (!cand || !cand->qualified_name || !import_targetable_label(cand->label) ||
+            (type_only && !cbm_label_is_type_like(cand->label)) ||
+            cbm_node_props_generated(cand->properties_json) ||
+            (source_file_qn && strcmp(cand->qualified_name, source_file_qn) == 0) ||
+            !rust_file_module(cand->file_path, u->root, cand_mod, sizeof(cand_mod))) {
+            continue;
+        }
+        int common = 0;
+        int extra = 0;
+        rust_module_fit(cand_mod, u->path, c->mod_len, &common, &extra);
+        if (common == c->nmod && (!best.node || extra < best.extra ||
+                                  (extra == best.extra &&
+                                   strcmp(cand->qualified_name, best.node->qualified_name) < 0))) {
+            best = (rust_pick_t){cand, extra};
+        }
+    }
+    return best;
+}
+
+/* Resolve a SCOPED Rust import inside u->root, never outside it: the item at
+ * its module, else the module the full path names (`use crate::a::b;`, a
+ * glob), else the item re-exported from a submodule of its module, else the
+ * type an associated item or enum variant belongs to. Nothing else: an item
+ * the crate re-exports from another crate is no item of this crate. */
+static const cbm_gbuf_node_t *rust_use_resolve(const cbm_pipeline_ctx_t *ctx,
+                                               const char *source_rel, const char *source_file_qn,
+                                               const rust_use_t *u) {
+    rust_pick_t leaf = {NULL, 0};
+    if (u->has_leaf) {
+        leaf = rust_use_pick(ctx, source_file_qn, u, &u->cands[0], false);
+        if (leaf.node && leaf.extra == 0) {
+            return leaf.node;
+        }
+    }
+    char work[PKGMAP_PATH_BUF];
+    if (u->path[0] && rust_join(work, sizeof(work), u->root, u->path)) {
+        const cbm_gbuf_node_t *mod = resolve_module_prefixes(ctx, source_rel, source_file_qn, work,
+                                                             strlen(work), true, false);
+        if (mod) {
+            return mod;
+        }
+    }
+    if (leaf.node) {
+        return leaf.node;
+    }
+    for (int i = u->has_leaf ? SKIP_ONE : 0; i < u->ncands; i++) {
+        rust_pick_t owner = rust_use_pick(ctx, source_file_qn, u, &u->cands[i], true);
+        if (owner.node) {
+            return owner.node;
+        }
+    }
+    return NULL;
+}
+
 /* Language-generic strategies retain their ordering. PHP name imports with
  * no namespace information (and global uses) restrict candidates before any
  * winner is selected, so a non-PHP collision cannot hide a later PHP hit.
@@ -2520,6 +3008,20 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
             }
         }
         return target;
+    }
+
+    /* Rust: a `use` path names an item of one crate, never a same-named
+     * definition of another crate (see rust_use_scope). */
+    if (src_lang == CBM_LANG_RUST && !php_only) {
+        rust_use_t ru;
+        switch (rust_use_scope(ctx, source_rel, imp->module_path, &ru)) {
+        case RUST_USE_NO_TARGET:
+            return NULL;
+        case RUST_USE_SCOPED:
+            return rust_use_resolve(ctx, source_rel, source_file_qn, &ru);
+        case RUST_USE_UNSCOPED:
+            break;
+        }
     }
 
     /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
@@ -2788,21 +3290,8 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         if (body[0]) {
             char work[1024];
             snprintf(work, sizeof(work), "%s", body);
-            for (;;) {
-                char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
-                const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
-                free(rqn);
-                if (n && (!php_only || node_in_php_file(n)) && import_targetable_label(n->label) &&
-                    (!source_file_qn || !n->qualified_name ||
-                     strcmp(n->qualified_name, source_file_qn) != 0)) {
-                    return n;
-                }
-                char *sl = strrchr(work, '/');
-                if (!sl) {
-                    break;
-                }
-                *sl = '\0';
-            }
+            return resolve_module_prefixes(ctx, source_rel, source_file_qn, work, 0, false,
+                                           php_only);
         }
     }
 

@@ -642,6 +642,162 @@ TEST(layout_json_memory_core_ownership) {
     PASS();
 }
 
+/* handle_layout re-reads this payload with yyjson_read(..., 0). Malformed
+ * UTF-8 has to come back as U+FFFD (EF BF BD); valid text has to decode to
+ * the original string. Stack strings are not owned by the result. */
+TEST(layout_json_invalid_utf8_roundtrip) {
+    ASSERT_NULL(cbm_layout_to_json(NULL));
+
+    cbm_layout_result_t empty = {0};
+    char *json = cbm_layout_to_json(&empty);
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "nodes")), 0);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "edges")), 0);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total_nodes")), 0);
+    yyjson_doc_free(doc);
+    cbm_layout_free_json(json);
+
+    cbm_layout_node_t nodes[4] = {
+        {
+            .id = 11,
+            .x = 1.5f,
+            .y = -2.0f,
+            .z = 3.25f,
+            .label = "Section\x80", /* isolated continuation */
+            .name = "Head\xC3",     /* truncated 2-byte lead */
+            .qualified_name = "doc.md::H\xE4\xB8", /* truncated 3-byte sequence */
+            .file_path = "docs/\xFFreadme.md",     /* invalid leading byte */
+            .start_line = 4,
+            .end_line = 9,
+            .size = 2.5f,
+            .color = 0x336699,
+            .in_calls = 1,
+            .out_calls = 2,
+            .status = "structural",
+        },
+        {
+            .id = 12,
+            .label = "Section",
+            .name = "q\"\x80",            /* quote, then a continuation byte */
+            .qualified_name = "bs\\\xFF", /* backslash, then an invalid lead */
+            .file_path = "nl\n\xC2",      /* newline, then a truncated lead */
+            .size = 1.0f,
+        },
+        {
+            .id = 13,
+            .label = "Section",
+            .name = "caf\xC3\xA9",                        /* U+00E9 */
+            .qualified_name = "\xE7\xAB\xA0\xE8\x8A\x82", /* U+7AE0 U+8282 */
+            .file_path = "docs/\xF0\x9F\x98\x80.md",      /* U+1F600 */
+            .size = 1.0f,
+            .status = "structural",
+        },
+        {
+            .id = 14,
+            .x = NAN,
+            .y = INFINITY,
+            .z = -INFINITY,
+            .size = NAN,
+        },
+    };
+    cbm_layout_edge_t edges[2] = {
+        {.source = 11, .target = 12, .type = "MENTIONS\x80"},
+        {.source = 12, .target = 13, .type = NULL},
+    };
+    cbm_layout_result_t layout = {
+        .nodes = nodes,
+        .node_count = 4,
+        .edges = edges,
+        .edge_count = 2,
+        .total_nodes = 4,
+    };
+
+    json = cbm_layout_to_json(&layout);
+    ASSERT_NOT_NULL(json);
+    doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    for (size_t i = 0; json[i] != '\0'; i++) {
+        ASSERT((unsigned char)json[i] < 0x80);
+    }
+    ASSERT_NOT_NULL(strstr(json, "\"Section\""));
+    ASSERT_NOT_NULL(strstr(json, "\\u00E9"));
+    ASSERT_NOT_NULL(strstr(json, "\\u7AE0\\u8282"));
+    ASSERT_NOT_NULL(strstr(json, "\\uD83D\\uDE00"));
+    ASSERT_NOT_NULL(strstr(json, "\\uFFFD"));
+    ASSERT_NOT_NULL(strstr(json, "q\\\"\\uFFFD"));
+    ASSERT_NOT_NULL(strstr(json, "bs\\\\\\uFFFD"));
+    ASSERT_NOT_NULL(strstr(json, "nl\\n\\uFFFD"));
+
+    root = yyjson_doc_get_root(doc);
+    yyjson_val *nodes_json = yyjson_obj_get(root, "nodes");
+    yyjson_val *edges_json = yyjson_obj_get(root, "edges");
+    ASSERT_EQ((int)yyjson_arr_size(nodes_json), 4);
+    ASSERT_EQ((int)yyjson_arr_size(edges_json), 2);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total_nodes")), 4);
+
+    yyjson_val *n0 = yyjson_arr_get(nodes_json, 0);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "id")), 11);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "label")), "Section\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "name")), "Head\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "qualified_name")),
+                  "doc.md::H\xEF\xBF\xBD\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "file_path")), "docs/\xEF\xBF\xBDreadme.md");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "status")), "structural");
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "start_line")), 4);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "end_line")), 9);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "in_calls")), 1);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "out_calls")), 2);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "x")), 1.5, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "y")), -2.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "z")), 3.25, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "size")), 2.5, 1e-6);
+
+    yyjson_val *n1 = yyjson_arr_get(nodes_json, 1);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n1, "id")), 12);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "label")), "Section");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "name")), "q\"\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "qualified_name")), "bs\\\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "file_path")), "nl\n\xEF\xBF\xBD");
+    ASSERT_NULL(yyjson_obj_get(n1, "status"));
+
+    yyjson_val *n2 = yyjson_arr_get(nodes_json, 2);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n2, "id")), 13);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "label")), "Section");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "name")), "caf\xC3\xA9");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "qualified_name")), "\xE7\xAB\xA0\xE8\x8A\x82");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "file_path")), "docs/\xF0\x9F\x98\x80.md");
+
+    yyjson_val *n3 = yyjson_arr_get(nodes_json, 3);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n3, "id")), 14);
+    ASSERT_NULL(yyjson_obj_get(n3, "label"));
+    ASSERT_NULL(yyjson_obj_get(n3, "name"));
+    ASSERT_NULL(yyjson_obj_get(n3, "qualified_name"));
+    ASSERT_NULL(yyjson_obj_get(n3, "file_path"));
+    ASSERT_NULL(yyjson_obj_get(n3, "status"));
+    ASSERT_NULL(yyjson_obj_get(n3, "start_line"));
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "x")), 0.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "y")), 0.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "z")), 0.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "size")), 1.0, 1e-6);
+
+    yyjson_val *e0 = yyjson_arr_get(edges_json, 0);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e0, "source")), 11);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e0, "target")), 12);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(e0, "type")), "MENTIONS\xEF\xBF\xBD");
+
+    yyjson_val *e1 = yyjson_arr_get(edges_json, 1);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e1, "source")), 12);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e1, "target")), 13);
+    ASSERT_NULL(yyjson_obj_get(e1, "type"));
+
+    yyjson_doc_free(doc);
+    cbm_layout_free_json(json);
+    PASS();
+}
+
 TEST(layout_null_inputs) {
     /* NULL store → NULL result */
     cbm_layout_result_t *r = cbm_layout_compute(NULL, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
@@ -2830,6 +2986,7 @@ SUITE(ui) {
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
     RUN_TEST(layout_json_memory_core_ownership);
+    RUN_TEST(layout_json_invalid_utf8_roundtrip);
     RUN_TEST(layout_null_inputs);
     RUN_TEST(layout_dead_code_classification);
     RUN_TEST(layout_coincident_nodes_bounded);
