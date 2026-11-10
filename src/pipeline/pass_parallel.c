@@ -3359,7 +3359,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
              cbm_python_import_binding_contradicts(&result->imports, call->callee_name,
                                                    res.qualified_name, rc->main_gbuf,
-                                                   rc->project_name, rel));
+                                                   rc->project_name, rel)) ||
+            /* Same-module bound-receiver suppression (#1128) - see pass_calls.c;
+             * the language list is inside the helper, so the two cannot drift. */
+            cbm_suppress_same_module_bound_receiver(
+                lang, call->is_method, call->callee_name, res.qualified_name, res.strategy,
+                &result->imports, call->receiver_is_amd_dependency);
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve

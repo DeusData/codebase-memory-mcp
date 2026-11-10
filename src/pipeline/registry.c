@@ -769,6 +769,160 @@ static bool js_ts_family(CBMLanguage lang) {
            lang == CBM_LANG_ARKTS;
 }
 
+/* ── Same-module bound-receiver guard (#1128) ─────────────────────────────
+ * Strategy 2 (same_module) looks a callee up in its own module twice: first the
+ * whole callee (`Api.get` -> <module>.Api.get), then the name after the first
+ * separator (`axios.get` -> <module>.get). The second lookup drops the
+ * receiver, so a member call binds a module-level definition only because this
+ * file happens to define one with the member's name: `axios.get(url)` in a file
+ * with its own `function get()` became a 0.90 CALLS edge to that function. The
+ * weak-member guard above deliberately keeps same_module, so this class needs a
+ * guard of its own.
+ *
+ * Refusing every non-self receiver is wrong for this family: methods of an
+ * object literal (`const context = { push() {} }`) and functions assigned onto
+ * an object (`Translator.create = function create() {}`) are stored as plain
+ * module-level functions, so `context.push()` reaching the module's `push`
+ * through this lookup is usually right (2026-10-19 measurement on vuejs/core
+ * and NodeBB). So the binding is refused only when the caller's own source
+ * says the receiver is something else:
+ *   - an import of this file: an ES `import` (default, namespace or named) or a
+ *     CommonJS `const x = require(...)`, read from the file's import list;
+ *   - an AMD dependency: a parameter of the factory passed to
+ *     `define([...], function (dep) {...})` or `require([...], ...)`. AMD
+ *     dependencies are not imports (they mint no IMPORTS edges), so the
+ *     extractor's walk decides it per call (CBMCall.receiver_is_amd_dependency);
+ *   - a builtin global of the JS runtime (`console.log`, `Math.max`,
+ *     `JSON.parse`, `Object.keys`, `process.exit`, ...).
+ * Only the receiver-dropping lookup is refused. When the whole callee matched
+ * (`search.init()` -> <scope>.search.init: in NodeBB's chats.js that is the
+ * AMD dependency's own module) the receiver is part of what matched. A local
+ * name an import statement only synthesizes from its path (side-effect import,
+ * re-export, `require('x').y`) binds nothing and does not count.
+ * Self receivers (`this`/`super`) never reach it: the extractor leaves those
+ * calls unflagged (is_method false). CommonJS `exports.get()` and
+ * `module.exports.get()` name this module and are in neither list.
+ *
+ * It is a call-site suppressor, not a change to the strategy chain: the chain
+ * also resolves type references, field types, reads/writes, SQL lineage and
+ * the cross-LSP pass, for every language at once. Like the guards above it only
+ * marks the plain-CALLS fall-through for dropping, so service and route edges
+ * are unchanged. The language list lives here and both call sites read it
+ * through this helper, so pass_calls.c and pass_parallel.c cannot drift: the
+ * JS/TS family plus the hosts whose <script> bodies are JS/TS (the weak-member
+ * guard's set without Python). Go must never join: its receiver methods carry
+ * flat QNs that only this lookup reaches. */
+static bool same_module_receiver_guard_lang(CBMLanguage lang) {
+    return js_ts_family(lang) || lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
+           lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+}
+
+/* Builtin globals of the JS runtime (ECMAScript, browser, Node/CommonJS). Like
+ * PERL_BUILTINS a fact about the language, not about corpus fashion. MUST stay
+ * sorted ASCII-ascending for bsearch. */
+static const char *const JS_BUILTIN_GLOBALS[] = {
+    "Array",    "ArrayBuffer",    "Atomics",     "BigInt",
+    "Boolean",  "Buffer",         "DataView",    "Date",
+    "Error",    "Intl",           "JSON",        "Map",
+    "Math",     "Number",         "Object",      "Promise",
+    "Proxy",    "Reflect",        "RegExp",      "Set",
+    "String",   "Symbol",         "URL",         "WeakMap",
+    "WeakSet",  "WebAssembly",    "console",     "document",
+    "global",   "globalThis",     "history",     "localStorage",
+    "location", "navigator",      "performance", "process",
+    "require",  "sessionStorage", "window",
+};
+
+/* Identifier bytes: ASCII letters, digits, `_`, `$`, and every byte of a
+ * multi-byte UTF-8 sequence (a non-ASCII identifier is still one name). */
+enum { JS_FIRST_NON_ASCII_BYTE = 0x80 };
+
+static bool js_identifier_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '$' || c >= JS_FIRST_NON_ASCII_BYTE;
+}
+
+/* Length of the identifier that roots `callee` when a member access (`.` or
+ * `?.`) follows it, else 0: `axios.get` -> 5, `a.b.c` -> 1, `_store().get` ->
+ * 0 (a call result is not a binding). The registry splits the callee at this
+ * same first separator. */
+static size_t js_receiver_root_len(const char *callee) {
+    size_t n = 0;
+    while (js_identifier_byte((unsigned char)callee[n])) {
+        n++;
+    }
+    if (n == 0 || (callee[0] >= '0' && callee[0] <= '9')) {
+        return 0;
+    }
+    if (callee[n] == '.' || (callee[n] == '?' && callee[n + SKIP_ONE] == '.')) {
+        return n;
+    }
+    return 0;
+}
+
+static bool js_builtin_global(const char *root, size_t len) {
+    char key[CBM_SZ_32];
+    if (len >= sizeof(key)) {
+        return false; /* longer than every table entry */
+    }
+    memcpy(key, root, len);
+    key[len] = '\0';
+    return bsearch(key, JS_BUILTIN_GLOBALS,
+                   sizeof(JS_BUILTIN_GLOBALS) / sizeof(JS_BUILTIN_GLOBALS[0]),
+                   sizeof(JS_BUILTIN_GLOBALS[0]), python_builtin_member_cmp) != NULL;
+}
+
+/* Per-file scan: imports.count is a file-local number, never the corpus, so
+ * this stays O(file) per call (the Python receiver check does the same). A
+ * synthesized local (side-effect import, re-export, `require('x').y`) is the
+ * path's last segment, not a name the file binds: `require('node:stream')`
+ * must not make every `stream` parameter read as the stream module. */
+static bool receiver_bound_by_import(const CBMImportArray *imports, const char *root, size_t len) {
+    if (!imports) {
+        return false;
+    }
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (imp->local_name && !imp->local_name_synthesized &&
+            strncmp(imp->local_name, root, len) == 0 && imp->local_name[len] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when the same_module hit kept the receiver: the whole-callee lookup
+ * matched `<scope>.search.init` for `search.init()`, so the receiver is part of
+ * what matched, not dropped. That lookup is never this guard's business. */
+static bool same_module_hit_kept_receiver(const char *callee_name, const char *resolved_qn) {
+    size_t clen = strlen(callee_name);
+    size_t qlen = strlen(resolved_qn);
+    return qlen > clen && resolved_qn[qlen - clen - SKIP_ONE] == '.' &&
+           strcmp(resolved_qn + (qlen - clen), callee_name) == 0;
+}
+
+bool cbm_suppress_same_module_bound_receiver(CBMLanguage lang, bool is_method,
+                                             const char *callee_name, const char *resolved_qn,
+                                             const char *strategy,
+                                             const CBMImportArray *file_imports,
+                                             bool receiver_is_amd_dependency) {
+    if (!same_module_receiver_guard_lang(lang) || !is_method) {
+        return false;
+    }
+    if (!strategy || strcmp(strategy, "same_module") != 0) {
+        return false;
+    }
+    if (!callee_name || !resolved_qn || same_module_hit_kept_receiver(callee_name, resolved_qn)) {
+        return false;
+    }
+    size_t len = js_receiver_root_len(callee_name);
+    if (len == 0) {
+        return false; /* no identifier receiver: `_store().get`, a bare call */
+    }
+    return receiver_is_amd_dependency || js_builtin_global(callee_name, len) ||
+           receiver_bound_by_import(file_imports, callee_name, len);
+}
+
 /* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
  * in the extension table, so a .c file referencing a symbol declared in its
  * own header would otherwise read as a language boundary. */
@@ -1464,67 +1618,13 @@ static const char *same_module_candidate(const cbm_registry_t *r, const char *mo
     return NULL;
 }
 
-static bool is_self_receiver(const char *prefix) {
-    if (!prefix || !prefix[0]) {
-        return true;
-    }
-    static const char *const self_receivers[] = {"self",  "this", "cls", "@self", "$this",
-                                                 "$self", "Me",   "me",  "Self",  NULL};
-    for (int i = 0; self_receivers[i]; i++) {
-        if (strcmp(prefix, self_receivers[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool is_same_module_receiver(const char *prefix, const char *module_qn) {
-    if (is_self_receiver(prefix)) {
-        return true;
-    }
-    if (!module_qn || !module_qn[0]) {
-        return false;
-    }
-    char norm_prefix[CBM_SZ_256];
-    size_t plen = strlen(prefix);
-    if (plen >= sizeof(norm_prefix)) {
-        plen = sizeof(norm_prefix) - 1;
-    }
-    size_t j = 0;
-    for (size_t i = 0; i < plen && j + 1 < sizeof(norm_prefix); i++) {
-        if (prefix[i] == ':' && i + 1 < plen && prefix[i + 1] == ':') {
-            norm_prefix[j++] = '.';
-            i++;
-        } else {
-            norm_prefix[j++] = prefix[i];
-        }
-    }
-    norm_prefix[j] = '\0';
-
-    if (strcmp(norm_prefix, module_qn) == 0) {
-        return true;
-    }
-    size_t nlen = strlen(norm_prefix);
-    size_t mlen = strlen(module_qn);
-    if (mlen > nlen && module_qn[mlen - nlen - 1] == '.' &&
-        strcmp(module_qn + (mlen - nlen), norm_prefix) == 0) {
-        return true;
-    }
-    return false;
-}
-
 /* Strategy 2: Same-module match. Scoring elsewhere retains the raw file QN. */
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
-                                            const char *prefix, const char *suffix,
-                                            const char *module_qn, size_t scope_len,
-                                            CBMLanguage lang) {
+                                            const char *suffix, const char *module_qn,
+                                            size_t scope_len) {
     const char *stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
-    if (!stored_key && suffix && suffix[0]) {
-        if (lang == CBM_LANG_GO || is_same_module_receiver(prefix, module_qn) ||
-            strchr(suffix, '.') != NULL || strstr(suffix, "::") != NULL) {
-            stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
-        }
-    }
+    if (!stored_key && suffix && suffix[0])
+        stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
     if (stored_key)
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     return empty_result();
@@ -1753,143 +1853,10 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
                          .lang = side ? lang : NULL};
 }
 
-static bool qn_ends_with_qualified(const char *candidate_qn, const char *callee_name) {
-    if (!candidate_qn || !callee_name) {
-        return false;
-    }
-    char norm_callee[CBM_SZ_256];
-    size_t clen = strlen(callee_name);
-    if (clen >= sizeof(norm_callee)) {
-        clen = sizeof(norm_callee) - 1;
-    }
-    size_t j = 0;
-    for (size_t i = 0; i < clen && j + 1 < sizeof(norm_callee); i++) {
-        if (callee_name[i] == ':' && i + 1 < clen && callee_name[i + 1] == ':') {
-            norm_callee[j++] = '.';
-            i++;
-        } else {
-            norm_callee[j++] = callee_name[i];
-        }
-    }
-    norm_callee[j] = '\0';
-
-    size_t nlen = strlen(norm_callee);
-    size_t qlen = strlen(candidate_qn);
-    if (qlen < nlen) {
-        return false;
-    }
-    if (strcmp(candidate_qn, norm_callee) == 0) {
-        return true;
-    }
-    if (qlen > nlen && candidate_qn[qlen - nlen - 1] == '.' &&
-        strcmp(candidate_qn + (qlen - nlen), norm_callee) == 0) {
-        return true;
-    }
-    return false;
-}
-
-static bool is_builtin_candidate(const char *qn) {
-    if (!qn) {
-        return false;
-    }
-    return strncmp(qn, "builtins.", 9) == 0 || strncmp(qn, "<python-builtins>.", 18) == 0 ||
-           strncmp(qn, "<kotlin-builtins>.", 18) == 0;
-}
-
-static bool is_candidate_method(const cbm_registry_t *r, const char *qn) {
-    const char *label = cbm_registry_label_of(r, qn);
-    return label && strcmp(label, "Method") == 0;
-}
-
-static bool is_imported_receiver(const char *prefix, const char **import_keys, int import_count) {
-    if (!prefix || !import_keys || import_count <= 0) {
-        return false;
-    }
-    for (int i = 0; i < import_count; i++) {
-        if (import_keys[i] && strcmp(import_keys[i], prefix) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool is_known_type_or_namespace(const cbm_registry_t *r, const char *name) {
-    if (!r || !name || !name[0]) {
-        return false;
-    }
-    const char *exact_label = cbm_registry_label_of(r, name);
-    if (exact_label &&
-        (strcmp(exact_label, "Class") == 0 || strcmp(exact_label, "Module") == 0 ||
-         strcmp(exact_label, "Namespace") == 0 || strcmp(exact_label, "Struct") == 0 ||
-         strcmp(exact_label, "Interface") == 0 || strcmp(exact_label, "Enum") == 0 ||
-         strcmp(exact_label, "Package") == 0)) {
-        return true;
-    }
-    const qn_array_t *arr = cbm_ht_get(r->by_name, name);
-    if (!arr) {
-        return false;
-    }
-    for (int i = 0; i < arr->count; i++) {
-        const char *label = cbm_registry_label_of(r, arr->items[i]);
-        if (label && (strcmp(label, "Class") == 0 || strcmp(label, "Module") == 0 ||
-                      strcmp(label, "Namespace") == 0 || strcmp(label, "Struct") == 0 ||
-                      strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
-                      strcmp(label, "Package") == 0)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool should_reject_receiver(const cbm_registry_t *r, const char *callee_name,
-                                   const char *candidate_qn, const char **import_keys,
-                                   int import_count) {
-    if (!callee_name || !candidate_qn) {
-        return false;
-    }
-    const char *dot = strchr(callee_name, '.');
-    const char *colons = strstr(callee_name, "::");
-    const char *sep = dot;
-    if (colons && (!sep || colons < sep)) {
-        sep = colons;
-    }
-    if (!sep) {
-        return false;
-    }
-    char prefix[CBM_SZ_256];
-    size_t plen = (size_t)(sep - callee_name);
-    if (plen >= sizeof(prefix)) {
-        plen = sizeof(prefix) - 1;
-    }
-    memcpy(prefix, callee_name, plen);
-    prefix[plen] = '\0';
-
-    if (is_self_receiver(prefix)) {
-        return false;
-    }
-    if (is_builtin_candidate(candidate_qn)) {
-        return false;
-    }
-    if (qn_ends_with_qualified(candidate_qn, callee_name)) {
-        return false;
-    }
-    if (!is_candidate_method(r, candidate_qn)) {
-        return true;
-    }
-    if (is_imported_receiver(prefix, import_keys, import_count)) {
-        return true;
-    }
-    if (is_known_type_or_namespace(r, prefix)) {
-        return true;
-    }
-    return false;
-}
-
 /* Strategies 3.5, 3 and 4 over one same-name candidate set. */
 static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
                                                 const char *callee_name, const char *module_qn,
-                                                const char **import_keys, const char **import_vals,
-                                                int import_count) {
+                                                const char **import_vals, int import_count) {
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -1905,9 +1872,6 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
         if (!receiver_chain_admits(callee_name, arr->items[0])) {
             return empty_result();
         }
-        if (should_reject_receiver(r, callee_name, arr->items[0], import_keys, import_count)) {
-            return empty_result();
-        }
         double conf = CONF_UNIQUE_NAME;
         if (import_vals && import_count > 0 &&
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
@@ -1917,27 +1881,19 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
     }
 
     /* Strategy 4: multiple candidates */
-    cbm_resolution_t res;
     if (import_vals && import_count > 0) {
-        res = resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
-    } else {
-        const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                                   qn_lang_flags(arr), arr->count, module_qn);
-        if (best) {
-            if (!receiver_chain_admits(callee_name, best)) {
-                return empty_result();
-            }
-            double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-            res = (cbm_resolution_t){best, "suffix_match", conf, arr->count};
-        } else {
-            res = empty_result();
+        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
+    }
+    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                               qn_lang_flags(arr), arr->count, module_qn);
+    if (best) {
+        if (!receiver_chain_admits(callee_name, best)) {
+            return empty_result();
         }
+        double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
+        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
-    if (res.qualified_name &&
-        should_reject_receiver(r, callee_name, res.qualified_name, import_keys, import_count)) {
-        return empty_result();
-    }
-    return res;
+    return empty_result();
 }
 
 /* Strategy 3+4: Name lookup + suffix match. skip_members: the callee cannot
@@ -1948,9 +1904,8 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
  * 345 -> 9 callers (2026-10-13 graph audit). Dropping only the Fields made
  * libc `read()` the unique name of a C++ adapter's Method instead. */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
-                                            const char *module_qn, const char **import_keys,
-                                            const char **import_vals, int import_count,
-                                            bool skip_members) {
+                                            const char *module_qn, const char **import_vals,
+                                            int import_count, bool skip_members) {
     const char *lookup = simple_name(callee_name);
     const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -1968,11 +1923,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         if (view.count == 0) {
             return empty_result();
         }
-        return resolve_name_candidates(r, &view, callee_name, module_qn, import_keys, import_vals,
-                                       import_count);
+        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count);
     }
-    return resolve_name_candidates(r, arr, callee_name, module_qn, import_keys, import_vals,
-                                   import_count);
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
@@ -1980,8 +1933,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
-                                               size_t scope_len, bool skip_members,
-                                               CBMLanguage lang) {
+                                               size_t scope_len, bool skip_members) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -2014,12 +1966,12 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
         resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
-        res = resolve_same_module(r, callee_name, prefix, suffix, module_qn, scope_len, lang);
+        res = resolve_same_module(r, callee_name, suffix, module_qn, scope_len);
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, skip_members);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
+                                  skip_members);
     }
     return res;
 }
@@ -2070,8 +2022,7 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
-                                                size_t scope_len, bool skip_members,
-                                                CBMLanguage lang) {
+                                                size_t scope_len, bool skip_members) {
     if (!r || !callee_name) {
         return empty_result();
     }
@@ -2086,7 +2037,7 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
 
     cbm_resolution_t res =
         registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                               import_map_count, scope_len, skip_members, lang);
+                               import_map_count, scope_len, skip_members);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2128,8 +2079,7 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, module_qn ? strlen(module_qn) : 0, false,
-                                   CBM_LANG_COUNT);
+                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
 }
 
 static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
@@ -2142,7 +2092,7 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false, lang);
+                                   import_map_count, lang_scope_len(module_qn, lang), false);
 }
 
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
@@ -2156,8 +2106,7 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members,
-                                   lang);
+                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
@@ -2325,8 +2274,7 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, module_qn ? strlen(module_qn) : 0, false,
-                                  CBM_LANG_COUNT);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

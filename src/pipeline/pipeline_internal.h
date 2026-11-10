@@ -907,6 +907,23 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
                                            const char *resolved_qn, const cbm_gbuf_t *gbuf,
                                            const char *project_name, const char *rel_path);
 
+/* #1128: true when a JS/TS-family member call resolved by `same_module` only
+ * through the lookup that drops its receiver (`resolved_qn` does not end in the
+ * whole callee), while that receiver is bound to an import of the file
+ * (`file_imports`: ES import or CommonJS require), to an AMD dependency
+ * (`receiver_is_amd_dependency`, the extractor's per-call fact), or is a
+ * builtin global of the JS runtime (`console`, `Math`, `JSON`, ...):
+ * `axios.get()` must not bind the `get` this file happens to define. Any other
+ * receiver keeps the edge (`context.push()` onto an object-literal method
+ * stored at module level). The language list is inside the helper, so
+ * pass_calls.c and pass_parallel.c cannot drift. Only the plain-CALLS
+ * fall-through is dropped. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_same_module_bound_receiver(CBMLanguage lang, bool is_method,
+                                             const char *callee_name, const char *resolved_qn,
+                                             const char *strategy,
+                                             const CBMImportArray *file_imports,
+                                             bool receiver_is_amd_dependency);
+
 /* Base-class twin: true when a Python base spelling (`unittest.TestCase`,
  * `TestCase` under `from unittest import TestCase`, `ut.TestCase` under
  * `import unittest as ut`) is bound by an EXTERNAL import whose chain

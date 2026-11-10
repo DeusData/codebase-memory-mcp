@@ -1126,7 +1126,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
          * paths are module chains) — MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PYTHON && cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
          cbm_python_import_binding_contradicts(imports, call->callee_name, res.qualified_name,
-                                               ctx->gbuf, ctx->project_name, rel));
+                                               ctx->gbuf, ctx->project_name, rel)) ||
+        /* Same-module bound-receiver suppression (#1128): `axios.get()` with
+         * axios imported must not bind the `get` this file happens to define.
+         * The language list is inside the helper - MUST match pass_parallel.c. */
+        cbm_suppress_same_module_bound_receiver(lang, call->is_method, call->callee_name,
+                                                res.qualified_name, res.strategy, imports,
+                                                call->receiver_is_amd_dependency);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
