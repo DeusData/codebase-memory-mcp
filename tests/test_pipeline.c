@@ -13236,6 +13236,169 @@ TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel) {
     return run_rust_std_receiver_probe(52, "par");
 }
 
+/* IMPORTS edges from the file at src_file whose local_name is local and whose
+ * target node lives in target_file (any target when NULL). -1 on a query
+ * failure. */
+static int rust_import_into_file_count(cbm_store_t *s, const char *project, const char *src_file,
+                                       const char *local, const char *target_file) {
+    static const char sql[] =
+        "SELECT count(*) FROM edges e JOIN nodes f ON f.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='IMPORTS' "
+        "AND f.file_path=?2 AND json_extract(e.properties,'$.local_name')=?3 "
+        "AND (?4 IS NULL OR t.file_path=?4)";
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int count = -1;
+    if (sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 2, src_file, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 3, local, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        (target_file ? sqlite3_bind_text(st, 4, target_file, -1, SQLITE_TRANSIENT)
+                     : sqlite3_bind_null(st, 4)) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        count = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* CALLS edges from a node named src_name to a node named tgt_name carrying the
+ * given resolution strategy. -1 on a query failure. */
+static int rust_calls_by_strategy_count(cbm_store_t *s, const char *project, const char *src_name,
+                                        const char *tgt_name, const char *strategy) {
+    static const char sql[] =
+        "SELECT count(*) FROM edges e JOIN nodes f ON f.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='CALLS' "
+        "AND f.name=?2 AND t.name=?3 AND json_extract(e.properties,'$.strategy')=?4";
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int count = -1;
+    if (sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 2, src_name, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 3, tgt_name, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 4, strategy, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        count = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* A Cargo workspace of two crates that both define util::helper and
+ * net::proto::encode. A relative `use` names a path inside the importing
+ * crate, so `crate::util::helper` and `super::proto::encode` from beta bind
+ * beta's items, never alpha's (the project-wide name fallback took the
+ * lexicographically smallest QN, i.e. always alpha). `serde_json::json` names
+ * an external crate: no project symbol may stand in for it, so alpha's `json`
+ * function gets neither the IMPORTS edge nor the import_map CALLS of `json!`
+ * (nor alpha's `env` the `use std::env` of beta's build script, a crate root),
+ * and `crate::util::Gone`, an item beta does not define, binds nothing: its
+ * `util` segment names a module, never alpha's function `util`.
+ * `alpha_core::util::helper` names a workspace member (package `alpha-core`)
+ * and still binds into alpha. pad_files > 0 forces the parallel resolver. */
+static int rust_workspace_relative_import_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_ws_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n");
+    write_temp_file(tmp, "crates/alpha/Cargo.toml",
+                    "[package]\nname = \"alpha-core\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/alpha/src/lib.rs",
+                    "pub mod net;\npub mod util;\n\npub fn json() -> u32 {\n    7\n}\n\n"
+                    "pub fn env() -> u32 {\n    8\n}\n\npub fn util() -> u32 {\n    9\n}\n");
+    write_temp_file(tmp, "crates/alpha/src/util.rs", "pub fn helper() -> u32 {\n    1\n}\n");
+    write_temp_file(tmp, "crates/alpha/src/net/mod.rs", "pub mod proto;\n");
+    write_temp_file(tmp, "crates/alpha/src/net/proto.rs", "pub fn encode() -> u32 {\n    10\n}\n");
+    write_temp_file(tmp, "crates/beta/Cargo.toml",
+                    "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/beta/src/lib.rs",
+                    "pub mod bridge;\npub mod net;\npub mod run;\npub mod util;\n");
+    write_temp_file(tmp, "crates/beta/src/util.rs", "pub fn helper() -> u32 {\n    2\n}\n");
+    write_temp_file(tmp, "crates/beta/src/net/mod.rs", "pub mod client;\npub mod proto;\n");
+    write_temp_file(tmp, "crates/beta/src/net/proto.rs", "pub fn encode() -> u32 {\n    20\n}\n");
+    write_temp_file(tmp, "crates/beta/src/net/client.rs",
+                    "use super::proto::encode;\n"
+                    "\n"
+                    "pub fn send() -> u32 {\n"
+                    "    encode()\n"
+                    "}\n");
+    write_temp_file(tmp, "crates/beta/src/run.rs",
+                    "use crate::util::helper;\n"
+                    "use crate::util::Gone;\n"
+                    "use serde_json::json;\n"
+                    "\n"
+                    "pub fn go() -> u32 {\n"
+                    "    helper()\n"
+                    "}\n"
+                    "\n"
+                    "pub fn emit() -> u32 {\n"
+                    "    let _v = json!({\"a\": 1});\n"
+                    "    0\n"
+                    "}\n");
+    write_temp_file(tmp, "crates/beta/build.rs",
+                    "use std::env;\n\nfn main() {\n    let _ = env::var(\"OUT_DIR\");\n}\n");
+    write_temp_file(tmp, "crates/beta/src/bridge.rs",
+                    "use alpha_core::util::helper;\n"
+                    "\n"
+                    "pub fn cross() -> u32 {\n"
+                    "    helper()\n"
+                    "}\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, pad_files, "rust_ws.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    static const char run_rs[] = "crates/beta/src/run.rs";
+    static const char client_rs[] = "crates/beta/src/net/client.rs";
+    static const char bridge_rs[] = "crates/beta/src/bridge.rs";
+    static const char beta_util[] = "crates/beta/src/util.rs";
+    static const char alpha_util[] = "crates/alpha/src/util.rs";
+    static const char beta_proto[] = "crates/beta/src/net/proto.rs";
+    static const char alpha_proto[] = "crates/alpha/src/net/proto.rs";
+
+    /* crate:: stays in beta. */
+    ASSERT_EQ(rust_import_into_file_count(s, project, run_rs, "helper", beta_util), 1);
+    ASSERT_EQ(rust_import_into_file_count(s, project, run_rs, "helper", alpha_util), 0);
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "go", "helper", beta_util), 1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "go", "helper", alpha_util), 0);
+    /* super:: is relative to net::client inside beta. */
+    ASSERT_EQ(rust_import_into_file_count(s, project, client_rs, "encode", beta_proto), 1);
+    ASSERT_EQ(rust_import_into_file_count(s, project, client_rs, "encode", alpha_proto), 0);
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "send", "encode", beta_proto), 1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "send", "encode", alpha_proto), 0);
+    /* An external crate's macro is no project symbol. */
+    ASSERT_EQ(rust_import_into_file_count(s, project, run_rs, "json", NULL), 0);
+    ASSERT_EQ(rust_calls_by_strategy_count(s, project, "emit", "json", "import_map"), 0);
+    ASSERT_EQ(rust_import_into_file_count(s, project, "crates/beta/build.rs", "env", NULL), 0);
+    /* A path segment above the item names a module, never alpha's fn util. */
+    ASSERT_EQ(rust_import_into_file_count(s, project, run_rs, "Gone", NULL), 0);
+    /* A workspace member named by its crate name binds into that member. */
+    ASSERT_EQ(rust_import_into_file_count(s, project, bridge_rs, "helper", alpha_util), 1);
+    ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "cross", "helper", alpha_util), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_workspace_relative_import_stays_in_crate) {
+    return rust_workspace_relative_import_case(0);
+}
+
+TEST(pipeline_rust_workspace_relative_import_stays_in_crate_parallel) {
+    return rust_workspace_relative_import_case(52);
+}
+
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
 
 /* Fixture for the #1942 bare-reference-vs-Field probes: a Go struct field
@@ -32124,6 +32287,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_generic_impl_method_sources_its_calls_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
+    RUN_TEST(pipeline_rust_workspace_relative_import_stays_in_crate);
+    RUN_TEST(pipeline_rust_workspace_relative_import_stays_in_crate_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_c_bare_ref_never_binds_field);
