@@ -1170,6 +1170,17 @@ cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn) {
     return result;
 }
 
+cbm_svc_kind_t cbm_service_pattern_match_in_project(const char *resolved_qn, const char *name,
+                                                    const char *project_name) {
+    if (resolved_qn && project_name && project_name[0]) {
+        size_t len = strlen(project_name);
+        if (strncmp(resolved_qn, project_name, len) == 0 && resolved_qn[len] == '.') {
+            resolved_qn += len + 1;
+        }
+    }
+    return cbm_service_pattern_match_named(resolved_qn, name);
+}
+
 cbm_svc_kind_t cbm_service_pattern_match_named(const char *resolved_qn, const char *name) {
     if (!resolved_qn || !name) {
         return cbm_service_pattern_match(resolved_qn);

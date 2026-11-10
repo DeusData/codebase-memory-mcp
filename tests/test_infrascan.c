@@ -184,6 +184,12 @@ TEST(infrascan_service_pattern_match_rejects_ids_inside_words) {
     };
     ASSERT_EQ(svc_case_mismatches(cases), 0);
     ASSERT_EQ(cbm_service_pattern_match_named("proj.worker.run(_:Alamofire)", "run"), CBM_SVC_NONE);
+    ASSERT_EQ(cbm_service_pattern_match_in_project("Dio.src.nav.navigateTo", "navigateTo", "Dio"),
+              CBM_SVC_NONE);
+    ASSERT_EQ(cbm_service_pattern_match_in_project("Dio.src.axios.get", "get", "Dio"),
+              CBM_SVC_HTTP);
+    ASSERT_EQ(cbm_service_pattern_match_in_project("axios.get", NULL, "Dio"), CBM_SVC_HTTP);
+    ASSERT_EQ(cbm_service_pattern_match_in_project("Dio.client.get", "get", "Di"), CBM_SVC_HTTP);
     ASSERT_EQ(cbm_service_pattern_match_named("proj.Alamofire.request(_:String)", "request"),
               CBM_SVC_HTTP);
     /* A field whose name contains a call keeps its complete QN. */

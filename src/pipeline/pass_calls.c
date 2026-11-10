@@ -852,8 +852,11 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls, const char *route_mount,
                                  CBMLanguage lang) {
-    cbm_svc_kind_t svc =
-        cbm_service_pattern_match_named(res->qualified_name, target ? target->name : NULL);
+    cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
+        res->qualified_name, target ? target->name : NULL,
+        target && res->qualified_name && strcmp(target->qualified_name, res->qualified_name) == 0
+            ? ctx->project_name
+            : NULL);
     if (svc == CBM_SVC_ROUTE_REG && route_reg_path(call, lang) != NULL) {
         return handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
                                          imp_count, route_mount, lang);
@@ -1387,12 +1390,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * the missing target must NOT drop the call — otherwise no HTTP_CALLS edge
      * is written and cross-repo matching finds nothing (#523). Emit directly
      * when the call carries a URL/topic first argument. */
-    if (calls_emit_service_call(ctx, call, source_node,
-                                cbm_service_pattern_match(res.qualified_name), &res, evidence)) {
+    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+    if (calls_emit_service_call(
+            ctx, call, source_node,
+            cbm_service_pattern_match_in_project(res.qualified_name, NULL,
+                                                 target_node ? ctx->project_name : NULL),
+            &res, evidence)) {
         return SKIP_ONE;
     }
 
-    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }

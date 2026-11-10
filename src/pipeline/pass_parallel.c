@@ -2866,12 +2866,15 @@ static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
 static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_gbuf_node_t *target, const CBMCall *call,
                               const cbm_resolution_t *res, const char *module_qn,
-                              const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                              const char **imp_keys, const char **imp_vals, int imp_count,
-                              bool suppress_plain_calls, const char *route_mount,
-                              CBMLanguage lang) {
-    cbm_svc_kind_t svc =
-        cbm_service_pattern_match_named(res->qualified_name, target ? target->name : NULL);
+                              const char *project_name, const cbm_registry_t *registry,
+                              const cbm_gbuf_t *main_gbuf, const char **imp_keys,
+                              const char **imp_vals, int imp_count, bool suppress_plain_calls,
+                              const char *route_mount, CBMLanguage lang) {
+    cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
+        res->qualified_name, target ? target->name : NULL,
+        target && res->qualified_name && strcmp(target->qualified_name, res->qualified_name) == 0
+            ? project_name
+            : NULL);
     const char *arg = call->first_string_arg;
 
     /* Also detect route registration by callee name suffix alone (handles unresolved
@@ -3620,8 +3623,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                             .strategy = "service_pattern"};
                 site_evidence->calls_emitted |=
                     emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
-                                      module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                      imp_count, false, route_mount, lang);
+                                      module_qn, rc->project_name, rc->registry, rc->main_gbuf,
+                                      imp_keys, imp_vals, imp_count, false, route_mount, lang);
                 continue;
             }
         }
@@ -3643,8 +3646,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     site_evidence->candidate_qn = count == SKIP_ONE ? target->qualified_name : NULL;
                     site_evidence->calls_emitted |=
                         emit_service_edge(ws->local_edge_buf, source_node, target, call, &selected,
-                                          module_qn, rc->registry, rc->main_gbuf, imp_keys,
-                                          imp_vals, imp_count, false, route_mount, lang);
+                                          module_qn, rc->project_name, rc->registry, rc->main_gbuf,
+                                          imp_keys, imp_vals, imp_count, false, route_mount, lang);
                     ws->calls_resolved++;
                 }
                 continue;
@@ -3680,8 +3683,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * route/HTTP/service classification is unchanged. */
                 site_evidence->calls_emitted |=
                     emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
-                                      module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                      imp_count, true, route_mount, lang);
+                                      module_qn, rc->project_name, rc->registry, rc->main_gbuf,
+                                      imp_keys, imp_vals, imp_count, true, route_mount, lang);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
@@ -3790,9 +3793,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     (u[0] == '/' || strstr(u, "://") != NULL ||
                                      (psvc == CBM_SVC_ASYNC && strlen(u) > PP_ESC_SPACE));
                 if (url_or_topic) {
-                    site_evidence->calls_emitted |= emit_service_edge(
-                        ws->local_edge_buf, source_node, NULL, call, &res, module_qn, rc->registry,
-                        rc->main_gbuf, imp_keys, imp_vals, imp_count, false, route_mount, lang);
+                    site_evidence->calls_emitted |=
+                        emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res,
+                                          module_qn, rc->project_name, rc->registry, rc->main_gbuf,
+                                          imp_keys, imp_vals, imp_count, false, route_mount, lang);
                     ws->calls_resolved++;
                 }
             }
@@ -3800,9 +3804,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         site_evidence->candidate_qn = target_node->qualified_name;
         _rc_t0 = extract_now_ns();
-        site_evidence->calls_emitted |= emit_service_edge(
-            ws->local_edge_buf, source_node, target_node, call, &res, module_qn, rc->registry,
-            rc->main_gbuf, imp_keys, imp_vals, imp_count, drop_plain_call, route_mount, lang);
+        site_evidence->calls_emitted |=
+            emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
+                              rc->project_name, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                              imp_count, drop_plain_call, route_mount, lang);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

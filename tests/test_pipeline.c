@@ -16065,7 +16065,7 @@ TEST(pipeline_arg_url_skips_client_navigation) {
         free(saved_single);
         FAIL("save environment");
     }
-    char tmp[256] = "/tmp/cbm_arg_url_nav_XXXXXX";
+    char tmp[256] = "/tmp/cbm_arg_url_nav_Dio_XXXXXX";
     if (!cbm_mkdtemp(tmp)) {
         free(saved_workers);
         free(saved_single);
