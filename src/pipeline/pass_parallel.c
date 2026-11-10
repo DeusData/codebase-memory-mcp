@@ -3581,7 +3581,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                 cbm_pipeline_get_nsmap()) ||
             /* MUST match pass_calls.c exactly. */
             (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call, rc->registry));
+             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call,
+                                                      rc->registry)) ||
+            /* Same-module bound-receiver suppression (#1128) - see pass_calls.c;
+             * the language list is inside the helper, so the two cannot drift. */
+            cbm_suppress_same_module_bound_receiver(
+                lang, call->is_method, call->callee_name, res.qualified_name, res.strategy,
+                &result->imports, call->receiver_is_amd_dependency);
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
