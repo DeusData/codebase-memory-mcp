@@ -1641,6 +1641,32 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
     ASSERT_TRUE(fixture_closed);
     PASS();
 }
+
+/* An idle monitor must not repeatedly perform the expensive presence probe
+ * while no maintenance request exists (#2093). The monitor records the exact
+ * value it sleeps on in its no-maintenance branch; once recorded that value is
+ * stable, so the verdict depends on neither elapsed time nor scheduler cadence.
+ * The deadline below is only a hang guard. */
+TEST(daemon_frontend_idle_maintenance_probe_is_bounded) {
+    frontend_maintenance_fixture_t fixture;
+    ASSERT_TRUE(frontend_maintenance_fixture_start(&fixture, "idle-cadence"));
+
+    cbm_daemon_frontend_test_observer_reset(false);
+    cbm_daemon_maintenance_monitor_t *monitor = cbm_daemon_maintenance_monitor_start(
+        fixture.manager, NULL, NULL, EXIT_SUCCESS, "idle cadence test");
+    ASSERT_TRUE(monitor != NULL);
+    uint64_t deadline = cbm_now_ms() + 10000U;
+    while (cbm_now_ms() < deadline && cbm_daemon_frontend_test_monitor_idle_sleep_ms() == 0) {
+        cbm_usleep(1000);
+    }
+    uint32_t idle_sleep_ms = cbm_daemon_frontend_test_monitor_idle_sleep_ms();
+    ASSERT_TRUE(cbm_daemon_maintenance_monitor_stop(&monitor));
+    frontend_maintenance_fixture_finish(&fixture);
+
+    ASSERT_TRUE(idle_sleep_ms != 0);
+    ASSERT_GTE(idle_sleep_ms, 250);
+    PASS();
+}
 #endif
 
 #ifndef _WIN32
@@ -1982,6 +2008,7 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_rejects_non_notification_cancellation_shapes);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(daemon_frontend_idle_uses_one_maintenance_observer);
+    RUN_TEST(daemon_frontend_idle_maintenance_probe_is_bounded);
 #endif
 #ifndef _WIN32
     RUN_TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked);
