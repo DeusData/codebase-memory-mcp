@@ -1,0 +1,311 @@
+{
+  "staticChains": 2,
+  "observedPathShown": true,
+  "observedCount": 3,
+  "observedLabel": "smoke-run",
+  "staticOnlyCount": 4,
+  "runtimeOnlyCount": 1,
+  "noTracesHonest": true,
+  "hopClickNavigates": true,
+  "port": 4271,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w4b",
+  "fixture": "fixtures/atlas-sample (Kopie in einem mkdtemp-Verzeichnis)",
+  "target": "createUser",
+  "timings": {
+    "buildMs": 9449,
+    "serverStartMs": 7076,
+    "totalMs": 43770
+  },
+  "generatedAt": "2026-08-28T20:34:06.221Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "baseCommit": "dccd2294150ef76ba57f4060a24397da3def60a6",
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4270,
+    "beforeIngest": {
+      "status": "ready",
+      "target": "createUser",
+      "events": 0,
+      "staticPaths": 2,
+      "observedPaths": 0,
+      "staticOnly": 5,
+      "runtimeOnly": 0,
+      "staticChains": [
+        [
+          "src/server.ts",
+          "main",
+          "createApp",
+          "registerUserRoutes",
+          "createUser"
+        ],
+        [
+          "create",
+          "createUser"
+        ]
+      ],
+      "observedChains": [],
+      "observedHops": [],
+      "edges": [
+        {
+          "kind": "static-only",
+          "from": "registerUserRoutes",
+          "to": "createUser",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "createApp",
+          "to": "registerUserRoutes",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "main",
+          "to": "createApp",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "src/server.ts",
+          "to": "main",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "create",
+          "to": "createUser",
+          "verdict": ""
+        }
+      ],
+      "noTraces": {
+        "present": true,
+        "message": "No observed call came back for this symbol. CodeAtlas does not watch code while it runs; it reads back what somebody handed the analysis backend.",
+        "how": "Hand it a run with the CLI, against the same HOME the server reads. The tool is not on /rpc, so this page cannot do it for you:",
+        "command": "echo '{\"project\":\"codeatlasweb-w4b\",\"label\":\"my-run\",\"traces\":[{\"path\":[\"<caller qualified name>\",\"<callee qualified name>\"],\"count\":1}]}' | codebase-memory-mcp cli ingest_traces",
+        "format": "One entry is either {\"path\": [...]} with 2 to 256 qualified names, adjacent ones being caller and callee, or a bare {\"caller\": \"...\", \"callee\": \"...\"}. \"count\" and \"label\" are optional. Only pairs whose both ends are in the index are stored; up to ten unresolved names come back so a recorder can be fixed rather than silently losing data.",
+        "where": "The backend hands an observation back only where it also records the call, so a recorded call the index has no relation for is stored and cannot be read again through /api/trace or /api/flow."
+      },
+      "noDivergence": "",
+      "truncated": "The walk stopped after 4 hops or 6 chains with callers still to follow, so a chain shown here may be a floor rather than the whole way in."
+    },
+    "ingest": {
+      "status": "stored",
+      "label": "smoke-run",
+      "pairs_stored": 3,
+      "paths_stored": 1,
+      "pairs_unmatched": 0,
+      "unmatched_sample": [],
+      "pair_total": 3
+    },
+    "afterIngest": {
+      "status": "ready",
+      "target": "createUser",
+      "events": 2,
+      "staticPaths": 2,
+      "observedPaths": 1,
+      "staticOnly": 4,
+      "runtimeOnly": 1,
+      "staticChains": [
+        [
+          "src/server.ts",
+          "main",
+          "createApp",
+          "registerUserRoutes",
+          "createUser"
+        ],
+        [
+          "create",
+          "createUser"
+        ]
+      ],
+      "observedChains": [
+        [
+          "registerUserRoutes",
+          "createUser"
+        ]
+      ],
+      "observedHops": [
+        {
+          "name": "createUser",
+          "count": 3,
+          "label": "smoke-run",
+          "lastSeen": "2026-08-28T20:33:54Z"
+        }
+      ],
+      "edges": [
+        {
+          "kind": "static-only",
+          "from": "createApp",
+          "to": "registerUserRoutes",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "main",
+          "to": "createApp",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "src/server.ts",
+          "to": "main",
+          "verdict": ""
+        },
+        {
+          "kind": "static-only",
+          "from": "create",
+          "to": "createUser",
+          "verdict": ""
+        },
+        {
+          "kind": "runtime-only",
+          "from": "createUser",
+          "to": "validateUser",
+          "verdict": "the index records this call, it is simply not on a way in"
+        }
+      ],
+      "noTraces": {
+        "present": false,
+        "message": "",
+        "how": "",
+        "command": "",
+        "format": "",
+        "where": ""
+      },
+      "noDivergence": "",
+      "truncated": "The walk stopped after 4 hops or 6 chains with callers still to follow, so a chain shown here may be a floor rather than the whole way in."
+    },
+    "hopClicked": {
+      "name": "main",
+      "expected": "src/server.ts",
+      "count": 1,
+      "readerAfter": "src/server.ts"
+    },
+    "gitStatus": [
+      "M src/services/userService.ts"
+    ],
+    "reindexed": {
+      "nodes": 77,
+      "edges": 180
+    },
+    "impact": {
+      "status": "ready",
+      "mode": "worktree",
+      "badge": "high",
+      "tiles": [
+        {
+          "label": "changed files",
+          "value": "1"
+        },
+        {
+          "label": "symbols in them",
+          "value": "5"
+        },
+        {
+          "label": "one step out",
+          "value": "1"
+        },
+        {
+          "label": "2 steps out",
+          "value": "1"
+        },
+        {
+          "label": "endpoints",
+          "value": "2"
+        },
+        {
+          "label": "tests affected",
+          "value": "1"
+        },
+        {
+          "label": "untested affected",
+          "value": "6"
+        }
+      ],
+      "rules": [
+        "2 endpoints are registered in a file this change reaches.",
+        "No test caller was found for 6 affected symbols."
+      ],
+      "narrative": "1 file differs from the baseline, and the index places 5 symbols inside it. The analysis scoped the diff to 2 declarations, and the list below is the 5 symbols the index places inside those files. Walking the calls inwards reaches 2 further symbols within 2 steps. 2 endpoints are registered in a file this change reaches: GET /users, POST /users. No test caller was found for 6 affected symbols, so a change to them would go unnoticed by any automatic check.",
+      "evidence": [
+        {
+          "source": "detect_changes",
+          "claim": "1 file differs from the baseline, and the index places 5 symbols inside it.",
+          "value": "the change set the analysis reported, plus the calls into it (1 changed file, 7 symbols reported)"
+        },
+        {
+          "source": "detect_changes",
+          "claim": "The analysis scoped the diff to 2 declarations, and the list below is the 5 symbols the index places inside those files.",
+          "value": "the change set the analysis reported, plus the calls into it (2 seed declarations reported, 5 symbols listed)"
+        },
+        {
+          "source": "detect_changes",
+          "claim": "Walking the calls inwards reaches 2 further symbols within 2 steps.",
+          "value": "the change set the analysis reported, plus the calls into it (2 callers over 2 walked steps)"
+        },
+        {
+          "source": "architecture",
+          "claim": "2 endpoints are registered in a file this change reaches: GET /users, POST /users.",
+          "value": "the whole-project summary, including the routes CodeAtlas recovered (3 routes recovered, 2 reached)"
+        },
+        {
+          "source": "facts",
+          "claim": "No test caller was found for 6 affected symbols, so a change to them would go unnoticed by any automatic check.",
+          "value": "the per-symbol readings: complexity, and callers flagged as test code (7 symbols checked for test callers)"
+        }
+      ],
+      "direct": [
+        "toUser",
+        "listUsers",
+        "createUser",
+        "create",
+        "countUsers"
+      ],
+      "downstream": [
+        "registerUserRoutes",
+        "createApp"
+      ],
+      "endpoints": [
+        {
+          "label": "GET /users",
+          "via": "file"
+        },
+        {
+          "label": "POST /users",
+          "via": "file"
+        }
+      ],
+      "untested": 6,
+      "routeNote": "Routes were read off the text of 10 indexed source files.",
+      "refError": ""
+    },
+    "refCheck": {
+      "callsBefore": 1,
+      "callsAfter": 1,
+      "refError": "\"main..dev\" is not a usable git ref: a git ref holds no two consecutive dots. Nothing was asked of the analysis backend.",
+      "ref": "main..dev"
+    },
+    "apiRoutes": {
+      "/api/layout": 3,
+      "/api/tree": 21,
+      "/api/trace": 7,
+      "/api/flows": 3,
+      "/api/flow": 21
+    },
+    "rpcTools": {
+      "index_status": 3,
+      "search_graph": 4,
+      "query_graph": 82,
+      "get_code_snippet": 16,
+      "detect_changes": 1,
+      "get_architecture": 1
+    }
+  }
+}

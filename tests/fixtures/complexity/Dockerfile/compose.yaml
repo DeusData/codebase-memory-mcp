@@ -1,0 +1,20 @@
+services:
+  web:
+    image: acme/cx-app:1-web
+    build: .
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      LOG_LEVEL: info
+  worker:
+    image: acme/cx-app:1-worker
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - db
+    environment:
+      - QUEUE
+  db:
+    image: postgres:16

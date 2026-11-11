@@ -347,6 +347,12 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
  * an unbounded idle hang. The host lifetime loop calls this every tick; it is a
  * no-op unless a last-committed-client linger is armed. */
 void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
+/* #2178 heartbeat over the listener's runtime artifacts, plus the participant
+ * guard the service owns when it started itself; see
+ * cbm_daemon_ipc_listener_touch for the 1/0/-1 result. Call only from the
+ * thread that stops and frees the service, which is the only thread that
+ * closes the listener. */
+int cbm_daemon_runtime_service_touch_listener(cbm_daemon_runtime_service_t *service);
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key);
 uint64_t cbm_daemon_runtime_service_client_process_id(cbm_daemon_runtime_service_t *service,
@@ -417,11 +423,12 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
 
 /* Execute using the sole outstanding token returned by token_reserve(). This
  * is the cancellable frontend path; the legacy helper above reserves
- * internally. */
+ * internally. request_sent_out reports whether the application frame crossed
+ * the local transport, including failures while awaiting its response. */
 cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_request_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const void *request, uint32_t request_length, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms);
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms);
 
 /* Begin a two-phase close without freeing the client. This atomically rejects
  * future exchanges and interrupts an exchange already in flight. Exactly one
@@ -471,6 +478,52 @@ void cbm_daemon_runtime_set_containment_hook_for_testing(
  * in test time. UINT32_MAX restores the production constant; any other value
  * (0 = expire immediately) overrides. Process-global; reset it after use. */
 void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms);
+/* Connection-cap seams (flaky-ledger item 12). While held, the two bounded
+ * waits on a peer in the connection-cap path end only on that peer: a
+ * connection that has not sent its first frame keeps its worker slot until it
+ * closes (or the service stops) instead of until the request deadline, and an
+ * inline rejection's drain (Windows; a no-op on POSIX) lasts until the peer
+ * closes instead of 250 ms. A "slow hello" becomes a state the test releases,
+ * not a window it races. Process-global; reset it after use. */
+void cbm_daemon_runtime_hold_peer_waits_for_testing(bool hold);
+/* The four points that order a HELLO against an inline accept-loop rejection.
+ * The hook runs on the client thread for the CLIENT_* points and on the accept
+ * thread for the DAEMON_* points (never under the service mutex), so a test can
+ * pin either order: daemon answers after the HELLO is on the wire, or the
+ * daemon has answered and closed before the HELLO is sent. NULL removes it. */
+typedef enum {
+    CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_CONNECTED = 0, /* transport up, HELLO not sent */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_SENT,          /* HELLO send attempted */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTING,     /* inline rejection not yet written */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTED,      /* inline rejection written + closed */
+} cbm_daemon_runtime_hello_point_t;
+typedef void (*cbm_daemon_runtime_hello_hook_t)(cbm_daemon_runtime_hello_point_t point);
+void cbm_daemon_runtime_set_hello_hook_for_testing(cbm_daemon_runtime_hello_hook_t hook);
+
+/* Executable-image fingerprint-cache seams. reset empties the cache, zeroes
+ * the hash counter and disarms the stub; a test that arms the stub must reset
+ * before its first assertion, because an armed stub replaces every later
+ * fingerprint in the process. resolve drives a synthetic file identity through
+ * the exact resolve-then-commit path the acquire sites use: `before` is the
+ * identity the digest is keyed on, `after` the identity observed after the
+ * hash, and the digest is committed only when the two agree. It refuses unless
+ * the stub is armed, since no native image backs a synthetic identity. */
+typedef struct {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t size;
+    int64_t mtime_seconds;
+    int64_t mtime_nanoseconds;
+    int64_t ctime_seconds;
+    int64_t ctime_nanoseconds;
+} cbm_daemon_runtime_fingerprint_identity_for_testing_t;
+void cbm_daemon_runtime_fingerprint_cache_reset_for_testing(void);
+void cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(const char *digest);
+int cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(void);
+bool cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *before,
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *after,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

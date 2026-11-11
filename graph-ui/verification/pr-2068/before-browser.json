@@ -1,0 +1,7 @@
+{
+  "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+  "consoleErrors": [],
+  "revision": "80f4f41f9bcb9daf60afc5f607bcbcba24a4b196",
+  "data": "Real repository indexed through POST /api/index",
+  "port": 9749
+}

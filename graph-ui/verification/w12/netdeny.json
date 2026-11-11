@@ -1,0 +1,141 @@
+{
+  "command": "node tools/smoke-w12.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 247,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 156197,
+  "maxProcessTreeSize": 8,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4660",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4661",
+      "seen": 29
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4662",
+      "seen": 53
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4663",
+      "seen": 24
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:54914",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:54947",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55178",
+      "seen": 2
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55406",
+      "seen": 2
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55599",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55600",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55632",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55828",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55849",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55861",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55862",
+      "seen": 11
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:55863",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56057",
+      "seen": 6
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56059",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56092",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56094",
+      "seen": 10
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56095",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56171",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56173",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56174",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56176",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56177",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56178",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56283",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56316",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56317",
+      "seen": 17
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:56318",
+      "seen": 5
+    }
+  ],
+  "generatedAt": "2026-08-31T13:23:49.019Z"
+}

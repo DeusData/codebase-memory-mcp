@@ -6,6 +6,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/str_util.h"
+#include "callable_sig.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -425,7 +426,14 @@ static void collect_prod_defs(cbm_pipeline_ctx_t *ctx, ens_prod_def_t ***defs_ou
         char class_qn[CBM_SZ_256];
         class_qn[0] = '\0';
         if (xd->qualified_name) {
-            const char *dot = strrchr(xd->qualified_name, '.');
+            /* Owner = base QN minus its leaf (#2061 suffixes hold no '.'). */
+            const char *dot = NULL;
+            size_t base_len = cbm_qn_callable_base_len_named(xd->qualified_name, xd->name);
+            for (size_t i = 0; i < base_len; i++) {
+                if (xd->qualified_name[i] == '.') {
+                    dot = xd->qualified_name + i;
+                }
+            }
             if (dot) {
                 int len = (int)(dot - xd->qualified_name);
                 if (len > 0 && len < CBM_SZ_256) {

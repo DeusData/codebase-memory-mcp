@@ -1,0 +1,25 @@
+{
+  "command": "node tools/smoke-w9.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 85,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 50418,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4461",
+      "seen": 2
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49707",
+      "seen": 2
+    }
+  ],
+  "generatedAt": "2026-08-30T17:30:30.916Z"
+}

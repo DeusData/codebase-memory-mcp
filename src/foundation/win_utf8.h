@@ -10,7 +10,41 @@
 #include <stdlib.h>
 #include <wchar.h>
 
-static inline wchar_t *cbm_utf8_to_wide(const char *utf8) {
+#include "mem_core.h"
+
+/* Converter heaps. The `*_in(cls, ...)` forms allocate through the memory
+ * core and their result is released with cbm_free(cls, p). The legacy names
+ * allocate with the C library for the callers that still release with free();
+ * that route is the residual the memory-core ratchet drives down, so new
+ * callers use the `_in` forms. */
+typedef struct {
+    int core;
+    cbm_mem_class_t cls;
+} cbm_wide_heap_t;
+
+static inline cbm_wide_heap_t cbm_wide_heap_core(cbm_mem_class_t cls) {
+    cbm_wide_heap_t heap = {1, cls};
+    return heap;
+}
+
+static inline cbm_wide_heap_t cbm_wide_heap_libc(void) {
+    cbm_wide_heap_t heap = {0, CBM_MEM_CLASS_OTHER};
+    return heap;
+}
+
+static inline void *cbm_wide_heap_alloc(cbm_wide_heap_t heap, size_t bytes) {
+    return heap.core ? cbm_alloc(heap.cls, bytes) : malloc(bytes);
+}
+
+static inline void cbm_wide_heap_free(cbm_wide_heap_t heap, void *block) {
+    if (heap.core) {
+        cbm_free(heap.cls, block);
+    } else {
+        free(block);
+    }
+}
+
+static inline wchar_t *cbm_utf8_to_wide_heap(cbm_wide_heap_t heap, const char *utf8) {
     if (!utf8) {
         return NULL;
     }
@@ -18,12 +52,20 @@ static inline wchar_t *cbm_utf8_to_wide(const char *utf8) {
     if (len <= 0) {
         return NULL;
     }
-    wchar_t *w = (wchar_t *)malloc((size_t)len * sizeof(wchar_t));
+    wchar_t *w = (wchar_t *)cbm_wide_heap_alloc(heap, (size_t)len * sizeof(wchar_t));
     if (!w || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, w, len) != len) {
-        free(w);
+        cbm_wide_heap_free(heap, w);
         return NULL;
     }
     return w;
+}
+
+static inline wchar_t *cbm_utf8_to_wide(const char *utf8) {
+    return cbm_utf8_to_wide_heap(cbm_wide_heap_libc(), utf8);
+}
+
+static inline wchar_t *cbm_utf8_to_wide_in(cbm_mem_class_t cls, const char *utf8) {
+    return cbm_utf8_to_wide_heap(cbm_wide_heap_core(cls), utf8);
 }
 
 static inline int cbm_win_path_separator(wchar_t value) {
@@ -54,7 +96,8 @@ static inline void cbm_win_path_normalize_wide_separators(wchar_t *path) {
  * This makes behavior independent of the process manifest and LongPathsEnabled
  * policy. Never use this for non-file strings (command lines, pipe names,
  * registry paths). */
-static inline wchar_t *cbm_wide_path_to_extended(const wchar_t *wide_path) {
+static inline wchar_t *cbm_wide_path_to_extended_heap(cbm_wide_heap_t heap,
+                                                      const wchar_t *wide_path) {
     if (!wide_path) {
         return NULL;
     }
@@ -62,7 +105,7 @@ static inline wchar_t *cbm_wide_path_to_extended(const wchar_t *wide_path) {
     if (input_length >= 32767U) {
         return NULL;
     }
-    wchar_t *wide = (wchar_t *)malloc((input_length + 1U) * sizeof(*wide));
+    wchar_t *wide = (wchar_t *)cbm_wide_heap_alloc(heap, (input_length + 1U) * sizeof(*wide));
     if (!wide) {
         return NULL;
     }
@@ -77,11 +120,12 @@ static inline wchar_t *cbm_wide_path_to_extended(const wchar_t *wide_path) {
     }
 
     DWORD needed = GetFullPathNameW(wide, 0, NULL, NULL);
-    wchar_t *full = needed > 0U ? (wchar_t *)malloc((size_t)needed * sizeof(wchar_t)) : NULL;
+    wchar_t *full =
+        needed > 0U ? (wchar_t *)cbm_wide_heap_alloc(heap, (size_t)needed * sizeof(wchar_t)) : NULL;
     DWORD copied = full ? GetFullPathNameW(wide, needed, full, NULL) : 0U;
-    free(wide);
+    cbm_wide_heap_free(heap, wide);
     if (!full || copied == 0U || copied >= needed) {
-        free(full);
+        cbm_wide_heap_free(heap, full);
         return NULL;
     }
     cbm_win_path_normalize_wide_separators(full);
@@ -92,7 +136,7 @@ static inline wchar_t *cbm_wide_path_to_extended(const wchar_t *wide_path) {
         full[1] == L':' && full[2] == L'\\';
     int unc_absolute = copied >= 5U && full[0] == L'\\' && full[1] == L'\\';
     if (!drive_absolute && !unc_absolute) {
-        free(full);
+        cbm_wide_heap_free(heap, full);
         return NULL;
     }
 
@@ -103,25 +147,38 @@ static inline wchar_t *cbm_wide_path_to_extended(const wchar_t *wide_path) {
     size_t extended_length = prefix_length + tail_length;
     /* The documented extended-length limit includes the terminating NUL. */
     if (extended_length >= 32767U) {
-        free(full);
+        cbm_wide_heap_free(heap, full);
         return NULL;
     }
-    wchar_t *prefixed = (wchar_t *)malloc((extended_length + 1U) * sizeof(wchar_t));
+    wchar_t *prefixed =
+        (wchar_t *)cbm_wide_heap_alloc(heap, (extended_length + 1U) * sizeof(wchar_t));
     if (!prefixed) {
-        free(full);
+        cbm_wide_heap_free(heap, full);
         return NULL;
     }
     wmemcpy(prefixed, prefix, prefix_length);
     wmemcpy(prefixed + prefix_length, full + tail_offset, tail_length + 1U);
-    free(full);
+    cbm_wide_heap_free(heap, full);
     return prefixed;
 }
 
-static inline wchar_t *cbm_path_to_wide(const char *utf8_path) {
-    wchar_t *wide = cbm_utf8_to_wide(utf8_path);
-    wchar_t *extended = cbm_wide_path_to_extended(wide);
-    free(wide);
+static inline wchar_t *cbm_wide_path_to_extended(const wchar_t *wide_path) {
+    return cbm_wide_path_to_extended_heap(cbm_wide_heap_libc(), wide_path);
+}
+
+static inline wchar_t *cbm_path_to_wide_heap(cbm_wide_heap_t heap, const char *utf8_path) {
+    wchar_t *wide = cbm_utf8_to_wide_heap(heap, utf8_path);
+    wchar_t *extended = cbm_wide_path_to_extended_heap(heap, wide);
+    cbm_wide_heap_free(heap, wide);
     return extended;
+}
+
+static inline wchar_t *cbm_path_to_wide(const char *utf8_path) {
+    return cbm_path_to_wide_heap(cbm_wide_heap_libc(), utf8_path);
+}
+
+static inline wchar_t *cbm_path_to_wide_in(cbm_mem_class_t cls, const char *utf8_path) {
+    return cbm_path_to_wide_heap(cbm_wide_heap_core(cls), utf8_path);
 }
 
 /* GetModuleFileNameW can preserve the \\?\ spelling used to launch a process.

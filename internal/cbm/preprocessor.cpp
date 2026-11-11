@@ -381,6 +381,56 @@ static bool parse_line_directive(const char *line, size_t len, uint32_t *out_lin
     return true;
 }
 
+// True when `prev` and `tok` touched in the source text: same file and line,
+// `prev` ending exactly where `tok` starts (simplecpp's own adjacency test),
+// and neither produced by a macro expansion (expansion tokens carry the call
+// site's location, so their columns prove nothing).
+static bool tokens_source_adjacent(const simplecpp::Token *prev, const simplecpp::Token *tok) {
+    if (!prev->macro.empty() || !tok->macro.empty() || !prev->location.sameline(tok->location)) {
+        return false;
+    }
+    const std::string &s = prev->str();
+    if (s.find_first_of("\r\n") != std::string::npos) {
+        return false;
+    }
+    return prev->location.col + s.size() == tok->location.col;
+}
+
+// The expanded buffer in the source's own spelling. Mirrors
+// simplecpp::TokenList::stringify() line for line — the same newlines and
+// #line directives, so build_line_map and every line-based remap are unchanged —
+// except that tokens which touched in the source stay touching. stringify()
+// joins every same-line pair with one space, so the second pass spelled a
+// multi-token name differently from the raw pass: the explicit specialization
+// `template<> struct bitonic<int64_t, AVX2>` became `bitonic < int64_t , AVX2 >`,
+// and every QN built from that text (defs adopted by the #961 rescue, call
+// scopes, C-LSP class scopes) minted a second node for the same definition, the
+// QN dedup (strcmp) missing it. A gap that held whitespace or a comment is still
+// one space, as before.
+static std::string stringify_source_spacing(const simplecpp::TokenList &tokens) {
+    std::ostringstream ret;
+    simplecpp::Location loc;
+    loc.line = 1;
+    for (const simplecpp::Token *tok = tokens.cfront(); tok; tok = tok->next) {
+        if (tok->location.line < loc.line || tok->location.fileIndex != loc.fileIndex) {
+            ret << "\n#line " << tok->location.line << " \"" << tokens.file(tok->location)
+                << "\"\n";
+            loc = tok->location;
+        }
+        while (tok->location.line > loc.line) {
+            ret << '\n';
+            loc.line++;
+        }
+        const simplecpp::Token *prev = tok->previous;
+        if (prev && prev->location.sameline(tok->location) && !tokens_source_adjacent(prev, tok)) {
+            ret << ' ';
+        }
+        ret << tok->str();
+        loc.adjust(tok->str());
+    }
+    return ret.str();
+}
+
 static bool build_line_map(const std::string &expanded, const std::string &main_file,
                            uint32_t *original_line_by_expanded_line,
                            uint8_t *belongs_to_main_file) {
@@ -476,7 +526,7 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
 
         simplecpp::preprocess(output, rawtokens, files, filedata, dui);
 
-        std::string result = output.stringify();
+        std::string result = stringify_source_spacing(output);
 
         // Clean up loaded file data
         simplecpp::cleanup(filedata);

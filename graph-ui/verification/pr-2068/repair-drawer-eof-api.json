@@ -1,0 +1,30 @@
+{
+  "at": "2026-09-09T21:33:53Z",
+  "origin": "http://127.0.0.1:9749",
+  "project": "cbm-pr2068",
+  "path": "src/daemon/project_lock.c",
+  "request": {
+    "start_line": 53,
+    "max_lines": 160,
+    "source_mode": "full"
+  },
+  "response_metadata": {
+    "name": "src/daemon/project_lock.c",
+    "qualified_name": "cbm-pr2068.src.daemon.project_lock",
+    "label": "Module",
+    "file_path": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068/src/daemon/project_lock.c",
+    "start_line": 53,
+    "end_line": 190,
+    "source_mode": "full",
+    "callers": 0,
+    "callees": 0
+  },
+  "source_sha256": "67e0160609b6e736b926fb3a971ffb30d18bec218ea850321556360181e06b91",
+  "split_segments": 138,
+  "segments_after_dropping_trailing_empty": 137,
+  "expected_inclusive_range": 138,
+  "source_fixture": "../../src/architecture/fixtures/project-lock-eof.json",
+  "requested_line": 61,
+  "actual_requested_source": "        cbm_private_lock_directory_close(directory);",
+  "finding": "The final Module source range includes an empty EOF line. Drop a trailing empty segment only when exactly the remaining count equals the reported range. Other differences still invalidate line evidence."
+}

@@ -1,0 +1,804 @@
+{
+  "modeAutoSwitches": true,
+  "hierarchyNodes": 8,
+  "hierarchyDepth": 3,
+  "rootIsChosen": true,
+  "columnsMatchHops": true,
+  "stepPulseFollowsTour": true,
+  "clickFollows": true,
+  "toggleBackToGalaxy": true,
+  "headerHonest": true,
+  "port": 4331,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w4e",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "entrySymbol": "createUser",
+  "entryFile": "src/services/userService.ts",
+  "timings": {
+    "buildMs": 10412,
+    "serverStartMs": 6905,
+    "totalMs": 40787
+  },
+  "generatedAt": "2026-08-30T10:52:31.990Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4330,
+    "beforeWalk": {
+      "seam": {
+        "mode": "galaxy",
+        "hierarchyAvailable": false,
+        "headline": "76 nodes, 178 edges from /api/layout",
+        "pulsedQn": "",
+        "nodes": 76,
+        "highlightedCount": 0,
+        "targetChanges": 2,
+        "legendEntries": 5,
+        "hierarchy": null
+      },
+      "head": {
+        "headline": "76 nodes, 178 edges from /api/layout",
+        "panelMode": "galaxy",
+        "groupPresent": true,
+        "chips": [
+          {
+            "mode": "galaxy",
+            "active": "true",
+            "pressed": "true",
+            "disabled": false,
+            "title": ""
+          },
+          {
+            "mode": "hierarchy",
+            "active": "false",
+            "pressed": "false",
+            "disabled": false,
+            "title": ""
+          }
+        ],
+        "legend": [],
+        "pulseRings": [],
+        "note": "no symbol in focus: the galaxy follows the twin"
+      }
+    },
+    "afterWalk": {
+      "seam": {
+        "mode": "hierarchy",
+        "hierarchyAvailable": true,
+        "headline": "hierarchy of createUser: 8 symbols, depth 3",
+        "pulsedQn": "codeatlasweb-w4e.src.services.userService.createUser",
+        "nodes": 76,
+        "highlightedCount": 8,
+        "targetChanges": 4,
+        "legendEntries": 5,
+        "hierarchy": {
+          "root": "codeatlasweb-w4e.src.services.userService.createUser",
+          "rootName": "createUser",
+          "nodes": 8,
+          "depth": 3,
+          "truncated": false,
+          "cap": 15,
+          "walkDepth": 3,
+          "placements": [
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.createUser",
+              "name": "createUser",
+              "file": "src/services/userService.ts",
+              "hop": 0,
+              "x": 0,
+              "y": 0
+            },
+            {
+              "key": "codeatlasweb-w4e.src.types.UserEntity",
+              "name": "UserEntity",
+              "file": "src/types.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 180
+            },
+            {
+              "key": "codeatlasweb-w4e.src.util.validate.ValidationError",
+              "name": "ValidationError",
+              "file": "src/util/validate.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 108
+            },
+            {
+              "key": "codeatlasweb-w4e.src.repo.db.insert",
+              "name": "insert",
+              "file": "src/repo/db.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 36
+            },
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "name": "listUsers",
+              "file": "src/services/userService.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -36
+            },
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.toUser",
+              "name": "toUser",
+              "file": "src/services/userService.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -108
+            },
+            {
+              "key": "codeatlasweb-w4e.src.util.validate.validateUser",
+              "name": "validateUser",
+              "file": "src/util/validate.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -180
+            },
+            {
+              "key": "codeatlasweb-w4e.src.repo.db.query",
+              "name": "query",
+              "file": "src/repo/db.ts",
+              "hop": 2,
+              "x": 240,
+              "y": 0
+            }
+          ],
+          "edges": [
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.repo.db.insert"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.services.userService.listUsers"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.services.userService.toUser"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.types.UserEntity"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.util.validate.validateUser"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "to": "codeatlasweb-w4e.src.repo.db.query"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.util.validate.validateUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError"
+            }
+          ],
+          "walkEdges": 8,
+          "extraEdges": 3,
+          "extras": [
+            {
+              "type": "RAISES",
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError",
+              "offset": 9
+            },
+            {
+              "type": "CALL_REFERENCE",
+              "from": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "to": "codeatlasweb-w4e.src.services.userService.toUser",
+              "offset": 0
+            },
+            {
+              "type": "RAISES",
+              "from": "codeatlasweb-w4e.src.util.validate.validateUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError",
+              "offset": 9
+            }
+          ]
+        }
+      },
+      "head": {
+        "headline": "hierarchy of createUser: 8 symbols, depth 3",
+        "panelMode": "hierarchy",
+        "groupPresent": true,
+        "chips": [
+          {
+            "mode": "galaxy",
+            "active": "false",
+            "pressed": "false",
+            "disabled": false,
+            "title": ""
+          },
+          {
+            "mode": "hierarchy",
+            "active": "true",
+            "pressed": "true",
+            "disabled": false,
+            "title": ""
+          }
+        ],
+        "legend": [],
+        "pulseRings": [
+          "codeatlasweb-w4e.src.services.userService.createUser"
+        ],
+        "note": ""
+      }
+    },
+    "entryTour": {
+      "kind": "entry",
+      "steps": 8,
+      "index": 0,
+      "titles": [
+        "Start here: createUser",
+        "Hop 1: insert",
+        "Hop 1: listUsers",
+        "Hop 1: toUser",
+        "Hop 1: UserEntity",
+        "Hop 1: ValidationError",
+        "Hop 1: validateUser",
+        "Hop 2: query"
+      ]
+    },
+    "hierarchy": {
+      "root": "codeatlasweb-w4e.src.services.userService.createUser",
+      "rootName": "createUser",
+      "nodes": 8,
+      "depth": 3,
+      "truncated": false,
+      "cap": 15,
+      "walkDepth": 3,
+      "placements": [
+        {
+          "key": "codeatlasweb-w4e.src.services.userService.createUser",
+          "name": "createUser",
+          "file": "src/services/userService.ts",
+          "hop": 0,
+          "x": 0,
+          "y": 0
+        },
+        {
+          "key": "codeatlasweb-w4e.src.types.UserEntity",
+          "name": "UserEntity",
+          "file": "src/types.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 180
+        },
+        {
+          "key": "codeatlasweb-w4e.src.util.validate.ValidationError",
+          "name": "ValidationError",
+          "file": "src/util/validate.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 108
+        },
+        {
+          "key": "codeatlasweb-w4e.src.repo.db.insert",
+          "name": "insert",
+          "file": "src/repo/db.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 36
+        },
+        {
+          "key": "codeatlasweb-w4e.src.services.userService.listUsers",
+          "name": "listUsers",
+          "file": "src/services/userService.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -36
+        },
+        {
+          "key": "codeatlasweb-w4e.src.services.userService.toUser",
+          "name": "toUser",
+          "file": "src/services/userService.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -108
+        },
+        {
+          "key": "codeatlasweb-w4e.src.util.validate.validateUser",
+          "name": "validateUser",
+          "file": "src/util/validate.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -180
+        },
+        {
+          "key": "codeatlasweb-w4e.src.repo.db.query",
+          "name": "query",
+          "file": "src/repo/db.ts",
+          "hop": 2,
+          "x": 240,
+          "y": 0
+        }
+      ],
+      "edges": [
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.repo.db.insert"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.services.userService.listUsers"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.services.userService.toUser"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.types.UserEntity"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.util.validate.ValidationError"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.util.validate.validateUser"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.services.userService.listUsers",
+          "to": "codeatlasweb-w4e.src.repo.db.query"
+        },
+        {
+          "from": "codeatlasweb-w4e.src.util.validate.validateUser",
+          "to": "codeatlasweb-w4e.src.util.validate.ValidationError"
+        }
+      ],
+      "walkEdges": 8,
+      "extraEdges": 3,
+      "extras": [
+        {
+          "type": "RAISES",
+          "from": "codeatlasweb-w4e.src.services.userService.createUser",
+          "to": "codeatlasweb-w4e.src.util.validate.ValidationError",
+          "offset": 9
+        },
+        {
+          "type": "CALL_REFERENCE",
+          "from": "codeatlasweb-w4e.src.services.userService.listUsers",
+          "to": "codeatlasweb-w4e.src.services.userService.toUser",
+          "offset": 0
+        },
+        {
+          "type": "RAISES",
+          "from": "codeatlasweb-w4e.src.util.validate.validateUser",
+          "to": "codeatlasweb-w4e.src.util.validate.ValidationError",
+          "offset": 9
+        }
+      ]
+    },
+    "columns": {
+      "hops": [
+        0,
+        1,
+        2
+      ],
+      "columnOf": {
+        "0": 0,
+        "1": 120,
+        "2": 240
+      },
+      "oneXPerHop": true,
+      "distinctColumns": true,
+      "risesWithHop": true,
+      "rootLeftmost": true
+    },
+    "canvasInHierarchy": {
+      "found": true,
+      "context": true,
+      "contextLost": false,
+      "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)",
+      "width": 439,
+      "height": 303,
+      "litPixels": 3033,
+      "brightest": 255,
+      "brightColumnBands": 8
+    },
+    "canvasMarked": true,
+    "pulse": {
+      "before": "codeatlasweb-w4e.src.services.userService.createUser",
+      "after": "codeatlasweb-w4e.src.repo.db.insert",
+      "ringsBefore": [
+        "codeatlasweb-w4e.src.services.userService.createUser"
+      ],
+      "ringsAfter": [
+        "codeatlasweb-w4e.src.repo.db.insert"
+      ]
+    },
+    "click": {
+      "standing": {
+        "readerPath": "src/repo/db.ts",
+        "twin": "insert",
+        "twinQn": "codeatlasweb-w4e.src.repo.db.insert"
+      },
+      "target": {
+        "key": "codeatlasweb-w4e.src.types.UserEntity",
+        "name": "UserEntity",
+        "file": "src/types.ts",
+        "hop": 1,
+        "x": 120,
+        "y": 180
+      },
+      "after": {
+        "readerPath": "src/types.ts",
+        "twin": "UserEntity",
+        "twinQn": "codeatlasweb-w4e.src.types.UserEntity"
+      }
+    },
+    "backToGalaxy": {
+      "head": {
+        "headline": "76 nodes, 178 edges from /api/layout",
+        "panelMode": "galaxy",
+        "groupPresent": true,
+        "chips": [
+          {
+            "mode": "galaxy",
+            "active": "true",
+            "pressed": "true",
+            "disabled": false,
+            "title": ""
+          },
+          {
+            "mode": "hierarchy",
+            "active": "false",
+            "pressed": "false",
+            "disabled": false,
+            "title": ""
+          }
+        ],
+        "legend": [
+          {
+            "key": "edge-color",
+            "text": "edge colourDEFINES 52USAGE 37IMPORTS 26CALLS 25CONTAINS_FILE 11CONFIGURES 6CONTAINS_FOLDER 6DEFINES_METHOD 6IMPLEMENTS 4RAISES 3CALL_REFERENCE 1HAS_BRANCH 1one colour per edge type, from the table that draws the lines. Counted in this layout, most frequent first. Click a kind to take it out; it stays here, dimmed."
+          },
+          {
+            "key": "node-color",
+            "text": "node colourthe server maps a symbol degree to a stellar spectral colour (layout3d.c, stellar_color): few edges give a red dwarf, many a blue giant. This panel paints what the layout sent."
+          },
+          {
+            "key": "node-size",
+            "text": "node sizea base size per node label plus a boost from the same degree, both computed by the server. A bigger dot means more edges, not more importance."
+          },
+          {
+            "key": "focus",
+            "text": "focusthe focused symbol and its direct neighbours stay bright, everything else dims. The focus follows the twin, and a click in the sky sends it back."
+          },
+          {
+            "key": "positions",
+            "text": "positionsa deterministic layout computed by the server, not by this browser: the same index gives the same sky."
+          }
+        ],
+        "pulseRings": [],
+        "note": ""
+      },
+      "seam": {
+        "mode": "galaxy",
+        "hierarchyAvailable": true,
+        "headline": "76 nodes, 178 edges from /api/layout",
+        "pulsedQn": "",
+        "nodes": 76,
+        "highlightedCount": 6,
+        "targetChanges": 9,
+        "legendEntries": 5,
+        "hierarchy": {
+          "root": "codeatlasweb-w4e.src.services.userService.createUser",
+          "rootName": "createUser",
+          "nodes": 8,
+          "depth": 3,
+          "truncated": false,
+          "cap": 15,
+          "walkDepth": 3,
+          "placements": [
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.createUser",
+              "name": "createUser",
+              "file": "src/services/userService.ts",
+              "hop": 0,
+              "x": 0,
+              "y": 0
+            },
+            {
+              "key": "codeatlasweb-w4e.src.types.UserEntity",
+              "name": "UserEntity",
+              "file": "src/types.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 180
+            },
+            {
+              "key": "codeatlasweb-w4e.src.util.validate.ValidationError",
+              "name": "ValidationError",
+              "file": "src/util/validate.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 108
+            },
+            {
+              "key": "codeatlasweb-w4e.src.repo.db.insert",
+              "name": "insert",
+              "file": "src/repo/db.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 36
+            },
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "name": "listUsers",
+              "file": "src/services/userService.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -36
+            },
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.toUser",
+              "name": "toUser",
+              "file": "src/services/userService.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -108
+            },
+            {
+              "key": "codeatlasweb-w4e.src.util.validate.validateUser",
+              "name": "validateUser",
+              "file": "src/util/validate.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -180
+            },
+            {
+              "key": "codeatlasweb-w4e.src.repo.db.query",
+              "name": "query",
+              "file": "src/repo/db.ts",
+              "hop": 2,
+              "x": 240,
+              "y": 0
+            }
+          ],
+          "edges": [
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.repo.db.insert"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.services.userService.listUsers"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.services.userService.toUser"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.types.UserEntity"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.util.validate.validateUser"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "to": "codeatlasweb-w4e.src.repo.db.query"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.util.validate.validateUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError"
+            }
+          ],
+          "walkEdges": 8,
+          "extraEdges": 3,
+          "extras": [
+            {
+              "type": "RAISES",
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError",
+              "offset": 9
+            },
+            {
+              "type": "CALL_REFERENCE",
+              "from": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "to": "codeatlasweb-w4e.src.services.userService.toUser",
+              "offset": 0
+            },
+            {
+              "type": "RAISES",
+              "from": "codeatlasweb-w4e.src.util.validate.validateUser",
+              "to": "codeatlasweb-w4e.src.util.validate.ValidationError",
+              "offset": 9
+            }
+          ]
+        }
+      },
+      "identity": {
+        "count": 1,
+        "sameElement": true,
+        "mark": "the-one-canvas",
+        "hasContext": true,
+        "contextLost": false
+      },
+      "canvas": {
+        "found": true,
+        "context": true,
+        "contextLost": false,
+        "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)",
+        "width": 439,
+        "height": 226,
+        "litPixels": 3132,
+        "brightest": 255,
+        "brightColumnBands": 4
+      },
+      "legendInHierarchy": [
+        {
+          "key": "edge-color",
+          "text": "edgesCALLS 8RAISES 2CALL_REFERENCE 1one line per call on this walk, cycles included rather than hidden. What else the index records between these symbols is drawn in its own colour: the calls make the columns."
+        },
+        {
+          "key": "positions",
+          "text": "positionscolumns are the call depth from the entry point, and inside a column the symbols are ordered by name. A deterministic projection of the walk, not the server layout: the same walk always draws the same picture."
+        },
+        {
+          "key": "node-color",
+          "text": "node colourno layout entrytaken from the loaded galaxy layout, where the server maps a symbol degree to a stellar spectral colour (layout3d.c, stellar_color). A symbol the layout does not carry stays neutral grey (#8FA3B0): nothing here knows its degree."
+        },
+        {
+          "key": "node-size",
+          "text": "node sizefrom the same layout entry, so a bigger dot means more edges in the whole graph, not more importance and not a deeper place in this walk. Sizes are held inside a band, so that one very large dot cannot push its own name into its neighbour's."
+        },
+        {
+          "key": "focus",
+          "text": "focusthe symbol the reader stands on carries a ring that follows every step of the walk. Nothing else dims here: the whole subgraph is the answer. A click on a node opens its file and takes the twin with it, exactly as in the galaxy."
+        }
+      ]
+    },
+    "legend": {
+      "hierarchyEntries": 5,
+      "galaxyEntries": 5,
+      "positionsInHierarchy": "positionscolumns are the call depth from the entry point, and inside a column the symbols are ordered by name. A deterministic projection of the walk, not the server layout: the same walk always draws the same picture.",
+      "positionsInGalaxy": "positionsa deterministic layout computed by the server, not by this browser: the same index gives the same sky."
+    },
+    "legendSwapped": true,
+    "capped": {
+      "seam": {
+        "mode": "hierarchy",
+        "hierarchyAvailable": true,
+        "headline": "hierarchy of createUser: 3 symbols, depth 2; walk capped at 3 symbols (depth 3), so what follows this is not shown",
+        "pulsedQn": "codeatlasweb-w4e.src.services.userService.createUser",
+        "nodes": 76,
+        "highlightedCount": 3,
+        "targetChanges": 4,
+        "legendEntries": 5,
+        "hierarchy": {
+          "root": "codeatlasweb-w4e.src.services.userService.createUser",
+          "rootName": "createUser",
+          "nodes": 3,
+          "depth": 2,
+          "truncated": true,
+          "cap": 3,
+          "walkDepth": 3,
+          "placements": [
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.createUser",
+              "name": "createUser",
+              "file": "src/services/userService.ts",
+              "hop": 0,
+              "x": 0,
+              "y": 0
+            },
+            {
+              "key": "codeatlasweb-w4e.src.repo.db.insert",
+              "name": "insert",
+              "file": "src/repo/db.ts",
+              "hop": 1,
+              "x": 120,
+              "y": 36
+            },
+            {
+              "key": "codeatlasweb-w4e.src.services.userService.listUsers",
+              "name": "listUsers",
+              "file": "src/services/userService.ts",
+              "hop": 1,
+              "x": 120,
+              "y": -36
+            }
+          ],
+          "edges": [
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.repo.db.insert"
+            },
+            {
+              "from": "codeatlasweb-w4e.src.services.userService.createUser",
+              "to": "codeatlasweb-w4e.src.services.userService.listUsers"
+            }
+          ],
+          "walkEdges": 2,
+          "extraEdges": 0,
+          "extras": []
+        }
+      },
+      "head": {
+        "headline": "hierarchy of createUser: 3 symbols, depth 2; walk capped at 3 symbols (depth 3), so what follows this is not shown",
+        "panelMode": "hierarchy",
+        "groupPresent": true,
+        "chips": [
+          {
+            "mode": "galaxy",
+            "active": "false",
+            "pressed": "false",
+            "disabled": false,
+            "title": ""
+          },
+          {
+            "mode": "hierarchy",
+            "active": "true",
+            "pressed": "true",
+            "disabled": false,
+            "title": ""
+          }
+        ],
+        "legend": [
+          {
+            "key": "edge-color",
+            "text": "edgesCALLS 2one line per call on this walk, cycles included rather than hidden. What else the index records between these symbols is drawn in its own colour: the calls make the columns."
+          },
+          {
+            "key": "positions",
+            "text": "positionscolumns are the call depth from the entry point, and inside a column the symbols are ordered by name. A deterministic projection of the walk, not the server layout: the same walk always draws the same picture."
+          },
+          {
+            "key": "node-color",
+            "text": "node colourno layout entrytaken from the loaded galaxy layout, where the server maps a symbol degree to a stellar spectral colour (layout3d.c, stellar_color). A symbol the layout does not carry stays neutral grey (#8FA3B0): nothing here knows its degree."
+          },
+          {
+            "key": "node-size",
+            "text": "node sizefrom the same layout entry, so a bigger dot means more edges in the whole graph, not more importance and not a deeper place in this walk. Sizes are held inside a band, so that one very large dot cannot push its own name into its neighbour's."
+          },
+          {
+            "key": "focus",
+            "text": "focusthe symbol the reader stands on carries a ring that follows every step of the walk. Nothing else dims here: the whole subgraph is the answer. A click on a node opens its file and takes the twin with it, exactly as in the galaxy."
+          }
+        ],
+        "pulseRings": [
+          "codeatlasweb-w4e.src.services.userService.createUser"
+        ],
+        "note": ""
+      }
+    },
+    "header": {
+      "defaultHead": "hierarchy of createUser: 8 symbols, depth 3",
+      "defaultHonest": true,
+      "cappedHead": "hierarchy of createUser: 3 symbols, depth 2; walk capped at 3 symbols (depth 3), so what follows this is not shown",
+      "cappedHonest": true
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14
+    },
+    "rpcTools": {
+      "index_status": 4,
+      "query_graph": 109,
+      "check_index_coverage": 6,
+      "get_architecture": 2,
+      "search_graph": 4,
+      "get_code_snippet": 7
+    }
+  }
+}
