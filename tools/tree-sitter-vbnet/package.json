@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-vbnet-cbm",
+  "version": "0.1.0-cbm.1",
+  "description": "cbm fork of tree-sitter-vbnet @ 538b708 with CodeGraph's real-world VB.NET patch",
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}

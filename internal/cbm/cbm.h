@@ -292,6 +292,10 @@ typedef struct {
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
+    /* Call matching: defaulted parameters, indexed in declaration order. */
+    uint64_t param_default_mask;
+    uint8_t selector_param_count;
+    const char *call_selector;
     /* C# only: declared namespace of a TOP-LEVEL type, "" for the global
      * namespace (proven only by a clean parse), NULL for nested types, an
      * unknown namespace and every other language. Per type, because the
@@ -343,6 +347,9 @@ typedef struct {
 } CBMCallArg;
 
 #define CBM_MAX_CALL_ARGS 8
+/* Swift trailing-closure capture bound (#2061): more than this on one call
+ * marks the call truncated and the overload matcher fails closed. */
+#define CBM_MAX_TRAILING_CLOSURES 8
 
 /* The qualified name of a C-preprocessor macro (`#define NAME ...` in C, C++,
  * CUDA, Objective-C, GLSL, ISPC) is `<module QN>.<NAME>#macro`. C keeps macros
@@ -394,11 +401,31 @@ typedef struct {
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python only today. Read by the
                                      // weak-local-binding guard. Default false.
+    bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
+                                     // parameter the factory of an enclosing AMD
+                                     // define([...], fn) / require([...], fn) binds to a
+                                     // dependency (#1128). Not an import (no IMPORTS
+                                     // edge): read by the same-module bound-receiver
+                                     // guard. Default false.
     bool receiver_is_self_attribute; // Python member call whose receiver is an attribute
                                      // chain rooted at self/cls but not self/cls itself
                                      // (self.compiler.apply_converters()). An object the
                                      // class owns, not a parameter: read by the weak-member
                                      // guard's unique-name exemption. Default false.
+    bool has_trailing_closure;
+    bool args_truncated;
+    /* Swift multi-trailing-closure capture (#2061). `has_trailing_closure`
+     * stays the "there is at least one trailing closure" flag manual callers
+     * and existing tests set; `trailing_closure_count` is the actual number
+     * captured (0 => fall back to the bool, treated as one unlabelled closure).
+     * `trailing_closure_labels[i]` is closure i's argument label from the
+     * grammar's `lambda_literal (simple_identifier ':')*` sequence (NULL when
+     * unlabelled; entry 0 is always unlabelled). More closures than
+     * CBM_MAX_TRAILING_CLOSURES sets `trailing_closure_truncated`, and the
+     * overload matcher then fails closed rather than guessing a partial set. */
+    uint8_t trailing_closure_count;
+    bool trailing_closure_truncated;
+    const char **trailing_closure_labels;
 } CBMCall;
 
 // What an import statement names, when the syntax says so. Only PHP's
@@ -411,6 +438,10 @@ typedef enum {
 } CBMImportKind;
 
 typedef struct {
+    /* JS/TS: the statement binds no local name (side-effect `import './x'`,
+     * re-export, bare `require('x').y`), so local_name is the path's last segment,
+     * not a binding the file can call through (#1128). Default false. */
+    bool local_name_synthesized;
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
     const char *member;      // ES named import: the exported name the local binds (`get` in
@@ -557,8 +588,14 @@ typedef struct {
 
 typedef struct {
     const char *var_name;          // variable being assigned
-    const char *type_name;         // class/type name of RHS constructor
-    const char *enclosing_func_qn; // QN of enclosing function
+    const char *type_name;         // declared type or RHS constructor type
+    const char *enclosing_func_qn; // enclosing function, class, or module QN
+    uint32_t value_start_byte;     // Swift call initializer span; type_name may be unknown
+    uint32_t value_end_byte;       // exclusive; zero when no initializer call was recorded
+    uint32_t decl_end_byte;        // Swift: the binding is in scope from the end of its
+    uint32_t scope_end_byte;       // declaration to the end of its block; zero = unknown
+    bool constructed;              // Swift: type_name is the type the initializer call
+                                   // constructs (`Foo(...)`), not an annotation or parameter
 } CBMTypeAssign;
 
 // String reference: URL, config key, or async target found in source.

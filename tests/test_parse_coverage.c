@@ -2037,6 +2037,147 @@ TEST(pascal_broken_source_still_flagged_issue2211) {
     PASS();
 }
 
+/* ── VB.NET: the vendored grammar parses real VB.NET (#1178, #1179) ────────
+ * tools/tree-sitter-vbnet (tree-sitter-vbnet + CodeGraph's real-world patch)
+ * is vendored ahead of VB.NET extraction: no CBMLanguage routes to it yet, so
+ * these cases parse through tree_sitter_vbnet() directly. The sample is the
+ * shape extraction must index -- Imports, a WinForms Designer partial class,
+ * Handles, Namespace, Inherits/Implements, MustOverride, #Region, Sub New,
+ * Property, Function -- plus names that begin with a keyword. It is RED on the
+ * alternatives: unpatched upstream leaves ERROR nodes at the Designer's Single
+ * literals (8.25!, 6.0!) and at MustOverride, and the patch revision before
+ * 2026-10-06 turns `Sub NewItem()` into an ERROR and `Public SharedCache` into
+ * a Shared field named Cache. */
+extern const TSLanguage *tree_sitter_vbnet(void);
+
+static const char VB_REAL_SOURCE[] =
+    "Imports System\n"
+    "Imports System.Collections.Generic\n"
+    "Imports System.Windows.Forms\n"
+    "\n"
+    "<Global.Microsoft.VisualBasic.CompilerServices.DesignerGenerated()> _\n"
+    "Partial Class MainForm\n"
+    "    Inherits System.Windows.Forms.Form\n"
+    "\n"
+    "    <System.Diagnostics.DebuggerStepThrough()> _\n"
+    "    Private Sub InitializeComponent()\n"
+    "        Me.btnSave = New System.Windows.Forms.Button()\n"
+    "        Me.SuspendLayout()\n"
+    "        Me.btnSave.Font = New System.Drawing.Font(\"Segoe UI\", 8.25!)\n"
+    "        Me.btnSave.Text = \"Save\"\n"
+    "        Me.AutoScaleDimensions = New System.Drawing.SizeF(6.0!, 13.0!)\n"
+    "        Me.Controls.Add(Me.btnSave)\n"
+    "        Me.ResumeLayout(False)\n"
+    "    End Sub\n"
+    "\n"
+    "    Friend WithEvents btnSave As System.Windows.Forms.Button\n"
+    "End Class\n"
+    "\n"
+    "Partial Class MainForm\n"
+    "    Private Sub btnSave_Click(sender As Object, e As EventArgs) Handles btnSave.Click\n"
+    "        MessageBox.Show(\"Saved\")\n"
+    "    End Sub\n"
+    "End Class\n"
+    "\n"
+    "Namespace Contoso.Billing\n"
+    "    Public MustInherit Class EntityBase\n"
+    "        Public MustOverride Function Describe() As String\n"
+    "    End Class\n"
+    "\n"
+    "    Public Class Customer\n"
+    "        Inherits EntityBase\n"
+    "        Implements IComparable(Of Customer), IDisposable\n"
+    "\n"
+    "#Region \"Fields\"\n"
+    "        Private _name As String\n"
+    "        Public SharedCache As Integer\n"
+    "        Public Dimension As Integer\n"
+    "#End Region\n"
+    "\n"
+    "        Public Sub New(name As String)\n"
+    "            _name = name\n"
+    "        End Sub\n"
+    "\n"
+    "        Public Sub NewItem()\n"
+    "            Dimension = 0\n"
+    "        End Sub\n"
+    "\n"
+    "        Public Property Name As String\n"
+    "            Get\n"
+    "                Return _name\n"
+    "            End Get\n"
+    "            Set(value As String)\n"
+    "                _name = value\n"
+    "            End Set\n"
+    "        End Property\n"
+    "\n"
+    "        Public Overrides Function Describe() As String\n"
+    "            Return _name\n"
+    "        End Function\n"
+    "\n"
+    "        Public Sub Dispose() Implements IDisposable.Dispose\n"
+    "            _name = Nothing\n"
+    "        End Sub\n"
+    "\n"
+    "        Public Function CompareTo(o As Customer) As Integer _\n"
+    "            Implements IComparable(Of Customer).CompareTo\n"
+    "            Return String.Compare(_name, o.Name)\n"
+    "        End Function\n"
+    "    End Class\n"
+    "End Namespace\n";
+
+/* Counts the `identifier` nodes under `node` whose text is exactly `text`. */
+static int vb_identifier_count(TSNode node, const char *src, const char *text) {
+    int hits = 0;
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        uint32_t start = ts_node_start_byte(node);
+        uint32_t len = ts_node_end_byte(node) - start;
+        if (strlen(text) == len && memcmp(src + start, text, len) == 0) {
+            hits++;
+        }
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vb_identifier_count(ts_node_child(node, i), src, text);
+    }
+    return hits;
+}
+
+TEST(vbnet_vendored_grammar_parses_real_vb_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    /* The vendored runtime accepts the generated ABI (15). */
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vbnet()));
+    TSTree *tree =
+        ts_parser_parse_string(parser, NULL, VB_REAL_SOURCE, (uint32_t)strlen(VB_REAL_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_STR_EQ(ts_node_type(root), "source_file");
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* Names that begin with a keyword stay whole identifiers. */
+    ASSERT_GTE(vb_identifier_count(root, VB_REAL_SOURCE, "SharedCache"), 1);
+    ASSERT_GTE(vb_identifier_count(root, VB_REAL_SOURCE, "Dimension"), 1);
+    ASSERT_GTE(vb_identifier_count(root, VB_REAL_SOURCE, "NewItem"), 1);
+    ASSERT_EQ(vb_identifier_count(root, VB_REAL_SOURCE, "Cache"), 0);
+    ASSERT_EQ(vb_identifier_count(root, VB_REAL_SOURCE, "ension"), 0);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vbnet_vendored_grammar_still_flags_broken_source) {
+    static const char broken[] = "Public Class Broken\n    Public Sub (\nEnd Class\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vbnet()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, broken, (uint32_t)strlen(broken));
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
@@ -2100,4 +2241,6 @@ SUITE(parse_coverage) {
     RUN_TEST(pascal_cyrillic_procedure_name_extracted_issue2211);
     RUN_TEST(pascal_ascii_control_still_clean_issue2211);
     RUN_TEST(pascal_broken_source_still_flagged_issue2211);
+    RUN_TEST(vbnet_vendored_grammar_parses_real_vb_clean);
+    RUN_TEST(vbnet_vendored_grammar_still_flags_broken_source);
 }

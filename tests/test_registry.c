@@ -5,6 +5,7 @@
  * resolution strategies, and qualified name computation.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h" /* cbm_python_import_binding_contradicts (#2127) */
 
@@ -281,6 +282,243 @@ TEST(resolve_same_module) {
     ASSERT_STR_EQ(res.qualified_name, "proj.pkg.service.helper");
     ASSERT_STR_EQ(res.strategy, "same_module");
     ASSERT_TRUE(res.confidence >= 0.85);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* #1128: these cases moved from the strategy chain to the call-site guard (the
+ * review of 2026-10-19). The chain stays unchanged - it also resolves type
+ * references, field types, reads/writes, SQL lineage and the cross-LSP pass for
+ * every language - so it still returns the raw same_module candidate, and
+ * cbm_suppress_same_module_bound_receiver decides whether a JS/TS member call
+ * keeps it: refused only when the receiver is bound to an import, to an AMD
+ * dependency, or is a builtin global. `is_method` is what the extractor sets
+ * (false only for a this/super receiver). */
+TEST(resolve_same_module_only_on_self_receiver) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "get", "proj.pkg.service.get", "Function");
+    const CBMLanguage js = CBM_LANG_JAVASCRIPT;
+    const char *mod = "proj.pkg.service";
+    CBMImport axios_import = {.local_name = "axios", .module_path = "axios", .is_default = true};
+    const CBMImportArray imports = {.items = &axios_import, .count = 1, .cap = 1};
+
+    /* Dotted call with an imported receiver (`import axios from 'axios'`,
+     * "axios.get"): the chain still finds the local get by its member name, and
+     * the guard drops the binding. */
+    cbm_resolution_t res1 = cbm_registry_resolve(r, "axios.get", mod, NULL, NULL, 0);
+    ASSERT_STR_EQ(res1.qualified_name, "proj.pkg.service.get");
+    ASSERT_STR_EQ(res1.strategy, "same_module");
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(js, true, "axios.get", res1.qualified_name,
+                                                        res1.strategy, &imports, false));
+    /* The same receiver with no binding fact is an ordinary variable and keeps
+     * the edge: `context.push()` onto an object-literal method stored at
+     * module level is usually right. */
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(js, true, "axios.get", res1.qualified_name,
+                                                         res1.strategy, NULL, false));
+
+    /* Dotted call with delegation pattern ("_get_store().get"): a call result
+     * carries no binding fact, so it is outside this guard and keeps the edge. */
+    cbm_resolution_t res2 = cbm_registry_resolve(r, "_get_store().get", mod, NULL, NULL, 0);
+    ASSERT_STR_EQ(res2.strategy, "same_module");
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(
+        js, true, "_get_store().get", res2.qualified_name, res2.strategy, &imports, false));
+
+    /* Dotted call with self-receiver ("this.get" in JS): unflagged by the
+     * extractor, so the guard keeps it. */
+    cbm_resolution_t res3 = cbm_registry_resolve(r, "this.get", mod, NULL, NULL, 0);
+    ASSERT_STR_EQ(res3.qualified_name, "proj.pkg.service.get");
+    ASSERT_STR_EQ(res3.strategy, "same_module");
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(js, false, "this.get", res3.qualified_name,
+                                                         res3.strategy, &imports, false));
+
+    /* Dotted call with exact module name prefix ("proj.pkg.service.get"): the
+     * whole callee names the target, kept. */
+    cbm_resolution_t res4 = cbm_registry_resolve(r, "proj.pkg.service.get", mod, NULL, NULL, 0);
+    ASSERT_STR_EQ(res4.qualified_name, "proj.pkg.service.get");
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(
+        js, true, "proj.pkg.service.get", res4.qualified_name, res4.strategy, &imports, false));
+
+    /* Dotted call with namespace/module last segment ("service.get"): the
+     * receiver is bound to nothing, kept. */
+    cbm_resolution_t res5 = cbm_registry_resolve(r, "service.get", mod, NULL, NULL, 0);
+    ASSERT_STR_EQ(res5.qualified_name, "proj.pkg.service.get");
+    ASSERT_STR_EQ(res5.strategy, "same_module");
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(
+        js, true, "service.get", res5.qualified_name, res5.strategy, &imports, false));
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* #1128: the guard's binding facts, its keep cases and its language gate. */
+TEST(suppress_same_module_bound_receiver_binding_facts) {
+    const CBMLanguage ts = CBM_LANG_TYPESCRIPT;
+    const char *hit = "proj.src.client.get"; /* <module>.get: the receiver was dropped */
+    CBMImport items[] = {
+        {.local_name = "axios", .module_path = "axios", .is_default = true},
+        {.local_name = "fs", .module_path = "node:fs"},                        /* namespace */
+        {.local_name = "http", .module_path = "./client", .member = "client"}, /* named */
+        {.local_name = "db", .module_path = "../database"},                    /* require */
+        {.local_name = "stream", .module_path = "node:stream", .local_name_synthesized = true},
+    };
+    const CBMImportArray imports = {.items = items, .count = 5, .cap = 5};
+
+    /* Refused: each binding fact on its own. */
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "axios.get", hit, "same_module",
+                                                        &imports, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "fs.get", hit, "same_module",
+                                                        &imports, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "http.get", hit, "same_module",
+                                                        &imports, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "db.get", hit, "same_module",
+                                                        &imports, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "api.get", hit, "same_module",
+                                                        NULL, true)); /* AMD dependency */
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "console.get", hit, "same_module",
+                                                        NULL, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "Math.get", hit, "same_module",
+                                                        NULL, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "window.get", hit, "same_module",
+                                                        NULL, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "axios?.get", hit, "same_module",
+                                                        &imports, false));
+    ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(ts, true, "axios.defaults.get",
+                                                        "proj.src.client.defaults.get",
+                                                        "same_module", &imports, false));
+
+    /* Kept: a synthesized local (`require('node:stream').Readable` binds no
+     * `stream`), an unbound receiver, CommonJS `exports`/`module`, a near-miss
+     * of a builtin or import name, no identifier receiver. */
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "stream.get", hit, "same_module",
+                                                         &imports, false));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "context.get", hit,
+                                                         "same_module", &imports, false));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "exports.get", hit,
+                                                         "same_module", &imports, false));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "module.exports.get",
+                                                         "proj.src.client.exports.get",
+                                                         "same_module", &imports, false));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "consoles.get", hit,
+                                                         "same_module", &imports, false));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "axio.get", hit, "same_module",
+                                                         &imports, false));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "_store().get", hit,
+                                                         "same_module", &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "get", hit, "same_module",
+                                                         &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "9x.get", hit, "same_module",
+                                                         &imports, false));
+
+    /* Kept: the whole-callee lookup matched (the receiver is part of the hit),
+     * another strategy, an unflagged call, malformed input. */
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(
+        ts, true, "axios.get", "proj.src.client.axios.get", "same_module", &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "axios.get", hit, "unique_name",
+                                                         &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "axios.get", hit, "import_map",
+                                                         &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "axios.get", hit,
+                                                         "lsp_ts_method", &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, false, "axios.get", hit, "same_module",
+                                                         &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, NULL, hit, "same_module",
+                                                         &imports, true));
+    ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(ts, true, "axios.get", NULL, "same_module",
+                                                         &imports, true));
+    ASSERT_FALSE(
+        cbm_suppress_same_module_bound_receiver(ts, true, "axios.get", hit, NULL, &imports, true));
+
+    /* Language gate: the JS/TS family and the <script> hosts are in; Go never
+     * (flat receiver-method QNs only this lookup reaches); Python, PHP are not. */
+    static const CBMLanguage in[] = {CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_TSX,
+                                     CBM_LANG_ARKTS,      CBM_LANG_HTML,       CBM_LANG_VUE,
+                                     CBM_LANG_SVELTE,     CBM_LANG_ASTRO};
+    for (size_t i = 0; i < sizeof(in) / sizeof(in[0]); i++) {
+        ASSERT_TRUE(cbm_suppress_same_module_bound_receiver(in[i], true, "console.get", hit,
+                                                            "same_module", &imports, false));
+    }
+    static const CBMLanguage out[] = {CBM_LANG_GO, CBM_LANG_PYTHON, CBM_LANG_PHP};
+    for (size_t i = 0; i < sizeof(out) / sizeof(out[0]); i++) {
+        ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(out[i], true, "console.get", hit,
+                                                             "same_module", &imports, true));
+    }
+    PASS();
+}
+
+/* #1128: these cases asked the name-only strategies (3/4) to refuse a member
+ * call whose receiver contradicts the candidate. The chain stays unchanged (the
+ * review of 2026-10-19), so they are answered at the call site instead: for the
+ * JS/TS family the weak-member guard (#592/#606) drops a member call bound by a
+ * name-only strategy, which every negative case below is, and the positive cases
+ * resolve as before and pass both guards. */
+TEST(resolve_qualified_receiver_awareness) {
+    cbm_registry_t *r = cbm_registry_new();
+    const CBMLanguage js = CBM_LANG_JAVASCRIPT;
+
+    /* 1. Register a Method candidate under Class Service: proj.pkg.Service.get */
+    cbm_registry_add(r, "Service", "proj.pkg.Service", "Class");
+    cbm_registry_add(r, "get", "proj.pkg.Service.get", "Method");
+
+    /* 2. Register a Module axios */
+    cbm_registry_add(r, "axios", "proj.axios", "Module");
+
+    /* Test Case A: Unrelated receiver that is a known module/type -> name-only
+     * guess, dropped by the member guard */
+    /* axios.get called, axios is a known Module */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "axios.get", "proj.app", NULL, NULL, 0);
+        ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, res.strategy));
+    }
+
+    /* Test Case B: Unrelated receiver that is an imported receiver -> name-only
+     * guess, dropped by the member guard */
+    /* other_service.get called, other_service is an imported alias/key mapping to OtherService */
+    {
+        const char *keys[] = {"other_service"};
+        const char *vals[] = {"proj.pkg.OtherService"};
+        cbm_resolution_t res =
+            cbm_registry_resolve(r, "other_service.get", "proj.app", keys, vals, 1);
+        ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, res.strategy));
+    }
+
+    /* Test Case B2: Related receiver that is an imported receiver -> should resolve */
+    /* my_service.get called, my_service is an imported alias/key mapping to Service */
+    {
+        const char *keys[] = {"my_service"};
+        const char *vals[] = {"proj.pkg.Service"};
+        cbm_resolution_t res = cbm_registry_resolve(r, "my_service.get", "proj.app", keys, vals, 1);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+        ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, res.strategy));
+        ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(
+            js, true, "my_service.get", res.qualified_name, res.strategy, NULL, false));
+    }
+
+    /* Test Case D: Fully qualified receiver matching the candidate's parent path -> should resolve
+     */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "Service.get", "proj.app", NULL, NULL, 0);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+        ASSERT_FALSE(cbm_suppress_same_module_bound_receiver(
+            js, true, "Service.get", res.qualified_name, res.strategy, NULL, false));
+    }
+
+    /* Test Case E: Double colon C++/Perl style qualification (e.g. Service::get) -> should resolve
+     */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "Service::get", "proj.app", NULL, NULL, 0);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+    }
+
+    /* Test Case F: Function candidate behind an unrelated receiver -> name-only
+     * guess, dropped by the member guard */
+    /* Register unique Function helper.compute */
+    cbm_registry_add(r, "compute", "proj.pkg.helper.compute", "Function");
+    {
+        cbm_resolution_t res =
+            cbm_registry_resolve(r, "unrelated.compute", "proj.app", NULL, NULL, 0);
+        ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, res.strategy));
+    }
 
     cbm_registry_free(r);
     PASS();
@@ -966,11 +1204,11 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
 
     /* Proximity outranks the tie order: the sibling wins over a shallower stranger. */
-    cbm_registry_t *near = cbm_registry_new();
-    cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
-    cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
+    cbm_registry_t *proximity = cbm_registry_new();
+    cbm_registry_add(proximity, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
+    cbm_registry_add(proximity, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
                      "Function");
-    cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
+    cbm_resolution_t nr = cbm_registry_resolve(proximity, "vnic_rq_free",
                                                "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
     ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
 
@@ -978,7 +1216,7 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     cbm_registry_free(backward);
     cbm_registry_free(lex_a);
     cbm_registry_free(lex_b);
-    cbm_registry_free(near);
+    cbm_registry_free(proximity);
     PASS();
 }
 
@@ -2059,10 +2297,10 @@ TEST(external_import_shadow_declared_package_kept) {
 
     /* The walk is by dotted segment, not by substring: a tree that declares
      * "org.example.tests" must not claim "org.example.testsuite.helper". */
-    CBMImport near[] = {
+    CBMImport adjacent_imports[] = {
         {.local_name = "near", .module_path = "org.example.testsuite.helper.near"},
     };
-    CBMImportArray narr = {.items = near, .count = 1, .cap = 1};
+    CBMImportArray narr = {.items = adjacent_imports, .count = 1, .cap = 1};
     CBMHashTable *prefix_only = cbm_ht_create(8);
     ASSERT_NOT_NULL(prefix_only);
     cbm_ht_set(prefix_only, "org.example.tests", (void *)"qn");
@@ -2173,6 +2411,464 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
         cbm_registry_resolve(r, "user_logged_in.send", "proj.auth.views", keys, vals, 1);
     ASSERT_STR_EQ(res.qualified_name, "proj.auth.signals.user_logged_in.send");
     ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(swift_overload_labels_defaults_and_trailing_closure) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    const char *qns[] = {
+        "proj.Service.work(flag:Bool)",
+        "proj.Service.work(name:String)",
+        "proj.Service.work(name:Int)",
+        "proj.Other.work(name:String)",
+        "proj.Service.send(value:Int,completion:()=>Void)",
+        "proj.Service.configure(a:Int,b:Int,c:Int)",
+        "proj.Service.consume(values:[()=>Void])",
+        "proj.Service.consume(completion:()=>Void)",
+        "proj.Service.accept(value:Pair<()=>Void,Int>)",
+        "proj.Service.perform(completion:(()=>Void)?)",
+        "proj.Service.perform(completion:((Int)=>Void))",
+        "proj.Service.perform(completion:(()=>Void,Int))",
+        "proj.Service.perform(completion:(()=>Result<Int,Error>)?)",
+        "proj.Service.collect(_:Int~)",
+        "proj.Service.named(name:Int~)",
+        "proj.Service.run(completion:()=>Void,flag:Bool)",
+        "proj.Service.batch(completions:(()=>Void)~)",
+        "proj.Service.sheet(onDismiss:(()=>Void)?,content:()=>Void)",
+        "proj.Service.combine(callbacks:(()=>Void)~,completion:()=>Void)",
+        "proj.Service.repeated(x:Int,x:Int)",
+        "proj.Service.repeated(x:String,x:String)",
+        "proj.Service.unlabeled(_:Int,_:Int)",
+    };
+    const char *names[] = {"work",    "work",     "work",     "work",     "send",    "configure",
+                           "consume", "consume",  "accept",   "perform",  "perform", "perform",
+                           "perform", "collect",  "named",    "run",      "batch",   "sheet",
+                           "combine", "repeated", "repeated", "unlabeled"};
+    const uint8_t counts[] = {1, 1, 1, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2};
+    for (int i = 0; i < 22; i++) {
+        cbm_registry_add(r, names[i], qns[i], "Method");
+        uint64_t defaults = (i == 5 || i == 15)  ? UINT64_C(1) << 1
+                            : i == 17 || i >= 19 ? UINT64_C(1)
+                                                 : 0;
+        cbm_registry_set_swift_signature(r, qns[i], defaults, counts[i], NULL);
+    }
+
+    const char *out[8] = {0};
+    const char *generic_qns[] = {"proj.Service.constrained<T;where T==()=>Void>(_:T)",
+                                 "proj.Service.constrained<T>(_:T)async"};
+    for (int i = 0; i < 2; i++) {
+        cbm_registry_add(r, "constrained", generic_qns[i], "Method");
+        cbm_registry_set_swift_signature(r, generic_qns[i], 0, 1, NULL);
+    }
+    CBMCallArg generic_arg = {0};
+    CBMCall generic_call = {
+        .callee_name = "Service.constrained", .args = &generic_arg, .arg_count = 1};
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &generic_call, "proj.Caller", NULL, 0, out, 8), 2);
+    const char *nested = "proj.Service.nested<T,U;where T==Box<[Int]>,U==()=>Void>(_:T)=>Int";
+    cbm_registry_add(r, "nested", nested, "Method");
+    cbm_registry_set_swift_signature(r, nested, 0, 1, NULL);
+    generic_call.callee_name = "Service.nested";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &generic_call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], nested);
+    const char *returns[] = {"proj.Service.pick()=>Int",
+                             "proj.Service.pick()async=>(A/Item)=>B/Item"};
+    for (int i = 0; i < 2; i++) {
+        cbm_registry_add(r, "pick", returns[i], "Method");
+        cbm_registry_set_swift_signature(r, returns[i], 0, 0, NULL);
+    }
+    CBMCall returned = {.callee_name = "Service.pick"};
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &returned, "proj.Caller", NULL, 0, out, 8), 2);
+    const char *malformed[] = {"proj.Service.bad()=>", "proj.Service.bad()=>[Int",
+                               "proj.Service.bad()=>Int)"};
+    for (int i = 0; i < 3; i++) {
+        cbm_registry_add(r, "bad", malformed[i], "Method");
+        cbm_registry_set_swift_signature(r, malformed[i], 0, 0, NULL);
+    }
+    returned.callee_name = "Service.bad";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &returned, "proj.Caller", NULL, 0, out, 8), -1);
+    const char *operators[] = {"<", ">"};
+    for (int i = 0; i < 2; i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "proj.Service.%s(_:A,_:A)=>Bool", operators[i]);
+        cbm_registry_add(r, operators[i], qn, "Method");
+        cbm_registry_set_swift_signature(r, qn, 0, 2, NULL);
+        CBMCallArg operands[2] = {{0}};
+        CBMCall operation = {.callee_name = operators[i], .args = operands, .arg_count = 2};
+        ASSERT_EQ(cbm_registry_swift_candidates(r, &operation, "proj.Caller", NULL, 0, out, 8), 1);
+        ASSERT_STR_EQ(out[0], qn);
+    }
+    CBMCallArg args[3] = {{.keyword = "name"}};
+    CBMCall call = {.callee_name = "Service.work", .args = args, .arg_count = 1};
+    int n = cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8);
+    ASSERT_EQ(n, 2); /* type is unknown: keep both compatible overloads */
+    ASSERT_TRUE((strcmp(out[0], qns[1]) == 0 && strcmp(out[1], qns[2]) == 0) ||
+                (strcmp(out[0], qns[2]) == 0 && strcmp(out[1], qns[1]) == 0));
+
+    args[0].keyword = "flag";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[0]);
+
+    args[1].keyword = "unexpected";
+    call.arg_count = 2;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    call.arg_count = 0;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    call.arg_count = 1;
+    call.has_trailing_closure = true;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    call.has_trailing_closure = false;
+
+    args[1].keyword = NULL;
+    args[0].keyword = "missing";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+
+    args[0].keyword = "a";
+    args[1].keyword = "c";
+    call.callee_name = "configure";
+    call.arg_count = 2;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[5]);
+
+    /* The first default must remain skippable even when its label matches
+     * the argument needed by the following required parameter. */
+    call.callee_name = "Service.repeated";
+    call.arg_count = 1;
+    args[0].keyword = "x";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 2);
+    call.arg_count = 2;
+    args[1].keyword = "x";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 2);
+    call.arg_count = 0;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    call.arg_count = 1;
+    args[0].keyword = "wrong";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    call.callee_name = "Service.unlabeled";
+    args[0].keyword = NULL;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[21]);
+
+    args[0].keyword = "value";
+    call.callee_name = "send";
+    call.arg_count = 1;
+    call.has_trailing_closure = true;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[4]);
+    call.callee_name = "Service.consume";
+    call.arg_count = 0;
+    call.has_trailing_closure = true;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[7]);
+    call.callee_name = "Service.accept";
+    call.arg_count = 1;
+    call.has_trailing_closure = false;
+    args[0].keyword = "value";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[8]);
+    call.callee_name = "Service.perform";
+    call.arg_count = 0;
+    call.has_trailing_closure = true;
+    n = cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8);
+    ASSERT_EQ(n, 3); /* wrappers transparent; tuple must not match */
+    bool has_optional = false, has_grouped = false, has_generic_result = false;
+    for (int i = 0; i < n; i++) {
+        has_optional |= strcmp(out[i], qns[9]) == 0;
+        has_grouped |= strcmp(out[i], qns[10]) == 0;
+        has_generic_result |= strcmp(out[i], qns[12]) == 0;
+    }
+    ASSERT_TRUE(has_optional && has_grouped && has_generic_result);
+
+    call.callee_name = "run";
+    call.arg_count = 0;
+    call.has_trailing_closure = true;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[15]); /* trailing closure before defaulted parameter */
+    call.callee_name = "batch";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[16]); /* variadic closure accepts trailing closure */
+    call.arg_count = 1;
+    args[0].keyword = "completions";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[16]); /* explicit and trailing variadic closures */
+    call.arg_count = 0;
+
+    call.callee_name = "sheet";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[17]); /* skip default closure for required trailing closure */
+    call.callee_name = "combine";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    ASSERT_STR_EQ(out[0], qns[18]); /* skip variadic closures for required trailing closure */
+    call.has_trailing_closure = false;
+    args[1].keyword = NULL;
+    call.callee_name = "collect";
+    call.arg_count = 0;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    args[0].keyword = NULL;
+    call.arg_count = 2;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    call.arg_count = 3;
+    args[2].keyword = NULL;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    args[0].keyword = "name";
+    call.callee_name = "named";
+    call.arg_count = 1;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    args[1].keyword = NULL;
+    call.arg_count = 2;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), 1);
+    args[0].keyword = "other";
+    call.arg_count = 1;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    args[0].keyword = "name";
+    args[1].keyword = "name";
+    call.arg_count = 2;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 8), -1);
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(swift_manifest_root_targets_respect_nested_package_boundaries) {
+    char *root = th_mktempdir("cbm_swift_root_targets");
+    ASSERT_NOT_NULL(root);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Package.swift"),
+                            "let package = Package(name: \"Product\", targets: ["
+                            ".target(name: \"Core\", path: \".\")])\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Nested/Package.swift"),
+                            "let package = Package(name: \"Nested\", targets: ["
+                            ".target(name: \"Core\", path: \".\")])\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Unknown/Package.swift"),
+                            "let package = Package(name: \"Unknown\", targets: ["
+                            ".target(name: \"Computed\", path: computed)])\n"),
+              0);
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", root);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(graph);
+    const char *qns[] = {"proj.Root.Type.Service", "proj.Root.Ext.Service",
+                         "proj.Nested.Type.Service", "proj.Nested.Ext.Service",
+                         "proj.Unknown.Ext.Service"};
+    const char *files[] = {"Core/Types.swift", "Extra/Extensions.swift", "Nested/Core/Types.swift",
+                           "Nested/Extra/Extensions.swift", "Unknown/Extra/Extensions.swift"};
+    const char *methods[] = {"proj.Root.Ext.Service.run()", "proj.Nested.Ext.Service.run()",
+                             "proj.Unknown.Ext.Service.run()"};
+    for (int i = 0; i < 5; i++) {
+        cbm_registry_add(r, "Service", qns[i], "Class");
+        ASSERT_GT(cbm_gbuf_upsert_node(graph, "Class", "Service", qns[i], files[i], 1, 3,
+                                       i == 0 || i == 2 ? "{\"swift_type_path\":\"Service\"}"
+                                                        : "{\"swift_extension\":\"Service\"}"),
+                  0);
+    }
+    for (int i = 0; i < 3; i++) {
+        cbm_registry_add(r, "run", methods[i], "Method");
+        cbm_registry_set_swift_signature(r, methods[i], 0, 0, "()");
+    }
+    cbm_registry_build_swift_owners(r, graph, root, NULL, 0);
+    CBMCall call = {.callee_name = "Service.run"};
+    const char *out[4] = {0};
+    ASSERT_EQ(cbm_registry_swift_candidates_in_file(r, &call, NULL, graph, "proj.Root.Type", NULL,
+                                                    0, out, 4),
+              1);
+    ASSERT_STR_EQ(out[0], methods[0]);
+    ASSERT_EQ(cbm_registry_swift_candidates_in_file(r, &call, NULL, graph, "proj.Nested.Type", NULL,
+                                                    0, out, 4),
+              1);
+    ASSERT_STR_EQ(out[0], methods[1]);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "Package.swift"),
+                            "let package = Package(name: \"Product\", targets: ["
+                            ".target(name: \"Core\", path: \".\"),"
+                            ".target(name: \"Other\", path: \".\")])\n"),
+              0);
+    cbm_registry_build_swift_owners(r, graph, root, NULL, 0);
+    ASSERT_EQ(cbm_registry_swift_candidates_in_file(r, &call, NULL, graph, "proj.Root.Type", NULL,
+                                                    0, out, 4),
+              -1);
+    cbm_registry_free(r);
+    cbm_gbuf_free(graph);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
+TEST(swift_receiver_resolution_is_independent_of_registration_order) {
+    const char *alpha = "proj.alpha.Service.work(flag:Bool)";
+    const char *beta = "proj.beta.Service.work(flag:Bool)";
+    CBMCallArg arg = {.keyword = "flag"};
+    CBMCall call = {.callee_name = "Service.work", .args = &arg, .arg_count = 1};
+    for (int reverse = 0; reverse < 2; reverse++) {
+        cbm_registry_t *r = cbm_registry_new();
+        ASSERT_NOT_NULL(r);
+        cbm_registry_add(r, "Service", "proj.alpha.Service", "Class");
+        cbm_registry_add(r, "Service", "proj.beta.Service", "Class");
+        const char *first = reverse ? beta : alpha;
+        const char *second = reverse ? alpha : beta;
+        cbm_registry_add(r, "work", first, "Method");
+        cbm_registry_add(r, "work", second, "Method");
+        cbm_registry_set_swift_signature(r, first, 0, 1, NULL);
+        cbm_registry_set_swift_signature(r, second, 0, 1, NULL);
+
+        const char *out[4] = {0};
+        ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.alpha.Caller", NULL, 0, out, 4), 1);
+        ASSERT_STR_EQ(out[0], alpha);
+        cbm_registry_free(r);
+    }
+    PASS();
+}
+
+/* Two trailing closures bind positionally: the first (unlabelled) to the
+ * first free closure parameter, later ones by their exact label (#2061).
+ * `handle { } onError: { }` can only be the two-closure overload; a wrong
+ * second label matches neither overload. */
+TEST(swift_multiple_trailing_closures_match_labels) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    const char *one_qn = "proj.Service.handle(completion:()=>Void)";
+    const char *two_qn = "proj.Service.handle(completion:()=>Void,onError:()=>Void)";
+    cbm_registry_add(r, "handle", one_qn, "Method");
+    cbm_registry_add(r, "handle", two_qn, "Method");
+    cbm_registry_set_swift_signature(r, one_qn, 0, 1, NULL);
+    cbm_registry_set_swift_signature(r, two_qn, 0, 2, NULL);
+
+    const char *good[2] = {NULL, "onError"};
+    CBMCall call = {.callee_name = "Service.handle",
+                    .has_trailing_closure = true,
+                    .trailing_closure_count = 2,
+                    .trailing_closure_labels = good};
+    const char *out[4] = {0};
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], two_qn);
+
+    /* A second closure whose label matches no parameter matches nothing. */
+    const char *bad[2] = {NULL, "unknown"};
+    call.trailing_closure_labels = bad;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), -1);
+
+    /* Two closures cannot fit the one-closure overload even with no labels. */
+    const char *anon[2] = {NULL, NULL};
+    call.trailing_closure_labels = anon;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), -1);
+
+    call.trailing_closure_count = 1;
+    call.trailing_closure_truncated = true;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), -1);
+    call.trailing_closure_count = 2;
+    call.trailing_closure_truncated = false;
+
+    /* A later label satisfies its required closure, so the first unlabelled
+     * closure can skip an earlier defaulted closure and bind the required one. */
+    const char *delayed_qn =
+        "proj.Service.delayed(onDismiss:(()=>Void)?,content:()=>Void,onError:(()=>Void)?)";
+    cbm_registry_add(r, "delayed", delayed_qn, "Method");
+    cbm_registry_set_swift_signature(r, delayed_qn, (UINT64_C(1) << 0) | (UINT64_C(1) << 2), 3,
+                                     NULL);
+    call.callee_name = "Service.delayed";
+    call.trailing_closure_labels = good;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], delayed_qn);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Repeated external labels must stop the default-skip lookahead at the
+ * next trailing label, even if a still later closure has the same label. */
+TEST(swift_repeated_labels_skip_default_before_next_trailing_label) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    const char *qn = "proj.Service.repeated(a:()=>Void,b:()=>Void,a:()=>Void,b:()=>Void)";
+    cbm_registry_add(r, "repeated", qn, "Method");
+    cbm_registry_set_swift_signature(r, qn, (UINT64_C(1) << 0) | (UINT64_C(1) << 3), 4, NULL);
+    const char *labels[3] = {NULL, "a", "b"};
+    CBMCall call = {.callee_name = "Service.repeated",
+                    .has_trailing_closure = true,
+                    .trailing_closure_count = 3,
+                    .trailing_closure_labels = labels};
+    const char *out[4] = {0};
+    /* Parameter 1 is required before the next label at parameter 2, so
+     * parameter 0 uses its default and the closures bind parameters 1-3. */
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], qn);
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(swift_repeated_labels_do_not_skip_default_past_next_trailing_label) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    const char *qn = "proj.Service.repeated(a:()=>Void,b:()=>Void,a:()=>Void,b:()=>Void)";
+    cbm_registry_add(r, "repeated", qn, "Method");
+    cbm_registry_set_swift_signature(r, qn, (UINT64_C(1) << 0) | (UINT64_C(1) << 1), 4, NULL);
+    const char *labels[2] = {NULL, "b"};
+    CBMCall call = {.callee_name = "Service.repeated",
+                    .has_trailing_closure = true,
+                    .trailing_closure_count = 2,
+                    .trailing_closure_labels = labels};
+    const char *out[4] = {0};
+    /* The next label matches parameter 1 immediately. The first closure
+     * binds parameter 0, leaving required parameters 2 and 3 unsupplied. */
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), -1);
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A variadic closure parameter already skipped by the parenthesized
+ * flag argument cannot consume an earlier trailing closure. */
+TEST(swift_variadic_trailing_closures_do_not_precede_parenthesized_argument) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    const char *qn = "proj.Service.f(callbacks:(()=>Void)~,flag:Bool,done:()=>Void)";
+    cbm_registry_add(r, "f", qn, "Method");
+    cbm_registry_set_swift_signature(r, qn, UINT64_C(1) << 1, 3, NULL);
+    CBMCallArg arg = {.keyword = "flag"};
+    const char *labels[2] = {NULL, "done"};
+    CBMCall call = {.callee_name = "Service.f",
+                    .args = &arg,
+                    .arg_count = 1,
+                    .has_trailing_closure = true,
+                    .trailing_closure_count = 2,
+                    .trailing_closure_labels = labels};
+    const char *out[4] = {0};
+    /* f(flag: true) { } done: { } cannot fill callbacks after flag was
+     * supplied. Only the done parameter remains for two trailing closures. */
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), -1);
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(swift_overloaded_bucket_fails_closed) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    const char *first_qn = "proj.Service.work(flag:Bool)";
+    cbm_registry_add(r, "work", first_qn, "Method");
+    cbm_registry_set_swift_signature(r, first_qn, 0, 1, NULL);
+    const char *other = "proj.Other.work(flag:Bool)";
+    cbm_registry_add(r, "work", other, "Method");
+    cbm_registry_set_swift_signature(r, other, 0, 1, NULL);
+    char qns[256][64];
+    for (int i = 1; i < 256; i++) {
+        snprintf(qns[i], sizeof(qns[i]), "proj.Other%d.work(flag:Bool)", i);
+        cbm_registry_add(r, "work", qns[i], "Method");
+        cbm_registry_set_swift_signature(r, qns[i], 0, 1, NULL);
+    }
+    CBMCall call = {.callee_name = "Service.work"};
+    const char *out[4] = {0};
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), -1);
+    CBMCallArg arg = {.keyword = "flag"};
+    call.args = &arg;
+    call.arg_count = 1;
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], first_qn);
+    call.callee_name = "work";
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Service", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], first_qn);
     cbm_registry_free(r);
     PASS();
 }
@@ -2552,7 +3248,7 @@ TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
  * index: discovery order; incremental: node-id order), and the lexical walk of
  * a caller in layout.py never enters the __init__ function. */
 TEST(registry_python_local_bound_at_own_file_issue1548) {
-    const size_t init_prefix = strlen("proj.pkg");      /* pkg/__init__.py */
+    const size_t init_prefix = strlen("proj.pkg");       /* pkg/__init__.py */
     const size_t mod_prefix = strlen("proj.pkg.layout"); /* pkg/layout.py */
     for (int order = 0; order < 2; order++) {
         cbm_registry_t *r = cbm_registry_new();
@@ -2593,8 +3289,8 @@ TEST(registry_python_local_bound_at_own_file_issue1548) {
 /* The prefix every def of a file carries, without allocating; the same as
  * cbm_pipeline_fqn_compute(project, path, name) minus ".name". */
 TEST(fqn_symbol_prefix_len_matches_fqn_compute) {
-    static const char *const paths[] = {"pkg/layout.py", "pkg/__init__.py", "a.py",
-                                        "deep/x/y/mod.py", "web/index.py", "noext"};
+    static const char *const paths[] = {"pkg/layout.py",   "pkg/__init__.py", "a.py",
+                                        "deep/x/y/mod.py", "web/index.py",    "noext"};
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         char *qn = cbm_pipeline_fqn_compute("proj", paths[i], "sym");
         ASSERT_NOT_NULL(qn);
@@ -2642,6 +3338,8 @@ SUITE(registry) {
     RUN_TEST(registry_no_duplicates);
     /* Resolution */
     RUN_TEST(resolve_same_module);
+    RUN_TEST(resolve_same_module_only_on_self_receiver);
+    RUN_TEST(suppress_same_module_bound_receiver_binding_facts);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
     RUN_TEST(registry_indexes_by_passed_name_not_qn_tail);
@@ -2651,7 +3349,16 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
+    RUN_TEST(swift_receiver_resolution_is_independent_of_registration_order);
+    RUN_TEST(swift_manifest_root_targets_respect_nested_package_boundaries);
+    RUN_TEST(swift_overload_labels_defaults_and_trailing_closure);
+    RUN_TEST(swift_multiple_trailing_closures_match_labels);
+    RUN_TEST(swift_repeated_labels_skip_default_before_next_trailing_label);
+    RUN_TEST(swift_repeated_labels_do_not_skip_default_past_next_trailing_label);
+    RUN_TEST(swift_variadic_trailing_closures_do_not_precede_parenthesized_argument);
+    RUN_TEST(swift_overloaded_bucket_fails_closed);
     RUN_TEST(resolve_unique_name);
+    RUN_TEST(resolve_qualified_receiver_awareness);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */
