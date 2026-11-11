@@ -14,6 +14,8 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "discover/discover.h"
+#include "helpers.h" /* cbm_fqn_module_source_lang */
+#include "foundation/arena.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
@@ -4277,7 +4279,7 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
 
 typedef struct {
     char *namespace_name; /* dot-normalized package clause */
-    char *module_qn;      /* language-aware module QN of the declaring file */
+    char *module_qn;      /* language-aware module QN of the declaring file (qn_arena) */
 } scala_file_entry_t;
 
 typedef struct {
@@ -4285,21 +4287,21 @@ typedef struct {
     cbm_scala_index_t *index;
 } scala_index_build_t;
 
-/* The module QN a file's top-level symbols hang off. Directory-module
- * languages (Java, Go) put `class Outer` in Outer.java at <dir>.Outer, so
- * <dir> is the module and Outer's methods and nested types sit two segments
- * below it; stem-module languages (Scala `object Foo` in Foo.scala is
- * Foo.Foo) use the file stem. MUST match cbm_lang_module_is_dir()
- * (internal/cbm/helpers.c). */
-static bool pkgmap_module_is_dir(const char *rel) {
+/* The language whose module QN a file's top-level symbols hang off.
+ * Directory-module languages (Java, Go) put `class Outer` in Outer.java at
+ * <dir>.Outer, so <dir> is the module and Outer's methods and nested types
+ * sit two segments below it; stem-module languages (Scala `object Foo` in
+ * Foo.scala is Foo.Foo) use the file stem. The module QN itself comes from
+ * cbm_fqn_module_source_lang, the helper the extractor's definition QNs are
+ * built with, so both sides apply the same rule. */
+static CBMLanguage pkgmap_file_language(const char *rel) {
     const char *base = rel;
     for (const char *p = rel; *p; p++) {
         if (*p == '/' || *p == '\\') {
             base = p + SKIP_ONE;
         }
     }
-    CBMLanguage lang = cbm_language_for_filename(base);
-    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+    return cbm_language_for_filename(base);
 }
 
 /* Keep the two smallest File nodes of a package (see scala_package_files_t). */
@@ -4387,8 +4389,7 @@ static void scala_index_free_file_entry(const char *key, void *value, void *ud) 
     (void)key; /* borrowed from the caller's rels array */
     (void)ud;
     scala_file_entry_t *fe = value;
-    cbm_free(CBM_MEM_CLASS_OTHER, fe->namespace_name);
-    free(fe->module_qn); /* malloc'd by cbm_pipeline_fqn_module_dir */
+    cbm_free(CBM_MEM_CLASS_OTHER, fe->namespace_name); /* module_qn lives in qn_arena */
     cbm_free(CBM_MEM_CLASS_OTHER, fe);
 }
 
@@ -4429,6 +4430,8 @@ static cbm_scala_index_t *scala_index_build(const cbm_pipeline_ctx_t *ctx,
     if (!b.index) {
         return NULL;
     }
+    CBMArena qn_arena; /* the declaring files' module QNs, build-time only */
+    cbm_arena_init(&qn_arena);
     for (int i = 0; i < count; i++) {
         if (!namespaces[i] || !namespaces[i][0] || !rels[i]) {
             continue;
@@ -4444,8 +4447,8 @@ static cbm_scala_index_t *scala_index_build(const cbm_pipeline_ctx_t *ctx,
             continue;
         }
         fe->namespace_name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, namespaces[i]);
-        fe->module_qn =
-            cbm_pipeline_fqn_module_dir(ctx->project_name, rels[i], pkgmap_module_is_dir(rels[i]));
+        fe->module_qn = cbm_fqn_module_source_lang(&qn_arena, ctx->project_name, rels[i],
+                                                   pkgmap_file_language(rels[i]));
         if (!fe->namespace_name || !fe->module_qn) {
             scala_index_free_file_entry(rels[i], fe, NULL);
             continue;
@@ -4461,12 +4464,14 @@ static cbm_scala_index_t *scala_index_build(const cbm_pipeline_ctx_t *ctx,
         }
     }
     if (!b.files) {
+        cbm_arena_destroy(&qn_arena);
         scala_index_free(b.index);
         return NULL;
     }
     cbm_gbuf_foreach_node(ctx->gbuf, scala_index_visit_node, &b);
     cbm_ht_foreach(b.files, scala_index_free_file_entry, NULL);
     cbm_ht_free(b.files);
+    cbm_arena_destroy(&qn_arena);
     return b.index;
 }
 
