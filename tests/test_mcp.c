@@ -22877,7 +22877,10 @@ TEST(tool_underscore_projects_visible_in_cache_scans) {
                   issue704_make_db(cache, "_renamed.db", "uscore-drift", "uscore_drift_fn") &&
                   issue704_make_db(cache, "_config-extra.db", "_config-extra", "uscore_extra_fn") &&
                   issue704_make_db(cache, CBM_CONFIG_DB_FILENAME, "hidden-config", "hidden_fn") &&
-                  issue704_make_db(cache, CBM_CROSS_REPO_DB_FILENAME, "hidden-cross", "hidden_fn");
+                  issue704_make_db(cache, CBM_CROSS_REPO_DB_FILENAME, "hidden-cross",
+                                   "hidden_fn") &&
+                  issue704_make_db(cache, CBM_ACTIVITY_DB_FILENAME, "hidden-activity",
+                                   "hidden_fn");
     cbm_mcp_server_t *srv = seeded ? cbm_mcp_server_new(NULL) : NULL;
     bool server_created = srv != NULL;
     bool listed = false;
@@ -22924,7 +22927,7 @@ TEST(tool_underscore_projects_visible_in_cache_scans) {
         hinted = response && strstr(response, "project not found") &&
                  strstr(response, "__w-org-uscorerepo") && strstr(response, "uscore-drift") &&
                  strstr(response, "_config-extra") && !strstr(response, "hidden-config") &&
-                 !strstr(response, "hidden-cross");
+                 !strstr(response, "hidden-cross") && !strstr(response, "hidden-activity");
         free(response);
         response = cbm_mcp_handle_tool(
             srv, "search_graph", "{\"project\":\"hidden-config\",\"name_pattern\":\"hidden_fn\"}");

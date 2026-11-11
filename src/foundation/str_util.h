@@ -79,6 +79,8 @@ bool cbm_validate_project_name(const char *name);
  * projects. */
 #define CBM_CONFIG_DB_FILENAME "_config.db"
 #define CBM_CROSS_REPO_DB_FILENAME "_cross_repo.db"
+/* The daemon's activity and log store (ui/http_server.c). */
+#define CBM_ACTIVITY_DB_FILENAME "activity.db"
 
 /* True when a cache-directory entry is one of the internal stores above. */
 bool cbm_is_internal_cache_db(const char *filename);
