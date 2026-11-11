@@ -243,6 +243,68 @@ TEST(registry_sole_test_candidate_still_resolves) {
     PASS();
 }
 
+/* The test-double path rule: whole directory segments named fake, mock, mocks,
+ * testing or testutil, and Go files named mock_*.go or fake_*.go. Anchored, so
+ * the substrings the old QN scan tripped on (inspect, latest, contest) and
+ * near-miss names (fakeroot, mockery, testingutil) stay ordinary code. */
+TEST(registry_test_double_path_table) {
+    static const char *const doubles[] = {
+        "pkg/client/fake/clientset.go",
+        "fake/x.go",
+        "internal/mocks/store.go",
+        "pkg/mock/store.go",
+        "pkg/testing/fixtures.go",
+        "internal/testutil/helpers.go",
+        "pkg/mock_store.go",
+        "pkg/fake_clock.go",
+        "mock_store.go",
+        "src/fake/deep/nested/util.py",
+    };
+    static const char *const ordinary[] = {
+        "pkg/inspect/x.go",      "pkg/latest/x.go",      "pkg/contest/x.go", "pkg/fakeroot/x.go",
+        "pkg/mockery/x.go",      "pkg/testingutil/x.go", "pkg/mocking.go",   "pkg/mock_store.py",
+        "pkg/fake_clock.golang", "pkg/fake.go",          "pkg/x/fake",       "pkg/Fake/x.go",
+        "pkg/myfake/x.go",       "pkg/fake-client/x.go", "testing.go",       "",
+    };
+    char why[256];
+    for (size_t i = 0; i < sizeof(doubles) / sizeof(doubles[0]); i++) {
+        if (!cbm_registry_test_double_path(doubles[i])) {
+            snprintf(why, sizeof(why), "expected a test-double path: %s", doubles[i]);
+            FAIL(why);
+        }
+    }
+    for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
+        if (cbm_registry_test_double_path(ordinary[i])) {
+            snprintf(why, sizeof(why), "expected an ordinary path: %s", ordinary[i]);
+            FAIL(why);
+        }
+    }
+    ASSERT_FALSE(cbm_registry_test_double_path(NULL));
+    PASS();
+}
+
+/* The Swift overload choosers score with the verdicts stored at registration,
+ * carried through their own filtered lists. Both overloads fit the call and tie
+ * on proximity; without the verdicts the smaller QN (the test double) would win
+ * the tie. */
+TEST(registry_swift_overload_choice_uses_stored_verdicts) {
+    cbm_registry_t *r = cbm_registry_new();
+    const char *double_qn = "proj.Fixtures.Store.load(path:String)";
+    const char *real_qn = "proj.Zeta.Store.load(path:String)";
+    cbm_registry_add(r, "load", double_qn, "Method", true);
+    cbm_registry_add(r, "load", real_qn, "Method", false);
+    cbm_registry_set_swift_signature(r, double_qn, 0, 1, NULL);
+    cbm_registry_set_swift_signature(r, real_qn, 0, 1, NULL);
+
+    CBMCallArg arg = {.keyword = "path"};
+    CBMCall call = {.callee_name = "load", .args = &arg, .arg_count = 1};
+    const char *out[4] = {0};
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], real_qn);
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(registry_label_of) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Foo", "proj.pkg.Foo", "Class", false);
@@ -3382,6 +3444,8 @@ SUITE(registry) {
     RUN_TEST(registry_prefers_non_test_over_test_candidate);
     RUN_TEST(registry_test_verdict_comes_from_the_caller_not_the_qn);
     RUN_TEST(registry_sole_test_candidate_still_resolves);
+    RUN_TEST(registry_test_double_path_table);
+    RUN_TEST(registry_swift_overload_choice_uses_stored_verdicts);
     RUN_TEST(registry_label_of);
     RUN_TEST(registry_value_target_field_twin);
     RUN_TEST(registry_find_by_name);

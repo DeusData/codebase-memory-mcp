@@ -6619,6 +6619,132 @@ TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full) {
     PASS();
 }
 
+/* #2427 rank probes: one bare call, two same-named candidates, and the
+ * registry's test ranking alone decides which one the call binds. Three runs
+ * on one database: a full index, then a comment-only edit of the caller on
+ * the closure-repair route, then another on the forced legacy-partial route.
+ * Both incremental routes re-resolve the caller against a registry seeded from
+ * stored nodes rather than the extractor's definitions, which is where a
+ * seeder that loses the verdict shows. */
+typedef struct {
+    int want[3];
+    int other[3];
+    cbm_incremental_route_t route[3];
+} rank_probe_t;
+
+static int rank_probe_count(const char *db, const char *project, const char *source,
+                            const char *target, const char *file) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        return -1;
+    }
+    int n = named_edge_to_file_count(s, project, "CALLS", source, target, file);
+    cbm_store_close(s);
+    return n;
+}
+
+static void rank_probe(const char *tmp, const char *caller_path, const char *caller_src,
+                       const char *source, const char *target, const char *want_file,
+                       const char *other_file, rank_probe_t *out) {
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rank.db", tmp);
+    for (int run = 0; run < 3; run++) {
+        out->want[run] = -1;
+        out->other[run] = -1;
+        out->route[run] = CBM_INCREMENTAL_ROUTE_NONE;
+        if (run > 0) {
+            char edited[512];
+            snprintf(edited, sizeof(edited), "%s// edit %d\n", caller_src, run);
+            write_temp_file(tmp, caller_path, edited);
+        }
+        cbm_pipeline_incremental_test_reset_faults();
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        if (run == 2) {
+            cbm_pipeline_incremental_test_force_legacy_partial_once();
+        }
+#endif
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        if (!p) {
+            return;
+        }
+        int rc = cbm_pipeline_run(p);
+        out->route[run] = cbm_pipeline_incremental_test_last_route();
+        char project[256];
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        if (rc != 0) {
+            return;
+        }
+        out->want[run] = rank_probe_count(db, project, source, target, want_file);
+        out->other[run] = rank_probe_count(db, project, source, target, other_file);
+    }
+}
+
+/* "latest" spells "test", so the QN scan the extractor's verdict replaced
+ * ranked the production Parse below a helper in a _test.go file, whose Go QN
+ * names only its package and so spells nothing. The verdict ranks them the
+ * right way round, and both incremental routes must read the same verdict
+ * back from the stored nodes: the closure-repair proxies once carried no
+ * is_test, every candidate scored as production, and the smaller QN -- the
+ * test helper -- won. */
+TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_verdict_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package app\n\nfunc Run() int { return Parse() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "latest/parse.go", "package latest\n\nfunc Parse() int { return 1 }\n");
+    write_temp_file(tmp, "harness/parse_test.go",
+                    "package harness\n\nfunc Parse() int { return 2 }\n");
+    write_temp_file(tmp, "app/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "app/run.go", caller, "Run", "Parse", "latest/parse.go",
+               "harness/parse_test.go", &r);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* A generated fake beside its callers: client/fake shares more of the caller's
+ * package path than the real store does, so on the extractor's verdict alone
+ * (a fake is not a test file) the fake wins on proximity. The test-double path
+ * rule ranks it last in the full index and, through the incremental seed's own
+ * use of the rule, on both incremental routes. */
+TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_double_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package client\n\nfunc Run() int { return Load() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "store/load.go", "package store\n\nfunc Load() int { return 1 }\n");
+    write_temp_file(tmp, "client/fake/load.go", "package fake\n\nfunc Load() int { return 2 }\n");
+    write_temp_file(tmp, "client/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "client/run.go", caller, "Run", "Load", "store/load.go", "client/fake/load.go",
+               &r);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -34486,6 +34612,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
     RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
+    RUN_TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
