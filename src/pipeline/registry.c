@@ -2161,6 +2161,14 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     if (!keys || !vals || map_count <= 0) {
         return empty_result();
     }
+    /* A wildcard import (`import pkg._`, `import pkg.*`, `from m import *`)
+     * binds no local name: its "*" entry only makes the package
+     * import-reachable for the strategies below. Scala operators are method
+     * calls, so `a * b` has the callee "*" and must not bind to the
+     * wildcard's target (#2360). */
+    if (strcmp(prefix, "*") == 0) {
+        return empty_result();
+    }
 
     /* Find prefix in import map keys. Prefer the per-file TLS hash
      * cache (O(1)) over the linear scan when available. */

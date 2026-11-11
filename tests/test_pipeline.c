@@ -14491,6 +14491,107 @@ TEST(pipeline_scala_import_alias_parallel_resolves_exact_method) {
     PASS();
 }
 
+/* A Scala wildcard import (`import pkg._`, `import pkg.Owner._`) binds no
+ * local name: its IMPORTS edge carries the local name "*". Scala operators are
+ * method calls, so `h * width` is a call whose callee is "*" as well, and it
+ * must never bind to the wildcard's target through the import map. */
+static int scala_operator_calls(cbm_store_t *s) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT n.qualified_name, e.properties FROM edges e"
+                           " JOIN nodes n ON n.id = e.target_id WHERE e.type = 'CALLS'"
+                           " AND json_valid(e.properties)"
+                           " AND json_extract(e.properties, '$.callee') = '*'",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        fprintf(stderr, "  operator call bound: -> %s %s\n", sqlite3_column_text(st, 0),
+                sqlite3_column_text(st, 1));
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int scala_wildcard_operator_case(const char *tmpl, bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", tmpl);
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    write_temp_file(tmp, "wild_model.scala",
+                    "package wild_model\n"
+                    "object Consts { val Width: Int = 10 }\n"
+                    "object Helper { def run(): Int = 1 }\n");
+    write_temp_file(tmp, "wild_caller.scala",
+                    "package wild_caller\n"
+                    "import wild_model._\n"
+                    "import wild_model.Consts._\n"
+                    "import wild_model.Helper\n"
+                    "object Area {\n"
+                    "  def area(h: Int): Int = h * Width\n"
+                    "  def scaled(): Int = Helper.run() * 2\n"
+                    "}\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "wild_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object WildFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (parallel) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_wild.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int ok = p && cbm_pipeline_run(p) == 0;
+    cbm_store_t *s = ok ? cbm_store_open_path(db_path) : NULL;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        cbm_edge_t *imports = NULL;
+        int import_count = 0;
+        cbm_store_find_edges_by_type(s, project, "IMPORTS", &imports, &import_count);
+        if (imports) {
+            cbm_store_free_edges(imports, import_count);
+        }
+        /* Both wildcards and the named import keep their IMPORTS edges, and a
+         * named import still binds its calls through the import map. */
+        bool named = cross_file_call_to_owner_has_strategy(s, project, "scaled", "run",
+                                                           "Helper.run", "import_map");
+        int operators = scala_operator_calls(s);
+        if (import_count != 3 || !named || operators != 0) {
+            fprintf(stderr, "  wildcard case parallel=%d: imports=%d named=%d operator_calls=%d\n",
+                    parallel, import_count, named, operators);
+            ok = 0;
+        }
+        cbm_store_close(s);
+    } else {
+        ok = 0;
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else if (parallel) {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    return ok;
+}
+
+TEST(pipeline_scala_wildcard_import_binds_no_operator_call) {
+    ASSERT_TRUE(scala_wildcard_operator_case("/tmp/cbm_scala_wild_XXXXXX", false));
+    ASSERT_TRUE(scala_wildcard_operator_case("/tmp/cbm_scala_wild_par_XXXXXX", true));
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -34758,6 +34859,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_member_import_in_split_package_binds_owner_member);
     RUN_TEST(pipeline_scala_index_built_only_for_scala_importers);
     RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
+    RUN_TEST(pipeline_scala_wildcard_import_binds_no_operator_call);
     RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355);
