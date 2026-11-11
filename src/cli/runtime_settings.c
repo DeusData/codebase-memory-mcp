@@ -241,6 +241,16 @@ static bool canonical_cache_path(const char *cache, char out[SETTINGS_PATH_CAP],
     return cbm_daemon_ipc_private_directory_secure(out);
 }
 
+/* For a cache this process may only read: never created and never hardened,
+ * only verified (cbm_daemon_ipc_private_directory_verify). */
+static bool verified_cache_path(const char *cache, char out[SETTINGS_PATH_CAP]) {
+    if (!cache || !cache[0] || !cbm_canonical_path(cache, out, SETTINGS_PATH_CAP) ||
+        !cbm_is_dir(out))
+        return false;
+    cbm_normalize_path_sep(out);
+    return cbm_daemon_ipc_private_directory_verify(out);
+}
+
 static sqlite3 *settings_open(const char *cache) {
     if (!cache || !cache[0] || strlen(cache) + 12 >= SETTINGS_PATH_CAP)
         return NULL;
@@ -519,17 +529,23 @@ static sqlite3 *settings_open_snapshot(const char *path, bool *hot_journal) {
     return NULL;
 }
 
-static sqlite3 *settings_read_snapshot(const char *path) {
+static sqlite3 *settings_read_snapshot(const char *path, bool recover) {
     bool hot_journal = false;
     sqlite3 *db = settings_open_snapshot(path, &hot_journal);
-    if (!db && hot_journal && settings_recover_hot_journal(path))
+    if (!db && hot_journal && !recover)
+        /* The rollback is a write, which a read-only process must not make. */
+        cbm_log_error("config_db.hot_journal_read_only", "path", path, "hint",
+                      "an interrupted settings write must be rolled back by a read-write start "
+                      "first");
+    else if (!db && hot_journal && settings_recover_hot_journal(path))
         db = settings_open_snapshot(path, &hot_journal);
     return db;
 }
 
-bool cbm_runtime_settings_init(const char *cache) {
+static bool runtime_settings_init(const char *cache, bool read_only) {
     char canonical[SETTINGS_PATH_CAP];
-    if (!canonical_cache_path(cache, canonical, true))
+    if (read_only ? !verified_cache_path(cache, canonical)
+                  : !canonical_cache_path(cache, canonical, true))
         return false;
     if (initialized)
         return strcmp(canonical, initial_cache) == 0;
@@ -541,7 +557,7 @@ bool cbm_runtime_settings_init(const char *cache) {
         /* The snapshot read happens before individual optional tables are
          * queried; failing here exits the whole process. Hook clients skip
          * this init. */
-        db = settings_read_snapshot(path);
+        db = settings_read_snapshot(path, !read_only);
         if (!db)
             return false;
     }
@@ -566,6 +582,14 @@ bool cbm_runtime_settings_init(const char *cache) {
     cbm_set_environment_resolver(resolve_environment);
     initialized = true;
     return true;
+}
+
+bool cbm_runtime_settings_init(const char *cache) {
+    return runtime_settings_init(cache, false);
+}
+
+bool cbm_runtime_settings_init_read_only(const char *cache) {
+    return runtime_settings_init(cache, true);
 }
 
 static void json_string(yyjson_mut_doc *doc, yyjson_mut_val *object, const char *key,
@@ -842,7 +866,7 @@ void cbm_runtime_settings_load_ui(bool *enabled, int *port) {
     /* Without the wait and the hot-journal recovery, a concurrent commit or an
      * interrupted write made every read fail and the caller silently kept its
      * defaults. */
-    sqlite3 *db = settings_read_snapshot(path);
+    sqlite3 *db = settings_read_snapshot(path, true);
     if (!db)
         return;
     for (size_t i = 0; i < SETTINGS_COUNT; i++)
