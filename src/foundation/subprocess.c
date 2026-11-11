@@ -5,13 +5,16 @@
  */
 #include "subprocess.h"
 
+#include "arena.h"
 #include "compat.h" /* cbm_nanosleep */
 #include "compat_fs.h"
 #include "git_env.h" /* strip_git_repo_env: scrubbed child environment for git */
 #include "log.h"
+#include "mem_core.h"
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -19,14 +22,18 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #include "win_utf8.h" /* cbm_utf8_to_wide — spawn the worker with a wide command line so a
                        * non-ASCII repo path survives CreateProcess (#423/#20) */
 #include <stdlib.h>   /* free */
 #else
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #ifdef __APPLE__
+#include <paths.h>
+#include <libproc.h>
 #include <spawn.h>
 #endif
 extern char **environ;
@@ -411,6 +418,9 @@ struct cbm_subprocess {
     size_t argc;
     char *windows_cmd_payload;
     char *log_file;
+    CBMArena stdout_arena;
+    char *stdout_file;
+    char *stdin_file;
     cbm_proc_log_cb on_log_line;
     void *log_ud;
     int quiet_timeout_ms;
@@ -435,15 +445,409 @@ struct cbm_subprocess {
     cbm_proc_result_t result;
 
 #ifdef _WIN32
+    wchar_t *environment;
     HANDLE process;
     HANDLE job;
     DWORD process_id;
     bool root_forced;
 #else
+    char **environment;
+#ifdef __APPLE__
+    char *search_path;
+#endif
     pid_t pid;
     pid_t pgid;
 #endif
 };
+
+static void cbm_rss_add_saturated(uint64_t *total, uint64_t value) {
+    if (value > UINT64_MAX - *total) {
+        *total = UINT64_MAX;
+    } else {
+        *total += value;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+uint64_t cbm_subprocess_rss_sum_for_testing(const uint64_t *values, size_t count) {
+    uint64_t total = 0;
+    for (size_t index = 0; values && index < count; index++) {
+        cbm_rss_add_saturated(&total, values[index]);
+    }
+    return total;
+}
+
+static atomic_int g_tree_rss_member_fault;
+
+void cbm_subprocess_tree_rss_fault_members_for_testing(int platform_error) {
+    atomic_store_explicit(&g_tree_rss_member_fault, platform_error, memory_order_release);
+}
+
+/* Test builds can make every NON-root member's measurement fail with one
+ * platform error (errno on POSIX, GetLastError() on Windows); 0 = real call.
+ * Production builds compile the check out entirely. */
+static int cbm_tree_rss_member_fault(bool root) {
+    return root ? 0 : atomic_load_explicit(&g_tree_rss_member_fault, memory_order_acquire);
+}
+#endif
+
+/* A member that cannot be measured is skipped only when the platform says it
+ * no longer exists (it exited between the listing and the measurement, and
+ * holds nothing). Any other failure is a live member whose memory a total
+ * would silently leave out, so the probe fails instead -- a watchdog that
+ * under-reports is one that quietly stopped watching. The root is strict
+ * either way. */
+#ifdef _WIN32
+static HANDLE cbm_tree_rss_open_member(DWORD pid, bool root, DWORD *error_out) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int fault = cbm_tree_rss_member_fault(root);
+    if (fault != 0) {
+        *error_out = (DWORD)fault;
+        return NULL;
+    }
+#else
+    (void)root;
+#endif
+    /* GetProcessMemoryInfo documents PROCESS_QUERY_INFORMATION |
+     * PROCESS_VM_READ. PROCESS_QUERY_LIMITED_INFORMATION is a lesser
+     * alternative on newer Windows; the Job Object membership list
+     * already closes most of the pid-reuse window between listing and
+     * opening. */
+    HANDLE member = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    *error_out = member ? ERROR_SUCCESS : GetLastError();
+    return member;
+}
+
+static bool cbm_tree_rss_member_exited(HANDLE member) {
+    DWORD exit_code = 0;
+    return GetExitCodeProcess(member, &exit_code) && exit_code != STILL_ACTIVE;
+}
+
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    DWORD capacity = 32;
+    JOBOBJECT_BASIC_PROCESS_ID_LIST *processes = NULL;
+    for (;;) {
+        size_t bytes = sizeof(*processes) + (size_t)(capacity - 1) * sizeof(ULONG_PTR);
+        if (bytes > UINT32_MAX) {
+            cbm_free(CBM_MEM_CLASS_OTHER, processes);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        JOBOBJECT_BASIC_PROCESS_ID_LIST *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, processes, bytes);
+        if (!grown) {
+            cbm_free(CBM_MEM_CLASS_OTHER, processes);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        processes = grown;
+        ZeroMemory(processes, bytes);
+        processes->NumberOfAssignedProcesses = capacity;
+        if (QueryInformationJobObject(process->job, JobObjectBasicProcessIdList, processes,
+                                      (DWORD)bytes, NULL)) {
+            break;
+        }
+        if (GetLastError() != ERROR_MORE_DATA || capacity > (UINT32_MAX / 2U)) {
+            cbm_free(CBM_MEM_CLASS_OTHER, processes);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        capacity *= 2U;
+    }
+
+    uint64_t total = 0;
+    DWORD measured = 0;
+    bool failed = false;
+    for (DWORD index = 0; index < processes->NumberOfProcessIdsInList && !failed; index++) {
+        DWORD pid = (DWORD)processes->ProcessIdList[index];
+        bool root = pid == process->process_id;
+        DWORD open_error = ERROR_SUCCESS;
+        HANDLE member = cbm_tree_rss_open_member(pid, root, &open_error);
+        if (!member) {
+            /* ERROR_INVALID_PARAMETER: no process has this id any more. */
+            failed = root || open_error != ERROR_INVALID_PARAMETER;
+            continue;
+        }
+        PROCESS_MEMORY_COUNTERS memory;
+        ZeroMemory(&memory, sizeof(memory));
+        if (GetProcessMemoryInfo(member, &memory, sizeof(memory))) {
+            cbm_rss_add_saturated(&total, (uint64_t)memory.WorkingSetSize);
+            measured++;
+        } else {
+            failed = root || !cbm_tree_rss_member_exited(member);
+        }
+        CloseHandle(member);
+    }
+    DWORD listed = processes->NumberOfProcessIdsInList;
+    cbm_free(CBM_MEM_CLASS_OTHER, processes);
+    if (failed || (measured == 0 && listed > 0)) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    if (measured == 0) {
+        return CBM_PROC_TREE_RSS_EMPTY;
+    }
+    *rss_bytes = total;
+    return CBM_PROC_TREE_RSS_OK;
+}
+#elif defined(__APPLE__)
+/* The members of the contained process group, as the kernel lists them. An
+ * all-process scan cannot decide membership: proc_pidinfo answers EPERM for
+ * every process of another user, so "not in our group" and "in our group but
+ * unreadable" would look the same. Returns the member count, or -1. */
+static int cbm_tree_rss_list_group(pid_t pgid, pid_t **pids_out) {
+    int capacity = 64;
+    pid_t *pids = NULL;
+    for (;;) {
+        pid_t *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, pids, (size_t)capacity * sizeof(*pids));
+        if (!grown) {
+            cbm_free(CBM_MEM_CLASS_OTHER, pids);
+            return -1;
+        }
+        pids = grown;
+        errno = 0;
+        int bytes =
+            proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, pids, capacity * (int)sizeof(*pids));
+        if (bytes < 0 || (bytes == 0 && errno != 0)) {
+            cbm_free(CBM_MEM_CLASS_OTHER, pids);
+            return -1;
+        }
+        int count = bytes / (int)sizeof(*pids);
+        if (count < capacity) {
+            *pids_out = pids;
+            return count;
+        }
+        if (capacity > INT_MAX / (int)sizeof(*pids) / 2) {
+            cbm_free(CBM_MEM_CLASS_OTHER, pids);
+            return -1;
+        }
+        capacity *= 2;
+    }
+}
+
+static int cbm_tree_rss_member_rusage(pid_t pid, bool root, struct rusage_info_v2 *usage) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int fault = cbm_tree_rss_member_fault(root);
+    if (fault != 0) {
+        errno = fault;
+        return -1;
+    }
+#else
+    (void)root;
+#endif
+    return proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t *)usage);
+}
+
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    pid_t *pids = NULL;
+    int count = cbm_tree_rss_list_group(process->pgid, &pids);
+    if (count < 0) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+
+    uint64_t total = 0;
+    int measured = 0;
+    bool failed = false;
+    for (int index = 0; index < count && !failed; index++) {
+        if (pids[index] <= 0) {
+            continue;
+        }
+        bool root = pids[index] == process->pid;
+        struct rusage_info_v2 usage;
+        if (cbm_tree_rss_member_rusage(pids[index], root, &usage) != 0) {
+            /* ESRCH: the member exited after the listing. */
+            failed = root || errno != ESRCH;
+            continue;
+        }
+        /* phys_footprint is what the OS charges, matching cbm_mem_charged().
+         * ri_resident_size still counts pages mimalloc already marked
+         * MADV_FREE_REUSABLE, so a Mac worker can look like 17 GB RSS while
+         * the kernel holds it to 5.5 GB. */
+        cbm_rss_add_saturated(&total, usage.ri_phys_footprint);
+        measured++;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, pids);
+    if (failed) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    if (measured == 0) {
+        return CBM_PROC_TREE_RSS_EMPTY;
+    }
+    *rss_bytes = total;
+    return CBM_PROC_TREE_RSS_OK;
+}
+#else
+static bool cbm_proc_pid_name(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)name; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+typedef enum {
+    CBM_LINUX_STAT_OK = 0,
+    CBM_LINUX_STAT_GONE,       /* the process exited after the /proc listing */
+    CBM_LINUX_STAT_UNREADABLE, /* a process whose stat could not be read or parsed */
+} cbm_linux_stat_t;
+
+/* /proc/<pid>/stat is world-readable, so on a default /proc mount the only
+ * expected failure is the exit race: ENOENT at open, ESRCH at read. Anything
+ * else (EACCES under hidepid=1, a parse failure) leaves the process's group
+ * unknown, and the probe fails closed rather than guess it is not ours. */
+static cbm_linux_stat_t cbm_linux_stat_failure(int error) {
+    return error == ENOENT || error == ESRCH ? CBM_LINUX_STAT_GONE : CBM_LINUX_STAT_UNREADABLE;
+}
+
+static cbm_linux_stat_t cbm_linux_proc_stat_line(const char *pid_name, bool root, char *line,
+                                                 size_t line_size) {
+    char path[64];
+    int length = snprintf(path, sizeof(path), "/proc/%s/stat", pid_name);
+    if (length <= 0 || length >= (int)sizeof(path)) {
+        return CBM_LINUX_STAT_UNREADABLE;
+    }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int fault = cbm_tree_rss_member_fault(root);
+    if (fault != 0) {
+        return cbm_linux_stat_failure(fault);
+    }
+#else
+    (void)root;
+#endif
+    errno = 0;
+    FILE *stat_file = cbm_fopen(path, "rb");
+    if (!stat_file) {
+        return cbm_linux_stat_failure(errno);
+    }
+    errno = 0;
+    bool read = fgets(line, (int)line_size, stat_file) != NULL;
+    int read_error = errno;
+    (void)fclose(stat_file);
+    if (!read) {
+        return read_error == ESRCH ? CBM_LINUX_STAT_GONE : CBM_LINUX_STAT_UNREADABLE;
+    }
+    return CBM_LINUX_STAT_OK;
+}
+
+static cbm_linux_stat_t cbm_linux_proc_stat(const char *pid_name, bool root, pid_t *group,
+                                            int64_t *rss_pages) {
+    char stat_line[4096];
+    cbm_linux_stat_t status =
+        cbm_linux_proc_stat_line(pid_name, root, stat_line, sizeof(stat_line));
+    if (status != CBM_LINUX_STAT_OK) {
+        return status;
+    }
+    char *command_end = strrchr(stat_line, ')');
+    if (!command_end || command_end[1] != ' ') {
+        return CBM_LINUX_STAT_UNREADABLE;
+    }
+
+    char *save = NULL;
+    char *token = strtok_r(command_end + 2, " ", &save);
+    int field = 3;
+    bool have_group = false;
+    bool have_rss = false;
+    while (token) {
+        if (field == 5 || field == 24) {
+            char *end = NULL;
+            long long value = strtoll(token, &end, 10);
+            if (!end || *end != '\0') {
+                return CBM_LINUX_STAT_UNREADABLE;
+            }
+            if (field == 5) {
+                *group = (pid_t)value;
+                have_group = true;
+            } else {
+                *rss_pages = (int64_t)value;
+                have_rss = true;
+                break;
+            }
+        }
+        token = strtok_r(NULL, " ", &save);
+        field++;
+    }
+    return have_group && have_rss ? CBM_LINUX_STAT_OK : CBM_LINUX_STAT_UNREADABLE;
+}
+
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        (void)closedir(proc);
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+
+    uint64_t total = 0;
+    int measured = 0;
+    bool failed = false;
+    struct dirent *entry;
+    while (!failed && (entry = readdir(proc)) != NULL) {
+        if (!cbm_proc_pid_name(entry->d_name)) {
+            continue;
+        }
+        pid_t group = 0;
+        int64_t pages = 0;
+        bool root_entry = strtol(entry->d_name, NULL, 10) == (long)process->pid;
+        cbm_linux_stat_t status = cbm_linux_proc_stat(entry->d_name, root_entry, &group, &pages);
+        if (status != CBM_LINUX_STAT_OK) {
+            failed = root_entry || status != CBM_LINUX_STAT_GONE;
+            continue;
+        }
+        if (group != process->pgid || pages < 0) {
+            continue;
+        }
+        uint64_t page_count = (uint64_t)pages;
+        uint64_t bytes = page_count > UINT64_MAX / (uint64_t)page_size
+                             ? UINT64_MAX
+                             : page_count * (uint64_t)page_size;
+        cbm_rss_add_saturated(&total, bytes);
+        measured++;
+    }
+    (void)closedir(proc);
+    if (failed) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    if (measured == 0) {
+        return CBM_PROC_TREE_RSS_EMPTY;
+    }
+    *rss_bytes = total;
+    return CBM_PROC_TREE_RSS_OK;
+}
+#endif
+
+cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_bytes(cbm_subprocess_t *process,
+                                                         uint64_t *rss_bytes) {
+    if (!process || !rss_bytes) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    *rss_bytes = 0;
+    return cbm_subprocess_tree_rss_platform(process, rss_bytes);
+}
+
+bool cbm_subprocess_root_running(const cbm_subprocess_t *process) {
+    if (!process || process->root_reaped) {
+        return false;
+    }
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    return lifecycle == CBM_SUBPROCESS_ACTIVE || lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED;
+}
+
+bool cbm_subprocess_termination_pending(const cbm_subprocess_t *process) {
+    return process && process->termination_started;
+}
+
+bool cbm_subprocess_supervision_active(const cbm_subprocess_t *process) {
+    if (!process) {
+        return false;
+    }
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    return lifecycle == CBM_SUBPROCESS_ACTIVE || lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED;
+}
 
 static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->outcome = CBM_PROC_SPAWN_FAILED;
@@ -458,6 +862,157 @@ static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->job_memory_available = false;
 }
 
+#ifdef _WIN32
+/* Preserve the native Unicode environment, including Windows' hidden =C:
+ * drive entries. Names compare ordinally without case, independent of locale. */
+static size_t cbm_win_environment_name_length(const wchar_t *entry) {
+    const wchar_t *equals = wcschr(entry + (entry[0] == L'=' ? 1 : 0), L'=');
+    return equals ? (size_t)(equals - entry) : wcslen(entry);
+}
+
+static int cbm_win_environment_compare(const void *left, const void *right) {
+    const wchar_t *a = *(const wchar_t *const *)left;
+    const wchar_t *b = *(const wchar_t *const *)right;
+    return CompareStringOrdinal(a, (int)cbm_win_environment_name_length(a), b,
+                                (int)cbm_win_environment_name_length(b), TRUE) -
+           CSTR_EQUAL;
+}
+
+static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const char *const *overrides,
+                                            size_t override_count) {
+    wchar_t *inherited =
+        process->strip_git_repo_env ? cbm_git_child_env_block() : GetEnvironmentStringsW();
+    if (!inherited) {
+        return false;
+    }
+    size_t count = 0;
+    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        count++;
+    }
+    wchar_t **entries = NULL;
+    wchar_t **converted = NULL;
+    bool ok = false;
+    if (override_count > SIZE_MAX / sizeof(*entries) ||
+        count > SIZE_MAX / sizeof(*entries) - override_count) {
+        goto done;
+    }
+    entries = cbm_calloc(CBM_MEM_CLASS_OTHER, (count + override_count) * sizeof(*entries));
+    converted = cbm_calloc(CBM_MEM_CLASS_OTHER, override_count * sizeof(*converted));
+    if (!entries || !converted) {
+        goto done;
+    }
+    size_t index = 0;
+    for (wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        entries[index++] = entry;
+    }
+    for (size_t i = 0; i < override_count; i++) {
+        if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
+            continue;
+        }
+        converted[i] = cbm_utf8_to_wide_in(CBM_MEM_CLASS_OTHER, overrides[i]);
+        if (!converted[i]) {
+            goto done;
+        }
+        size_t slot = 0;
+        while (slot < count && cbm_win_environment_compare(&entries[slot], &converted[i]) != 0) {
+            slot++;
+        }
+        entries[slot] = converted[i];
+        if (slot == count) {
+            count++;
+        }
+    }
+    qsort(entries, count, sizeof(*entries), cbm_win_environment_compare);
+    size_t length = count ? 1 : 2; /* Empty blocks also need two NUL characters. */
+    for (size_t i = 0; i < count; i++) {
+        size_t entry_length = wcslen(entries[i]) + 1;
+        if (entry_length > SIZE_MAX / sizeof(wchar_t) - length) {
+            goto done;
+        }
+        length += entry_length;
+    }
+    process->environment = cbm_calloc(CBM_MEM_CLASS_OTHER, length * sizeof(*process->environment));
+    if (!process->environment) {
+        goto done;
+    }
+    wchar_t *next = process->environment;
+    for (size_t i = 0; i < count; i++) {
+        size_t entry_length = wcslen(entries[i]) + 1;
+        wmemcpy(next, entries[i], entry_length);
+        next += entry_length;
+    }
+    ok = true;
+done:
+    if (converted) {
+        for (size_t i = 0; i < override_count; i++) {
+            cbm_free(CBM_MEM_CLASS_OTHER, converted[i]);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, converted);
+    cbm_free(CBM_MEM_CLASS_OTHER, entries);
+    if (process->strip_git_repo_env) {
+        cbm_git_child_env_free(inherited);
+    } else {
+        FreeEnvironmentStringsW(inherited);
+    }
+    return ok;
+}
+#else
+static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const char *const *overrides,
+                                            size_t override_count) {
+#ifdef __APPLE__
+    const char *search_path = getenv("PATH");
+    process->search_path =
+        cbm_mem_strdup(CBM_MEM_CLASS_OTHER, search_path ? search_path : _PATH_DEFPATH);
+    if (!process->search_path) {
+        return false;
+    }
+#endif
+    char **inherited = process->envp ? process->envp : environ;
+    size_t count = 0;
+    while (inherited && inherited[count]) {
+        count++;
+    }
+    if (override_count >= SIZE_MAX / sizeof(*process->environment) ||
+        count > SIZE_MAX / sizeof(*process->environment) - override_count - 1) {
+        return false;
+    }
+    process->environment = cbm_calloc(CBM_MEM_CLASS_OTHER,
+                                      (count + override_count + 1) * sizeof(*process->environment));
+    if (!process->environment) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        process->environment[i] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, inherited[i]);
+        if (!process->environment[i]) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < override_count; i++) {
+        if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
+            continue;
+        }
+        size_t name_length = (size_t)(strchr(overrides[i], '=') - overrides[i]);
+        size_t slot = 0;
+        while (slot < count &&
+               !(strncmp(process->environment[slot], overrides[i], name_length) == 0 &&
+                 process->environment[slot][name_length] == '=')) {
+            slot++;
+        }
+        char *entry = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, overrides[i]);
+        if (!entry) {
+            return false;
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, process->environment[slot]);
+        process->environment[slot] = entry;
+        if (slot == count) {
+            count++;
+        }
+    }
+    return true;
+}
+#endif
+
 static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
     if (!process) {
         return;
@@ -468,9 +1023,21 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
         }
     }
     free(process->argv);
+#ifndef _WIN32
+    if (process->environment) {
+        for (size_t i = 0; process->environment[i]; i++) {
+            cbm_free(CBM_MEM_CLASS_OTHER, process->environment[i]);
+        }
+    }
+#endif
+    cbm_free(CBM_MEM_CLASS_OTHER, process->environment);
+#ifdef __APPLE__
+    cbm_free(CBM_MEM_CLASS_OTHER, process->search_path);
+#endif
     free(process->bin);
     free(process->windows_cmd_payload);
     free(process->log_file);
+    cbm_arena_destroy(&process->stdout_arena);
 #ifndef _WIN32
     cbm_git_child_env_free(process->envp);
 #endif
@@ -479,6 +1046,16 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
 
 static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     if (!opts || !opts->bin || !opts->bin[0]) {
+        return NULL;
+    }
+    if (opts->stdout_file && (!opts->stdout_file[0] ||
+                              (opts->log_file && strcmp(opts->stdout_file, opts->log_file) == 0))) {
+        return NULL;
+    }
+    if (opts->stdin_file &&
+        (!opts->stdin_file[0] ||
+         (opts->log_file && strcmp(opts->stdin_file, opts->log_file) == 0) ||
+         (opts->stdout_file && strcmp(opts->stdin_file, opts->stdout_file) == 0))) {
         return NULL;
     }
 #ifdef _WIN32
@@ -491,6 +1068,21 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
         return NULL;
     }
 #endif
+
+    size_t override_count = 0;
+    if (opts->env_overrides) {
+        while (override_count < CBM_SUBPROCESS_ARGV_LIMIT && opts->env_overrides[override_count]) {
+            const char *entry = opts->env_overrides[override_count];
+            const char *equals = strchr(entry, '=');
+            if (!equals || equals == entry) {
+                return NULL;
+            }
+            override_count++;
+        }
+        if (override_count == CBM_SUBPROCESS_ARGV_LIMIT) {
+            return NULL;
+        }
+    }
 
     size_t argc = 1;
     if (opts->argv) {
@@ -507,6 +1099,7 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     if (!process) {
         return NULL;
     }
+    cbm_arena_init_lazy(&process->stdout_arena, 256);
     process->bin = cbm_strdup(opts->bin);
     process->windows_cmd_payload =
         opts->windows_cmd_payload ? cbm_strdup(opts->windows_cmd_payload) : NULL;
@@ -528,6 +1121,20 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     if (opts->log_file) {
         process->log_file = cbm_strdup(opts->log_file);
         if (!process->log_file) {
+            cbm_subprocess_free_config(process);
+            return NULL;
+        }
+    }
+    if (opts->stdout_file) {
+        process->stdout_file = cbm_arena_strdup(&process->stdout_arena, opts->stdout_file);
+        if (!process->stdout_file) {
+            cbm_subprocess_free_config(process);
+            return NULL;
+        }
+    }
+    if (opts->stdin_file) {
+        process->stdin_file = cbm_arena_strdup(&process->stdout_arena, opts->stdin_file);
+        if (!process->stdin_file) {
             cbm_subprocess_free_config(process);
             return NULL;
         }
@@ -554,6 +1161,11 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
         }
     }
 #endif
+    if (override_count > 0 &&
+        !cbm_subprocess_copy_environment(process, opts->env_overrides, override_count)) {
+        cbm_subprocess_free_config(process);
+        return NULL;
+    }
     atomic_init(&process->lifecycle, CBM_SUBPROCESS_ACTIVE);
     cbm_subprocess_result_init(&process->result);
     return process;
@@ -649,16 +1261,79 @@ static cbm_proc_poll_t cbm_subprocess_finish_failed(cbm_subprocess_t *process,
 
 #ifdef _WIN32
 
-static void cbm_win_close_spawn_handles(HANDLE nul, HANDLE log, LPPROC_THREAD_ATTRIBUTE_LIST attrs,
-                                        bool attrs_init) {
+/* Match cbm_path_to_wide's file-path spelling using the process arena. Existing
+ * option conversions retain their legacy heap ownership. */
+static wchar_t *cbm_win_stdin_path(cbm_subprocess_t *process) {
+    int length =
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, process->stdin_file, -1, NULL, 0);
+    if (length <= 0 || length > 32767) {
+        return NULL;
+    }
+    wchar_t *wide = cbm_arena_alloc(&process->stdout_arena, (size_t)length * sizeof(*wide));
+    if (!wide || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, process->stdin_file, -1, wide,
+                                     length) != length) {
+        return NULL;
+    }
+    size_t input_length = (size_t)length - 1U;
+    if (cbm_win_path_has_namespace_prefix(wide, input_length)) {
+        cbm_win_path_normalize_wide_separators(wide);
+        return wide;
+    }
+    if (input_length < 240U) {
+        return wide;
+    }
+    DWORD needed = GetFullPathNameW(wide, 0, NULL, NULL);
+    if (needed == 0U || needed > 32767U) {
+        return NULL;
+    }
+    wchar_t *full = cbm_arena_alloc(&process->stdout_arena, (size_t)needed * sizeof(*full));
+    DWORD copied = full ? GetFullPathNameW(wide, needed, full, NULL) : 0U;
+    if (copied == 0U || copied >= needed) {
+        return NULL;
+    }
+    cbm_win_path_normalize_wide_separators(full);
+    bool drive_absolute =
+        copied >= 3U &&
+        ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
+        full[1] == L':' && full[2] == L'\\';
+    bool unc_absolute = copied >= 5U && full[0] == L'\\' && full[1] == L'\\';
+    if (!drive_absolute && !unc_absolute) {
+        return NULL;
+    }
+    const wchar_t *prefix = drive_absolute ? L"\\\\?\\" : L"\\\\?\\UNC\\";
+    size_t prefix_length = drive_absolute ? 4U : 8U;
+    size_t tail_offset = drive_absolute ? 0U : 2U;
+    size_t tail_length = (size_t)copied - tail_offset;
+    size_t extended_length = prefix_length + tail_length;
+    if (extended_length >= 32767U) {
+        return NULL;
+    }
+    wchar_t *prefixed =
+        cbm_arena_alloc(&process->stdout_arena, (extended_length + 1U) * sizeof(*prefixed));
+    if (!prefixed) {
+        return NULL;
+    }
+    wmemcpy(prefixed, prefix, prefix_length);
+    wmemcpy(prefixed + prefix_length, full + tail_offset, tail_length + 1U);
+    return prefixed;
+}
+
+static void cbm_win_close_spawn_handles(HANDLE nul, HANDLE input, HANDLE log, HANDLE stdout_capture,
+                                        LPPROC_THREAD_ATTRIBUTE_LIST attrs, bool attrs_init) {
     if (attrs) {
         if (attrs_init) {
             DeleteProcThreadAttributeList(attrs);
         }
         free(attrs);
     }
+    if (stdout_capture != INVALID_HANDLE_VALUE) {
+        CloseHandle(stdout_capture);
+    }
     if (log != INVALID_HANDLE_VALUE) {
         CloseHandle(log);
+    }
+    if (input != INVALID_HANDLE_VALUE) {
+        CloseHandle(input);
     }
     if (nul != INVALID_HANDLE_VALUE) {
         CloseHandle(nul);
@@ -675,12 +1350,19 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     if (!built) {
         return -1;
     }
+    /* Everything a failure must release, so every failure leaves through
+     * the one exit at the end. */
+    HANDLE job = NULL;
+    HANDLE nul = INVALID_HANDLE_VALUE;
+    HANDLE input = INVALID_HANDLE_VALUE;
+    HANDLE log = INVALID_HANDLE_VALUE;
+    HANDLE stdout_capture = INVALID_HANDLE_VALUE;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    bool attrs_init = false;
     wchar_t *wbin = cbm_utf8_to_wide(process->bin);
     wchar_t *wcmdline = cbm_utf8_to_wide(cmdline);
     if (!wbin || !wcmdline) {
-        free(wbin);
-        free(wcmdline);
-        return -1;
+        goto fail;
     }
 
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
@@ -690,29 +1372,39 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
         limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
         limits.JobMemoryLimit = (SIZE_T)process->memory_limit_bytes;
     }
-    HANDLE job = CreateJobObjectW(NULL, NULL);
+    job = CreateJobObjectW(NULL, NULL);
     if (!job ||
         !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-        if (job) {
-            CloseHandle(job);
-        }
-        free(wbin);
-        free(wcmdline);
-        return -1;
+        goto fail;
     }
 
     SECURITY_ATTRIBUTES security;
     ZeroMemory(&security, sizeof(security));
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
-    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, NULL);
-    HANDLE log = INVALID_HANDLE_VALUE;
+    nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      &security, OPEN_EXISTING, 0, NULL);
     if (nul == INVALID_HANDLE_VALUE) {
-        CloseHandle(job);
-        free(wbin);
-        free(wcmdline);
-        return -1;
+        goto fail;
+    }
+    if (process->stdin_file) {
+        wchar_t *winput = cbm_win_stdin_path(process);
+        /* Validate before any output can be truncated; recheck the opened
+         * handle rather than relying only on path attributes. */
+        DWORD attributes = winput ? GetFileAttributesW(winput) : INVALID_FILE_ATTRIBUTES;
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            !(attributes &
+              (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) {
+            input = CreateFileW(winput, GENERIC_READ, FILE_SHARE_READ, &security, OPEN_EXISTING,
+                                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        }
+        BY_HANDLE_FILE_INFORMATION input_info;
+        if (input == INVALID_HANDLE_VALUE || GetFileType(input) != FILE_TYPE_DISK ||
+            !GetFileInformationByHandle(input, &input_info) ||
+            (input_info.dwFileAttributes &
+             (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) {
+            goto fail;
+        }
     }
     if (process->log_file) {
         wchar_t *wlog = cbm_path_to_wide(process->log_file);
@@ -727,41 +1419,53 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
             free(wlog);
         }
         if (log == INVALID_HANDLE_VALUE) {
-            CloseHandle(nul);
-            CloseHandle(job);
-            free(wbin);
-            free(wcmdline);
-            return -1;
+            goto fail;
         }
     }
 
-    HANDLE inherit[2];
+    if (process->stdout_file) {
+        wchar_t *wstdout = cbm_path_to_wide(process->stdout_file);
+        if (wstdout) {
+            stdout_capture = CreateFileW(wstdout, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            free(wstdout);
+        }
+        if (stdout_capture == INVALID_HANDLE_VALUE) {
+            goto fail;
+        }
+    }
+
+    HANDLE inherit[4];
     SIZE_T inherit_count = 0;
     inherit[inherit_count++] = nul;
+    if (input != INVALID_HANDLE_VALUE) {
+        inherit[inherit_count++] = input;
+    }
     if (log != INVALID_HANDLE_VALUE) {
         inherit[inherit_count++] = log;
     }
+    if (stdout_capture != INVALID_HANDLE_VALUE) {
+        inherit[inherit_count++] = stdout_capture;
+    }
     SIZE_T attrs_size = 0;
     (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
-    LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attrs_size);
-    bool attrs_init = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
+    attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attrs_size);
+    attrs_init = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
     bool attrs_ready = attrs_init && UpdateProcThreadAttribute(
                                          attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
                                          inherit_count * sizeof(inherit[0]), NULL, NULL);
     if (!attrs_ready) {
-        cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);
-        CloseHandle(job);
-        free(wbin);
-        free(wcmdline);
-        return -1;
+        goto fail;
     }
 
     STARTUPINFOEXW startup;
     ZeroMemory(&startup, sizeof(startup));
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = nul;
-    startup.StartupInfo.hStdOutput = log != INVALID_HANDLE_VALUE ? log : nul;
+    startup.StartupInfo.hStdInput = input != INVALID_HANDLE_VALUE ? input : nul;
+    startup.StartupInfo.hStdOutput = stdout_capture != INVALID_HANDLE_VALUE
+                                         ? stdout_capture
+                                         : (log != INVALID_HANDLE_VALUE ? log : nul);
     startup.StartupInfo.hStdError = log != INVALID_HANDLE_VALUE ? log : nul;
     startup.lpAttributeList = attrs;
 
@@ -769,16 +1473,21 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     ZeroMemory(&child, sizeof(child));
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
                   CREATE_NO_WINDOW;
-    /* Fail closed: a git child must never inherit a caller's GIT_DIR. */
-    wchar_t *env = process->strip_git_repo_env ? cbm_git_child_env_block() : NULL;
+    /* Scrubbing remains authoritative even when explicit overrides are present. */
+    wchar_t *env = process->environment;
+    if (!env && process->strip_git_repo_env) {
+        env = cbm_git_child_env_block();
+    }
     if (env) {
         flags |= CREATE_UNICODE_ENVIRONMENT;
     }
     BOOL created = (!process->strip_git_repo_env || env) &&
                    CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
                                   &startup.StartupInfo, &child);
-    cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
-    cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);
+    if (!process->environment) {
+        cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
+    }
+    cbm_win_close_spawn_handles(nul, input, log, stdout_capture, attrs, attrs_init);
     free(wbin);
     free(wcmdline);
     if (!created) {
@@ -810,6 +1519,15 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     process->process_id = child.dwProcessId;
     process->job = job;
     return 0;
+
+fail:
+    cbm_win_close_spawn_handles(nul, input, log, stdout_capture, attrs, attrs_init);
+    if (job) {
+        CloseHandle(job);
+    }
+    free(wbin);
+    free(wcmdline);
+    return -1;
 }
 
 static bool cbm_win_job_active(cbm_subprocess_t *process, bool *known) {
@@ -989,6 +1707,14 @@ static int g_force_spawn_eagain = 0;
 void cbm_subprocess_force_spawn_eagain_for_testing(int attempts) {
     g_force_spawn_eagain = attempts > 0 ? attempts : 0;
 }
+static int g_hold_until_exit = 0;
+void cbm_subprocess_hold_parent_until_child_exits_for_testing(int spawns) {
+    g_hold_until_exit = spawns > 0 ? spawns : 0;
+}
+static int g_observe_exiting = 0;
+void cbm_subprocess_observe_exiting_child_for_testing(int spawns) {
+    g_observe_exiting = spawns > 0 ? spawns : 0;
+}
 int cbm_subprocess_pending_spawn_eagain_for_testing(void) {
     return g_force_spawn_eagain;
 }
@@ -1133,7 +1859,8 @@ cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, lon
 /* fork+exec child setup. On Apple this runs ONLY for the exec-failure
  * fallback (see cbm_posix_spawn_apple), which preserves the documented
  * "bogus binary => child exits 127" contract across platforms. */
-static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int output, long max_fd) {
+static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int output, int error,
+                                 long max_fd) {
     if (setpgid(0, 0) < 0) {
         _exit(127);
     }
@@ -1141,8 +1868,8 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
 
     /* Never let a worker consume the MCP transport inherited as stdin. Only
      * async-signal-safe calls are used between fork and exec. */
-    if (input < 0 || output < 0 || dup2(input, STDIN_FILENO) < 0 ||
-        dup2(output, STDOUT_FILENO) < 0 || dup2(output, STDERR_FILENO) < 0) {
+    if (input < 0 || output < 0 || error < 0 || dup2(input, STDIN_FILENO) < 0 ||
+        dup2(output, STDOUT_FILENO) < 0 || dup2(error, STDERR_FILENO) < 0) {
         _exit(127);
     }
     if (input > STDERR_FILENO) {
@@ -1158,7 +1885,20 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
      * still has execvp's exact-path semantics because it contains '/'. */
-    execvp(process->bin, process->argv);
+    if (process->environment) {
+#ifdef __APPLE__
+        /* Only this child changes environ. execvP keeps the caller's PATH for
+         * executable lookup, including execvp's ENOEXEC shell fallback. */
+        environ = process->environment;
+        execvP(process->bin, process->search_path, process->argv);
+#else
+        /* execvpe searches the inherited caller PATH while passing the owned
+         * environment to the executed image; the parent's environ is untouched. */
+        execvpe(process->bin, process->argv, process->environment);
+#endif
+    } else {
+        execvp(process->bin, process->argv);
+    }
     _exit(127);
 }
 
@@ -1200,7 +1940,8 @@ static int cbm_posix_fd_at_least_three(int fd) {
  *     the child's close-everything loop, and the three dup2'd fds stay open
  *     because dup2 clears close-on-exec.
  * posix_spawnp keeps execvp's PATH semantics for a bare tool name. */
-static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int output, pid_t *pid_out) {
+static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int output, int error,
+                                 pid_t *pid_out) {
     /* posix_spawn is the PRIMARY path on macOS; fork+exec is only the
      * exec-class fallback. Injection therefore has to live here too, or a test
      * on macOS exercises nothing. */
@@ -1230,11 +1971,15 @@ static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int outpu
                       posix_spawnattr_setsigdefault(&attr, &all_signals) == 0 &&
                       posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO) == 0 &&
                       posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) == 0 &&
-                      posix_spawn_file_actions_adddup2(&actions, output, STDERR_FILENO) == 0;
+                      posix_spawn_file_actions_adddup2(&actions, error, STDERR_FILENO) == 0;
     pid_t pid = -1;
-    int rc = configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv,
-                                       process->envp ? process->envp : environ)
-                        : -1;
+    char **environment = process->environment;
+    if (!environment) {
+        environment = process->envp ? process->envp : environ;
+    }
+    int rc = configured
+                 ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv, environment)
+                 : -1;
     (void)posix_spawn_file_actions_destroy(&actions);
     (void)posix_spawnattr_destroy(&attr);
     if (configured && rc == 0 && pid > 0) {
@@ -1263,12 +2008,49 @@ static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int outpu
 }
 #endif
 
+/* Our own unreaped child that setpgid/getpgid cannot find (ESRCH) is not
+ * running: it has exited, or is exiting -- macOS stops finding a child as it
+ * starts to exit, before waitid can report it. Wait until it is reapable;
+ * the wait ends with its exit, and WNOWAIT leaves it for the supervision to
+ * collect with its exit status. */
+static bool cbm_posix_child_reapable(pid_t pid) {
+    for (;;) {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT) == 0) {
+            return info.si_pid == pid;
+        }
+        if (errno != EINTR) {
+            return false;
+        }
+    }
+}
+
 static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     int input_flags = O_RDONLY;
 #ifdef O_CLOEXEC
     input_flags |= O_CLOEXEC;
 #endif
-    int input = cbm_posix_fd_at_least_three(open("/dev/null", input_flags));
+    if (process->stdin_file) {
+        /* O_NONBLOCK prevents waiting for a FIFO writer before fstat rejects
+         * non-regular input. No output has been opened at this point. */
+        input_flags |= O_NONBLOCK;
+#ifdef O_NOFOLLOW
+        input_flags |= O_NOFOLLOW;
+#endif
+    }
+    int input = cbm_posix_fd_at_least_three(
+        open(process->stdin_file ? process->stdin_file : "/dev/null", input_flags));
+    if (input < 0) {
+        return -1;
+    }
+    if (process->stdin_file) {
+        struct stat input_status;
+        if (fstat(input, &input_status) != 0 || !S_ISREG(input_status.st_mode)) {
+            (void)close(input);
+            return -1;
+        }
+    }
     const char *target = process->log_file ? process->log_file : "/dev/null";
     int output_flags = O_WRONLY | O_CREAT | O_TRUNC;
 #ifdef O_CLOEXEC
@@ -1278,13 +2060,8 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     output_flags |= O_NOFOLLOW;
 #endif
     int output = cbm_posix_fd_at_least_three(open(target, output_flags, 0600));
-    if (input < 0 || output < 0) {
-        if (input >= 0) {
-            (void)close(input);
-        }
-        if (output >= 0) {
-            (void)close(output);
-        }
+    if (output < 0) {
+        (void)close(input);
         return -1;
     }
     struct stat output_status;
@@ -1300,6 +2077,23 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
         return -1;
     }
 
+    int stdout_capture = -1;
+    if (process->stdout_file) {
+        stdout_capture =
+            cbm_posix_fd_at_least_three(open(process->stdout_file, output_flags, 0600));
+        struct stat stdout_status;
+        if (stdout_capture < 0 || fstat(stdout_capture, &stdout_status) != 0 ||
+            !S_ISREG(stdout_status.st_mode) || fchmod(stdout_capture, 0600) != 0) {
+            if (stdout_capture >= 0) {
+                (void)close(stdout_capture);
+            }
+            (void)close(input);
+            (void)close(output);
+            return -1;
+        }
+    }
+    int child_output = stdout_capture >= 0 ? stdout_capture : output;
+
     long max_fd = sysconf(_SC_OPEN_MAX);
     if (max_fd < 0 || max_fd > 1048576L) {
         max_fd = 65536L;
@@ -1307,11 +2101,11 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
 
     pid_t pid = -1;
 #ifdef __APPLE__
-    int spawn_rc = cbm_posix_spawn_apple(process, input, output, &pid);
+    int spawn_rc = cbm_posix_spawn_apple(process, input, child_output, output, &pid);
     for (int attempt = 0; spawn_rc == CBM_SPAWN_RETRY && attempt < CBM_SPAWN_RETRY_ATTEMPTS;
          attempt++) {
         cbm_spawn_backoff(attempt);
-        spawn_rc = cbm_posix_spawn_apple(process, input, output, &pid);
+        spawn_rc = cbm_posix_spawn_apple(process, input, child_output, output, &pid);
     }
     if (spawn_rc == CBM_SPAWN_RETRY) {
         spawn_rc = -1; /* still exhausted after backoff: a real failure */
@@ -1319,6 +2113,9 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     if (spawn_rc < 0) {
         (void)close(input);
         (void)close(output);
+        if (stdout_capture >= 0) {
+            (void)close(stdout_capture);
+        }
         return -1;
     }
     if (spawn_rc > 0) { /* exec-class failure: reproduce the fork+exec 127 */
@@ -1326,10 +2123,13 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
         if (pid < 0) {
             (void)close(input);
             (void)close(output);
+            if (stdout_capture >= 0) {
+                (void)close(stdout_capture);
+            }
             return -1;
         }
         if (pid == 0) {
-            cbm_posix_child_exec(process, input, output, max_fd);
+            cbm_posix_child_exec(process, input, child_output, output, max_fd);
         }
     }
 #else
@@ -1337,21 +2137,54 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     if (pid < 0) {
         (void)close(input);
         (void)close(output);
+        if (stdout_capture >= 0) {
+            (void)close(stdout_capture);
+        }
         return -1;
     }
     if (pid == 0) {
-        cbm_posix_child_exec(process, input, output, max_fd);
+        cbm_posix_child_exec(process, input, child_output, output, max_fd);
     }
 #endif
     (void)close(input);
     (void)close(output);
+    if (stdout_capture >= 0) {
+        (void)close(stdout_capture);
+    }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_hold_until_exit > 0) {
+        g_hold_until_exit--;
+        siginfo_t held;
+        (void)waitid(P_PID, (id_t)pid, &held, WEXITED | WNOWAIT);
+    }
+#endif
     /* Parent and child both establish the group, removing scheduler-order races.
      * If the child won and already execed, EACCES is accepted only after proving
-     * that its process group is the expected isolated one. */
-    bool contained = setpgid(pid, pid) == 0;
+     * that its process group is the expected isolated one. A child that has
+     * EXITED, or is exiting, is a finished run, not a failed spawn: macOS no
+     * longer shows such an unreaped child to setpgid/getpgid (ESRCH), and on a
+     * loaded machine a short command (`git config`) gets there before the
+     * parent does. Its group was set before exec, by the spawn attributes or by
+     * the child itself; the parent waits until it is reapable, and the
+     * supervision below reaps it with its real exit status. */
+    bool observe_exiting = false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_observe_exiting > 0) {
+        g_observe_exiting--;
+        observe_exiting = true;
+    }
+#endif
+    bool contained = !observe_exiting && setpgid(pid, pid) == 0;
+    if (observe_exiting) {
+        errno = ESRCH;
+    }
     if (!contained && (errno == EACCES || errno == EPERM || errno == ESRCH)) {
-        contained = getpgid(pid) == pid;
+        bool missing = errno == ESRCH;
+        contained = !observe_exiting && getpgid(pid) == pid;
+        if (!contained && (missing || errno == ESRCH)) {
+            contained = cbm_posix_child_reapable(pid);
+        }
     }
     if (!contained) {
         (void)kill(pid, SIGKILL);

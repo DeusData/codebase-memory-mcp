@@ -16,6 +16,8 @@ pipx install codebase-memory-mcp
 
 There is one composition per platform: the graph UI ships in every build, so no variant selection is needed.
 
+For testing, `CBM_DOWNLOAD_URL` overrides the download base URL (default `https://github.com/DeusData/codebase-memory-mcp/releases/download/v<version>`): the archive and `checksums.txt` are fetched from `<CBM_DOWNLOAD_URL>/<file>`. It must be `https://`, or plain `http://` to exactly `localhost`, `127.0.0.1`, or `[::1]` (optional port; no proxy, no redirects).
+
 ## Usage
 
 ```bash

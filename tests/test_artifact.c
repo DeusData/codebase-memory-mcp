@@ -2,6 +2,7 @@
  * test_artifact.c — Tests for persistent artifact export/import.
  */
 #include "test_framework.h"
+#include "sqlite3.h" /* vendored/sqlite3 — seed a legacy project_summaries row in ADR tests */
 #include "store/store.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline.h"
@@ -62,6 +63,21 @@ static void cleanup_dir(const char *path) {
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
     (void)system(cmd);
+}
+
+/* Remove a destination graph DB (+ its -wal/-shm/-journal) while leaving the ADR
+ * sidecar "<db>.adr.db" in place. Import only runs when the graph DB is missing
+ * (try_artifact_bootstrap); this mirrors that shape so the import rename does not
+ * hit an existing file (which Windows refuses, unlike POSIX). */
+static void remove_graph_db_keep_sidecar(const char *db) {
+    char p[1200];
+    (void)cbm_unlink(db);
+    snprintf(p, sizeof(p), "%s-wal", db);
+    (void)cbm_unlink(p);
+    snprintf(p, sizeof(p), "%s-shm", db);
+    (void)cbm_unlink(p);
+    snprintf(p, sizeof(p), "%s-journal", db);
+    (void)cbm_unlink(p);
 }
 
 static void write_text_file(const char *path, const char *text) {
@@ -206,6 +222,226 @@ TEST(artifact_export_fast_roundtrip) {
     PASS();
 }
 
+/* The ADR travels with the exported artifact: it lives in the "<db>.adr.db"
+ * sidecar, and export must carry it into graph.db.zst so an import restores it
+ * into the destination's sidecar (round-2 review item 7d). */
+TEST(artifact_export_roundtrip_keeps_adr) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    const char *adr_text = "# Decision\nThe team chose the sidecar design.";
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", adr_text), CBM_STORE_OK);
+    cbm_store_close(src);
+
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* The imported project starts with the team's ADR (restored into the
+     * destination sidecar by import). */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    /* The fresh destination sidecar is marked migrated after the import, so a
+     * later reindex's migrate-before-delete is a no-op. Opening the sidecar for
+     * the restore already commits the marker; the restore itself adds none. */
+    char side[1100];
+    snprintf(side, sizeof(side), "%s.adr.db", import_db);
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open_v2(side, &raw, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(
+        sqlite3_prepare_v2(raw, "SELECT value FROM adr_meta WHERE key='migrated';", -1, &st, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* Regression: a stale legacy `project_summaries` row that lingers in the graph DB
+ * after its ADR was migrated then DELETED must NOT resurrect through an export.
+ * With the sidecar empty, the snapshot must ship an empty table, so an import
+ * finds no ADR. (Before the DELETE-first fix, VACUUM INTO copied the stale row
+ * and import restored a deleted decision record.) */
+TEST(artifact_export_without_adr_does_not_resurrect_legacy_row) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    /* Pre-sidecar layout: an ADR lingering only in the graph DB. */
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(g_db, &raw), SQLITE_OK);
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO project_summaries (project, summary, source_hash, created_at, updated_at) "
+        "VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');",
+        "test-proj", "# Decision\nstale, later deleted");
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
+
+    /* Migrate it into the sidecar (marker set), then DELETE it. The graph row
+     * still lingers; the sidecar is now migrated-but-empty. */
+    cbm_store_t *s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_adr_migrate_once(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_delete(s, "test-proj"), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* An import must not clobber an ADR already present locally: the restore uses
+ * INSERT OR IGNORE, so the teammate's own decision record survives importing a
+ * shared artifact. */
+TEST(artifact_import_does_not_clobber_local_adr) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    /* The shared artifact carries ADR "A". */
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", "# Decision\nshared A"), CBM_STORE_OK);
+    cbm_store_close(src);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    /* The importing machine already has its own local ADR "B" for this project. */
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    cbm_store_t *local = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(local);
+    ASSERT_EQ(cbm_store_adr_store(local, "test-proj", "# Decision\nlocal B"), CBM_STORE_OK);
+    cbm_store_close(local);
+
+    /* Import only runs when the graph DB is missing (try_artifact_bootstrap), and
+     * Windows cannot rename over an existing file. Remove the destination graph DB
+     * (keeping the sidecar + its marker) to match production. */
+    remove_graph_db_keep_sidecar(import_db);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* Local B is preserved — the import did not overwrite it with shared A. */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, "# Decision\nlocal B");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* The shared ADR must reach a teammate who has ALREADY indexed the project: their
+ * sidecar is marked migrated but has no ADR row, so the marker-gated migrate-once
+ * would skip it. Import restores-if-absent (ungated), so the artifact's ADR "A"
+ * arrives. (On main, import replaced the whole DB, so the ADR always came through;
+ * the sidecar must preserve that.) */
+TEST(artifact_import_restores_adr_when_local_absent) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    /* The shared artifact carries ADR "A". */
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", "# Decision\nshared A"), CBM_STORE_OK);
+    cbm_store_close(src);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    /* The destination is already indexed: a marked sidecar with NO ADR row. */
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    create_test_db(import_db);
+    cbm_store_t *pre = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(pre);
+    ASSERT_EQ(cbm_store_adr_migrate_once(pre), CBM_STORE_OK); /* marks the sidecar, no ADR */
+    cbm_adr_t none = {0};
+    ASSERT_EQ(cbm_store_adr_get(pre, "test-proj", &none), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&none);
+    cbm_store_close(pre);
+
+    /* Import only runs when the graph DB is missing; remove it (keep the marked
+     * sidecar) so the rename succeeds on Windows too. */
+    remove_graph_db_keep_sidecar(import_db);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* The shared ADR "A" is restored despite the pre-existing marker. */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, "# Decision\nshared A");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* A failed ADR restore must not be silent (#2315 follow-up). A DIRECTORY at
+ * "<db>.adr.db" makes the sidecar open fail deterministically (no hook). The
+ * graph DB is already installed when the restore runs, so the import still
+ * succeeds (best-effort, unchanged), but the team ADR that did not arrive is
+ * logged with the store's reason instead of being dropped without a trace. */
+TEST(artifact_import_logs_failed_adr_restore) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", "# Decision\nshared A"), CBM_STORE_OK);
+    cbm_store_close(src);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    char adr_dir[1100];
+    snprintf(adr_dir, sizeof(adr_dir), "%s.adr.db", import_db);
+    ASSERT_EQ(cbm_mkdir(adr_dir), 0);
+
+    capture_logs_start();
+    int rc = cbm_artifact_import(g_repo, import_db);
+    const char *logs = capture_logs_end();
+
+    ASSERT_EQ(rc, 0); /* the graph DB is installed; the restore stays best-effort */
+    ASSERT_TRUE(cbm_file_exists(import_db));
+    const char *line = strstr(logs, "level=warn msg=artifact.import err=adr_restore");
+    ASSERT_NOT_NULL(line);
+    /* The store's reason is carried (the text log format maps spaces to '_'). */
+    ASSERT(strstr(line, "detail=adr_sidecar_open") != NULL);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_export_best_roundtrip) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -329,6 +565,82 @@ TEST(artifact_gitattributes_created) {
     ASSERT_TRUE(rd > 0);
     ASSERT_NOT_NULL(strstr(content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
     ASSERT_TRUE(strstr(content, "merge=ours binary") == NULL);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* Read a small file through the UTF-8 path layer (wide on Windows), so a
+ * non-ASCII path is never misread by the test's own ANSI CRT call. Returns the
+ * byte count, or 0 when the file cannot be opened or is empty. */
+static size_t read_small_file_utf8(const char *path, char *buf, size_t cap) {
+    buf[0] = '\0';
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return 0;
+    }
+    size_t rd = fread(buf, 1, cap - 1, fp);
+    (void)fclose(fp);
+    buf[rd] = '\0';
+    return rd;
+}
+
+/* #1171: a repository (and a cache directory) under a non-ASCII path must
+ * export, report the artifact present, and import — also onto an existing
+ * cache db. On Windows the atomic writer used the ANSI CRT fopen + MoveFileExA
+ * and the existence check the ANSI stat, so CJK characters outside the active
+ * code page made every step fail. The same export also writes the
+ * .gitattributes merge=ours protection, which ensure_gitattributes created
+ * with the ANSI CRT open(): on Windows it was silently missing. The bytes are
+ * escaped UTF-8 for a CJK repo directory name and a CJK cache directory name
+ * (kept ASCII in source). */
+#define ART_CJK_REPO "\xe6\x8c\x81\xe4\xb9\x85\xe5\x8c\x96\xe5\xa4\x8d\xe7\x8e\xb0"
+#define ART_CJK_CACHE "\xe5\xaf\xbc\xe5\x85\xa5"
+TEST(artifact_roundtrip_non_ascii_paths) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char repo[1024];
+    snprintf(repo, sizeof(repo), "%s/cbm-" ART_CJK_REPO, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", repo);
+    ASSERT_TRUE(cbm_file_exists(zst));
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+
+    char ga[1024];
+    snprintf(ga, sizeof(ga), "%s/.codebase-memory/.gitattributes", repo);
+    char ga_content[512];
+    ASSERT_TRUE(read_small_file_utf8(ga, ga_content, sizeof(ga_content)) > 0);
+    ASSERT_NOT_NULL(strstr(ga_content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
+
+    /* Create-only-if-absent: a re-export never rewrites an existing
+     * .gitattributes the user may have edited. */
+    static const char user_ga[] = "# user-owned\n";
+    FILE *uga = cbm_fopen(ga, "wb");
+    ASSERT_NOT_NULL(uga);
+    ASSERT_TRUE(fputs(user_ga, uga) >= 0);
+    ASSERT_EQ(fclose(uga), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    ASSERT_EQ(read_small_file_utf8(ga, ga_content, sizeof(ga_content)), strlen(user_ga));
+    ASSERT_STR_EQ(ga_content, user_ga);
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/" ART_CJK_CACHE, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(cache_dir, 0755));
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", cache_dir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+    /* Re-import replaces the existing cache db (the second-session path). */
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+    cbm_store_close(s);
 
     cleanup_dir(g_tmpdir);
     PASS();
@@ -1096,12 +1408,18 @@ SUITE(artifact) {
     RUN_TEST(artifact_repo_path_shell_safe_rejects_injection);
     RUN_TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows);
     RUN_TEST(artifact_export_fast_roundtrip);
+    RUN_TEST(artifact_export_roundtrip_keeps_adr);
+    RUN_TEST(artifact_export_without_adr_does_not_resurrect_legacy_row);
+    RUN_TEST(artifact_import_does_not_clobber_local_adr);
+    RUN_TEST(artifact_import_restores_adr_when_local_absent);
+    RUN_TEST(artifact_import_logs_failed_adr_restore);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
     RUN_TEST(artifact_commit_hash);
     RUN_TEST(artifact_schema_version_mismatch);
     RUN_TEST(artifact_import_missing);
     RUN_TEST(artifact_gitattributes_created);
+    RUN_TEST(artifact_roundtrip_non_ascii_paths);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_import_rejects_size_mismatch);

@@ -1,0 +1,1398 @@
+{
+  "startedAt": "2026-09-09T21:37:58.459Z",
+  "origin": "http://127.0.0.1:9749",
+  "project": "cbm-pr2068",
+  "file": "src/daemon/application.c",
+  "method": "Fresh browser, global search, ordinary clicks; no storage seeding, API mocks or repository changes.",
+  "actions": [
+    {
+      "description": "Start exploring",
+      "before": {
+        "x": 983.9375,
+        "y": 729.984375,
+        "width": 119.0625,
+        "height": 42.796875
+      }
+    },
+    {
+      "description": "Explore",
+      "before": {
+        "x": 215.5,
+        "y": 12,
+        "width": 71.125,
+        "height": 36.796875
+      }
+    },
+    {
+      "description": "Global Search",
+      "before": {
+        "x": 926.234375,
+        "y": 12,
+        "width": 128.3125,
+        "height": 36.796875
+      }
+    },
+    {
+      "description": "First exact file search result",
+      "before": {
+        "x": 439,
+        "y": 267.390625,
+        "width": 722,
+        "height": 26.796875
+      }
+    },
+    {
+      "description": "Select a real function from the file inspector",
+      "before": {
+        "x": 1175,
+        "y": 1118.890625,
+        "width": 411,
+        "height": 28
+      }
+    },
+    {
+      "description": "Selection context opens the shared Change impact workspace",
+      "before": {
+        "x": 1161,
+        "y": 564.390625,
+        "width": 439,
+        "height": 40
+      }
+    }
+  ],
+  "screenshots": [
+    {
+      "name": "explore-after-exact-path-search.png",
+      "at": "2026-09-09T21:38:08.349Z"
+    },
+    {
+      "name": "explore-after-symbol-list.png",
+      "at": "2026-09-09T21:38:17.839Z"
+    },
+    {
+      "name": "explore-after-selection-context.png",
+      "at": "2026-09-09T21:38:25.144Z"
+    },
+    {
+      "name": "explore-after-shared-impact.png",
+      "at": "2026-09-09T21:38:31.348Z"
+    }
+  ],
+  "pageErrors": [],
+  "externalRequests": [],
+  "rpc": [
+    {
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "tool": "get_architecture",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "aspects": [
+          "all"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "scopes": [
+          "."
+        ],
+        "scope_limit": 1000,
+        "scope_offset": 0,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name LIMIT 1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.file_path LIMIT 1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.200.091f738e1a18a620"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.400.cb42711816aa71ad"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.600.d3fa4a361333dc33"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.800.e8b36b579cb3c296"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1000.da6c2036e2b3c897"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1200.79e8c9ef92925ae8"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1400.f499d0468edfc056"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1600.dd8036e46d49c249"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.121.e6a98e1d3bd78078"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.241.e4825367cfca3bc8"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.365.ba5d587a5b2ded55"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.484.19e2f2ece8a900a4"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.595.ed3402094d14b609"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.714.989114d932a9814d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.834.b4a4064c94c5b0ce"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.939.187e9e45e4ce55cd"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1039.223d2df82e90e69b"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1148.f8186429ec21d175"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1258.0316b3b252728ae3"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1376.9df877499e2bece4"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1494.184c2bb05af101e6"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.a412b05a6d0e32c2.0dfebd232438b67b93f4cd0f499992d3.131.9db46e591a2eac1e"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Interface) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Type) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "paths": [
+          "src/daemon/application.c"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6b1590743e407166.f58a45e563611d920d2bbc167fc7b120.127.5c30f9fe682fd8d1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.200.3b9805f730c8be7c"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.400.bb7f6a20711f6b7d"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 1001,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.600.fd67e505cb3a27f2"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 1501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.800.1854549916618a0d"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 2001,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1000.37425c48c1a2c08a"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 2501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1200.c1db4fad70162e41"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 3001,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1400.a28d7e9cfc6e9543"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 3501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1600.9ebf1f3c68be526e"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1800.61a17ff93f6a0b17"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.200.3b9805f730c8be7c"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2000.b275d9ece1d8debb"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.400.bb7f6a20711f6b7d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2200.93d134d6edc5a131"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.600.fd67e505cb3a27f2"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2400.756a72cd219a9d87"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.800.1854549916618a0d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2600.6d22d902d0fe8d29"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1000.37425c48c1a2c08a"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2800.b06b7b7b763d9156"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1200.c1db4fad70162e41"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3000.32a641e1cbbccc9b"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1400.a28d7e9cfc6e9543"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3200.62856e8290dbda44"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1600.9ebf1f3c68be526e"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3400.3cef49011407050b"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1800.61a17ff93f6a0b17"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3600.500bcbcb909966c0"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2000.b275d9ece1d8debb"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 288 AND n.end_line >= 288 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3800.cf5490bc42ef427d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2200.93d134d6edc5a131"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 288 AND n.end_line >= 288 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.4000.adce797c8edb1623"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2400.756a72cd219a9d87"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 288 AND n.end_line >= 288 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2600.6d22d902d0fe8d29"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.qualified_name, b.file_path, b.start_line, r.line ORDER BY r.line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b) WHERE b.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN a.name, a.qualified_name, a.file_path, a.start_line, a.is_test, r.line ORDER BY r.line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:RAISES]->(b) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.file_path, b.start_line, r.line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CONFIGURES]->(b:EnvVar) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.env_key, b.file_path, r.line, r.strategy LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:USAGE]->(b) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.qualified_name, b.file_path, b.start_line, r.line LIMIT 200"
+      }
+    },
+    {
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application.application_project_lock_release_fully",
+        "source_mode": "full",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.qualified_name, b.file_path, b.start_line, r.line ORDER BY r.line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2800.b06b7b7b763d9156"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b:Class) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.qualified_name LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:THROWS]->(b) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.file_path, b.start_line, r.line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b:Class) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.application_project_lock_release_fully\" RETURN b.name, b.qualified_name LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.200.3b9805f730c8be7c"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3000.32a641e1cbbccc9b"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 273 AND n.end_line >= 273 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.400.bb7f6a20711f6b7d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3200.62856e8290dbda44"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.200.3b9805f730c8be7c"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 273 AND n.end_line >= 273 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.600.fd67e505cb3a27f2"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3400.3cef49011407050b"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.400.bb7f6a20711f6b7d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 273 AND n.end_line >= 273 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.800.1854549916618a0d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3600.500bcbcb909966c0"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.600.fd67e505cb3a27f2"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 268 AND n.end_line >= 268 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1000.37425c48c1a2c08a"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.3800.cf5490bc42ef427d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.800.1854549916618a0d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 268 AND n.end_line >= 268 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1200.c1db4fad70162e41"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.4000.adce797c8edb1623"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1000.37425c48c1a2c08a"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 268 AND n.end_line >= 268 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1400.a28d7e9cfc6e9543"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1200.c1db4fad70162e41"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/project_lock.c\" AND n.start_line <= 67 AND n.end_line >= 67 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1600.9ebf1f3c68be526e"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1400.a28d7e9cfc6e9543"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/project_lock.c\" AND n.start_line <= 67 AND n.end_line >= 67 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1800.61a17ff93f6a0b17"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1600.9ebf1f3c68be526e"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/project_lock.c\" AND n.start_line <= 67 AND n.end_line >= 67 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2000.b275d9ece1d8debb"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.1800.61a17ff93f6a0b17"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/foundation/platform.c\" AND n.start_line <= 286 AND n.end_line >= 286 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2200.93d134d6edc5a131"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2000.b275d9ece1d8debb"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/foundation/platform.c\" AND n.start_line <= 286 AND n.end_line >= 286 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2400.756a72cd219a9d87"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2200.93d134d6edc5a131"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/foundation/platform.c\" AND n.start_line <= 286 AND n.end_line >= 286 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.62a75514945c45e9.889a33e1bed60437c544a8577924dd62.2600.6d22d902d0fe8d29"
+      }
+    }
+  ],
+  "checks": {
+    "initialSearchRows": [
+      "CBM_DAEMON_APPLICATION_INTERNAL_Hsrc/daemon/application_internal.hL5loadedsrc + daemon + application",
+      "CBM_DAEMON_APPLICATION_Hsrc/daemon/application.hL11loadedsrc + daemon + application",
+      "CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAXsrc/daemon/runtime.hL60loadedsrc + daemon + application",
+      "CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALIDsrc/daemon/runtime.hL129loadedsrc + daemon + application",
+      "O_CLOEXECsrc/daemon/ipc.cL320loadedsrc + daemon + application",
+      "O_DIRECTORYsrc/daemon/ipc.cL323loadedsrc + daemon + application",
+      "O_NOFOLLOWsrc/daemon/ipc.cL326loadedsrc + daemon + application",
+      "MATRIX_A_CASEStests/repro/repro_call_argument_matrix_a.cL1188loadedsrc + daemon + application",
+      "CARD_BUDGET_CLASS_Agraph-ui/src/compiler/card-compiler.tsL59loadedsrc + daemon + application",
+      "NOT_A_CALLABLEgraph-ui/src/traces/bug-paths.test.tsL170loadedsrc + daemon + application"
+    ],
+    "initialSearchStatus": "searching",
+    "searchResults": [
+      "application.csrc/daemon/application.cexact file path"
+    ],
+    "firstSearchPath": "src/daemon/application.c",
+    "symbols": "Symbols in this file\ncbm_daemon_application_watch\nclass · 98\ncbm_daemon_application_session\nclass · 105\ncbm_daemon_application_job\nclass · 133\ncbm_daemon_application_watch_job_subscription\nclass · 158\ncbm_daemon_application_mutation\nclass · 164\ncbm_daemon_application\nclass · 171\ncbm_watcher\nclass · 173\ncbm_config\nclass · 174\ncbm_daemon_application_fail_next_job_thread_start_for_test\nfunction · 218\ncbm_daemon_application_background_initializes_for_test\nfunction · 232\ncbm_daemon_application_busy_queue_waits_for_test\nfunction · 243\ncbm_daemon_application_hold_job_before_start_for_test\nfunction · 247\napplication_job_thread_create\nfunction · 252\napplication_request_cancelled_locked\nfunction · 260\napplication_deadline_after\nfunction · 268\napplication_cleanup_force_terminate\nfunction · 273\napplication_project_lock_release_fully\nfunction · 288\napplication_worker_diagnostic\nfunction · 311\napplication_worker_start_default\nfunction · 327\napplication_worker_poll_default\nfunction · 352\napplication_worker_cancel_default\nfunction · 360\napplication_worker_log_path_default\nfunction · 367\napplication_worker_destroy_default\nfunction · 374\napplication_get_u32\nfunction · 383\napplication_put_u32\nfunction · 388\napplication_text_copy\nfunction · 395\napplication_regular_db_exists\nfunction · 407\napplication_canonical_directory_exists\nfunction · 421\napplication_find_watch_locked\nfunction · 426\napplication_remove_watch_entry_locked\nfunction · 436\napplication_remove_watch_locked\nfunction · 462\napplication_release_session_watch_locked\nfunction · 467\napplication_session_workspace_allowed\nfunction · 482\napplication_refresh_watch_locked\nfunction · 499\napplication_refresh_watch\nfunction · 582\napplication_job_free\nfunction · 591\napplication_jobs_reap_completed\nfunction · 605\napplication_tmp_lock\nfunction · 645\napplication_tmp_unlock\nfunction · 651\napplication_cache_dir\nfunction · 655\napplication_unique_recovery_file\nfunction · 680\napplication_recovery_files_create\nfunction · 711\napplication_recovery_files_remove\nfunction · 724\napplication_truncate_file\nfunction · 734\napplication_read_suspects\nfunction · 741\napplication_free_suspects\nfunction · 833\napplication_suspect_contains\nfunction · 843\napplication_append_quarantine\nfunction · 852\napplication_max_restarts\nfunction · 865\napplication_attempt_init\nfunction · 877\napplication_attempt_free\nfunction · 883\napplication_job_cancel_requested\nfunction · 888\napplication_project_keys_conflict\nfunction · 896\napplication_mutation_conflicts_locked\nfunction · 901\napplication_job_reserves_project_locked\nfunction · 912\napplication_mutation_begin_internal\nfunction · 922\ncbm_daemon_application_project_mutation_try_begin\nfunction · 1015\ncbm_daemon_application_project_mutation_end\nfunction · 1020\napplication_watcher_mutation_begin\nfunction · 1058\napplication_watcher_mutation_end\nfunction · 1062\napplication_watcher_project_pruned\nfunction · 1066\napplication_session_mutation_begin\nfunction · 1081\napplication_session_mutation_try_begin\nfunction · 1087\napplication_session_mutation_end\nfunction · 1093\napplication_job_wait_for_mutations\nfunction · 1100\napplication_cancelled_result\nfunction · 1117\napplication_job_run_attempt\nfunction · 1125\napplication_job_failure_response\nfunction · 1203\napplication_attempt_disposition\nfunction · 1224\napplication_record_attempt\nfunction · 1237\napplication_record_cancelled\nfunction · 1250\napplication_result_is_attributable_failure\nfunction · 1258\napplication_job_execution_init\nfunction · 1280\napplication_job_execution_cancel\nfunction · 1285\napplication_index_response_succeeded\nfunction · 1296\napplication_consume_attempt\nfunction · 1306\napplication_recovery_record_suspects\nfunction · 1337\napplication_job_try_partial\nfunction · 1384\napplication_job_recover\nfunction · 1411\napplication_auto_index_retry_pending_locked\nfunction · 1466\napplication_job_publish\nfunction · 1514\napplication_job_thread\nfunction · 1556\napplication_find_job_locked\nfunction · 1595\napplication_find_active_job_locked\nfunction · 1608\napplication_index_project_key\nfunction · 1618\napplication_active_job_count_locked\nfunction · 1625\napplication_index_args_normalize_defaults\nfunction · 1640\napplication_index_args_equal\nfunction · 1659\napplication_job_subscribe_locked\nfunction · 1681\napplication_job_subscribe\nfunction · 1744\napplication_job_unsubscribe_locked\nfunction · 1755\napplication_auto_index_release_locked\nfunction · 1768\napplication_auto_index_cancel_join\nfunction · 1784\napplication_update_cancel_locked\nfunction · 1808\napplication_update_owner_release_locked\nfunction · 1819\napplication_update_version_valid\nfunction · 1835\napplication_update_publish_terminal_locked\nfunction · 1848\napplication_update_thread\nfunction · 1876\napplication_update_subscribe_locked\nfunction · 1927\napplication_update_reap\nfunction · 1967\napplication_auto_index_args\nfunction · 2002\napplication_background_initialize_impl\nfunction · 2017\napplication_background_initialize\nfunction · 2100\napplication_jsonrpc_success\nfunction · 2106\napplication_update_notice_inject\nfunction · 2115\napplication_watch_job_subscription_exists_locked\nfunction · 2128\napplication_watch_job_subscribe_late_session_locked\nfunction · 2145\napplication_watch_job_subscribe_sessions_locked\nfunction · 2173\napplication_watch_job_unsubscribe_session_locked\nfunction · 2219\napplication_watch_job_unsubscribe_job_locked\nfunction · 2238\napplication_job_wait_for_session\nfunction · 2254\napplication_index_execute\nfunction · 2278\napplication_session_open\nfunction · 2341\napplication_set_context\nfunction · 2383\napplication_oversized_response_error\nfunction · 2458\napplication_framable_response\nfunction · 2499\ncbm_daemon_application_framable_response_for_test\nfunction · 2508\napplication_mcp_request\nfunction · 2513\napplication_tool_request\nfunction · 2573\napplication_set_ui_config\nfunction · 2609\napplication_ui_readiness_proof\nfunction · 2647\napplication_request_dispatch\nfunction · 2665\napplication_request\nfunction · 2710\napplication_cancel_jobs_locked\nfunction · 2798\napplication_request_cancel\nfunction · 2806\napplication_session_cancel\nfunction · 2836\napplication_session_close\nfunction · 2894\ncbm_daemon_application_set_permanent\nfunction · 2936\ncbm_daemon_application_new\nfunction · 2945\ncbm_daemon_application_shutdown\nfunction · 3035\ncbm_daemon_application_free_with_timeout\nfunction · 3093\ncbm_daemon_application_free\nfunction · 3164\ncbm_daemon_application_runtime_callbacks\nfunction · 3168\napplication_client_exchange_tagged\nfunction · 3184\napplication_client_exchange\nfunction · 3228\ncbm_daemon_application_client_set_context\nfunction · 3236\ncbm_daemon_application_client_set_ui_config\nfunction · 3292\ncbm_daemon_application_client_ui_readiness_proof\nfunction · 3326\napplication_client_text_request_tagged\nfunction · 3358\napplication_client_text_request\nfunction · 3380\ncbm_daemon_application_client_mcp\nfunction · 3388\ncbm_daemon_application_client_mcp_tagged\nfunction · 3395\ncbm_daemon_application_client_tool\nfunction · 3404\ncbm_daemon_application_client_hook_augment\nfunction · 3428\napplication_background_index\nfunction · 3436\ncbm_daemon_application_index\nfunction · 3544\ncbm_daemon_application_watcher_index\nfunction · 3549\ncbm_daemon_application_active_jobs\nfunction · 3554\ncbm_daemon_application_job_subscribers\nfunction · 3569\ncbm_daemon_application_physical_job_limit\nfunction · 3581\ncbm_daemon_application_worker_memory_budget_bytes\nfunction · 3591\ncbm_daemon_application_session_retains_store_for_test\nfunction · 3601",
+    "symbolKinds": [
+      "class · 98",
+      "class · 105",
+      "class · 133",
+      "class · 158",
+      "class · 164",
+      "class · 171",
+      "class · 173",
+      "class · 174",
+      "function · 218",
+      "function · 232",
+      "function · 243",
+      "function · 247",
+      "function · 252",
+      "function · 260",
+      "function · 268",
+      "function · 273",
+      "function · 288",
+      "function · 311",
+      "function · 327",
+      "function · 352",
+      "function · 360",
+      "function · 367",
+      "function · 374",
+      "function · 383",
+      "function · 388",
+      "function · 395",
+      "function · 407",
+      "function · 421",
+      "function · 426",
+      "function · 436",
+      "function · 462",
+      "function · 467",
+      "function · 482",
+      "function · 499",
+      "function · 582",
+      "function · 591",
+      "function · 605",
+      "function · 645",
+      "function · 651",
+      "function · 655",
+      "function · 680",
+      "function · 711",
+      "function · 724",
+      "function · 734",
+      "function · 741",
+      "function · 833",
+      "function · 843",
+      "function · 852",
+      "function · 865",
+      "function · 877",
+      "function · 883",
+      "function · 888",
+      "function · 896",
+      "function · 901",
+      "function · 912",
+      "function · 922",
+      "function · 1015",
+      "function · 1020",
+      "function · 1058",
+      "function · 1062",
+      "function · 1066",
+      "function · 1081",
+      "function · 1087",
+      "function · 1093",
+      "function · 1100",
+      "function · 1117",
+      "function · 1125",
+      "function · 1203",
+      "function · 1224",
+      "function · 1237",
+      "function · 1250",
+      "function · 1258",
+      "function · 1280",
+      "function · 1285",
+      "function · 1296",
+      "function · 1306",
+      "function · 1337",
+      "function · 1384",
+      "function · 1411",
+      "function · 1466",
+      "function · 1514",
+      "function · 1556",
+      "function · 1595",
+      "function · 1608",
+      "function · 1618",
+      "function · 1625",
+      "function · 1640",
+      "function · 1659",
+      "function · 1681",
+      "function · 1744",
+      "function · 1755",
+      "function · 1768",
+      "function · 1784",
+      "function · 1808",
+      "function · 1819",
+      "function · 1835",
+      "function · 1848",
+      "function · 1876",
+      "function · 1927",
+      "function · 1967",
+      "function · 2002",
+      "function · 2017",
+      "function · 2100",
+      "function · 2106",
+      "function · 2115",
+      "function · 2128",
+      "function · 2145",
+      "function · 2173",
+      "function · 2219",
+      "function · 2238",
+      "function · 2254",
+      "function · 2278",
+      "function · 2341",
+      "function · 2383",
+      "function · 2458",
+      "function · 2499",
+      "function · 2508",
+      "function · 2513",
+      "function · 2573",
+      "function · 2609",
+      "function · 2647",
+      "function · 2665",
+      "function · 2710",
+      "function · 2798",
+      "function · 2806",
+      "function · 2836",
+      "function · 2894",
+      "function · 2936",
+      "function · 2945",
+      "function · 3035",
+      "function · 3093",
+      "function · 3164",
+      "function · 3168",
+      "function · 3184",
+      "function · 3228",
+      "function · 3236",
+      "function · 3292",
+      "function · 3326",
+      "function · 3358",
+      "function · 3380",
+      "function · 3388",
+      "function · 3395",
+      "function · 3404",
+      "function · 3428",
+      "function · 3436",
+      "function · 3544",
+      "function · 3549",
+      "function · 3554",
+      "function · 3569",
+      "function · 3581",
+      "function · 3591",
+      "function · 3601"
+    ],
+    "fileIdentity": "src/daemon/application.c",
+    "reader": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n/*\n * application.c — Daemon-owned CBM application sessions and thin-client wire.\n */\n#include \"daemon/application.h\"\n#include \"daemon/application_internal.h\"\n#include \"cli/cli.h\"\n#include \"foundation/compat.h\"\n#include \"foundation/compat_fs.h\"\n#include \"foundation/compat_thread.h\"\n#include \"foundation/log.h\"\n#include \"foundation/mem.h\"\n#include \"foundation/platform.h\"\n#include \"foundation/secure_random.h\"\n#include \"foundation/sha256.h\"\n#include \"foundation/subprocess.h\"\n#include \"foundation/workspace.h\"\n#include \"mcp/index_supervisor.h\"\n#include \"mcp/mcp.h\"\n#include \"mcp/mcp_internal.h\"\n#include \"pipeline/pipeline.h\"\n#include \"ui/config.h\"\n#include \"watcher/watcher.h\"\n#include <yyjson/yyjson.h>\n#include <ctype.h>\n#include <limits.h>\n#include <stdint.h>\n#include <stdatomic.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/stat.h>\n#ifdef _WIN32\n#ifndef WIN32_LEAN_AND_MEAN",
+    "selectionContext": "Selection context\n\napplication_project_lock_release_fully\n\nGRAPH EVIDENCE\n\n2 indexed caller edges from 1 files reach this selection. Check these callers when changing its contract.\n\nIncoming relationships · 2\nOutgoing relationships · 4\nObserved agent activity · 0 retained events for this file\nRead source evidence",
+    "selectedIdentity": "application_project_lock_release_fully\nfunction\nsrc/daemon/application.c:288-299",
+    "analysisScope": "Use current editor selection\nsrc/daemon/application.c\nAnalysis scope\nEntire indexed file\ncbm_daemon_application_fail_next_job_thread_start_for_test · line 218\ncbm_daemon_application_background_initializes_for_test · line 232\ncbm_daemon_application_busy_queue_waits_for_test · line 243\ncbm_daemon_application_hold_job_before_start_for_test · line 247\napplication_job_thread_create · line 252\napplication_request_cancelled_locked · line 260\napplication_deadline_after · line 268\napplication_cleanup_force_terminate · line 273\napplication_project_lock_release_fully · line 288\napplication_worker_diagnostic · line 311\napplication_worker_start_default · line 327\napplication_worker_poll_default · line 352\napplication_worker_cancel_default · line 360\napplication_worker_log_path_default · line 367\napplication_worker_destroy_default · line 374\napplication_get_u32 · line 383\napplication_put_u32 · line 388\napplication_text_copy · line 395\napplication_regular_db_exists · line 407\napplication_canonical_directory_exists · line 421\napplication_find_watch_locked · line 426\napplication_remove_watch_entry_locked · line 436\napplication_remove_watch_locked · line 462\napplication_release_session_watch_locked · line 467\napplication_session_workspace_allowed · line 482\napplication_refresh_watch_locked · line 499\napplication_refresh_watch · line 582\napplication_job_free · line 591\napplication_jobs_reap_completed · line 605\napplication_tmp_lock · line 645\napplication_tmp_unlock · line 651\napplication_cache_dir · line 655\napplication_unique_recovery_file · line 680\napplication_recovery_files_create · line 711\napplication_recovery_files_remove · line 724\napplication_truncate_file · line 734\napplication_read_suspects · line 741\napplication_free_suspects · line 833\napplication_suspect_contains · line 843\napplication_append_quarantine · line 852\napplication_max_restarts · line 865\napplication_attempt_init · line 877\napplication_attempt_free · line 883\napplication_job_cancel_requested · line 888\napplication_project_keys_conflict · line 896\napplication_mutation_conflicts_locked · line 901\napplication_job_reserves_project_locked · line 912\napplication_mutation_begin_internal · line 922\ncbm_daemon_application_project_mutation_try_begin · line 1015\ncbm_daemon_application_project_mutation_end · line 1020\napplication_watcher_mutation_begin · line 1058\napplication_watcher_mutation_end · line 1062\napplication_watcher_project_pruned · line 1066\napplication_session_mutation_begin · line 1081\napplication_session_mutation_try_begin · line 1087\napplication_session_mutation_end · line 1093\napplication_job_wait_for_mutations · line 1100\napplication_cancelled_result · line 1117\napplication_job_run_attempt · line 1125\napplication_job_failure_response · line 1203\napplication_attempt_disposition · line 1224\napplication_record_attempt · line 1237\napplication_record_cancelled · line 1250\napplication_result_is_attributable_failure · line 1258\napplication_job_execution_init · line 1280\napplication_job_execution_cancel · line 1285\napplication_index_response_succeeded · line 1296\napplication_consume_attempt · line 1306\napplication_recovery_record_suspects · line 1337\napplication_job_try_partial · line 1384\napplication_job_recover · line 1411\napplication_auto_index_retry_pending_locked · line 1466\napplication_job_publish · line 1514\napplication_job_thread · line 1556\napplication_find_job_locked · line 1595\napplication_find_active_job_locked · line 1608\napplication_index_project_key · line 1618\napplication_active_job_count_locked · line 1625\napplication_index_args_normalize_defaults · line 1640\napplication_index_args_equal · line 1659\napplication_job_subscribe_locked · line 1681\napplication_job_subscribe · line 1744\napplication_job_unsubscribe_locked · line 1755\napplication_auto_index_release_locked · line 1768\napplication_auto_index_cancel_join · line 1784\napplication_update_cancel_locked · line 1808\napplication_update_owner_release_locked · line 1819\napplication_update_version_valid · line 1835\napplication_update_publish_terminal_locked · line 1848\napplication_update_thread · line 1876\napplication_update_subscribe_locked · line 1927\napplication_update_reap · line 1967\napplication_auto_index_args · line 2002\napplication_background_initialize_impl · line 2017\napplication_background_initialize · line 2100\napplication_jsonrpc_success · line 2106\napplication_update_notice_inject · line 2115\napplication_watch_job_subscription_exists_locked · line 2128\napplication_watch_job_subscribe_late_session_locked · line 2145\napplication_watch_job_subscribe_sessions_locked · line 2173\napplication_watch_job_unsubscribe_session_locked · line 2219\napplication_watch_job_unsubscribe_job_locked · line 2238\napplication_job_wait_for_session · line 2254\napplication_index_execute · line 2278\napplication_session_open · line 2341\napplication_set_context · line 2383\napplication_oversized_response_error · line 2458\napplication_framable_response · line 2499\ncbm_daemon_application_framable_response_for_test · line 2508\napplication_mcp_request · line 2513\napplication_tool_request · line 2573\napplication_set_ui_config · line 2609\napplication_ui_readiness_proof · line 2647\napplication_request_dispatch · line 2665\napplication_request · line 2710\napplication_cancel_jobs_locked · line 2798\napplication_request_cancel · line 2806\napplication_session_cancel · line 2836\napplication_session_close · line 2894\ncbm_daemon_application_set_permanent · line 2936\ncbm_daemon_application_new · line 2945\ncbm_daemon_application_shutdown · line 3035\ncbm_daemon_application_free_with_timeout · line 3093\ncbm_daemon_application_free · line 3164\ncbm_daemon_application_runtime_callbacks · line 3168\napplication_client_exchange_tagged · line 3184\napplication_client_exchange · line 3228\ncbm_daemon_application_client_set_context · line 3236\ncbm_daemon_application_client_set_ui_config · line 3292\ncbm_daemon_application_client_ui_readiness_proof · line 3326\napplication_client_text_request_tagged · line 3358\napplication_client_text_request · line 3380\ncbm_daemon_application_client_mcp · line 3388\ncbm_daemon_application_client_mcp_tagged · line 3395\ncbm_daemon_application_client_tool · line 3404\ncbm_daemon_application_client_hook_augment · line 3428\napplication_background_index · line 3436\ncbm_daemon_application_index · line 3544\ncbm_daemon_application_watcher_index · line 3549\ncbm_daemon_application_active_jobs · line 3554\ncbm_daemon_application_job_subscribers · line 3569\ncbm_daemon_application_physical_job_limit · line 3581\ncbm_daemon_application_worker_memory_budget_bytes · line 3591\ncbm_daemon_application_session_retains_store_for_test · line 3601\nOpen source evidence",
+    "analysisSymbol": "cbm-pr2068.src.daemon.application.application_project_lock_release_fully"
+  },
+  "success": true,
+  "finishedAt": "2026-09-09T21:38:31.349Z"
+}

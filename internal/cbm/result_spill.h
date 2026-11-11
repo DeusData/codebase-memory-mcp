@@ -43,7 +43,10 @@ CBMFileResult *cbm_result_spill_load(const cbm_result_spill_t *sp, int slot);
 
 /* Read only the parked header of slot `slot` into *out: every count in it
  * is valid, every pointer meaningless. False when the slot is empty or the
- * read fails. Lets a consumer skip the load when there is nothing to read. */
+ * read fails. Lets a consumer skip the load when there is nothing to read.
+ * Python namespace version/language/status/count are scalar evidence only:
+ * zero facts with NOT_CAPTURED/INCOMPLETE is not a known-empty namespace, and
+ * event pointers require load. Failed peek/load provides no namespace evidence. */
 bool cbm_result_spill_peek_header(const cbm_result_spill_t *sp, int slot, CBMFileResult *out);
 
 /* Read only the parked header of slot `slot`: how many defs and impl

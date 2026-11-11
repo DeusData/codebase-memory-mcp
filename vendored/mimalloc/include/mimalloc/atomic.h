@@ -9,13 +9,14 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_ATOMIC_H
 
 // include windows.h or pthreads.h
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__CYGWIN__)  // we use windows locks on cygwin, but otherwise treat it at unix
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif !defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__))
-#define  MI_USE_PTHREADS
+#endif
+#if MI_TLS_MODEL_PTHREADS || (!defined(_WIN32) && !defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)))
+#define  MI_USE_PTHREADS        1
 #include <pthread.h>
 #endif
 
@@ -215,24 +216,22 @@ static inline uintptr_t mi_atomic_exchange_explicit(_Atomic(uintptr_t)*p, uintpt
   (void)(mo);
   return (uintptr_t)MI_MSC_64(_InterlockedExchange)((volatile msc_intptr_t*)p, (msc_intptr_t)exchange);
 }
-static inline void mi_atomic_thread_fence(mi_memory_order mo) {
-  (void)(mo);
-  _Atomic(uintptr_t) x = 0;
-  mi_atomic_exchange_explicit(&x, 1, mo);
-}
 
 static inline uintptr_t mi_atomic_load_explicit(_Atomic(uintptr_t) const* p, mi_memory_order mo) {
   (void)(mo);
   // assert(mo<=mi_memory_order_acquire); // others are not used by mimalloc
   #if defined(_M_IX86) || defined(_M_X64)
+    // on x86/x64 we have a strong memory model so any load is acquire
     return (uintptr_t)MI_MSC_XX(__iso_volatile_load)((volatile const intptr_t*)p);
   #elif defined(_M_ARM) || defined(_M_ARM64)
     if (mo == mi_memory_order_relaxed) {
       return (uintptr_t)MI_MSC_XX(__iso_volatile_load)((volatile const intptr_t*)p);
     }
+    #if !defined(__clang__) // work around __ldar missing in clang-cl, see https://github.com/llvm/llvm-project/issues/121689
     else if (mo <= mi_memory_order_acquire) {
       return MI_MSC_XX(__ldar)((volatile const uintptr_t*)p);
     }
+    #endif
     else {
       const uintptr_t u = (uintptr_t)MI_MSC_XX(__iso_volatile_load)((volatile const intptr_t*)p);
       __dmb(15);  // _ARM(64)_BARRIER_SY
@@ -252,9 +251,11 @@ static inline void mi_atomic_store_explicit(_Atomic(uintptr_t)*p, uintptr_t x, m
     if (mo == mi_memory_order_relaxed) {
       MI_MSC_XX(__iso_volatile_store)((volatile intptr_t*)p, x);
     }
+    #if !defined(__clang__) // work around __stlr missing in clang-cl, see https://github.com/llvm/llvm-project/issues/121689
     else if (mo <= mi_memory_order_release) {
       MI_MSC_XX(__stlr)((volatile uintptr_t*)p,x);
     }
+    #endif
     else {
       mi_atomic_exchange_explicit(p, x, mo);
     }
@@ -272,7 +273,7 @@ static inline int64_t mi_atomic_loadi64_explicit(_Atomic(int64_t)*p, mi_memory_o
     if (mo == mi_memory_order_relaxed) {
       return __iso_volatile_load64((volatile const int64_t*)p);
     }
-    #if defined(_M_ARM64)
+    #if defined(_M_ARM64) && !defined(__clang__) // work around __ldar64 missing in clang-cl, see https://github.com/llvm/llvm-project/issues/121689
     else if (mo <= mi_memory_order_acquire) {
       return __ldar64((volatile const uintptr_t*)p);
     }
@@ -297,7 +298,7 @@ static inline void mi_atomic_storei64_explicit(_Atomic(int64_t)*p, int64_t x, mi
     if (mo == mi_memory_order_relaxed) {
       __iso_volatile_store64((volatile int64_t*)p,x);
     }
-    #if defined(_M_ARM64)
+    #if defined(_M_ARM64) && !defined(__clang__) // work around __stlr64 missing in clang-cl, see https://github.com/llvm/llvm-project/issues/121689
     else if (mo == mi_memory_order_release) {
       __stlr64((volatile uint64_t*)p, (uint64_t)x);
     }
@@ -335,18 +336,18 @@ static inline void mi_atomic_void_addi64_relaxed(volatile int64_t* p, const vola
   }
 }
 
-static inline void mi_atomic_maxi64_relaxed(volatile _Atomic(int64_t)*p, int64_t x) {
+static inline void mi_atomic_maxi64_relaxed(volatile _Atomic(int64_t)* p, int64_t x) {
   int64_t current;
   do {
     current = *p;
   } while (current < x && _InterlockedCompareExchange64(p, x, current) != current);
 }
 
-static inline void mi_atomic_addi64_acq_rel(volatile _Atomic(int64_t*)p, int64_t i) {
+static inline void mi_atomic_addi64_acq_rel(volatile _Atomic(int64_t)* p, int64_t i) {
   mi_atomic_addi64_relaxed(p, i);
 }
 
-static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t*)p, int64_t* exp, int64_t des) {
+static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t)* p, int64_t* exp, int64_t des) {
   const int64_t read = _InterlockedCompareExchange64(p, des, *exp);
   if (read == *exp) {
     return true;
@@ -358,17 +359,17 @@ static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t*)p, 
 }
 
 // The pointer macros cast to `uintptr_t`.
-#define mi_atomic_load_ptr_acquire(tp,p)                (tp*)mi_atomic_load_acquire((_Atomic(uintptr_t)*)(p))
-#define mi_atomic_load_ptr_relaxed(tp,p)                (tp*)mi_atomic_load_relaxed((_Atomic(uintptr_t)*)(p))
+#define mi_atomic_load_ptr_acquire(tp,p)                ((tp*)mi_atomic_load_acquire((_Atomic(uintptr_t)*)(p)))
+#define mi_atomic_load_ptr_relaxed(tp,p)                ((tp*)mi_atomic_load_relaxed((_Atomic(uintptr_t)*)(p)))
 #define mi_atomic_store_ptr_release(tp,p,x)             mi_atomic_store_release((_Atomic(uintptr_t)*)(p),(uintptr_t)(x))
 #define mi_atomic_store_ptr_relaxed(tp,p,x)             mi_atomic_store_relaxed((_Atomic(uintptr_t)*)(p),(uintptr_t)(x))
 #define mi_atomic_cas_ptr_weak_release(tp,p,exp,des)    mi_atomic_cas_weak_release((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
 #define mi_atomic_cas_ptr_weak_acq_rel(tp,p,exp,des)    mi_atomic_cas_weak_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
 #define mi_atomic_cas_ptr_strong_release(tp,p,exp,des)  mi_atomic_cas_strong_release((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
 #define mi_atomic_cas_ptr_strong_acq_rel(tp,p,exp,des)  mi_atomic_cas_strong_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t*)exp,(uintptr_t)des)
-#define mi_atomic_exchange_ptr_relaxed(tp,p,x)          (tp*)mi_atomic_exchange_relaxed((_Atomic(uintptr_t)*)(p),(uintptr_t)x)
-#define mi_atomic_exchange_ptr_release(tp,p,x)          (tp*)mi_atomic_exchange_release((_Atomic(uintptr_t)*)(p),(uintptr_t)x)
-#define mi_atomic_exchange_ptr_acq_rel(tp,p,x)          (tp*)mi_atomic_exchange_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t)x)
+#define mi_atomic_exchange_ptr_relaxed(tp,p,x)          ((tp*)mi_atomic_exchange_relaxed((_Atomic(uintptr_t)*)(p),(uintptr_t)x))
+#define mi_atomic_exchange_ptr_release(tp,p,x)          ((tp*)mi_atomic_exchange_release((_Atomic(uintptr_t)*)(p),(uintptr_t)x))
+#define mi_atomic_exchange_ptr_acq_rel(tp,p,x)          ((tp*)mi_atomic_exchange_acq_rel((_Atomic(uintptr_t)*)(p),(uintptr_t)x))
 
 #define mi_atomic_loadi64_acquire(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(acquire))
 #define mi_atomic_loadi64_relaxed(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(relaxed))
@@ -417,7 +418,7 @@ typedef _Atomic(uintptr_t) mi_atomic_guard_t;
 #define mi_lock_maybe(lock,acquire)    for(bool _mi_go = (acquire ? (mi_lock_acquire(lock),true) : true); _mi_go; _mi_go = (acquire ? (mi_lock_release(lock),false) : false) )
 
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__CYGWIN__)
 
 typedef struct mi_lock_s {
   SRWLOCK mutex;    // slim reader-writer lock
@@ -496,10 +497,10 @@ static inline void mi_lock_release(mi_lock_t* lock) {
   lock->mutex.unlock();
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
-  new(&lock->mutex) std::mutex();
+  new(&lock->mutex) std::mutex();  // in-place constructor
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
-  (void)(lock);
+  lock->mutex.~mutex(); // in-place destructor
 }
 
 #else
@@ -524,6 +525,7 @@ static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
   return mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  size_t ticks = 0;
   for (int i = 0; i < 10000; i++) {  // for at most 10000 tries?
     if (mi_lock_try_acquire(lock)) return;
     _mi_prim_thread_yield();

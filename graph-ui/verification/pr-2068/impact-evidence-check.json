@@ -1,0 +1,19 @@
+{
+  "project": "cbm-pr2068",
+  "file": "src/ui/http_server.c",
+  "port": 9749,
+  "validation_phase": "final frozen C/UI against final source index, matching final browser map proof",
+  "verified_path_edges": 60,
+  "verified_endpoint_source_locations": 120,
+  "verified_history_commits": 3,
+  "verified_cochange_files": 15,
+  "refresh_status": "pending",
+  "refresh_response_ms": 8.9,
+  "index_status_response_ms_during_worker": 1.43,
+  "cache_response_identical": true,
+  "map_generation_matches": true,
+  "index_generation": "u0911bd5153455afeg2",
+  "indexed_at": "2026-09-09T19:51:51Z",
+  "git_head": "80f4f41f9bcb9daf60afc5f607bcbcba24a4b196",
+  "note": "Local functional observation, not a performance benchmark."
+}

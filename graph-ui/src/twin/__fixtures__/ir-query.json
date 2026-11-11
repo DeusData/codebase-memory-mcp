@@ -1,0 +1,440 @@
+{
+  "schemaVersion": 1,
+  "symbol": {
+    "nodeId": "codeatlas-atlas-sample.src.repo.db.query",
+    "name": "query",
+    "qualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+    "range": {
+      "start": {
+        "line": 16,
+        "character": 0
+      },
+      "end": {
+        "line": 28,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "generation": 2,
+  "snippetHash": "cb58da8148d8ea87798b58f5d57883c79e741038082d0e7069fc8bd350cbd4e4",
+  "purpose": {
+    "value": "Function query in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.",
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "graph-node",
+        "strategy": "derived-summary",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "steps": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "calls": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "calledBy": {
+    "value": [
+      {
+        "name": "getOrder",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.orderService.getOrder",
+        "file": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "line": 11,
+        "isTest": false
+      },
+      {
+        "name": "listUsers",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.userService.listUsers",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "line": 19,
+        "isTest": false
+      },
+      {
+        "name": "hotspotScan",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.hotspotScan",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 44,
+        "isTest": false
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "range": {
+          "startLine": 11,
+          "endLine": 11
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "startLine": 19,
+          "endLine": 19
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 44,
+          "endLine": 44
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "reads": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "writes": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "typeRefs": {
+    "value": [
+      {
+        "name": "table",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.server.SimpleRouter.table",
+        "file": "file:///workspace/atlas-sample/src/server.ts",
+        "line": 27
+      },
+      {
+        "name": "Row",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.Row",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 4
+      },
+      {
+        "name": "rows",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.rows",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 15
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/server.ts",
+        "range": {
+          "startLine": 27,
+          "endLine": 27
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 4,
+          "endLine": 4
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 15,
+          "endLine": 15
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "throws": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "externalEffects": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "tests": {
+    "value": [],
+    "state": "inferred",
+    "evidence": []
+  },
+  "missingTests": {
+    "value": true,
+    "state": "inferred",
+    "evidence": []
+  },
+  "complexity": {
+    "value": {
+      "cyclomatic": 0,
+      "cognitive": 0,
+      "loopDepth": 0,
+      "transitiveLoopDepth": 0,
+      "linearScanInLoop": false,
+      "allocInLoop": false,
+      "unguardedRecursion": false,
+      "recursive": false,
+      "isEntryPoint": false,
+      "isExported": false
+    },
+    "state": "unsupported",
+    "evidence": []
+  },
+  "risks": [
+    {
+      "id": "untested-hub",
+      "severity": "medium",
+      "kind": "untested-hub",
+      "message": "query is called from 3 places and no test caller was found, so a change here is unverified everywhere it is used."
+    }
+  ],
+  "checklist": [
+    {
+      "id": "5692ec4d59374ccc57f369eef56350d69b8f8e12",
+      "category": "inputs",
+      "label": "Know the shape of table",
+      "target": {
+        "name": "table",
+        "qualifiedName": "codeatlas-atlas-sample.src.server.SimpleRouter.table",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/server.ts",
+        "range": {
+          "start": {
+            "line": 26,
+            "character": 0
+          },
+          "end": {
+            "line": 27,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 26,
+            "character": 0
+          },
+          "end": {
+            "line": 26,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "265b849ecb744cec9689d77864b96a4850651ac2",
+      "category": "inputs",
+      "label": "Know the shape of Row",
+      "target": {
+        "name": "Row",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.Row",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 3,
+            "character": 0
+          },
+          "end": {
+            "line": 4,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 3,
+            "character": 0
+          },
+          "end": {
+            "line": 3,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "13cdcd93e101a05f78c4c8851880eaecea0b6db1",
+      "category": "inputs",
+      "label": "Know the shape of rows",
+      "target": {
+        "name": "rows",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.rows",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 14,
+            "character": 0
+          },
+          "end": {
+            "line": 15,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 14,
+            "character": 0
+          },
+          "end": {
+            "line": 14,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "5423683890364175c499b7f6a367172119cad270",
+      "category": "callers",
+      "label": "See who calls this: getOrder",
+      "target": {
+        "name": "getOrder",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.orderService.getOrder",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "range": {
+          "start": {
+            "line": 10,
+            "character": 0
+          },
+          "end": {
+            "line": 11,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 10,
+            "character": 0
+          },
+          "end": {
+            "line": 10,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "a13c659ed6e56cbee811ccbd8fef92c9df823f62",
+      "category": "callers",
+      "label": "See who calls this: listUsers",
+      "target": {
+        "name": "listUsers",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.userService.listUsers",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "start": {
+            "line": 18,
+            "character": 0
+          },
+          "end": {
+            "line": 19,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 18,
+            "character": 0
+          },
+          "end": {
+            "line": 18,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "777cb60af484e975b90ada0815263fe50f427efc",
+      "category": "callers",
+      "label": "See who calls this: hotspotScan",
+      "target": {
+        "name": "hotspotScan",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.hotspotScan",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 43,
+            "character": 0
+          },
+          "end": {
+            "line": 44,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 43,
+            "character": 0
+          },
+          "end": {
+            "line": 43,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "7512d458235451601fb03f7e087b9beeb3854f6a",
+      "category": "tests",
+      "label": "No test callers found (inferred): decide if this needs a test",
+      "target": {
+        "nodeId": "codeatlas-atlas-sample.src.repo.db.query",
+        "name": "query",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "kind": "function",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 16,
+            "character": 0
+          },
+          "end": {
+            "line": 28,
+            "character": 0
+          }
+        },
+        "projectName": "codeatlas-atlas-sample"
+      },
+      "done": false
+    }
+  ]
+}

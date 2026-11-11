@@ -1,0 +1,7 @@
+# Diese sechs Summen sind der BELEG der Eval-Laeufe aus W5 (docs/adr/0001-modellwahl.md, Abschnitt "Eval-Ergebnis"), nicht eine Liste von Dateien, die dieses Programm mitliefert oder erwartet: seit W10 waehlt der Leser sein Modell selbst, models/ ist sein Cache, und wer nur drei dieser Dateien liegen hat, hat nichts Kaputtes, sondern drei Modelle.
+85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87  gemma-4-E4B-it-Q4_K_M.gguf
+b1b3de114215d9507409a662a501a631095a479a419584e8a2ded6304b19b4f5  LFM2.5-1.2B-Instruct-Q4_K_M.gguf
+81b64d05a23b17b34c475f42b3e72fbde62d4b92cc34541f7a8031d0752deafa  MiniCPM5-1B-Q4_K_M.gguf
+cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046  qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223  Qwen3.5-2B-Q4_K_M.gguf
+3874209241c9a397e2f62cd3f70f80fd2dfbf0dfccb6838416bdb48a714e8630  Qwen3.5-4B-Q4_K_M.gguf

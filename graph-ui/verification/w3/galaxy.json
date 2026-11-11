@@ -1,0 +1,137 @@
+{
+  "searchResultCount": 10,
+  "searchTopNames": [
+    "createUser",
+    "create",
+    "toUser",
+    "registerUserRoutes",
+    "createApp",
+    "UserEntity",
+    "validateUser",
+    "create",
+    "User",
+    "UserInput"
+  ],
+  "enterOpenedFile": "src/services/userService.ts",
+  "twinSubject": "codeatlasweb-w3.src.services.userService.createUser",
+  "twinSubjectAfterClick": "codeatlasweb-w3.src.util.validate.validateUser",
+  "flyToCount": 3,
+  "clickOpenedFile": "src/util/validate.ts",
+  "highlightedCount": 12,
+  "layoutNodes": 76,
+  "layoutSource": "/api/layout",
+  "port": 4251,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w3",
+  "fixture": "fixtures/atlas-sample",
+  "searchTerm": "createUser",
+  "timings": {
+    "buildMs": 9670,
+    "serverStartMs": 6905,
+    "totalMs": 34204
+  },
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4250,
+    "galaxyHeadline": "76 nodes, 178 edges from /api/layout",
+    "canvas": {
+      "found": true,
+      "context": true,
+      "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)",
+      "width": 439,
+      "height": 314,
+      "litPixels": 14963,
+      "brightest": 255
+    },
+    "searchHeadline": "10 hits for \"createUser\"",
+    "searchRows": [
+      "createUsersrc/services/userService.tsL23create + user",
+      "createsrc/services/userService.tsL40create + user",
+      "toUsersrc/services/userService.tsL9user",
+      "registerUserRoutessrc/routes/users.tsL7user",
+      "createAppsrc/server.tsL32create",
+      "UserEntitysrc/types.tsL37user",
+      "validateUsersrc/util/validate.tsL19user",
+      "createsrc/services/orderService.tsL30create",
+      "Usersrc/types.tsL27user",
+      "UserInputsrc/util/validate.tsL14user"
+    ],
+    "flyToBeforeEnter": 0,
+    "afterEnter": {
+      "breadcrumb": "src › services › userService.ts",
+      "tabs": [
+        "src/services/userService.ts"
+      ],
+      "readerPath": "src/services/userService.ts",
+      "twin": "codeatlasweb-w3.src.services.userService.createUser",
+      "twinName": "createUser",
+      "targetChanges": 1,
+      "highlightedCount": 12,
+      "lastTargetQn": "codeatlasweb-w3.src.services.userService.createUser",
+      "commandValue": "",
+      "overlayGone": true
+    },
+    "clickQn": "codeatlasweb-w3.src.util.validate.validateUser",
+    "clickAccepted": true,
+    "afterClick": {
+      "breadcrumb": "src › util › validate.ts",
+      "tabs": [
+        "src/services/userService.ts",
+        "src/util/validate.ts"
+      ],
+      "readerPath": "src/util/validate.ts",
+      "twin": "codeatlasweb-w3.src.util.validate.validateUser",
+      "targetChanges": 3,
+      "highlightedCount": 5,
+      "lastTargetQn": "codeatlasweb-w3.src.util.validate.validateUser"
+    },
+    "canvasFocused": {
+      "found": true,
+      "context": true,
+      "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)",
+      "width": 439,
+      "height": 343,
+      "litPixels": 12658,
+      "brightest": 255
+    },
+    "toggle": {
+      "visibleWhileTyping": true,
+      "hiddenAfterKey": true,
+      "visibleAfterMenuClick": true,
+      "canvasAfterReopen": {
+        "found": true,
+        "context": true,
+        "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)",
+        "width": 439,
+        "height": 343,
+        "litPixels": 12658,
+        "brightest": 255
+      },
+      "nodesAfterReopen": 76
+    },
+    "galaxyNote": "",
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 29,
+      "check_index_coverage": 3,
+      "search_graph": 2,
+      "get_code_snippet": 4
+    },
+    "debounce": {
+      "typedChars": 10,
+      "searchGraphCalls": 2
+    }
+  },
+  "generatedAt": "2026-08-29T13:48:48.147Z",
+  "error": null
+}

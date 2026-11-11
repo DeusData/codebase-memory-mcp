@@ -13,6 +13,11 @@
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot sample JSON string-copy allocation failure, not a backing-pool
+ * growth event: 0 is next, 4 is fifth, -1 disables. Setting clears consumption. */
+void cbm_mcp_doc_links_test_fail_sample_alloc_after(int successful_copies);
+bool cbm_mcp_doc_links_test_sample_alloc_failed(void);
+
 typedef void (*cbm_mcp_auto_index_count_test_hook_fn)(void *context);
 #endif
 
@@ -34,6 +39,13 @@ void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint
  * scratch count cannot see other processes' entries in the shared temp dir.
  * The server borrows dir until it is reset or the server is freed. */
 void cbm_mcp_server_set_search_scratch_dir_for_test(cbm_mcp_server_t *srv, const char *dir);
+/* search_code's in-process scan of `filelist_path` (records separated as the
+ * scoped list is written: NUL on POSIX, newline on Windows) into `out_path`.
+ * Returns the scan cause in mcp_scan_cause_t order: 0 success, 1 command
+ * failure, 3 output limit, 4 deadline, 5 cancelled. */
+int cbm_mcp_search_scan_for_test(cbm_mcp_server_t *srv, const char *filelist_path,
+                                 const char *pattern, bool use_regex, const char *out_path,
+                                 size_t output_limit, uint64_t deadline_ms);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
@@ -48,6 +60,35 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
  * must remove any untrusted field with the same name before invoking this. */
 bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy);
+bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
+                                             char *error, size_t error_size);
+
+/* Request-scoped facts a worker resource failure is reported against. One
+ * supervised request can run several worker attempts (crash/hang recovery), and
+ * serving_index_preserved describes the request, not only its last attempt:
+ * it is true only when a servable index served the project when the request
+ * began AND no attempt of the request committed to replacing it (the
+ * publication fence, index_supervisor.h) AND that index is still servable. */
+typedef struct {
+    bool serving_index_existed;
+    bool publication_committed;
+} cbm_mcp_index_request_facts_t;
+
+/* Capture the facts at the start of a request, before its first worker. */
+void cbm_mcp_index_request_facts_begin(const char *args, cbm_mcp_index_request_facts_t *facts);
+/* Fold one finished attempt into the request facts. */
+void cbm_mcp_index_request_facts_record(cbm_mcp_index_request_facts_t *facts,
+                                        const cbm_index_worker_result_t *worker_result);
+/* NULL facts claim nothing: serving_index_preserved is then false. */
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result,
+                                             const cbm_mcp_index_request_facts_t *facts);
+
+/* Encode a doc_candidates setting the user set to a boolean on an internal
+ * worker request (the worker reads no config). Unset or unparseable adds no
+ * key, so the worker's index mode decides. False only when encoding fails. */
+bool cbm_mcp_index_doc_candidates_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                              struct cbm_config *config);
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
@@ -67,6 +108,16 @@ const char *cbm_mcp_edge_strategy_class(const char *strategy);
 
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
+
+/* True when the `ignore_worktrees` config key is on for this server (default
+ * off). Callers pair it with cbm_git_is_linked_worktree() to decide whether an
+ * automatic index of a linked worktree should be skipped. */
+bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv);
+
+/* The same key when srv may have no store (the lifecycle hook). Never attaches
+ * a store to srv and never creates the runtime store; reads it only when it
+ * already exists. */
+bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv);
 
 /* detect_changes seed scoping (#1363): does `node`'s line range overlap any
  * recorded hunk for `file`? Exposed for direct unit testing of the overlap
@@ -96,6 +147,13 @@ typedef bool (*cbm_mcp_snapshot_read_test_hook_fn)(void *context, const char *ab
 void cbm_mcp_server_set_snapshot_read_test_hook(cbm_mcp_server_t *srv,
                                                 cbm_mcp_snapshot_read_test_hook_fn hook,
                                                 void *context);
+
+/* Runs after get_code_snippet has read and verified a file's bytes and before
+ * it slices them, so a test can write the file at exactly that point (#2585). */
+typedef void (*cbm_mcp_snippet_capture_test_hook_fn)(void *context, const char *rel_path);
+void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
+                                                  cbm_mcp_snippet_capture_test_hook_fn hook,
+                                                  void *context);
 
 /* Filesystem PATH_MAX prevents a portable end-to-end fixture for multi-KiB
  * stored paths. This seam drives the normal search result ownership,

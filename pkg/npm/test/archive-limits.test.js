@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable } = require('node:stream');
@@ -10,30 +11,29 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const {
-  DEFAULT_ARCHIVE_LIMITS,
   UNIX_ARCHIVE_NAMES,
   WINDOWS_ARCHIVE_NAMES,
   WINDOWS_BINARY_NAME,
+  download,
   extractExactTarArchive,
   extractZipOnWindows,
+  resolveDownloadBase,
 } = require('../install.js');
 const {
   TAR_PATH_SKIP, buildZip, patternBytes, writeTarGz,
 } = require('./archive-fixtures.js');
 
 const EXECUTABLE = 'codebase-memory-mcp';
-// Spans several pipe chunks, so an over-limit member is cut off mid-stream.
+// Spans several pipe chunks, so the counted writer sees a multi-chunk stream.
 const LARGE_EXECUTABLE = patternBytes(300 * 1024);
+// The size cap the 0.12.0 wrappers enforced, which refused every release.
+const FORMER_MEMBER_CAP_BYTES = 256 * 1024 * 1024;
 
 function withScratch(callback) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-npm-archive-test-'));
   return Promise.resolve()
     .then(() => callback(root))
     .finally(() => fs.rmSync(root, { recursive: true, force: true }));
-}
-
-function limitsWith(overrides) {
-  return { ...DEFAULT_ARCHIVE_LIMITS, ...overrides };
 }
 
 function releaseEntries(names, executableData) {
@@ -60,59 +60,6 @@ function fakeTarListing(names) {
     return `${names.join('\n')}\n`;
   };
 }
-
-function neverLists() {
-  throw new Error('the listing must not run');
-}
-
-test('tar extraction refuses an archive larger than the compressed limit', { skip: TAR_PATH_SKIP }, () =>
-  withScratch(async (root) => {
-    const archive = writeTarGz(root, 'release.tar.gz', releaseEntries(UNIX_ARCHIVE_NAMES));
-    const destination = makeDestination(root);
-
-    await assert.rejects(
-      extractExactTarArchive(
-        archive, destination, UNIX_ARCHIVE_NAMES, EXECUTABLE,
-        neverLists, limitsWith({ compressedBytes: 16 }),
-      ),
-      /16-byte compressed safety limit/,
-    );
-    assert.deepEqual(fs.readdirSync(destination), []);
-  }));
-
-test('tar extraction refuses an exact namespace wider than the member limit', { skip: TAR_PATH_SKIP }, () =>
-  withScratch(async (root) => {
-    const archive = writeTarGz(root, 'release.tar.gz', releaseEntries(UNIX_ARCHIVE_NAMES));
-    const destination = makeDestination(root);
-
-    await assert.rejects(
-      extractExactTarArchive(
-        archive, destination, UNIX_ARCHIVE_NAMES, EXECUTABLE,
-        neverLists, limitsWith({ members: 2 }),
-      ),
-      /2-member safety limit/,
-    );
-    assert.deepEqual(fs.readdirSync(destination), []);
-  }));
-
-test('tar extraction stops an over-limit member in the counted writer and leaves no file', { skip: TAR_PATH_SKIP }, () =>
-  withScratch(async (root) => {
-    const archive = writeTarGz(
-      root, 'release.tar.gz', releaseEntries(UNIX_ARCHIVE_NAMES, LARGE_EXECUTABLE),
-    );
-    const destination = makeDestination(root);
-
-    // The real listing passes (names only); the limit trips while tar is
-    // still streaming the executable into the writer.
-    await assert.rejects(
-      extractExactTarArchive(
-        archive, destination, UNIX_ARCHIVE_NAMES, EXECUTABLE,
-        undefined, limitsWith({ memberBytes: 64 * 1024 }),
-      ),
-      /"codebase-memory-mcp" exceeds the 65536-byte expanded safety limit/,
-    );
-    assert.deepEqual(fs.readdirSync(destination), []);
-  }));
 
 test('tar extraction leaves a pre-existing target untouched', { skip: TAR_PATH_SKIP }, () =>
   withScratch(async (root) => {
@@ -181,7 +128,7 @@ test('tar extraction installs the executable byte-identical with the executable 
     assert.deepEqual(fs.readdirSync(destination), [EXECUTABLE]);
   }));
 
-function loadInstallerWithHttps(fakeHttps) {
+function loadInstallerWithTransports({ fakeHttps, fakeHttp }) {
   const installPath = path.join(__dirname, '..', 'install.js');
   const source = fs.readFileSync(installPath, 'utf8');
   const sandbox = {
@@ -197,7 +144,8 @@ function loadInstallerWithHttps(fakeHttps) {
     process,
     require: (specifier) => {
       if (specifier === './package.json') return { version: '0.0.0-test' };
-      if (specifier === 'https') return fakeHttps;
+      if (specifier === 'https' && fakeHttps) return fakeHttps;
+      if (specifier === 'http' && fakeHttp) return fakeHttp;
       return require(specifier);
     },
     setTimeout,
@@ -206,10 +154,13 @@ function loadInstallerWithHttps(fakeHttps) {
   return sandbox.module.exports;
 }
 
-// Answers every request with one HTTP 200 response shaped by `configure`.
-function fakeHttpsServing(configure) {
+// Answers every request with one HTTP 200 response shaped by `configure`;
+// `requests` records each (url, options) the installer issued.
+function fakeTransportServing(configure, requests = []) {
   return {
-    get(url, callback) {
+    get(url, ...rest) {
+      const callback = rest[rest.length - 1];
+      requests.push({ url, options: rest.length > 1 ? rest[0] : undefined });
       const request = new EventEmitter();
       request.destroy = (err) => { if (err) request.emit('error', err); };
       setImmediate(() => {
@@ -224,49 +175,145 @@ function fakeHttpsServing(configure) {
   };
 }
 
-test('download refuses a response whose declared length exceeds the limit', () =>
+function refusingTransport() {
+  return {
+    get(url) {
+      throw new Error(`unexpected request to ${url}`);
+    },
+  };
+}
+
+test('download stores a body whose declared length exceeds the former 256 MiB cap', () =>
   withScratch(async (root) => {
-    const { download } = loadInstallerWithHttps(fakeHttpsServing((response) => {
-      response.headers['content-length'] = '9';
-      response.push(null);
-    }));
+    const { download: fakeDownload } = loadInstallerWithTransports({
+      fakeHttps: fakeTransportServing((response) => {
+        response.headers['content-length'] = String(FORMER_MEMBER_CAP_BYTES + 1);
+        response.push('payload');
+        response.push(null);
+      }),
+    });
     const destination = path.join(root, 'release.tar.gz');
 
-    await assert.rejects(
-      download('https://example.invalid/release.tar.gz', destination, 8),
-      /8-byte safety limit/,
-    );
-    assert.equal(fs.existsSync(destination), false);
-  }));
-
-test('download refuses a body that exceeds the limit and removes the partial file', () =>
-  withScratch(async (root) => {
-    const { download } = loadInstallerWithHttps(fakeHttpsServing((response) => {
-      response.push(Buffer.alloc(1024, 0x78));
-      response.push(null);
-    }));
-    const destination = path.join(root, 'release.tar.gz');
-
-    await assert.rejects(
-      download('https://example.invalid/release.tar.gz', destination, 8),
-      /8-byte safety limit/,
-    );
-    assert.equal(fs.existsSync(destination), false);
-  }));
-
-test('download within the limit stores the body', () =>
-  withScratch(async (root) => {
-    const { download } = loadInstallerWithHttps(fakeHttpsServing((response) => {
-      response.headers['content-length'] = '7';
-      response.push('payload');
-      response.push(null);
-    }));
-    const destination = path.join(root, 'release.tar.gz');
-
-    await download('https://example.invalid/release.tar.gz', destination, 1024);
+    await fakeDownload('https://example.invalid/release.tar.gz', destination);
 
     assert.equal(fs.readFileSync(destination, 'utf8'), 'payload');
   }));
+
+test('download refuses plain HTTP unless the base is a loopback override', () =>
+  withScratch(async (root) => {
+    const { download: fakeDownload } = loadInstallerWithTransports({
+      fakeHttps: refusingTransport(),
+      fakeHttp: refusingTransport(),
+    });
+    const destination = path.join(root, 'release.tar.gz');
+
+    await assert.rejects(
+      fakeDownload('http://127.0.0.1/release.tar.gz', destination),
+      /Refusing non-HTTPS or credentialed URL/,
+    );
+    await assert.rejects(
+      fakeDownload('http://example.invalid/release.tar.gz', destination, true),
+      /Refusing non-loopback HTTP URL/,
+    );
+    assert.equal(fs.existsSync(destination), false);
+  }));
+
+test('a loopback download uses a fresh agent, so no proxy applies', () =>
+  withScratch(async (root) => {
+    const requests = [];
+    const { download: fakeDownload } = loadInstallerWithTransports({
+      fakeHttps: refusingTransport(),
+      fakeHttp: fakeTransportServing((response) => {
+        response.push('payload');
+        response.push(null);
+      }, requests),
+    });
+    const destination = path.join(root, 'release.tar.gz');
+
+    await fakeDownload('http://[::1]:8080/release.tar.gz', destination, true);
+
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'payload');
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, 'http://[::1]:8080/release.tar.gz');
+    assert.equal(requests[0].options.agent, false);
+  }));
+
+function withLoopbackServer(handler, callback) {
+  const server = http.createServer(handler);
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  }).then(() => Promise.resolve()
+    .then(() => callback(`http://127.0.0.1:${server.address().port}`))
+    .finally(() => new Promise((resolve) => server.close(resolve))));
+}
+
+test('a loopback download fetches from a local server and refuses its redirects', () =>
+  withScratch((root) => withLoopbackServer((request, response) => {
+    if (request.url === '/release/codebase-memory-mcp.tar.gz') {
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      response.end('loopback payload');
+      return;
+    }
+    response.writeHead(302, { location: 'https://example.invalid/elsewhere' });
+    response.end();
+  }, async (origin) => {
+    const archive = path.join(root, 'release.tar.gz');
+    await download(`${origin}/release/codebase-memory-mcp.tar.gz`, archive, true);
+    assert.equal(fs.readFileSync(archive, 'utf8'), 'loopback payload');
+
+    const redirected = path.join(root, 'redirected.tar.gz');
+    await assert.rejects(
+      download(`${origin}/release/checksums.txt`, redirected, true),
+      /Refusing redirect from loopback download/,
+    );
+    assert.equal(fs.existsSync(redirected), false);
+  })));
+
+test('CBM_DOWNLOAD_URL follows install.sh: HTTPS or exact-loopback HTTP only', () => {
+  const { version } = require('../package.json');
+  const githubBase = `https://github.com/DeusData/codebase-memory-mcp/releases/download/v${version}`;
+  assert.deepEqual(resolveDownloadBase({}), { base: githubBase, loopback: false });
+  assert.deepEqual(
+    resolveDownloadBase({ CBM_DOWNLOAD_URL: '' }), { base: githubBase, loopback: false },
+  );
+
+  for (const base of [
+    'https://mirror.example/releases/v1',
+    'https://127.0.0.1:8443/fixture',
+  ]) {
+    assert.deepEqual(
+      resolveDownloadBase({ CBM_DOWNLOAD_URL: base }), { base, loopback: false }, base,
+    );
+  }
+  for (const base of [
+    'http://localhost',
+    'http://localhost:8080/fixture',
+    'http://127.0.0.1:41234/standard',
+    'http://[::1]:9/x?y#z',
+  ]) {
+    assert.deepEqual(
+      resolveDownloadBase({ CBM_DOWNLOAD_URL: base }), { base, loopback: true }, base,
+    );
+  }
+  for (const base of [
+    'http://example.com/releases',
+    'http://127.0.0.1.example.com/',
+    'http://localhost.example.com:8080/',
+    'http://user@localhost/',
+    'http://127.0.0.2/',
+    'HTTP://localhost/',
+    'file:///tmp/releases',
+    'ftp://localhost/releases',
+    'github.com/DeusData/codebase-memory-mcp',
+  ]) {
+    assert.throws(
+      () => resolveDownloadBase({ CBM_DOWNLOAD_URL: base }),
+      /Refusing non-HTTPS download URL \(CBM_DOWNLOAD_URL\)/,
+      base,
+    );
+  }
+});
 
 // The Windows path runs a constant PowerShell program through powershell.exe,
 // which only a Windows host provides (pwsh is not a wrapper dependency, and
@@ -288,33 +335,14 @@ test('Windows zip extraction refuses an archive with more members than the limit
 
     assert.throws(
       () => extractZipOnWindows(
-        archive, destination, ['one', 'two', 'three'], ['one'],
-        limitsWith({ members: 2 }),
+        archive, destination, ['one', 'two', 'three'], ['one'], 2,
       ),
       /2-member safety limit/,
     );
     assert.deepEqual(fs.readdirSync(destination), []);
   }));
 
-test('Windows zip extraction refuses a member whose declared size exceeds the limit', { skip: WINDOWS_ONLY }, () =>
-  withScratch(async (root) => {
-    const archive = path.join(root, 'member.zip');
-    fs.writeFileSync(archive, buildZip([
-      { name: WINDOWS_BINARY_NAME, data: Buffer.alloc(65, 0x78) },
-    ]));
-    const destination = makeDestination(root);
-
-    assert.throws(
-      () => extractZipOnWindows(
-        archive, destination, [WINDOWS_BINARY_NAME], [WINDOWS_BINARY_NAME],
-        limitsWith({ memberBytes: 64 }),
-      ),
-      /64-byte expanded safety limit/,
-    );
-    assert.deepEqual(fs.readdirSync(destination), []);
-  }));
-
-test('Windows zip extraction stops a member that yields more bytes than it declares', { skip: WINDOWS_ONLY }, () =>
+test('Windows zip extraction rejects a member that yields more bytes than it declares', { skip: WINDOWS_ONLY }, () =>
   withScratch(async (root) => {
     const archive = path.join(root, 'longer.zip');
     fs.writeFileSync(archive, buildZip([
@@ -325,14 +353,13 @@ test('Windows zip extraction stops a member that yields more bytes than it decla
     assert.throws(
       () => extractZipOnWindows(
         archive, destination, [WINDOWS_BINARY_NAME], [WINDOWS_BINARY_NAME],
-        limitsWith({ memberBytes: 64 }),
       ),
-      /64-byte actual expanded safety limit/,
+      /actual size \d+ does not match declared size 10/,
     );
     assert.deepEqual(fs.readdirSync(destination), []);
   }));
 
-test('Windows zip extraction within the limits installs only the executable', { skip: WINDOWS_ONLY }, () =>
+test('Windows zip extraction installs only the executable', { skip: WINDOWS_ONLY }, () =>
   withScratch(async (root) => {
     const archive = path.join(root, 'release.zip');
     fs.writeFileSync(archive, buildZip(releaseEntries(WINDOWS_ARCHIVE_NAMES)));

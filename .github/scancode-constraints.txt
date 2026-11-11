@@ -1,0 +1,5 @@
+# Constraints for the ScanCode install of the license gate (PIP_CONSTRAINT).
+# pluggy 1.7.0 (2026-10-15) no longer finds plugincode 32.0.0's class-level
+# hookspecs: scancode then crashes at import with "did not find any
+# 'pre_scan' hooks" and the gate fails on every run.
+pluggy==1.6.0
