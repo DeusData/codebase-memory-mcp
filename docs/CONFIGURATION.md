@@ -310,14 +310,20 @@ Such a session opts out of the shared daemon entirely:
 - **No shared state is written.** It creates no rendezvous, takes no cohort,
   lifetime or project lock, and writes neither `_config.db` nor any index page,
   so it cannot disturb a daemon running alongside it. The one exception is
-  SQLite's own reader protocol: on an index in WAL mode, like any reader it
-  creates `<project>.db-shm` and an empty `<project>.db-wal` if they are absent.
-
-It still needs a `CBM_CACHE_DIR` it can write: like every CBM process it sets
-that directory to `0700` at startup, so a read-only mount or a sandbox that
-denies writes there stops it before it starts. `search_code` and
-`detect_changes` also stage short-lived scratch files in `${CBM_CACHE_DIR}/logs`
-(creating it if needed), and `search_code` in `/tmp`.
+  SQLite's own reader protocol: reading a database in WAL mode, like any reader
+  it creates `<db>-shm` and an empty `<db>-wal` if they are absent.
+- **The cache may be read-only.** Every daemon-backed CBM process (MCP
+  sessions, `cli`, hooks, the daemon) creates `CBM_CACHE_DIR` and makes it
+  owner-only at startup — `0700` with no ACL, or an owner-only DACL on Windows.
+  This mode never creates, chmods or otherwise changes it. It checks that the
+  directory already exists, belongs to you and is owner-only — no group or
+  other permission bits (`0500` is fine), no extended ACL on macOS, an
+  owner-only DACL on Windows — and that every directory containing it passes
+  the same ownership checks as for any CBM cache; otherwise it refuses to
+  start, saying why. So the cache can be a read-only mount or a read-only
+  snapshot of the indexing sessions' cache. Scratch files that `search_code`
+  and `detect_changes` stage go to `/tmp` (`%TEMP%` on Windows), not into the
+  cache.
 
 Leave it unset whenever the daemon is reachable, when a session must index,
 re-index, read or edit ADRs, or delete projects, or when you need the UI or
