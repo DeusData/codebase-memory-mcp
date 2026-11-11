@@ -6518,6 +6518,157 @@ TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate) {
     PASS();
 }
 
+/* #2796: a cache-directory scan opens every project database, so it must stop
+ * at the next one once its request is cancelled. The probe counts the
+ * databases a scan reaches and cancels the request on a chosen visit. */
+typedef struct {
+    cbm_mcp_server_t *server;
+    int visits;
+    int cancel_on_visit; /* one-based; zero never cancels */
+    bool cancel_accepted;
+} mcp_project_scan_probe_t;
+
+static void mcp_project_scan_probe(void *context, const char *db_file) {
+    (void)db_file;
+    mcp_project_scan_probe_t *probe = context;
+    probe->visits++;
+    if (probe->visits == probe->cancel_on_visit) {
+        probe->cancel_accepted = cbm_mcp_server_cancel_active(probe->server);
+    }
+}
+
+enum { MCP_SCAN_CANCEL_PROJECTS = 12, MCP_SCAN_CANCEL_VISIT = 3 };
+
+static bool mcp_scan_cancel_cache_seed(const char *cache) {
+    for (int i = 0; i < MCP_SCAN_CANCEL_PROJECTS; i++) {
+        char project[32];
+        char db_path[512];
+        char root_path[128];
+        snprintf(project, sizeof(project), "scan-cancel-%02d", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        snprintf(root_path, sizeof(root_path), "/workspaces/scan-cancel-%02d", i);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        if (!store) {
+            return false;
+        }
+        bool seeded = cbm_store_upsert_project(store, project, root_path) == CBM_STORE_OK;
+        cbm_store_close(store);
+        if (!seeded) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void mcp_scan_cancel_cache_clear(const char *cache) {
+    for (int i = 0; i < MCP_SCAN_CANCEL_PROJECTS; i++) {
+        char project[32];
+        snprintf(project, sizeof(project), "scan-cancel-%02d", i);
+        cleanup_project_db(cache, project);
+    }
+    cbm_rmdir(cache);
+}
+
+/* One scan with the probe armed: returns the tool response and reports how
+ * many databases the scan reached. */
+static char *mcp_scan_cancel_run(cbm_mcp_server_t *srv, const char *tool, const char *args,
+                                 int cancel_on_visit, mcp_project_scan_probe_t *probe) {
+    memset(probe, 0, sizeof(*probe));
+    probe->server = srv;
+    probe->cancel_on_visit = cancel_on_visit;
+    cbm_mcp_server_set_project_scan_test_hook(srv, mcp_project_scan_probe, probe);
+    char *response = cbm_mcp_handle_tool(srv, tool, args);
+    cbm_mcp_server_set_project_scan_test_hook(srv, NULL, NULL);
+    return response;
+}
+
+TEST(tool_list_projects_scan_stops_at_request_cancellation_issue2796) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-scan-cancel-list-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    bool seeded = mcp_scan_cancel_cache_seed(cache);
+    cbm_mcp_server_t *srv = seeded ? cbm_mcp_server_new(NULL) : NULL;
+    const char *args = "{\"metadata_only\":true,\"format\":\"json\",\"limit\":500}";
+
+    /* Control: an uncancelled scan reaches every database and answers. */
+    mcp_project_scan_probe_t whole = {0};
+    char *whole_response = srv ? mcp_scan_cancel_run(srv, "list_projects", args, 0, &whole) : NULL;
+    bool whole_ok = whole_response && !strstr(whole_response, "\"isError\":true") &&
+                    strstr(whole_response, "scan-cancel-11") != NULL;
+
+    /* Cancelled on the third database: the scan must not open a fourth. */
+    mcp_project_scan_probe_t cut = {0};
+    char *cut_response =
+        srv ? mcp_scan_cancel_run(srv, "list_projects", args, MCP_SCAN_CANCEL_VISIT, &cut) : NULL;
+    bool cut_reported = cut_response && strstr(cut_response, "\"isError\":true") &&
+                        strstr(cut_response, "list_projects cancelled for this request") &&
+                        !strstr(cut_response, "scan-cancel-");
+
+    /* The cancellation belongs to that request only. */
+    mcp_project_scan_probe_t after = {0};
+    char *after_response = srv ? mcp_scan_cancel_run(srv, "list_projects", args, 0, &after) : NULL;
+    bool after_ok = after_response && !strstr(after_response, "\"isError\":true");
+
+    free(whole_response);
+    free(cut_response);
+    free(after_response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    mcp_scan_cancel_cache_clear(cache);
+
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(whole_ok);
+    ASSERT_EQ(whole.visits, MCP_SCAN_CANCEL_PROJECTS);
+    ASSERT_TRUE(cut.cancel_accepted);
+    ASSERT_TRUE(cut_reported);
+    ASSERT_EQ(cut.visits, MCP_SCAN_CANCEL_VISIT);
+    ASSERT_TRUE(after_ok);
+    ASSERT_EQ(after.visits, MCP_SCAN_CANCEL_PROJECTS);
+    PASS();
+}
+
+/* The same scan runs for every project name with no <name>.db: the internal-
+ * name fallback. A hook from a directory with no index hits it once per
+ * ancestor it probes, so it must honor cancellation too. */
+TEST(tool_project_name_miss_scan_stops_at_request_cancellation_issue2796) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-scan-cancel-miss-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    bool seeded = mcp_scan_cancel_cache_seed(cache);
+    cbm_mcp_server_t *srv = seeded ? cbm_mcp_server_new(NULL) : NULL;
+    const char *args = "{\"project\":\"scan-cancel-absent\",\"format\":\"json\"}";
+
+    /* Control: a miss with no cancellation reaches every database. */
+    mcp_project_scan_probe_t whole = {0};
+    char *whole_response = srv ? mcp_scan_cancel_run(srv, "index_status", args, 0, &whole) : NULL;
+
+    mcp_project_scan_probe_t cut = {0};
+    char *cut_response =
+        srv ? mcp_scan_cancel_run(srv, "index_status", args, MCP_SCAN_CANCEL_VISIT, &cut) : NULL;
+
+    bool responded = whole_response && cut_response;
+    free(whole_response);
+    free(cut_response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    mcp_scan_cancel_cache_clear(cache);
+
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(responded);
+    ASSERT_EQ(whole.visits, MCP_SCAN_CANCEL_PROJECTS);
+    ASSERT_TRUE(cut.cancel_accepted);
+    ASSERT_EQ(cut.visits, MCP_SCAN_CANCEL_VISIT);
+    PASS();
+}
+
 TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-list-lean-XXXXXX", cbm_tmpdir());
@@ -28257,6 +28408,8 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
+    RUN_TEST(tool_list_projects_scan_stops_at_request_cancellation_issue2796);
+    RUN_TEST(tool_project_name_miss_scan_stops_at_request_cancellation_issue2796);
     RUN_TEST(tool_project_discovery_agrees_across_store_switches_issue1115);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
