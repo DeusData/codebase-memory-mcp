@@ -2178,6 +2178,172 @@ TEST(vbnet_vendored_grammar_still_flags_broken_source) {
     PASS();
 }
 
+/* ── SQLite migrations (#2246) ───────────────────────────────────────────────
+ * The vendored SQL grammar is a self-maintained fork of DerekStride/tree-sitter-sql
+ * (tools/tree-sitter-sql + patches/sqlite-dialect.patch). Upstream rejected
+ * forms that valid SQLite migrations use, so those files were reported
+ * parse_partial. The first two tests and their inputs are Kerf's, from #2246,
+ * carried over as written; the others pin the remaining forms seen in real
+ * SQLite migration sets (vaultwarden, atuin), plus controls that keep "fixed"
+ * from meaning "stopped reporting errors". */
+static const char *SQLITE_VALID_MIGRATION =
+    "PRAGMA foreign_keys = ON;\n"
+    "CREATE TABLE IF NOT EXISTS registrations (\n"
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "  name TEXT NOT NULL\n"
+    ");\n"
+    "CREATE TRIGGER IF NOT EXISTS registrations_guard\n"
+    "BEFORE UPDATE ON registrations\n"
+    "BEGIN\n"
+    "  SELECT RAISE(ABORT, 'registrations are immutable');\n"
+    "END;\n"
+    "CREATE UNIQUE INDEX IF NOT EXISTS registrations_name ON registrations(name)\n"
+    "  WHERE name IS NOT NULL;\n";
+
+static const char *SQLITE_MALFORMED =
+    "CREATE TABLE broken ???;\n";
+
+TEST(sqlite_valid_migration_not_flagged) {
+    CBMFileResult *r = do_extract(SQLITE_VALID_MIGRATION, CBM_LANG_SQL, "migration.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_malformed_still_flagged) {
+    CBMFileResult *r = do_extract(SQLITE_MALFORMED, CBM_LANG_SQL, "broken.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_TRUE(r->error_region_count > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `key` is not reserved in SQLite, so it is a common column name. After the
+ * first column the grammar also accepts MySQL's `KEY name (cols)` index there,
+ * which took `key TEXT NOT NULL` for a malformed index (vaultwarden, atuin-kv). */
+static const char *SQLITE_KEY_COLUMN = "CREATE TABLE kv (\n"
+                                       "  namespace TEXT NOT NULL,\n"
+                                       "  key TEXT NOT NULL,\n"
+                                       "  value TEXT NOT NULL\n"
+                                       ");\n"
+                                       "CREATE UNIQUE INDEX idx_kv ON kv (namespace, key);\n";
+
+/* Control: MySQL's KEY index inside CREATE TABLE still parses as an index. */
+static const char *MYSQL_KEY_INDEX = "CREATE TABLE t (\n"
+                                     "  id INT NOT NULL,\n"
+                                     "  KEY idx_id (id)\n"
+                                     ");\n";
+
+static const char *SQLITE_WITHOUT_ROWID = "CREATE TABLE history_uploads (\n"
+                                          "  user_id TEXT NOT NULL,\n"
+                                          "  history_id TEXT NOT NULL,\n"
+                                          "  PRIMARY KEY (user_id, history_id)\n"
+                                          ") WITHOUT ROWID;\n";
+
+/* atuin's ai_session schema: a trigger with an unparenthesized WHEN condition
+ * and an INSERT OR IGNORE body, then an fts5 virtual table. */
+static const char *SQLITE_TRIGGER_WHEN_AND_FTS5 =
+    "CREATE TABLE sessions (id INTEGER PRIMARY KEY, root_harness INTEGER);\n"
+    "CREATE TABLE regrouped (session INTEGER PRIMARY KEY);\n"
+    "CREATE TRIGGER sessions_regrouped AFTER UPDATE OF root_harness ON sessions\n"
+    "WHEN OLD.root_harness IS NOT NEW.root_harness\n"
+    "BEGIN\n"
+    "    INSERT OR IGNORE INTO regrouped (session) VALUES (NEW.id);\n"
+    "END;\n"
+    "CREATE VIRTUAL TABLE messages_fts USING fts5(\n"
+    "    title,\n"
+    "    body,\n"
+    "    tokenize = 'unicode61',\n"
+    "    content = '',\n"
+    "    contentless_delete = 1\n"
+    ");\n";
+
+static const char *SQLITE_PRAGMA_FORMS = "PRAGMA journal_mode = WAL;\n"
+                                         "PRAGMA main.cache_size = -2000;\n"
+                                         "PRAGMA table_info(registrations);\n"
+                                         "PRAGMA optimize;\n";
+
+/* Invalid SQLite (its ALTER TABLE has no DROP INDEX), shipped in a real down
+ * migration (atuin-scripts): it must stay flagged. */
+static const char *SQLITE_ALTER_DROP_INDEX = "alter table scripts drop index name_uniq_idx;\n";
+
+static int sqlite_has_labeled_def(CBMFileResult *r, const char *label, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 0 when the file parsed without any error region; the ASSERTs return 1. */
+static int sqlite_check_clean(CBMFileResult *r) {
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    return 0;
+}
+
+TEST(sqlite_key_column_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_KEY_COLUMN, CBM_LANG_SQL, "create_kv_db.up.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "kv"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(mysql_key_index_in_create_table_still_clean_issue2246) {
+    CBMFileResult *r = do_extract(MYSQL_KEY_INDEX, CBM_LANG_SQL, "mysql_schema.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "t"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_without_rowid_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_WITHOUT_ROWID, CBM_LANG_SQL, "0003_queue_owners.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "history_uploads"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_trigger_when_body_and_fts5_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_TRIGGER_WHEN_AND_FTS5, CBM_LANG_SQL, "0001_init.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "regrouped"));
+    /* The virtual table is a table: it is extracted like one. */
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "messages_fts"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_pragma_forms_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_PRAGMA_FORMS, CBM_LANG_SQL, "pragmas.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_alter_table_drop_index_still_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_ALTER_DROP_INDEX, CBM_LANG_SQL, "unique_names.down.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_TRUE(r->error_region_count > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
@@ -2243,4 +2409,13 @@ SUITE(parse_coverage) {
     RUN_TEST(pascal_broken_source_still_flagged_issue2211);
     RUN_TEST(vbnet_vendored_grammar_parses_real_vb_clean);
     RUN_TEST(vbnet_vendored_grammar_still_flags_broken_source);
+
+    RUN_TEST(sqlite_valid_migration_not_flagged);
+    RUN_TEST(sqlite_malformed_still_flagged);
+    RUN_TEST(sqlite_key_column_not_flagged_issue2246);
+    RUN_TEST(mysql_key_index_in_create_table_still_clean_issue2246);
+    RUN_TEST(sqlite_without_rowid_not_flagged_issue2246);
+    RUN_TEST(sqlite_trigger_when_body_and_fts5_not_flagged_issue2246);
+    RUN_TEST(sqlite_pragma_forms_not_flagged_issue2246);
+    RUN_TEST(sqlite_alter_table_drop_index_still_flagged_issue2246);
 }

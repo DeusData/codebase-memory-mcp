@@ -60,8 +60,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Eleven further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`, `vbnet`) are
+- Twelve further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `sql`, `tsx`, `vbnet`) are
   self-maintained forks that retain their original upstream authors' licenses —
   see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -79,8 +79,13 @@ License summary:
   ([Isopod/tree-sitter-pascal](https://github.com/Isopod/tree-sitter-pascal),
   MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
   DeusData patch that accepts non-ASCII letters in identifiers; its grammar
-  source lives in `tools/tree-sitter-pascal/`. `vbnet` is described in its own
-  section below.
+  source lives in `tools/tree-sitter-pascal/`. `sql`
+  ([DerekStride/tree-sitter-sql](https://github.com/DerekStride/tree-sitter-sql),
+  MIT, (c) 2021 Derek Stride) is the upstream grammar with one (c) 2026
+  DeusData patch that accepts the SQLite syntax of real migration files
+  (PRAGMA, AUTOINCREMENT, WITHOUT ROWID, trigger bodies, virtual tables); its
+  grammar source lives in `tools/tree-sitter-sql/`. `vbnet` is described in its
+  own section below.
 
 ### tree-sitter-vbnet (with CodeGraph's real-world VB.NET patch)
 

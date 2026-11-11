@@ -43,6 +43,9 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
     "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
+    # sql: our SQLite-migration fork (#2246) of the pin we vendored before;
+    # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "sql": "DerekStride/tree-sitter-sql",
     "tsx": "tree-sitter/tree-sitter-typescript",
     # vbnet: tree-sitter-vbnet + CodeGraph's real-world VB.NET patch; same
     # routing rule as arkts -- `LICENSE` is upstream's MIT verbatim and is the
