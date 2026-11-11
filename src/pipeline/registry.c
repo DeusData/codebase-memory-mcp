@@ -205,6 +205,44 @@ static int common_prefix_len(const char *a, const char *b) {
 
 enum { REG_TEST_PENALTY = 1000 };
 
+/* A directory segment that, by name alone, holds test doubles: Go's generated
+ * fake clientsets and listers (pkg/client/.../fake), mock packages, and the
+ * testing / testutil helper packages. Whole segments only, compared exactly. */
+static bool test_double_dir_segment(const char *seg, size_t len) {
+    static const char *const dirs[] = {"fake", "mock", "mocks", "testing", "testutil"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        if (strlen(dirs[i]) == len && memcmp(seg, dirs[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `base` is a Go file named `prefix`*.go. */
+static bool go_file_with_prefix(const char *base, const char *prefix) {
+    static const char go_ext[] = ".go";
+    size_t blen = strlen(base);
+    size_t plen = strlen(prefix);
+    size_t elen = sizeof(go_ext) - SKIP_ONE;
+    return blen >= plen + elen && strncmp(base, prefix, plen) == 0 &&
+           strcmp(base + blen - elen, go_ext) == 0;
+}
+
+bool cbm_registry_test_double_path(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    const char *seg = rel_path;
+    for (const char *slash = strchr(seg, '/'); slash; slash = strchr(seg, '/')) {
+        if (test_double_dir_segment(seg, (size_t)(slash - seg))) {
+            return true;
+        }
+        seg = slash + SKIP_ONE;
+    }
+    /* `seg` is the file name now. */
+    return go_file_with_prefix(seg, "mock_") || go_file_with_prefix(seg, "fake_");
+}
+
 /* The stored test verdicts. index_under_name drops an entry it cannot record a
  * verdict for, so this covers every entry of a non-empty bucket. */
 static const uint8_t *qn_test_flags(const qn_array_t *arr) {

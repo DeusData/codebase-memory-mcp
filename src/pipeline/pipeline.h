@@ -290,6 +290,18 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label, bool is_test);
 
+/* The test-double path rule, for the registry's ranking only: true when the
+ * repo-relative path of a symbol's defining file has a directory segment named
+ * exactly `fake`, `mock`, `mocks`, `testing` or `testutil`, or its file name
+ * matches `mock_*.go` or `fake_*.go`. Go projects keep generated fake
+ * clientsets and mock packages in ordinary files the extractor rightly does
+ * not call tests; a call should still prefer real code over them. The three
+ * registry seeders (pass_definitions.c, pass_parallel.c,
+ * pipeline_incremental.c) pass the extractor's verdict OR this, so full and
+ * incremental indexes rank alike. It never decides what a node is: the stored
+ * is_test property, TESTS edges and importance stay with cbm_is_test_path. */
+bool cbm_registry_test_double_path(const char *rel_path);
+
 /* Swift-only metadata and label-compatible overload selection. The returned
  * QNs are borrowed from the registry and all belong to one base callable.
  * -1 means this name has Swift definitions but no compatible overload. */
