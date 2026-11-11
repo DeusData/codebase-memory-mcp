@@ -1,0 +1,199 @@
+==================
+Entry component struct
+==================
+
+@Entry
+@Component
+struct Index {
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Custom dialog struct
+==================
+
+@CustomDialog
+struct ConfirmDialog {
+  controller: CustomDialogController
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (property_identifier)
+        (type_annotation
+          (type_identifier)))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Reusable component struct
+==================
+
+@Reusable
+@Component
+struct Card {
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Exported component struct
+==================
+
+@Component
+export struct TitleBar {
+  build() {
+  }
+}
+
+---
+
+(program
+  (export_statement
+    (decorator
+      (identifier))
+    (struct_declaration
+      (type_identifier)
+      (class_body
+        (method_definition
+          (property_identifier)
+          (formal_parameters)
+          (statement_block))))))
+
+==================
+Export default struct
+==================
+
+@Component
+export default struct Footer {
+  build() {
+  }
+}
+
+---
+
+(program
+  (export_statement
+    (decorator
+      (identifier))
+    (struct_declaration
+      (type_identifier)
+      (class_body
+        (method_definition
+          (property_identifier)
+          (formal_parameters)
+          (statement_block))))))
+
+==================
+Struct with decorator arguments
+==================
+
+@Entry({ routeName: 'home' })
+@Component
+struct Home {
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (call_expression
+        (identifier)
+        (arguments
+          (object
+            (pair
+              (property_identifier)
+              (string
+                (string_fragment)))))))
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Two structs in one file
+==================
+
+@Component
+struct A {
+  build() {
+  }
+}
+
+@Component
+struct B {
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block))))
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))

@@ -35,17 +35,20 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+# shellcheck source=../scripts/test-runtime.sh
+source "${ROOT}/scripts/test-runtime.sh"
+cbm_test_runtime_init
+tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 cleanup() {
   CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
     "${BINARY}" daemon stop >/dev/null 2>&1 || true
-  rm -rf "${tmpdir}"
+  cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 
 missing="${tmpdir}/repository-does-not-exist"
 response="${tmpdir}/worker.response"
-args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\"}"
+args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\",$(cbm_test_index_worker_policy_json)}"
 
 if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \

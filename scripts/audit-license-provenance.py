@@ -10,6 +10,7 @@ Verdicts:
   ERROR              upstream fetch failed
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -19,17 +20,39 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRAMMARS = os.path.join(ROOT, "internal/cbm/vendored/grammars")
 
-FIRST_PARTY = {"cobol", "form", "janet", "magma", "protobuf", "wolfram"}
+# Grammars authored in this repository. This is a REGISTRATION, not an
+# exemption: membership only routes the check -- the audit still requires the
+# vendored LICENSE to be byte-equal to the project root LICENSE, and reports
+# FIRST-PARTY-VAR (a failing verdict) when it is not.
+FIRST_PARTY = {"chialisp", "cobol", "form", "janet", "magma", "protobuf", "wolfram"}
 FORKS = {  # self-maintained forks: vendored LICENSE must match the original upstream
+    # arkts: our own ArkTS fork of tree-sitter-typescript. The vendored LICENSE is
+    # upstream's MIT verbatim, which is what MIT requires of a derivative; our own
+    # copyright and the fork's provenance live where our SOURCE is (grammar.js
+    # header, MANIFEST.md, THIRD_PARTY.md) rather than inside upstream's notice.
+    # This is a routing entry, NOT an exemption -- check_upstream still byte-verifies
+    # against the real upstream repository.
+    "arkts": "tree-sitter/tree-sitter-typescript",
     "cfml": "cfmleditor/tree-sitter-cfml",
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",
+    # javascript / tsx: our JSX lone-ampersand forks (#1736) of the pins we vendored
+    # before; same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "javascript": "tree-sitter/tree-sitter-javascript",
+    # pascal: our Unicode-identifier fork (#2211) of the pin we vendored before;
+    # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
+    "tsx": "tree-sitter/tree-sitter-typescript",
+    # vbnet: tree-sitter-vbnet + CodeGraph's real-world VB.NET patch; same
+    # routing rule as arkts -- `LICENSE` is upstream's MIT verbatim and is the
+    # file byte-verified here (local_license() takes it before the sibling
+    # LICENSE-codegraph, whose provenance MANIFEST.md records by SHA-256).
+    "vbnet": "govindbanura/tree-sitter-vbnet",
 }
 SPECIAL_NOTICE = {
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",
     "pine": "PROVENANCE-NOTICE (upstream kvarenzn/tree-sitter-pine declares ISC, ships no license file)",
-    "vb_dotnet": "PROVENANCE-NOTICE (upstream CodeAnt-AI/tree-sitter-vb-dotnet declares MIT in package metadata, ships no license file)",
 }
 DISAGREEMENT = {
     "jinja2": "dbt-labs/tree-sitter-jinja2",
@@ -160,13 +183,24 @@ def main():
         check_upstream(rel, os.path.join(ROOT, rel), repo, exact_path=exact)
 
     # Special: nomic = canonical Apache-2.0 text; sqlite3 = first-party notice
+    #
+    # This used to `curl` https://www.apache.org/licenses/LICENSE-2.0.txt at
+    # gate time and byte-compare. A gating verdict must not depend on a live
+    # HTTP request: any fetch failure yielded an empty string, compared unequal,
+    # and reported DIFFERS -- indistinguishable from a real licence change. That
+    # is what reddened `security / license-gate` on PR #1337 for over two weeks,
+    # on a branch touching three CLI files and no licence at all.
+    #
+    # The canonical Apache-2.0 text is immutable and versioned, so it is pinned
+    # by digest instead. Verified byte-identical to the upstream text at the time
+    # of pinning (11358 bytes). A mismatch now means our vendored copy changed --
+    # which is exactly, and only, what this audit is meant to detect.
+    APACHE_2_0_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     fname, ours = local_license(os.path.join(ROOT, "vendored/nomic"))
-    apache = subprocess.run(
-        ["curl", "-fsSL", "https://www.apache.org/licenses/LICENSE-2.0.txt"],
-        capture_output=True, text=True).stdout
+    ours_digest = hashlib.sha256(ours.encode("utf-8")).hexdigest() if ours is not None else None
     results["vendored/nomic"] = (
-        "IDENTICAL" if ours == apache else "DIFFERS",
-        "apache.org canonical LICENSE-2.0.txt")
+        "IDENTICAL" if ours_digest == APACHE_2_0_SHA256 else "DIFFERS",
+        "canonical Apache-2.0 text, pinned by sha256")
     results["vendored/sqlite3"] = ("FIRST-PARTY-NOTICE",
                                    "own public-domain notice (sqlite has no upstream LICENSE)")
 

@@ -1,0 +1,1 @@
+MATCH p = (a:Class)-[:INHERITS*1..3]->(b:Class) RETURN a.name, length(p)

@@ -3,6 +3,7 @@
  */
 #include "log.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -32,11 +33,29 @@ static _Atomic CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
 static _Atomic cbm_log_sink_fn g_log_sink = (cbm_log_sink_fn)NULL;
 static _Atomic CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
 
+/* See cbm_log_set_crash_durable in log.h. Read on every emitted line, so it
+ * follows the same relaxed-atomic discipline as the four above. */
+static _Atomic bool g_log_crash_durable = false;
+
+void cbm_log_set_crash_durable(bool enabled) {
+    if (enabled) {
+        /* Best effort by contract: setvbuf is only guaranteed before a stream's
+         * first operation, so a process that has already written to stderr
+         * keeps its buffering. The per-line flush in emit_line is what makes
+         * the durability guarantee hold either way. */
+        (void)setvbuf(stderr, NULL, _IONBF, 0);
+    }
+    atomic_store_explicit(&g_log_crash_durable, enabled, memory_order_relaxed);
+}
+
+bool cbm_log_crash_durable(void) {
+    return atomic_load_explicit(&g_log_crash_durable, memory_order_relaxed);
+}
+
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
-    /* getenv() is safe here: this runs at startup before any thread is created,
-     * so there is no concurrent setenv() to race against. */
-    const char *raw = getenv("CBM_LOG_LEVEL");
+    /* Resolve the immutable startup override before the inherited environment. */
+    const char *raw = cbm_runtime_getenv("CBM_LOG_LEVEL");
     if (raw && raw[0] != '\0') {
         /* Textual form, case-insensitive. Index of each name == its enum value. */
         static const char *const names[] = {"debug", "info", "warn", "error", "none"};
@@ -66,7 +85,7 @@ void cbm_log_init_from_env(void) {
     /* Unrecognised value: leave the level unchanged (fail-open). */
 
 parse_format:;
-    const char *fmt = getenv("CBM_LOG_FORMAT");
+    const char *fmt = cbm_runtime_getenv("CBM_LOG_FORMAT");
     if (fmt && fmt[0] != '\0') {
         char lower_fmt[8];
         size_t i = 0;
@@ -85,6 +104,14 @@ parse_format:;
     /* Format is intentionally explicit-only. Logs stay local to stderr and the
      * optional in-process sink; deployment environment variables must not
      * silently change the operator-selected output shape. */
+}
+
+void cbm_log_init_for_process(bool quiet_by_default, bool require_info_liveness) {
+    cbm_log_set_level(quiet_by_default ? CBM_LOG_WARN : CBM_LOG_INFO);
+    cbm_log_init_from_env();
+    if (require_info_liveness && cbm_log_get_level() > CBM_LOG_INFO) {
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
 }
 
 void cbm_log_set_sink(cbm_log_sink_fn fn) {
@@ -225,6 +252,13 @@ static void emit_line(const char *line) {
         }
     }
     (void)fprintf(stderr, "%s\n", line);
+    if (atomic_load_explicit(&g_log_crash_durable, memory_order_relaxed)) {
+        /* The line is complete here and the stream lock is released, so a
+         * process that dies on the very next instruction still leaves this
+         * line on disk. Free when stderr is unbuffered; one write() per line
+         * when setvbuf was refused. */
+        (void)fflush(stderr);
+    }
 }
 
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
@@ -329,17 +363,29 @@ static void copy_path_without_query(const char *path, char *out, size_t outsz) {
 }
 
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
-                         int64_t duration_us) {
+                         int64_t duration_us, int64_t handler_duration_us,
+                         int64_t response_serialization_us, bool cancelled, bool timed_out) {
     char duration_ms[CBM_SZ_32];
+    char handler_duration_ms[CBM_SZ_32];
+    char response_serialization_ms[CBM_SZ_32];
     snprintf(duration_ms, sizeof(duration_ms), "%" PRId64, duration_us / 1000);
+    snprintf(handler_duration_ms, sizeof(handler_duration_ms), "%" PRId64,
+             handler_duration_us / 1000);
+    snprintf(response_serialization_ms, sizeof(response_serialization_ms), "%" PRId64,
+             response_serialization_us / 1000);
+    const char *status = timed_out ? "timeout" : (is_error ? "error" : "ok");
     if (tool_name && tool_name[0] != '\0') {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "tool", tool_name, "status",
-                is_error ? "error" : "ok", "duration_ms", duration_ms, NULL);
+                "method", method ? method : "", "tool", tool_name, "status", status, "duration_ms",
+                duration_ms, "handler_duration_ms", handler_duration_ms,
+                "response_serialization_ms", response_serialization_ms, "cancelled",
+                cancelled ? "true" : "false", "timed_out", timed_out ? "true" : "false", NULL);
     } else {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "status", is_error ? "error" : "ok", "duration_ms",
-                duration_ms, NULL);
+                "method", method ? method : "", "status", status, "duration_ms", duration_ms,
+                "handler_duration_ms", handler_duration_ms, "response_serialization_ms",
+                response_serialization_ms, "cancelled", cancelled ? "true" : "false", "timed_out",
+                timed_out ? "true" : "false", NULL);
     }
 }
 

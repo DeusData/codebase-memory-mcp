@@ -25,13 +25,21 @@ enum { REG_MAX_CANDIDATES = 256 };
 
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
+#include "foundation/arena.h"
 #include "foundation/dyn_array.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
+#include "callable_sig.h" /* cbm_qn_callable_base_len_named: overloads share the name key */
+#include "yyjson/yyjson.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -59,6 +67,8 @@ const char *cbm_confidence_band(double score) {
 #define CONF_IMPORT_MAP_SUFFIX 0.85
 /* Strategy 2: same_module — same file/package → high confidence */
 #define CONF_SAME_MODULE 0.90
+/* Python lexical scope — a def bound in an enclosing function (LEGB) */
+#define CONF_LEXICAL_SCOPE 0.95
 /* Strategy 3: unique_name — only one candidate project-wide */
 #define CONF_UNIQUE_NAME 0.75
 /* Strategy 4: suffix_match — multiple candidates, filtered */
@@ -71,8 +81,59 @@ const char *cbm_confidence_band(double score) {
 
 /* ── Internal types ──────────────────────────────────────────────── */
 
-/* Array of QN strings for byName index */
-typedef CBM_DYN_ARRAY(char *) qn_array_t;
+/* Array of QN strings for byName index, with the test/mock verdict of each
+ * name cached beside it: the scorer asked is_test_qn for every candidate of
+ * every unresolved call, and the answer depends only on the name, which never
+ * changes once registered (waste sanitizer scaling lane, 2026-09-17). Field
+ * order and names match CBM_DYN_ARRAY(char *) so cbm_da_push works on it. */
+typedef struct {
+    char **items;
+    int count;
+    int cap;
+    uint8_t *is_test; /* is_test_qn(items[i]), one byte per entry */
+    int is_test_cap;
+    /* Language of the file that defined items[i] (a CBMLanguage; CBM_LANG_COUNT
+     * = unknown, compatible with every caller), one byte per entry. Grown in
+     * lockstep with is_test, so is_test_cap bounds it too. */
+    uint8_t *lang;
+} qn_array_t;
+
+typedef struct {
+    uint64_t defaults;
+    uint8_t count;
+    char selector[];
+} swift_signature_t;
+typedef struct swift_owner swift_owner_t;
+struct swift_owner {
+    const char *qn;
+    const char *path;
+    const char *module;
+    const char *module_name;
+    const char *manifest;
+    const char *imports;
+    bool declaration;
+    swift_owner_t *primary;
+    swift_owner_t *members;
+    swift_owner_t *next_member;
+    swift_owner_t *next_path;
+    swift_owner_t *next;
+};
+
+typedef struct {
+    CBMArena arena;
+    const cbm_registry_t *registry;
+    cbm_pkg_entries_t targets;
+    CBMHashTable *by_source_root;
+    CBMHashTable *by_manifest_root;
+    CBMHashTable *by_target_name;
+    cbm_pkg_entry_t ambiguous_target;
+    CBMHashTable *by_qn;
+    CBMHashTable *by_path;
+    CBMHashTable *by_module_path;
+    CBMHashTable *return_types;
+    swift_owner_t *types;
+} swift_owners_t;
+_Static_assert(CBM_LANG_COUNT <= UINT8_MAX, "CBMLanguage must fit the per-entry lang byte");
 
 struct cbm_registry {
     /* Interned label strings (<=~30 distinct labels; owned here, freed in
@@ -85,6 +146,9 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+    CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
+    CBMHashTable *swift_overloads;  /* base callable QN -> overloads */
+    swift_owners_t *swift_owners;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -110,67 +174,202 @@ static const char *simple_name(const char *qn) {
 
 /* Extract everything before the last dot. Returns heap-allocated string. */
 
-/* Count common dot-separated prefix segments. */
+/* Count common dot-separated prefix segments. One pass over the shared prefix:
+ * the same answer as measuring each segment of both strings with strchr and
+ * strlen and comparing them, which walked every candidate's whole name per
+ * call (the scaling lane's x3.4, waste sanitizer 2026-09-17). */
 static int common_prefix_len(const char *a, const char *b) {
     if (!a || !b) {
         return 0;
     }
     int count = 0;
-    while (*a && *b) {
-        /* Find next segment in each */
-        const char *adot = strchr(a, '.');
-        const char *bdot = strchr(b, '.');
-        size_t alen = adot ? (size_t)(adot - a) : strlen(a);
-        size_t blen = bdot ? (size_t)(bdot - b) : strlen(b);
-        if (alen != blen || memcmp(a, b, alen) != 0) {
-            break;
+    size_t i = 0;
+    while (a[i] != '\0' && b[i] != '\0') { /* a segment starts here in both */
+        while (a[i] == b[i] && a[i] != '.' && a[i] != '\0') {
+            i++;
+        }
+        bool a_ends = a[i] == '.' || a[i] == '\0';
+        bool b_ends = b[i] == '.' || b[i] == '\0';
+        if (!a_ends || !b_ends) {
+            break; /* the segments differ in content or in length */
         }
         count++;
-        a += alen + (adot ? SKIP_ONE : 0);
-        b += blen + (bdot ? SKIP_ONE : 0);
-        if (!adot || !bdot) {
-            break;
+        if (a[i] == '\0' || b[i] == '\0') {
+            break; /* one name stops here: no further segment to compare */
         }
+        i++; /* both stand on '.': step into the next segment */
     }
     return count;
 }
 
 enum { REG_TEST_PENALTY = 1000 };
 
-/* Check if a qualified name looks like a test/mock path. */
+/* Check if a qualified name looks like a test/mock path: does it contain any of
+ * Test, test, Mock, mock, Stub, stub, Fake, fake, Fixture, spec? One pass that
+ * dispatches on the first character instead of ten strstr scans of the whole
+ * name (this ran for every candidate of every unresolved call: the scaling
+ * lane's x4.0, waste sanitizer 2026-09-17). */
 static bool is_test_qn(const char *qn) {
     if (!qn) {
         return false;
     }
-    return (strstr(qn, "Test") != NULL || strstr(qn, "test") != NULL ||
-            strstr(qn, "Mock") != NULL || strstr(qn, "mock") != NULL ||
-            strstr(qn, "Stub") != NULL || strstr(qn, "stub") != NULL ||
-            strstr(qn, "Fake") != NULL || strstr(qn, "fake") != NULL ||
-            strstr(qn, "Fixture") != NULL || strstr(qn, "spec") != NULL);
+    for (const char *p = qn; *p; p++) {
+        switch (*p) {
+        case 'T':
+            if (strncmp(p, "Test", 4) == 0) {
+                return true;
+            }
+            break;
+        case 't':
+            if (strncmp(p, "test", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'M':
+            if (strncmp(p, "Mock", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'm':
+            if (strncmp(p, "mock", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'S':
+            if (strncmp(p, "Stub", 4) == 0) {
+                return true;
+            }
+            break;
+        case 's':
+            if (strncmp(p, "stub", 4) == 0 || strncmp(p, "spec", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'F':
+            if (strncmp(p, "Fake", 4) == 0 || strncmp(p, "Fixture", 7) == 0) {
+                return true;
+            }
+            break;
+        case 'f':
+            if (strncmp(p, "fake", 4) == 0) {
+                return true;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+/* The cached test verdicts, only when they cover every entry: a failed growth
+ * leaves the cache short, and then the scorer asks per candidate as before. */
+static const uint8_t *qn_test_flags(const qn_array_t *arr) {
+    return arr->is_test && arr->is_test_cap >= arr->count ? arr->is_test : NULL;
+}
+
+/* The cached candidate languages, under the same coverage rule: both side
+ * arrays grow together and share is_test_cap. */
+static const uint8_t *qn_lang_flags(const qn_array_t *arr) {
+    return arr->lang && arr->is_test_cap >= arr->count ? arr->lang : NULL;
 }
 
 /* Score a candidate for tiebreaking. Higher = better.
  * Layer 1: Non-test code preferred over test code (+1000)
- * Layer 2: Namespace proximity via common prefix length (+plen) */
-static int candidate_score(const char *candidate_qn, const char *module_qn) {
+ * Layer 2: Namespace proximity via common prefix length (+plen)
+ * `is_test` is the cached verdict when the caller has one (-1: ask). */
+static int candidate_score(const char *candidate_qn, const char *module_qn, int is_test) {
     int score = 0;
-    if (!is_test_qn(candidate_qn)) {
+    bool test = is_test >= 0 ? is_test != 0 : is_test_qn(candidate_qn);
+    if (!test) {
         score += REG_TEST_PENALTY;
     }
     score += common_prefix_len(candidate_qn, module_qn);
     return score;
 }
 
-/* Pick candidate with highest composite score (test-deprioritization + namespace proximity). */
-static const char *best_by_import_distance(const char **candidates, int count,
-                                           const char *module_qn) {
+/* How plainly a candidate is something a call can target, lower = better: a
+ * function or method; then any other definition (a class for a constructor
+ * call, a macro, a type); then a candidate whose label is unknown; last a
+ * variable or field, which a call reaches only when it holds a function. */
+enum {
+    REG_RANK_CALLABLE = 0,
+    REG_RANK_OTHER_DEF = 1,
+    REG_RANK_UNKNOWN = 2,
+    REG_RANK_DATA = 3,
+};
+
+static int callable_rank(const cbm_registry_t *r, const char *qn) {
+    const char *label = r ? cbm_registry_label_of(r, qn) : NULL;
+    if (!label) {
+        return REG_RANK_UNKNOWN;
+    }
+    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
+        return REG_RANK_CALLABLE;
+    }
+    if (strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0) {
+        return REG_RANK_DATA;
+    }
+    return REG_RANK_OTHER_DEF;
+}
+
+/* A .NET reference assembly (`src/libraries/<Asm>/ref/<Asm>.cs`) declares an
+ * assembly's public surface with `throw null` bodies in one shallow file; a
+ * call that could equally mean the implementation means the implementation.
+ * C# only: elsewhere a `ref` directory is an ordinary name. */
+static bool csharp_reference_stub(const char *qn, uint8_t lang) {
+    return lang == CBM_LANG_CSHARP && strstr(qn, ".ref.") != NULL;
+}
+
+/* Total order among candidates that tie on candidate_score. The registry's
+ * by-name bucket is in registration order, which follows the file list; a
+ * tie broken by bucket position made the resolved target a function of
+ * that order (kernel: 632 CALLS edges differed between two indexes of the
+ * same tree, `dev_name` flipping between twenty same-named struct fields
+ * and unresolved, `sg_set_buf` between include/linux and tools/virtio).
+ * The rule, a pure function of the candidate set (O9):
+ *   1. the more plainly callable candidate (`dev_name` the function over the
+ *      struct fields; Kotlin `where(...)` the method over the property);
+ *   2. for C#, an implementation over a reference-assembly stub;
+ *   3. the lexicographically smaller QN (include/linux over tools/virtio).
+ * Nesting depth is deliberately not a criterion: "least nested wins" sent
+ * django's `Model.objects.filter` to the template `Library.filter`, one
+ * segment shallower than `QuerySet.filter` (2026-10-10 audit). */
+static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candidate,
+                                      uint8_t candidate_lang, const char *best, uint8_t best_lang) {
+    int ck = callable_rank(r, candidate);
+    int bk = callable_rank(r, best);
+    if (ck != bk) {
+        return ck < bk;
+    }
+    bool cs = csharp_reference_stub(candidate, candidate_lang);
+    bool bs = csharp_reference_stub(best, best_lang);
+    if (cs != bs) {
+        return !cs;
+    }
+    return strcmp(candidate, best) < 0;
+}
+
+/* Pick candidate with highest composite score (test-deprioritization + namespace
+ * proximity), ties settled by candidate_outranks_on_tie. `is_test_flags` and
+ * `lang_flags` are the candidates' cached test verdicts and languages, or NULL
+ * when the caller has none (a filtered subset carries its own copies). */
+static const char *best_by_import_distance(const cbm_registry_t *r, const char **candidates,
+                                           const uint8_t *is_test_flags, const uint8_t *lang_flags,
+                                           int count, const char *module_qn) {
     const char *best = NULL;
+    uint8_t best_lang = (uint8_t)CBM_LANG_COUNT;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
-        int score = candidate_score(candidates[i], module_qn);
-        if (score > best_score) {
+        int score =
+            candidate_score(candidates[i], module_qn, is_test_flags ? (int)is_test_flags[i] : -1);
+        uint8_t lang = lang_flags ? lang_flags[i] : (uint8_t)CBM_LANG_COUNT;
+        if (score > best_score ||
+            (score == best_score && best &&
+             candidate_outranks_on_tie(r, candidates[i], lang, best, best_lang))) {
             best_score = score;
             best = candidates[i];
+            best_lang = lang;
         }
     }
     return best;
@@ -189,23 +388,30 @@ static const char *best_by_import_distance(const char **candidates, int count,
  * file exit. Thread-local so each worker has its own cache without
  * contention. */
 static CBM_TLS CBMHashTable *_reach_cache = NULL;
+/* The cache's key copies live in one per-file arena, released with the cache:
+ * a strdup per memoized candidate was 12.5 M malloc + free pairs on the Go
+ * corpus (waste sanitizer, 2026-09-17). Keys are still copies -- the public
+ * cbm_registry_is_import_reachable may be handed a caller's buffer. */
+static CBM_TLS CBMArena _reach_keys;
+static CBM_TLS bool _reach_keys_live = false;
+/* The arena opens on the first memoized key, with a small first block that
+ * doubles: opened eagerly at the 64 KB default, the per-file arenas were 1.4 GB
+ * of cumulative allocation on the Go corpus, almost all of it never written
+ * (waste sanitizer, 2026-09-17). */
+enum { REACH_KEYS_FIRST_BLOCK = 4096 };
 
 /* Sentinels stored as values in the cache. NULL means "not cached".
  * We need two distinct non-NULL pointers to encode true/false. */
 #define REACH_CACHE_TRUE ((void *)(uintptr_t)1)
 #define REACH_CACHE_FALSE ((void *)(uintptr_t)2)
 
-static void reach_cache_free_key(const char *key, void *val, void *ud) {
-    (void)val;
-    (void)ud;
-    free((char *)key);
-}
-
 void cbm_registry_reach_cache_begin(int estimated_capacity) {
     if (_reach_cache) {
         /* Defensive: caller forgot to call _end. Clear and reuse. */
-        cbm_ht_foreach(_reach_cache, reach_cache_free_key, NULL);
         cbm_ht_clear(_reach_cache);
+        if (_reach_keys_live) {
+            cbm_arena_reset(&_reach_keys);
+        }
         return;
     }
     if (estimated_capacity < 16)
@@ -216,9 +422,12 @@ void cbm_registry_reach_cache_begin(int estimated_capacity) {
 void cbm_registry_reach_cache_end(void) {
     if (!_reach_cache)
         return;
-    cbm_ht_foreach(_reach_cache, reach_cache_free_key, NULL);
     cbm_ht_free(_reach_cache);
     _reach_cache = NULL;
+    if (_reach_keys_live) {
+        cbm_arena_destroy(&_reach_keys);
+        _reach_keys_live = false;
+    }
 }
 
 /* ── Per-file import-map prefix → module-QN hash ──────────────────
@@ -274,6 +483,8 @@ void cbm_registry_import_map_cache_end(void) {
  * eliminated. */
 typedef struct {
     cbm_resolution_t res;
+    size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
+    bool skip_members; /* a C call and a C reference to the same name share it too */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -340,7 +551,11 @@ static bool is_import_reachable(const char *candidate_qn, const char **import_va
     }
 
     if (_reach_cache) {
-        char *kdup = strdup(candidate_qn);
+        if (!_reach_keys_live) {
+            cbm_arena_init_sized(&_reach_keys, REACH_KEYS_FIRST_BLOCK);
+            _reach_keys_live = true;
+        }
+        char *kdup = cbm_arena_strdup(&_reach_keys, candidate_qn);
         if (kdup) {
             cbm_ht_set(_reach_cache, kdup, reachable ? REACH_CACHE_TRUE : REACH_CACHE_FALSE);
         }
@@ -428,31 +643,991 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
-/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
- * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
- * could not resolve the receiver type — type-resolved calls win via lsp_*
- * strategies before the registry runs. Binding such a call to a project symbol
- * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
- * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
- * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
- * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
- * default-drop) because the parallel resolver runs lsp_* strategies through the
- * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
- * + side-effect-free so the contract is unit-testable without a full pipeline. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
-    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+/* Dynamic-language analogue of the Perl guard above (#592/#606/#1276
+ * direction; precedent #477). A member call `x.foo()` reaches the weak textual
+ * cascade ONLY when the language's LSP could not resolve the receiver type —
+ * type-resolved calls win via lsp_* strategies before the registry runs.
+ * Binding such a call to a project symbol by a weak short-name strategy
+ * fabricates a CALLS edge (`re.test()` -> SalesforceRestClient.test,
+ * `accelerator.print()` -> MockAccelerator.print). Drop ONLY the weak
+ * strategies; keep import/same-module/qualified-tail matches and every lsp_*
+ * strategy. Uses an EXPLICIT drop-list (not keep-list + default-drop) because
+ * the parallel resolver runs lsp_* strategies through the same guard variable —
+ * a default-drop would silently kill lsp_ts_method. Pure + side-effect-free so
+ * the contract is unit-testable without a full pipeline.
+ *
+ * `enabled` is the CALLER's per-language gate, deliberately kept OUT of this
+ * helper: the guard applies only to the language set each call site enumerates
+ * (today Python plus the JS/TS family including ArkTS). Widening it is a
+ * per-language decision made at the call sites in pass_calls.c and
+ * pass_parallel.c, which MUST stay in lockstep — a gate added to only one of
+ * them diverges the sequential and parallel resolvers. */
+/* The weak short-name strategies that actually reach the call-resolution
+ * guards: the registry's suffix_match / unique_name and the parallel
+ * field_type_hint. "fuzzy" is listed as defensive insurance only —
+ * cbm_registry_fuzzy_resolve is not wired into the sequential/parallel resolvers
+ * today, so it never reaches these helpers, but naming it keeps a future wiring
+ * from silently reintroducing the noise. Everything else — same_module /
+ * import_map / import_map_suffix / qualified_suffix / callee_suffix /
+ * service_pattern / lsp_* — is a receiver- or import-aware match and is KEPT.
+ *
+ * Shared by BOTH weak-call guards below so the drop-list exists exactly once: a
+ * list that drifted between the member guard and the local-binding guard would
+ * make the two disagree about what "weak" means. */
+static bool weak_short_name_strategy(const char *strategy) {
+    if (!strategy || !strategy[0]) {
         return false;
     }
-    /* Weak short-name strategies that actually reach the call-resolution guards:
-     * the registry's suffix_match / unique_name and the parallel field_type_hint.
-     * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
-     * is not wired into the sequential/parallel resolvers today, so it never
-     * reaches this helper, but naming it keeps a future wiring from silently
-     * reintroducing the noise. Everything else — same_module / import_map /
-     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
-     * lsp_* — is a receiver- or import-aware match and is KEPT. */
     return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
+    if (!enabled || !is_method) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
+/* ── Python builtin-type members ─────────────────────────────────────────
+ * Methods of Python's builtin types (str, bytes, list, dict, set, file objects)
+ * plus the builtin functions that appear as attribute calls. Like PERL_BUILTINS
+ * this is a fact about the LANGUAGE, not about corpus fashion: a member call
+ * whose name is a builtin's own method — `parts.extend(...)`, `line.strip()`,
+ * `d.items()` — is that builtin's method whenever the receiver is untyped, so a
+ * project symbol that merely shares the spelling must not bind. MUST stay
+ * sorted ASCII-ascending for bsearch. */
+static const char *const PYTHON_BUILTIN_MEMBERS[] = {
+    "add",        "append",       "capitalize",
+    "casefold",   "center",       "clear",
+    "close",      "copy",         "count",
+    "decode",     "difference",   "discard",
+    "encode",     "endswith",     "expandtabs",
+    "extend",     "fileno",       "find",
+    "flush",      "format",       "get",
+    "index",      "insert",       "intersection",
+    "isalnum",    "isalpha",      "isdecimal",
+    "isdigit",    "isidentifier", "islower",
+    "isnumeric",  "isprintable",  "isspace",
+    "istitle",    "isupper",      "issubset",
+    "issuperset", "items",        "join",
+    "keys",       "ljust",        "lower",
+    "lstrip",     "partition",    "pop",
+    "popitem",    "print",        "read",
+    "readable",   "readline",     "readlines",
+    "remove",     "replace",      "reverse",
+    "rfind",      "rindex",       "rjust",
+    "rpartition", "rsplit",       "rstrip",
+    "seek",       "setdefault",   "sort",
+    "split",      "splitlines",   "startswith",
+    "strip",      "swapcase",     "symmetric_difference",
+    "tell",       "title",        "truncate",
+    "union",      "update",       "upper",
+    "values",     "writable",     "write",
+    "writelines", "zfill",
+};
+
+static int python_builtin_member_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, *(const char *const *)elem);
+}
+
+bool cbm_python_is_builtin_member(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return bsearch(name, PYTHON_BUILTIN_MEMBERS,
+                   sizeof(PYTHON_BUILTIN_MEMBERS) / sizeof(PYTHON_BUILTIN_MEMBERS[0]),
+                   sizeof(PYTHON_BUILTIN_MEMBERS[0]), python_builtin_member_cmp) != NULL;
+}
+
+/* The member guard's one exemption. A Python member call whose receiver could
+ * not be typed still carries real evidence when three facts line up: the callee
+ * name has exactly ONE definition in the whole project (strategy unique_name),
+ * the receiver is an attribute chain rooted at self/cls — an object the class
+ * owns, not a parameter handed in — and the name is not a builtin type's own
+ * method. `self.compiler.apply_converters()` names the only apply_converters in
+ * django and nothing else it could mean exists. Measured on django/django
+ * (v0.10.8 → v0.11.0 A/B, 2026-09-16): the unconditional guard dropped 800 such
+ * self-rooted edges, every sampled one a real call in the source. A bare
+ * parameter receiver (`accelerator.backward()`, #1276's own case) carries no
+ * ownership evidence and stays suppressed, as does every builtin-member name
+ * (`self.parts.extend()`). Python only: the JS/TS family keeps the TS-LSP trade
+ * recorded in the resolution probe. Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy) {
+    if (!is_python || !receiver_is_self_attribute) {
+        return false;
+    }
+    if (!strategy || strcmp(strategy, "unique_name") != 0) {
+        return false;
+    }
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    return !cbm_python_is_builtin_member(simple_name(callee_name));
+}
+
+/* Bare-call counterpart of the member guard above. A Python call `foo()` whose
+ * callee identifier is bound as a parameter of an enclosing scope cannot be the
+ * module-level `foo`: the parameter shadows it for the whole body. Binding such
+ * a call to a project Function/Method by a weak short-name strategy fabricates
+ * the edge by construction (`def _run_with_heavy_slot(run): run()` ->
+ * SatoriLive.run).
+ *
+ * This is deliberately NOT keyed on the callee's spelling. A list of
+ * "generic-looking" names (get / run / execute) asserts that certain spellings
+ * are usually noise, which is a claim about corpus fashion rather than about
+ * what the resolver knew — and it ages invisibly, because nothing fails when the
+ * distribution shifts, the graph just quietly loses different edges. A parameter
+ * binding is a fact about THIS file's scope, decidable outright.
+ *
+ * `enabled` is the caller's per-language gate, kept out of the helper for the
+ * same reason as the member guard: the two call sites in pass_calls.c and
+ * pass_parallel.c MUST enumerate the identical language set, or the sequential
+ * and parallel resolvers diverge. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
+                                          const char *strategy) {
+    if (!enabled || !callee_is_locally_bound) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
+/* A module specifier that names a path inside the indexed tree ("./x", "../x",
+ * "/abs/x", and on Windows "C:\x", "C:/x", "\\server\share\x") rather than an
+ * external package. Package specifiers are everything else — "drizzle-orm",
+ * "rxjs/operators", "@scope/pkg". Windows paths must count as in-tree here:
+ * pr-smoke runs this pipeline on Windows, and misclassifying a drive-letter or
+ * UNC specifier as "external" is exactly the false-external edge this guard
+ * exists to prevent (#1355). */
+static bool specifier_is_relative(const char *module_path) {
+    if (!module_path || !module_path[0]) {
+        return false;
+    }
+    if (module_path[0] == '.' || module_path[0] == '/') {
+        return true;
+    }
+    /* UNC share: \\server\share\... */
+    if (module_path[0] == '\\' && module_path[1] == '\\') {
+        return true;
+    }
+    /* Drive-letter absolute path: C:\repo\... or C:/repo/... */
+    if (isalpha((unsigned char)module_path[0]) && module_path[1] == ':' &&
+        (module_path[2] == '\\' || module_path[2] == '/')) {
+        return true;
+    }
+    return false;
+}
+
+/* True when the specifier names a package that the indexed tree DECLARES —
+ * a workspace sibling, not a third-party dependency. `indexed_packages` is the
+ * pipeline's package map, keyed by the `name` of every manifest found in the
+ * tree (package.json, go.mod, Cargo.toml, ...), so a pnpm/npm/cargo workspace
+ * registers each of its own packages here.
+ *
+ * The key is the bare package name, so a subpath specifier is walked back one
+ * slash at a time: "drizzle-orm/pg-core" -> "drizzle-orm". Scoped names keep
+ * their leading segment ("@scope/pkg/sub" -> "@scope/pkg" -> "@scope").
+ *
+ * Deliberately a NAME test, not a resolution test. A workspace package usually
+ * points `main`/`module` at a build artifact ("./index.cjs") that is not
+ * checked in, so asking whether the entry file exists in the graph answers
+ * "no" for exactly the monorepos this has to protect. Whether the tree claims
+ * the name is decidable from the manifest alone. */
+static bool specifier_names_indexed_package(const CBMHashTable *indexed_packages,
+                                            const char *module_path) {
+    if (!indexed_packages || !module_path || !module_path[0]) {
+        return false;
+    }
+    if (cbm_ht_has(indexed_packages, module_path)) {
+        return true;
+    }
+    char buf[CBM_SZ_512];
+    if (strlen(module_path) >= sizeof(buf)) {
+        return false;
+    }
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    for (char *slash = strrchr(buf, '/'); slash != NULL; slash = strrchr(buf, '/')) {
+        *slash = '\0';
+        if (cbm_ht_has(indexed_packages, buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when the specifier is a package PATH the indexed tree itself DECLARES.
+ * `declared_packages` is the pipeline's namespace map, keyed by the
+ * dot-normalized `package` / `namespace` / `use` declaration of every indexed
+ * file (cbm_pipeline_namespace_map_build), so this is the JVM/CLR/PHP
+ * counterpart of the manifest-name test above: those languages have no
+ * specifier shape that separates in-tree from third-party, and their manifests
+ * (pom.xml, build.gradle) name artifacts, not packages.
+ *
+ * A package-path specifier names a member inside a package, so the trailing
+ * segment is walked off one at a time, exactly like the namespace-map lookup in
+ * cbm_pipeline_resolve_import_node: `org.jetbrains.exposed.v1.tests.shared
+ * .assertEquals` -> `org.jetbrains.exposed.v1.tests.shared`, which Exposed's
+ * own Assert.kt declares, so the call keeps its edge. `java.net.URL` walks to
+ * `java.net` then `java`, which no project file declares, so it stays external
+ * and the guard still cuts its bind to an in-tree `URL` class.
+ *
+ * Separator normalization mirrors the map builder's: PHP writes `\`, some
+ * grammars `::` or `/`. NULL disables the check. */
+static bool specifier_names_declared_package(const CBMHashTable *declared_packages,
+                                             const char *module_path) {
+    if (!declared_packages || !module_path || !module_path[0]) {
+        return false;
+    }
+    char buf[CBM_SZ_512];
+    if (strlen(module_path) >= sizeof(buf)) {
+        return false;
+    }
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    char *brace = strchr(buf, '{');
+    if (brace) {
+        *brace = '\0'; /* grouped import — the prefix is the package */
+    }
+    char *alias = strstr(buf, " as ");
+    if (alias) {
+        *alias = '\0';
+    }
+    for (char *p = buf; *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    /* Collapse the empty segments "::" just produced, then strip glob/
+     * separator noise off the tail. */
+    for (;;) {
+        char *dd = strstr(buf, "..");
+        if (!dd) {
+            break;
+        }
+        memmove(dd, dd + 1, strlen(dd + 1) + 1);
+    }
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '*' || buf[len - 1] == '.' || buf[len - 1] == ' ')) {
+        buf[--len] = '\0';
+    }
+    if (buf[0] == '\0') {
+        return false;
+    }
+    if (cbm_ht_has(declared_packages, buf)) {
+        return true;
+    }
+    /* The walk has no floor, and that is a deliberate false-NEGATIVE: once the
+     * tree declares `com.example`, EVERY specifier under `com.example.**` reads
+     * as in-tree, including a third-party library that happens to publish under
+     * a declared prefix. Such a call keeps the same-name fallback it has on
+     * main, so the cost is a fabricated edge this guard could have removed —
+     * never a real edge lost. Stopping earlier would need a rule for where a
+     * package path ends and a type begins, and getting that wrong fails the
+     * other way. Pinned by external_import_shadow_declared_prefix_is_permissive
+     * in test_registry.c. */
+    for (char *dot = strrchr(buf, '.'); dot != NULL; dot = strrchr(buf, '.')) {
+        *dot = '\0';
+        if (cbm_ht_has(declared_packages, buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool import_map_binds(const char **import_map_keys, int import_map_count,
+                             const char *local_name) {
+    if (!import_map_keys || import_map_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < import_map_count; i++) {
+        if (import_map_keys[i] && strcmp(import_map_keys[i], local_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1355: a bare call whose name the calling file binds to an EXTERNAL package
+ * import must not fall back to a project-wide same-name guess.
+ *
+ * `import { eq } from "drizzle-orm"` binds `eq` in this file's scope. When the
+ * package is not part of the indexed tree it materializes no IMPORTS edge, so
+ * the import map has no entry, strategies 1-2 miss, and strategy 3/4 attach
+ * `eq(users.id, id)` to whatever project symbol happens to share the simple
+ * name — a CALLS edge into an unrelated local helper. The explicit import
+ * statement is positive evidence, taken from the caller's own source, that the
+ * identifier does NOT denote that symbol.
+ *
+ * Fires only when ALL of:
+ *   - the callee is a BARE identifier: member (`x.foo()`) and package/namespace
+ *     qualified callees are the receiver-aware guards' business, not this one;
+ *   - the match came from a project-wide guess (suffix_match / unique_name;
+ *     field_type_hint / fuzzy listed for the same defensive reason as the TS/JS
+ *     guard) — every import-, receiver- or module-aware strategy is KEPT;
+ *   - the file imports that exact local name from a NON-RELATIVE specifier;
+ *   - no import-map key binds the name, i.e. that import resolved to nothing in
+ *     the graph. A name the map does bind already had its chance at strategy 1
+ *     and is import-aware by construction.
+ *
+ * Relative specifiers are deliberately excluded: they name a path inside the
+ * indexed tree, so a missing IMPORTS edge is an in-project resolution gap and
+ * the same-name fallback can still be right. A name imported from both a
+ * relative and a package specifier keeps the edge — the relative binding wins
+ * the tie explicitly, so the outcome does not depend on import order.
+ *
+ * `indexed_packages` extends that same reasoning to workspace monorepos, where
+ * a BARE specifier also names in-tree code: `import { eq } from "drizzle-orm"`
+ * inside the drizzle-orm repository is a sibling package, not a dependency. A
+ * specifier the tree's own manifests claim is treated exactly like a relative
+ * one. NULL disables the check and restores the specifier-shape-only contract.
+ *
+ * `declared_packages` closes the same hole for the package-path languages,
+ * where NO specifier shape says in-tree: `import
+ * org.jetbrains.exposed.v1.tests.shared.assertEquals` is spelled exactly like
+ * `import kotlin.test.assertEquals`, and only the tree's own `package`
+ * declarations tell them apart. It is permissive by construction — any
+ * specifier UNDER a declared package prefix counts as in-tree, see the note on
+ * the walk — so it can leave a fabricated edge in place, never remove a real
+ * one. NULL disables the check.
+ *
+ * Pure + side-effect-free so the contract is unit-testable without a pipeline. */
+bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
+                                         const CBMImportArray *file_imports,
+                                         const char **import_map_keys, int import_map_count,
+                                         const CBMHashTable *indexed_packages,
+                                         const CBMHashTable *declared_packages) {
+    if (!callee_name || !callee_name[0] || !strategy || !strategy[0]) {
+        return false;
+    }
+    if (strcmp(strategy, "suffix_match") != 0 && strcmp(strategy, "unique_name") != 0 &&
+        strcmp(strategy, "field_type_hint") != 0 && strcmp(strategy, "fuzzy") != 0) {
+        return false;
+    }
+    if (strchr(callee_name, '.') != NULL || strstr(callee_name, "::") != NULL) {
+        return false;
+    }
+    if (!file_imports || file_imports->count <= 0) {
+        return false;
+    }
+    if (import_map_binds(import_map_keys, import_map_count, callee_name)) {
+        return false;
+    }
+    bool external_binding = false;
+    for (int i = 0; i < file_imports->count; i++) {
+        const CBMImport *imp = &file_imports->items[i];
+        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, callee_name) != 0) {
+            continue;
+        }
+        if (specifier_is_relative(imp->module_path) ||
+            specifier_names_indexed_package(indexed_packages, imp->module_path) ||
+            specifier_names_declared_package(declared_packages, imp->module_path)) {
+            return false; /* an in-tree binding for this name — never suppress */
+        }
+        external_binding = true;
+    }
+    return external_binding;
+}
+
+bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
+                                       double confidence) {
+    /* Go analog of the TS/JS guard above, same failure class: a selector call
+     * whose receiver the Go LSP could not type reaches the registry and a bare
+     * short-name strategy binds it to an arbitrary same-named project symbol
+     * (`f.Close()` on an os.File -> a project `Close`, suffix_match over 15
+     * candidates). Built on the shared drop-list so "weak" means one thing
+     * for every guard; Go narrows it in one place only (unique_name below).
+     * field_type_hint stays weak: it is a receiver-NAME substring match, not
+     * a declared-type lookup (the parallel resolver no longer produces it for
+     * Go; a typed field call such as lrp_go_s8's `s.repo.Find()` resolves
+     * through the Go LSP). */
+    if (!is_go || !is_method || !weak_short_name_strategy(strategy)) {
+        return false;
+    }
+    if (strcmp(strategy, "unique_name") != 0) {
+        return true; /* suffix_match, field_type_hint, fuzzy */
+    }
+    /* unique_name is dropped only when PENALIZED: resolve_name_lookup scales
+     * CONF_UNIQUE_NAME by DEFAULT_CONFIDENCE exactly when the lone candidate
+     * is not reachable through the caller's imports — the stdlib/vendor
+     * hijack shape (`io.Copy` -> a project `Copy`). An unpenalized
+     * unique_name target sits inside the caller's import closure (or the
+     * file has no imports, e.g. a same-package call) and must be kept —
+     * dropping it kills genuinely-typed lone-candidate calls that never
+     * enter the field-type-hint upgrade (candidate_count == 1). */
+    return confidence < CONF_UNIQUE_NAME;
+}
+
+bool cbm_go_suppress_bare_init_bind(bool is_go, bool is_member, const char *name,
+                                    const char *strategy, const char *target_label) {
+    /* The Go spec gives `init` no binding in the package block: the
+     * identifier declares init functions and nothing else, and "init
+     * functions cannot be referred to from anywhere in a program". A method
+     * or a field named init is reached only through a selector (`x.init()`,
+     * `e.init`), which arrives here as is_member and is left alone. So a
+     * BARE `init` is always a local name: a closure (`init :=
+     * func(ctx) {...}; init(ctx)`, 22 kubernetes e2e storage suites), a
+     * parameter (`func sum(init func() ref.Val)`), or the `package init`
+     * clause of a directory named init. None of them is a project node.
+     *
+     * Every Go Function named init is a package init (no other package-level
+     * `init` can be declared), so that target is refused for every registry
+     * strategy. Before #1915 the flat QN made same_module bind the bare name
+     * to its own package's init; after it, the per-file QN misses there and
+     * the name fallback binds unrelated init methods instead. A Method or
+     * Field namesake is refused when only the name found it (the shared weak
+     * drop-list), which is how every such edge was minted. lsp_* answers are
+     * untouched: the sequential resolver emits them before its registry
+     * guards run, so refusing one here would split the two resolvers.
+     *
+     * Go-gated: elsewhere `init` is an ordinary name. A bare `init()` in a
+     * Java, C#, C++, Kotlin or Ruby method calls the class's own method, and
+     * a C, Python or JS `init` function is called by its bare name. */
+    if (!is_go || is_member || !name || strcmp(name, "init") != 0 || !target_label) {
+        return false;
+    }
+    if (strategy && strncmp(strategy, "lsp_", strlen("lsp_")) == 0) {
+        return false;
+    }
+    if (strcmp(target_label, "Function") == 0) {
+        return true;
+    }
+    if (strcmp(target_label, "Method") == 0 || strcmp(target_label, "Field") == 0) {
+        return weak_short_name_strategy(strategy);
+    }
+    return false;
+}
+
+/* Import-binding counterpart of the parameter guard above (#2127). An import
+ * binds the identifier for the whole module; when that import is external it
+ * never materializes, and the chain falls through to project-wide short-name
+ * strategies (`from unittest.mock import patch; patch()` -> a REST view's
+ * `PkgConfigView.patch`). The caller decides whether the binding contradicts
+ * the target (cbm_python_import_binding_contradicts: a SCOPE FACT about this
+ * file, not a spelling list); only weak strategies are dropped, so import_map /
+ * same_module / lsp_* edges are untouched. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
+                                         const char *strategy) {
+    if (!enabled || !import_binding_contradicts) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
+static bool js_ts_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+           lang == CBM_LANG_ARKTS;
+}
+
+/* ── Same-module bound-receiver guard (#1128) ─────────────────────────────
+ * Strategy 2 (same_module) looks a callee up in its own module twice: first the
+ * whole callee (`Api.get` -> <module>.Api.get), then the name after the first
+ * separator (`axios.get` -> <module>.get). The second lookup drops the
+ * receiver, so a member call binds a module-level definition only because this
+ * file happens to define one with the member's name: `axios.get(url)` in a file
+ * with its own `function get()` became a 0.90 CALLS edge to that function. The
+ * weak-member guard above deliberately keeps same_module, so this class needs a
+ * guard of its own.
+ *
+ * Refusing every non-self receiver is wrong for this family: methods of an
+ * object literal (`const context = { push() {} }`) and functions assigned onto
+ * an object (`Translator.create = function create() {}`) are stored as plain
+ * module-level functions, so `context.push()` reaching the module's `push`
+ * through this lookup is usually right (2026-10-19 measurement on vuejs/core
+ * and NodeBB). So the binding is refused only when the caller's own source
+ * says the receiver is something else:
+ *   - an import of this file: an ES `import` (default, namespace or named) or a
+ *     CommonJS `const x = require(...)`, read from the file's import list;
+ *   - an AMD dependency: a parameter of the factory passed to
+ *     `define([...], function (dep) {...})` or `require([...], ...)`. AMD
+ *     dependencies are not imports (they mint no IMPORTS edges), so the
+ *     extractor's walk decides it per call (CBMCall.receiver_is_amd_dependency);
+ *   - a builtin global of the JS runtime (`console.log`, `Math.max`,
+ *     `JSON.parse`, `Object.keys`, `process.exit`, ...).
+ * Only the receiver-dropping lookup is refused. When the whole callee matched
+ * (`search.init()` -> <scope>.search.init: in NodeBB's chats.js that is the
+ * AMD dependency's own module) the receiver is part of what matched. A local
+ * name an import statement only synthesizes from its path (side-effect import,
+ * re-export, `require('x').y`) binds nothing and does not count.
+ * Self receivers (`this`/`super`) never reach it: the extractor leaves those
+ * calls unflagged (is_method false). CommonJS `exports.get()` and
+ * `module.exports.get()` name this module and are in neither list.
+ *
+ * It is a call-site suppressor, not a change to the strategy chain: the chain
+ * also resolves type references, field types, reads/writes, SQL lineage and
+ * the cross-LSP pass, for every language at once. Like the guards above it only
+ * marks the plain-CALLS fall-through for dropping, so service and route edges
+ * are unchanged. The language list lives here and both call sites read it
+ * through this helper, so pass_calls.c and pass_parallel.c cannot drift: the
+ * JS/TS family plus the hosts whose <script> bodies are JS/TS (the weak-member
+ * guard's set without Python). Go must never join: its receiver methods carry
+ * flat QNs that only this lookup reaches. */
+static bool same_module_receiver_guard_lang(CBMLanguage lang) {
+    return js_ts_family(lang) || lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
+           lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+}
+
+/* Builtin globals of the JS runtime (ECMAScript, browser, Node/CommonJS). Like
+ * PERL_BUILTINS a fact about the language, not about corpus fashion. MUST stay
+ * sorted ASCII-ascending for bsearch. */
+static const char *const JS_BUILTIN_GLOBALS[] = {
+    "Array",    "ArrayBuffer",    "Atomics",     "BigInt",
+    "Boolean",  "Buffer",         "DataView",    "Date",
+    "Error",    "Intl",           "JSON",        "Map",
+    "Math",     "Number",         "Object",      "Promise",
+    "Proxy",    "Reflect",        "RegExp",      "Set",
+    "String",   "Symbol",         "URL",         "WeakMap",
+    "WeakSet",  "WebAssembly",    "console",     "document",
+    "global",   "globalThis",     "history",     "localStorage",
+    "location", "navigator",      "performance", "process",
+    "require",  "sessionStorage", "window",
+};
+
+/* Identifier bytes: ASCII letters, digits, `_`, `$`, and every byte of a
+ * multi-byte UTF-8 sequence (a non-ASCII identifier is still one name). */
+enum { JS_FIRST_NON_ASCII_BYTE = 0x80 };
+
+static bool js_identifier_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '$' || c >= JS_FIRST_NON_ASCII_BYTE;
+}
+
+/* Length of the identifier that roots `callee` when a member access (`.` or
+ * `?.`) follows it, else 0: `axios.get` -> 5, `a.b.c` -> 1, `_store().get` ->
+ * 0 (a call result is not a binding). The registry splits the callee at this
+ * same first separator. */
+static size_t js_receiver_root_len(const char *callee) {
+    size_t n = 0;
+    while (js_identifier_byte((unsigned char)callee[n])) {
+        n++;
+    }
+    if (n == 0 || (callee[0] >= '0' && callee[0] <= '9')) {
+        return 0;
+    }
+    if (callee[n] == '.' || (callee[n] == '?' && callee[n + SKIP_ONE] == '.')) {
+        return n;
+    }
+    return 0;
+}
+
+static bool js_builtin_global(const char *root, size_t len) {
+    char key[CBM_SZ_32];
+    if (len >= sizeof(key)) {
+        return false; /* longer than every table entry */
+    }
+    memcpy(key, root, len);
+    key[len] = '\0';
+    return bsearch(key, JS_BUILTIN_GLOBALS,
+                   sizeof(JS_BUILTIN_GLOBALS) / sizeof(JS_BUILTIN_GLOBALS[0]),
+                   sizeof(JS_BUILTIN_GLOBALS[0]), python_builtin_member_cmp) != NULL;
+}
+
+/* Per-file scan: imports.count is a file-local number, never the corpus, so
+ * this stays O(file) per call (the Python receiver check does the same). A
+ * synthesized local (side-effect import, re-export, `require('x').y`) is the
+ * path's last segment, not a name the file binds: `require('node:stream')`
+ * must not make every `stream` parameter read as the stream module. */
+static bool receiver_bound_by_import(const CBMImportArray *imports, const char *root, size_t len) {
+    if (!imports) {
+        return false;
+    }
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (imp->local_name && !imp->local_name_synthesized &&
+            strncmp(imp->local_name, root, len) == 0 && imp->local_name[len] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when the same_module hit kept the receiver: the whole-callee lookup
+ * matched `<scope>.search.init` for `search.init()`, so the receiver is part of
+ * what matched, not dropped. That lookup is never this guard's business. */
+static bool same_module_hit_kept_receiver(const char *callee_name, const char *resolved_qn) {
+    size_t clen = strlen(callee_name);
+    size_t qlen = strlen(resolved_qn);
+    return qlen > clen && resolved_qn[qlen - clen - SKIP_ONE] == '.' &&
+           strcmp(resolved_qn + (qlen - clen), callee_name) == 0;
+}
+
+bool cbm_suppress_same_module_bound_receiver(CBMLanguage lang, bool is_method,
+                                             const char *callee_name, const char *resolved_qn,
+                                             const char *strategy,
+                                             const CBMImportArray *file_imports,
+                                             bool receiver_is_amd_dependency) {
+    if (!same_module_receiver_guard_lang(lang) || !is_method) {
+        return false;
+    }
+    if (!strategy || strcmp(strategy, "same_module") != 0) {
+        return false;
+    }
+    if (!callee_name || !resolved_qn || same_module_hit_kept_receiver(callee_name, resolved_qn)) {
+        return false;
+    }
+    size_t len = js_receiver_root_len(callee_name);
+    if (len == 0) {
+        return false; /* no identifier receiver: `_store().get`, a bare call */
+    }
+    return receiver_is_amd_dependency || js_builtin_global(callee_name, len) ||
+           receiver_bound_by_import(file_imports, callee_name, len);
+}
+
+/* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
+ * in the extension table, so a .c file referencing a symbol declared in its
+ * own header would otherwise read as a language boundary. */
+static bool c_cpp_family(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
+}
+
+/* ── Cross-language resolution compatibility ─────────────────────────
+ * A name-based registry guess (qualified_suffix / unique_name / suffix_match)
+ * carries no import or type evidence, so its answer only stands when the
+ * caller's language can actually call the target by that name
+ * (cbm_registry_name_guess_vetoed). same_module joins them: module QNs drop
+ * the extension, so tests/x.c and tests/x.py share one module, and a call in
+ * the C file found the Python function by name inside it. Families are the interop
+ * groups the resolvers already honour, plus the well-known interop pairs:
+ *   - JS family: JS/TS/TSX/ArkTS (the #725 and #1928 guards) and the script
+ *     hosts whose calls ARE JS/TS (HTML/Vue/Svelte/Astro, the weak-member
+ *     guard's embedded-script set; QML embeds JS and imports .js files).
+ *   - C family: C/C++ (.h maps to C++, the #1928 guard), plus CUDA and ObjC,
+ *     which call C/C++ declarations from shared headers directly.
+ *   - JVM: Java/Kotlin/Scala/Groovy call each other's classes directly (the
+ *     JVM cross-file LSP pairs Java with Kotlin).
+ *   - .NET: C#/F#. PHP: PHP/Blade. Go: Go/templ (templ compiles to Go).
+ *     Lua: Lua/Luau/Teal. BEAM: Erlang/Elixir/Gleam. Shell: Bash/Zsh.
+ *     SQL: SQL/PL-SQL. Salesforce: Apex/SOQL/SOSL. HDL: Verilog/SystemVerilog.
+ *     CFML: tag and script dialects. ObjectScript: UDL/routine/export.
+ *   - Swift additionally calls the C family (C and ObjC headers import into
+ *     Swift as native declarations), and Python calls ObjectScript (IRIS
+ *     Embedded Python, iris.cls(...), #1260) and back.
+ * Every other language is its own family. An unknown language on either side
+ * (CBM_LANG_COUNT) is compatible with everything: without evidence, no filter.
+ * The languages are the DETECTED languages of the calling file and of the
+ * defining file (not a filename guess: .m is MATLAB by extension but ObjC by
+ * content), so full, parallel and incremental registries agree. */
+enum {
+    XL_FAM_NONE = 0,
+    XL_FAM_JS,
+    XL_FAM_C,
+    XL_FAM_JVM,
+    XL_FAM_DOTNET,
+    XL_FAM_PHP,
+    XL_FAM_GO,
+    XL_FAM_LUA,
+    XL_FAM_BEAM,
+    XL_FAM_SHELL,
+    XL_FAM_SQL,
+    XL_FAM_SALESFORCE,
+    XL_FAM_HDL,
+    XL_FAM_CFML,
+    XL_FAM_OBJECTSCRIPT,
+};
+
+static int xl_family(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
+    case CBM_LANG_HTML:
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_ASTRO:
+    case CBM_LANG_QML:
+        return XL_FAM_JS;
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+        return XL_FAM_C;
+    case CBM_LANG_JAVA:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
+    case CBM_LANG_GROOVY:
+        return XL_FAM_JVM;
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_FSHARP:
+        return XL_FAM_DOTNET;
+    case CBM_LANG_PHP:
+    case CBM_LANG_BLADE:
+        return XL_FAM_PHP;
+    case CBM_LANG_GO:
+    case CBM_LANG_TEMPL:
+        return XL_FAM_GO;
+    case CBM_LANG_LUA:
+    case CBM_LANG_LUAU:
+    case CBM_LANG_TEAL:
+        return XL_FAM_LUA;
+    case CBM_LANG_ERLANG:
+    case CBM_LANG_ELIXIR:
+    case CBM_LANG_GLEAM:
+        return XL_FAM_BEAM;
+    case CBM_LANG_BASH:
+    case CBM_LANG_ZSH:
+        return XL_FAM_SHELL;
+    case CBM_LANG_SQL:
+    case CBM_LANG_PLSQL:
+        return XL_FAM_SQL;
+    case CBM_LANG_APEX:
+    case CBM_LANG_SOQL:
+    case CBM_LANG_SOSL:
+        return XL_FAM_SALESFORCE;
+    case CBM_LANG_VERILOG:
+    case CBM_LANG_SYSTEMVERILOG:
+        return XL_FAM_HDL;
+    case CBM_LANG_CFML:
+    case CBM_LANG_CFSCRIPT:
+        return XL_FAM_CFML;
+    case CBM_LANG_OBJECTSCRIPT_UDL:
+    case CBM_LANG_OBJECTSCRIPT_ROUTINE:
+    case CBM_LANG_OBJECTSCRIPT_EXPORT:
+        return XL_FAM_OBJECTSCRIPT;
+    default:
+        return XL_FAM_NONE;
+    }
+}
+
+bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target) {
+    if (caller < 0 || caller >= CBM_LANG_COUNT || target < 0 || target >= CBM_LANG_COUNT) {
+        return true; /* unknown on either side: no evidence to filter on */
+    }
+    if (caller == target) {
+        return true;
+    }
+    int cf = xl_family(caller);
+    int tf = xl_family(target);
+    if (cf != XL_FAM_NONE && cf == tf) {
+        return true;
+    }
+    /* Swift imports C and ObjC headers as native declarations. IRIS Embedded
+     * Python and ObjectScript call each other's classes by name
+     * (iris.cls("Pkg.A").Run(), #1260). */
+    return (caller == CBM_LANG_SWIFT && tf == XL_FAM_C) ||
+           (target == CBM_LANG_SWIFT && cf == XL_FAM_C) ||
+           (caller == CBM_LANG_PYTHON && tf == XL_FAM_OBJECTSCRIPT) ||
+           (target == CBM_LANG_PYTHON && cf == XL_FAM_OBJECTSCRIPT);
+}
+
+/* Synthetic definition sources minted by a language's own LSP layer
+ * (py_builtins.c, kotlin_builtins.c). They have no real file to detect, but
+ * their language is a fact of the injecting LSP. */
+CBMLanguage cbm_registry_synthetic_path_language(const char *file_path) {
+    if (!file_path) {
+        return CBM_LANG_COUNT;
+    }
+    if (strcmp(file_path, "<python-builtins>") == 0) {
+        return CBM_LANG_PYTHON;
+    }
+    if (strcmp(file_path, "<kotlin-builtins>") == 0) {
+        return CBM_LANG_KOTLIN;
+    }
+    return CBM_LANG_COUNT;
+}
+
+static const char *path_basename(const char *path) {
+    if (!path || !path[0]) {
+        return path;
+    }
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) {
+        slash = bslash;
+    }
+#endif
+    return slash ? slash + 1 : path;
+}
+
+/* Build and configuration languages have no cross-language call semantics: a
+ * Makefile's `$(eval ...)` or a CMake `function(...)` names nothing in a C
+ * file, so a bare-name bind into another language is always a collision
+ * (2026-09-16 probe: kernel Makefile targets bound to `sk_psock.eval`). */
+static bool build_config_language(CBMLanguage lang) {
+    return lang == CBM_LANG_MAKEFILE || lang == CBM_LANG_CMAKE || lang == CBM_LANG_YAML ||
+           lang == CBM_LANG_TOML || lang == CBM_LANG_JSON || lang == CBM_LANG_INI ||
+           lang == CBM_LANG_DOCKERFILE;
+}
+
+bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
+                                              const char *strategy) {
+    /* Two same-named symbols in different languages: suffix_match picks one
+     * winner by import-distance and attaches every bare-name call to it
+     * (#725, Bash/Python main, JS/Python commit). unique_name is the
+     * candidates==1 case (#1572) and is not this guard — except for a build
+     * or configuration caller, where even a unique match into another
+     * language is a collision by construction. */
+    if (!strategy) {
+        return false;
+    }
+    bool config_caller = build_config_language(caller_lang);
+    if (strcmp(strategy, "suffix_match") != 0 &&
+        !(config_caller && strcmp(strategy, "unique_name") == 0)) {
+        return false;
+    }
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    return true;
+}
+
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {
+    /* #1928: USAGE / WRITES / READS analog of the CALLS guard above. A
+     * variable or field reference resolved by the short-name registry must
+     * not cross a language boundary: unlike CALLS, a reference edge carries
+     * no import-closure evidence at all — a Go test's local `event` and an
+     * eBPF C probe's automatic `event` share nothing but the spelling, so
+     * EVERY registry strategy is a bare-name guess here and none is exempt.
+     * LSP-backed semantic references resolve before the registry fallback
+     * and never reach this predicate, which is where a genuine cross-language
+     * binding (a future cgo resolver) would live. The JS/TS family keeps its
+     * exemption (.js/.ts/.d.ts pairs legitimately share symbols), and C/C++
+     * count as one family (.h maps to CBM_LANG_CPP). */
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
+        return false;
+    }
+    return true;
+}
+
+bool cbm_suppress_bare_field_ref(CBMLanguage lang, bool is_member_access,
+                                 const char *target_label) {
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression (x.f). The extractor
+     * strips the receiver before the resolver runs (resolve_lhs_write_name
+     * records the trailing field name; is_reference_node records the inner
+     * field_identifier), so the reference TEXT is always dot-less and cannot
+     * carry the distinction — the recorded is_member_access shape can. Only a
+     * reference that was never the member half of a selector is refused a
+     * Field bind.
+     *
+     * #2666: C has the same rule. A struct member is named only as the member
+     * half of `a.b`, `a->b` or a designator `.b`, all recorded as
+     * field_identifier; a bare C identifier (a macro argument such as
+     * RUN_SELECTED_SUITE(mcp), a stray name in an unexpanded macro body) is
+     * never one. The call path already drops a bare C call onto a Field
+     * (cbm_call_onto_field_policy).
+     *
+     * Go- and C-gated: a C#/Java/C++/Python method body legitimately
+     * references its own members bare (cp_reads_writes_cs_static_field pins
+     * that shape as required), so a global veto would break those languages.
+     * A `.h` is parsed as C++ and keeps that behavior. */
+    if ((lang != CBM_LANG_GO && lang != CBM_LANG_C) || is_member_access || !target_label) {
+        return false;
+    }
+    return strcmp(target_label, "Field") == 0;
+}
+
+cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
+                                                   const char *target_label,
+                                                   const char *target_file_path) {
+    /* The short-name registry holds Field nodes, so a call spelled like some
+     * struct member can resolve onto that Field. Three shapes are decided here:
+     *   - a caller in another language: nothing but the spelling connects a
+     *     Bash `command` or a Python `sorted()` to a C struct member. The
+     *     unique_name exemption of the CALLS guard (#1572) is about functions;
+     *     for a Field the #1928 reference rule applies, with its JS/TS and
+     *     C/C++ family exemptions;
+     *   - a bare C call (`socket(...)`, a function-pointer parameter
+     *     `want(x)`): a bare C name is never a struct member;
+     *   - a C or C++ member call (`cb.close(ctx)`, `text.size()`): the type of
+     *     the object decides which struct's member is called, never the
+     *     member name alone. The C LSP publishes owners in both modes.
+     * A bare C++ call keeps its resolution (a method body reaches its own
+     * members without a selector), and so does every other language. */
+    if (!target_label || strcmp(target_label, "Field") != 0) {
+        return CBM_FIELD_CALL_KEEP;
+    }
+    if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
+        return CBM_FIELD_CALL_DROP;
+    }
+    if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
+        return CBM_FIELD_CALL_KEEP;
+    }
+    if (callee_text && (strchr(callee_text, '.') || strstr(callee_text, "->"))) {
+        return CBM_FIELD_CALL_BY_OWNER;
+    }
+    return caller_lang == CBM_LANG_C ? CBM_FIELD_CALL_DROP : CBM_FIELD_CALL_KEEP;
+}
+
+bool cbm_c_arrow_member_call(CBMLanguage caller_lang, const char *callee_text) {
+    if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
+        return false;
+    }
+    return callee_text != NULL && strstr(callee_text, "->") != NULL;
+}
+
+bool cbm_c_member_rule_file(CBMLanguage lang, const char *rel_path) {
+    if (lang == CBM_LANG_C) {
+        return true;
+    }
+    if (lang != CBM_LANG_CPP || !rel_path) {
+        return false;
+    }
+    size_t len = strlen(rel_path);
+    return len > PAIR_LEN && strcmp(rel_path + len - PAIR_LEN, ".h") == 0;
+}
+
+bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access) {
+    /* The member half of `a.b` / `a->b` is not a name in any C scope: only the
+     * type of `a` gives `b` a meaning. Handing the bare `b` to the short-name
+     * registry bound whichever Field (or function, or variable) was called
+     * `b` -- on this repository 9,150 USAGE and 2,810 WRITES edges onto
+     * Fields, 3,976 of the USAGE edges on a name several structs share. Such a
+     * reference binds through the C LSP's field-owner rows; an object the LSP
+     * could not type binds only a member name that is unique in the project
+     * (cbm_registry_unique_field_qn), never one of several.
+     *
+     * C-gated like the Go rule above: a C++ or Objective-C method body
+     * reaches its own members without a selector, and their member accesses
+     * keep the existing resolution until their LSPs publish owners too. */
+    return is_c && is_member_access;
+}
+
+bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label) {
+    /* A Java call expression never names data. `p.x()` is a method invocation
+     * whatever `x` spells elsewhere in the tree, so a CALLS edge into a
+     * Variable or a Field is a spelling collision and not a call.
+     *
+     * The bind is reached when the type-aware resolver finds no method to
+     * return: a record's accessors are implicit, so `record Point(double x,
+     * double y, double z)` declares no `x()` for java_lookup_method to find,
+     * and every `p.x()` falls through to the short-name registry — which
+     * matches the first `x` anywhere in the project, typically an unrelated
+     * class's private field. Measured on a 600-file Java tree (2026-09-22):
+     * 278 of 2444 CALLS edges landed on fields that way, and the callers of
+     * one four-field class absorbed every record read in the project.
+     *
+     * Java-gated, like the Go guard above, because the veto is only sound
+     * where no callable name can be anything but a method: Kotlin properties
+     * hold function values (`val f: () -> Unit; f()`) and C has function
+     * pointers, so both legitimately call through data. */
+    if (!is_java || !target_label) {
+        return false;
+    }
+    return strcmp(target_label, "Variable") == 0 || strcmp(target_label, "Field") == 0;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -478,10 +1653,42 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     qn_array_t *arr = value;
     if (arr) {
         /* items borrow the exact map's keys — freed there, not here */
+        cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test);
+        cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->lang);
         cbm_da_free(arr);
         free(arr);
     }
     free((void *)key);
+}
+
+static void free_swift_signature(const char *key, void *value, void *ud) {
+    (void)key;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+static void free_swift_overloads(const char *key, void *value, void *ud) {
+    (void)ud;
+    qn_array_t *overloads = value;
+    cbm_da_free(overloads);
+    cbm_free(CBM_MEM_CLASS_OTHER, overloads);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void swift_owners_free(swift_owners_t *index) {
+    if (!index) {
+        return;
+    }
+    cbm_ht_free(index->by_qn);
+    cbm_ht_free(index->by_path);
+    cbm_ht_free(index->by_module_path);
+    cbm_ht_free(index->return_types);
+    cbm_ht_free(index->by_source_root);
+    cbm_ht_free(index->by_manifest_root);
+    cbm_ht_free(index->by_target_name);
+    cbm_pkg_entries_free(&index->targets);
+    cbm_arena_destroy(&index->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, index);
 }
 
 void cbm_registry_free(cbm_registry_t *r) {
@@ -491,6 +1698,15 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    if (r->swift_signatures) {
+        cbm_ht_foreach(r->swift_signatures, free_swift_signature, NULL);
+        cbm_ht_free(r->swift_signatures);
+    }
+    if (r->swift_overloads) {
+        cbm_ht_foreach(r->swift_overloads, free_swift_overloads, NULL);
+        cbm_ht_free(r->swift_overloads);
+    }
+    swift_owners_free(r->swift_owners);
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -501,16 +1717,105 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 /* ── Registration ────────────────────────────────────────────────── */
 
-void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label) {
-    (void)name;
-    if (!r || !qualified_name || !label) {
-        return;
+/* Record `owned_qn` in the by-name bucket for `key`, keeping the bucket's
+ * is_test flags in step with its entries.
+ *
+ * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
+ * is new, and it calls this at most once per distinct key. */
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn,
+                             CBMLanguage lang) {
+    qn_array_t *arr = cbm_ht_get(r->by_name, key);
+    if (!arr) {
+        arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
+        cbm_ht_set(r->by_name, strdup(key), arr);
     }
+    int before = arr->count;
+    cbm_da_push(arr, (char *)owned_qn);
+    if (arr->count == before) {
+        return; /* the name could not be recorded: no verdict to cache */
+    }
+    if (arr->count > arr->is_test_cap) {
+        int want = arr->cap > 0 ? arr->cap : arr->count;
+        uint8_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test, (size_t)want * sizeof(uint8_t));
+        if (grown) {
+            arr->is_test = grown;
+            uint8_t *grown_lang =
+                cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->lang, (size_t)want * sizeof(uint8_t));
+            /* Both side arrays share is_test_cap: on failure it stays below
+             * count, so this name serves neither cached test verdicts nor
+             * language filtering, exactly the unfiltered answer. */
+            if (grown_lang) {
+                arr->lang = grown_lang;
+                arr->is_test_cap = want;
+            }
+        }
+    }
+    if (arr->count <= arr->is_test_cap) {
+        arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
+        arr->lang[arr->count - SKIP_ONE] =
+            (uint8_t)(lang >= 0 && lang < CBM_LANG_COUNT ? lang : CBM_LANG_COUNT);
+    }
+}
 
+static bool registry_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
+}
+
+/* Length of the QN prefix the defs of the caller's file carry: its module QN
+ * (cbm_pipeline_fqn_module), minus the trailing `__init__` / `index` segment
+ * that symbol QNs drop (pkg/__init__.py defines proj.pkg.f). 0 when there is
+ * no module QN or `qualified_name` does not extend that prefix. */
+static size_t python_def_prefix_len(const char *module_qn, const char *qualified_name) {
+    static const char *const dropped[] = {".__init__", ".index"};
+    size_t n = module_qn ? strlen(module_qn) : 0;
+    for (size_t i = 0; i < sizeof(dropped) / sizeof(dropped[0]); i++) {
+        size_t k = strlen(dropped[i]);
+        if (n > k && strcmp(module_qn + n - k, dropped[i]) == 0) {
+            n -= k;
+            break;
+        }
+    }
+    if (n == 0 || !qualified_name || strncmp(qualified_name, module_qn, n) != 0 ||
+        qualified_name[n] != '.') {
+        return 0;
+    }
+    return n;
+}
+
+/* Whether `qualified_name` sits inside a def of its OWN file: only prefixes
+ * strictly longer than `module_prefix_len` (cbm_pipeline_fqn_symbol_prefix_len
+ * of the defining file) count. A package's __init__.py can define a function
+ * whose QN equals a submodule's (poetry: layouts/__init__.py `def layout` vs
+ * layouts/layout.py), so an unbounded walk read the submodule's classes as
+ * that function's locals -- and the answer depended on which file registered
+ * first. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name,
+                                       size_t module_prefix_len) {
+    char scope[CBM_SZ_512];
+    size_t len = qualified_name ? strlen(qualified_name) : 0;
+    size_t floor = module_prefix_len;
+    if (!r || floor == 0 || len <= floor || len >= sizeof(scope) || qualified_name[floor] != '.') {
+        return false;
+    }
+    memcpy(scope, qualified_name, len + SKIP_ONE);
+    for (char *dot = strrchr(scope, '.'); dot && (size_t)(dot - scope) > floor;
+         dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        if (registry_label_is_callable(cbm_ht_get(r->exact, scope))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Record `qualified_name` in the exact map. Returns the registry's owned copy
+ * of the QN, or NULL when it is already registered or cannot be recorded. */
+static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_name,
+                                      const char *label) {
     /* Check for duplicate */
     if (cbm_ht_get(r->exact, qualified_name)) {
-        return;
+        return NULL;
     }
 
     /* Intern the label (bounded set; linear scan is fine at this size). */
@@ -527,24 +1832,189 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         r->label_pool_n++;
     }
     if (!interned) {
-        return; /* pool exhausted (cannot happen with sane label sets) */
+        return NULL; /* pool exhausted (cannot happen with sane label sets) */
     }
 
     /* Store in exact map: QN → interned label. The key is the registry's ONE
-     * owned copy of the QN; by_name below borrows it (same lifetime) instead
+     * owned copy of the QN; by_name borrows it (same lifetime) instead
      * of a second strdup — this pair of copies was ~280 MB on the kernel. */
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
-    const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
+    return cbm_ht_get_key(r->exact, qualified_name);
+}
 
-    /* Index by simple name.
-     * No array dedup needed: exact-map check above guarantees uniqueness. */
-    const char *simple = simple_name(qualified_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, simple);
-    if (!arr) {
-        arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
-        cbm_ht_set(r->by_name, strdup(simple), arr);
+void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
+                      const char *label) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0);
+}
+
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, lang, 0);
+}
+
+/* Python nests defs: a def or class declared in a function body -- a closure,
+ * an app factory's route handler, a local class and its methods -- is a local
+ * of that function, and its QN extends the function's
+ * (proj.mod.create_app.index). No code outside the function can name it, so it
+ * stays out of the short-name index: the weak name strategies (unique_name,
+ * suffix_match) must not offer django's per-test `class MyModelAdmin` or a
+ * decorator's `def wrapper` to a caller in another function or file. The exact
+ * map still holds it, for LSP targets and cbm_registry_resolve_lexical. One
+ * file's defs register parent first, so the enclosing function is already in
+ * the exact map when its locals arrive; the walk never leaves the symbol's own
+ * file (`module_prefix_len`, cbm_pipeline_fqn_symbol_prefix_len of the defining
+ * file; 0 = no local detection).
+ * Gated to Python: probing every prefix of every symbol would cost a kernel
+ * index seconds for nothing. */
+void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
+                                     const char *qualified_name, const char *label,
+                                     CBMLanguage lang, size_t module_prefix_len) {
+    if (!r || !qualified_name || !label) {
+        return;
     }
-    cbm_da_push(arr, (char *)owned_qn);
+    if (lang == CBM_LANG_PYTHON &&
+        cbm_registry_qn_is_function_local(r, qualified_name, module_prefix_len)) {
+        (void)registry_add_exact(r, qualified_name, label);
+        return;
+    }
+    const char *owned_qn = registry_add_exact(r, qualified_name, label);
+    if (!owned_qn) {
+        return;
+    }
+
+    /* Index the symbol under the QN's last dot segment, and additionally under
+     * the name its caller passed when that segment carries a '#' fence.
+     *
+     * The derived key is the one every language has always used and it stays
+     * unconditional, so a grammar whose QNs carry no '#' is byte-identical to
+     * before this commit. The second key exists for one shape: a fenced tail is
+     * a literal string no bare callee is ever written as. A QN such as
+     * "proj.lib.add#cfg(test)" (Rust cfg twins were minted that way until they
+     * became variants of one definition) would otherwise be filed under the
+     * whole string "add#cfg(test)" — simple_name() has no '#' handling — where
+     * no bare `add` callee could reach it.
+     *
+     * Gating on the fence rather than on the file's language is what makes
+     * "unchanged for every other grammar" checkable instead of asserted. Every
+     * by-name lookup keys through simple_name(), which splits on '.' and "::"
+     * only, so a passed name that differs from the derived key by anything
+     * OTHER than a fence is a key no lookup can reach: an HCL block's
+     * "resource.aws_instance.web" and a TOML table's "tool.poetry.dependencies"
+     * are both already indexed under the tail a reference spells, and adding
+     * their dotted form would only widen the bucket the scorer walks.
+     *
+     * `name` is NULL or empty only for callers that have no symbol name to
+     * give; those have the derived key and nothing else.
+     *
+     * A signature-qualified callable (#2061) is indexed by its bare `name` in
+     * place of the derived key, so every overload shares one bucket; any other
+     * QN keeps its historical last-segment key. */
+    const char *derived = simple_name(qualified_name);
+    const char *primary =
+        name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
+    index_under_name(r, primary, owned_qn, lang);
+    /* '#' is a QN fence; no extractor mints one for a REGISTERED definition
+     * today (Rust cfg twins are variants of one plain QN; a C macro's QN ends in
+     * "#macro", but Macro is no registry label, so it never gets here). A
+     * grammar that starts
+     * minting a '#' opts into this second key by doing so, whatever it means by
+     * the fence: its symbols become reachable under the passed name as well,
+     * and they share that name's bucket with everything else filed under it.
+     * The passed name is compared with the key already written: a
+     * signature-qualified callable is filed under `name` already, and its
+     * capped suffix may carry a '#' of its own. */
+    if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
+        index_under_name(r, name, owned_qn, lang);
+    }
+}
+
+static void swift_index_overload(cbm_registry_t *r, const char *qn, const char *owned) {
+    if (!r->swift_overloads) {
+        r->swift_overloads = cbm_ht_create(CBM_SZ_512);
+    }
+    if (!r->swift_overloads) {
+        return;
+    }
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    char *base = cbm_alloc(CBM_MEM_CLASS_OTHER, base_len + SKIP_ONE);
+    if (!base) {
+        return;
+    }
+    memcpy(base, qn, base_len);
+    base[base_len] = '\0';
+    qn_array_t *overloads = cbm_ht_get(r->swift_overloads, base);
+    if (!overloads) {
+        overloads = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*overloads));
+        if (!overloads) {
+            cbm_free(CBM_MEM_CLASS_OTHER, base);
+            return;
+        }
+        cbm_ht_set(r->swift_overloads, base, overloads);
+    } else {
+        cbm_free(CBM_MEM_CLASS_OTHER, base);
+    }
+    for (int i = 0; i < overloads->count; i++) {
+        if (overloads->items[i] == owned) {
+            return;
+        }
+    }
+    cbm_da_push(overloads, (char *)owned);
+}
+
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count,
+                                      const char *selector) {
+    if (!r || !qualified_name) {
+        return;
+    }
+    const char *owned = cbm_ht_get_key(r->exact, qualified_name);
+    if (!owned) {
+        return;
+    }
+    if (!r->swift_signatures) {
+        r->swift_signatures = cbm_ht_create(CBM_SZ_512);
+        if (!r->swift_signatures) {
+            return;
+        }
+    }
+    const char *text =
+        selector ? selector : qualified_name + cbm_qn_callable_base_len(qualified_name);
+    swift_signature_t *sig = cbm_alloc(CBM_MEM_CLASS_OTHER, sizeof(*sig) + strlen(text) + SKIP_ONE);
+    if (!sig) {
+        return;
+    }
+    sig->defaults = default_mask;
+    sig->count = param_count;
+    memcpy(sig->selector, text, strlen(text) + SKIP_ONE);
+    cbm_free(CBM_MEM_CLASS_OTHER, cbm_ht_get(r->swift_signatures, owned));
+    cbm_ht_set(r->swift_signatures, owned, sig);
+    swift_index_overload(r, qualified_name, owned);
+}
+
+/* A generated member (a Java record's implicit accessor) is a definition the
+ * source never spells: no call names it except through its owner's type. The
+ * exact map holds it for the LSP targets and the import/same-module lookups,
+ * as it holds a Python function's locals; the by-name index does not, so no
+ * unique_name / suffix_match / field_type_hint / fuzzy guess can land on it. */
+void cbm_registry_add_qn_only(cbm_registry_t *r, const char *qualified_name, const char *label) {
+    if (!r || !qualified_name || !label) {
+        return;
+    }
+    (void)registry_add_exact(r, qualified_name, label);
+}
+
+bool cbm_def_props_generated(const char *const *extra_props) {
+    for (const char *const *kv = extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        if (strcmp(kv[0], CBM_PROP_GENERATED) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_node_props_generated(const char *properties_json) {
+    /* The key as the definition passes write it: "generated":"<value>". */
+    return properties_json && strstr(properties_json, "\"" CBM_PROP_GENERATED "\":\"") != NULL;
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -563,6 +2033,61 @@ const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn) {
     return cbm_ht_get(r->exact, qn);
 }
 
+const char *cbm_registry_value_target(const cbm_registry_t *r, const char *qn) {
+    const char *label = cbm_registry_label_of(r, qn);
+    if (!label || strcmp(label, "Method") != 0) {
+        return qn;
+    }
+    char twin[CBM_SZ_1K];
+    int n = snprintf(twin, sizeof(twin), "%s#field", qn);
+    if (n < 0 || (size_t)n >= sizeof(twin)) {
+        return qn;
+    }
+    const char *owned = cbm_ht_get_key(r->exact, twin);
+    return owned ? owned : qn;
+}
+
+/* Python evaluates a class statement's bases in the namespace of the body
+ * that encloses it. For a class nested in a class, a bare base naming a class
+ * defined EARLIER in that same class body is that sibling
+ * (`class IntegrityError(DatabaseError)` in sqlalchemy's asyncpg adapter),
+ * whatever same-named classes the project has elsewhere. A sibling defined
+ * later is not bound yet when the base is evaluated. Exact lookups only. */
+const char *cbm_registry_resolve_python_class_body_base(const cbm_registry_t *r,
+                                                        const cbm_gbuf_t *gb, const char *class_qn,
+                                                        const char *base, CBMLanguage lang) {
+    if (lang != CBM_LANG_PYTHON || !r || !gb || !class_qn || !base || !base[0] ||
+        strchr(base, '.')) {
+        return NULL;
+    }
+    const char *dot = strrchr(class_qn, '.');
+    if (!dot || dot == class_qn) {
+        return NULL;
+    }
+    char sibling[CBM_SZ_1K];
+    int enclosing_len = (int)(dot - class_qn);
+    int n = snprintf(sibling, sizeof(sibling), "%.*s", enclosing_len, class_qn);
+    if (n < 0 || (size_t)n >= sizeof(sibling) ||
+        !cbm_label_is_type_like(cbm_registry_label_of(r, sibling))) {
+        return NULL; /* not nested in a class body (module level, or a def) */
+    }
+    n = snprintf(sibling, sizeof(sibling), "%.*s.%s", enclosing_len, class_qn, base);
+    if (n < 0 || (size_t)n >= sizeof(sibling) || strcmp(sibling, class_qn) == 0) {
+        return NULL;
+    }
+    const char *owned = cbm_ht_get_key(r->exact, sibling);
+    if (!owned || !cbm_label_is_type_like(cbm_registry_label_of(r, owned))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *cls = cbm_gbuf_find_by_qn(gb, class_qn);
+    const cbm_gbuf_node_t *sib = cbm_gbuf_find_by_qn(gb, owned);
+    if (!cls || !sib || !cls->file_path || !sib->file_path ||
+        strcmp(cls->file_path, sib->file_path) != 0 || sib->start_line >= cls->start_line) {
+        return NULL;
+    }
+    return owned;
+}
+
 int cbm_registry_find_by_name(const cbm_registry_t *r, const char *name, const char ***out,
                               int *count) {
     if (!r || !out || !count) {
@@ -577,6 +2102,48 @@ int cbm_registry_find_by_name(const cbm_registry_t *r, const char *name, const c
         *count = 0;
     }
     return 0;
+}
+
+const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name) {
+    /* A member name that exactly one Field in the whole project carries names
+     * that Field without any choice being made. This is what an untyped C
+     * member access may still bind: the defect in bare-name member resolution
+     * was the arbitrary pick among SEVERAL same-named members (kernel: 359,236
+     * of the edges a typed-only rule dropped were onto such a unique name).
+     * Only Fields are candidates -- a function or variable of the same name
+     * can never be what `a.b` means -- and two of them bind nothing. */
+    const char **qns = NULL;
+    int count = 0;
+    if (!member_name || cbm_registry_find_by_name(r, member_name, &qns, &count) != 0 || !qns) {
+        return NULL;
+    }
+    const char *only = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *label = qns[i] ? cbm_registry_label_of(r, qns[i]) : NULL;
+        if (!label || strcmp(label, "Field") != 0) {
+            continue;
+        }
+        if (only) {
+            return NULL;
+        }
+        only = qns[i];
+    }
+    return only;
+}
+
+bool cbm_registry_has_type_named(const cbm_registry_t *r, const char *name) {
+    if (!r || !name || !name[0]) {
+        return false;
+    }
+    const char **qns = NULL;
+    int count = 0;
+    cbm_registry_find_by_name(r, name, &qns, &count);
+    for (int i = 0; i < count; i++) {
+        if (cbm_label_is_type_like(cbm_registry_label_of(r, qns[i]))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int cbm_registry_size(const cbm_registry_t *r) {
@@ -619,11 +2186,12 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
     /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
-     * import called bare: `from m import f as g; g()` — #875/#979). With a
-     * suffix present (`imported.method()`), returning the bare base here
-     * would swallow the suffix and bind the call to the imported symbol's
-     * own node (a Variable/Class/module) instead of base.method — exactly
-     * the mis-resolution the comment above warns about. That regressed
+     * import called bare: `from m import f as g; g()` — #875/#979; Yui
+     * `import execute as bridge_execute`). With a suffix present
+     * (`imported.method()`), returning the bare base here would swallow
+     * the suffix and bind the call to the imported symbol's own node
+     * (a Variable/Class/module) instead of base.method — exactly the
+     * mis-resolution the comment above warns about. That regressed
      * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
      * degraded to edges onto the signal variables themselves). #1000 */
     if (!suffix || !suffix[0]) {
@@ -673,33 +2241,68 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     return empty_result();
 }
 
-/* Strategy 2: Same-module match */
-static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
-                                            const char *suffix, const char *module_qn) {
+/* Exact same-module lookup without ever hashing a truncated candidate. The
+ * long path uses the canonical short-name bucket, not heuristic name limits. */
+static const char *same_module_candidate(const cbm_registry_t *r, const char *module_qn,
+                                         size_t scope_len, const char *name) {
+    if (!module_qn || !name)
+        return NULL;
+    size_t name_len = strlen(name);
     char candidate[CBM_SZ_512];
-    snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, callee_name);
-    const char *stored_key = cbm_ht_get_key(r->exact, candidate);
-    if (stored_key) {
+    if (scope_len < sizeof(candidate) && name_len < sizeof(candidate) - scope_len - 1) {
+        memcpy(candidate, module_qn, scope_len);
+        candidate[scope_len] = '.';
+        memcpy(candidate + scope_len + 1, name, name_len + 1);
+        return cbm_ht_get_key(r->exact, candidate);
+    }
+    qn_array_t *arr = (qn_array_t *)cbm_ht_get(r->by_name, simple_name(name));
+    if (!arr)
+        return NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        if (!qn)
+            continue;
+        size_t qn_len = strlen(qn);
+        if (qn_len > scope_len && qn_len - scope_len - 1 == name_len &&
+            memcmp(qn, module_qn, scope_len) == 0 && qn[scope_len] == '.' &&
+            memcmp(qn + scope_len + 1, name, name_len) == 0)
+            return qn;
+    }
+    return NULL;
+}
+
+/* Strategy 2: Same-module match. Scoring elsewhere retains the raw file QN. */
+static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
+                                            const char *suffix, const char *module_qn,
+                                            size_t scope_len) {
+    const char *stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
+    if (!stored_key && suffix && suffix[0])
+        stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
+    if (stored_key)
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
-    }
-    if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
-        stored_key = cbm_ht_get_key(r->exact, candidate);
-        if (stored_key) {
-            return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
-        }
-    }
     return empty_result();
 }
 
 /* Strategy 4: multiple candidates with import filtering. */
-static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const char *module_qn,
-                                                   const char **import_vals, int import_count) {
+static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
+                                                   const char *module_qn, const char **import_vals,
+                                                   int import_count) {
     const char *filtered[CBM_SZ_256];
+    uint8_t filtered_test[CBM_SZ_256];
+    uint8_t filtered_lang[CBM_SZ_256];
+    const uint8_t *flags = qn_test_flags(arr);
+    const uint8_t *langs = qn_lang_flags(arr);
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
         if (is_import_reachable(arr->items[i], import_vals, import_count)) {
-            filtered[fcount++] = arr->items[i];
+            if (flags) {
+                filtered_test[fcount] = flags[i];
+            }
+            if (langs) {
+                filtered_lang[fcount] = langs[i];
+            }
+            filtered[fcount] = arr->items[i];
+            fcount++;
         }
     }
     if (fcount == SKIP_ONE) {
@@ -707,14 +2310,16 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best = best_by_import_distance(filtered, fcount, module_qn);
+        const char *best = best_by_import_distance(r, filtered, flags ? filtered_test : NULL,
+                                                   langs ? filtered_lang : NULL, fcount, module_qn);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
     /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                               qn_lang_flags(arr), arr->count, module_qn);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
@@ -779,19 +2384,132 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
-/* Strategy 3+4: Name lookup + suffix match */
-static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
-                                            const char *module_qn, const char **import_vals,
-                                            int import_count) {
-    const char *lookup = simple_name(callee_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
-    if (!arr || arr->count == 0) {
-        return empty_result();
+/* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
+ * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
+ * throw away, and throwing it away binds Foundation's URLSession.shared.data to
+ * a project's own PickedFile.data: high confidence, and nothing in the graph
+ * shows it is wrong. Require instead that the candidate's own parent segment
+ * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
+ * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
+ *
+ * Only an upper-case first segment is guarded. A lower-case root names a value
+ * (vm.load, http.Get, os.path.join) whose declared type the chain does not
+ * show, so the chain proves nothing there and the call passes through
+ * unchanged. A callee with no separator passes through as well.
+ *
+ * Language agnostic by design: the registry holds no language, and every
+ * language that writes receiver chains gains the same protection. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+    /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
+     * the same way qualified_suffix_match does. */
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else {
+            dotted[w++] = *s++;
+        }
     }
-    if (arr->count > REG_MAX_CANDIDATES) {
-        return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
+    dotted[w] = '\0';
+
+    const char *last_dot = strrchr(dotted, '.');
+    if (!last_dot) {
+        return true; /* bare name — no receiver chain to judge */
+    }
+    if (dotted[0] < 'A' || dotted[0] > 'Z') {
+        return true; /* lower-case root names a value, not a type */
+    }
+    /* A name written in capitals with underscores is a constant holding a
+     * value, not a type: ISO_4217_URL.lower is a string's own method. JSON and
+     * URL carry no underscore and stay guarded. */
+    int has_underscore = 0;
+    int all_caps = 1;
+    for (size_t i = 0; i < w && dotted[i] != '.'; i++) {
+        if (dotted[i] == '_') {
+            has_underscore = 1;
+        } else if (dotted[i] >= 'a' && dotted[i] <= 'z') {
+            all_caps = 0;
+            break;
+        }
+    }
+    if (all_caps && has_underscore) {
+        return true;
     }
 
+    /* The candidate's ancestry: every segment before its final name. */
+    const char *cand_last = strrchr(candidate_qn, '.');
+    if (!cand_last || cand_last == candidate_qn) {
+        return true; /* top-level candidate — no ancestry to look for */
+    }
+
+    /* Walk the chain — every segment before the final callee name. A trailing
+     * "()" is dropped so JSONEncoder().encode reads as JSONEncoder. A chain
+     * segment admits the candidate when it names ANY segment of the candidate's
+     * ancestry, not only the immediate parent: Settings.builder().putList binds
+     * settings.Settings.Builder.putList because Settings owns Builder, and
+     * RequestOptions.DEFAULT.toBuilder().setWarningsHandler binds
+     * RequestOptions.Builder.setWarningsHandler the same way. Measured on
+     * elastic/elasticsearch: the parent-only rule refused 9,473 unique-name
+     * calls, most of them exactly these factory chains into a nested Builder.
+     * A foreign root still finds nothing in the ancestry — Base64.getEncoder
+     * does not admit DocOffsetsCodec.getEncoder, URLSession.shared.data does
+     * not admit PickedFile.data — so the #1893 refusals hold. */
+    for (const char *seg = dotted; seg < last_dot;) {
+        const char *end = strchr(seg, '.');
+        size_t len = (size_t)(end - seg);
+        if (len >= 2 && seg[len - 2] == '(' && seg[len - 1] == ')') {
+            len -= 2; /* an empty "()" — JSONEncoder().encode names JSONEncoder */
+        }
+        for (const char *anc = candidate_qn; anc < cand_last;) {
+            const char *anc_end = strchr(anc, '.');
+            size_t anc_len = (size_t)(anc_end - anc);
+            if (anc_len == len && len > 0 && strncmp(seg, anc, len) == 0) {
+                return true;
+            }
+            anc = anc_end + SKIP_ONE;
+        }
+        seg = end + SKIP_ONE;
+    }
+    return false;
+}
+
+/* The same-name candidates without the members -- Field and Method nodes --
+ * in `view` (backed by the caller's buffers, at most REG_MAX_CANDIDATES
+ * entries). The side arrays are carried over only when the bucket has them
+ * for every entry. */
+static void candidates_without_members(const cbm_registry_t *r, const qn_array_t *arr,
+                                       qn_array_t *view, char **items, uint8_t *is_test,
+                                       uint8_t *lang) {
+    const uint8_t *flags = qn_test_flags(arr);
+    const uint8_t *langs = qn_lang_flags(arr);
+    bool side = flags && langs;
+    int n = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const char *label = cbm_registry_label_of(r, arr->items[i]);
+        if (label && (strcmp(label, "Field") == 0 || strcmp(label, "Method") == 0)) {
+            continue;
+        }
+        items[n] = arr->items[i];
+        if (side) {
+            is_test[n] = flags[i];
+            lang[n] = langs[i];
+        }
+        n++;
+    }
+    *view = (qn_array_t){.items = items,
+                         .count = n,
+                         .cap = n,
+                         .is_test = side ? is_test : NULL,
+                         .is_test_cap = side ? n : 0,
+                         .lang = side ? lang : NULL};
+}
+
+/* Strategies 3.5, 3 and 4 over one same-name candidate set. */
+static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
+                                                const char *callee_name, const char *module_qn,
+                                                const char **import_vals, int import_count) {
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -804,6 +2522,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
+        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+            return empty_result();
+        }
         double conf = CONF_UNIQUE_NAME;
         if (import_vals && import_count > 0 &&
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
@@ -814,34 +2535,58 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
+        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
     }
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                               qn_lang_flags(arr), arr->count, module_qn);
     if (best) {
+        if (!receiver_chain_admits(callee_name, best)) {
+            return empty_result();
+        }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
     return empty_result();
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
-    if (!r || !callee_name) {
+/* Strategy 3+4: Name lookup + suffix match. skip_members: the callee cannot
+ * name a member (a bare C call: C has no methods, and a struct member is only
+ * ever reached through its object), so Field and Method nodes do not compete.
+ * With a Field in the bucket, a unique header function became a suffix_match
+ * that the #725 guard then refused (.h is C++): kernel `put_page(page)`
+ * 345 -> 9 callers (2026-10-13 graph audit). Dropping only the Fields made
+ * libc `read()` the unique name of a C++ adapter's Method instead. */
+static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
+                                            const char *module_qn, const char **import_vals,
+                                            int import_count, bool skip_members) {
+    const char *lookup = simple_name(callee_name);
+    const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
+    if (!arr || arr->count == 0) {
         return empty_result();
     }
-
-    /* Per-file cache: same callee_name in N call sites → 1 chain walk
-     * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
-        if (cached) {
-            return cached->res;
-        }
+    if (arr->count > REG_MAX_CANDIDATES) {
+        return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
+    if (skip_members) {
+        qn_array_t view;
+        char *view_items[REG_MAX_CANDIDATES];
+        uint8_t view_test[REG_MAX_CANDIDATES];
+        uint8_t view_lang[REG_MAX_CANDIDATES];
+        candidates_without_members(r, arr, &view, view_items, view_test, view_lang);
+        if (view.count == 0) {
+            return empty_result();
+        }
+        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count);
+    }
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count);
+}
 
+/* The strategy chain shared by both public resolve variants (no caching here —
+ * cbm_registry_resolve owns the per-file cache). */
+static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count,
+                                               size_t scope_len, bool skip_members) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -874,19 +2619,104 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
-        res = resolve_same_module(r, callee_name, suffix, module_qn);
+        res = resolve_same_module(r, callee_name, suffix, module_qn, scope_len);
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
+                                  skip_members);
+    }
+    return res;
+}
+
+/* The recorded language of the registry entry `qn` (the owned key pointer a
+ * resolution returns), or CBM_LANG_COUNT when unknown. The by-name bucket is
+ * at most REG_MAX_CANDIDATES long whenever a name strategy produced `qn`. */
+static CBMLanguage registry_entry_language(const cbm_registry_t *r, const char *qn) {
+    const qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(qn));
+    if (!arr || !arr->lang || arr->is_test_cap < arr->count) {
+        return CBM_LANG_COUNT;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->items[i] == qn || strcmp(arr->items[i], qn) == 0) {
+            return (CBMLanguage)arr->lang[i];
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
+/* The cross-language veto (see cbm_lang_resolution_compatible). A name-only
+ * answer carries no import or module evidence, so it only stands when the
+ * caller's language can call the target: a JS `app.get` must not bind
+ * Python's builtins.dict.get because it is the one "get" in the project.
+ * Callers turn a vetoed answer into an EMPTY resolution BEFORE their empty-
+ * resolution fallbacks, so route registration / HTTP classification still
+ * run. A veto, not a re-pick among the remaining candidates: re-picking
+ * promotes the next same-language short-name guess (measured on n8n: +3.1k
+ * CALLS, 88% of them jest `describe()` bound to a project method).
+ * field_type_hint is included: it re-picks by type-name substring across ALL
+ * candidates, language-blind. */
+bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_lang,
+                                    const cbm_resolution_t *res) {
+    if (!r || !res || caller_lang < 0 || caller_lang >= CBM_LANG_COUNT || !res->qualified_name ||
+        !res->qualified_name[0] || !res->strategy) {
+        return false;
+    }
+    if (strcmp(res->strategy, "unique_name") != 0 && strcmp(res->strategy, "suffix_match") != 0 &&
+        strcmp(res->strategy, "qualified_suffix") != 0 &&
+        strcmp(res->strategy, "field_type_hint") != 0 &&
+        strcmp(res->strategy, "same_module") != 0) {
+        return false;
+    }
+    return !cbm_lang_resolution_compatible(caller_lang,
+                                           registry_entry_language(r, res->qualified_name));
+}
+
+static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                size_t scope_len, bool skip_members) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+
+    /* Per-file cache: same callee_name in N call sites → 1 chain walk
+     * + N-1 O(1) hash hits. module_qn is constant per file so the
+     * cache key only needs callee_name. */
+    resolve_cache_entry_t *cached =
+        _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
+    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members)
+        return cached->res;
+
+    cbm_resolution_t res =
+        registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                               import_map_count, scope_len, skip_members);
+
+    /* Data relations (Table/View) are lineage-only registry members: common
+     * table names (users, orders, config) collide with code identifiers across
+     * every language, so the DEFAULT resolve never returns them — a veto, not a
+     * re-route, so a name-collision does not fall through to a weaker strategy.
+     * Every consumer (CALLS/USAGE/READS/WRITES/THROWS/handlers/decorators,
+     * present and future) is thereby relation-safe by construction. The SQL
+     * lineage path opts in via cbm_registry_resolve_lineage. */
+    if (res.qualified_name && res.qualified_name[0] &&
+        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+        res = empty_result();
     }
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
-    if (_resolve_cache) {
+    if (cached) {
+        /* Same key, different effective scope: reuse its owned entry/key. */
+        cached->res = res;
+        cached->scope_len = scope_len;
+        cached->skip_members = skip_members;
+    } else if (_resolve_cache) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
             e->res = res;
+            e->scope_len = scope_len;
+            e->skip_members = skip_members;
             char *kdup = strdup(callee_name);
             if (kdup) {
                 cbm_ht_set(_resolve_cache, kdup, e);
@@ -896,6 +2726,1988 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         }
     }
     return res;
+}
+
+/* Read labels from the uncapped selector. Types may contain commas in
+ * tuples, generic arguments or function types, so only top-level commas split
+ * parameters. The type text is used only to recognize a trailing closure. */
+typedef struct {
+    int parens;
+    int brackets;
+    int angles;
+} swift_parameter_depth_t;
+
+static void swift_parameter_depth_step(swift_parameter_depth_t *depth, char ch, char previous) {
+    switch (ch) {
+    case '(':
+        depth->parens++;
+        break;
+    case ')':
+        if (depth->parens > 0) {
+            depth->parens--;
+        }
+        break;
+    case '[':
+        depth->brackets++;
+        break;
+    case ']':
+        if (depth->brackets > 0) {
+            depth->brackets--;
+        }
+        break;
+    case '<':
+        depth->angles++;
+        break;
+    case '>':
+        if (depth->angles > 0 && previous != '=') {
+            depth->angles--;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static bool swift_type_wraps(const char *start, const char *end) {
+    if (*start != '(') {
+        return false;
+    }
+    swift_parameter_depth_t depth = {0};
+    bool comma = false;
+    for (const char *p = start; p < end; p++) {
+        swift_parameter_depth_step(&depth, *p, p == start ? '\0' : p[-SKIP_ONE]);
+        if (*p == ')' && depth.parens == 0) {
+            return p == end - SKIP_ONE && !comma;
+        }
+        if (*p == ',' && depth.parens == SKIP_ONE && depth.brackets == 0 && depth.angles == 0) {
+            comma = true;
+        }
+    }
+    return false;
+}
+
+static bool swift_type_is_closure(const char *start, const char *end) {
+    while (start < end) {
+        if (end[-SKIP_ONE] == '?') {
+            end--;
+            continue;
+        }
+        if (!swift_type_wraps(start, end)) {
+            break;
+        }
+        start++;
+        end--;
+    }
+    swift_parameter_depth_t depth = {0};
+    for (const char *p = start; p + SKIP_ONE < end; p++) {
+        if (*p == '=' && p[SKIP_ONE] == '>' && depth.parens == 0 && depth.brackets == 0 &&
+            depth.angles == 0) {
+            return true;
+        }
+        swift_parameter_depth_step(&depth, *p, p == start ? '\0' : p[-SKIP_ONE]);
+    }
+    return false;
+}
+
+enum { SWIFT_MAX_PARAMETERS = 64, SWIFT_INCOMPATIBLE = -1 };
+
+typedef struct {
+    const char *labels[SWIFT_MAX_PARAMETERS];
+    size_t label_lens[SWIFT_MAX_PARAMETERS];
+    bool closures[SWIFT_MAX_PARAMETERS];
+    bool variadics[SWIFT_MAX_PARAMETERS];
+    unsigned count;
+} swift_parameters_t;
+
+/* Exact match for a later trailing closure's label. NULL and empty labels
+ * never match, so a call with no captured label binds nothing by label. */
+static bool swift_label_matches(const char *label, const char *want, size_t want_len) {
+    return label && label[0] && strlen(label) == want_len && memcmp(label, want, want_len) == 0;
+}
+
+/* Whether trailing closure used may bind signature parameter i. The first
+ * unlabelled closure skips a default or variadic parameter only if a required
+ * parameter precedes the first parameter matching the next trailing label. */
+static bool swift_trailing_binds(const swift_signature_t *meta, const CBMCall *call,
+                                 const swift_parameters_t *params, unsigned i, unsigned total,
+                                 unsigned used) {
+    if (used >= total || !params->closures[i]) {
+        return false;
+    }
+    if (used > 0) {
+        const char *tl = call->trailing_closure_labels ? call->trailing_closure_labels[used] : NULL;
+        return swift_label_matches(tl, params->labels[i], params->label_lens[i]);
+    }
+    if (!params->variadics[i] && (meta->defaults & (UINT64_C(1) << i)) == 0) {
+        return true;
+    }
+    const char *next_label = total > SKIP_ONE && call->trailing_closure_labels
+                                 ? call->trailing_closure_labels[SKIP_ONE]
+                                 : NULL;
+    for (unsigned j = i + SKIP_ONE; j < params->count; j++) {
+        if (swift_label_matches(next_label, params->labels[j], params->label_lens[j])) {
+            break;
+        }
+        if (!params->variadics[j] && (meta->defaults & (UINT64_C(1) << j)) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool swift_parameter_add(swift_parameters_t *params, const char *entry, const char *end) {
+    if (params->count >= SWIFT_MAX_PARAMETERS) {
+        return false;
+    }
+    const char *colon = memchr(entry, ':', (size_t)(end - entry));
+    if (!colon) {
+        return false;
+    }
+    unsigned i = params->count;
+    params->labels[i] = entry;
+    params->label_lens[i] = (size_t)(colon - entry);
+    params->variadics[i] = end > colon + SKIP_ONE && end[-SKIP_ONE] == '~';
+    const char *type_end = params->variadics[i] ? end - SKIP_ONE : end;
+    params->closures[i] = swift_type_is_closure(colon + SKIP_ONE, type_end);
+    params->count++;
+    return true;
+}
+
+/* Declaration requirements distinguish nodes, without proving applicability. */
+static size_t swift_generic_prefix_len(const char *sig, size_t n) {
+    unsigned depth = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (sig[i] == '<') {
+            depth++;
+        } else if (sig[i] == '>' && (i == 0 || sig[i - SKIP_ONE] != '=')) {
+            if (depth == 0) {
+                return 0;
+            }
+            if (--depth == 0) {
+                return i + SKIP_ONE;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Split only at top-level commas; preserve the closure/variadic spelling rules. */
+static bool swift_parameters_read(const swift_signature_t *meta, swift_parameters_t *params) {
+    const char *sig = meta->selector;
+    size_t n = cbm_callable_return_offset(sig);
+    const size_t async_len = sizeof("async") - SKIP_ONE;
+    if (n >= async_len && memcmp(sig + n - async_len, "async", async_len) == 0) {
+        n -= async_len;
+    }
+    /* Declaration generic requirements distinguish nodes, but do not prove
+     * applicability. Read only params when selecting compatible candidates. */
+    if (n && sig[0] == '<') {
+        size_t i = swift_generic_prefix_len(sig, n);
+        if (i == 0 || i >= n) {
+            return false;
+        }
+        sig += i;
+        n -= i;
+    }
+    if (n < PAIR_LEN || sig[0] != '(' || sig[n - SKIP_ONE] != ')' || strchr(sig, '#')) {
+        return false;
+    }
+    const char *entry = sig + SKIP_ONE;
+    const char *end = sig + n - SKIP_ONE;
+    swift_parameter_depth_t depth = {0};
+    for (const char *p = entry; p <= end; p++) {
+        bool boundary = p == end || (*p == ',' && depth.parens == 0 && depth.brackets == 0 &&
+                                     depth.angles == 0);
+        if (boundary) {
+            if (p > entry && !swift_parameter_add(params, entry, p)) {
+                return false;
+            }
+            entry = p + SKIP_ONE;
+            continue;
+        }
+        char previous = p == entry ? '\0' : p[-SKIP_ONE];
+        swift_parameter_depth_step(&depth, *p, previous);
+    }
+    return params->count == meta->count;
+}
+
+static bool swift_argument_label_matches(const swift_parameters_t *params, const CBMCall *call,
+                                         unsigned i, int arg) {
+    if (arg >= call->arg_count) {
+        return false;
+    }
+    const char *given = call->args[arg].keyword;
+    if (!given) {
+        given = "_";
+    }
+    return strlen(given) == params->label_lens[i] &&
+           memcmp(given, params->labels[i], params->label_lens[i]) == 0;
+}
+
+static int swift_variadic_advance(const CBMCall *call, int arg, bool label_matches) {
+    if (!label_matches) {
+        return arg;
+    }
+    arg++;
+    while (arg < call->arg_count && !call->args[arg].keyword) {
+        arg++;
+    }
+    return arg;
+}
+
+static uint16_t swift_trailing_advance(const swift_parameters_t *params,
+                                       const swift_signature_t *meta, const CBMCall *call,
+                                       unsigned i, unsigned total, uint16_t states) {
+    uint16_t next = 0;
+    for (unsigned used = 0; used < total; used++) {
+        if ((states & (UINT16_C(1) << used)) &&
+            swift_trailing_binds(meta, call, params, i, total, used)) {
+            next |= (uint16_t)(UINT16_C(1) << (used + SKIP_ONE));
+        }
+    }
+    return next;
+}
+
+static void swift_parameter_advance(const swift_parameters_t *params, const swift_signature_t *meta,
+                                    const CBMCall *call, unsigned i, unsigned total, int arg,
+                                    uint16_t states, uint16_t *next) {
+    uint16_t trailing =
+        arg == call->arg_count ? swift_trailing_advance(params, meta, call, i, total, states) : 0;
+    if (params->variadics[i] || (meta->defaults & (UINT64_C(1) << i))) {
+        /* After explicit arguments, preserve the first eligible trailing
+         * binding instead of skipping it to a later one. */
+        next[arg] |= states & (uint16_t)~(trailing >> SKIP_ONE);
+    }
+    if (swift_argument_label_matches(params, call, i, arg)) {
+        int end = params->variadics[i] ? swift_variadic_advance(call, arg, true) : arg + SKIP_ONE;
+        next[end] |= states;
+        if (params->variadics[i] && end == call->arg_count) {
+            next[end] |= swift_trailing_advance(params, meta, call, i, total, states);
+        }
+    }
+    next[arg] |= trailing;
+}
+
+static bool swift_parameters_match(const swift_parameters_t *params, const swift_signature_t *meta,
+                                   const CBMCall *call) {
+    /* Preserve the legacy bool as one unlabelled closure for manual callers. */
+    unsigned trailing_total = call->trailing_closure_count;
+    if (trailing_total == 0 && call->has_trailing_closure) {
+        trailing_total = SKIP_ONE;
+    }
+    /* Each argument cursor retains the reachable trailing-closure counts.
+     * A matching label must not greedily consume an earlier default when
+     * the same label is needed by a later required parameter. */
+    uint16_t states[CBM_MAX_CALL_ARGS + SKIP_ONE] = {SKIP_ONE};
+    for (unsigned i = 0; i < params->count; i++) {
+        uint16_t next[CBM_MAX_CALL_ARGS + SKIP_ONE] = {0};
+        for (int arg = 0; arg <= call->arg_count; arg++) {
+            if (!states[arg]) {
+                continue;
+            }
+            swift_parameter_advance(params, meta, call, i, trailing_total, arg, states[arg], next);
+        }
+        memcpy(states, next, sizeof(states));
+    }
+    return (states[call->arg_count] & (UINT16_C(1) << trailing_total)) != 0;
+}
+
+static bool swift_signature_matches(const swift_signature_t *meta, const CBMCall *call) {
+    if (!meta || meta->count == UINT8_MAX || call->arg_count < 0 ||
+        call->arg_count > CBM_MAX_CALL_ARGS || (call->arg_count > 0 && !call->args) ||
+        call->args_truncated || call->trailing_closure_truncated ||
+        call->trailing_closure_count > CBM_MAX_TRAILING_CLOSURES) {
+        return false;
+    }
+    swift_parameters_t params;
+    params.count = 0;
+    if (!swift_parameters_read(meta, &params)) {
+        return false;
+    }
+    return swift_parameters_match(&params, meta, call);
+}
+
+/* Keep receiver choice ahead of general import/name choice. Without a module,
+ * this path still uses the deterministic distance tie-break, as before. */
+static const char *swift_choose_receiver(const cbm_registry_t *r, const char **matches, int matched,
+                                         const char *name, const CBMCall *call,
+                                         const char *module_qn, const char **import_vals,
+                                         int import_count, const char **scratch) {
+    if (!strchr(call->callee_name, '.')) {
+        return NULL;
+    }
+    size_t callee_len = strlen(call->callee_name);
+    const char **receiver_matches = scratch;
+    int receiver_count = 0;
+    for (int i = 0; i < matched; i++) {
+        size_t base = cbm_qn_callable_base_len_named(matches[i], name);
+        if (base >= callee_len &&
+            memcmp(matches[i] + base - callee_len, call->callee_name, callee_len) == 0 &&
+            (base == callee_len || matches[i][base - callee_len - SKIP_ONE] == '.')) {
+            receiver_matches[receiver_count++] = matches[i];
+        }
+    }
+    if (receiver_count == 0) {
+        return NULL;
+    }
+    const char **reachable = scratch + matched;
+    int reachable_count = 0;
+    if (import_vals) {
+        for (int i = 0; i < receiver_count; i++) {
+            if (is_import_reachable(receiver_matches[i], import_vals, import_count)) {
+                reachable[reachable_count++] = receiver_matches[i];
+            }
+        }
+    }
+    const char **preferred = reachable_count > 0 ? reachable : receiver_matches;
+    int preferred_count = reachable_count > 0 ? reachable_count : receiver_count;
+    return best_by_import_distance(r, preferred, NULL, NULL, preferred_count, module_qn);
+}
+
+static const char *swift_choose_candidate(const cbm_registry_t *r, const char **matches,
+                                          int matched, const char *name, const CBMCall *call,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **scratch) {
+    const char *chosen = swift_choose_receiver(r, matches, matched, name, call, module_qn,
+                                               import_vals, import_count, scratch);
+    if (chosen) {
+        return chosen;
+    }
+    const char **reachable = scratch;
+    int reachable_count = 0;
+    if (import_vals) {
+        for (int i = 0; i < matched; i++) {
+            if (is_import_reachable(matches[i], import_vals, import_count)) {
+                reachable[reachable_count++] = matches[i];
+            }
+        }
+    }
+    if (reachable_count > 0) {
+        chosen = module_qn
+                     ? best_by_import_distance(r, reachable, NULL, NULL, reachable_count, module_qn)
+                     : reachable[0];
+    }
+    if (!chosen) {
+        chosen = module_qn ? best_by_import_distance(r, matches, NULL, NULL, matched, module_qn)
+                           : matches[0];
+    }
+    return chosen;
+}
+
+static int swift_owner_bucket(const cbm_registry_t *r, const CBMCall *call, const char *type_qn,
+                              const char *name, const char **out, int out_cap, int found) {
+    char base[CBM_SZ_4K];
+    int n = snprintf(base, sizeof(base), "%s.%s", type_qn, name);
+    if (n < 0 || (size_t)n >= sizeof(base)) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    const qn_array_t *bucket = r->swift_overloads ? cbm_ht_get(r->swift_overloads, base) : NULL;
+    if (!bucket) {
+        return found;
+    }
+    for (int i = 0; i < bucket->count; i++) {
+        swift_signature_t *meta = cbm_ht_get(r->swift_signatures, bucket->items[i]);
+        if (meta && swift_signature_matches(meta, call)) {
+            if (found == out_cap) {
+                return SWIFT_INCOMPATIBLE;
+            }
+            out[found++] = bucket->items[i];
+        }
+    }
+    return found;
+}
+
+static yyjson_doc *swift_type_properties(const cbm_gbuf_t *graph, const char *qn) {
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(graph, qn);
+    if (!node || !node->properties_json) {
+        return NULL;
+    }
+    return yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+}
+
+/* shortcut: files outside literal SwiftPM targets use their source directory,
+ * add build-system module maps when other project formats are supported. */
+static size_t swift_owner_module_length(const char *file) {
+    const char *end = strrchr(file, '/');
+    for (const char *part = file; *part;) {
+        const char *slash = strchr(part, '/');
+        if (!slash) {
+            break;
+        }
+        size_t n = (size_t)(slash - part);
+        if (n == strlen("Source") && memcmp(part, "Source", n) == 0) {
+            end = slash;
+            break;
+        }
+        if ((n == strlen("Sources") && memcmp(part, "Sources", n) == 0) ||
+            (n == strlen("Tests") && memcmp(part, "Tests", n) == 0)) {
+            const char *target = strchr(slash + SKIP_ONE, '/');
+            if (target) {
+                end = target;
+            }
+            break;
+        }
+        part = slash + SKIP_ONE;
+    }
+    return end ? (size_t)(end - file) : 0;
+}
+
+static const char *swift_owner_module(CBMArena *arena, const char *file) {
+    return cbm_arena_strndup(arena, file, swift_owner_module_length(file));
+}
+
+static const char *swift_module_path_key(CBMArena *arena, const char *module, const char *path) {
+    return cbm_arena_sprintf(arena, "%s\n%s", module, path);
+}
+
+static const cbm_pkg_entry_t *swift_owner_target(const swift_owners_t *index, const char *file) {
+    char directory[CBM_SZ_4K];
+    size_t len = strlen(file);
+    if (len >= sizeof(directory)) {
+        return NULL;
+    }
+    memcpy(directory, file, len + SKIP_ONE);
+    for (;;) {
+        char *slash = strrchr(directory, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            directory[0] = '\0';
+        }
+        const cbm_pkg_entry_t *target = cbm_ht_get(index->by_source_root, directory);
+        if (target) {
+            return target;
+        }
+        if (cbm_ht_has(index->by_manifest_root, directory)) {
+            return &index->ambiguous_target;
+        }
+        if (!directory[0]) {
+            return NULL;
+        }
+    }
+}
+
+static void swift_owner_assign_module(swift_owners_t *index, swift_owner_t *type,
+                                      const char *file) {
+    const cbm_pkg_entry_t *target = swift_owner_target(index, file);
+    if (target && target->pkg_name) {
+        type->module =
+            cbm_arena_sprintf(&index->arena, "%s\n%s", target->manifest_rel, target->pkg_name);
+        type->module_name = target->pkg_name;
+        type->manifest = target->manifest_rel;
+    } else if (target) {
+        /* Overlapping target roots need sources/excludes before files can be assigned. */
+        type->module = cbm_arena_strdup(&index->arena, file);
+        type->module_name = "";
+    } else {
+        type->module = swift_owner_module(&index->arena, file);
+        const char *leaf = type->module ? strrchr(type->module, '/') : NULL;
+        type->module_name = leaf ? leaf + SKIP_ONE : type->module;
+    }
+}
+
+static void swift_owner_index_add(swift_owners_t *index, swift_owner_t *type) {
+    type->next = index->types;
+    index->types = type;
+    cbm_ht_set(index->by_qn, type->qn, type);
+    if (type->declaration) {
+        type->next_path = cbm_ht_get(index->by_path, type->path);
+        cbm_ht_set(index->by_path, type->path, type);
+        const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+        swift_owner_t *prior = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        if (key && (!prior || strcmp(type->qn, prior->qn) < 0)) {
+            cbm_ht_set(index->by_module_path, key, type);
+        }
+    }
+}
+
+static void swift_return_type_collect(const cbm_gbuf_node_t *node, swift_owners_t *index) {
+    const char *key = cbm_ht_get_key(index->registry->swift_signatures, node->qualified_name);
+    if (!key || !node->properties_json) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    const char *type = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "return_type"));
+    const char *owned = type ? cbm_arena_strdup(&index->arena, type) : NULL;
+    if (owned) {
+        cbm_ht_set(index->return_types, key, (void *)owned);
+    }
+    yyjson_doc_free(doc);
+}
+
+static void swift_owner_collect(const cbm_gbuf_node_t *node, void *userdata) {
+    swift_owners_t *index = userdata;
+    swift_return_type_collect(node, index);
+    if (!node->file_path || !node->properties_json ||
+        (!strstr(node->properties_json, "\"swift_type_path\"") &&
+         !strstr(node->properties_json, "\"swift_extension\""))) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    yyjson_val *props = yyjson_doc_get_root(doc);
+    const char *declaration = yyjson_get_str(yyjson_obj_get(props, "swift_type_path"));
+    const char *extension = yyjson_get_str(yyjson_obj_get(props, "swift_extension"));
+    const char *path = declaration ? declaration : extension;
+    swift_owner_t *type = path ? cbm_arena_alloc(&index->arena, sizeof(*type)) : NULL;
+    if (!type) {
+        yyjson_doc_free(doc);
+        return;
+    }
+    memset(type, 0, sizeof(*type));
+    type->qn = cbm_arena_strdup(&index->arena, node->qualified_name);
+    type->path = cbm_arena_strdup(&index->arena, path);
+    swift_owner_assign_module(index, type, node->file_path);
+    const char *imports = yyjson_get_str(yyjson_obj_get(props, "swift_imports"));
+    type->imports = cbm_arena_strdup(&index->arena, imports ? imports : "");
+    type->declaration = declaration != NULL;
+    if (type->qn && type->path && type->module && type->imports) {
+        swift_owner_index_add(index, type);
+    }
+    yyjson_doc_free(doc);
+}
+
+static bool swift_owner_imports(const swift_owner_t *extension, const char *leaf) {
+    size_t n = strlen(leaf);
+    for (const char *p = extension->imports; p && *p;) {
+        const char *end = strchr(p, '|');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (n && len >= n && memcmp(p, leaf, n) == 0 && (len == n || p[n] == '.')) {
+            return true;
+        }
+        p = end ? end + SKIP_ONE : NULL;
+    }
+    return false;
+}
+
+static swift_owner_t *swift_owner_imported_primary(const swift_owners_t *index,
+                                                   const swift_owner_t *type) {
+    swift_owner_t *imported = NULL;
+    bool imported_local = false;
+    bool ambiguous = false;
+    for (swift_owner_t *decl = cbm_ht_get(index->by_path, type->path); decl;
+         decl = decl->next_path) {
+        if (swift_owner_imports(type, decl->module_name)) {
+            bool same_package =
+                type->manifest && decl->manifest && strcmp(type->manifest, decl->manifest) == 0;
+            if (imported_local && !same_package) {
+                continue;
+            }
+            if (same_package && !imported_local) {
+                imported = NULL;
+                imported_local = true;
+                ambiguous = false;
+            }
+            if (imported && strcmp(imported->module, decl->module) != 0) {
+                ambiguous = true;
+                continue;
+            }
+            if (!imported || strcmp(decl->qn, imported->qn) < 0) {
+                imported = decl;
+            }
+        }
+    }
+    return ambiguous ? NULL : imported;
+}
+
+static swift_owner_t *swift_owner_primary(const swift_owners_t *index, const swift_owner_t *type) {
+    char key[CBM_SZ_4K];
+    int length = snprintf(key, sizeof(key), "%s\n%s", type->module, type->path);
+    swift_owner_t *local =
+        length >= 0 && (size_t)length < sizeof(key) ? cbm_ht_get(index->by_module_path, key) : NULL;
+    return local ? local : swift_owner_imported_primary(index, type);
+}
+
+static void swift_owner_group_members(swift_owners_t *index) {
+    /* Unindexed external types still share extensions within their own target. */
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        if (type->primary) {
+            continue;
+        }
+        const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+        swift_owner_t *prior = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        if (key && (!prior || strcmp(type->qn, prior->qn) < 0)) {
+            cbm_ht_set(index->by_module_path, key, type);
+        }
+    }
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        if (!type->primary) {
+            const char *key = swift_module_path_key(&index->arena, type->module, type->path);
+            type->primary = key ? cbm_ht_get(index->by_module_path, key) : NULL;
+        }
+        if (type->primary) {
+            type->next_member = type->primary->members;
+            type->primary->members = type;
+        }
+    }
+}
+
+void cbm_registry_build_swift_owners(cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                     const char *repo_path, char **excluded_dirs,
+                                     int excluded_count) {
+    if (!r || !graph) {
+        return;
+    }
+    swift_owners_free(r->swift_owners);
+    r->swift_owners = NULL;
+    if (!r->swift_signatures) {
+        return;
+    }
+    swift_owners_t *index = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*index));
+    if (!index) {
+        return;
+    }
+    cbm_arena_init(&index->arena);
+    index->registry = r;
+    cbm_pkg_entries_init(&index->targets);
+    (void)cbm_pkgmap_scan_swift_targets(repo_path, &index->targets, excluded_dirs, excluded_count);
+    index->by_source_root = cbm_ht_create(CBM_SZ_512);
+    index->by_manifest_root = cbm_ht_create(CBM_SZ_512);
+    index->by_target_name = cbm_ht_create(CBM_SZ_512);
+    index->by_qn = cbm_ht_create(CBM_SZ_512);
+    index->by_path = cbm_ht_create(CBM_SZ_512);
+    index->by_module_path = cbm_ht_create(CBM_SZ_512);
+    index->return_types = cbm_ht_create(CBM_SZ_512);
+    if (!index->by_source_root || !index->by_manifest_root || !index->by_target_name ||
+        !index->by_qn || !index->by_path || !index->by_module_path || !index->return_types) {
+        swift_owners_free(index);
+        return;
+    }
+    for (int i = 0; i < index->targets.count; i++) {
+        cbm_pkg_entry_t *target = &index->targets.items[i];
+        if (target->manifest_rel && !target->pkg_name && target->entry_rel) {
+            cbm_ht_set(index->by_manifest_root, target->entry_rel, target);
+        }
+        if (target->manifest_rel && target->pkg_name && target->entry_rel) {
+            const char *module =
+                swift_module_path_key(&index->arena, target->manifest_rel, target->pkg_name);
+            if (module) {
+                cbm_ht_set(index->by_target_name, module, target);
+            }
+            cbm_pkg_entry_t *prior = cbm_ht_get(index->by_source_root, target->entry_rel);
+            if (prior && (!prior->pkg_name || strcmp(prior->pkg_name, target->pkg_name) != 0 ||
+                          strcmp(prior->manifest_rel, target->manifest_rel) != 0)) {
+                cbm_ht_set(index->by_source_root, target->entry_rel, &index->ambiguous_target);
+            } else {
+                cbm_ht_set(index->by_source_root, target->entry_rel, target);
+            }
+        }
+    }
+    cbm_gbuf_foreach_node(graph, swift_owner_collect, index);
+    for (swift_owner_t *type = index->types; type; type = type->next) {
+        type->primary = swift_owner_primary(index, type);
+    }
+    swift_owner_group_members(index);
+    r->swift_owners = index;
+}
+
+static bool swift_module_visible(const swift_owners_t *index, const cbm_pkg_entry_t *target,
+                                 const CBMFileResult *file, const swift_owner_t *owner);
+
+static const char *swift_caller_path(const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                     const char *module_qn) {
+    const cbm_gbuf_node_t *module =
+        graph && module_qn ? cbm_gbuf_find_by_qn(graph, module_qn) : NULL;
+    if (module && module->file_path) {
+        return module->file_path;
+    }
+    return file && file->defs.count ? file->defs.items[0].file_path : NULL;
+}
+
+static bool swift_extension_visible(const swift_owners_t *index, const CBMFileResult *file,
+                                    const cbm_gbuf_t *graph, const char *module_qn,
+                                    const swift_owner_t *provider) {
+    if (provider->declaration || !file ||
+        (provider->primary && provider->primary->declaration &&
+         strcmp(provider->module, provider->primary->module) == 0)) {
+        return true;
+    }
+    const char *path = swift_caller_path(file, graph, module_qn);
+    const cbm_pkg_entry_t *target = path ? swift_owner_target(index, path) : NULL;
+    if (path && (!target || !target->pkg_name)) {
+        size_t length = target ? strlen(path) : swift_owner_module_length(path);
+        if (length == strlen(provider->module) && memcmp(path, provider->module, length) == 0) {
+            return true;
+        }
+    }
+    return swift_module_visible(index, target, file, provider);
+}
+
+static int swift_owner_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMFileResult *file, const char *module_qn,
+                                  const CBMCall *call, const char *name, const char **out,
+                                  int out_cap, const char **owner) {
+    const swift_owner_t *type = r->swift_owners ? cbm_ht_get(r->swift_owners->by_qn, *owner) : NULL;
+    if (!type || !type->primary) {
+        return swift_owner_bucket(r, call, *owner, name, out, out_cap, 0);
+    }
+    if (type->primary->declaration) {
+        *owner = type->primary->qn;
+    }
+    int found = 0;
+    for (const swift_owner_t *member = type->primary->members; member && found >= 0;
+         member = member->next_member) {
+        if (swift_extension_visible(r->swift_owners, file, graph, module_qn, member)) {
+            found = swift_owner_bucket(r, call, member->qn, name, out, out_cap, found);
+        }
+    }
+    return found;
+}
+
+enum { SWIFT_MAX_ANCESTORS = 64 };
+
+static bool swift_receiver_type_text(const char *type, char *out, size_t cap);
+
+static const swift_owner_t *swift_lexical_type(const swift_owners_t *index,
+                                               const swift_owner_t *scope, const char *nominal) {
+    size_t prefix = strlen(scope->path);
+    while (prefix) {
+        char key[CBM_SZ_4K];
+        int length = snprintf(key, sizeof(key), "%s\n%.*s.%s", scope->module, (int)prefix,
+                              scope->path, nominal);
+        const swift_owner_t *type = length >= 0 && (size_t)length < sizeof(key)
+                                        ? cbm_ht_get(index->by_module_path, key)
+                                        : NULL;
+        if (type) {
+            return type;
+        }
+        while (prefix && scope->path[prefix - SKIP_ONE] != '.') {
+            prefix--;
+        }
+        if (prefix) {
+            prefix--;
+        }
+    }
+    return NULL;
+}
+
+/* A declared type name belongs to the declaration's file, not the caller's. */
+static const char *swift_type_in_owner(const cbm_registry_t *r, const char *owner,
+                                       const char *type) {
+    char nominal[CBM_SZ_4K];
+    if (!swift_receiver_type_text(type, nominal, sizeof(nominal))) {
+        return NULL;
+    }
+    swift_owners_t *index = r->swift_owners;
+    const swift_owner_t *context = index ? cbm_ht_get(index->by_qn, owner) : NULL;
+    if (!context) {
+        return cbm_registry_resolve(r, nominal, owner, NULL, NULL, 0).qualified_name;
+    }
+    swift_owner_t reference = *context;
+    reference.path = nominal;
+    const swift_owner_t *resolved = swift_lexical_type(index, context, nominal);
+    if (!resolved && context->primary) {
+        resolved = swift_lexical_type(index, context->primary, nominal);
+    }
+    if (!resolved) {
+        resolved = swift_owner_primary(index, &reference);
+    }
+    if (resolved) {
+        return resolved->qn;
+    }
+    char *dot = strchr(nominal, '.');
+    if (!dot) {
+        return NULL;
+    }
+    *dot = '\0';
+    bool local = strcmp(nominal, context->module_name) == 0;
+    if (!local && !swift_owner_imports(context, nominal)) {
+        return NULL;
+    }
+    reference.path = dot + SKIP_ONE;
+    reference.imports = local ? "" : nominal;
+    resolved = local ? swift_owner_primary(index, &reference)
+                     : swift_owner_imported_primary(index, &reference);
+    return resolved ? resolved->qn : NULL;
+}
+
+static bool swift_type_seen(const char **types, int count, const char *qn) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(types[i], qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void swift_parent_types(const cbm_registry_t *r, const cbm_gbuf_t *graph, const char *owner,
+                               const char **types, int *count) {
+    yyjson_doc *doc = swift_type_properties(graph, owner);
+    if (!doc) {
+        return;
+    }
+    yyjson_val *bases = yyjson_obj_get(yyjson_doc_get_root(doc), "base_classes");
+    size_t i;
+    size_t max;
+    yyjson_val *base;
+    yyjson_arr_foreach(bases, i, max, base) {
+        const char *name = yyjson_get_str(base);
+        if (*count == SWIFT_MAX_ANCESTORS) {
+            break;
+        }
+        if (!name) {
+            continue;
+        }
+        const char *parent = swift_type_in_owner(r, owner, name);
+        if (parent && !swift_type_seen(types, *count, parent)) {
+            types[(*count)++] = parent;
+        }
+    }
+    yyjson_doc_free(doc);
+}
+
+static int swift_typed_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMFileResult *file, const char *module_qn,
+                                  const CBMCall *call, const char *type_qn, const char *name,
+                                  const char **out, int out_cap) {
+    const char *types[SWIFT_MAX_ANCESTORS] = {type_qn};
+    int count = SKIP_ONE;
+    /* shortcut: visit at most 64 hierarchy types, expand for larger valid hierarchies. */
+    for (int i = 0; i < count; i++) {
+        const char *owner = types[i];
+        int found =
+            swift_owner_candidates(r, graph, file, module_qn, call, name, out, out_cap, &owner);
+        if (found != 0) {
+            return found;
+        }
+        if (!graph || strcmp(name, "init") == 0 || strcmp(name, "deinit") == 0) {
+            break;
+        }
+        swift_parent_types(r, graph, owner, types, &count);
+    }
+    return SWIFT_INCOMPATIBLE;
+}
+
+enum { SWIFT_NO_TYPE_RECEIVER = -2 };
+
+static const swift_owner_t *swift_target_type(const swift_owners_t *index,
+                                              const cbm_pkg_entry_t *target, const char *type) {
+    char key[CBM_SZ_4K];
+    int n = snprintf(key, sizeof(key), "%s\n%s\n%s", target->manifest_rel, target->pkg_name, type);
+    return n >= 0 && (size_t)n < sizeof(key) ? cbm_ht_get(index->by_module_path, key) : NULL;
+}
+
+static const swift_owner_t *swift_imported_type(const swift_owners_t *index,
+                                                const cbm_pkg_entry_t *target,
+                                                const CBMFileResult *file, const char *type,
+                                                bool *ambiguous) {
+    const swift_owner_t *selected = NULL;
+    for (int i = 0; i < file->imports.count; i++) {
+        const char *name = file->imports.items[i].module_path;
+        if (!name) {
+            continue;
+        }
+        size_t length = strcspn(name, ".");
+        char key[CBM_SZ_4K];
+        int n = snprintf(key, sizeof(key), "%s\n%.*s", target->manifest_rel, (int)length, name);
+        const cbm_pkg_entry_t *imported =
+            n >= 0 && (size_t)n < sizeof(key) ? cbm_ht_get(index->by_target_name, key) : NULL;
+        if (!imported) {
+            continue;
+        }
+        const char *nominal = strncmp(type, name, length) == 0 && type[length] == '.'
+                                  ? type + length + SKIP_ONE
+                                  : type;
+        const swift_owner_t *candidate = swift_target_type(index, imported, nominal);
+        if (candidate) {
+            *ambiguous =
+                *ambiguous || (selected && strcmp(selected->module, candidate->module) != 0);
+            selected = candidate;
+        }
+    }
+    return selected;
+}
+
+static bool swift_module_visible(const swift_owners_t *index, const cbm_pkg_entry_t *target,
+                                 const CBMFileResult *file, const swift_owner_t *owner) {
+    if (target && target->pkg_name && owner->manifest &&
+        strcmp(owner->manifest, target->manifest_rel) == 0 &&
+        strcmp(owner->module_name, target->pkg_name) == 0) {
+        return true;
+    }
+    bool visible = false;
+    size_t length = strlen(owner->module_name);
+    for (int i = 0; i < file->imports.count; i++) {
+        const char *name = file->imports.items[i].module_path;
+        visible = visible || (name && length && strncmp(name, owner->module_name, length) == 0 &&
+                              (name[length] == '\0' || name[length] == '.'));
+    }
+    if (!target || !target->pkg_name) {
+        return visible;
+    }
+    char key[CBM_SZ_4K];
+    int n = snprintf(key, sizeof(key), "%s\n%s", target->manifest_rel, owner->module_name);
+    bool local_module = n >= 0 && (size_t)n < sizeof(key) && cbm_ht_has(index->by_target_name, key);
+    if (!visible || (local_module &&
+                     (!owner->manifest || strcmp(owner->manifest, target->manifest_rel) != 0))) {
+        return false;
+    }
+    return true;
+}
+
+static bool swift_receiver_visible(const swift_owners_t *index, const cbm_pkg_entry_t *target,
+                                   const CBMFileResult *file, const swift_owner_t *owner) {
+    owner = owner->primary && owner->primary->declaration ? owner->primary : owner;
+    return swift_module_visible(index, target, file, owner);
+}
+
+/* The global import map has one value per name. SwiftPM packages can each
+ * declare Core, so retain the caller's package before choosing its receiver. */
+static const char *swift_receiver_qn(const cbm_registry_t *r, const CBMFileResult *file,
+                                     const cbm_gbuf_t *graph, const char *type,
+                                     const char *module_qn, const char **import_vals,
+                                     int import_count) {
+    const swift_owners_t *index = r->swift_owners;
+    const char *path = swift_caller_path(file, graph, module_qn);
+    const cbm_pkg_entry_t *target =
+        index && path ? swift_owner_target(r->swift_owners, path) : NULL;
+    if (target && target->pkg_name && file) {
+        const swift_owner_t *selected = swift_target_type(index, target, type);
+        if (selected) {
+            return selected->qn;
+        }
+        bool ambiguous = false;
+        selected = swift_imported_type(index, target, file, type, &ambiguous);
+        if (ambiguous || selected) {
+            return ambiguous ? NULL : selected->qn;
+        }
+    }
+    cbm_resolution_t fallback =
+        cbm_registry_resolve(r, type, module_qn, NULL, import_vals, import_count);
+    const swift_owner_t *owner =
+        index && fallback.qualified_name ? cbm_ht_get(index->by_qn, fallback.qualified_name) : NULL;
+    if (owner && target && target->pkg_name && file &&
+        !swift_receiver_visible(index, target, file, owner)) {
+        return NULL;
+    }
+    return fallback.qualified_name;
+}
+
+static int swift_named_candidates(const cbm_registry_t *r, const cbm_gbuf_t *graph,
+                                  const CBMFileResult *file, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap) {
+    const char *dot = strrchr(call->callee_name, '.');
+    if (dot && isupper((unsigned char)call->callee_name[0]) &&
+        (size_t)(dot - call->callee_name) < CBM_SZ_512) {
+        char type[CBM_SZ_512];
+        memcpy(type, call->callee_name, (size_t)(dot - call->callee_name));
+        type[dot - call->callee_name] = '\0';
+        const char *receiver =
+            swift_receiver_qn(r, file, graph, type, module_qn, import_vals, import_count);
+        if (receiver) {
+            return swift_typed_candidates(r, graph, file, module_qn, call, receiver,
+                                          simple_name(call->callee_name), out, out_cap);
+        }
+        return SWIFT_INCOMPATIBLE;
+    }
+    return SWIFT_NO_TYPE_RECEIVER;
+}
+
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap) {
+    if (!r || !r->swift_signatures || !call || !call->callee_name || !out || out_cap < SKIP_ONE) {
+        return 0;
+    }
+    const char *name = simple_name(call->callee_name);
+    int typed = swift_named_candidates(r, NULL, NULL, call, module_qn, import_vals, import_count,
+                                       out, out_cap);
+    if (typed != SWIFT_NO_TYPE_RECEIVER) {
+        return typed;
+    }
+    qn_array_t *bucket = cbm_ht_get(r->by_name, name);
+    if (!bucket) {
+        return 0;
+    }
+    enum { SWIFT_MATCH_BUFFERS = 3 };
+    if ((size_t)bucket->count > SIZE_MAX / sizeof(const char *) / SWIFT_MATCH_BUFFERS) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    const char **matches = cbm_alloc(
+        CBM_MEM_CLASS_OTHER, (size_t)bucket->count * SWIFT_MATCH_BUFFERS * sizeof(*matches));
+    if (!matches) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    int matched = 0;
+    bool has_swift = false;
+    for (int i = 0; i < bucket->count; i++) {
+        const char *qn = bucket->items[i];
+        swift_signature_t *meta = cbm_ht_get(r->swift_signatures, qn);
+        has_swift = has_swift || meta != NULL;
+        if (meta && receiver_chain_admits(call->callee_name, qn) &&
+            swift_signature_matches(meta, call)) {
+            matches[matched++] = qn;
+        }
+    }
+    if (matched == 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, matches);
+        return has_swift ? SWIFT_INCOMPATIBLE : 0;
+    }
+    const char *chosen = swift_choose_candidate(r, matches, matched, name, call, module_qn,
+                                                import_vals, import_count, matches + bucket->count);
+    if (!chosen) {
+        cbm_free(CBM_MEM_CLASS_OTHER, matches);
+        return 0;
+    }
+    size_t chosen_base = cbm_qn_callable_base_len_named(chosen, name);
+    int found = 0;
+    for (int i = 0; i < matched; i++) {
+        size_t base = cbm_qn_callable_base_len_named(matches[i], name);
+        if (base == chosen_base && memcmp(matches[i], chosen, base) == 0) {
+            if (found == out_cap) {
+                cbm_free(CBM_MEM_CLASS_OTHER, matches);
+                return SWIFT_INCOMPATIBLE;
+            }
+            out[found++] = matches[i];
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, matches);
+    return found;
+}
+
+enum { SWIFT_SCOPE_MODULE = 1, SWIFT_SCOPE_CLASS = 2, SWIFT_SCOPE_LOCAL = 3 };
+enum { SWIFT_INITIALIZER_BINDINGS = 8 };
+
+typedef struct {
+    const CBMTypeAssign *assignment;
+    const char *type;
+    bool ready;
+} swift_inferred_binding_t;
+
+typedef struct {
+    swift_inferred_binding_t items[SWIFT_INITIALIZER_BINDINGS];
+    unsigned count;
+    const CBMTypeAssign *missing;
+} swift_binding_work_t;
+
+typedef struct {
+    const cbm_registry_t *registry;
+    const CBMFileResult *file;
+    const cbm_gbuf_t *graph;
+    const char *module_qn;
+    const char **imports;
+    int import_count;
+    /* Inferring an initializer's type: a label match is a guess, never a type. */
+    bool strict;
+} swift_inference_t;
+
+static const char *swift_initializer_type(const swift_inference_t *context,
+                                          swift_binding_work_t *work,
+                                          const CBMTypeAssign *assignment);
+static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
+                                     const CBMCall *call, const char **out, int out_cap);
+
+static int swift_binding_rank(const char *binding, const char *scope, const char *class_qn,
+                              const char *module_qn, bool field) {
+    if (!field && scope && strcmp(binding, scope) == 0) {
+        return SWIFT_SCOPE_LOCAL;
+    }
+    if (class_qn && strcmp(binding, class_qn) == 0) {
+        return SWIFT_SCOPE_CLASS;
+    }
+    if (!field && module_qn && strcmp(binding, module_qn) == 0) {
+        return SWIFT_SCOPE_MODULE;
+    }
+    return 0;
+}
+
+/* A block-local binding names the variable only where it is in scope: after
+ * its declaration and inside its block. `var request = try request.make()`
+ * reads the parameter on its right-hand side and the new variable after it. */
+static int swift_assignment_rank(const CBMTypeAssign *assignment, const char *name,
+                                 const CBMCall *call, const char *class_qn, const char *module_qn,
+                                 bool field) {
+    if (!assignment->var_name || !assignment->enclosing_func_qn ||
+        strcmp(assignment->var_name, name) != 0) {
+        return 0;
+    }
+    int rank = swift_binding_rank(assignment->enclosing_func_qn, call->enclosing_func_qn, class_qn,
+                                  module_qn, field);
+    if (rank == SWIFT_SCOPE_LOCAL && assignment->scope_end_byte &&
+        (call->site_start_byte < assignment->decl_end_byte ||
+         call->site_start_byte >= assignment->scope_end_byte)) {
+        return 0;
+    }
+    return rank;
+}
+
+static int swift_cached_binding(const swift_binding_work_t *work, const CBMTypeAssign *assignment) {
+    for (unsigned i = 0; i < work->count; i++) {
+        if (work->items[i].assignment == assignment) {
+            return (int)i;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+static const char *swift_binding_cached_type(swift_binding_work_t *work,
+                                             const CBMTypeAssign *assignment) {
+    int cached = swift_cached_binding(work, assignment);
+    if (cached >= 0 && work->items[cached].ready) {
+        return work->items[cached].type;
+    }
+    if (!work->missing) {
+        work->missing = assignment;
+    }
+    return "";
+}
+
+/* Where a receiver's type came from: no binding, a declaration (an annotation
+ * or a parameter), a constructor call, or only an initializer whose type was
+ * inferred from the call it makes. */
+typedef enum {
+    SWIFT_ORIGIN_NONE,
+    SWIFT_ORIGIN_DECLARED,
+    SWIFT_ORIGIN_CONSTRUCTED,
+    SWIFT_ORIGIN_INFERRED
+} swift_origin_t;
+
+/* Of the block-local bindings in scope at the call, the innermost block's: a
+ * local shadows a same-name local of an enclosing block, and a parameter,
+ * whose block is its whole function. Zero when no binding records a block. */
+static uint32_t swift_innermost_block(const CBMFileResult *file, const char *name,
+                                      const CBMCall *call) {
+    uint32_t block = 0;
+    for (int i = 0; i < file->type_assigns.count; i++) {
+        const CBMTypeAssign *a = &file->type_assigns.items[i];
+        if (a->scope_end_byte && (!block || a->scope_end_byte < block) &&
+            swift_assignment_rank(a, name, call, NULL, NULL, false) == SWIFT_SCOPE_LOCAL) {
+            block = a->scope_end_byte;
+        }
+    }
+    return block;
+}
+
+/* Conflicting bindings of one block ("") select no same-name method on either
+ * type. A binding whose initializer type could not be inferred leaves the
+ * receiver unknown (NULL), so the call keeps the label match (#2061). */
+static const char *swift_binding_type(const swift_inference_t *context, swift_binding_work_t *work,
+                                      const char *name, const CBMCall *call, const char *class_qn,
+                                      const char *module_qn, bool field, swift_origin_t *origin) {
+    const CBMFileResult *file = context->file;
+    int best = 0;
+    for (int i = 0; i < file->type_assigns.count; i++) {
+        const CBMTypeAssign *a = &file->type_assigns.items[i];
+        int rank = swift_assignment_rank(a, name, call, class_qn, module_qn, field);
+        if (rank > best) {
+            best = rank;
+        }
+    }
+    *origin = best ? SWIFT_ORIGIN_INFERRED : SWIFT_ORIGIN_NONE;
+    if (!best) {
+        return NULL;
+    }
+    uint32_t block = best == SWIFT_SCOPE_LOCAL ? swift_innermost_block(file, name, call) : 0;
+    const char *type = NULL;
+    bool unknown = false;
+    for (int i = 0; i < file->type_assigns.count; i++) {
+        const CBMTypeAssign *a = &file->type_assigns.items[i];
+        if (swift_assignment_rank(a, name, call, class_qn, module_qn, field) != best ||
+            (block && a->scope_end_byte && a->scope_end_byte != block)) {
+            continue;
+        }
+        const char *candidate = a->type_name;
+        if (candidate) {
+            /* A declaration among the bindings decides; else a constructor. */
+            if (!a->constructed) {
+                *origin = SWIFT_ORIGIN_DECLARED;
+            } else if (*origin != SWIFT_ORIGIN_DECLARED) {
+                *origin = SWIFT_ORIGIN_CONSTRUCTED;
+            }
+        } else {
+            candidate = swift_binding_cached_type(work, a);
+            if (!candidate[0]) {
+                unknown = true;
+                continue;
+            }
+        }
+        if (type && strcmp(type, candidate) != 0) {
+            return "";
+        }
+        type = candidate;
+    }
+    return unknown ? NULL : type;
+}
+
+static void swift_enclosing_class(const CBMCall *call, char *class_qn) {
+    class_qn[0] = '\0';
+    if (!call->enclosing_func_qn || strlen(call->enclosing_func_qn) >= CBM_SZ_4K) {
+        return;
+    }
+    size_t n = cbm_qn_callable_base_len(call->enclosing_func_qn);
+    memcpy(class_qn, call->enclosing_func_qn, n);
+    class_qn[n] = '\0';
+    char *dot = strrchr(class_qn, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+}
+
+static const char *swift_file_receiver(const swift_inference_t *context, swift_binding_work_t *work,
+                                       const CBMCall *call, const char *module_qn, char *expression,
+                                       char *class_qn, char **member, swift_origin_t *origin) {
+    swift_enclosing_class(call, class_qn);
+    *origin = SWIFT_ORIGIN_DECLARED;
+    char *dot = strchr(expression, '.');
+    *dot = '\0';
+    *member = dot + SKIP_ONE;
+    if (strcmp(expression, "self") == 0) {
+        dot = strchr(*member, '.');
+        if (!dot) {
+            return class_qn;
+        }
+        *dot = '\0';
+        const char *type =
+            swift_binding_type(context, work, *member, call, class_qn, module_qn, true, origin);
+        *member = dot + SKIP_ONE;
+        return type;
+    }
+    const char *type =
+        swift_binding_type(context, work, expression, call, class_qn, module_qn, false, origin);
+    if (*origin == SWIFT_ORIGIN_NONE && isupper((unsigned char)expression[0])) {
+        *origin = SWIFT_ORIGIN_DECLARED;
+        return expression;
+    }
+    return type;
+}
+
+/* Dots inside arguments do not separate receiver segments. */
+static char *swift_after_arguments(char *args) {
+    unsigned depth = SKIP_ONE;
+    char quote = '\0';
+    for (char *p = args + SKIP_ONE; *p; p++) {
+        if (*p == '\\' && p[SKIP_ONE]) {
+            p++;
+        } else if (quote) {
+            if (*p == quote) {
+                quote = '\0';
+            }
+        } else if (*p == '"') {
+            quote = *p;
+        } else if (*p == '(') {
+            depth++;
+        } else if (*p == ')' && --depth == 0) {
+            p++;
+            while (isspace((unsigned char)*p)) {
+                p++;
+            }
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static const CBMCall *swift_inner_call(const CBMFileResult *file, const CBMCall *call,
+                                       size_t prefix) {
+    for (int i = 0; i < file->calls.count; i++) {
+        const CBMCall *candidate = &file->calls.items[i];
+        if (candidate->callee_name && strlen(candidate->callee_name) == prefix &&
+            strncmp(candidate->callee_name, call->callee_name, prefix) == 0 &&
+            candidate->site_start_byte >= call->site_start_byte &&
+            candidate->site_end_byte <= call->site_end_byte) {
+            return candidate;
+        }
+    }
+    return NULL;
+}
+
+static const char *swift_chain_return_spelling(const cbm_registry_t *r, const char *qn) {
+    const swift_signature_t *sig = cbm_ht_get(r->swift_signatures, qn);
+    const char *signature = sig ? sig->selector : qn;
+    size_t offset = cbm_callable_return_offset(signature);
+    if (!signature[offset]) {
+        signature = qn;
+        offset = cbm_callable_return_offset(signature);
+    }
+    return offset && signature[offset] ? signature + offset + PAIR_LEN : NULL;
+}
+
+static const char *swift_chain_return_qn(const cbm_registry_t *r, const char *qn,
+                                         const char *receiver, const char *member,
+                                         const char *returned) {
+    if (strcmp(returned, "Self") == 0) {
+        return receiver;
+    }
+    char owner[CBM_SZ_4K];
+    size_t base = cbm_qn_callable_base_len_named(qn, member);
+    size_t name_length = strlen(member);
+    if (base <= name_length || base - name_length - SKIP_ONE >= sizeof(owner)) {
+        return NULL;
+    }
+    size_t length = base - name_length - SKIP_ONE;
+    memcpy(owner, qn, length);
+    owner[length] = '\0';
+    const char *raw = r->swift_owners ? cbm_ht_get(r->swift_owners->return_types, qn) : NULL;
+    return swift_type_in_owner(r, owner, raw ? raw : returned);
+}
+
+static const char *swift_function_return_type(const swift_inference_t *context, const char *qn,
+                                              const char *returned) {
+    const cbm_registry_t *r = context->registry;
+    swift_owners_t *index = r->swift_owners;
+    const cbm_gbuf_node_t *declaration = cbm_gbuf_find_by_qn(context->graph, qn);
+    if (!index || !declaration || !declaration->file_path) {
+        return NULL;
+    }
+    const char *raw = cbm_ht_get(index->return_types, qn);
+    char nominal[CBM_SZ_4K];
+    if (!swift_receiver_type_text(raw ? raw : returned, nominal, sizeof(nominal))) {
+        return NULL;
+    }
+    const cbm_pkg_entry_t *target = swift_owner_target(index, declaration->file_path);
+    const swift_owner_t *type = NULL;
+    if (target && target->pkg_name) {
+        type = swift_target_type(index, target, nominal);
+    } else if (!target) {
+        char key[CBM_SZ_4K];
+        size_t length = swift_owner_module_length(declaration->file_path);
+        int n =
+            snprintf(key, sizeof(key), "%.*s\n%s", (int)length, declaration->file_path, nominal);
+        type = n >= 0 && (size_t)n < sizeof(key) ? cbm_ht_get(index->by_module_path, key) : NULL;
+    }
+    if (type) {
+        return type->qn;
+    }
+    const char *caller = swift_caller_path(context->file, context->graph, context->module_qn);
+    if (caller && strcmp(caller, declaration->file_path) == 0) {
+        const char *resolved =
+            swift_receiver_qn(r, context->file, context->graph, nominal, context->module_qn,
+                              context->imports, context->import_count);
+        const swift_owner_t *owner = resolved ? cbm_ht_get(index->by_qn, resolved) : NULL;
+        return owner && swift_receiver_visible(index, target, context->file, owner) ? resolved
+                                                                                    : NULL;
+    }
+    return NULL; /* No declaring-file imports are available for a remote free function. */
+}
+
+/* `func run<Result>() -> Result`: the callee's own generic parameter names no
+ * type, so the value it returns stays unknown (#2061). The QN keeps the
+ * declaration's generic clause unless the signature was capped. */
+static bool swift_returns_generic_parameter(const char *qn, const char *member,
+                                            const char *returned) {
+    char nominal[CBM_SZ_4K];
+    if (!member || !swift_receiver_type_text(returned, nominal, sizeof(nominal))) {
+        return false;
+    }
+    const char *clause = qn + cbm_qn_callable_base_len_named(qn, member);
+    size_t length = clause[0] == '<' ? swift_generic_prefix_len(clause, strlen(clause)) : 0;
+    size_t name_length = strlen(nominal);
+    unsigned depth = 0;
+    for (size_t i = SKIP_ONE; i + SKIP_ONE < length && clause[i] != ';'; i++) {
+        bool entry = depth == 0 && (i == SKIP_ONE || clause[i - SKIP_ONE] == ',');
+        if (entry && strncmp(clause + i, nominal, name_length) == 0 && clause[i + name_length] &&
+            strchr(":,;>", clause[i + name_length])) {
+            return true;
+        }
+        if (clause[i] == '<') {
+            depth++;
+        } else if (clause[i] == '>' && clause[i - SKIP_ONE] != '=' && depth) {
+            depth--;
+        }
+    }
+    return false;
+}
+
+static const char *swift_candidates_return_type(const swift_inference_t *context, int count,
+                                                const char **out, const char *receiver,
+                                                const char *member) {
+    const cbm_registry_t *r = context->registry;
+    const char *type = NULL;
+    const char *spelling = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *returned = swift_chain_return_spelling(r, out[i]);
+        if (!returned || (spelling && strcmp(spelling, returned) != 0) ||
+            swift_returns_generic_parameter(out[i], member, returned)) {
+            return NULL;
+        }
+        const char *label = cbm_ht_get(r->exact, out[i]);
+        const char *resolved = label && strcmp(label, "Function") == 0
+                                   ? swift_function_return_type(context, out[i], returned)
+                                   : swift_chain_return_qn(r, out[i], receiver, member, returned);
+        if (!resolved || (type && strcmp(type, resolved) != 0)) {
+            return NULL;
+        }
+        spelling = returned;
+        type = resolved;
+    }
+    return type;
+}
+
+static const char *swift_chain_return(const swift_inference_t *context, const CBMCall *inner,
+                                      const char *receiver, const char *member, const char **out,
+                                      int out_cap) {
+    if (!inner) {
+        return NULL;
+    }
+    int count = swift_typed_candidates(context->registry, context->graph, context->file,
+                                       context->module_qn, inner, receiver, member, out, out_cap);
+    return swift_candidates_return_type(context, count, out, receiver, member);
+}
+
+static const CBMCall *swift_initializer_call(const CBMFileResult *file,
+                                             const CBMTypeAssign *assignment) {
+    const CBMCall *selected = NULL;
+    uint32_t widest = 0;
+    if (assignment->value_end_byte <= assignment->value_start_byte) {
+        return NULL;
+    }
+    for (int i = 0; i < file->calls.count; i++) {
+        const CBMCall *call = &file->calls.items[i];
+        if (!call->callee_name || call->site_start_byte < assignment->value_start_byte ||
+            call->site_end_byte != assignment->value_end_byte ||
+            call->site_end_byte <= call->site_start_byte) {
+            continue;
+        }
+        uint32_t width = call->site_end_byte - call->site_start_byte;
+        if (width > widest) {
+            selected = call;
+            widest = width;
+        } else if (width == widest && selected &&
+                   (call->site_start_byte != selected->site_start_byte ||
+                    strcmp(call->callee_name, selected->callee_name) != 0)) {
+            return NULL;
+        }
+    }
+    return selected;
+}
+
+static bool swift_initializer_function_visible(const swift_inference_t *context, const char *qn) {
+    const swift_owners_t *index = context->registry->swift_owners;
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(context->graph, qn);
+    if (!index || !node || !node->file_path) {
+        return false;
+    }
+    const cbm_pkg_entry_t *target = swift_owner_target(index, node->file_path);
+    char module[CBM_SZ_4K];
+    swift_owner_t provider = {.module = module};
+    if (target && target->pkg_name) {
+        int n = snprintf(module, sizeof(module), "%s\n%s", target->manifest_rel, target->pkg_name);
+        if (n < 0 || (size_t)n >= sizeof(module)) {
+            return false;
+        }
+        provider.module_name = target->pkg_name;
+        provider.manifest = target->manifest_rel;
+    } else {
+        size_t length =
+            target ? strlen(node->file_path) : swift_owner_module_length(node->file_path);
+        if (length >= sizeof(module)) {
+            return false;
+        }
+        memcpy(module, node->file_path, length);
+        module[length] = '\0';
+        const char *leaf = strrchr(module, '/');
+        provider.module_name = leaf ? leaf + SKIP_ONE : module;
+    }
+    return swift_extension_visible(index, context->file, context->graph, context->module_qn,
+                                   &provider);
+}
+
+static int swift_initializer_member_candidates(const swift_inference_t *context,
+                                               swift_binding_work_t *work, const CBMCall *call,
+                                               const char **out) {
+    char expression[CBM_SZ_4K];
+    char owner[CBM_SZ_4K];
+    if (strlen(call->callee_name) >= sizeof(expression)) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    (void)snprintf(expression, sizeof(expression), "%s", call->callee_name);
+    char *member = NULL;
+    swift_origin_t origin;
+    const char *type = swift_file_receiver(context, work, call, context->module_qn, expression,
+                                           owner, &member, &origin);
+    if (!type || !type[0]) {
+        return SWIFT_INCOMPATIBLE; /* Unknown roots cannot establish an initializer's type. */
+    }
+    swift_inference_t strict = *context;
+    strict.strict = true;
+    return swift_candidates_for_file(&strict, work, call, out, REG_MAX_CANDIDATES);
+}
+
+static int swift_initializer_candidates(const swift_inference_t *context,
+                                        swift_binding_work_t *work, const CBMTypeAssign *assignment,
+                                        const CBMCall *call, const char **out, char *owner) {
+    owner[0] = '\0';
+    if (strchr(call->callee_name, '.')) {
+        return swift_initializer_member_candidates(context, work, call, out);
+    }
+    swift_enclosing_class(call, owner);
+    const swift_owners_t *index = context->registry->swift_owners;
+    if (index && cbm_ht_has(index->by_qn, assignment->enclosing_func_qn)) {
+        (void)snprintf(owner, CBM_SZ_4K, "%s", assignment->enclosing_func_qn);
+    }
+    if (index && cbm_ht_has(index->by_qn, owner)) {
+        int count = swift_typed_candidates(context->registry, context->graph, context->file,
+                                           context->module_qn, call, owner, call->callee_name, out,
+                                           REG_MAX_CANDIDATES);
+        if (count > 0) {
+            return count;
+        }
+    }
+    owner[0] = '\0';
+    int count =
+        cbm_registry_swift_candidates(context->registry, call, context->module_qn, context->imports,
+                                      context->import_count, out, REG_MAX_CANDIDATES);
+    for (int i = 0; i < count; i++) {
+        const char *label = cbm_ht_get(context->registry->exact, out[i]);
+        if (!label || strcmp(label, "Function") != 0 ||
+            !swift_initializer_function_visible(context, out[i])) {
+            return SWIFT_INCOMPATIBLE;
+        }
+    }
+    return count;
+}
+
+static const char *swift_initializer_type(const swift_inference_t *context,
+                                          swift_binding_work_t *work,
+                                          const CBMTypeAssign *assignment) {
+    const CBMCall *call = swift_initializer_call(context->file, assignment);
+    if (!call) {
+        return NULL;
+    }
+    const char *out[REG_MAX_CANDIDATES];
+    char owner[CBM_SZ_4K];
+    int count = swift_initializer_candidates(context, work, assignment, call, out, owner);
+    return swift_candidates_return_type(context, count, out, owner[0] ? owner : NULL,
+                                        simple_name(call->callee_name));
+}
+
+/* Evaluate only demanded initializer dependencies. Pending entries identify
+ * cycles; capacity exhaustion leaves the dependent binding unknown.
+ * shortcut: at most 8 demanded bindings per call, expand for longer real initializer chains. */
+static void swift_resolve_initializer_bindings(const swift_inference_t *context,
+                                               swift_binding_work_t *work,
+                                               const CBMTypeAssign *assignment) {
+    if (work->count >= SWIFT_INITIALIZER_BINDINGS) {
+        return;
+    }
+    unsigned stack[SWIFT_INITIALIZER_BINDINGS];
+    unsigned depth = SKIP_ONE;
+    stack[0] = work->count++;
+    work->items[stack[0]].assignment = assignment;
+    while (depth) {
+        swift_inferred_binding_t *entry = &work->items[stack[depth - SKIP_ONE]];
+        work->missing = NULL;
+        const char *type = swift_initializer_type(context, work, entry->assignment);
+        if (work->missing) {
+            int dependency = swift_cached_binding(work, work->missing);
+            if (dependency < 0 && work->count < SWIFT_INITIALIZER_BINDINGS) {
+                unsigned next = work->count++;
+                work->items[next].assignment = work->missing;
+                stack[depth++] = next;
+                continue;
+            }
+            type = NULL;
+        }
+        entry->type = type ? type : "";
+        entry->ready = true;
+        depth--;
+    }
+}
+
+static bool swift_receiver_type_text(const char *type, char *out, size_t cap) {
+    size_t n = strcspn(type, "<?! (");
+    size_t metatype_len = sizeof(".Type") - SKIP_ONE;
+    if (n > metatype_len && memcmp(type + n - metatype_len, ".Type", metatype_len) == 0) {
+        n -= metatype_len;
+    }
+    if (n == 0 || n >= cap) {
+        return false;
+    }
+    memcpy(out, type, n);
+    out[n] = '\0';
+    return true;
+}
+
+static bool swift_call_uses_named_receiver(const CBMFileResult *file, const CBMCall *call) {
+    return !file || !strchr(call->callee_name, '.') ||
+           (isupper((unsigned char)call->callee_name[0]) && !strchr(call->callee_name, '('));
+}
+
+/* Walk the receiver chain from its root type: each `name(...)` segment
+ * continues on the return type its compatible candidates agree on. */
+static int swift_receiver_candidates(const swift_inference_t *context, const CBMCall *call,
+                                     char *expression, const char *type, char *member,
+                                     const char **out, int out_cap) {
+    const cbm_registry_t *r = context->registry;
+    bool from_chain = r->swift_owners && cbm_ht_has(r->swift_owners->by_qn, type);
+    while (type && type[0]) {
+        char type_text[CBM_SZ_4K];
+        if (!from_chain && !swift_receiver_type_text(type, type_text, sizeof(type_text))) {
+            return SWIFT_INCOMPATIBLE;
+        }
+        const char *receiver =
+            from_chain
+                ? cbm_ht_get_key(r->exact, type)
+                : swift_receiver_qn(r, context->file, context->graph, type_text, context->module_qn,
+                                    context->imports, context->import_count);
+        if (!receiver) {
+            return SWIFT_INCOMPATIBLE; /* known non-project receiver */
+        }
+        char *args = strchr(member, '(');
+        if (!args) {
+            return swift_typed_candidates(r, context->graph, context->file, context->module_qn,
+                                          call, receiver, member, out, out_cap);
+        }
+        char *after = swift_after_arguments(args);
+        if (!after || *after != '.') {
+            return SWIFT_INCOMPATIBLE;
+        }
+        *args = '\0';
+        const CBMCall *inner = swift_inner_call(context->file, call, (size_t)(args - expression));
+        type = swift_chain_return(context, inner, receiver, member, out, out_cap);
+        from_chain = true;
+        member = after + SKIP_ONE;
+    }
+    return SWIFT_INCOMPATIBLE;
+}
+
+/* A type that only an initializer gives (a constructor call, or a call whose
+ * return type was inferred) narrows the label match: when it has no member
+ * with this name and these labels, the call keeps the label match, as before
+ * initializer types were read (#2061). That holds for every constructor type,
+ * including one the project does not declare (DispatchSemaphore(), Data()). */
+static bool swift_keeps_label_match(const swift_inference_t *context, swift_origin_t origin) {
+    if (context->strict) {
+        return false; /* Inferring an initializer's type: a label match is a guess. */
+    }
+    return origin == SWIFT_ORIGIN_CONSTRUCTED || origin == SWIFT_ORIGIN_INFERRED;
+}
+
+static int swift_candidates_for_file(const swift_inference_t *context, swift_binding_work_t *work,
+                                     const CBMCall *call, const char **out, int out_cap) {
+    const cbm_registry_t *r = context->registry;
+    const CBMFileResult *file = context->file;
+    const char *module_qn = context->module_qn;
+    const char **import_vals = context->imports;
+    int import_count = context->import_count;
+    if (!r || !call || !call->callee_name || !out || out_cap < SKIP_ONE) {
+        return 0;
+    }
+    if (swift_call_uses_named_receiver(file, call)) {
+        const cbm_gbuf_t *graph = context->graph;
+        int named = swift_named_candidates(r, graph, file, call, module_qn, import_vals,
+                                           import_count, out, out_cap);
+        return named == SWIFT_NO_TYPE_RECEIVER
+                   ? cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count,
+                                                   out, out_cap)
+                   : named;
+    }
+    char expression[CBM_SZ_4K];
+    char class_qn[CBM_SZ_4K] = {0};
+    if (strlen(call->callee_name) >= sizeof(expression)) {
+        return SWIFT_INCOMPATIBLE;
+    }
+    (void)snprintf(expression, sizeof(expression), "%s", call->callee_name);
+    char *member = NULL;
+    swift_origin_t origin;
+    const char *type =
+        swift_file_receiver(context, work, call, module_qn, expression, class_qn, &member, &origin);
+    if (!type) {
+        return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
+                                             out_cap);
+    }
+    int found = swift_receiver_candidates(context, call, expression, type, member, out, out_cap);
+    if (found <= 0 && swift_keeps_label_match(context, origin)) {
+        return cbm_registry_swift_candidates(r, call, module_qn, import_vals, import_count, out,
+                                             out_cap);
+    }
+    return found;
+}
+
+int cbm_registry_swift_candidates_in_file(const cbm_registry_t *r, const CBMCall *call,
+                                          const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **out, int out_cap) {
+    swift_binding_work_t work = {0};
+    swift_inference_t context = {
+        .registry = r,
+        .file = file,
+        .graph = graph,
+        .module_qn = module_qn,
+        .imports = import_vals,
+        .import_count = import_count,
+    };
+    for (unsigned attempt = 0; attempt <= SWIFT_INITIALIZER_BINDINGS; attempt++) {
+        work.missing = NULL;
+        int count = swift_candidates_for_file(&context, &work, call, out, out_cap);
+        if (!work.missing) {
+            return count;
+        }
+        if (work.count >= SWIFT_INITIALIZER_BINDINGS) {
+            return SWIFT_INCOMPATIBLE;
+        }
+        swift_resolve_initializer_bindings(&context, &work, work.missing);
+    }
+    return SWIFT_INCOMPATIBLE;
+}
+
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
+}
+
+static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
+    return lang == CBM_LANG_PYTHON ? cbm_fqn_symbol_scope_len(module_qn)
+                                   : (module_qn ? strlen(module_qn) : 0);
+}
+
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           CBMLanguage lang) {
+    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, lang_scope_len(module_qn, lang), false);
+}
+
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang) {
+    /* A bare C call never names a member: a struct member is reached through
+     * its object (cbm_call_onto_field_policy refuses every Field it lands on)
+     * and C has no methods. So its Field and Method namesakes do not compete
+     * for the name; a C member call and every other language keep them. */
+    bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
+                        !strstr(callee_name, "->");
+    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
+}
+
+/* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
+
+/* Method QNs are path-based: <project>.<dirs>.<file stem>.<Class>.<method>.
+ * A PHP class is named by its namespace instead, so a "Ns\\Class::method"
+ * handler is placed on a QN by what places the class file itself. */
+#define CONF_PSR4_MEMBER 0.95
+#define CONF_NAMESPACE_PATH_MEMBER 0.90
+
+static bool seg_eq_nocase(const char *a, size_t alen, const char *b, size_t blen) {
+    if (alen != blen) {
+        return false;
+    }
+    for (size_t i = 0; i < alen; i++) {
+        char ca = (char)((a[i] >= 'A' && a[i] <= 'Z') ? a[i] - 'A' + 'a' : a[i]);
+        char cb = (char)((b[i] >= 'A' && b[i] <= 'Z') ? b[i] - 'A' + 'a' : b[i]);
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Does qn end with ".<cls>.<member>"? Returns the offset of that tail or -1. */
+static int qn_class_member_tail(const char *qn, const char *cls, size_t cls_len,
+                                const char *member) {
+    size_t qlen = strlen(qn);
+    size_t mlen = strlen(member);
+    if (qlen < cls_len + mlen + PAIR_LEN) {
+        return CBM_NOT_FOUND;
+    }
+    const char *m = qn + qlen - mlen;
+    const char *c = m - SKIP_ONE - cls_len;
+    if (strcmp(m, member) != 0 || m[-SKIP_ONE] != '.' || strncmp(c, cls, cls_len) != 0 ||
+        c[-SKIP_ONE] != '.') {
+        return CBM_NOT_FOUND;
+    }
+    return (int)(c - SKIP_ONE - qn);
+}
+
+/* PSR-4: the class file Composer's autoloader loads for the FQN, the class it
+ * defines, and that class's member — through the PSR-4 import resolver
+ * (cbm_pipeline_psr4_member_qn), so a root whose folder does not mirror its
+ * namespace (Acme\\Blog\\ -> packages/blog/src) places the class as well.
+ * Returns its tri-state outcome; *out_qn is the member QN when RESOLVED. */
+static cbm_psr4_member_t psr4_member_qn(const cbm_gbuf_t *gbuf, const char *fqn, size_t fqn_len,
+                                        const char *member, const char **out_qn) {
+    char cls_fqn[CBM_SZ_512];
+    *out_qn = NULL;
+    if (!gbuf || fqn_len >= sizeof(cls_fqn)) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    memcpy(cls_fqn, fqn, fqn_len);
+    cls_fqn[fqn_len] = '\0';
+    return cbm_pipeline_psr4_member_qn(gbuf, cls_fqn, member, out_qn);
+}
+
+/* Do the directory segments of qn (between the project root segment and the
+ * file stem, i.e. before offset tail = ".<Class>.<member>") end with every
+ * segment of the namespace fqn[0, ns_len)? Case-insensitive: App\\Http is
+ * conventionally app/Http. An empty namespace is trivially aligned. */
+static bool namespace_matches_dirs(const char *qn, int tail, const char *fqn, size_t ns_len) {
+    const char *root_dot = strchr(qn, '.');
+    const char *stem_end = qn + tail;
+    if (!root_dot || stem_end <= root_dot) {
+        return false;
+    }
+    const char *dir_end = stem_end - SKIP_ONE; /* back over the file stem */
+    while (*dir_end != '.') {
+        dir_end--;
+    }
+    size_t ns_end = ns_len;
+    while (ns_end > 0) {
+        size_t ns_start = ns_end;
+        while (ns_start > 0 && fqn[ns_start - SKIP_ONE] != '\\') {
+            ns_start--;
+        }
+        if (dir_end <= root_dot) {
+            return false; /* more namespace segments than directories */
+        }
+        const char *dir_start = dir_end;
+        while (dir_start[-SKIP_ONE] != '.') {
+            dir_start--;
+        }
+        if (!seg_eq_nocase(fqn + ns_start, ns_end - ns_start, dir_start,
+                           (size_t)(dir_end - dir_start))) {
+            return false;
+        }
+        dir_end = dir_start - SKIP_ONE;
+        ns_end = ns_start > 0 ? ns_start - SKIP_ONE : 0;
+    }
+    return true;
+}
+
+/* Namespace/path alignment: the one "<Class>.<member>" candidate that sits
+ * where its namespace says. NULL when none or several do. */
+static const char *aligned_member_qn(const cbm_registry_t *r, const char *fqn, size_t ns_len,
+                                     const char *cls, size_t cls_len, const char *member) {
+    const qn_array_t *arr = cbm_ht_get(r->by_name, member);
+    const char *match = NULL;
+    for (int i = 0; arr && i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        int tail = qn_class_member_tail(qn, cls, cls_len, member);
+        if (tail == CBM_NOT_FOUND || !namespace_matches_dirs(qn, tail, fqn, ns_len)) {
+            continue;
+        }
+        if (match) {
+            return NULL; /* ambiguous */
+        }
+        match = qn;
+    }
+    return match;
+}
+
+cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count,
+                                              const cbm_gbuf_t *gbuf, CBMLanguage lang) {
+    const char *sep = handler_ref ? strstr(handler_ref, "::") : NULL;
+    if (!r || !sep) {
+        return cbm_registry_resolve_lang(r, handler_ref, module_qn, import_map_keys,
+                                         import_map_vals, import_map_count, lang);
+    }
+    const char *member = sep + PAIR_LEN;
+    size_t fqn_len = (size_t)(sep - handler_ref);
+    size_t ns_len = fqn_len;
+    while (ns_len > 0 && handler_ref[ns_len - SKIP_ONE] != '\\') {
+        ns_len--;
+    }
+    const char *cls = handler_ref + ns_len;
+    size_t cls_len = fqn_len - ns_len;
+    ns_len = ns_len > 0 ? ns_len - SKIP_ONE : 0; /* drop the separator before the class */
+    if (cls_len == 0 || !member[0]) {
+        return empty_result();
+    }
+    const char *qn = NULL;
+    switch (psr4_member_qn(gbuf, handler_ref, fqn_len, member, &qn)) {
+    case CBM_PSR4_MEMBER_RESOLVED:
+        return (cbm_resolution_t){qn, "php_psr4", CONF_PSR4_MEMBER, REG_RESOLVED};
+    case CBM_PSR4_MEMBER_UNRESOLVED:
+        /* A covered class lives where PSR-4 says or nowhere; a namespace-
+         * mirroring folder elsewhere would be a guessed edge (#1186). */
+        return empty_result();
+    case CBM_PSR4_MEMBER_NOT_COVERED:
+        break;
+    }
+    qn = aligned_member_qn(r, handler_ref, ns_len, cls, cls_len, member);
+    if (qn) {
+        return (cbm_resolution_t){qn, "php_namespace_path", CONF_NAMESPACE_PATH_MEMBER,
+                                  REG_RESOLVED};
+    }
+    return empty_result();
+}
+
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+    /* Relation-permitting variant for SQL FROM/JOIN lineage usages ONLY.
+     * Deliberately uncached: the per-file cache is keyed by bare callee_name
+     * and stores the relation-vetoed answer of the default variant — sharing
+     * it would poison one variant with the other's semantics. SQL files hold
+     * few distinct relation refs, so the chain walk stays cheap. */
+    return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
+}
+
+/* Python looks a bare name up in the calling def's own scope, then in each
+ * enclosing def's scope, and only then in the module and the builtins; a class
+ * body is never among them. So a bare `index()` in create_app, or `visit(...)`
+ * in a def nested in method Tree.visit, names the def bound in the nearest
+ * enclosing def -- create_app.index, Tree.visit.visit -- before anything a
+ * module-wide strategy would find. Walks scope_qn outward while its prefixes
+ * are registered defs or classes (skipping the classes) and stops at the
+ * caller's module (`module_qn`), which the other strategies own -- a
+ * same-QN function of a package __init__.py is never an enclosing scope.
+ * Empty unless such a local exists. Uncached: the answer depends on the
+ * caller, not only on the name. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn, const char *module_qn) {
+    char scope[CBM_SZ_512];
+    char candidate[CBM_SZ_512];
+    size_t len = scope_qn ? strlen(scope_qn) : 0;
+    size_t floor = python_def_prefix_len(module_qn, scope_qn);
+    if (!r || !callee_name || !callee_name[0] || strchr(callee_name, '.') ||
+        strstr(callee_name, "::") || len == 0 || len >= sizeof(scope) || floor == 0) {
+        return empty_result();
+    }
+    memcpy(scope, scope_qn, len + SKIP_ONE);
+    while (strlen(scope) > floor) {
+        const char *label = cbm_ht_get(r->exact, scope);
+        if (!label) {
+            break;
+        }
+        if (registry_label_is_callable(label)) {
+            int n = snprintf(candidate, sizeof(candidate), "%s.%s", scope, callee_name);
+            const char *stored_key =
+                n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
+            if (stored_key) {
+                return (cbm_resolution_t){stored_key, "lexical_scope", CONF_LEXICAL_SCOPE,
+                                          REG_RESOLVED};
+            }
+        }
+        char *dot = strrchr(scope, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+    }
+    return empty_result();
+}
+
+/* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run
+ * once the LSP has not answered: a Python bare name bound in an enclosing def
+ * first (the LSP binds those locals itself; this covers the sites it did not
+ * resolve), then the language-aware chain. One entry point, so the two
+ * resolvers cannot diverge on the rule. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                  const char *module_qn,
+                                                  const char **import_map_keys,
+                                                  const char **import_map_vals,
+                                                  int import_map_count, CBMLanguage lang,
+                                                  const char *scope_qn) {
+    if (lang == CBM_LANG_PYTHON) {
+        cbm_resolution_t lexical =
+            cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
+        if (lexical.qualified_name && lexical.qualified_name[0]) {
+            return lexical;
+        }
+    }
+    return cbm_registry_resolve_call_lang(r, callee_name, module_qn, import_map_keys,
+                                          import_map_vals, import_map_count, lang);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
@@ -956,8 +4768,8 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     if (fcount == 0) {
         /* No import-reachable — use originals with penalty */
-        const char *best =
-            best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+        const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                                   qn_lang_flags(arr), arr->count, module_qn);
         if (!best) {
             return no_match;
         }
@@ -971,7 +4783,9 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
             true};
     }
-    const char *best = best_by_import_distance(fptr, fcount, module_qn);
+    const bool all = fptr == (const char **)arr->items;
+    const char *best = best_by_import_distance(r, fptr, all ? qn_test_flags(arr) : NULL,
+                                               all ? qn_lang_flags(arr) : NULL, fcount, module_qn);
     if (!best) {
         return no_match;
     }
@@ -1012,14 +4826,14 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 
     /* Build ".suffix" target */
     size_t slen = strlen(suffix);
-    char *target = malloc(slen + REG_SUFFIX_ALLOC);
+    char *target = cbm_alloc(CBM_MEM_CLASS_OTHER, slen + REG_SUFFIX_ALLOC);
     target[0] = '.';
     memcpy(target + SKIP_ONE, suffix, slen + SKIP_ONE);
 
     struct few_ctx ctx = {target, slen + SKIP_ONE, NULL, 0, 0};
     cbm_ht_foreach(r->exact, few_scan, &ctx);
 
-    free(target);
+    cbm_free(CBM_MEM_CLASS_OTHER, target);
     *out = ctx.results;
     return ctx.count;
 }

@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 /* stdlib.h declares getenv (cbm_tmpdir) and, on Windows, _putenv_s (cbm_setenv/
  * cbm_unsetenv). The x86-64 mingw toolchain pulled it in transitively, but the
@@ -96,6 +97,19 @@ static inline int cbm_nanosleep(const struct timespec *req, struct timespec *rem
 #define cbm_nanosleep nanosleep
 #endif
 
+/* Sleeps for the full requested duration even when POSIX signals interrupt it. */
+int cbm_nanosleep_full(const struct timespec *req);
+
+/* Per-CALLING-THREAD CPU time in nanoseconds. Unlike cbm_clock_gettime — which
+ * measures WALL time on every platform (QueryPerformanceCounter on Windows) —
+ * this advances only while the calling thread is actually scheduled on a CPU, so
+ * a descheduled/starved thread accrues (almost) none. Use it to budget work
+ * against real CPU consumed rather than wall-clock, which a contended host
+ * inflates without the thread doing any work. POSIX (incl. macOS 10.12+):
+ * CLOCK_THREAD_CPUTIME_ID. Windows: GetThreadTimes kernel+user. Returns 0 if the
+ * platform clock is unavailable. Implemented in compat.c. */
+uint64_t cbm_thread_cpu_time_ns(void);
+
 /* ── gmtime_r (Windows lacks it) ─────────────────────────────── */
 #ifdef _WIN32
 static inline struct tm *cbm_gmtime_r(const time_t *timep, struct tm *result) {
@@ -152,11 +166,9 @@ static inline int cbm_setenv(const char *name, const char *value, int overwrite)
         free(wide_value);
         return EINVAL;
     }
-    /* Keep the CRT's narrow environment useful for legacy getenv callers,
-     * then repair the process-wide Windows environment with the actual UTF-16
-     * value. _putenv_s alone routes UTF-8 path bytes through the active ANSI
-     * code page, which corrupts non-ASCII cache roots inherited by children. */
-    int status = _putenv_s(name, value);
+    /* _putenv_s can reject UTF-8 bytes outside the active ANSI code page.
+     * Narrow getenv returns bytes in that code page after this wide update. */
+    int status = _wputenv_s(wide_name, wide_value);
     if (status == 0 && !SetEnvironmentVariableW(wide_name, wide_value)) {
         status = EINVAL;
     }

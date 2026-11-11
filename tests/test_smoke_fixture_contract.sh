@@ -5,13 +5,28 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-python3 - "$ROOT" <<'PY'
+# PR smoke runs the legs scripts/ci/select-lanes.sh selects, so the paths the
+# release-fixture smoke depends on are checked against its real decisions.
+SMOKE_DECISIONS=""
+for changed_path in install.sh install.ps1 scripts/smoke-local.sh \
+    scripts/smoke-fixture-server.py scripts/gen-third-party-notices.sh \
+    test-infrastructure/vm/vm-smoke.sh test-infrastructure/vm/windows-user-path-guard.ps1; do
+    decision=$(printf '%s\n' "$changed_path" | bash "$ROOT/scripts/ci/select-lanes.sh")
+    SMOKE_DECISIONS="$SMOKE_DECISIONS$changed_path $decision
+"
+done
+
+python3 - "$ROOT" "$SMOKE_DECISIONS" <<'PY'
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -69,6 +84,46 @@ require(
     "smoke-local.sh must not reserve/release a port or launch a separate http.server",
 )
 
+# Every environment variable the CLI honours ahead of $HOME. A fixture that
+# redirects only HOME still resolves these to the developer's real config, so
+# both the shell fixtures and the C runner must neutralize the whole set.
+CLIENT_HOME_OVERRIDES = (
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "KIRO_HOME",
+    "HERMES_HOME",
+    "QWEN_HOME",
+    "CLINE_DATA_DIR",
+    "OPENCLAW_HOME",
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_CONFIG_PATH",
+    "OPENCLAW_WORKSPACE_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "COPILOT_HOME",
+    "CRUSH_GLOBAL_CONFIG",
+    "VIBE_HOME",
+    "GLAB_CONFIG_DIR",
+    "KIMI_CODE_HOME",
+    "CBM_CONTINUE_CONFIG_PATH",
+    "CBM_TRAE_CONFIG_PATH",
+    "CBM_ROO_CONFIG_PATH",
+    "CBM_CODY_CONFIG_PATH",
+    "OMP_PROFILE",
+    "PI_CODING_AGENT_DIR",
+)
+
+# The C suite exercises the same install/uninstall paths as the shell fixtures,
+# so it needs the same neutralization — otherwise a green run on a developer
+# machine only proves the ambient config happened to be writable.
+test_main = read("tests/test_main.c")
+for variable in CLIENT_HOME_OVERRIDES:
+    require(
+        f'"{variable}"' in test_main,
+        f"tests/test_main.c must neutralize ambient {variable}",
+    )
+
 for relative, source in (
     ("scripts/smoke-local.sh", smoke_local),
     ("test-infrastructure/vm/vm-smoke.sh", vm_smoke),
@@ -89,31 +144,7 @@ for relative, source in (
         'wait "$SERVER_PID"' in source,
         f"{relative} cleanup must reap the fixture-server process",
     )
-    for variable in (
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "KIRO_HOME",
-        "HERMES_HOME",
-        "QWEN_HOME",
-        "CLINE_DATA_DIR",
-        "OPENCLAW_HOME",
-        "OPENCLAW_STATE_DIR",
-        "OPENCLAW_PROFILE",
-        "OPENCLAW_CONFIG_PATH",
-        "OPENCLAW_WORKSPACE_DIR",
-        "OPENCODE_CONFIG",
-        "OPENCODE_CONFIG_DIR",
-        "COPILOT_HOME",
-        "CRUSH_GLOBAL_CONFIG",
-        "VIBE_HOME",
-        "GLAB_CONFIG_DIR",
-        "KIMI_CODE_HOME",
-        "CBM_CONTINUE_CONFIG_PATH",
-        "CBM_TRAE_CONFIG_PATH",
-        "CBM_ROO_CONFIG_PATH",
-        "CBM_CODY_CONFIG_PATH",
-        "CBM_TEST_WINDOWS_USER_PATH_RUN_ID",
-    ):
+    for variable in CLIENT_HOME_OVERRIDES + ("CBM_TEST_WINDOWS_USER_PATH_RUN_ID",):
         require(
             f"-u {variable}" in source,
             f"{relative} must neutralize ambient {variable}",
@@ -245,6 +276,13 @@ require(
     and "cli_windows_smoke_download_url_valid" in cli_source
     and "CbmSmokeRunId" in cli_source,
     "the Windows PATH test seam must be run-ID-only, sentinel-bound, and loopback-gated",
+)
+require(
+    "cli_remove_windows_user_path" in cli_source
+    and "Removed %s from the current-user PATH" in cli_source
+    and "Would remove %s from the current-user PATH" in cli_source,
+    "uninstall must remove exactly its own segment from the current-user PATH (#2117), "
+    "or repeated install/uninstall cycles grow the User PATH without bound",
 )
 
 # Every maintained local/PR native leg enters through the fixture wrapper.
@@ -382,22 +420,181 @@ require(
     "Phase 14 must assert update leaves the binary byte-identical",
 )
 
-for changed_path in (
-    "install\\.(sh|ps1)",
-    "scripts/smoke-local",
-    "scripts/smoke-fixture-server",
-    "scripts/gen-third-party-notices",
-    "test-infrastructure/vm/vm-smoke",
-    "windows-user-path-guard",
-):
+for line in sys.argv[2].splitlines():
+    changed_path, decision = line.split(" ", 1)
     require(
-        changed_path in pr_workflow,
-        f"PR product-change detector must include {changed_path}",
+        {"smoke-ubuntu", "smoke-mac", "smoke-win"} <= set(json.loads(decision)["lanes"]),
+        f"a change to {changed_path} must select all three PR smoke legs",
     )
 require(
     "tests/test_smoke_fixture_contract.sh" in test_driver,
     "scripts/test.sh must run the smoke fixture contract",
 )
+
+# Functional wrapper contract: install.sh must pass its wrapper-only selectors
+# to the downloaded candidate, while retaining the existing dir/skip controls.
+# Native Windows ships and exercises install.ps1; the Unix wrapper is covered
+# on both macOS and Linux venue legs.
+if sys.platform != "win32":
+    with tempfile.TemporaryDirectory(prefix="cbm-install-wrapper-") as temp:
+        temp_path = pathlib.Path(temp)
+        fixture = temp_path / "fixture"
+        payload = temp_path / "payload"
+        fixture.mkdir()
+        payload.mkdir()
+
+        uname_s = subprocess.check_output(["uname", "-s"], text=True).strip()
+        uname_m = subprocess.check_output(["uname", "-m"], text=True).strip()
+        os_name = "darwin" if uname_s == "Darwin" else "linux"
+        if uname_m in ("arm64", "aarch64"):
+            arch_name = "arm64"
+        else:
+            arch_name = "amd64"
+        portable = "-portable" if os_name == "linux" else ""
+        archive_name = (
+            f"codebase-memory-mcp-{os_name}-{arch_name}{portable}.tar.gz"
+        )
+        archive = fixture / archive_name
+
+        candidate = payload / "codebase-memory-mcp"
+        candidate.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [ \"${1:-}\" = --version ]; then echo 'cbm fixture 0'; exit 0; fi\n"
+            "if [ \"${1:-}\" != install ]; then exit 64; fi\n"
+            "printf '%s\\n' \"$@\" > \"$CBM_INSTALL_ARG_LOG\"\n"
+            "target=''\n"
+            "for arg in \"$@\"; do case \"$arg\" in --dir=*) target=${arg#--dir=} ;; esac; done\n"
+            "[ -n \"$target\" ] || exit 65\n"
+            "mkdir -p \"$target\"\n"
+            "cp \"$0\" \"$target/codebase-memory-mcp\"\n",
+            encoding="utf-8",
+        )
+        candidate.chmod(0o755)
+        (payload / "LICENSE").write_text("fixture license\n", encoding="utf-8")
+        (payload / "install.sh").write_text(install_script, encoding="utf-8")
+        (payload / "THIRD_PARTY_NOTICES.md").write_text(
+            "fixture notices\n", encoding="utf-8"
+        )
+        with tarfile.open(archive, "w:gz") as bundle:
+            for name in (
+                "codebase-memory-mcp",
+                "LICENSE",
+                "install.sh",
+                "THIRD_PARTY_NOTICES.md",
+            ):
+                bundle.add(payload / name, arcname=name)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        (fixture / "checksums.txt").write_text(
+            f"{digest}  {archive_name}\n", encoding="ascii"
+        )
+
+        # Replace curl only inside the subprocess environment. The wrapper still
+        # performs its real archive/checksum/extraction flow, but all bytes come
+        # from this generated fixture and no socket is opened.
+        fake_bin = temp_path / "fake-bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, shutil, sys, urllib.parse\n"
+            "args = sys.argv[1:]\n"
+            "target = pathlib.Path(args[args.index('-o') + 1])\n"
+            "name = pathlib.PurePosixPath(urllib.parse.urlparse(args[-1]).path).name\n"
+            "shutil.copyfile(pathlib.Path(os.environ['CBM_INSTALL_FIXTURE']) / name, target)\n",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+
+        wrapper = root / "install.sh"
+        help_result = subprocess.run(
+            [str(wrapper), "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+        require(
+            help_result.returncode == 0
+            and "--dir" in help_result.stdout
+            and "--skip-config" in help_result.stdout
+            and "--clients" in help_result.stdout,
+            "install.sh --help must document dir, skip-config, and clients",
+        )
+
+        base_env = dict(os.environ)
+        base_env.update(
+            CBM_DOWNLOAD_URL="http://127.0.0.1:9",
+            CBM_INSTALL_FIXTURE=str(fixture),
+            HOME=str(temp_path / "home"),
+            PATH=f"{fake_bin}{os.pathsep}{base_env['PATH']}",
+        )
+        pathlib.Path(base_env["HOME"]).mkdir()
+
+        def run_wrapper(
+            log_name: str, *arguments: str
+        ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+            argument_log = temp_path / log_name
+            env = dict(base_env)
+            env["CBM_INSTALL_ARG_LOG"] = str(argument_log)
+            result = subprocess.run(
+                [str(wrapper), *arguments],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=20,
+                check=False,
+            )
+            logged = (
+                argument_log.read_text(encoding="utf-8").splitlines()
+                if argument_log.is_file()
+                else []
+            )
+            return result, logged
+
+        unknown, unknown_args = run_wrapper(
+            "unknown-args.log", "--definitely-not-a-wrapper-flag"
+        )
+        require(
+            unknown.returncode == 2
+            and "Please consult --help." in unknown.stdout
+            and not unknown_args,
+            "install.sh must reject unknown flags before executing the candidate",
+        )
+
+        selected_dir = temp_path / "selected-bin"
+        selected, selected_args = run_wrapper(
+            "selected-args.log",
+            f"--dir={selected_dir}",
+            "--clients=claude,codex",
+            "--skip-config",
+        )
+        require(
+            selected.returncode == 0
+            and selected_args
+            == [
+                "install",
+                "-y",
+                "--force",
+                f"--dir={selected_dir}",
+                "--clients=claude,codex",
+                "--skip-config",
+            ],
+            "install.sh must forward the explicit clients selector with dir and skip-config",
+        )
+
+        ordinary_dir = temp_path / "ordinary-bin"
+        ordinary, ordinary_args = run_wrapper(
+            "ordinary-args.log", f"--dir={ordinary_dir}"
+        )
+        require(
+            ordinary.returncode == 0
+            and ordinary_args
+            == ["install", "-y", "--force", f"--dir={ordinary_dir}"],
+            "install.sh without selectors must preserve the ordinary install arguments",
+        )
 
 # Functional check: the helper must publish a live kernel-assigned port and
 # serve the exact expected artifact. This is intentionally build-free.

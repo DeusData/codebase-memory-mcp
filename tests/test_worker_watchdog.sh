@@ -65,7 +65,10 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+# shellcheck source=../scripts/test-runtime.sh
+source "${ROOT}/scripts/test-runtime.sh"
+cbm_test_runtime_init
+tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -79,7 +82,7 @@ cleanup() {
     [[ -n "${descendant_pid}" ]] && kill -9 "${descendant_pid}" 2>/dev/null || true
   fi
   [[ -n "${wrapper_pid}" ]] && kill -9 "${wrapper_pid}" 2>/dev/null || true
-  rm -rf "${tmpdir}"
+  cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 
@@ -106,7 +109,7 @@ SH
 chmod +x "${tmpdir}/wrapper.sh"
 
 CBM_BINARY="${BINARY}" BUILD_FINGERPRINT="${BUILD_FINGERPRINT}" TMPDIR_PATH="${tmpdir}" \
-  ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\"}" \
+  ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\",$(cbm_test_index_worker_policy_json)}" \
   CBM_TEST_HANG_ON=hang_me \
   CBM_TEST_WORKER_DESCENDANT_PID_FILE="${tmpdir}/descendant.pid" \
   "${tmpdir}/wrapper.sh" &

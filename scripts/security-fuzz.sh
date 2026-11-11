@@ -22,11 +22,14 @@ PASS=0
 TOTAL=0
 
 # Temp directory for input files (avoids pipe/stdin issues with timeout)
-FUZZ_TMPDIR=$(mktemp -d)
-trap 'rm -rf "$FUZZ_TMPDIR"' EXIT
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+FUZZ_TMPDIR="$CBM_TEST_RUNTIME_ROOT"
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 FUZZ_HOME="$FUZZ_TMPDIR/home"
-FUZZ_CACHE="$FUZZ_TMPDIR/cache"
-mkdir -p "$FUZZ_HOME" "$FUZZ_CACHE"
+mkdir "$FUZZ_HOME"
+export HOME="$FUZZ_HOME"
 
 # Helper: send a payload to the MCP server and check it doesn't crash.
 # Uses temp file + perl alarm for portable timeout (works on macOS + Linux).
@@ -49,11 +52,9 @@ test_payload() {
     # Run with 10s timeout: GNU timeout → perl alarm fallback
     local ec=0
     if command -v timeout &>/dev/null; then
-        HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
-            timeout 10 "$BINARY" < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
+        timeout 10 "$BINARY" < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
     else
-        HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
-            perl -e 'alarm(10); exec @ARGV' -- "$BINARY" \
+        perl -e 'alarm(10); exec @ARGV' -- "$BINARY" \
             < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
     fi
 
@@ -88,8 +89,7 @@ test_invalid_index_interactive() {
     local tmpoutput="$FUZZ_TMPDIR/output_${TOTAL}.jsonl"
     local ec=0
 
-    HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
-        python3 "$(dirname "$0")/test_mcp_interactive.py" "$BINARY" \
+    python3 "$(dirname "$0")/test_mcp_interactive.py" "$BINARY" \
         --scenario invalid-index --repo-path /nonexistent/path/abc123 \
         --response-timeout 45 --exit-timeout 15 > "$tmpoutput" 2>&1 || ec=$?
 
@@ -114,6 +114,19 @@ test_payload "missing id" '{"jsonrpc":"2.0","method":"tools/call"}'
 test_payload "wrong jsonrpc version" '{"jsonrpc":"1.0","id":2,"method":"tools/call","params":{}}'
 test_payload "array instead of object" '[1,2,3]'
 test_payload "deeply nested json" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"name_pattern":{"a":{"b":{"c":{"d":{"e":{"f":"deep"}}}}}}}}}'
+
+echo ""
+echo "--- Wrong JSON types ---"
+
+test_payload "null tool name" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":null,"arguments":{}}}'
+test_payload "numeric tool name" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":42,"arguments":{}}}'
+test_payload "object tool name" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":{"a":1},"arguments":{}}}'
+test_payload "array arguments" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":[1,2]}}'
+test_payload "string arguments" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":"nope"}}'
+test_payload "null arguments" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":null}}'
+test_payload "array params" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":[1,2]}'
+test_payload "numeric params" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":7}'
+test_payload "numeric method" '{"jsonrpc":"2.0","id":2,"method":7,"params":{}}'
 
 echo ""
 echo "--- Oversized inputs ---"

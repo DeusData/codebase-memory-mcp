@@ -1,0 +1,124 @@
+==================
+Builder function
+==================
+
+@Builder
+function GlobalCard(title: string) {
+  Column() {
+    Text(title)
+  }
+}
+
+---
+
+(program
+  (function_declaration
+    (decorator
+      (identifier))
+    (identifier)
+    (formal_parameters
+      (required_parameter
+        (identifier)
+        (type_annotation
+          (predefined_type))))
+    (statement_block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments)
+          (statement_block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (arguments
+                  (identifier))))))))))
+
+==================
+Extend function with implicit-receiver attributes
+==================
+
+@Extend(Text)
+function fancy(size: number) {
+  .fontSize(size)
+  .fontColor(Color.Red)
+}
+
+---
+
+(program
+  (function_declaration
+    (decorator
+      (call_expression
+        (identifier)
+        (arguments
+          (identifier))))
+    (identifier)
+    (formal_parameters
+      (required_parameter
+        (identifier)
+        (type_annotation
+          (predefined_type))))
+    (statement_block
+      (extend_attribute_chain
+        (extend_attribute
+          (property_identifier)
+          (arguments
+            (identifier)))
+        (extend_attribute
+          (property_identifier)
+          (arguments
+            (member_expression
+              (identifier)
+              (property_identifier))))))))
+
+==================
+Styles function
+==================
+
+@Styles
+function pressedStyle() {
+  .backgroundColor('#eee')
+}
+
+---
+
+(program
+  (function_declaration
+    (decorator
+      (identifier))
+    (identifier)
+    (formal_parameters)
+    (statement_block
+      (extend_attribute_chain
+        (extend_attribute
+          (property_identifier)
+          (arguments
+            (string
+              (string_fragment))))))))
+
+==================
+Plain function unchanged
+==================
+
+export function helper(x: number): number {
+  return x * 2
+}
+
+---
+
+(program
+  (export_statement
+    (function_declaration
+      (identifier)
+      (formal_parameters
+        (required_parameter
+          (identifier)
+          (type_annotation
+            (predefined_type))))
+      (type_annotation
+        (predefined_type))
+      (statement_block
+        (return_statement
+          (binary_expression
+            (identifier)
+            (number)))))))

@@ -1,0 +1,15 @@
+--- a/grammar.js
++++ b/grammar.js
+@@ -1193,7 +1193,11 @@
+ 		kIfndef:           $ => /ifndef/i,
+ 		kEndif:            $ => /endif/i,
+ 
+-		identifier:        $ => /[&]?[a-zA-Z_]+[0-9_a-zA-Z]*/,
++		// cbm fork (#2211): Delphi accepts non-ASCII letters in identifiers (e.g. the
++		// Cyrillic member names of 1C's OLE API); upstream is ASCII-only, so such a
++		// name became an ERROR node. Keywords are still extracted from this `word`
++		// token, so `begin`/`end`/`procedure` lex exactly as before.
++		identifier:        $ => /[&]?[\p{L}_][\p{L}\p{M}\p{Nd}_]*/,
+ 
+ 	  	_space:            $ => /[\s\r\n\t]+/,
+ 		pp:                $ => /\{\$[^}]*\}/,

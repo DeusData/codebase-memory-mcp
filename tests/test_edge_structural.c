@@ -257,7 +257,9 @@ static const char *ES_ALL_EDGE_TYPES[] = {"CALLS",
                                           "IMPORTS",
                                           "INHERITS",
                                           "INFRA_MAPS",
+                                          "MENTIONS",
                                           "OVERRIDE",
+                                          "REFERENCES_FILE",
                                           "SEMANTICALLY_RELATED",
                                           "SIMILAR_TO",
                                           "TESTS_FILE",
@@ -404,6 +406,32 @@ TEST(es_calls_crossfile_typescript) {
          "import { format } from './util';\n\n"
          "export function run(input: string): string {\n    return format(input);\n}\n"}};
     ASSERT_TRUE(es_edge_present(f, 2, "CALLS", 1)); /* run -> format */
+    PASS();
+}
+
+TEST(es_calls_vue_embedded_issue1410) {
+    static const ES_LangFile f[] = {
+        {"App.vue",
+         "<template><p>Vue</p></template>\n"
+         "<script setup lang=\"ts\">\n"
+         "function callee(): number { return 42; }\n"
+         "function caller(): number { return callee(); }\n"
+         "</script>\n"},
+    };
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
+    PASS();
+}
+
+TEST(es_calls_svelte_embedded_issue1807) {
+    static const ES_LangFile f[] = {
+        {"Toggle.svelte",
+         "<script lang=\"ts\">\n"
+         "function callee(): number { return 42; }\n"
+         "function caller(): number { return callee(); }\n"
+         "</script>\n"
+         "<button on:click={caller}>Toggle</button>\n"},
+    };
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
     PASS();
 }
 
@@ -798,14 +826,31 @@ TEST(es_decorates_attribute_csharp) {
  * resolves in the registry.  pass_usages.c handles this.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Python constructor syntax is a CALLS edge to the materialized Class node. */
+/* Python ClassName() with a user __init__ is a CALLS edge to that method.
+ * The Class node no longer receives the instantiation edge. A class with no
+ * user __init__ still targets the Class (lsp_constructor). */
 TEST(es_usage_crossfile_python) {
     static const ES_LangFile f[] = {
         {"models.py",
          "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py",
          "from .models import User\n\n\ndef create_user(name):\n    return User(name)\n"}};
-    ASSERT_EQ(es_exact_edge_by_name(f, 2, "CALLS", "create_user", "User"), 1);
+    ASSERT_EQ(es_exact_edge_by_name(f, 2, "CALLS", "create_user", "__init__"), 1);
+    ASSERT_EQ(es_exact_edge_by_name(f, 2, "CALLS", "create_user", "User"), 0);
+    PASS();
+}
+
+/* Issue #1642 repro: build() -> Embedder.__init__, not the Embedder class. */
+TEST(es_calls_python_constructor_init) {
+    static const ES_LangFile f[] = {
+        {"main.py", "class Embedder:\n"
+                    "    def __init__(self, model=\"x\"):\n"
+                    "        self.model = model\n"
+                    "\n"
+                    "def build():\n"
+                    "    return Embedder(model=\"y\")\n"}};
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "build", "__init__"), 1);
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "build", "Embedder"), 0);
     PASS();
 }
 
@@ -913,6 +958,8 @@ SUITE(edge_structural) {
     RUN_TEST(es_calls_crossfile_java);
     RUN_TEST(es_calls_crossfile_kotlin);
     RUN_TEST(es_calls_crossfile_csharp);
+    RUN_TEST(es_calls_vue_embedded_issue1410);
+    RUN_TEST(es_calls_svelte_embedded_issue1807);
 
     /* ── FAMILY 2: INHERITS cross-file ────────────────────────── */
     /* GREEN: Java, C#, C++ (extraction confirmed correct). */
@@ -952,6 +999,7 @@ SUITE(edge_structural) {
     /* ── FAMILY 7: USAGE cross-file ─────────────────────────── */
     /* Uncertain: depends on USAGE extraction for each language. */
     RUN_TEST(es_usage_crossfile_python);
+    RUN_TEST(es_calls_python_constructor_init);
     RUN_TEST(es_usage_crossfile_typescript);
     RUN_TEST(es_usage_crossfile_go);
 

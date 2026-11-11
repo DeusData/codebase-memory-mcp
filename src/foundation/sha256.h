@@ -17,6 +17,14 @@ typedef struct {
     uint64_t bitlen;
     uint8_t buf[64];
     size_t buflen;
+    /* Message-schedule scratch for one compression round. It lives in the
+     * context rather than in sha256_transform's own frame because a 256-byte
+     * local there is large enough for ASan's use-after-return fake stack,
+     * which then heap-allocates it on EVERY 64-byte block — millions of
+     * __asan_stack_malloc calls to fingerprint one large file, turning
+     * sanitized binary fingerprinting into minutes. Here it is allocated once
+     * per hash instead of once per block. */
+    uint32_t sched[64];
 } cbm_sha256_ctx;
 
 void cbm_sha256_init(cbm_sha256_ctx *c);
@@ -32,5 +40,14 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
  * zero. */
 void cbm_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
                      uint8_t out[CBM_SHA256_DIGEST_LEN]);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+#include <stdbool.h>
+/* The block backend in use: "arm-sha2", "x86-sha-ni" or "portable". */
+const char *cbm_sha256_backend_name_for_testing(void);
+/* Force the portable transform (true) or return to the probed backend (false),
+ * so a test can hash the same input both ways. */
+void cbm_sha256_force_portable_for_testing(bool force);
+#endif
 
 #endif /* CBM_SHA256_H */

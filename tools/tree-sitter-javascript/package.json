@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-javascript-cbm",
+  "version": "0.25.0-cbm.1",
+  "description": "cbm fork of tree-sitter-javascript @ 58404d8 (JSX lone-ampersand fix, #1736)",
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}

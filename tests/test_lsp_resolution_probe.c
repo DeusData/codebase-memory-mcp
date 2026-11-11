@@ -222,6 +222,36 @@ static void lrp_diag(cbm_store_t *store, const char *project, const char *scenar
     fprintf(stderr, "    [LRP] %s edges=[%s]\n", scenario, line[0] ? line : "(none)");
 }
 
+/* Count CALLS edges whose resolution strategy starts with `prefix`.
+ *
+ * The S6 inheritance scenarios need more than "an edge exists": a fixture
+ * small enough to have exactly one same-named method can be satisfied by a
+ * weak short-name guess that happens to be right, which is precisely the
+ * class of edge the receiver-aware guard (#592/#606) removes. Asserting an
+ * `lsp_*` strategy is what distinguishes inheritance RESOLUTION from a lucky
+ * coincidence. Returns -1 when the edges cannot be read at all. */
+static int lrp_count_calls_with_strategy(cbm_store_t *store, const char *project,
+                                         const char *prefix) {
+    if (!store) {
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK) {
+        return -1;
+    }
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s", prefix);
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        if (edges[i].properties_json && strstr(edges[i].properties_json, needle)) {
+            hits++;
+        }
+    }
+    cbm_store_free_edges(edges, n);
+    return hits;
+}
+
 /* Index + assert CALLS >= floor; on failure emit diagnostics.
  * expect_green=true: ASSERT_TRUE (green guard).
  * expect_green=false: still asserts CALLS>=1 (the correct outcome), so RED
@@ -952,11 +982,89 @@ TEST(lrp_python_s6_inherited_method) {
         {"child.py", "from .base import Base\n\n\nclass Child(Base):\n"
                      "    def extra(self):\n        return 'extra'\n\n\n"
                      "def run(c):\n    return c.describe()\n"}};
-    /* Uncertain: c.describe() on a Child — py_lsp_cross must see Child inherits Base
-     * (requires INHERITS edge resolution).  Given the Python extraction bug for
-     * base_classes, this may be RED end-to-end even if py_lsp_cross is correct.
-     * Assert the correct outcome; RED if extraction bug blocks resolution. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S6/inherited_method", 0));
+    /* MEASURED on main before the guard: strategy=unique_name, cands=1,
+     * conf=0.7500. "describe" is the only symbol of that name in this 2-file
+     * fixture, so a weak short-name guess happened to be right. In a real repo
+     * the same guess binds an arbitrary same-named method (the false edges
+     * #1276 targets: accelerator.print() -> MockAccelerator.print), so the
+     * Python weak-member guard suppresses member calls whose receiver is
+     * unresolved -- here `c`, a bare parameter. c.describe() is the ONLY call
+     * in the fixture, so a correctly-suppressed run yields exactly zero CALLS.
+     *
+     * This is NOT an inheritance case, despite the name, and it has no
+     * flip-back condition: `c` is un-annotated, so no receiver type exists to
+     * inherit THROUGH. Resolving cross-file base classes cannot recover this
+     * edge, because there is nothing to say `c` is a Child. Cross-file
+     * inheritance resolution is covered by S6b below, which supplies the
+     * receiver type this fixture deliberately withholds.
+     *
+     * The base_classes extraction bug this comment used to cite is FIXED --
+     * extraction_inheritance is green for Python, and base_classes holds clean
+     * names with parens, kwargs and generic subscripts already stripped.
+     *
+     * Tripwire: assert the store opened AND calls == 0 exactly, so an infra/DB
+     * failure cannot pass vacuously. */
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    int calls = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(calls, 0);
+    PASS();
+}
+
+/* S6b — Python inherited method call through a receiver whose type IS known.
+ *
+ * S6 above is deliberately kept as-is, but it cannot demonstrate inheritance
+ * resolution: its `def run(c)` parameter carries no annotation, so nothing in
+ * the program says `c` is a Child. Whatever binds c.describe() there is a
+ * guess about a name, not a fact about a type — which is why it resolves via
+ * unique_name and why the Python weak-member guard (#1324) is expected to take
+ * it to zero.
+ *
+ * This row supplies the receiver type three ways — annotated parameter, `self`
+ * inside the subclass, and a constructor result — so `Base.describe` is
+ * reachable ONLY by crossing the file boundary that `class Child(Base)`
+ * declares. Before cbm_pxc_collect_all_defs resolved base spellings to project
+ * QNs, py_lsp_cross received "Base" and looked it up as a qualified name, found
+ * nothing (Base lives in base.py), and all three fell through to unique_name at
+ * confidence 0.75. Asserting the lsp_* strategy is what separates the two
+ * outcomes: a short-name guess and a resolved inherited member produce the same
+ * edge COUNT here, and only the strategy tells them apart. */
+TEST(lrp_python_s6b_inherited_method_typed_receiver) {
+    static const LRP_File annotated[] = {
+        {"base.py", "class Base:\n    def describe(self):\n        return 'base'\n"},
+        {"child.py", "from .base import Base\n\n\nclass Child(Base):\n"
+                     "    def extra(self):\n        return 'extra'\n\n\n"
+                     "def run(c: Child):\n    return c.describe()\n"}};
+    static const LRP_File self_attr[] = {
+        {"base.py", "class Base:\n    def describe(self):\n        return 'base'\n"},
+        {"child.py", "from .base import Base\n\n\nclass Child(Base):\n"
+                     "    def go(self):\n        return self.describe()\n"}};
+    static const LRP_File constructed[] = {
+        {"base.py", "class Base:\n    def describe(self):\n        return 'base'\n"},
+        {"child.py", "from .base import Base\n\n\nclass Child(Base):\n    pass\n\n\n"
+                     "def run():\n    return Child().describe()\n"}};
+    const LRP_File *shapes[3] = {annotated, self_attr, constructed};
+    const char *names[3] = {"annotated_param", "self_attr", "constructor"};
+
+    for (int k = 0; k < 3; k++) {
+        LRP_Proj lp;
+        cbm_store_t *store = lrp_index(&lp, shapes[k], 2);
+        ASSERT_NOT_NULL(store);
+        int inherits = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
+        int lsp_calls = lrp_count_calls_with_strategy(store, lp.project, "lsp_");
+        if (inherits < 1 || lsp_calls < 1) {
+            fprintf(stderr, "  [LRP] python/S6b/%s FAIL inherits=%d lsp_calls=%d\n", names[k],
+                    inherits, lsp_calls);
+            lrp_diag(store, lp.project, names[k]);
+        }
+        lrp_cleanup(&lp, store);
+        /* INHERITS proves the cross-file base really was resolved; the lsp_
+         * strategy proves the CALL rode that relation instead of guessing. */
+        ASSERT_TRUE(inherits >= 1);
+        ASSERT_TRUE(lsp_calls >= 1);
+    }
     PASS();
 }
 
@@ -1100,25 +1208,38 @@ TEST(lrp_ts_s6_inherited_method) {
          "import { Base } from './base';\n\n"
          "export class Child extends Base {\n    extra(): string { return 'child'; }\n}\n\n"
          "export function run(c: Child): string { return c.describe(); }\n"}};
-    /* RED: c.describe() needs ts_lsp_cross to walk `Child extends Base`. The
-     * INHERITS edge IS extracted (the probe diagnostic shows INHERITS=1); the
-     * gap is in ts_lsp_cross's cross-file inheritance RESOLUTION, not extraction.
-     * Until the receiver-aware guard (#592/#606) landed, this scenario passed via
-     * a unique_name registry fallback — "describe" is unique in this 2-file
-     * fixture, so a weak short-name guess happened to be right. In a real repo the
-     * same guess binds an arbitrary same-named method (the false edges #606
-     * targets), so the guard now suppresses weak member-call matches with an
-     * unresolved receiver. c.describe() is the ONLY call in the fixture, so a
-     * correctly-suppressed run yields exactly zero CALLS.
-     * Tripwire: assert store opened AND calls == 0 exactly (an infra/DB failure
-     * must not vacuously pass); flip to ASSERT calls >= 1 once ts_lsp_cross
-     * resolves inheritance (lsp_ts_*, a strategy the guard keeps). */
+    /* GREEN: c.describe() resolves through `Child extends Base` across files.
+     *
+     * This scenario was RED for as long as ts_lsp_cross received the base class
+     * as its SOURCE SPELLING ("Base") while ts_lookup_member fed embedded_types
+     * straight into cbm_registry_lookup_type as a QN — so a base declared in
+     * ANOTHER file never matched, the receiver stayed unresolved, and the only
+     * call in the fixture died in the weak textual cascade. Its predecessor
+     * "pass" came from a unique_name registry fallback ("describe" is unique
+     * here, so a weak short-name guess happened to be right); the receiver-aware
+     * guard (#592/#606) correctly suppressed that, which is why the tripwire
+     * asserted exactly zero.
+     *
+     * cbm_pxc_collect_all_defs now resolves each base spelling to a project QN
+     * through the import map + project registry — the same inputs pass_semantic
+     * uses for its INHERITS edge — so `Child extends Base` is a cross-file fact
+     * the TS LSP can walk. Asserting the lsp_ts_* strategy is the whole point:
+     * it proves the edge came from inheritance RESOLUTION and not from another
+     * lucky short-name guess. Keep BOTH assertions — calls>=1 alone would go
+     * green again for the wrong reason if the guard ever regressed. */
     LRP_Proj lp;
     cbm_store_t *store = lrp_index(&lp, f, 2);
     ASSERT_NOT_NULL(store);
     int calls = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
+    int lsp_calls = lrp_count_calls_with_strategy(store, lp.project, "lsp_ts");
+    if (calls < 1 || lsp_calls < 1) {
+        fprintf(stderr, "  [LRP] ts/S6/inherited_method FAIL calls=%d lsp_ts_calls=%d\n", calls,
+                lsp_calls);
+        lrp_diag(store, lp.project, "ts/S6/inherited_method");
+    }
     lrp_cleanup(&lp, store);
-    ASSERT_EQ(calls, 0);
+    ASSERT_TRUE(calls >= 1);
+    ASSERT_TRUE(lsp_calls >= 1);
     PASS();
 }
 
@@ -1716,16 +1837,62 @@ TEST(lrp_tsx_usage_import_type_with_decoy) {
     PASS();
 }
 
-/* Python: constructor syntax is an exact call to the materialized Class node. */
+/* Python: ClassName() with a user __init__ is an exact CALLS edge to that
+ * method. The Class node no longer receives the instantiation edge. */
 TEST(lrp_python_usage_instantiation) {
     static const LRP_File f[] = {
         {"model.py", "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py", "from .model import User\n\n\ndef create(name):\n    return User(name)\n"}};
     LRP_Proj lp;
     cbm_store_t *store = lrp_index(&lp, f, 2);
-    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
+    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "__init__") : -1;
+    int class_edge = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
     lrp_cleanup(&lp, store);
     ASSERT_EQ(exact, 1);
+    ASSERT_EQ(class_edge, 0);
+    PASS();
+}
+
+/* Python same-file subclasses in the graph: ClassName() binds only to an
+ * __init__ the class declares itself. B(A) declares none, so make_b keeps
+ * its CALLS edge on the class B and the inherited A.__init__ gets none.
+ * C(A) declares its own __init__, so make_c calls C.__init__, not C and not
+ * the inherited A.__init__. */
+TEST(lrp_python_subclass_constructor_own_init_only) {
+    static const LRP_File f[] = {{"main.py", "class A:\n"
+                                             "    def __init__(self):\n"
+                                             "        self.ready = True\n"
+                                             "\n"
+                                             "class B(A):\n"
+                                             "    def go(self):\n"
+                                             "        return 1\n"
+                                             "\n"
+                                             "class C(A):\n"
+                                             "    def __init__(self):\n"
+                                             "        self.ready = False\n"
+                                             "\n"
+                                             "def make_b():\n"
+                                             "    return B()\n"
+                                             "\n"
+                                             "def make_c():\n"
+                                             "    return C()\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 1);
+    const char *p = store ? lp.project : NULL;
+    int b_class = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_b", "main.B");
+    int b_base_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_b", "main.A.__init__");
+    int c_own_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.C.__init__");
+    int c_class = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.C");
+    int c_base_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.A.__init__");
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(b_class, 1);
+    ASSERT_EQ(b_base_init, 0);
+    ASSERT_EQ(c_own_init, 1);
+    ASSERT_EQ(c_class, 0);
+    ASSERT_EQ(c_base_init, 0);
     PASS();
 }
 
@@ -1776,13 +1943,15 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_rust_s8_field_call);
     RUN_TEST(lrp_rust_crossfile_macro_hidden_call_carrier);
 
-    /* ── Python (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 uncertain (extraction bug) ── */
+    /* ── Python (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 suppressed by the
+     * weak-member guard (#1276), asserted == 0 until py_lsp_cross inherits ── */
     RUN_TEST(lrp_python_s1_crossfile_call);
     RUN_TEST(lrp_python_s2_method_dispatch);
     RUN_TEST(lrp_python_s3_constructor);
     RUN_TEST(lrp_python_s4_class_method);
     RUN_TEST(lrp_python_s5_chained);
     RUN_TEST(lrp_python_s6_inherited_method);
+    RUN_TEST(lrp_python_s6b_inherited_method_typed_receiver);
     RUN_TEST(lrp_python_s7_annotated_call);
     RUN_TEST(lrp_python_s8_field_type_hint);
     RUN_TEST(lrp_python_crossfile_dunder_carrier);
@@ -1844,4 +2013,5 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_usage_import_type_with_decoy);
     RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
     RUN_TEST(lrp_python_usage_instantiation);
+    RUN_TEST(lrp_python_subclass_constructor_own_init_only);
 }

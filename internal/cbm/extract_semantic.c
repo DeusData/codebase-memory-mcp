@@ -125,14 +125,14 @@ static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpe
 // Iterative throw walker
 static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         process_throw_node(ctx, node, spec);
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -146,7 +146,10 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 //   - field/member/selector access (`self.total = ...`, `obj.Field = ...` →
 //     write the trailing field name `total`/`Field`)
 // Returns NULL if no simple write target can be determined.
-static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left) {
+// Sets *is_member_out when the written name is the field half of a
+// member/selector LHS — the receiver is stripped from the returned name, so
+// this out-param is the only surviving record of the selector shape (#1962).
+static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_member_out) {
     // Unwrap a single-element expression_list (Go).
     if (strcmp(ts_node_type(left), "expression_list") == 0) {
         if (ts_node_named_child_count(left) != 1) {
@@ -184,6 +187,9 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left) {
             fld = ts_node_child_by_field_name(left, TS_FIELD("name"));
         }
         if (!ts_node_is_null(fld)) {
+            if (is_member_out) {
+                *is_member_out = true;
+            }
             return cbm_node_text(ctx->arena, fld, ctx->source);
         }
         return NULL;
@@ -251,20 +257,22 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
     if (ts_node_is_null(left)) {
         return;
     }
-    char *name = resolve_lhs_write_name(ctx, left);
+    bool is_member = false;
+    char *name = resolve_lhs_write_name(ctx, left, &is_member);
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
         CBMReadWrite rw;
         rw.var_name = name;
         rw.is_write = true;
         rw.enclosing_func_qn = func_qn;
+        rw.is_member_access = is_member;
         cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
     }
 }
 
 static void walk_readwrites(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (cbm_kind_in_set(node, spec->assignment_node_types)) {
@@ -272,7 +280,7 @@ static void walk_readwrites(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *
         }
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -329,12 +337,14 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
         TSNode left = resolve_write_lhs_node(node);
 
         if (!ts_node_is_null(left)) {
-            char *name = resolve_lhs_write_name(ctx, left);
+            bool is_member = false;
+            char *name = resolve_lhs_write_name(ctx, left, &is_member);
             if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
                 CBMReadWrite rw;
                 rw.var_name = name;
                 rw.is_write = true;
                 rw.enclosing_func_qn = state->enclosing_func_qn;
+                rw.is_member_access = is_member;
                 cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
             }
         }

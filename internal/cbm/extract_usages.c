@@ -49,36 +49,6 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 static bool is_direct_argument_value(TSNode node);
 static TSNode python_direct_callable_attribute_site(TSNode node);
 
-// Check if a node is inside a call expression (to avoid double-counting as usage)
-static bool is_inside_call(TSNode node, const CBMLangSpec *spec) {
-    TSNode cur = ts_node_parent(node);
-    while (!ts_node_is_null(cur)) {
-        if (cbm_kind_in_set(cur, spec->call_node_types)) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
-
-// Check if a node is inside an import statement
-static bool is_inside_import(TSNode node, const CBMLangSpec *spec) {
-    bool has_imports = spec->import_node_types && spec->import_node_types[0];
-    bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
-    if (!has_imports && !has_from_imports) {
-        return false;
-    }
-    TSNode cur = ts_node_parent(node);
-    while (!ts_node_is_null(cur)) {
-        if ((has_imports && cbm_kind_in_set(cur, spec->import_node_types)) ||
-            (has_from_imports && cbm_kind_in_set(cur, spec->import_from_types))) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
-
 // Is this an identifier-like node that represents a reference?
 static bool is_reference_node(TSNode node, CBMLanguage lang) {
     const char *kind = ts_node_type(node);
@@ -134,6 +104,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_QML:
     case CBM_LANG_CFSCRIPT:
         return strcmp(kind, "property_identifier") == 0 ||
@@ -191,6 +162,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_SCHEME:
     case CBM_LANG_FENNEL:
     case CBM_LANG_RACKET:
+    case CBM_LANG_CHIALISP:
     case CBM_LANG_LINKERSCRIPT:
         return strcmp(kind, "symbol") == 0;
     case CBM_LANG_MAKEFILE:
@@ -226,6 +198,8 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_OBJECTSCRIPT_ROUTINE:
         return strcmp(kind, "objectscript_identifier") == 0 ||
                strcmp(kind, "objectscript_identifier_special") == 0;
+    case CBM_LANG_PLSQL:
+        return strcmp(kind, "identifier") == 0;
     default:
         return false;
     }
@@ -404,6 +378,7 @@ typedef enum {
     CBM_OCCURRENCE_VHDL_INTERFACE,
     CBM_OCCURRENCE_PINE_FUNCTION,
     CBM_OCCURRENCE_LLVM_FUNCTION,
+    CBM_OCCURRENCE_PKL_DECLARATION,
 } CBMOccurrencePolicy;
 
 typedef struct {
@@ -491,6 +466,7 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_CLOJURE] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
     [CBM_LANG_SCHEME] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
     [CBM_LANG_RACKET] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
+    [CBM_LANG_CHIALISP] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
     [CBM_LANG_COMMONLISP] = {NULL, NULL, CBM_OCCURRENCE_COMMONLISP_DEFUN, false},
     [CBM_LANG_FENNEL] = {NULL, NULL, CBM_OCCURRENCE_FENNEL_FN, false},
     [CBM_LANG_ELIXIR] = {NULL, NULL, CBM_OCCURRENCE_ELIXIR_DEF, false},
@@ -522,6 +498,7 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_PINE] = {NULL, NULL, CBM_OCCURRENCE_PINE_FUNCTION, false},
     [CBM_LANG_PUPPET] = {NULL, NULL, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_LLVM_IR] = {llvm_binding_nodes, NULL, CBM_OCCURRENCE_LLVM_FUNCTION, false},
+    [CBM_LANG_PKL] = {NULL, NULL, CBM_OCCURRENCE_PKL_DECLARATION, false},
     [CBM_LANG_MESON] = {NULL, meson_write_nodes, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_GN] = {NULL, gn_write_nodes, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_LINKERSCRIPT] = {NULL, linkerscript_write_nodes, CBM_OCCURRENCE_STANDARD, true},
@@ -564,23 +541,39 @@ static bool lisp_def_head(const char *text) {
     return kind_in_exact_set(text, heads);
 }
 
+/* Chialisp heads whose THIRD form is a parameter list, so the symbols in it
+ * bind rather than refer: `(defun NAME (params) body)`. Deliberately not
+ * `defconstant` — its third form is the VALUE expression, whose symbols are
+ * genuine usages — and not `mod`, whose binder is the second form and is
+ * already covered by the shared named_child(1) rule below. */
+static bool chialisp_head_binds_params_at_2(const char *head) {
+    return head && (strcmp(head, "defun") == 0 || strcmp(head, "defun-inline") == 0 ||
+                    strcmp(head, "defmacro") == 0 || strcmp(head, "defmac") == 0);
+}
+
 static bool is_lisp_def_binding(CBMExtractCtx *ctx, TSNode node) {
+    bool chialisp = (ctx->language == CBM_LANG_CHIALISP);
     for (TSNode form = ts_node_parent(node); !ts_node_is_null(form); form = ts_node_parent(form)) {
         const char *kind = ts_node_type(form);
         if ((strcmp(kind, "list") != 0 && strcmp(kind, "list_lit") != 0) ||
             ts_node_named_child_count(form) < 2) {
             continue;
         }
-        TSNode head_node = ts_node_named_child(form, 0);
+        TSNode head_node =
+            chialisp ? cbm_lisp_named_child_skip_comments(form, 0) : ts_node_named_child(form, 0);
+        if (ts_node_is_null(head_node)) {
+            continue;
+        }
         char *head = cbm_node_text(ctx->arena, head_node, ctx->source);
-        if (!lisp_def_head(head)) {
+        if (!(chialisp ? cbm_chialisp_is_def_head(head) : lisp_def_head(head))) {
             continue;
         }
         if (node_contains(head_node, node) || named_child_contains(form, 1, node)) {
             return true;
         }
-        if (ctx->language == CBM_LANG_CLOJURE && ts_node_named_child_count(form) > 2 &&
-            named_child_contains(form, 2, node)) {
+        if ((ctx->language == CBM_LANG_CLOJURE ||
+             (chialisp && chialisp_head_binds_params_at_2(head))) &&
+            ts_node_named_child_count(form) > 2 && named_child_contains(form, 2, node)) {
             return true;
         }
         return false;
@@ -624,19 +617,48 @@ static bool is_elixir_def_binding(CBMExtractCtx *ctx, TSNode node) {
         TSNode signature = ts_node_named_child_count(arguments) > 0
                                ? ts_node_named_child(arguments, 0)
                                : arguments;
+        /* A guard makes that signature the whole `when` operator, which spans the
+         * guard expression as well as the head. Unwrapped to the head, only the
+         * parameters being BOUND are excluded here; a parameter READ inside the
+         * guard stays a usage, as the same read in the body already is. */
+        signature = cbm_elixir_def_head_unwrap_guard(signature);
         return node_contains(head, node) || node_contains(signature, node);
     }
     return false;
 }
 
-static bool is_first_named_part_of(TSNode node, const char *container_kind) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+/* Climbs from `node` to its nearest `container_kind` ancestor and reports
+ * whether `node` sits in that ancestor's first named child. It runs for every
+ * named leaf of ReScript, Julia, Typst, Elm, PureScript and Nickel files, so it
+ * climbs the unified walk's cursor (O(1) per hop) whenever the walk is on
+ * `node`. ts_node_parent answers by descending from the ROOT and scanning the
+ * children at every level: on an error-heavy parse (a binary Godot `.res`
+ * resource yields a root with ~170k children per MB) each call is
+ * O(root children), and one climb per leaf made the file quadratic (#2176:
+ * 1 MB spent 46 s in this walk, 4.7 MB never finished). The node-based climb
+ * remains only for callers outside the walk. */
+static bool is_first_named_part_of(TSNode node, const char *container_kind, WalkState *state) {
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    TSNode current = node;
+    for (;;) {
+        TSNode parent;
+        if (cursor) {
+            if (!ts_tree_cursor_goto_parent(cursor)) {
+                return false;
+            }
+            parent = ts_tree_cursor_current_node(cursor);
+        } else {
+            usage_slow_parent_fallback_test_note(); /* one root descent per hop */
+            parent = ts_node_parent(current);
+            if (ts_node_is_null(parent)) {
+                return false;
+            }
+        }
         if (strcmp(ts_node_type(parent), container_kind) == 0) {
             return named_child_contains(parent, 0, node);
         }
+        current = parent;
     }
-    return false;
 }
 
 static bool is_wolfram_lhs(TSNode node) {
@@ -1015,8 +1037,32 @@ static bool is_pine_function_binding(TSNode node) {
     return ancestor_field_binds(node, "function_declaration_statement", fields);
 }
 
-static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
-                              const CBMOccurrenceSpec *occurrence) {
+/* Pkl declares names positionally: no production labels the declared identifier
+ * with a `name` field, so the generic declared-container rule never binds them
+ * and every method name, parameter name, and property name would be re-emitted
+ * as an ordinary read of itself. Each container below holds its declared name
+ * as named child 0; annotations, defaults, and bodies follow it and stay reads.
+ * Resolve against the NEAREST container so a nested declaration's own name is
+ * the only occurrence its parent can bind. */
+static bool is_pkl_declaration_binding(TSNode node) {
+    static const char *const declaration_kinds[] = {"methodHeader",
+                                                    "typedIdentifier",
+                                                    "classProperty",
+                                                    "objectProperty",
+                                                    "clazz",
+                                                    "typeAlias",
+                                                    NULL};
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (kind_in_exact_set(ts_node_type(parent), declaration_kinds)) {
+            return named_child_contains(parent, 0, node);
+        }
+    }
+    return false;
+}
+
+static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node, const CBMOccurrenceSpec *occurrence,
+                              WalkState *state) {
     switch (occurrence->policy) {
     case CBM_OCCURRENCE_LISP_DEF:
         return is_lisp_def_binding(ctx, node);
@@ -1027,11 +1073,11 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
     case CBM_OCCURRENCE_ELIXIR_DEF:
         return is_elixir_def_binding(ctx, node);
     case CBM_OCCURRENCE_JULIA_FUNCTION:
-        return is_first_named_part_of(node, "function_definition");
+        return is_first_named_part_of(node, "function_definition", state);
     case CBM_OCCURRENCE_WOLFRAM_SET:
         return is_wolfram_lhs(node);
     case CBM_OCCURRENCE_TYPST_LET:
-        return is_first_named_part_of(node, "let");
+        return is_first_named_part_of(node, "let", state);
     case CBM_OCCURRENCE_AGDA_FUNCTION:
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {
@@ -1047,14 +1093,14 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
     case CBM_OCCURRENCE_HCL_ATTRIBUTE:
         return is_hcl_attribute_binding(node);
     case CBM_OCCURRENCE_ELM_VALUE:
-        return is_first_named_part_of(node, "value_declaration");
+        return is_first_named_part_of(node, "value_declaration", state);
     case CBM_OCCURRENCE_RESCRIPT_LET:
-        return is_first_named_part_of(node, "let_binding");
+        return is_first_named_part_of(node, "let_binding", state);
     case CBM_OCCURRENCE_PURESCRIPT_LHS:
-        return is_first_named_part_of(node, "function");
+        return is_first_named_part_of(node, "function", state);
     case CBM_OCCURRENCE_NICKEL_LET:
-        return is_first_named_part_of(node, "let_binding") ||
-               is_first_named_part_of(node, "pattern_fun");
+        return is_first_named_part_of(node, "let_binding", state) ||
+               is_first_named_part_of(node, "pattern_fun", state);
     case CBM_OCCURRENCE_ERLANG_CLAUSE:
         return is_erlang_clause_binding(node);
     case CBM_OCCURRENCE_NIX_FUNCTION:
@@ -1071,6 +1117,8 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
         return is_vhdl_interface_binding(node);
     case CBM_OCCURRENCE_PINE_FUNCTION:
         return is_pine_function_binding(node);
+    case CBM_OCCURRENCE_PKL_DECLARATION:
+        return is_pkl_declaration_binding(node);
     case CBM_OCCURRENCE_LLVM_FUNCTION:
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {
@@ -1100,7 +1148,7 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
     if (is_exact_language_binding(ctx, node, state)) {
         return true;
     }
-    if (is_policy_binding(ctx, node, occurrence)) {
+    if (is_policy_binding(ctx, node, occurrence, state)) {
         return true;
     }
 
@@ -1126,6 +1174,14 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         }
 
         const char *kind = ts_node_type(parent);
+        /* PL/SQL: `parameter` is a ref_call ARGUMENT wrapper (upstream grammar
+         * naming), not a declaration; definition-side bindings use the distinct
+         * parameter_declaration kind. Skip it so call arguments stay ordinary
+         * value usages. */
+        if (ctx->language == CBM_LANG_PLSQL && strcmp(kind, "parameter") == 0) {
+            current = parent;
+            continue;
+        }
         if (kind_in_exact_set(kind, common_whole_binding_nodes) ||
             kind_in_exact_set(kind, occurrence->whole_binding_nodes)) {
             return true;
@@ -1295,53 +1351,63 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
 }
 
 static bool is_direct_argument_value(TSNode node) {
-    usage_slow_parent_fallback_test_note();
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) {
-        return false;
-    }
-    if (is_labeled_argument_kind(ts_node_type(parent))) {
-        TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
-        return !ts_node_is_null(value) && ts_node_eq(value, node) &&
-               is_direct_argument_value(parent);
-    }
-    TSNode direct_arguments = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
-    if (!ts_node_is_null(direct_arguments) && ts_node_eq(direct_arguments, node)) {
-        return true;
-    }
-    if (is_argument_container_kind(ts_node_type(parent))) {
-        return true;
-    }
-    const char *parent_kind = ts_node_type(parent);
-    if (strcmp(parent_kind, "list_expression") == 0) {
-        TSNode call = ts_node_parent(parent);
-        if (!ts_node_is_null(call)) {
-            TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
-            return !ts_node_is_null(arguments) && ts_node_eq(arguments, parent);
+    /* A labeled argument (keyword_argument and kin) is itself what the call
+     * site holds, so when `node` is its value the question moves one level up.
+     * That step used to recurse; the loop asks it in place and takes the
+     * slow-parent note once per level, as each recursive entry did. */
+    for (;;) {
+        usage_slow_parent_fallback_test_note();
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent)) {
+            return false;
         }
-        return false;
+        if (is_labeled_argument_kind(ts_node_type(parent))) {
+            TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
+            if (ts_node_is_null(value) || !ts_node_eq(value, node)) {
+                return false;
+            }
+            node = parent;
+            continue;
+        }
+        TSNode direct_arguments = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
+        if (!ts_node_is_null(direct_arguments) && ts_node_eq(direct_arguments, node)) {
+            return true;
+        }
+        if (is_argument_container_kind(ts_node_type(parent))) {
+            return true;
+        }
+        const char *parent_kind = ts_node_type(parent);
+        if (strcmp(parent_kind, "list_expression") == 0) {
+            TSNode call = ts_node_parent(parent);
+            if (!ts_node_is_null(call)) {
+                TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+                return !ts_node_is_null(arguments) && ts_node_eq(arguments, parent);
+            }
+            return false;
+        }
+        if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
+            return false;
+        }
+        TSNode grandparent = ts_node_parent(parent);
+        return !ts_node_is_null(grandparent) &&
+               is_argument_container_kind(ts_node_type(grandparent));
     }
-    if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
-        return false;
-    }
-    TSNode grandparent = ts_node_parent(parent);
-    return !ts_node_is_null(grandparent) && is_argument_container_kind(ts_node_type(grandparent));
 }
 
-/* Cursor-backed counterpart for the unified walker. `cursor` must currently
- * point at `node`; it is consumed while walking toward the argument owner. */
-static bool is_direct_argument_value_cursor(TSNode node, TSTreeCursor *cursor) {
-    TSNode current = node;
-    while (!ts_node_is_null(current)) {
-        TSNode parent;
-        const char *field;
-        if (!occurrence_parent(cursor, current, &parent, &field))
-            return false;
+/* The body of the walk above, entered one level in: for a caller that has
+ * ALREADY stepped the cursor onto `parent` and knows which `field` of it the
+ * node below occupies. A caller that climbed to find its site has that pair in
+ * hand, and re-deriving it would mean either stepping the cursor twice or
+ * paying ts_node_parent for what the cursor just told us. */
+static bool is_direct_argument_value_from(TSNode parent, const char *field, TSTreeCursor *cursor) {
+    for (;;) {
         const char *parent_kind = ts_node_type(parent);
         if (is_labeled_argument_kind(parent_kind)) {
             if (!field || strcmp(field, "value") != 0)
                 return false;
-            current = parent;
+            /* The labeled argument now has to be the argument value itself. */
+            if (!occurrence_parent(cursor, parent, &parent, &field))
+                return false;
             continue;
         }
         if (field && strcmp(field, "arguments") == 0)
@@ -1362,7 +1428,16 @@ static bool is_direct_argument_value_cursor(TSNode node, TSTreeCursor *cursor) {
         return occurrence_parent(cursor, parent, &grandparent, &argument_field) &&
                is_argument_container_kind(ts_node_type(grandparent));
     }
-    return false;
+}
+
+/* Cursor-backed counterpart for the unified walker. `cursor` must currently
+ * point at `node`; it is consumed while walking toward the argument owner. */
+static bool is_direct_argument_value_cursor(TSNode node, TSTreeCursor *cursor) {
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(cursor, node, &parent, &field))
+        return false;
+    return is_direct_argument_value_from(parent, field, cursor);
 }
 
 static bool is_direct_argument_value_walk(TSNode node, WalkState *state) {
@@ -1397,6 +1472,7 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_GO:
     case CBM_LANG_PYTHON:
     case CBM_LANG_C:
@@ -1415,15 +1491,36 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
  * arguments are narrow syntactic candidates only. A language LSP must still
  * prove one target at this exact occurrence before the graph upgrades USAGE to
  * CALL_REFERENCE; unresolved, reassigned, and composite expressions stay USAGE. */
-static TSNode csharp_callable_value_site(TSNode node) {
-    usage_slow_parent_fallback_test_note();
+/* One step up from `site`, on the walk cursor when the caller has one. Every
+ * other language branch in call_reference_candidate_site climbs this way; C#
+ * used ts_node_parent, which tree-sitter answers by descending from the ROOT,
+ * so each step costs O(depth) with a child scan at every level. On the
+ * generated .NET JIT tests — single expressions megabytes deep — that was
+ * 18-48 us per visited node and ~85% of the whole unified walk (sampled
+ * 2026-09-19: stamp_usage_site -> ts_node_parent ->
+ * ts_node_child_with_descendant). Those files are also the ones the old CPU
+ * deadline used to cut off mid-walk, so the slow path and the nondeterminism
+ * it forced were the same defect seen from two ends. */
+static bool csharp_site_parent(TSTreeCursor *cursor, TSNode site, TSNode *parent,
+                               const char **field) {
+    if (!cursor) {
+        usage_slow_parent_fallback_test_note();
+    }
+    return occurrence_parent(cursor, site, parent, field);
+}
+
+static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char *parent_field,
+                                         TSTreeCursor *cursor) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
     }
 
+    /* The caller has already resolved node's parent (and the field it occupies)
+     * with the cursor, so the climb starts from that pair instead of asking for
+     * it again. Invariant below: `parent`/`field` always describe `site`. */
     TSNode site = node;
-    TSNode parent = ts_node_parent(site);
+    const char *field = parent_field;
     if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "generic_name") == 0) {
         TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
         if (ts_node_is_null(name) && ts_node_named_child_count(parent) > 0) {
@@ -1433,7 +1530,9 @@ static TSNode csharp_callable_value_site(TSNode node) {
             return (TSNode){0};
         }
         site = parent;
-        parent = ts_node_parent(site);
+        if (!csharp_site_parent(cursor, site, &parent, &field)) {
+            return (TSNode){0};
+        }
     }
 
     if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "member_access_expression") == 0) {
@@ -1442,7 +1541,9 @@ static TSNode csharp_callable_value_site(TSNode node) {
             return (TSNode){0};
         }
         site = parent;
-        parent = ts_node_parent(site);
+        if (!csharp_site_parent(cursor, site, &parent, &field)) {
+            return (TSNode){0};
+        }
     }
 
     while (!ts_node_is_null(parent) &&
@@ -1455,12 +1556,17 @@ static TSNode csharp_callable_value_site(TSNode node) {
             return (TSNode){0};
         }
         site = parent;
-        parent = ts_node_parent(site);
+        if (!csharp_site_parent(cursor, site, &parent, &field)) {
+            return (TSNode){0};
+        }
     }
 
     /* The wrapper chain proves admission, but the semantic row is keyed to the
      * terminal method-name identifier. Keep the raw carrier on that leaf. */
-    return is_direct_argument_value(site) ? node : (TSNode){0};
+    if (ts_node_is_null(parent)) {
+        return (TSNode){0};
+    }
+    return is_direct_argument_value_from(parent, field, cursor) ? node : (TSNode){0};
 }
 
 /* Climb out of the parentheses wrapping a direct argument and return the
@@ -1517,12 +1623,14 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
     const char *parent_field = NULL;
     if (!cursor) {
         usage_slow_parent_fallback_test_note();
-        parent = ts_node_parent(node);
-    } else {
-        (void)occurrence_parent(cursor, node, &parent, &parent_field);
     }
+    /* Resolve the parent AND the field node occupies in it, on both paths. The
+     * C# site walk below carries that field into the argument test, and
+     * ts_node_parent on its own would leave it NULL there — silently losing the
+     * "this node IS the arguments" case whenever no cursor is available. */
+    (void)occurrence_parent(cursor, node, &parent, &parent_field);
     bool ts_family = ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                     ctx->language == CBM_LANG_TSX;
+                     ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS;
     if (ts_family && strcmp(kind, "property_identifier") == 0 && !ts_node_is_null(parent) &&
         strcmp(ts_node_type(parent), "member_expression") == 0) {
         TSNode property = ts_node_child_by_field_name(parent, TS_FIELD("property"));
@@ -1560,7 +1668,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         return is_direct_argument_value_walk(node, state) ? node : (TSNode){0};
     }
     if (ctx->language == CBM_LANG_CSHARP) {
-        return csharp_callable_value_site(node);
+        return csharp_callable_value_site(node, parent, parent_field, cursor);
     }
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
@@ -1686,9 +1794,25 @@ static uint32_t active_lexical_scope_id(const WalkState *state) {
 static uint32_t lexical_ancestor_of_kind(const WalkState *state, uint32_t start_id,
                                          bool want_function, bool want_block);
 
-static bool python_default_value_reference(TSNode node) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+/* One step up: on the occurrence cursor when there is one, else with
+ * ts_node_parent, which descends from the ROOT, so a climb costs O(depth^2). */
+static TSNode usage_parent_step(TSTreeCursor *cursor, TSNode current) {
+    if (cursor) {
+        return ts_tree_cursor_goto_parent(cursor) ? ts_tree_cursor_current_node(cursor)
+                                                  : (TSNode){0};
+    }
+    usage_slow_parent_fallback_test_note();
+    return ts_node_parent(current);
+}
+
+/* Asked for every Python usage, and a deep expression puts O(depth) parents
+ * above each one. A tree without errors climbs them on the walk cursor, like
+ * python_scope_directive_kind; a tree with errors keeps ts_node_parent. */
+static bool python_default_value_reference(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    TSTreeCursor *cursor =
+        ts_node_has_error(ctx->root) ? NULL : reset_occurrence_cursor(state, node);
+    for (TSNode parent = usage_parent_step(cursor, node); !ts_node_is_null(parent);
+         parent = usage_parent_step(cursor, parent)) {
         const char *kind = ts_node_type(parent);
         /* A nested executable scope inside the default owns its own lookups;
          * only a direct default expression is evaluated in the declaring
@@ -1709,10 +1833,10 @@ static bool python_default_value_reference(TSNode node) {
     return false;
 }
 
-static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, const WalkState *state,
-                                                TSNode node) {
+static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
     uint32_t scope_id = active_lexical_scope_id(state);
-    if (!ctx || ctx->language != CBM_LANG_PYTHON || !python_default_value_reference(node)) {
+    if (!ctx || ctx->language != CBM_LANG_PYTHON ||
+        !python_default_value_reference(ctx, state, node)) {
         return scope_id;
     }
     uint32_t function_id = lexical_ancestor_of_kind(state, scope_id, true, false);
@@ -1788,13 +1912,41 @@ static bool ensure_lexical_binding_capacity(WalkState *state) {
 }
 
 static bool lexical_ancestor_kind(TSNode node, const char *kind) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+    for (TSNode parent = usage_parent_step(NULL, node); !ts_node_is_null(parent);
+         parent = usage_parent_step(NULL, parent)) {
         if (strcmp(ts_node_type(parent), kind) == 0) {
             return true;
         }
     }
     return false;
+}
+
+/* Is `node` a name listed by a Python global/nonlocal statement? The grammar
+ * makes those names direct children of the statement, so in a tree without
+ * errors one parent step on the walk cursor answers it. The full climb above
+ * steps with ts_node_parent, which descends from the ROOT each time: O(depth^2)
+ * per identifier, asked for every Python identifier, so one deep arithmetic
+ * expression went cubic. Error recovery can put a name under an ERROR child of
+ * the statement, so a tree with errors keeps the full climb. */
+static CBMPythonDirectiveKind python_scope_directive_kind(CBMExtractCtx *ctx, WalkState *state,
+                                                          TSNode node) {
+    if (ts_node_has_error(ctx->root)) {
+        if (lexical_ancestor_kind(node, "global_statement")) {
+            return CBM_PYTHON_DIRECTIVE_GLOBAL;
+        }
+        return lexical_ancestor_kind(node, "nonlocal_statement") ? CBM_PYTHON_DIRECTIVE_NONLOCAL
+                                                                 : 0;
+    }
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(reset_occurrence_cursor(state, node), node, &parent, &field)) {
+        return 0;
+    }
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "global_statement") == 0) {
+        return CBM_PYTHON_DIRECTIVE_GLOBAL;
+    }
+    return strcmp(kind, "nonlocal_statement") == 0 ? CBM_PYTHON_DIRECTIVE_NONLOCAL : 0;
 }
 
 static TSNode declared_function_name_owner(TSNode node, const CBMLangSpec *spec) {
@@ -2025,7 +2177,8 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
     }
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX: {
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS: {
         if (strcmp(ts_node_type(boundary), "import_statement") != 0) {
             return false;
         }
@@ -2142,13 +2295,11 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     TSNode function_declaration = declared_function_name_owner(node, spec);
     TSNode class_declaration = declared_class_name_owner(node, spec);
 
-    if (ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"))) {
+    CBMPythonDirectiveKind scope_directive =
+        ctx->language == CBM_LANG_PYTHON ? python_scope_directive_kind(ctx, state, node) : 0;
+    if (scope_directive) {
         uint32_t function_id = lexical_ancestor_of_kind(state, current_id, true, false);
-        CBMPythonDirectiveKind directive = lexical_ancestor_kind(node, "global_statement")
-                                               ? CBM_PYTHON_DIRECTIVE_GLOBAL
-                                               : CBM_PYTHON_DIRECTIVE_NONLOCAL;
-        record_python_directive(state, function_id, name, directive);
+        record_python_directive(state, function_id, name, scope_directive);
         return;
     }
 
@@ -2212,7 +2363,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
         whole_scope = true;
     } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-               ctx->language == CBM_LANG_TSX) {
+               ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         bool is_var = js_var_binding(node);
         scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
         if (scope_id == 0) {
@@ -2426,7 +2577,8 @@ static bool emit_direct_perl_coderef_usage(CBMExtractCtx *ctx, TSNode node,
 }
 
 // Try to emit a usage for a reference node. Returns early if the node should be skipped.
-static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                           bool inside_call, bool inside_import) {
     if (emit_direct_perl_coderef_usage(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0)) {
         return;
     }
@@ -2439,7 +2591,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (is_call_argument_label(node)) {
         return;
     }
-    if (is_inside_call(node, spec) || is_inside_import(node, spec)) {
+    if (inside_call || inside_import) {
         return;
     }
     if (is_binding_occurrence(ctx, node, spec, NULL) ||
@@ -2456,18 +2608,79 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
 }
 
-// Iterative usage walker — explicit stack
+// Iterative usage walker — explicit stack.
+//
+// The call/import ancestry that gates usage emission is maintained as ENTER/
+// EXIT counters on the walk instead of per-node ancestor re-walks: the old
+// is_inside_call/is_inside_import helpers climbed every ancestor via
+// ts_node_parent, and tree-sitter's ts_node_parent RE-DESCENDS from the root
+// scanning siblings — O(depth x sibling-position) per node, which went
+// quadratic on wide nodes (a 1,536-argument call in dotnet/runtime's JIT
+// torture tests put 92% of extract time into these walks; 490 s for one
+// 147 KB file). Counter semantics match the helpers exactly: strict ancestors
+// only — a node is emitted BEFORE its own kind increments the counters, so a
+// call node itself does not count as "inside a call".
 static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    typedef struct {
+        TSNode node;
+        uint32_t next_child;
+        bool counts_call;
+        bool counts_import;
+    } UsageFrame;
+    int cap = 256;
+    UsageFrame *frames = (UsageFrame *)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*frames));
+    if (!frames) {
+        return;
+    }
+    bool has_imports = spec->import_node_types && spec->import_node_types[0];
+    bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
+    int call_depth = 0;
+    int import_depth = 0;
+    int top = 0;
+    frames[top++] = (UsageFrame){root, 0, false, false};
+    bool entering = true;
 
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        try_emit_usage(ctx, node, spec);
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+    while (top > 0) {
+        UsageFrame *f = &frames[top - 1];
+        if (entering) {
+            try_emit_usage(ctx, f->node, spec, call_depth > 0, import_depth > 0);
+            f->counts_call = cbm_kind_in_set(f->node, spec->call_node_types);
+            f->counts_import =
+                (has_imports && cbm_kind_in_set(f->node, spec->import_node_types)) ||
+                (has_from_imports && cbm_kind_in_set(f->node, spec->import_from_types));
+            if (f->counts_call) {
+                call_depth++;
+            }
+            if (f->counts_import) {
+                import_depth++;
+            }
+        }
+        uint32_t count = ts_node_child_count(f->node);
+        if (f->next_child < count) {
+            TSNode child = ts_node_child(f->node, f->next_child);
+            f->next_child++;
+            if (top == cap) {
+                int new_cap = cap * 2;
+                UsageFrame *grown =
+                    (UsageFrame *)cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*grown));
+                if (!grown) {
+                    return;
+                }
+                memcpy(grown, frames, (size_t)cap * sizeof(*frames));
+                frames = grown;
+                cap = new_cap;
+            }
+            frames[top++] = (UsageFrame){child, 0, false, false};
+            entering = true;
+        } else {
+            if (f->counts_call) {
+                call_depth--;
+            }
+            if (f->counts_import) {
+                import_depth--;
+            }
+            top--;
+            entering = false;
         }
     }
 }
@@ -2497,7 +2710,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     bool possible_binding_leaf =
         ts_node_is_named(node) && ts_node_named_child_count(node) == 0 &&
         (state->inside_import || is_exact_language_binding(ctx, node, state) ||
-         is_policy_binding(ctx, node, occurrence));
+         is_policy_binding(ctx, node, occurrence, state));
     if (!reference_node && !possible_binding_leaf) {
         return;
     }
@@ -2553,8 +2766,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     bool python_scope_directive =
-        ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"));
+        ctx->language == CBM_LANG_PYTHON && python_scope_directive_kind(ctx, state, node) != 0;
     if (python_scope_directive || is_binding_occurrence(ctx, node, spec, state)) {
         char *binding_name = reference_name(ctx, node);
         if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
@@ -2582,6 +2794,10 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.ref_name = name;
         usage.enclosing_func_qn = state->enclosing_func_qn;
         usage.lexical_scope_id = usage_lexical_scope_id_for_node(ctx, state, node);
+        /* The member half of a selector is its own reference node
+         * (field_identifier); record that shape — the name alone cannot carry
+         * it, and the Go Field guard keys on it (#1962). */
+        usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }

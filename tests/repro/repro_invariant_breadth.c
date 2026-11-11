@@ -10,7 +10,7 @@
  *
  * QUALITY_ANALYSIS.md gap #6 reports 27 languages failing this.  This file
  * is the "large breadth table" — one per-language case, table-driven, asserting
- * the invariant across 26 languages.
+ * the invariant across 27 languages.
  *
  * Fixture design rule:
  *   Each fixture defines exactly TWO functions: a callee (helper) and a caller
@@ -26,6 +26,9 @@
  *   RED (module-sourced or no CALLS at all -- reproduces the gap):
  *     r, julia, dart, groovy, commonlisp, powershell, ada, clojure,
  *     fsharp, racket, rescript, scheme  (12 cases)
+ *
+ *   Added after the original snapshot:
+ *     chialisp  (1 case, expected GREEN -- lisp-family scope attribution)
  *
  * Note: the "suspicious" group (r, julia, ...) from QUALITY_ANALYSIS may be
  * GREEN because the calls-breadth table (test_lang_contract.c) already shows
@@ -530,6 +533,24 @@ static const IBCase IB_CASES[] = {
          */
         0, "list head is symbol not identifier; "
            "no scheme branch in extract_callee_name"
+    },
+
+    {
+        "chialisp", "a.clsp",
+        "(mod ()\n"
+        "  (defun helper (x)\n"
+        "    (* x 2))\n"
+        "  (defun run ()\n"
+        "    (helper 21))\n"
+        ")\n",
+        /*
+         * Chialisp: EXPECTED-GREEN. Every def is nested inside the top-level
+         * `(mod ...)`, so the in-body call can only be Function-sourced if
+         * compute_lisp_func_qn pushes a scope for the inner `(defun run ...)`
+         * rather than stopping at the module. That is exactly what would
+         * regress if the Chialisp def-head set drifted from the defs walk.
+         */
+        1, NULL
     },
 };
 

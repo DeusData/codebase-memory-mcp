@@ -1,0 +1,1 @@
+MATCH (m:Module)<-[:DEFINES]-(f:File) WITH m, count(f) AS c WHERE c > 2 RETURN m.name, c ORDER BY c DESC LIMIT 10

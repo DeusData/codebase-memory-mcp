@@ -27,8 +27,11 @@ fi
 
 echo "=== Fuzz Testing ($DURATION seconds) ==="
 
-FUZZ_TMPDIR=$(mktemp -d)
-trap 'rm -rf "$FUZZ_TMPDIR"' EXIT
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+FUZZ_TMPDIR="$CBM_TEST_RUNTIME_ROOT"
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 CRASHES=0
 ITERATIONS=0

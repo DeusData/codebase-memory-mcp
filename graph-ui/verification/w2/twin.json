@@ -1,0 +1,156 @@
+{
+  "sectionsPopulated": 5,
+  "stepsCount": 6,
+  "stepsOrdered": true,
+  "firstStep": "validateUser",
+  "envReadShown": "DB_URL",
+  "throwShown": "ValidationError",
+  "missingTestsHonest": true,
+  "depthProseNoQualifiedNames": true,
+  "depthDenseShowsConfidence": true,
+  "badgeCount": 5,
+  "caretSyncNoRefetch": true,
+  "followNavigatesEditor": true,
+  "evidenceVisible": true,
+  "port": 4241,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w2b",
+  "fixture": "fixtures/atlas-sample",
+  "openedFile": "src/services/userService.ts",
+  "timings": {
+    "buildMs": 5423,
+    "serverStartMs": 6921,
+    "totalMs": 23778
+  },
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4240,
+    "caretLines": {
+      "validateUser": 24,
+      "insert": 30
+    },
+    "fetchesAfterFirstResolve": 1,
+    "sections": [
+      {
+        "name": "purpose",
+        "populated": true
+      },
+      {
+        "name": "steps",
+        "populated": true
+      },
+      {
+        "name": "callers",
+        "populated": true
+      },
+      {
+        "name": "state",
+        "populated": true
+      },
+      {
+        "name": "errors",
+        "populated": true
+      },
+      {
+        "name": "effects",
+        "populated": false
+      },
+      {
+        "name": "tests",
+        "populated": false
+      }
+    ],
+    "steps": [
+      {
+        "label": "validateUser",
+        "line": 24
+      },
+      {
+        "label": "ValidationError",
+        "line": 27
+      },
+      {
+        "label": "UserEntity",
+        "line": 29
+      },
+      {
+        "label": "listUsers",
+        "line": 29
+      },
+      {
+        "label": "insert",
+        "line": 30
+      },
+      {
+        "label": "toUser",
+        "line": 35
+      }
+    ],
+    "stateLabels": [
+      "DB_URL",
+      "User"
+    ],
+    "errorLabels": [
+      "ValidationError"
+    ],
+    "testsSentence": "No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+    "badgeClasses": [
+      "cldr codeatlas-step-badge codeatlas-step-badge-1 codeatlas-step-badge-pulse",
+      "cldr codeatlas-step-badge codeatlas-step-badge-2",
+      "cldr codeatlas-step-badge codeatlas-step-badge-3",
+      "cldr codeatlas-step-badge codeatlas-step-badge-5",
+      "cldr codeatlas-step-badge codeatlas-step-badge-6"
+    ],
+    "evidenceText": "invocationvalidate.ts:24cbm, index generation 1",
+    "denseSample": "SEMANTIC_TWIN flow (createUser) Detail level Dense Logic Calls Data Errors Tests Runtime Changes PURPOSE inferred ? Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type. STEPS 6 entries ? 24 validateUser validate.ts:19 exact via direct-call 1 citation ? invocation validate.ts:24 cbm, index generation 1 27 ValidationError new validate.ts:4 exact ",
+    "certainty": {
+      "atTechnicalDepth": 0,
+      "atDenseDepth": {
+        "count": 11,
+        "labels": [
+          "exact"
+        ],
+        "scored": 0,
+        "blank": 0
+      },
+      "numericFormPresent": false,
+      "note": "Diese Engine zeichnet keinen Score auf, also lauten die Angaben exact und unscored. Die Zahlform kommt hier nicht vor und wird an der aufgezeichneten IR bewiesen (src/twin/render-model.test.ts)."
+    },
+    "proseSample": "SEMANTIC_TWIN flow (createUser) Detail level Narrative Logic Calls Data Errors Tests Runtime Changes This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of returning a result. The parts it leans on, in the order they come up: validateUser ValidationError UserEntity listUsers insert Nobody wrote that",
+    "proseQualifiedHit": null,
+    "caretSync": {
+      "currentBefore": "24",
+      "currentAfter": "30",
+      "fetchesBefore": 1,
+      "fetchesAfter": 1,
+      "stillCreateUser": true
+    },
+    "afterFollow": {
+      "breadcrumb": "src › util › validate.ts",
+      "tabs": [
+        "src/services/userService.ts",
+        "src/util/validate.ts"
+      ],
+      "subject": "flow (validateUser)",
+      "symbol": "validateUser",
+      "caret": 19
+    },
+    "apiRoutes": {
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 1,
+      "query_graph": 28,
+      "get_code_snippet": 4
+    },
+    "fetchesTotal": 2
+  },
+  "generatedAt": "2026-08-28T18:14:26.270Z",
+  "error": null
+}

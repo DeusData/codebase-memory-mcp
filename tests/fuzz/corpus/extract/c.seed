@@ -1,0 +1,11 @@
+store.c
+#include <stdlib.h>
+#include "store.h"
+
+struct store { int n; char *buf; };
+
+struct store *store_new(int n) {
+    struct store *s = malloc(sizeof(*s));
+    s->n = n;
+    return s;
+}

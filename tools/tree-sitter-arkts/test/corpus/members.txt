@@ -1,0 +1,275 @@
+==================
+State member decorators
+==================
+
+@Component
+struct S {
+  @State message: string = 'Hello'
+  @Prop count: number
+  @Link linked: Model
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (decorator
+          (identifier))
+        (property_identifier)
+        (type_annotation
+          (predefined_type))
+        (string
+          (string_fragment)))
+      (public_field_definition
+        (decorator
+          (identifier))
+        (property_identifier)
+        (type_annotation
+          (predefined_type)))
+      (public_field_definition
+        (decorator
+          (identifier))
+        (property_identifier)
+        (type_annotation
+          (type_identifier)))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Keyed member decorators
+==================
+
+@Component
+struct S {
+  @Provide('key') provided: string = ''
+  @Consume('key') consumed: string
+  @StorageLink('store') stored: number = 1
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (decorator
+          (call_expression
+            (identifier)
+            (arguments
+              (string
+                (string_fragment)))))
+        (property_identifier)
+        (type_annotation
+          (predefined_type))
+        (string))
+      (public_field_definition
+        (decorator
+          (call_expression
+            (identifier)
+            (arguments
+              (string
+                (string_fragment)))))
+        (property_identifier)
+        (type_annotation
+          (predefined_type)))
+      (public_field_definition
+        (decorator
+          (call_expression
+            (identifier)
+            (arguments
+              (string
+                (string_fragment)))))
+        (property_identifier)
+        (type_annotation
+          (predefined_type))
+        (number))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Stacked Watch decorator
+==================
+
+@Component
+struct S {
+  @State @Watch('onChange') watched: boolean = false
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (decorator
+          (identifier))
+        (decorator
+          (call_expression
+            (identifier)
+            (arguments
+              (string
+                (string_fragment)))))
+        (property_identifier)
+        (type_annotation
+          (predefined_type))
+        (false))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Plain and private members
+==================
+
+@Component
+struct S {
+  plain: number = 0
+  private scroller: Scroller = new Scroller()
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (property_identifier)
+        (type_annotation
+          (predefined_type))
+        (number))
+      (public_field_definition
+        (accessibility_modifier)
+        (property_identifier)
+        (type_annotation
+          (type_identifier))
+        (new_expression
+          (identifier)
+          (arguments)))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+Struct methods and getters
+==================
+
+@Component
+struct S {
+  aboutToAppear() {
+    this.init()
+  }
+
+  get label(): string {
+    return 'x'
+  }
+
+  private init(): void {
+  }
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (this)
+                (property_identifier))
+              (arguments)))))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (type_annotation
+          (predefined_type))
+        (statement_block
+          (return_statement
+            (string
+              (string_fragment)))))
+      (method_definition
+        (accessibility_modifier)
+        (property_identifier)
+        (formal_parameters)
+        (type_annotation
+          (predefined_type))
+        (statement_block))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))
+
+==================
+BuilderParam member
+==================
+
+@Component
+struct S {
+  @BuilderParam content: () => void
+
+  build() {
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (decorator
+          (identifier))
+        (property_identifier)
+        (type_annotation
+          (function_type
+            (formal_parameters)
+            (predefined_type))))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block)))))

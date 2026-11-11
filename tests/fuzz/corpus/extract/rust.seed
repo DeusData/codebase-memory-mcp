@@ -1,0 +1,10 @@
+lib.rs
+use std::collections::HashMap;
+
+pub trait Store { fn get(&self, k: &str) -> Option<&String>; }
+
+pub struct Mem { m: HashMap<String, String> }
+
+impl Store for Mem {
+    fn get(&self, k: &str) -> Option<&String> { self.m.get(k) }
+}

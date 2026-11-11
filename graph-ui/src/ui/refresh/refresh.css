@@ -1,0 +1,6 @@
+/* Hand test 2026-10-04 (A3, K42): a Refresh says that it runs and, beside it, what it found. The live region stays in the tree. */
+.atlas-refresh { display: inline-flex; align-items: center; flex-wrap: wrap; min-width: 0; }
+.atlas-refresh > button[aria-disabled="true"] { opacity: 0.6; cursor: progress; }
+.atlas-refresh-status { color: var(--atlas-dim); font-size: 11px; line-height: 1.4; }
+.atlas-refresh-status:not(:empty) { margin-left: 8px; }
+.atlas-refresh-status[data-phase="failed"] { color: var(--atlas-alarm); }

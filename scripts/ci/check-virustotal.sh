@@ -106,6 +106,7 @@ class ExpectedObject:
     size: int
     association_count: int
     association_kinds: frozenset[str]
+    withheld: bool
 
     @property
     def requires_microsoft(self) -> bool:
@@ -188,7 +189,54 @@ def parse_versioned_tsv(
     return metadata, rows
 
 
-def load_expected(path: pathlib.Path) -> Tuple[List[ExpectedObject], int]:
+def load_withheld(raw_path: str) -> Dict[str, str]:
+    """Objects deliberately removed from the surface scan (VT_WITHHELD).
+
+    exclude-rescanned-selected-objects.sh deletes the SELECTED executables from
+    the objects directory before the upload — their bytes were already scanned
+    as release candidates, identity is settled by sha256, and re-submitting
+    identical bytes re-rolls a probabilistic classifier (measured on v0.10.5:
+    verdicts flipped in both directions within the hour). The gate accepts a
+    withheld object only when this manifest vouches for it BY HASH; everything
+    else keeps the strict on-disk contract. An absent manifest keeps the
+    original behavior everywhere else this gate runs (candidate stage,
+    dry-run), where nothing is ever withheld."""
+    path = pathlib.Path(raw_path).absolute()
+    if path.is_symlink() or not path.is_file():
+        raise GateError(f"withheld manifest is not a regular file: {path}")
+    if path.stat().st_size > 1024 * 1024:
+        raise GateError(f"withheld manifest is unexpectedly large: {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] != "# cbm-virustotal-withheld-v1":
+        raise GateError("withheld manifest marker is missing")
+    cursor = 1
+    metadata: Dict[str, str] = {}
+    while cursor < len(lines) and lines[cursor].startswith("# "):
+        key, separator, value = lines[cursor][2:].partition("=")
+        if not separator or not key or key in metadata or not value:
+            raise GateError(f"malformed withheld metadata: {lines[cursor]}")
+        metadata[key] = value
+        cursor += 1
+    if metadata.get("reason") != "already-scanned-as-candidate":
+        raise GateError("withheld manifest does not state the accepted reason")
+    if cursor >= len(lines) or lines[cursor] != "sha256\tobject":
+        raise GateError("withheld manifest header is malformed")
+    withheld: Dict[str, str] = {}
+    for line in lines[cursor + 1 :]:
+        sha256, separator, name = line.partition("\t")
+        if not separator or SHA256_RE.fullmatch(sha256) is None or not name or "/" in name:
+            raise GateError(f"malformed withheld row: {line}")
+        if sha256 in withheld:
+            raise GateError(f"duplicate withheld sha256: {sha256}")
+        withheld[sha256] = name
+    if not withheld:
+        raise GateError("withheld manifest names no objects")
+    return withheld
+
+
+def load_expected(
+    path: pathlib.Path, withheld: Dict[str, str]
+) -> Tuple[List[ExpectedObject], int]:
     metadata, rows = parse_versioned_tsv(
         path,
         marker="cbm-release-scan-set-v2",
@@ -230,15 +278,26 @@ def load_expected(path: pathlib.Path) -> Tuple[List[ExpectedObject], int]:
         ):
             raise GateError(f"unassociated object in expected set: {scan_path}")
         local_path = path.parent.joinpath(*pure.parts)
-        try:
-            mode = local_path.lstat().st_mode
-        except FileNotFoundError as error:
-            raise GateError(f"expected scan object is missing: {scan_path}") from error
-        if not stat.S_ISREG(mode):
-            raise GateError(f"expected scan object is not a regular file: {scan_path}")
-        actual_size = local_path.stat().st_size
-        if actual_size != size or sha256_file(local_path) != sha256:
-            raise GateError(f"expected scan object changed after extraction: {scan_path}")
+        is_withheld = sha256 in withheld
+        if is_withheld:
+            if withheld[sha256] != pure.parts[1]:
+                raise GateError(
+                    f"withheld manifest names a different object for this hash: {scan_path}"
+                )
+            if os.path.lexists(local_path):
+                raise GateError(
+                    f"withheld object is still present in the scan directory: {scan_path}"
+                )
+        else:
+            try:
+                mode = local_path.lstat().st_mode
+            except FileNotFoundError as error:
+                raise GateError(f"expected scan object is missing: {scan_path}") from error
+            if not stat.S_ISREG(mode):
+                raise GateError(f"expected scan object is not a regular file: {scan_path}")
+            actual_size = local_path.stat().st_size
+            if actual_size != size or sha256_file(local_path) != sha256:
+                raise GateError(f"expected scan object changed after extraction: {scan_path}")
         association_total += association_count
         objects.append(
             ExpectedObject(
@@ -248,10 +307,17 @@ def load_expected(path: pathlib.Path) -> Tuple[List[ExpectedObject], int]:
                 size=size,
                 association_count=association_count,
                 association_kinds=frozenset(kinds),
+                withheld=is_withheld,
             )
         )
     if association_total != associations:
         raise GateError("scan-set association counts do not match manifest metadata")
+    expected_hashes = {item.sha256 for item in objects}
+    spurious = sorted(set(withheld) - expected_hashes)
+    if spurious:
+        raise GateError(f"withheld manifest names hashes outside the expected scan set: {spurious}")
+    if all(item.withheld for item in objects):
+        raise GateError("every expected object is withheld; the surface scan would cover nothing")
     return objects, associations
 
 
@@ -363,6 +429,7 @@ def parse_action_output(
     objects: Sequence[ExpectedObject],
     manifest: pathlib.Path,
 ) -> List[Submission]:
+    objects = [item for item in objects if not item.withheld]
     if not raw:
         raise GateError("VirusTotal action output is empty")
     aliases = output_aliases(objects, manifest)
@@ -697,7 +764,10 @@ def main() -> None:
             raise GateError(f"unsafe pre-existing VT results path: {results_path}")
         results_path.unlink()
 
-    expected, associations = load_expected(expected_manifest)
+    withheld_path = os.environ.get("VT_WITHHELD", "")
+    withheld = load_withheld(withheld_path) if withheld_path else {}
+
+    expected, associations = load_expected(expected_manifest, withheld)
     validate_associations(
         associations_manifest,
         objects=expected,
@@ -708,6 +778,13 @@ def main() -> None:
         objects=expected,
         manifest=expected_manifest,
     )
+    withheld_count = sum(1 for item in expected if item.withheld)
+    if withheld_count:
+        print(
+            f"=== {withheld_count} expected object(s) withheld from the surface scan "
+            f"(already scanned as candidates; identity settled by sha256, manifest: "
+            f"{withheld_path}) ==="
+        )
     print(
         f"=== VirusTotal exact-set gate: {len(submissions)} distinct objects, "
         f"{associations} associations, >= {min_engines} decisive engines each ==="

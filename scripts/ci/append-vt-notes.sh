@@ -211,40 +211,52 @@ asset_base = (
 )
 
 
-def verdict_cell(target: str, variant: str) -> str:
-    result = results_by_path[candidate_by_pair[target, variant]["scan_path"]]
+# Release notes report the SHIPPED binary and nothing else.
+#
+# Several candidates per product are scanned so the selector has an alternative
+# when an opaque classifier flags one of them, but a reader installing cbm cares
+# about the bytes they receive, not about the ones we discarded. The rejected
+# candidates' verdicts stay in the published evidence TSVs for anyone auditing
+# the selection, and they matter to US in development as a signal; they are
+# noise in a changelog.
+def shipped_result(target: str) -> dict:
+    selection = selection_by_target[target]
+    variant = selection["selected_variant"]
+    return results_by_path[candidate_by_pair[target, variant]["scan_path"]]
+
+
+def verdict_cell(target: str) -> str:
+    result = shipped_result(target)
     label = "clean" if result["policy_classification"] == "clean" else "Microsoft `!ml`"
     return f"[{label}]({result['virustotal_url']})"
 
 
-ml_count = sum(
-    result["policy_classification"] == "microsoft-ml" for result in results
-)
-engine_counts = [int(result["completed_engines"]) for result in results]
+shipped = [shipped_result(target) for target in TARGETS]
+ml_count = sum(result["policy_classification"] == "microsoft-ml" for result in shipped)
+engine_counts = [int(result["completed_engines"]) for result in shipped]
 engine_range = str(min(engine_counts)) if min(engine_counts) == max(engine_counts) else f"{min(engine_counts)}–{max(engine_counts)}"
 section = [
     START,
     "## Security Verification",
     "",
     (
-        f"Before smoke and soak testing, VirusTotal completed **{len(TARGETS) * len(VARIANTS)} executable scans**: "
-        "stripped and unstripped candidates for each of the **8 release products**. "
-        f"Every scan had at least 50 decisive engines (observed range: {engine_range})."
+        f"Every binary published below was scanned by VirusTotal before smoke and soak "
+        f"testing, and the verdict for the exact shipped bytes is linked per product "
+        f"(decisive engines: {engine_range})."
     ),
     (
-        "All candidates were clean."
+        "Every shipped binary was clean."
         if ml_count == 0
-        else f"**{ml_count} candidate(s)** had only the documented single Microsoft machine-learning `!ml` result; no other decisive engine reported malicious or suspicious."
+        else f"**{ml_count} shipped binary/binaries** carried only the documented single Microsoft machine-learning `!ml` result; no other decisive engine reported malicious or suspicious."
     ),
     "",
-    "| Product | Stripped candidate | Unstripped candidate | Shipped |",
-    "|---|---|---|---|",
+    "| Product | Shipped binary | VirusTotal verdict |",
+    "|---|---|---|",
 ]
 for target in TARGETS:
     selection = selection_by_target[target]
     section.append(
-        f"| `{target}` | {verdict_cell(target, 'stripped')} | "
-        f"{verdict_cell(target, 'unstripped')} | `{selection['selected_variant']}` (`{selection['selected_sha256']}`) |"
+        f"| `{target}` | `{selection['selected_sha256']}` | {verdict_cell(target)} |"
     )
 section.extend(
     [

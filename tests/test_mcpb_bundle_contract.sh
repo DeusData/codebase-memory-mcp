@@ -14,7 +14,16 @@
 # the SQLite OMIT_LOAD_EXTENSION marker — live in .rodata. This test packages
 # the same opaque selected bytes under foreign target labels deliberately; this
 # boundary proves it never invokes strip/codesign and never changes bytes.
+#
+# One assertion is scoped out, by name: A1d-bind-now measures eager binding,
+# a property of the RELEASE link (-z now in Makefile.cbm). The stub below is
+# compiled straight from stub.c with the compiler's defaults, so on an ELF leg
+# it would fail A1d for a reason that has nothing to do with packaging.
+# CBM_COMPOSITION_FIXTURE=1 tells the gate this target is a fixture; the gate
+# prints A1d as n/a and runs everything else unchanged. Release derivation
+# never sets it.
 set -euo pipefail
+export CBM_COMPOSITION_FIXTURE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cbm-mcpb-contract.XXXXXX")"

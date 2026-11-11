@@ -28,6 +28,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/sanitized.h"
 #include "lsp/cs_lsp.h"
 #include <stdlib.h>
 #include <time.h>
@@ -235,10 +236,12 @@ TEST(cslsp_bench_resolution_ratio) {
         ASSERT_GTE(resolved * 100, calls * 45);
     }
 
-    /* Time budget. ASan+UBSan instrumentation slows the parse ~5-10×, so
-     * scale the budget when a sanitizer is active. Native: 200 ms for a
-     * ~260-line fixture; sanitized: 2000 ms. */
-#if defined(CBM_SANITIZED_BUILD) || defined(__SANITIZE_ADDRESS__)
+    /* Time budget. Instrumentation slows the parse ~5-10×, so scale the budget
+     * when a sanitizer is active. Native: 200 ms for a ~260-line fixture;
+     * sanitized: 2000 ms. The condition used to name ASan specifically, which
+     * left the TSan and MSan lanes measuring an instrumented parse against the
+     * native 200 ms. */
+#if CBM_SANITIZED
     ASSERT(ms < 2000.0);
 #else
     ASSERT(ms < 200.0);

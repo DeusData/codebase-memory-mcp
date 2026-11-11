@@ -6,6 +6,7 @@
  * Uses xxHash for deterministic random vectors. Pure C, zero dependencies.
  */
 #include "semantic/semantic.h"
+#include "foundation/mem_core.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
@@ -119,7 +120,7 @@ cbm_sem_config_t cbm_sem_get_config(void) {
         .threshold = (float)CBM_SEM_EDGE_THRESHOLD,
         .max_edges = CBM_SEM_MAX_EDGES,
     };
-    const char *thresh = getenv("CBM_SEMANTIC_THRESHOLD");
+    const char *thresh = cbm_runtime_getenv("CBM_SEMANTIC_THRESHOLD");
     if (thresh) {
         /* strtod reports errors via endptr; reject non-numeric input silently. */
         char *end = NULL;
@@ -132,7 +133,7 @@ cbm_sem_config_t cbm_sem_get_config(void) {
 }
 
 bool cbm_sem_is_enabled(void) {
-    const char *val = getenv("CBM_SEMANTIC_ENABLED");
+    const char *val = cbm_runtime_getenv("CBM_SEMANTIC_ENABLED");
     return val && val[0] == '1';
 }
 
@@ -158,7 +159,7 @@ static bool is_camel_break(const char *name, int i) {
 static void flush_token(char *buf, int *blen, char **out, int *count, int max_out) {
     if (*blen > 0 && *count < max_out) {
         buf[*blen] = '\0';
-        out[(*count)++] = strdup(buf);
+        out[(*count)++] = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, buf);
     }
     *blen = 0;
 }
@@ -358,7 +359,7 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
     for (int t = 0; t < orig_count && count < max_out; t++) {
         for (int a = 0; abbrevs[a].abbrev; a++) {
             if (strcmp(out[t], abbrevs[a].abbrev) == 0) {
-                out[count++] = strdup(abbrevs[a].expanded);
+                out[count++] = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, abbrevs[a].expanded);
                 break;
             }
         }
@@ -422,7 +423,8 @@ static void ensure_pretrained_map(void) {
             const char *tok = PRETRAINED_TOKENS[i];
             if (tok && tok[0]) {
                 snprintf(idx_buf, sizeof(idx_buf), "%d", i);
-                cbm_ht_set(g_pretrained_map, strdup(tok), strdup(idx_buf));
+                cbm_ht_set(g_pretrained_map, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, tok),
+                           cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, idx_buf));
             }
         }
         atomic_store_explicit(&g_pretrained_ready, MAP_READY, memory_order_release);
@@ -524,7 +526,8 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
     }
     if (c->entry_count >= c->entry_cap) {
         int new_cap = c->entry_cap < CORPUS_INIT_CAP ? CORPUS_INIT_CAP : c->entry_cap * PAIR_LEN;
-        corpus_entry_t *grown = realloc(c->entries, (size_t)new_cap * sizeof(corpus_entry_t));
+        corpus_entry_t *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, c->entries,
+                                            (size_t)new_cap * sizeof(corpus_entry_t));
         if (!grown) {
             return CBM_NOT_FOUND;
         }
@@ -532,16 +535,17 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
         c->entry_cap = new_cap;
     }
     int idx = c->entry_count++;
-    c->entries[idx].token = strdup(token);
+    c->entries[idx].token = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, token);
     c->entries[idx].doc_freq = 0;
     memset(&c->entries[idx].enriched_vec, 0, sizeof(cbm_sem_vec_t));
     snprintf(idx_buf, sizeof(idx_buf), "%d", idx);
-    cbm_ht_set(c->token_map, strdup(token), strdup(idx_buf));
+    cbm_ht_set(c->token_map, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, token),
+               cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, idx_buf));
     return idx;
 }
 
 cbm_sem_corpus_t *cbm_sem_corpus_new(void) {
-    cbm_sem_corpus_t *c = calloc(SKIP_ONE, sizeof(cbm_sem_corpus_t));
+    cbm_sem_corpus_t *c = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(cbm_sem_corpus_t));
     if (c) {
         c->token_map = cbm_ht_create(CORPUS_INIT_CAP);
     }
@@ -556,11 +560,13 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
     if (corpus->doc_count >= corpus->doc_cap) {
         int new_cap =
             corpus->doc_cap < DOC_TOKENS_INIT ? DOC_TOKENS_INIT : corpus->doc_cap * PAIR_LEN;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
+        int **grown_ids = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids,
+                                      (size_t)new_cap * sizeof(int *));
+        int *grown_counts = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_counts,
+                                        (size_t)new_cap * sizeof(int));
         if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_ids);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_counts);
             return;
         }
         corpus->doc_token_ids = grown_ids;
@@ -568,11 +574,13 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
         corpus->doc_cap = new_cap;
     }
     int doc_idx = corpus->doc_count++;
-    corpus->doc_token_ids[doc_idx] = malloc((size_t)count * sizeof(int));
+    corpus->doc_token_ids[doc_idx] = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)count * sizeof(int));
     corpus->doc_token_counts[doc_idx] = count;
 
     /* Per-doc unique set for IDF */
-    int *seen = calloc((size_t)corpus->entry_cap + (size_t)count + CORPUS_INIT_CAP, sizeof(int));
+    int *seen =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC,
+                   ((size_t)corpus->entry_cap + (size_t)count + CORPUS_INIT_CAP) * sizeof(int));
     int seen_count = 0;
 
     for (int i = 0; i < count; i++) {
@@ -594,7 +602,7 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
             corpus->entries[tid].doc_freq++;
         }
     }
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, seen);
 }
 
 /* ── Parallel corpus batch build ──────────────────────────────────── */
@@ -612,8 +620,8 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
 typedef struct {
     cbm_sem_corpus_t *corpus;
     char **all_tokens;
+    const size_t *offsets; /* document d = all_tokens[offsets[d] ..] */
     const int *token_counts;
-    int max_tokens;
     int doc_count;
     _Atomic int *doc_freq_atomic; /* per-entry atomic counter (entry_count long) */
     _Atomic int next_idx;
@@ -630,12 +638,12 @@ static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *s
         bc->corpus->doc_token_counts[doc_index] = 0;
         return;
     }
-    int *ids = malloc((size_t)count * sizeof(int));
+    int *ids = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)count * sizeof(int));
     bc->corpus->doc_token_ids[doc_index] = ids;
     bc->corpus->doc_token_counts[doc_index] = count;
 
     int seen_count = 0;
-    char **tokens = &bc->all_tokens[(ptrdiff_t)doc_index * bc->max_tokens];
+    char **tokens = &bc->all_tokens[bc->offsets[doc_index]];
     for (int i = 0; i < count; i++) {
         const char *idx_str = cbm_ht_get(bc->corpus->token_map, tokens[i]);
         int tid = CBM_NOT_FOUND;
@@ -671,7 +679,7 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
     batch_resolve_ctx_t *bc = ctx_ptr;
     /* Per-worker scratch for unique-per-doc tracking */
     int local_seen_cap = CBM_SEM_SEEN_INIT_CAP;
-    int *seen = malloc((size_t)local_seen_cap * sizeof(int));
+    int *seen = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)local_seen_cap * sizeof(int));
     if (!seen) {
         return;
     }
@@ -689,7 +697,7 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
         for (int d = start; d < end; d++) {
             int count = bc->token_counts[d];
             if (count > local_seen_cap) {
-                int *grown = realloc(seen, (size_t)count * sizeof(int));
+                int *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, seen, (size_t)count * sizeof(int));
                 if (!grown) {
                     continue;
                 }
@@ -699,12 +707,12 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
             batch_resolve_one_doc(bc, d, seen);
         }
     }
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, seen);
 }
 
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc) {
-    if (!corpus || !all_tokens || !token_counts || doc_count <= 0) {
+                                   const size_t *offsets, const int *token_counts, int doc_count) {
+    if (!corpus || !all_tokens || !offsets || !token_counts || doc_count <= 0) {
         return;
     }
 
@@ -712,11 +720,13 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
      * Hash table mutation can't be parallelized; strdup+insert is the cost. */
     if (corpus->doc_cap < corpus->doc_count + doc_count) {
         int new_cap = corpus->doc_count + doc_count;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
+        int **grown_ids = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids,
+                                      (size_t)new_cap * sizeof(int *));
+        int *grown_counts = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_counts,
+                                        (size_t)new_cap * sizeof(int));
         if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_ids);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_counts);
             return;
         }
         corpus->doc_token_ids = grown_ids;
@@ -728,7 +738,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
 
     for (int d = 0; d < doc_count; d++) {
         int count = token_counts[d];
-        char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
+        char **tokens = &all_tokens[offsets[d]];
         for (int i = 0; i < count; i++) {
             /* Inserts token into token_map if new; we discard return here —
              * Phase B will re-lookup in read-only mode to get the ID. */
@@ -739,14 +749,15 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
      * to shared state except atomic doc_freq counters). */
-    _Atomic int *doc_freq_atomic = calloc((size_t)corpus->entry_count, sizeof(_Atomic int));
+    _Atomic int *doc_freq_atomic =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)corpus->entry_count * sizeof(_Atomic int));
     if (!doc_freq_atomic) {
         /* OOM fallback: sequential path. Roll back doc_count first since
          * add_doc increments it itself. */
         corpus->doc_count = base_doc;
         for (int d = 0; d < doc_count; d++) {
             int count = token_counts[d];
-            char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
+            char **tokens = &all_tokens[offsets[d]];
             cbm_sem_corpus_add_doc(corpus, (const char **)tokens, count);
         }
         return;
@@ -757,7 +768,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         .corpus = corpus,
         .all_tokens = all_tokens,
         .token_counts = token_counts,
-        .max_tokens = max_tokens_per_doc,
+        .offsets = offsets,
         .doc_count = doc_count,
         .doc_freq_atomic = doc_freq_atomic,
     };
@@ -775,7 +786,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         corpus->entries[i].doc_freq +=
             atomic_load_explicit(&doc_freq_atomic[i], memory_order_relaxed);
     }
-    free(doc_freq_atomic);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, doc_freq_atomic);
 }
 
 /* ── Parallel corpus_finalize ─────────────────────────────────────── */
@@ -1205,14 +1216,15 @@ static void pass1_quantize_worker(int worker_id, void *ctx_ptr) {
 /* Build reverse index: token_id → list of (doc_id, position) pairs.
  * SEQUENTIAL (fast: just pointer arithmetic + flat array fill). */
 static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
-    reverse_index_t *rev = calloc(SKIP_ONE, sizeof(reverse_index_t));
+    reverse_index_t *rev = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(reverse_index_t));
     if (!rev) {
         return NULL;
     }
     /* Phase A: count occurrences per token */
-    int *counts = calloc((size_t)corpus->entry_count + SKIP_ONE, sizeof(int));
+    int *counts =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)corpus->entry_count + SKIP_ONE) * sizeof(int));
     if (!counts) {
-        free(rev);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
         return NULL;
     }
     long total = 0;
@@ -1228,10 +1240,11 @@ static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
         }
     }
     /* Phase B: exclusive prefix sum → offsets[] */
-    rev->offsets = malloc(((size_t)corpus->entry_count + SKIP_ONE) * sizeof(int));
+    rev->offsets =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)corpus->entry_count + SKIP_ONE) * sizeof(int));
     if (!rev->offsets) {
-        free(counts);
-        free(rev);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, counts);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
         return NULL;
     }
     int running = 0;
@@ -1242,13 +1255,13 @@ static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
     }
     rev->offsets[corpus->entry_count] = running;
     /* Phase C: fill flat array. Ensure allocation size > 0 even for empty
-     * corpora (avoids malloc(0) which is implementation-defined). */
+     * corpora (avoids cbm_alloc(CBM_MEM_CLASS_SEMANTIC, 0) which is implementation-defined). */
     size_t flat_bytes = (total > 0 ? (size_t)total : SKIP_ONE) * sizeof(cooccur_pos_t);
-    rev->flat = malloc(flat_bytes);
+    rev->flat = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, flat_bytes);
     if (!rev->flat) {
-        free(rev->offsets);
-        free(counts);
-        free(rev);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev->offsets);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, counts);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
         return NULL;
     }
     for (int d = 0; d < corpus->doc_count; d++) {
@@ -1263,7 +1276,7 @@ static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
             }
         }
     }
-    free(counts);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, counts);
     return rev;
 }
 
@@ -1271,9 +1284,9 @@ static void free_reverse_index(reverse_index_t *rev) {
     if (!rev) {
         return;
     }
-    free(rev->offsets);
-    free(rev->flat);
-    free(rev);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, rev->offsets);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, rev->flat);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
 }
 
 /* Bundle of parameters shared by the finalize sub-phases. */
@@ -1323,7 +1336,8 @@ static void finalize_pass1(finalize_params_t *p) {
 
 /* Sub-phases 4+5: quantize pass1 to int8, run RRI pass 2, blend + normalize. */
 static void finalize_pass2(finalize_params_t *p) {
-    int8_t *pass1_q = malloc((size_t)p->corpus->entry_count * CBM_SEM_DIM * sizeof(int8_t));
+    int8_t *pass1_q = cbm_alloc(CBM_MEM_CLASS_SEMANTIC,
+                                (size_t)p->corpus->entry_count * CBM_SEM_DIM * sizeof(int8_t));
     if (pass1_q) {
         pass1_quant_ctx_t qc = {
             .entries = p->corpus->entries,
@@ -1334,7 +1348,8 @@ static void finalize_pass2(finalize_params_t *p) {
         cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, p->opts);
     }
 
-    cbm_sem_vec_t *pass1 = malloc((size_t)p->corpus->entry_count * sizeof(cbm_sem_vec_t));
+    cbm_sem_vec_t *pass1 =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)p->corpus->entry_count * sizeof(cbm_sem_vec_t));
     if (pass1) {
         for (int i = 0; i < p->corpus->entry_count; i++) {
             pass1[i] = p->corpus->entries[i].enriched_vec;
@@ -1366,13 +1381,23 @@ static void finalize_pass2(finalize_params_t *p) {
         };
         atomic_init(&bc.next_idx, 0);
         cbm_parallel_for(p->worker_count, blend_worker, &bc, p->opts);
-        free(pass1);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, pass1);
     }
-    free(pass1_q);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, pass1_q);
 
     norm_ctx_t nc = {.entries = p->corpus->entries, .entry_count = p->corpus->entry_count};
     atomic_init(&nc.next_idx, 0);
     cbm_parallel_for(p->worker_count, normalize_worker, &nc, p->opts);
+}
+
+/* The per-document token id lists exist for the co-occurrence pass only;
+ * released at the end of finalize so the vector phase runs without them
+ * (783k small blocks on the kernel). */
+static void corpus_release_docs(cbm_sem_corpus_t *corpus) {
+    for (int d = 0; d < corpus->doc_count; d++) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids[d]);
+        corpus->doc_token_ids[d] = NULL;
+    }
 }
 
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
@@ -1401,8 +1426,8 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
         corpus->finalized = true;
         return;
     }
-    cbm_sem_src_entry_t *src_entries =
-        calloc((size_t)corpus->entry_count, sizeof(cbm_sem_src_entry_t));
+    cbm_sem_src_entry_t *src_entries = cbm_calloc(
+        CBM_MEM_CLASS_SEMANTIC, (size_t)corpus->entry_count * sizeof(cbm_sem_src_entry_t));
     if (!src_entries) {
         free_reverse_index(rev);
         corpus->finalized = true;
@@ -1423,8 +1448,9 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     finalize_pass1(&params);
     finalize_pass2(&params);
 
-    free(src_entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, src_entries);
     free_reverse_index(rev);
+    corpus_release_docs(corpus);
     corpus->finalized = true;
 }
 
@@ -1465,6 +1491,33 @@ const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const
     return &corpus->entries[idx].enriched_vec;
 }
 
+int cbm_sem_corpus_token_index(const cbm_sem_corpus_t *corpus, const char *token) {
+    if (!corpus || !token) {
+        return CBM_NOT_FOUND;
+    }
+    int idx = parse_token_index(cbm_ht_get(corpus->token_map, token));
+    return (idx < 0 || idx >= corpus->entry_count) ? CBM_NOT_FOUND : idx;
+}
+
+/* Same arithmetic as cbm_sem_corpus_idf, by index. */
+float cbm_sem_corpus_idf_at(const cbm_sem_corpus_t *corpus, int index) {
+    if (!corpus || corpus->doc_count == 0 || index < 0 || index >= corpus->entry_count) {
+        return 0.0F;
+    }
+    int df = corpus->entries[index].doc_freq;
+    if (df <= 0) {
+        return 0.0F;
+    }
+    return logf((float)corpus->doc_count / (float)df);
+}
+
+const cbm_sem_vec_t *cbm_sem_corpus_ri_vec_at(const cbm_sem_corpus_t *corpus, int index) {
+    if (!corpus || index < 0 || index >= corpus->entry_count) {
+        return NULL;
+    }
+    return &corpus->entries[index].enriched_vec;
+}
+
 int cbm_sem_corpus_doc_count(const cbm_sem_corpus_t *corpus) {
     return corpus ? corpus->doc_count : 0;
 }
@@ -1490,8 +1543,8 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
 
 static void free_ht_kv(const char *key, void *value, void *userdata) {
     (void)userdata;
-    free((void *)key);
-    free(value);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)key);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
 }
 
 void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus) {
@@ -1499,19 +1552,19 @@ void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus) {
         return;
     }
     for (int i = 0; i < corpus->entry_count; i++) {
-        free(corpus->entries[i].token);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->entries[i].token);
     }
-    free(corpus->entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->entries);
     for (int d = 0; d < corpus->doc_count; d++) {
-        free(corpus->doc_token_ids[d]);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids[d]);
     }
-    free(corpus->doc_token_ids);
-    free(corpus->doc_token_counts);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_counts);
     if (corpus->token_map) {
         cbm_ht_foreach(corpus->token_map, free_ht_kv, NULL);
         cbm_ht_free(corpus->token_map);
     }
-    free(corpus);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus);
 }
 
 /* ── Combined scoring ────────────────────────────────────────────── */
@@ -1566,6 +1619,47 @@ static float small_cosine(const float *a, const float *b, int dims) {
     return denom < CBM_SEM_DENOM_EPS ? 0.0F : dot / denom;
 }
 
+static int cmp_int_asc(const void *pa, const void *pb) {
+    int a = *(const int *)pa;
+    int b = *(const int *)pb;
+    return (a > b) - (a < b);
+}
+
+/* Terms are keyed by corpus token, so two functions share a term only when
+ * they share the word. (Until 2026-10 the key was the token's POSITION in the
+ * function: any two functions of similar length "shared" their first terms,
+ * and the TF-IDF signal measured length, not vocabulary.) */
+int cbm_sem_tfidf_terms(const cbm_sem_corpus_t *corpus, char *const *tokens, const int *token_index,
+                        int count, int *indices, float *weights) {
+    if (!corpus || !indices || !weights || count <= 0) {
+        return 0;
+    }
+    int known = 0;
+    for (int t = 0; t < count; t++) {
+        int idx = token_index ? token_index[t] : cbm_sem_corpus_token_index(corpus, tokens[t]);
+        if (idx >= 0 && cbm_sem_corpus_idf_at(corpus, idx) > 0.0F) {
+            indices[known++] = idx;
+        }
+    }
+    if (known > 1) {
+        qsort(indices, (size_t)known, sizeof(indices[0]), cmp_int_asc);
+    }
+    /* Each run of one index becomes one term; its weight is the idf added once
+     * per occurrence (equal indices have equal idf). */
+    int terms = 0;
+    for (int k = 0; k < known; k++) {
+        float idf = cbm_sem_corpus_idf_at(corpus, indices[k]);
+        if (terms > 0 && indices[terms - SKIP_ONE] == indices[k]) {
+            weights[terms - SKIP_ONE] += idf;
+        } else {
+            indices[terms] = indices[k];
+            weights[terms] = idf;
+            terms++;
+        }
+    }
+    return terms;
+}
+
 /* Sparse cosine over two pre-sorted (index, weight) vectors.  Returns 0 when
  * either side is empty or the magnitude product is below the epsilon guard. */
 static float sparse_tfidf_cosine(const cbm_sem_func_t *a, const cbm_sem_func_t *b) {
@@ -1598,49 +1692,47 @@ static float sparse_tfidf_cosine(const cbm_sem_func_t *a, const cbm_sem_func_t *
     return denom > CBM_SEM_DENOM_EPS ? (dot / denom) : 0.0F;
 }
 
-float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
-                             const cbm_sem_config_t *cfg) {
-    if (!a || !b || !cfg) {
-        return 0.0F;
+void cbm_sem_signal_values(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
+                           cbm_sem_signals_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->proximity = CBM_SEM_UNIT_POS;
+    if (!a || !b) {
+        return;
     }
+    if (a->has_minhash && b->has_minhash) {
+        double j = cbm_minhash_jaccard((const cbm_minhash_t *)a->minhash,
+                                       (const cbm_minhash_t *)b->minhash);
+        out->minhash = (float)j;
+        out->near_copy = j >= CBM_MINHASH_JACCARD_THRESHOLD;
+    }
+    out->tfidf = sparse_tfidf_cosine(a, b);
+    out->ri = cbm_rsq_ip(&a->ri_code, &b->ri_code);            /* signal 2: Random Indexing */
+    out->api = cbm_rsq_ip(&a->api_code, &b->api_code);         /* signal 4: API signatures */
+    out->type = cbm_rsq_ip(&a->type_code, &b->type_code);      /* signal 5: type signatures */
+    out->decorator = cbm_rsq_ip(&a->deco_code, &b->deco_code); /* signal 7: decorators */
+    /* signals 8+9+11: structural profile + data flow + Halstead */
+    out->struct_profile =
+        small_cosine(a->struct_profile, b->struct_profile, CBM_SEM_AST_PROFILE_DIMS);
+    out->proximity = cbm_sem_proximity(a->file_path, b->file_path); /* signal 6: multiplier */
+}
 
+float cbm_sem_combine(const cbm_sem_signals_t *s, const cbm_sem_config_t *cfg) {
     /* Short-circuit: if MinHash Jaccard is already above the SIMILAR_TO threshold,
      * the pass_similarity pipeline already emitted a SIMILAR_TO edge for this pair.
      * Returning 0 here avoids flooding top-k with cross-service copy-paste boilerplate
      * (logging_middleware, shared push/pull handlers) that SIMILAR_TO already covers,
      * freeing the edge budget for true semantic leaps (vocabulary-bridged relations). */
-    if (a->has_minhash && b->has_minhash) {
-        double early_j = cbm_minhash_jaccard((const cbm_minhash_t *)a->minhash,
-                                             (const cbm_minhash_t *)b->minhash);
-        if (early_j >= CBM_MINHASH_JACCARD_THRESHOLD) {
-            return 0.0F;
-        }
+    if (!s || !cfg || s->near_copy) {
+        return 0.0F;
     }
-
-    float score = cfg->w_tfidf * sparse_tfidf_cosine(a, b);
-
-    /* Signal 2: Random Indexing */
-    score += cfg->w_ri * cbm_rsq_ip(&a->ri_code, &b->ri_code);
-
-    /* Signal 3: MinHash Jaccard */
-    if (a->has_minhash && b->has_minhash) {
-        double j = cbm_minhash_jaccard((const cbm_minhash_t *)a->minhash,
-                                       (const cbm_minhash_t *)b->minhash);
-        score += cfg->w_minhash * (float)j;
-    }
-
-    /* Signal 4: API Signatures */
-    score += cfg->w_api * cbm_rsq_ip(&a->api_code, &b->api_code);
-
-    /* Signal 5: Type Signatures */
-    score += cfg->w_type * cbm_rsq_ip(&a->type_code, &b->type_code);
-
-    /* Signal 7: Decorator Pattern */
-    score += cfg->w_decorator * cbm_rsq_ip(&a->deco_code, &b->deco_code);
-
-    /* Signal 8+9+11: Structural profile + data flow + Halstead */
-    float sp_score = small_cosine(a->struct_profile, b->struct_profile, CBM_SEM_AST_PROFILE_DIMS);
-    score += cfg->w_struct_profile * sp_score;
+    /* The terms in the historical order (float addition is not associative). */
+    float score = cfg->w_tfidf * s->tfidf;
+    score += cfg->w_ri * s->ri;
+    score += cfg->w_minhash * s->minhash;
+    score += cfg->w_api * s->api;
+    score += cfg->w_type * s->type;
+    score += cfg->w_decorator * s->decorator;
+    score += cfg->w_struct_profile * s->struct_profile;
 
     /* Signal 6: Module proximity (multiplier, not additive).
      * Proximity returns [1.0, 1.10] — a same-file/same-dir boost for ranking.
@@ -1648,15 +1740,313 @@ float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
      * cosine-similarity range.  Without the clamp, a 0.95 base × 1.10 proximity
      * would emit a 1.045 score which violates the semantic of "similarity" and
      * breaks downstream consumers that expect a normalized value. */
-    score *= cbm_sem_proximity(a->file_path, b->file_path);
+    score *= s->proximity;
     if (score > CBM_SEM_UNIT_POS) {
         score = CBM_SEM_UNIT_POS;
     }
     if (score < 0.0F) {
         score = 0.0F;
     }
-
     return score;
+}
+
+typedef struct {
+    float score;
+    int pos;
+} sem_rank_t;
+
+static int cmp_rank_best_first(const void *pa, const void *pb) {
+    const sem_rank_t *a = pa;
+    const sem_rank_t *b = pb;
+    if (a->score != b->score) {
+        return a->score > b->score ? -1 : 1;
+    }
+    return (a->pos > b->pos) - (a->pos < b->pos);
+}
+
+/* Best-first, not first-come: when a function has more candidate partners
+ * than its budget, it keeps its best ones. Judged on held-out repositories
+ * (2026-10-07): the pairs first-come admitted over budget were 0 of 17
+ * related, the ones best-first admits instead 7 of 20. */
+bool cbm_sem_admit_best_first(const float *scores, const int *fa, const int *fb,
+                              const bool *eligible, int n, int max_edges, int *counts,
+                              bool *admitted) {
+    if (n <= 0) {
+        return true;
+    }
+    memset(admitted, 0, (size_t)n * sizeof(admitted[0]));
+    sem_rank_t *order = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)n * sizeof(sem_rank_t));
+    if (!order) {
+        return false;
+    }
+    int m = 0;
+    for (int k = 0; k < n; k++) {
+        if (eligible[k]) {
+            order[m++] = (sem_rank_t){.score = scores[k], .pos = k};
+        }
+    }
+    qsort(order, (size_t)m, sizeof(order[0]), cmp_rank_best_first);
+    for (int r = 0; r < m; r++) {
+        int k = order[r].pos;
+        if (counts[fa[k]] < max_edges && counts[fb[k]] < max_edges) {
+            counts[fa[k]]++;
+            counts[fb[k]]++;
+            admitted[k] = true;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, order);
+    return true;
+}
+
+/* Until 2026-10 the reader stopped at the first '"' and kept escapes raw:
+ * a docstring holding a quote lost everything after it, and "\nreturn" gave
+ * the token "nreturn". */
+const char *cbm_sem_json_str(const char *json, const char *key, char *buf, int bufsize) {
+    if (!json || !key || !buf || bufsize <= 0) {
+        return NULL;
+    }
+    char search[CBM_SZ_64];
+    snprintf(search, sizeof(search), "\"%s\":\"", key);
+    const char *p = strstr(json, search);
+    if (!p) {
+        return NULL;
+    }
+    p += strlen(search);
+    int n = 0;
+    for (; *p && *p != '"' && n + SKIP_ONE < bufsize; p++) {
+        char c = *p;
+        if (c == '\\' && p[SKIP_ONE]) {
+            p++;
+            switch (*p) {
+            case 'n':
+            case 't':
+            case 'r':
+            case 'b':
+            case 'f':
+                c = ' ';
+                break;
+            case 'u':
+                c = ' ';
+                for (int k = 0; k < 4 && isxdigit((unsigned char)p[SKIP_ONE]); k++) {
+                    p++;
+                }
+                break;
+            default:
+                c = *p; /* \" \\ \/ */
+                break;
+            }
+        }
+        buf[n++] = c;
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Score bands at the quartiles of the admitted scores (0.773, 0.802, 0.838 at
+ * the stored score's three decimals, so one shown score always carries one p),
+ * each band's p the judged share of related pairs, pooled where a higher band
+ * judged lower: the upper three pool to one. Judged 2026-10-07 in eleven
+ * held-out repositories: the pairs this scoring admits that the previous one
+ * did not (100, blind, three reading rounds) and the earlier samples' pairs it
+ * keeps (65), each weighted by its share of the admitted set. Ships as the
+ * edge property "p". */
+static const float SEM_P_CUTS[] = {0.773F};
+static const float SEM_P_BANDS[] = {0.626F, 0.760F};
+
+float cbm_sem_calibrated_p(float score) {
+    size_t band = 0;
+    while (band < sizeof(SEM_P_CUTS) / sizeof(SEM_P_CUTS[0]) && score >= SEM_P_CUTS[band]) {
+        band++;
+    }
+    return SEM_P_BANDS[band];
+}
+
+/* Doc -> code candidates by their tfidf: each band's p the judged share of
+ * sections that are about the function (2026-10-07: 274 blind-judged
+ * candidates -- a section's best five non-test functions -- from five held-out
+ * repositories, three reading rounds; the top three measured bands pooled to
+ * stay monotone). Below the first cut (judged 0.06) nothing is stored. */
+enum { SEM_DOC_P_NBANDS = 4 };
+static const float SEM_DOC_P_CUTS[SEM_DOC_P_NBANDS - 1] = {CBM_SEM_DOC_MIN_SCORE, 0.30F, 0.40F};
+/* Per format, p below the first cut and in each band; 0 = not stored (a
+ * band judged below 0.20). Blind-judged, three reading rounds, pooled where
+ * a higher band judged lower:
+ *   Markdown  by kind and position since SEM7: SEM_DOC_P_MD_* below (its
+ *             first curve, 2026-10-07: 274 candidates of five repositories,
+ *             0.06 / 0.36 / 0.42 / 0.55, did not separate positions).
+ *   reST      2026-10-08, 120 candidates, three Sphinx projects; 0.20-0.30
+ *             judged 0.125, so reST starts at 0.30.
+ *   AsciiDoc  2026-10-08, 114 candidates, one repository (the only one of
+ *             its search that qualified).
+ *   PDF       no qualifying repository: not measured, nothing stored. */
+static const float SEM_DOC_P_BANDS[CBM_SEM_DOC_FMT_COUNT][SEM_DOC_P_NBANDS] = {
+    [CBM_SEM_DOC_FMT_OTHER] = {0.0F, 0.0F, 0.0F, 0.0F},
+    [CBM_SEM_DOC_FMT_MARKDOWN] = {0.0F, 0.0F, 0.0F, 0.0F}, /* SEM_DOC_P_MD_* */
+    [CBM_SEM_DOC_FMT_RST] = {0.0F, 0.0F, 0.35F, 0.625F},
+    [CBM_SEM_DOC_FMT_ADOC] = {0.0F, 0.225F, 0.25F, 0.50F},
+    [CBM_SEM_DOC_FMT_PDF] = {0.0F, 0.0F, 0.0F, 0.0F},
+};
+
+cbm_sem_doc_format_t cbm_sem_doc_format(const char *path) {
+    static const struct {
+        const char *ext;
+        cbm_sem_doc_format_t fmt;
+    } exts[] = {{".md", CBM_SEM_DOC_FMT_MARKDOWN},       {".mdx", CBM_SEM_DOC_FMT_MARKDOWN},
+                {".markdown", CBM_SEM_DOC_FMT_MARKDOWN}, {".rst", CBM_SEM_DOC_FMT_RST},
+                {".rest", CBM_SEM_DOC_FMT_RST},          {".txt", CBM_SEM_DOC_FMT_RST},
+                {".adoc", CBM_SEM_DOC_FMT_ADOC},         {".asciidoc", CBM_SEM_DOC_FMT_ADOC},
+                {".asc", CBM_SEM_DOC_FMT_ADOC},          {".pdf", CBM_SEM_DOC_FMT_PDF}};
+    const char *dot = path ? strrchr(path, '.') : NULL;
+    if (!dot || strchr(dot, '/')) {
+        return CBM_SEM_DOC_FMT_OTHER;
+    }
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        if (strcasecmp(dot, exts[i].ext) == 0) {
+            return exts[i].fmt;
+        }
+    }
+    return CBM_SEM_DOC_FMT_OTHER;
+}
+
+double cbm_sem_p_2dp(float p) {
+    /* 1e-4 on the x100 scale: a float holds 0.325 as 0.32499998..., 1.2e-6
+     * below the half; judged values have at most three decimals, so the
+     * nearest one that must round down (x.xx4) is 0.1 away */
+    return (double)(long)((double)p * 100.0 + 0.5 + 1e-4) / 100.0;
+}
+
+/* Markdown by kind and position (SEM7, 2026-10-08: 490 blind-judged
+ * candidates from four monorepos with per-component docs, three reading
+ * rounds, pooled where a higher band judged lower). A doc's position decides
+ * most: functions outside the doc's home were right 6 of 90 (none stored);
+ * inside it 0.18 / 0.33 / 0.53. A doc of the whole project: SEM7's and
+ * sample 4's judged items pooled (the user's choice; 158 items, nine
+ * repositories): 0.17 / 0.22 / 0.51. Local extras (home functions below the
+ * top 5) 19 of 60 = 0.32 at every band; whole files 0.12 below 0.40, then
+ * 0.30. Below 0.20 nothing. */
+static const float SEM_DOC_P_MD_FUNCTION[CBM_SEM_DOC_POS_COUNT][SEM_DOC_P_NBANDS] = {
+    [CBM_SEM_DOC_POS_GLOBAL] = {0.0F, 0.0F, 0.217F, 0.509F},
+    [CBM_SEM_DOC_POS_LOCAL] = {0.0F, 0.0F, 0.325F, 0.525F},
+    [CBM_SEM_DOC_POS_OUTSIDE] = {0.0F, 0.0F, 0.0F, 0.0F},
+};
+static const float SEM_DOC_P_MD_LOCAL[SEM_DOC_P_NBANDS] = {0.0F, 0.317F, 0.317F, 0.317F};
+static const float SEM_DOC_P_MD_FILE[SEM_DOC_P_NBANDS] = {0.0F, 0.0F, 0.0F, 0.30F};
+
+float cbm_sem_doc_calibrated_p(cbm_sem_doc_format_t fmt, cbm_sem_doc_kind_t kind,
+                               cbm_sem_doc_pos_t pos, float score) {
+    if ((int)fmt < 0 || fmt >= CBM_SEM_DOC_FMT_COUNT || (int)pos < 0 ||
+        pos >= CBM_SEM_DOC_POS_COUNT) {
+        return 0.0F;
+    }
+    size_t band = 0;
+    while (band < SEM_DOC_P_NBANDS - 1 && score >= SEM_DOC_P_CUTS[band]) {
+        band++;
+    }
+    if (fmt != CBM_SEM_DOC_FMT_MARKDOWN) {
+        /* measured for function candidates only, without position (SEM6) */
+        return kind == CBM_SEM_DOC_KIND_FUNCTION ? SEM_DOC_P_BANDS[fmt][band] : 0.0F;
+    }
+    switch (kind) {
+    case CBM_SEM_DOC_KIND_FUNCTION:
+        return SEM_DOC_P_MD_FUNCTION[pos][band];
+    case CBM_SEM_DOC_KIND_LOCAL:
+        return pos == CBM_SEM_DOC_POS_LOCAL ? SEM_DOC_P_MD_LOCAL[band] : 0.0F;
+    case CBM_SEM_DOC_KIND_FILE:
+        return SEM_DOC_P_MD_FILE[band];
+    default:
+        return 0.0F; /* a folder candidate: cbm_sem_doc_folder_p */
+    }
+}
+
+/* A doc's home folder as its candidate (SEM7): a README or index doc was
+ * right 26 of 30 (0.87); any other doc 5 of 30 (not stored). Markdown only. */
+float cbm_sem_doc_folder_p(cbm_sem_doc_format_t fmt, const char *doc_path) {
+    if (fmt != CBM_SEM_DOC_FMT_MARKDOWN || !doc_path) {
+        return 0.0F;
+    }
+    const char *base = strrchr(doc_path, '/');
+    base = base ? base + 1 : doc_path;
+    const char *dot = strrchr(base, '.');
+    size_t n = dot ? (size_t)(dot - base) : strlen(base);
+    bool readme = (n == sizeof("readme") - 1 && strncasecmp(base, "readme", n) == 0) ||
+                  (n == sizeof("index") - 1 && strncasecmp(base, "index", n) == 0);
+    return readme ? 0.867F : 0.0F;
+}
+
+cbm_sem_diag_family_t cbm_sem_diag_family(const char *format, const char *diagram_kind) {
+    static const char *const mermaid[] = {"sequence",   "class",         "er",
+                                          "c4_context", "c4_container",  "c4_component",
+                                          "c4_dynamic", "c4_deployment", "architecture"};
+    static const char *const plantuml[] = {"c4", "class", "sequence", "usecase", "component"};
+    if (!format || !format[0]) {
+        return CBM_SEM_DIAG_NONE;
+    }
+    const char *const *structural = NULL;
+    size_t n = 0;
+    if (strcmp(format, "mermaid") == 0) {
+        structural = mermaid;
+        n = sizeof(mermaid) / sizeof(mermaid[0]);
+    } else if (strcmp(format, "plantuml") == 0) {
+        structural = plantuml;
+        n = sizeof(plantuml) / sizeof(plantuml[0]);
+    } else {
+        return CBM_SEM_DIAG_GRAPH;
+    }
+    for (size_t i = 0; diagram_kind && i < n; i++) {
+        if (strcmp(diagram_kind, structural[i]) == 0) {
+            return CBM_SEM_DIAG_STRUCTURAL;
+        }
+    }
+    return CBM_SEM_DIAG_PROSE;
+}
+
+/* Markdown sections that embed a diagram, by the section's family (DIAG-C,
+ * 2026-10-11: 553 blind-judged candidates from sections of 16 held-out
+ * repositories that embed a diagram, three reading rounds; function
+ * candidates at or inside the home pooled, as both curves rose by band).
+ * A diagram section is about its candidates more often than SEM7's Markdown
+ * curve says, so its first band is stored too:
+ *   prose       0.24 / 0.28 / 0.45, local extras 11 of 40 = 0.275
+ *   structural  0.32 / 0.46 / 0.57, local extras  7 of  9 = 0.78 (every
+ *               local extra of the family; 95% interval 0.45-0.94)
+ * Graph diagrams (DOT, D2) were not found in Markdown sections: SEM7. */
+static const struct {
+    bool fitted;
+    float function[SEM_DOC_P_NBANDS];
+    float local;
+} SEM_DOC_P_MD_DIAGRAM[CBM_SEM_DIAG_COUNT] = {
+    [CBM_SEM_DIAG_PROSE] = {true, {0.0F, 0.24F, 0.28F, 0.45F}, 0.275F},
+    [CBM_SEM_DIAG_STRUCTURAL] = {true, {0.0F, 0.32F, 0.464F, 0.567F}, 0.778F},
+};
+
+float cbm_sem_doc_section_p(cbm_sem_doc_format_t fmt, cbm_sem_diag_family_t fam,
+                            cbm_sem_doc_kind_t kind, cbm_sem_doc_pos_t pos, float score) {
+    bool fitted = fmt == CBM_SEM_DOC_FMT_MARKDOWN && (int)fam > 0 && fam < CBM_SEM_DIAG_COUNT &&
+                  SEM_DOC_P_MD_DIAGRAM[fam].fitted;
+    bool home = pos == CBM_SEM_DOC_POS_GLOBAL || pos == CBM_SEM_DOC_POS_LOCAL;
+    if (!fitted || !((kind == CBM_SEM_DOC_KIND_FUNCTION && home) ||
+                     (kind == CBM_SEM_DOC_KIND_LOCAL && pos == CBM_SEM_DOC_POS_LOCAL))) {
+        return cbm_sem_doc_calibrated_p(fmt, kind, pos, score);
+    }
+    size_t band = 0;
+    while (band < SEM_DOC_P_NBANDS - 1 && score >= SEM_DOC_P_CUTS[band]) {
+        band++;
+    }
+    if (band == 0) {
+        return 0.0F; /* below CBM_SEM_DOC_MIN_SCORE: never measured, nothing stored */
+    }
+    return kind == CBM_SEM_DOC_KIND_LOCAL ? SEM_DOC_P_MD_DIAGRAM[fam].local
+                                          : SEM_DOC_P_MD_DIAGRAM[fam].function[band];
+}
+
+float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
+                             const cbm_sem_config_t *cfg) {
+    if (!a || !b || !cfg) {
+        return 0.0F;
+    }
+    cbm_sem_signals_t s;
+    cbm_sem_signal_values(a, b, &s);
+    return cbm_sem_combine(&s, cfg);
 }
 
 /* ── Graph diffusion ─────────────────────────────────────────────── */

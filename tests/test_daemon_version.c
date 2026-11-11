@@ -9,6 +9,7 @@
 #include "test_framework.h"
 
 #include "daemon/daemon.h"
+#include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "daemon/service_internal.h"
 #include "foundation/compat.h"
@@ -274,6 +275,87 @@ TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds) {
     ASSERT_NOT_NULL(strstr(visible, BUILD_A));
     ASSERT_NOT_NULL(strstr(visible, "2.4.0"));
     ASSERT_NOT_NULL(strstr(visible, BUILD_B));
+    PASS();
+}
+
+/* #2277: a version/build conflict refusal must say WHICH daemon holds the
+ * endpoint and how to clear it. The reporter saw only "close all CBM sessions
+ * and commands", with no pid, no hint that a live agent session (Codex) had
+ * launched an older install, and no mention of `daemon stop`. */
+static cbm_daemon_runtime_status_t version_test_active_status(const char *version, bool permanent,
+                                                              uint32_t pid) {
+    cbm_daemon_runtime_status_t status;
+    memset(&status, 0, sizeof(status));
+    status.permanent = permanent;
+    status.daemon_pid = pid;
+    (void)snprintf(status.semantic_version, sizeof(status.semantic_version), "%s", version);
+    (void)snprintf(status.build_fingerprint, sizeof(status.build_fingerprint), "%s", BUILD_A);
+    return status;
+}
+
+TEST(daemon_conflict_remedy_names_session_managed_daemon_and_its_sessions) {
+    cbm_daemon_runtime_status_t active = version_test_active_status("0.10.3", false, 4242);
+    active.committed_clients = 2;
+    active.client_count = 2;
+    active.client_pids[0] = 5151;
+    active.client_pids[1] = 6262;
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
+
+    ASSERT_TRUE(cbm_daemon_conflict_remedy_format(&active, remedy, sizeof(remedy)));
+    ASSERT_NOT_NULL(strstr(remedy, "pid 4242"));
+    ASSERT_NOT_NULL(strstr(remedy, "version 0.10.3"));
+    ASSERT_NOT_NULL(strstr(remedy, "session-managed"));
+    ASSERT_NOT_NULL(strstr(remedy, "5151, 6262"));
+    ASSERT_NOT_NULL(strstr(remedy, "which -a codebase-memory-mcp"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon stop"));
+    PASS();
+}
+
+TEST(daemon_conflict_remedy_names_permanent_daemon_and_truncated_session_list) {
+    cbm_daemon_runtime_status_t active = version_test_active_status("0.12.0", true, 77);
+    active.committed_clients = CBM_DAEMON_CONTROL_CLIENT_CAP + 3U;
+    active.client_count = CBM_DAEMON_CONTROL_CLIENT_CAP;
+    for (uint32_t i = 0; i < CBM_DAEMON_CONTROL_CLIENT_CAP; i++) {
+        active.client_pids[i] = 1000U + i;
+    }
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
+
+    ASSERT_TRUE(cbm_daemon_conflict_remedy_format(&active, remedy, sizeof(remedy)));
+    ASSERT_NOT_NULL(strstr(remedy, "pid 77"));
+    ASSERT_NOT_NULL(strstr(remedy, "permanent"));
+    ASSERT_NOT_NULL(strstr(remedy, "1007 and 3 more"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon stop"));
+    PASS();
+}
+
+TEST(daemon_conflict_remedy_reports_a_stopping_daemon) {
+    cbm_daemon_runtime_status_t active = version_test_active_status("0.10.3", false, 99);
+    active.stopping = true;
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
+
+    ASSERT_TRUE(cbm_daemon_conflict_remedy_format(&active, remedy, sizeof(remedy)));
+    ASSERT_NOT_NULL(strstr(remedy, "pid 99"));
+    ASSERT_NOT_NULL(strstr(remedy, "already stopping"));
+    PASS();
+}
+
+TEST(daemon_conflict_remedy_without_status_points_at_daemon_status) {
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
+
+    ASSERT_TRUE(cbm_daemon_conflict_remedy_format(NULL, remedy, sizeof(remedy)));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon status"));
+    ASSERT_NOT_NULL(strstr(remedy, "which -a codebase-memory-mcp"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon stop"));
+    PASS();
+}
+
+TEST(daemon_conflict_remedy_fails_closed_when_truncated) {
+    cbm_daemon_runtime_status_t active = version_test_active_status("0.10.3", false, 4242);
+    char tiny[16];
+
+    ASSERT_FALSE(cbm_daemon_conflict_remedy_format(&active, tiny, sizeof(tiny)));
+    ASSERT_STR_EQ(tiny, "");
+    ASSERT_FALSE(cbm_daemon_conflict_remedy_format(&active, NULL, 0));
     PASS();
 }
 
@@ -613,6 +695,11 @@ SUITE(daemon_version) {
     RUN_TEST(daemon_build_fingerprint_hashes_exact_executable_bytes);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
+    RUN_TEST(daemon_conflict_remedy_names_session_managed_daemon_and_its_sessions);
+    RUN_TEST(daemon_conflict_remedy_names_permanent_daemon_and_truncated_session_list);
+    RUN_TEST(daemon_conflict_remedy_reports_a_stopping_daemon);
+    RUN_TEST(daemon_conflict_remedy_without_status_points_at_daemon_status);
+    RUN_TEST(daemon_conflict_remedy_fails_closed_when_truncated);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);
     RUN_TEST(daemon_hello_fails_closed_without_an_exact_build_fingerprint);
     RUN_TEST(daemon_conflict_log_is_durable_private_and_rotates);

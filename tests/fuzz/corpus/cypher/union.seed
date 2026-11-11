@@ -1,0 +1,1 @@
+MATCH (n:Function) RETURN n.name AS name UNION MATCH (n:Method) RETURN n.name AS name

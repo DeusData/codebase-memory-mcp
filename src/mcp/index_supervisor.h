@@ -22,8 +22,10 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdatomic.h>
 
+#include "foundation/index_policy.h"
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
 
 /* Worker-role state, set once from the CLI arg parser (main.c) when this process
@@ -40,6 +42,7 @@ void cbm_index_set_worker_role(bool is_worker, const char *response_out);
 #define CBM_INDEX_WORKER_QUARANTINE_ARG "--index-worker-quarantine"
 #define CBM_INDEX_WORKER_MEMORY_BUDGET_ARG "--index-worker-memory-budget-bytes"
 #define CBM_INDEX_WORKER_BUILD_ARG "--index-worker-build"
+#define CBM_INDEX_WORKER_PUBLISH_FENCE_ARG "--index-worker-publish-fence"
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_LENGTH 64U
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE 65U
 void cbm_index_set_worker_role_options(bool is_worker, const char *response_out, bool single_thread,
@@ -49,11 +52,68 @@ bool cbm_index_worker_active(void);
 const char *cbm_index_worker_response_out(void);
 size_t cbm_index_worker_memory_budget_bytes(void);
 
+/* Publication fence. A worker resource limit (index_max_rss_mb,
+ * index_max_duration_seconds) is enforced by the supervisor, while only the
+ * worker replaces the serving database. When such a limit is enabled, every
+ * worker attempt gets a fence file path, and publication and resource
+ * termination both CLAIM it by creating that file exclusively, so exactly one
+ * of them can win:
+ *   - the worker claims immediately before it replaces the serving database;
+ *     losing means the supervisor already decided to stop it for a limit, so
+ *     the run aborts before publication and the previous index stays intact;
+ *   - the supervisor claims before it terminates the worker for a limit;
+ *     losing means the worker already committed to publishing, so the limit is
+ *     no longer enforced for that attempt and the attempt runs to completion.
+ * A reported resource failure therefore never follows a publication by the
+ * same attempt. Without an enabled worker limit there is no fence and nothing
+ * changes. The supervisor passes the path on the worker argv; the worker entry
+ * installs it here (NULL clears it). */
+void cbm_index_set_worker_publish_fence(const char *fence_file);
+const char *cbm_index_worker_publish_fence(void);
+
+/* Worker side: claim publication. True when publishing may proceed: no fence
+ * is installed, or this call created the fence file. False when the
+ * supervisor already claimed it (a resource limit stopped this attempt) or the
+ * claim could not be made; the caller must then leave the serving database
+ * untouched. Idempotent after a successful claim. */
+bool cbm_index_worker_claim_publication(void);
+
+/* Event name of the worker log's startup header. Shared with the tests so the
+ * contract has exactly one spelling. */
+#define CBM_INDEX_WORKER_LOG_START_EVENT "index.worker.start"
+
+/* Worker-side: open the worker log for post-mortem use. Call this FIRST in a
+ * process admitted by the worker argv grammar, before any indexing work.
+ *
+ * Six reports (#1070, #1130, #1132, #1133, #1145, #1450) describe a worker that
+ * died and left a log of 0 bytes: nothing was ever flushed, so every one of them
+ * is unreproducible and unattributable. This makes the log always say something:
+ *   1. the stream becomes crash-durable (see cbm_log_set_crash_durable), so a
+ *      crash, a SIGKILL or a hang can no longer swallow what was written;
+ *   2. a startup header — version, build fingerprint, pid, repo path and the
+ *      worker's own arguments — is written and flushed synchronously, so even a
+ *      worker that dies before its first unit of work is identifiable.
+ *
+ * It fixes no crash. It converts an empty file into a report we can act on.
+ * Idempotent: the worker role is installed twice (process entry, then the CLI
+ * arg parser), and the header is written once. */
+void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
+
 /* Capture the exact executable-image fingerprint once, during process startup
  * before any worker can be launched. Repeated calls return the original capture
  * and never re-hash a pathname that an installer may since have replaced. */
 bool cbm_index_supervisor_capture_build_fingerprint(void);
 const char *cbm_index_supervisor_build_fingerprint(void);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Test-only: the runner captures a synthetic stub (see the capture seam) so
+ * spawned workers start instantly, but a daemon runtime service can only carry
+ * the REAL image hash. A fixture that runs a real daemon and drives the
+ * production activation guard against it aligns the captured value with that
+ * hash for its duration and restores the previous value afterwards. Invalid
+ * input is ignored. Never compiled into production. */
+void cbm_index_supervisor_set_build_fingerprint_for_test(const char *fingerprint);
+#endif
 
 typedef struct {
     const char *expected_build_fingerprint;
@@ -63,6 +123,7 @@ typedef struct {
     const char *marker_file;
     const char *quarantine_file;
     size_t memory_budget_bytes;
+    const char *publish_fence_file;
 } cbm_index_worker_invocation_t;
 
 typedef enum {
@@ -116,9 +177,25 @@ typedef struct {
     bool forced;
     bool tree_quiesced;
     bool supervision_failed;
+    /* #1300: the worker exited CLEAN but wrote no response (an empty or
+     * unreadable response file). A contained failure, never a success: the
+     * response stays NULL, the worker log is retained and named, and
+     * last_phase is the last structured event that log recorded ("unknown"
+     * when it holds none), so the report says where the run stopped. */
+    bool response_missing;
+    char last_phase[128];
+    char worker_log[4096];
     bool response_rejected; /* clean worker exceeded the bounded response protocol */
-    char *response;         /* worker result only after a contained, uncancelled CLEAN exit;
-                             * borrowed for async polls, caller-owned from the sync wrapper */
+    cbm_index_resource_violation_t resource_violation;
+    bool resource_probe_failed;
+    /* The worker claimed the publication fence: it committed to replacing the
+     * serving database (whether or not it got that far). Also true when the
+     * fence state could not be read, because a report may only claim the
+     * previous index was preserved when it can prove it. Always false without
+     * a fence (no worker limit enabled) and for an attempt stopped by a limit. */
+    bool publication_committed;
+    char *response; /* worker result only after a contained, uncancelled CLEAN exit;
+                     * borrowed for async polls, caller-owned from the sync wrapper */
 } cbm_index_worker_result_t;
 
 /* Daemon-owned, nonblocking supervisor for one contained worker process tree. */
@@ -130,12 +207,36 @@ typedef enum {
     CBM_INDEX_WORKER_POLL_TERMINAL = 1,
 } cbm_index_worker_poll_t;
 
+/* Pure Windows backstop policy, available on all platforms for regression tests.
+ * Small/zero budgets disable the OS cap, not the cooperative budget or containment. */
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes);
+
 /* Start returns after process creation. All string arguments are copied by the
  * contained subprocess layer. Recovery values are encoded only as hidden argv
  * and applied after exec by cbm_index_set_worker_role_options(). */
 int cbm_index_worker_start(const char *args_json, size_t memory_budget_bytes, bool single_thread,
                            const char *marker_file, const char *quarantine_file,
                            cbm_index_worker_handle_t **handle_out);
+int cbm_index_worker_start_with_policy(const char *args_json, size_t memory_budget_bytes,
+                                       const cbm_index_resource_policy_t *resource_policy,
+                                       bool single_thread, const char *marker_file,
+                                       const char *quarantine_file, uint64_t duration_origin_ms,
+                                       cbm_index_worker_handle_t **handle_out);
+
+/* Policy plus the request-scoped log callback. The daemon default start path
+ * needs both: a missing policy fails closed, and worker diagnostics still
+ * reach the daemon journal. duration_origin_ms is the request clock; 0 means now. */
+int cbm_index_worker_start_with_policy_log(const char *args_json, size_t memory_budget_bytes,
+                                           const cbm_index_resource_policy_t *resource_policy,
+                                           bool single_thread, const char *marker_file,
+                                           const char *quarantine_file,
+                                           cbm_proc_log_cb log_callback, void *log_context,
+                                           uint64_t duration_origin_ms,
+                                           cbm_index_worker_handle_t **handle_out);
+
+/* Supervisor clock used to stamp a request-scoped duration origin. Tests may
+ * replace it; production is cbm_now_ms(). */
+uint64_t cbm_index_worker_now_ms(void);
 
 /* Request-scoped variant used by interactive local CLI calls. The callback is
  * invoked by the owner thread while it polls the contained worker; log_context
@@ -199,7 +300,26 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
                                            cbm_proc_log_cb log_callback, void *log_context,
                                            const atomic_int *cancel_requested,
                                            cbm_index_worker_result_t *result);
+int cbm_index_spawn_worker_with_policy_log_cancel(
+    const char *args_json, const cbm_index_resource_policy_t *resource_policy, bool single_thread,
+    const char *marker_file, const char *quarantine_file, cbm_proc_log_cb log_callback,
+    void *log_context, const atomic_int *cancel_requested, uint64_t duration_origin_ms,
+    cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef uint64_t (*cbm_index_supervisor_clock_fn)(void *context);
+typedef cbm_proc_tree_rss_status_t (*cbm_index_supervisor_rss_fn)(cbm_subprocess_t *process,
+                                                                  uint64_t *rss_bytes,
+                                                                  void *context);
+void cbm_index_supervisor_set_resource_hooks_for_testing(cbm_index_supervisor_clock_fn clock_fn,
+                                                         cbm_index_supervisor_rss_fn rss_fn,
+                                                         void *context);
+void cbm_index_supervisor_reset_resource_hooks_for_testing(void);
+/* Borrowed fence path of an attempt; NULL when it has no fence. */
+const char *cbm_index_worker_publish_fence_path_for_testing(
+    const cbm_index_worker_handle_t *handle);
+#endif
 
 #endif /* CBM_INDEX_SUPERVISOR_H */

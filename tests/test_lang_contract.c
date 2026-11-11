@@ -24,6 +24,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -460,6 +461,141 @@ TEST(contract_python_relative_import) {
     PASS();
 }
 
+/* Python: relative aliased from-import must CALLS the real def (execute). */
+TEST(contract_python_aliased_from_import_calls) {
+    static const LangFile f[] = {{"gate.py", "def execute(x):\n    return x\n"},
+                                 {"router.py",
+                                  "from .gate import execute as bridge_execute\n\n\n"
+                                  "def submit_task(y):\n    return bridge_execute(y)\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "submit_task", &nodes, &ncount),
+              CBM_STORE_OK);
+    ASSERT_TRUE(ncount >= 1);
+    char **callers = NULL;
+    char **callees = NULL;
+    int n_callers = 0;
+    int n_callees = 0;
+    ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
+                                            &n_callees),
+              0);
+    int saw_execute = 0;
+    int saw_alias_ghost = 0;
+    for (int i = 0; i < n_callees; i++) {
+        if (callees[i] && strcmp(callees[i], "execute") == 0) {
+            saw_execute = 1;
+        }
+        if (callees[i] && strcmp(callees[i], "bridge_execute") == 0) {
+            saw_alias_ghost = 1;
+        }
+    }
+    for (int i = 0; i < n_callers; i++) {
+        free(callers[i]);
+    }
+    for (int i = 0; i < n_callees; i++) {
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+    cbm_store_free_nodes(nodes, ncount);
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(saw_execute);
+    ASSERT_FALSE(saw_alias_ghost);
+    PASS();
+}
+
+/* Python: absolute aliased from-import must CALLS the real def (Yui router shape). */
+TEST(contract_python_absolute_aliased_from_import_calls) {
+    static const LangFile f[] = {
+        {"services/satori_bridge/__init__.py", ""},
+        {"services/satori_bridge/gate.py", "def execute(x):\n    return x\n"},
+        {"services/yui_core/__init__.py", ""},
+        {"services/yui_core/router.py",
+         "from services.satori_bridge.gate import execute as bridge_execute\n\n\n"
+         "def submit_task(y):\n    return bridge_execute(y)\n"},
+        {"services/__init__.py", ""}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 5);
+    ASSERT_TRUE(store != NULL);
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "submit_task", &nodes, &ncount),
+              CBM_STORE_OK);
+    ASSERT_TRUE(ncount >= 1);
+    char **callers = NULL;
+    char **callees = NULL;
+    int n_callers = 0;
+    int n_callees = 0;
+    ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
+                                            &n_callees),
+              0);
+    int saw_execute = 0;
+    int saw_alias_ghost = 0;
+    for (int i = 0; i < n_callees; i++) {
+        if (callees[i] && strcmp(callees[i], "execute") == 0) {
+            saw_execute = 1;
+        }
+        if (callees[i] && strcmp(callees[i], "bridge_execute") == 0) {
+            saw_alias_ghost = 1;
+        }
+    }
+    for (int i = 0; i < n_callers; i++) {
+        free(callers[i]);
+    }
+    for (int i = 0; i < n_callees; i++) {
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+    cbm_store_free_nodes(nodes, ncount);
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(saw_execute);
+    ASSERT_FALSE(saw_alias_ghost);
+    PASS();
+}
+
+/* Python: unresolvable module + alias must emit no CALLS (no invented edge). */
+TEST(contract_python_ghost_module_aliased_from_import_no_calls) {
+    static const LangFile f[] = {{"router.py", "from ghost_module import nope as alias\n\n\n"
+                                               "def submit_task(y):\n    return alias(y)\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_TRUE(store != NULL);
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "submit_task", &nodes, &ncount),
+              CBM_STORE_OK);
+    ASSERT_TRUE(ncount >= 1);
+    char **callers = NULL;
+    char **callees = NULL;
+    int n_callers = 0;
+    int n_callees = 0;
+    ASSERT_EQ(cbm_store_node_neighbor_names(store, nodes[0].id, 32, &callers, &n_callers, &callees,
+                                            &n_callees),
+              0);
+    int saw_any_callee = 0;
+    for (int i = 0; i < n_callees; i++) {
+        if (callees[i] && callees[i][0]) {
+            saw_any_callee = 1;
+        }
+    }
+    for (int i = 0; i < n_callers; i++) {
+        free(callers[i]);
+    }
+    for (int i = 0; i < n_callees; i++) {
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+    cbm_store_free_nodes(nodes, ncount);
+    lang_cleanup(&lp, store);
+    ASSERT_FALSE(saw_any_callee);
+    PASS();
+}
+
 /* TypeScript: a relative import resolves to a sibling module → IMPORTS edge. */
 TEST(contract_typescript_relative_import) {
     static const LangFile f[] = {
@@ -553,6 +689,58 @@ static void breadth_diag(cbm_store_t *store, const char *project, const char *re
     if (dr) {
         cbm_free_result(dr);
     }
+}
+
+/* Chialisp: a constant defined in an included .clib must resolve from the
+ * puzzle that includes it.
+ *
+ * This is the whole reason `Constant` is admitted to the cross-file name
+ * registry (cbm_label_is_registry_symbol). Chialisp's condition codes,
+ * CREATE_COIN and friends, are `(defconstant ...)` forms in a shared .clib and
+ * are referenced by name from every puzzle. Labelled `Constant` but left OUT of
+ * the registry, they are seeded nowhere, cbm_registry_resolve returns nothing,
+ * and roughly half of a Chialisp graph is unreachable — present as nodes, but
+ * never the target of an edge. This test fails (zero cross-file USAGE edges)
+ * the moment "Constant" is dropped from that predicate. */
+TEST(contract_chialisp_constant_resolves_across_files) {
+    static const LangFile f[] = {{"condition_codes.clib", "(\n  (defconstant CREATE_COIN 51)\n)\n"},
+                                 {"puzzle.clsp", "(mod (ARG)\n"
+                                                 "  (include condition_codes.clib)\n"
+                                                 "  (defun run (amount)\n"
+                                                 "    (list CREATE_COIN amount))\n"
+                                                 ")\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+
+    cbm_node_t *consts = NULL;
+    int nconst = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "CREATE_COIN", &consts, &nconst),
+              CBM_STORE_OK);
+    ASSERT_TRUE(nconst >= 1);
+    ASSERT_TRUE(consts[0].label != NULL && strcmp(consts[0].label, "Constant") == 0);
+    ASSERT_TRUE(consts[0].file_path != NULL && strstr(consts[0].file_path, "condition_codes.clib"));
+
+    cbm_edge_t *edges = NULL;
+    int nedges = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_target_type(store, consts[0].id, "USAGE", &edges, &nedges),
+              CBM_STORE_OK);
+    int cross_file = 0;
+    for (int i = 0; i < nedges; i++) {
+        cbm_node_t src;
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &src) != CBM_STORE_OK) {
+            continue;
+        }
+        if (src.file_path && strstr(src.file_path, "puzzle.clsp")) {
+            cross_file++;
+        }
+        cbm_node_free_fields(&src);
+    }
+    cbm_store_free_edges(edges, nedges);
+    cbm_store_free_nodes(consts, nconst);
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(cross_file >= 1);
+    PASS();
 }
 
 TEST(contract_all_grammars_in_graph) {
@@ -720,6 +908,9 @@ static const CallCase CALL_CASES[] = {
      "fn helper(x: felt252) -> felt252 {\n    x + 1\n}\n\nfn run() -> felt252 {\n    "
      "helper(41)\n}\n",
      true, NULL},
+    {"chialisp", "a.clsp",
+     "(mod ()\n  (defun helper (x)\n    (* x 2))\n  (defun run ()\n    (helper 21))\n)\n", true,
+     NULL},
     {"clojure", "a.clj", "(defn helper [] 42)\n\n(defn run [] (helper))\n", false,
      "lisp: call is a list_lit whose head is a sym_lit (not a field, not a first-child "
      "'identifier'); no lisp branch in extract_callee_name"},
@@ -875,9 +1066,12 @@ static const char *ALL_EDGE_TYPES[] = {"CALLS",
                                        "IMPORTS",
                                        "INHERITS",
                                        "INFRA_MAPS",
+                                       "MENTIONS",
                                        "OVERRIDE",
+                                       "REFERENCES_FILE",
                                        "SEMANTICALLY_RELATED",
                                        "SIMILAR_TO",
+                                       "SPAWNS",
                                        "TESTS_FILE",
                                        "TESTS",
                                        "TRPC_CALLS",
@@ -1359,6 +1553,87 @@ TEST(contract_edge_infra_routes_from_deploy_configs_still_minted) {
     PASS();
 }
 
+/* #2388: the YAML key-path walk kept its pending mappings in a 256-frame stack
+ * and stopped pushing once full. A `data:` payload block with more nested
+ * entries than that lost the full `data.<entry>.webhook_url` path of every entry
+ * past the cap; only the shorter per-mapping refs survived, the payload deny
+ * never saw them, and each of those values minted an infra Route (44 of 300
+ * here). Every payload value must stay unminted however wide the block is. */
+enum { WIDE_PAYLOAD_ENTRIES = 300 };
+
+TEST(contract_edge_no_infra_routes_from_wide_payload_block_issue2388) {
+    size_t cap = (size_t)WIDE_PAYLOAD_ENTRIES * 64 + 16;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "data:\n");
+    for (int i = 0; i < WIDE_PAYLOAD_ENTRIES; i++) {
+        pos +=
+            (size_t)snprintf(src + pos, cap - pos,
+                             "  svc%d:\n    webhook_url: https://h%d.payload.example/hook\n", i, i);
+    }
+    LangProj lp;
+    LangFile f[] = {{"service.yaml", src}};
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_NOT_NULL(store);
+    int routes = count_infra_routes_matching(store, lp.project, "payload.example");
+    if (routes != 0) {
+        fprintf(stderr, "  [2388] FAIL wide payload block minted %d infra routes (expected 0)\n",
+                routes);
+    }
+    ASSERT_EQ(routes, 0);
+    lang_cleanup(&lp, store);
+    free(src);
+    PASS();
+}
+
+/* A config URL becomes an infra Route only under a key that names an endpoint
+ * this service exposes. Reference links are not: across 17 infra repositories
+ * the infra Routes were changelog `pull_request` links (deckhouse 6,240),
+ * alert `runbook_url`s, chart `home`/`source`, kubeconfig `server`s, Argo
+ * `repoURL`s and docs `link`s -- and one root handler took all of them. */
+TEST(contract_edge_no_infra_routes_from_reference_links) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"CHANGELOG/v1.29.yml", "candi:\n"
+                                "  fixes:\n"
+                                "    - summary: fix a race\n"
+                                "      pull_request: https://github.com/org/repo/pull/1234\n"},
+        {"modules/cni/oss.yaml", "- name: Cilium\n"
+                                 "  link: https://github.com/cilium/cilium\n"},
+        {"charts/app/alerts.yaml", "groups:\n"
+                                   "  - name: app\n"
+                                   "    rules:\n"
+                                   "      - alert: Down\n"
+                                   "        annotations:\n"
+                                   "          runbook_url: https://runbooks.example.io/down\n"},
+        {"apps/app.yaml", "spec:\n"
+                          "  source:\n"
+                          "    repoURL: https://charts.example.io/stable\n"
+                          "  home: https://app.example.io\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(count_infra_routes_matching(store, lp.project, "https://"), 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* The endpoint keys keep minting in their camelCase / _url spellings. */
+TEST(contract_edge_infra_routes_from_endpoint_key_spellings) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"pubsub.yaml", "subscriptions:\n"
+                        "  - name: orders\n"
+                        "    pushEndpoint: https://orders.internal.example/push\n"},
+        {"hooks.yaml", "payments:\n"
+                       "  callbackUrl: https://pay.internal.example/callback\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(count_infra_routes_matching(store, lp.project, "orders.internal.example") >= 1);
+    ASSERT_TRUE(count_infra_routes_matching(store, lp.project, "pay.internal.example") >= 1);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* True if some CALLS edge's TARGET node carries `label` and a QN ending with
  * `qn_suffix` — i.e. the call resolved to that specific definition. */
 static int calls_edge_targets(cbm_store_t *store, const char *project, const char *label,
@@ -1518,7 +1793,9 @@ TEST(contract_edge_parallel_service_edges) {
         {"gql.py", "def gql(query_string):\n    return query_string\n"},
         {"client.py",
          "from gql import gql\n\n\ndef fetch_user():\n"
-         "    return gql(\"query GetUser { user { id name } }\")\n\n\n"
+         /* The embedded double quote survives extraction from this single-quoted
+          * Python string and breaks GRAPHQL_CALLS JSON unless operation is escaped. */
+         "    return gql('query GetUser { user(name: \"quoted\") { id name } }')\n\n\n"
          "def create_user():\n"
          "    return gql(\"mutation CreateUser { addUser(name: \\\"x\\\") { id } }\")\n"},
         /* TRPC_CALLS: local createTRPCProxyClient (same-module resolution). */
@@ -1559,6 +1836,20 @@ TEST(contract_edge_parallel_service_edges) {
     int grpc = store ? cbm_store_count_edges_by_type(store, lp.project, "GRPC_CALLS") : -1;
     int trpc = store ? cbm_store_count_edges_by_type(store, lp.project, "TRPC_CALLS") : -1;
     int infra = store ? cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS") : -1;
+    int invalid_props = -1;
+    if (store) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3 *db = cbm_store_get_db(store);
+        if (db &&
+            sqlite3_prepare_v2(db,
+                               "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                               "AND properties != '' AND json_valid(properties)=0;",
+                               -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            invalid_props = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
     if (graphql < 1 || grpc < 1 || trpc < 1 || infra < 1) {
         fprintf(stderr,
                 "  [EDGE] parallel-service: GRAPHQL_CALLS=%d GRPC_CALLS=%d TRPC_CALLS=%d "
@@ -1571,6 +1862,7 @@ TEST(contract_edge_parallel_service_edges) {
     ASSERT_TRUE(grpc >= 1);
     ASSERT_TRUE(trpc >= 1);
     ASSERT_TRUE(infra >= 1);
+    ASSERT_EQ(invalid_props, 0);
     PASS();
 }
 
@@ -1648,9 +1940,13 @@ SUITE(lang_contract) {
     RUN_TEST(contract_java_methods);
     RUN_TEST(contract_kotlin_methods);
     RUN_TEST(contract_python_relative_import);
+    RUN_TEST(contract_python_aliased_from_import_calls);
+    RUN_TEST(contract_python_absolute_aliased_from_import_calls);
+    RUN_TEST(contract_python_ghost_module_aliased_from_import_no_calls);
     RUN_TEST(contract_typescript_relative_import);
 
     /* Graph-level breadth across all grammars (P4). */
+    RUN_TEST(contract_chialisp_constant_resolves_across_files);
     RUN_TEST(contract_all_grammars_in_graph);
 
     /* CALLS-edge breadth across non-LSP languages (P5). */
@@ -1682,6 +1978,9 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
     RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
     RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
+    RUN_TEST(contract_edge_no_infra_routes_from_wide_payload_block_issue2388);
+    RUN_TEST(contract_edge_no_infra_routes_from_reference_links);
+    RUN_TEST(contract_edge_infra_routes_from_endpoint_key_spellings);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);

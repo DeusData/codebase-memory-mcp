@@ -5,6 +5,47 @@
 #include "../src/foundation/arena.h"
 #include <stdint.h>
 
+TEST(arena_init_exact_one_block_then_append_block_growth) {
+    CBMArena a;
+    cbm_arena_init_exact(&a, 100);
+    ASSERT_EQ(a.nblocks, 1);
+    ASSERT_EQ(a.block_sizes[0], 104); /* rounded to the 8-byte allocation grain */
+    ASSERT_EQ(a.grow_size, CBM_ARENA_APPEND_BLOCK);
+    void *p = cbm_arena_alloc(&a, 100);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(a.used, 104);
+    ASSERT_EQ(a.nblocks, 1); /* the exact block is full, nothing wasted */
+    void *q = cbm_arena_alloc(&a, 8);
+    ASSERT_NOT_NULL(q);
+    ASSERT_EQ(a.nblocks, 2);
+    /* An append takes a small block, not 2 x 104 and not the 64 KB default:
+     * the appended-to result arenas are the worker's peak. */
+    ASSERT_EQ(a.block_sizes[1], CBM_ARENA_APPEND_BLOCK);
+    ASSERT_EQ(a.grow_size, 2 * CBM_ARENA_APPEND_BLOCK);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(arena_growth_doubles_grow_size_and_reset_restores_it) {
+    CBMArena a;
+    cbm_arena_init_sized(&a, 64);
+    ASSERT_EQ(a.grow_size, 128);
+    ASSERT_NOT_NULL(cbm_arena_alloc(&a, 64));
+    ASSERT_NOT_NULL(cbm_arena_alloc(&a, 8)); /* -> block 128 */
+    ASSERT_EQ(a.nblocks, 2);
+    ASSERT_EQ(a.block_sizes[1], 128);
+    ASSERT_EQ(a.grow_size, 256);
+    ASSERT_NOT_NULL(cbm_arena_alloc(&a, 1000)); /* larger than grow_size: exact */
+    ASSERT_EQ(a.nblocks, 3);
+    ASSERT_EQ(a.block_sizes[2], 1000);
+    ASSERT_EQ(a.grow_size, 2000);
+    cbm_arena_reset(&a);
+    ASSERT_EQ(a.nblocks, 1);
+    ASSERT_EQ(a.grow_size, 128);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(arena_init_default) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -427,7 +468,45 @@ TEST(arena_strndup_zero_len) {
     PASS();
 }
 
+/* A lazy arena holds nothing until its first allocation, which opens exactly
+ * the configured block; growth then doubles as usual, and destroying it closes
+ * it again (an allocation after destroy is refused, never a silent reopen). */
+TEST(arena_lazy_opens_on_first_alloc_only) {
+    CBMArena a;
+    cbm_arena_init_lazy(&a, 4096);
+    ASSERT_EQ(a.nblocks, 0);
+    ASSERT_EQ(cbm_arena_capacity(&a), 0);
+    cbm_arena_rewind(&a); /* safe on a lazy arena that never opened */
+
+    void *p = cbm_arena_alloc(&a, 100);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(a.nblocks, 1);
+    ASSERT_EQ(a.block_sizes[0], 4096);
+    ASSERT_EQ(a.used, 104);
+    ASSERT_EQ(a.waste_grows, 0); /* the opening block is not a growth */
+
+    void *q = cbm_arena_alloc(&a, 4000); /* does not fit the rest: one doubled block */
+    ASSERT_NOT_NULL(q);
+    ASSERT_EQ(a.nblocks, 2);
+    ASSERT_EQ(a.block_sizes[1], 8192);
+
+    cbm_arena_destroy(&a);
+    ASSERT_EQ(a.nblocks, 0);
+    ASSERT_NULL(cbm_arena_alloc(&a, 16));
+
+    /* An opening allocation larger than the configured block gets a block that fits. */
+    cbm_arena_init_lazy(&a, 4096);
+    void *big = cbm_arena_alloc(&a, 10000);
+    ASSERT_NOT_NULL(big);
+    ASSERT_EQ(a.nblocks, 1);
+    ASSERT_GTE(a.block_sizes[0], 10000);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 SUITE(arena) {
+    RUN_TEST(arena_init_exact_one_block_then_append_block_growth);
+    RUN_TEST(arena_growth_doubles_grow_size_and_reset_restores_it);
     RUN_TEST(arena_init_default);
     RUN_TEST(arena_init_sized);
     RUN_TEST(arena_alloc_basic);
@@ -460,4 +539,5 @@ SUITE(arena) {
     RUN_TEST(arena_total_through_reset);
     RUN_TEST(arena_reset_block_size_invariant);
     RUN_TEST(arena_strndup_zero_len);
+    RUN_TEST(arena_lazy_opens_on_first_alloc_only);
 }

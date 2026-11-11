@@ -1,0 +1,5 @@
+Makefile
+CC ?= cc
+all: app
+app: main.o
+	$(CC) -o $@ $^

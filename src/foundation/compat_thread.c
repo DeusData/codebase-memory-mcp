@@ -2,15 +2,18 @@
  * compat_thread.c — Portable thread, mutex, and aligned allocation.
  *
  * POSIX: thin wrappers around pthreads and posix_memalign.
- * Windows: CreateThread, CRITICAL_SECTION, _aligned_malloc.
+ * Windows: CreateThread, CRITICAL_SECTION, aligned allocation.
  */
+#include "foundation/mem_events.h"
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 
 #include "foundation/platform.h"
+#include "foundation/sanitized.h" /* CBM_SANITIZED — diagnostic stack floor */
 
 #include <mimalloc.h> /* mi_thread_done at thread exit */
 
+#include <errno.h> /* EINVAL — a refused stack-size hint, see cbm_thread_create */
 #include <pthread.h>
 #include <stdlib.h>
 
@@ -31,7 +34,7 @@
  * exactly the threads that overflow. Diagnostic builds only: the shipping
  * binary keeps its fixed, predictable stack sizes. */
 static size_t cbm_thread_stack_floor(size_t requested) {
-#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+#if CBM_SANITIZED
     const char *env = getenv("CBM_THREAD_STACK_MB");
     if (env && env[0]) {
         char *end = NULL;
@@ -92,6 +95,9 @@ static bool thread_release_heap_enabled(void) {
 static void NTAPI cbm_thread_detach_callback(PVOID handle, DWORD reason, PVOID reserved) {
     (void)handle;
     (void)reserved;
+    if (reason == DLL_THREAD_DETACH) {
+        cbm_memev_thread_end(); /* waste-sanitizer thread state; no-op outside that build */
+    }
     if (reason == DLL_THREAD_DETACH && thread_release_heap_enabled()) {
         mi_thread_done();
     }
@@ -173,6 +179,24 @@ int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), v
     pthread_attr_setstacksize(&attr, stack_size);
     int rc = pthread_create(&t->handle, &attr, fn, arg);
     pthread_attr_destroy(&attr);
+    if (rc == EINVAL) {
+        /* glibc carves the static TLS block out of the thread's own stack
+         * allocation, so a small REQUESTED stack stops being legal the moment
+         * the image's TLS grows — no warning where the growth happens, only
+         * EINVAL here, from then on. That is exactly how the 64 KB
+         * parent-death watchdog stopped starting once this image's TLS passed
+         * it (PR #2233): the worker then refused to index without containment
+         * and SIGKILLed its own group, so every venue reported nothing but
+         * "killed (signal 9)".
+         * A stack size is a hint about how much this thread needs; the platform
+         * refusing the hint is not a reason to fail to create the thread. Fall
+         * back to the default stack, which always has room for the TLS block. */
+        pthread_attr_t fallback;
+        pthread_attr_init(&fallback);
+        pthread_attr_setstacksize(&fallback, cbm_thread_default_stack_size());
+        rc = pthread_create(&t->handle, &fallback, fn, arg);
+        pthread_attr_destroy(&fallback);
+    }
     return rc;
 }
 
@@ -203,6 +227,16 @@ void cbm_mutex_init(cbm_mutex_t *m) {
 }
 
 void cbm_mutex_lock(cbm_mutex_t *m) {
+#if defined(CBM_MEMWASTE) && CBM_MEMWASTE
+    if (cbm_memev_enabled()) {
+        bool contended = !TryEnterCriticalSection(&m->cs);
+        if (contended) {
+            EnterCriticalSection(&m->cs);
+        }
+        cbm_work_note(CBM_WORK_MUTEX, __builtin_return_address(0), 0, contended ? 1 : 0, 0);
+        return;
+    }
+#endif
     EnterCriticalSection(&m->cs);
 }
 
@@ -221,7 +255,13 @@ void cbm_mutex_init(cbm_mutex_t *m) {
 }
 
 void cbm_mutex_lock(cbm_mutex_t *m) {
+#if defined(CBM_MEMWASTE) && CBM_MEMWASTE
+    /* pthread_mutex_lock itself counts in this flavour; going through the same
+     * lock with our caller as the site keeps the attribution and counts once. */
+    (void)cbm_memev_mutex_lock(&m->mtx, __builtin_return_address(0));
+#else
     pthread_mutex_lock(&m->mtx);
+#endif
 }
 
 void cbm_mutex_unlock(cbm_mutex_t *m) {
@@ -239,12 +279,20 @@ void cbm_mutex_destroy(cbm_mutex_t *m) {
 #ifdef _WIN32
 
 int cbm_aligned_alloc(void **ptr, size_t alignment, size_t size) {
+#if defined(CBM_MEM_GLOBAL_OVERRIDE) && CBM_MEM_GLOBAL_OVERRIDE
+    *ptr = mi_malloc_aligned(size, alignment);
+#else
     *ptr = _aligned_malloc(size, alignment);
+#endif
     return *ptr ? 0 : -1;
 }
 
 void cbm_aligned_free(void *ptr) {
+#if defined(CBM_MEM_GLOBAL_OVERRIDE) && CBM_MEM_GLOBAL_OVERRIDE
+    mi_free(ptr);
+#else
     _aligned_free(ptr);
+#endif
 }
 
 #else /* POSIX */

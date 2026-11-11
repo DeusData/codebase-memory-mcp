@@ -7,10 +7,23 @@ set -euo pipefail
 #   git config core.hooksPath scripts/hooks
 
 echo "pre-commit: running all linters in parallel..."
-make -j3 -f Makefile.cbm lint
+# clang-tidy runs diff-scoped (lint-tidy-diff, see scripts/lint-tidy-diff.sh):
+# the full lint-tidy sweep surfaces thousands of pre-existing findings that
+# have nothing to do with this commit and would block every contributor who
+# has clang-tidy on PATH. `make lint-tidy` remains available for a full audit.
+make -j3 -f Makefile.cbm lint-ci lint-tidy-diff
 
 echo "pre-commit: security audit (source-level)..."
 scripts/security-audit.sh
 
 echo "pre-commit: building and running tests..."
-make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) -f Makefile.cbm test
+(
+    # Git exports repository-local variables to hooks. The test suite creates
+    # independent repositories and linked worktrees, so keep the commit's
+    # index and object paths out of those fixtures.
+    while IFS= read -r variable; do
+        unset "$variable"
+    done < <(git rev-parse --local-env-vars)
+
+    make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" -f Makefile.cbm test
+)

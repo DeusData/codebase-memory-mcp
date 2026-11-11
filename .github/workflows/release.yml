@@ -1,7 +1,8 @@
 # Release pipeline: lint → test → build → smoke/soak → draft → verify → publish
 #
-# Security (security-static + codeql-gate) starts immediately and runs in
-# parallel with lint/test/build/smoke/soak. It only blocks the final verify
+# Security (security-static + license-gate) and CodeQL (codeql.yml: full scan
+# of this commit + the open-alert check) start immediately and run in
+# parallel with lint/test/build/smoke/soak. They only block the final verify
 # step — everything else proceeds independently.
 name: Release
 
@@ -44,10 +45,47 @@ jobs:
   # ── Security (starts immediately, blocks only verify) ───────────
   security:
     uses: ./.github/workflows/_security.yml
+    # No job in _security.yml reads code scanning or the Actions API any more
+    # (the CodeQL gate moved to codeql.yml), so the token stays read-only.
+    permissions:
+      contents: read
     secrets: inherit
+
+  # ── CodeQL (starts immediately, blocks only verify) ──────────────
+  # Full scan of this exact commit (every language, vendored C included) +
+  # the open-alert check. codeql.yml uploads results and reads the alerts:
+  # a called workflow cannot request more than its caller grants, so
+  # withholding either permission fails the whole run at startup.
+  codeql:
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  # ── 0. Preflight: refuse malformed dispatch inputs ──────────────
+  # The tag is inputs.version VERBATIM. A bare "0.10.7" publishes a release the
+  # installers can never resolve (they fetch releases/download/v<version>/...),
+  # and with immutable releases the mis-named tag cannot be retagged, deleted,
+  # or its name reused — the name is burned permanently (2026-08-18 incident).
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce v-prefixed semver version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "version OK: $VERSION"
+          else
+            echo "::error::version must be v-prefixed semver (vX.Y.Z), got '$VERSION'"
+            exit 1
+          fi
 
   # ── 1. Lint (cppcheck + clang-format) ───────────────────────────
   lint:
+    needs: [preflight]
     uses: ./.github/workflows/_lint.yml
 
   # ── 2. Tests (all platforms, full suite for release) ────────────
@@ -65,11 +103,19 @@ jobs:
       shard_suites: true
 
   # ── 3. Build all platforms ──────────────────────────────────────
-  # !cancelled() && !failure(): run when `test` is deliberately skipped, but
-  # never when lint or test actually failed.
+  # `test` may be skipped ONLY by the skip_tests input. A skipped `test` is
+  # also what a cancelled/timed-out lint produces (needs-cascade), and the
+  # bare !cancelled() && !failure() form cannot tell those apart: failure()
+  # does not cover a needed job that was CANCELLED, so a lint timeout let the
+  # whole pipeline publish with the test matrix silently skipped
+  # (v0.10.7 incident, 2026-08-18). Require the explicit results.
   build:
-    if: ${{ !cancelled() && !failure() }}
-    needs: [test]
+    if: >-
+      ${{ !cancelled()
+      && needs.lint.result == 'success'
+      && (needs.test.result == 'success'
+          || (inputs.skip_tests && needs.test.result == 'skipped')) }}
+    needs: [lint, test]
     permissions:
       contents: read
       id-token: write
@@ -92,7 +138,7 @@ jobs:
   # an optional phase needs this override, or the phase being optional silently
   # makes the phases after it optional as well.
   smoke:
-    if: ${{ !cancelled() && !failure() }}
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
     with:
@@ -100,7 +146,7 @@ jobs:
 
   # ── 5. Soak tests ──────────────────────────────────────────────
   soak:
-    if: ${{ !cancelled() && !failure() }}
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     needs: [build]
     uses: ./.github/workflows/_soak.yml
     with:
@@ -108,6 +154,15 @@ jobs:
       run_asan: ${{ inputs.soak_level == 'full' }}
       version: ${{ inputs.version }}
       use_release_artifacts: true
+
+  # ── Waste sanitizer, REPORT-ONLY ────────────────────────────────
+  # The same full run as the dry run, on the release commit. Not in
+  # release-draft's needs: the report is evidence for the release notes, never
+  # a publication gate.
+  memwaste:
+    uses: ./.github/workflows/_memwaste.yml
+    with:
+      mode: full
 
   # ── 6. Create DRAFT release ────────────────────────────────────
   # Requires smoke to have actually SUCCEEDED, not merely "not failed". The bare
@@ -130,7 +185,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download only selected release containers
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-*
           merge-multiple: true
@@ -139,7 +194,7 @@ jobs:
       # download above. Preserve only the three reviewable manifests that bind
       # candidate bytes, VT results, and the tuple-local decision.
       - name: Download candidate selection evidence separately
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-selection-evidence
           path: selection-evidence
@@ -164,8 +219,16 @@ jobs:
             release-selection.tsv \
             > checksums.txt
 
+      # The legacy ui-* aliases are byte-identical copies published after verify
+      # (scripts/ci/publish-legacy-aliases.sh), so they were absent from
+      # checksums.txt and 0.9.x updaters refused to install them (#1134). Their
+      # digests are added here, BEFORE attestation, so the attested artifact
+      # covers both names.
+      - name: Cover legacy ui-* aliases in checksums
+        run: scripts/ci/append-legacy-alias-checksums.sh checksums.txt
+
       - name: Attest checksum provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: checksums.txt
 
@@ -173,7 +236,7 @@ jobs:
       # same-run workflow artifact, not a draft-release download, so that
       # job keeps contents: read and no gh dependency.
       - name: Preserve checksums for the registry job
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-checksums
           path: checksums.txt
@@ -183,14 +246,26 @@ jobs:
       - name: Generate SBOM
         run: python3 scripts/ci/generate-sbom.py "${{ inputs.version }}"
 
+      # actions/attest-sbom is deprecated. What it does now is emit
+      # "::warning::actions/attest-sbom has been deprecated" and forward to
+      # actions/attest with NODE_OPTIONS set, passing sbom-path straight
+      # through. Calling attest directly produces the same attestation without
+      # the wrapper, and sbom-path is a first-class input there (verified
+      # against the action definition at this exact SHA, which is tag v4.1.0).
+      #
+      # This step deliberately carries no continue-on-error: a release must
+      # fail if its SBOM cannot be attested. An unattested SBOM is worse than
+      # an absent one, because the artifact still ships looking complete.
       - name: Attest SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        env:
+          NODE_OPTIONS: '--max-http-header-size=32768'
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign artifacts
         run: |
@@ -218,11 +293,17 @@ jobs:
         # move the release tag. (A floating HEAD also broke the 0.8.0 release:
         # HEAD had become a commit touching .github/workflows/, and the App
         # token may not create refs pointing at workflow-modifying commits.)
+        # The Go wrapper is a nested module: `go install
+        # .../pkg/go/cmd/codebase-memory-mcp@vX.Y.Z` and @latest resolve its
+        # versions from pkg/go/v* tags only (without one, Go fetches the whole
+        # repository, which is over its 500 MB module limit).
         run: |
           git tag -f "$VERSION" "$GITHUB_SHA"
           git push origin "$VERSION" --force
+          git tag -f "pkg/go/$VERSION" "$GITHUB_SHA"
+          git push origin "pkg/go/$VERSION" --force
 
-      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v2
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.version }}
           draft: true
@@ -241,12 +322,12 @@ jobs:
           body: ${{ inputs.release_notes || '' }}
           generate_release_notes: ${{ inputs.release_notes == '' }}
 
-  # ── 7. Verify + Publish (requires security gate) ───────────────
+  # ── 7. Verify + Publish (requires the security and CodeQL gates) ─
   verify:
-    needs: [release-draft, security]
+    needs: [release-draft, security, codeql]
     # Explicit condition: a deliberately skipped test ancestor must not skip
     # the publish chain; the draft itself proves smoke and soak both succeeded.
-    if: ${{ !cancelled() && !failure() && needs.security.result == 'success' && needs.release-draft.result == 'success' }}
+    if: ${{ !cancelled() && !failure() && needs.security.result == 'success' && needs.codeql.result == 'success' && needs.release-draft.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -308,10 +389,23 @@ jobs:
       # install.sh and install.ps1 are the highest-consequence non-executable
       # bytes we publish: users pipe them straight into a shell.
       #
-      # The selected executables are re-submitted too. That is deliberate and
-      # nearly free: VirusTotal is content-addressed, so identical bytes return
-      # the analysis it already holds instead of re-running 70+ engines — the
-      # same property that made the analysis-id equality check untenable.
+      # The selected executables are NOT re-submitted. They were scanned as
+      # candidates, and verify-release-selection.py has just proven every
+      # published container carries exactly those bytes — identity is settled by
+      # hash, so a second scan adds no assurance.
+      #
+      # It also is not free, contrary to what this comment used to claim.
+      # Measured on v0.10.5: all eight re-submissions produced a NEW analysis
+      # (same file-id, timestamp 47 minutes later), and Microsoft's ML engine
+      # answered differently for two of them within that hour — in opposite
+      # directions. The release notes then cited one scan while the links showed
+      # the other. See scripts/ci/exclude-rescanned-selected-objects.sh.
+      - name: Withhold already-scanned selected executables
+        run: |
+          bash scripts/ci/exclude-rescanned-selected-objects.sh \
+            binaries/objects "$RUNNER_TEMP/release-selection.tsv" \
+            binaries/virustotal-withheld.tsv
+
       - name: VirusTotal scan of every extracted release object
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
@@ -329,18 +423,20 @@ jobs:
           VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
           VT_ASSOCIATIONS: binaries/associations.tsv
           VT_RESULTS_PATH: binaries/vt-results.tsv
+          VT_WITHHELD: binaries/virustotal-withheld.tsv
           MIN_ENGINES: 50
         run: scripts/ci/check-virustotal.sh
 
       - name: Preserve extracted-object VirusTotal evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: virustotal-evidence-release-${{ github.run_id }}
           path: |
             binaries/associations.tsv
             binaries/scan-set.tsv
             binaries/vt-results.tsv
+            binaries/virustotal-withheld.tsv
           if-no-files-found: warn
 
       - name: Publish durable public VirusTotal evidence
@@ -402,7 +498,7 @@ jobs:
 
       # ── npm ──────────────────────────────────────────────────
       - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -430,10 +526,16 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+          # `next` is "the newest you can opt into": once a stable release
+          # exists, an older RC must not stay behind it (0.9.1-rc.1 did until
+          # v0.12.1). Re-runnable: dist-tag add is idempotent.
+          if [[ "$RELEASE_VERSION" != *-* ]]; then
+            npm dist-tag add "codebase-memory-mcp@$V" next
+          fi
 
       # ── PyPI ─────────────────────────────────────────────────
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -515,7 +617,7 @@ jobs:
       # the release-draft job as a same-run artifact (not a draft-release
       # download — that would need contents beyond read plus gh).
       - name: Fetch release checksums
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-checksums
 

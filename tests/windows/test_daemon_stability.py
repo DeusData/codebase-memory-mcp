@@ -12,6 +12,8 @@ that guard the daemon's PRODUCT contract under stress and misuse:
   with the SAME pid (no second daemon, no restart); ``daemon status`` reports
   the active pid; a ``--port=N`` pointing at an occupied port must not block
   the start (the UI bind is retried in the background by design).
+* ``daemon start --port=N`` while another process holds ``_config.db``'s
+  write lock waits for the daemon's UI save instead of failing the handshake.
 * ``daemon stop`` REFUSES while an MCP session is attached, lists the blocking
   client, and succeeds once the session closes.
 * Crash recovery: after a kill -9 the stale daemon state must clear, a cold
@@ -24,10 +26,22 @@ that guard the daemon's PRODUCT contract under stress and misuse:
 
 Every daemon this guard starts carries a kill-by-pid backstop so a stuck
 daemon can never hang the suite. Each section runs under its OWN cache
-directory: daemon coordination is cache-scoped, so sections are isolated from
-each other and from any interactive CBM use on the host.
+directory AND its own ``CBM_RUNTIME_DIR``; the second one is what isolates it.
+Daemon coordination is NOT cache-scoped: the rendezvous key hashes a
+compile-time constant under a machine-global parent (the real
+``CSIDL_LOCAL_APPDATA`` -- the ``LOCALAPPDATA`` variable is ignored), so
+without the override every section, every sibling guard on the runner and
+any interactive CBM use on the host share ONE daemon, and a daemon wedged in
+one place fails every check that comes after it. ``CBM_RUNTIME_DIR`` is the
+only relocation hook; the daemon inherits it from the client that spawns it,
+and the directory must exist before the binary runs because the endpoint
+code validates the parent and never creates it.
 
-Exit code: 0 == all sections green, 1 == regression, 2 == setup error.
+Exit code: 0 == all sections green; 1 == regression (every failing section is
+named -- sections are isolated, so a red one no longer poisons the rest);
+2 == setup error: a precondition the lifecycle guard owns -- ``daemon start``
+itself -- did not hold. The daemon's FULL output is printed either way, so the
+board shows why instead of a 300-character allocator preamble.
 
 Usage:
     python test_daemon_stability.py <path-to-codebase-memory-mcp[.exe]>
@@ -37,6 +51,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -44,17 +59,61 @@ import threading
 import time
 
 STATUS_POLL_S = 0.5
+# Failure excerpts show the TAIL of the output: the allocator/runtime preamble
+# comes first, and a fixed head slice used to hide the actual error.
+EXCERPT_CHARS = 1500
+# Return code reported for a client that hit its subprocess timeout.
+TIMEOUT_RC = 124
+
+
+class SetupFailure(Exception):
+    """A precondition this guard does not own did not hold.
+
+    Only ``daemon start`` failures raise this: test_daemon_lifecycle.py runs
+    first and asserts that surface as a regression, so reporting it here as
+    exit 2 (precondition) hides nothing from the board.  Everything the guard
+    owns -- including an MCP session failing to initialize against a daemon
+    that DID start -- stays a regression (exit 1).
+    """
+
+
+def runtime_for(cache):
+    """The section's private daemon rendezvous parent, a sibling of its cache."""
+    head, tail = os.path.split(cache)
+    return os.path.join(head, tail.replace("cache-", "runtime-", 1))
+
+
+def section_dirs(work, name):
+    cache = os.path.join(work, "cache-" + name)
+    os.makedirs(cache, exist_ok=True)
+    # Must exist before the binary runs: the endpoint validates the parent
+    # (exists, is a directory, not a reparse point) and never creates it.
+    os.makedirs(runtime_for(cache), exist_ok=True)
+    return cache
+
+
+def cli_env(cache):
+    env = dict(os.environ)
+    env["CBM_CACHE_DIR"] = cache
+    env["CBM_RUNTIME_DIR"] = runtime_for(cache)
+    return env
 
 
 def run_cli(binary, cache, args, stdin=None, timeout=90):
-    env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = cache
     return subprocess.run([binary] + args, capture_output=True, timeout=timeout,
-                          env=env, input=stdin)
+                          env=cli_env(cache), input=stdin)
 
 
 def out_text(result):
     return ((result.stdout or b"") + (result.stderr or b"")).decode("utf-8", "replace")
+
+
+def excerpt(text, limit=EXCERPT_CHARS):
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if len(text) <= limit:
+        return text
+    return "...(%d chars elided)...\n%s" % (len(text) - limit, text[-limit:])
 
 
 def kill_pid(pid):
@@ -97,28 +156,26 @@ def read_line_with_timeout(stream, timeout_s):
 
 
 def section_params(binary, work):
-    cache = os.path.join(work, "cache-params")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "params")
     bare = run_cli(binary, cache, ["daemon"])
     if bare.returncode == 0 or "usage:" not in out_text(bare):
-        print("RED: bare `daemon` should print usage and fail:\n%s" % out_text(bare)[:300])
+        print("RED: bare `daemon` should print usage and fail:\n%s" % excerpt(out_text(bare)))
         return False
     unknown = run_cli(binary, cache, ["daemon", "bogus"])
     if unknown.returncode == 0 or "unknown daemon option" not in out_text(unknown):
-        print("RED: `daemon bogus` should be rejected:\n%s" % out_text(unknown)[:300])
+        print("RED: `daemon bogus` should be rejected:\n%s" % excerpt(out_text(unknown)))
         return False
     bad_port = run_cli(binary, cache, ["daemon", "start", "--port=0"])
     if bad_port.returncode == 0 or "--port requires" not in out_text(bad_port):
         print("RED: `--port=0` should be rejected before spawning:\n%s"
-              % out_text(bad_port)[:300])
+              % excerpt(out_text(bad_port)))
         return False
     print("PASS: parameter surface rejects bare/unknown/out-of-range daemon invocations")
     return True
 
 
 def section_hook_fail_open(binary, work):
-    cache = os.path.join(work, "cache-hook")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "hook")
     payload = json.dumps({
         "hook_event_name": "PreToolUse",
         "tool_name": "Grep",
@@ -131,7 +188,7 @@ def section_hook_fail_open(binary, work):
     marker = os.path.join(cache, ".hook-daemon-absent-notice")
     if first.returncode != 0:
         print("RED: hook-augment without a daemon must fail OPEN (exit 0), got rc=%d:\n%s"
-              % (first.returncode, (first_out + first_err)[:300]))
+              % (first.returncode, excerpt(first_out + first_err)))
         return False
     if "systemMessage" not in first_out or "no CBM daemon" not in first_err:
         print("RED: the first absent-daemon hook call must surface the visible notice "
@@ -152,8 +209,7 @@ def section_hook_fail_open(binary, work):
 
 
 def section_start_status_port(binary, work):
-    cache = os.path.join(work, "cache-start")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "start")
     daemon_pid = 0
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -165,21 +221,21 @@ def section_start_status_port(binary, work):
         daemon_pid = pid_from(start_text)
         if start.returncode != 0 or "permanent" not in start_text or not daemon_pid:
             print("RED: `daemon start --port=<occupied>` must still start the daemon "
-                  "(UI bind is non-blocking):\n%s" % start_text[:400])
+                  "(UI bind is non-blocking):\n%s" % excerpt(start_text))
             return False
         status = run_cli(binary, cache, ["daemon", "status"])
         status_text = out_text(status)
         if status.returncode != 0 or "active (permanent" not in status_text or \
                 pid_from(status_text) != daemon_pid:
             print("RED: status must report the active permanent daemon pid %d:\n%s"
-                  % (daemon_pid, status_text[:400]))
+                  % (daemon_pid, excerpt(status_text)))
             return False
         again = run_cli(binary, cache, ["daemon", "start"], timeout=60)
         again_text = out_text(again)
         if again.returncode != 0 or "already active (permanent" not in again_text or \
                 pid_from(again_text) != daemon_pid:
             print("RED: a second `daemon start` must report already-active with the SAME "
-                  "pid %d:\n%s" % (daemon_pid, again_text[:400]))
+                  "pid %d:\n%s" % (daemon_pid, excerpt(again_text)))
             return False
         stop = run_cli(binary, cache, ["daemon", "stop"])
         if stop.returncode != 0 or not wait_status_not_running(binary, cache, 45):
@@ -194,29 +250,128 @@ def section_start_status_port(binary, work):
         kill_pid(daemon_pid)
 
 
+def daemon_log_contains(cache, needle):
+    try:
+        with open(os.path.join(cache, "logs", "cbm-daemon.log"), "rb") as handle:
+            return needle in handle.read()
+    except OSError:
+        return False
+
+
+def section_start_port_waits_for_settings_writer(binary, work):
+    """`daemon start --port` while another process holds _config.db's write lock.
+
+    section_start_status_port went red on CI runners: the client gave the UI
+    handshake a 1 s reply budget while the daemon was still committing the UI
+    configuration. Holding the lock makes that slow save a state the test can
+    ask for. The holder is released on EVENTS: when the client exits (it gave
+    up under the lock), or WRITER_HOLD_S after the daemon LOGGED that it waits
+    for the writer. WRITER_HOLD_S outlasts the old 1 s budget and stays inside
+    the daemon's 3 s bound for a wedged holder.
+    """
+    writer_hold_s = 1.5
+    cache = section_dirs(work, "writer")
+    daemon_pid = 0
+    holder = None
+    client = None
+    try:
+        warm = run_cli(binary, cache, ["daemon", "start"], timeout=60)
+        if warm.returncode != 0 or not pid_from(out_text(warm)):
+            raise SetupFailure("permanent daemon did not start to create _config.db "
+                               "(rc=%s):\n%s" % (warm.returncode, out_text(warm)))
+        stop = run_cli(binary, cache, ["daemon", "stop"])
+        if stop.returncode != 0 or not wait_status_not_running(binary, cache, 45):
+            print("RED: the warm-up daemon did not stop cleanly")
+            return False
+        holder = sqlite3.connect(os.path.join(cache, "_config.db"), isolation_level=None,
+                                 timeout=0)
+        holder.execute("BEGIN IMMEDIATE")
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        client = subprocess.Popen([binary, "daemon", "start", "--port=%d" % port],
+                                  env=cli_env(cache), stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        waited_at = None
+        deadline = time.monotonic() + 90
+        while client.poll() is None and time.monotonic() < deadline:
+            now = time.monotonic()
+            if waited_at is None and daemon_log_contains(cache, b"config_db.busy_wait"):
+                waited_at = now
+            if waited_at is not None and now - waited_at >= writer_hold_s:
+                break
+            time.sleep(0.05)
+        exited_under_lock = client.poll() is not None
+        # Release by CLOSING the holder: the OS drops a handle's locks when it
+        # closes, so the release cannot be refused. On Windows a COMMIT of this
+        # change-free transaction returned plain SQLITE_BUSY (code 5, no journal,
+        # client still waiting) while the daemon retried the lock: 3 of 5 full
+        # guard runs, on the test's own connection, never on the product's side.
+        holder.close()
+        holder = None
+        output, _ = client.communicate(timeout=90)
+        text = output.decode("utf-8", "replace")
+        daemon_pid = pid_from(text)
+        if exited_under_lock or client.returncode != 0 or "permanent" not in text:
+            print("RED: `daemon start --port` must wait for a settings writer, not give up "
+                  "on the UI handshake (exited_under_lock=%s rc=%s daemon_waited=%s):\n%s"
+                  % (exited_under_lock, client.returncode, waited_at is not None,
+                     excerpt(text)))
+            return False
+        stop = run_cli(binary, cache, ["daemon", "stop"])
+        if stop.returncode != 0 or not wait_status_not_running(binary, cache, 45):
+            print("RED: the daemon did not stop cleanly after the held-writer start")
+            return False
+        daemon_pid = 0
+        client = None
+        print("PASS: `daemon start --port` waits out a held settings writer and starts")
+        return True
+    finally:
+        if holder is not None:
+            holder.close()
+        if client is not None:
+            if client.poll() is None:
+                client.kill()
+                client.wait()
+            # The client may have started a daemon whose pid was never read (a
+            # failure before its output); a survivor locked the guard root's
+            # binary and failed the next run's residue cleanup.
+            run_cli(binary, cache, ["daemon", "stop"], timeout=60)
+        kill_pid(daemon_pid)
+
+
 def section_stop_refuses_busy(binary, work):
-    cache = os.path.join(work, "cache-busy")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "busy")
     daemon_pid = 0
     session = None
+    session_err = None
     try:
         start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
         daemon_pid = pid_from(out_text(start))
         if start.returncode != 0 or not daemon_pid:
-            print("SETUP FAIL: permanent daemon did not start for the busy-stop check")
-            return False
-        env = dict(os.environ)
-        env["CBM_CACHE_DIR"] = cache
+            raise SetupFailure("permanent daemon did not start for the busy-stop check "
+                               "(rc=%s):\n%s" % (start.returncode, out_text(start)))
+        # The session's stderr goes to a file, not DEVNULL: when initialize
+        # never answers, it is the only trace of what the frontend saw.
+        session_err_path = os.path.join(work, "busy-session.stderr")
+        session_err = open(session_err_path, "wb")
         session = subprocess.Popen([binary], stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                   env=env)
+                                   stdout=subprocess.PIPE, stderr=session_err,
+                                   env=cli_env(cache))
         session.stdin.write(b'{"jsonrpc":"2.0","id":0,"method":"initialize",'
                             b'"params":{"capabilities":{}}}\n')
         session.stdin.flush()
         reply = read_line_with_timeout(session.stdout, 45)
         if not reply or b'"result"' not in reply:
-            print("SETUP FAIL: MCP session did not complete initialize: %r"
-                  % (reply[:200] if reply else reply))
+            session.kill()
+            session.wait(timeout=30)
+            session_err.close()
+            with open(session_err_path, "rb") as handle:
+                session_stderr = handle.read()
+            print("RED: MCP session did not complete initialize against a running "
+                  "daemon (pid %d); reply=%r\nsession stderr:\n%s"
+                  % (daemon_pid, reply, excerpt(session_stderr)))
             return False
         busy = run_cli(binary, cache, ["daemon", "stop"])
         busy_text = out_text(busy)
@@ -228,7 +383,7 @@ def section_stop_refuses_busy(binary, work):
         pids_ok = bool(listed_pids) if os.name == "nt" else str(session.pid) in listed_pids
         if busy.returncode == 0 or "NOT stopped" not in busy_text or not pids_ok:
             print("RED: `daemon stop` with an attached MCP session (pid %d) must refuse "
-                  "and list the blocking client:\n%s" % (session.pid, busy_text[:400]))
+                  "and list the blocking client:\n%s" % (session.pid, excerpt(busy_text)))
             return False
         session.stdin.close()
         session.wait(timeout=45)
@@ -250,35 +405,41 @@ def section_stop_refuses_busy(binary, work):
     finally:
         if session and session.poll() is None:
             session.kill()
+        if session_err:
+            session_err.close()
         kill_pid(daemon_pid)
 
 
 def section_crash_recovery(binary, work):
-    cache = os.path.join(work, "cache-crash")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "crash")
     daemon_pid = 0
     second_pid = 0
     try:
         start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
         daemon_pid = pid_from(out_text(start))
         if start.returncode != 0 or not daemon_pid:
-            print("SETUP FAIL: permanent daemon did not start for the crash check")
-            return False
+            raise SetupFailure("permanent daemon did not start for the crash check "
+                               "(rc=%s):\n%s" % (start.returncode, out_text(start)))
         kill_pid(daemon_pid)
         if not wait_status_not_running(binary, cache, 60):
-            print("RED: after kill -9 of pid %d the stale daemon state never cleared "
-                  "(`daemon status` kept reporting it)" % daemon_pid)
+            # Print what status said: a hot settings journal left by the kill
+            # made every command fail with "could not load saved runtime
+            # settings", which a bare "kept reporting it" hid.
+            last = run_cli(binary, cache, ["daemon", "status"], timeout=30)
+            print("RED: after kill -9 of pid %d the stale daemon state never cleared; "
+                  "last `daemon status` rc=%s:\n%s"
+                  % (daemon_pid, last.returncode, excerpt(out_text(last))))
             return False
         cold = run_cli(binary, cache, ["cli", "list_projects", "{}"], timeout=90)
-        if cold.returncode != 0 or "daemon start" not in out_text(cold):
-            print("RED: a cold one-shot after the daemon crash should succeed with the "
-                  "startup-tax hint:\n%s" % out_text(cold)[:400])
+        if cold.returncode != 0 or "daemon start" in out_text(cold):
+            print("RED: a cold one-shot after the daemon crash should succeed without "
+                  "default startup chatter:\n%s" % excerpt(out_text(cold)))
             return False
         restart = run_cli(binary, cache, ["daemon", "start"], timeout=60)
         second_pid = pid_from(out_text(restart))
         if restart.returncode != 0 or not second_pid or second_pid == daemon_pid:
             print("RED: `daemon start` after the crash must launch a FRESH daemon:\n%s"
-                  % out_text(restart)[:400])
+                  % excerpt(out_text(restart)))
             return False
         daemon_pid = 0
         stop = run_cli(binary, cache, ["daemon", "stop"])
@@ -298,7 +459,16 @@ def _parallel_one_shots(binary, cache, count):
     results = [None] * count
 
     def _one(index):
-        results[index] = run_cli(binary, cache, ["cli", "list_projects", "{}"], timeout=120)
+        try:
+            results[index] = run_cli(binary, cache, ["cli", "list_projects", "{}"],
+                                     timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            # Keep the hang as a failed result WITH its partial output; raised
+            # on the worker thread it was lost, and the client reported as
+            # "rc=none" with nothing to read.
+            results[index] = subprocess.CompletedProcess(
+                exc.cmd, TIMEOUT_RC, exc.stdout or b"",
+                (exc.stderr or b"") + ("\n[timed out after %ss]" % exc.timeout).encode())
 
     threads = [threading.Thread(target=_one, args=(i,)) for i in range(count)]
     for thread in threads:
@@ -309,37 +479,34 @@ def _parallel_one_shots(binary, cache, count):
 
 
 def section_churn_stability(binary, work):
-    cache = os.path.join(work, "cache-churn")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "churn")
     daemon_pid = 0
     try:
         start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
         daemon_pid = pid_from(out_text(start))
         if start.returncode != 0 or not daemon_pid:
-            print("SETUP FAIL: permanent daemon did not start for the churn check")
-            return False
+            raise SetupFailure("permanent daemon did not start for the churn check "
+                               "(rc=%s):\n%s" % (start.returncode, out_text(start)))
         for round_index in range(10):
             one = run_cli(binary, cache, ["cli", "list_projects", "{}"], timeout=90)
             if one.returncode != 0:
                 print("RED: sequential churn one-shot %d failed:\n%s"
-                      % (round_index, out_text(one)[:300]))
+                      % (round_index, excerpt(out_text(one))))
                 return False
         for wave in range(2):
             results = _parallel_one_shots(binary, cache, 6)
             for index, result in enumerate(results):
                 if result is None or result.returncode != 0:
-                    print("RED: parallel churn wave %d client %d failed (rc=%s):\n"
-                          "stdout=%r\nstderr=%r"
+                    print("RED: parallel churn wave %d client %d failed (rc=%s):\n%s"
                           % (wave, index,
-                             result.returncode if result else "none",
-                             (result.stdout or b"")[-300:] if result else b"",
-                             (result.stderr or b"")[-400:] if result else b""))
+                             result.returncode if result else "none (still running)",
+                             excerpt(out_text(result)) if result else "(no result)"))
                     return False
         status = run_cli(binary, cache, ["daemon", "status"])
         status_text = out_text(status)
         if status.returncode != 0 or pid_from(status_text) != daemon_pid:
             print("RED: after the churn the daemon must still be the SAME process "
-                  "(expected pid %d):\n%s" % (daemon_pid, status_text[:400]))
+                  "(expected pid %d):\n%s" % (daemon_pid, excerpt(status_text)))
             return False
         stop = run_cli(binary, cache, ["daemon", "stop"])
         if stop.returncode != 0 or not wait_status_not_running(binary, cache, 45):
@@ -353,14 +520,132 @@ def section_churn_stability(binary, work):
         kill_pid(daemon_pid)
 
 
+def section_local_cleanup_waits_for_startup_gate(binary, work):
+    """A live startup owner must not turn completed local work into failure."""
+    if os.name != "nt":
+        print("SKIP: local teardown reacquires the startup gate only on Windows")
+        return True
+    import msvcrt
+
+    cache = section_dirs(work, "cleanup-contention")
+    env = cli_env(cache)
+    env["CBM_LOG_LEVEL"] = "info"
+    env["CBM_LOG_FORMAT"] = "text"
+    warm = subprocess.run([binary, "cli", "list_projects"], capture_output=True,
+                          timeout=90, env=env)
+    if warm.returncode != 0:
+        raise SetupFailure("could not initialize the private runtime:\n" + out_text(warm))
+    gates = []
+    for parent, _, files in os.walk(runtime_for(cache)):
+        if "cbm-startup-v2.lock" in files:
+            gates.append(os.path.join(parent, "cbm-startup-v2.lock"))
+    if len(gates) != 1:
+        raise SetupFailure("expected one private startup gate, got %r" % gates)
+
+    repo = os.path.join(work, "cleanup-repo")
+    os.makedirs(repo)
+    for index in range(200):
+        with open(os.path.join(repo, "unit_%d.py" % index), "w") as handle:
+            handle.write("".join("def function_%d_%d():\n    return %d\n"
+                                 % (index, item, item) for item in range(100)))
+    err_path = os.path.join(work, "cleanup-contention.stderr")
+    process = None
+    locked = False
+    traces = {}
+
+    def read_trace():
+        # The daemon supervises indexing in a worker. Worker progress goes to
+        # its own durable log; the outer CLI only reports the final response.
+        paths = [err_path]
+        log_dir = os.path.join(cache, "logs")
+        if os.path.isdir(log_dir):
+            paths.extend(os.path.join(log_dir, name) for name in os.listdir(log_dir)
+                         if name.startswith(".worker-log-"))
+        for path in paths:
+            try:
+                with open(path, "rb") as handle:
+                    traces[path] = handle.read()
+            except FileNotFoundError:
+                pass  # The supervisor removes a successful worker's log.
+        return b"\n".join(traces.values())
+
+    with open(gates[0], "r+b") as gate, open(err_path, "wb") as errors:
+        try:
+            process = subprocess.Popen(
+                [binary, "cli", "index_repository", "--progress"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=env)
+            process.stdin.write(json.dumps({"repo_path": repo, "mode": "fast"}).encode())
+            process.stdin.close()
+            process.stdin = None
+            deadline = time.monotonic() + 120
+            # Extraction is after begin_work released startup-v2. Observe that
+            # event before acquiring the real one-byte native startup lock.
+            while time.monotonic() < deadline:
+                trace = read_trace()
+                if b"msg=parallel.extract" in trace or b"msg=pass.definitions" in trace:
+                    gate.seek(0)
+                    try:
+                        msvcrt.locking(gate.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        time.sleep(0.01)
+                        continue
+                    locked = True
+                    break
+                if process.poll() is not None:
+                    raise SetupFailure("index exited before the gate collision:\n" +
+                                       excerpt(trace))
+                time.sleep(0.01)
+            if not locked:
+                raise SetupFailure("index never entered local work:\n" + excerpt(trace))
+            while time.monotonic() < deadline:
+                trace = read_trace()
+                if b"Completed index_repository (" in trace:
+                    break
+                if process.poll() is not None:
+                    print("RED: index exited while a live peer held startup-v2:\n" +
+                          excerpt(trace))
+                    return False
+                time.sleep(0.01)
+            else:
+                raise SetupFailure("CLI did not finish its work:\n" + excerpt(trace))
+            # The outer CLI flushes this completion message after receiving
+            # the worker result and closing its daemon session, immediately
+            # before local cleanup. pipeline.done is too early: worker result
+            # handling can outlast a short lock hold. Keep the gate for longer
+            # than the old 500 ms cleanup deadline after this real boundary.
+            time.sleep(1)
+            stayed_alive = process.poll() is None
+            gate.seek(0)
+            msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
+            locked = False
+            stdout, _ = process.communicate(timeout=30)
+            trace = read_trace()
+            if not stayed_alive or process.returncode != 0 or b"cleanup_timeout" in trace:
+                print("RED: completed work must wait out startup contention and exit 0 "
+                      "after release (rc=%s):\n%s" %
+                      (process.returncode, excerpt(stdout + trace)))
+                return False
+            print("PASS: completed local work waited for the live startup owner and exited 0")
+            return True
+        finally:
+            if locked:
+                gate.seek(0)
+                msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
+            if process is not None and process.poll() is None:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                               capture_output=True, timeout=30)
+                process.wait(timeout=30)
+            status = run_cli(binary, cache, ["daemon", "status"], timeout=30)
+            kill_pid(pid_from(out_text(status)))
+
+
 def section_cold_storm(binary, work):
-    cache = os.path.join(work, "cache-storm")
-    os.makedirs(cache, exist_ok=True)
+    cache = section_dirs(work, "storm")
     results = _parallel_one_shots(binary, cache, 6)
     for index, result in enumerate(results):
         if result is None or result.returncode != 0:
             print("RED: cold-storm client %d failed (racing daemon spawn):\n%s"
-                  % (index, out_text(result)[:300] if result else "(no result)"))
+                  % (index, excerpt(out_text(result)) if result else "(no result)"))
             return False
     if not wait_status_not_running(binary, cache, 90):
         print("RED: the ephemeral daemon shared by the cold storm never retired")
@@ -378,22 +663,50 @@ def main():
         print("FAIL: binary not found: %s" % binary)
         return 2
 
-    work = tempfile.mkdtemp(prefix="cbm_daemon_stab_")
+    # POSIX is for local iteration only, and there the rendezvous is a Unix
+    # socket whose path is capped at 104 bytes on macOS (sun_path); the default
+    # TMPDIR is already ~50 bytes deep, so keep the whole namespace under /tmp.
+    # On Windows TEMP is the guard root the runner hardened; leave it alone.
+    work = tempfile.mkdtemp(prefix="cbm_daemon_stab_",
+                            dir=None if os.name == "nt" else "/tmp")
     sections = [
         section_params,
         section_hook_fail_open,
         section_start_status_port,
+        section_start_port_waits_for_settings_writer,
         section_stop_refuses_busy,
         section_crash_recovery,
         section_churn_stability,
+        section_local_cleanup_waits_for_startup_gate,
         section_cold_storm,
     ]
+    failed = []
+    setup_failed = []
     try:
         for section in sections:
-            if not section(binary, work):
-                print("\nRED (tests/windows/test_daemon_stability.py): %s failed"
-                      % section.__name__)
-                return 1
+            try:
+                ok = section(binary, work)
+            except SetupFailure as exc:
+                print("\nSETUP FAIL (%s): %s" % (section.__name__, exc))
+                setup_failed.append(section.__name__)
+                continue
+            except subprocess.TimeoutExpired as exc:
+                # The section's own finally already fired its kill backstop.
+                print("\nRED: %s hung -- %s timed out after %ss:\n%s"
+                      % (section.__name__, exc.cmd, exc.timeout,
+                         excerpt((exc.stdout or b"") + (exc.stderr or b""))))
+                ok = False
+            if not ok:
+                failed.append(section.__name__)
+        if failed:
+            print("\nRED (tests/windows/test_daemon_stability.py): %s failed"
+                  % ", ".join(failed))
+            return 1
+        if setup_failed:
+            print("\nSETUP FAIL (tests/windows/test_daemon_stability.py): %s could not "
+                  "run -- `daemon start` did not hold; the lifecycle guard owns that red"
+                  % ", ".join(setup_failed))
+            return 2
         print("\nGREEN: daemon stability, parameters, and failure modes behave.")
         return 0
     finally:

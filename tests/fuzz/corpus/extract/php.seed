@@ -1,0 +1,7 @@
+index.php
+<?php
+namespace App;
+
+class Controller {
+    public function show(int $id): string { return (string) $id; }
+}

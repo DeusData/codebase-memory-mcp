@@ -83,6 +83,7 @@ def main():
     print("The `-ui` archives ship a compiled frontend asset pack beside the binary.")
     print("The packages below are its production dependency tree; license texts are")
     print("reproduced verbatim from the packages as installed at build time.")
+    print("The whole production dependency tree is covered conservatively.")
     print()
 
     for name, version in sorted(pkgs):

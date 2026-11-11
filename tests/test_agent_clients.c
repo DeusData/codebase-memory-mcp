@@ -49,6 +49,7 @@ static cbm_agent_client_resolve_options_t agent_options(agent_probe_t *probe) {
         .trae_config_path = NULL,
         .roo_config_path = NULL,
         .cody_config_path = NULL,
+        .omp_agent_dir = NULL,
         .is_windows = false,
         .path_exists = agent_path_exists,
         .command_exists = agent_command_exists,
@@ -161,6 +162,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
+        "omp",       "agentty",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -181,6 +183,8 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
         CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
         CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL,
     };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));
@@ -829,6 +833,7 @@ TEST(agent_clients_json_schemas_are_exact_and_policy_neutral) {
         {CBM_AGENT_CLIENT_IBM_BOB_IDE, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_IBM_BOB_SHELL, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_POCHI, "\"mcp\""},
+        {CBM_AGENT_CLIENT_OMP, "\"type\": \"stdio\""},
     };
     const char *binary = "/opt/Codebase Memory/bin/cbm\\\"special";
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -866,6 +871,7 @@ TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
         CBM_AGENT_CLIENT_IBM_BOB_IDE,
         CBM_AGENT_CLIENT_IBM_BOB_SHELL,
         CBM_AGENT_CLIENT_POCHI,
+        CBM_AGENT_CLIENT_OMP,
     };
     for (size_t i = 0U; i < sizeof(clients) / sizeof(clients[0]); i++) {
         const char *foreign =
@@ -929,6 +935,45 @@ TEST(agent_clients_refuse_foreign_and_preserve_modified_entries) {
     th_cleanup(dir);
     PASS();
 }
+
+TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided) {
+    agent_probe_t probe = {0};
+    cbm_agent_client_resolve_options_t options = agent_options(&probe);
+    char resolved[512];
+
+    /* Default (no env) keeps the documented ~/.omp/agent path. */
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/home/tester/.omp/agent/mcp.json");
+
+    /* Named profile directory takes precedence over the home-relative default. */
+    options.omp_agent_dir = "/home/tester/.omp/profiles/work/agent";
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/home/tester/.omp/profiles/work/agent/mcp.json");
+
+    /* PI_CODING_AGENT_DIR relocations also flow through the resolved option. */
+    options.omp_agent_dir = "/srv/omp-shared/agent";
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/srv/omp-shared/agent/mcp.json");
+    PASS();
+}
+
+TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability) {
+    const cbm_agent_client_profile_t *profile =
+        cbm_agent_client_by_id(CBM_AGENT_CLIENT_OMP);
+    ASSERT_NOT_NULL(profile);
+    ASSERT_EQ(profile->capabilities & CBM_AGENT_CAP_INSTRUCTIONS, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_MCP, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_SKILL, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_AGENT, 0U);
+    PASS();
+}
+
 
 TEST(agent_clients_remove_only_canonical_and_missing_is_noop) {
     char *dir = NULL;
@@ -1114,6 +1159,113 @@ TEST(client_adapter_pi_default_exports_its_factory_issue1550) {
     PASS();
 }
 
+/* Pi's ToolDefinition requires `parameters` and `execute`. The adapter used to
+ * emit `{ name, run }`, which Pi accepted but treated as a tool with no
+ * parameter schema — strict providers (xAI/Grok) then reject the request with
+ * a 422 "missing field parameters", and the tool is uncallable because Pi
+ * invokes `execute`, never `run`. Pin the corrected shape. */
+TEST(client_adapter_pi_emits_parameters_and_execute) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "execute: async (toolCallId, params, signal, _onUpdate, ctx) => {"));
+    ASSERT_NOT_NULL(strstr(js, ", params, signal ?? ctx?.signal)"));
+    ASSERT_NULL(strstr(js, "execute: async (args, ctx) => {"));
+    ASSERT_NULL(strstr(js, ", args, ctx?.signal)"));
+    ASSERT_NOT_NULL(strstr(js, "@earendil-works/pi-coding-agent"));
+    ASSERT_NOT_NULL(strstr(js, "result.content"));
+    ASSERT_NULL(strstr(js, "run: (args, ctx)"));
+    ASSERT_NOT_NULL(strstr(js, "parameters:"));
+    /* TypeBox parameters schema is embedded with Type.Object syntax. */
+    ASSERT_NOT_NULL(strstr(js, "Type.Object("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* #2787: String enums must use Type.String({ enum: [...] }) without anyOf/const */
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
+    /* A numeric registry property must remain numeric in the generated schema. */
+    ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
+    /* TypeBox import should be present. */
+    ASSERT_NOT_NULL(strstr(js, "import { Type } from 'typebox';"));
+    /* Raw JSON output is required so the bridge can parse the MCP result; the
+     * human-readable path would leave `call` with nothing to JSON.parse. */
+    ASSERT_NOT_NULL(strstr(js, "'cli', '--json'"));
+    free(js);
+    PASS();
+}
+
+/* #1834: raw JSON in argv selects the deprecated compatibility path. The Pi
+ * bridge must keep arguments out of process listings and feed the existing
+ * stdin transport only after all child handlers are attached. */
+TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+
+    const char *spawn = strstr(js, "spawn(BIN, ['cli', '--json', tool], {");
+    const char *stdio = strstr(js, "stdio: ['pipe', 'pipe', 'pipe']");
+    const char *stdout_handler = strstr(js, "child.stdout.on('data'");
+    const char *stdin_error_handler = strstr(js, "child.stdin.on('error'");
+    const char *error_handler = strstr(js, "child.on('error'");
+    const char *close_handler = strstr(js, "child.on('close'");
+    const char *stdin_end = strstr(js, "child.stdin.end(JSON.stringify(args ?? {}));");
+
+    ASSERT_NOT_NULL(spawn);
+    ASSERT_NOT_NULL(stdio);
+    ASSERT_NOT_NULL(stdout_handler);
+    ASSERT_NOT_NULL(stdin_error_handler);
+    ASSERT_NOT_NULL(error_handler);
+    ASSERT_NOT_NULL(close_handler);
+    ASSERT_NOT_NULL(stdin_end);
+    ASSERT(stdout_handler < stdin_end);
+    ASSERT(stdin_error_handler < stdin_end);
+    ASSERT(error_handler < stdin_end);
+    ASSERT(close_handler < stdin_end);
+    ASSERT_NOT_NULL(strstr(js, "let stdinError;"));
+    ASSERT_NOT_NULL(strstr(js, "stdinError = e;"));
+    ASSERT_NOT_NULL(strstr(js, "if (stdinError)"));
+
+    /* These are the exact deprecated transport shapes being retired. */
+    ASSERT_NULL(strstr(js, "tool, JSON.stringify(args ?? {})]"));
+    ASSERT_NULL(strstr(js, "stdio: ['ignore', 'pipe', 'pipe']"));
+
+    free(js);
+    PASS();
+}
+
+/* Result wrap + abort: Pi's TUI reads result.content; a spawn/parse failure
+ * must throw rather than return a result without content; AbortSignal must
+ * kill the cli child. String-shape only; a live Pi process is not gated. */
+TEST(client_adapter_pi_wraps_result_and_honors_abort) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "return { content, details: result ?? {} };"));
+    ASSERT_NOT_NULL(strstr(js, "if (result && typeof result === 'object' && result.error)"));
+    ASSERT_NOT_NULL(strstr(js, "throw new Error(String(result.error));"));
+    ASSERT_NOT_NULL(strstr(js, "Array.isArray(result.content)"));
+    ASSERT_NOT_NULL(
+        strstr(js, "[{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }]"));
+    ASSERT_NOT_NULL(strstr(js, "signal?.addEventListener('abort', onAbort, { once: true })"));
+    ASSERT_NOT_NULL(strstr(js, "if (!child.killed) child.kill();"));
+    free(js);
+    PASS();
+}
+
+/* #2787: Pi extension must emit string enums as Type.String({ enum: [...] })
+ * rather than Type.Union([Type.Literal(...)]) which TypeBox serializes as
+ * anyOf/const, breaking Gemini / Antigravity function declaration validation. */
+TEST(client_adapter_pi_emits_string_enum_issue2787) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NOT_NULL(strstr(js, "'full'"));
+    ASSERT_NOT_NULL(strstr(js, "'moderate'"));
+    ASSERT_NOT_NULL(strstr(js, "'fast'"));
+    ASSERT_NOT_NULL(strstr(js, "'cross-repo-intelligence'"));
+    free(js);
+    PASS();
+}
+
 /* #616 rejected `"` in its path template but not `\`, so a Windows home like
  * C:\Users\urs\bin produced `\u` — an invalid unicode escape — and the whole
  * auto-loaded plugin failed to parse. A broken plugin in an auto-load directory
@@ -1158,10 +1310,154 @@ TEST(client_adapter_opencode_sends_the_required_hook_event) {
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PreToolUse'"));
     ASSERT_NOT_NULL(strstr(js, "tool.execute.after"));
+    ASSERT_NOT_NULL(strstr(js, "const args = input?.args ?? {};"));
+    ASSERT_NOT_NULL(strstr(js, "tool_input: args"));
+    ASSERT_NULL(strstr(js, "output?.args"));
     /* OpenCode reaches the tools over MCP already; this adapter must not
      * register any, or we reintroduce the second tool surface. */
     ASSERT_NULL(strstr(js, "registerTool"));
     ASSERT_NULL(strstr(js, CBM_ADAPTER_MARKER_START));
+    free(js);
+    PASS();
+}
+
+/* The richer OpenCode adapter carries every context surface the plugin API
+ * documents: session-start tier routing on the first tool result of each
+ * session, post-read coverage notes, and post-compaction reinjection through
+ * the documented experimental surface. It must unwrap hook-augment's Claude
+ * JSON envelope so plain text — not raw JSON — reaches the model. */
+TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'SessionStart'"));
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PostToolUse'"));
+    ASSERT_NOT_NULL(strstr(js, "tool_name: 'Read'"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
+    ASSERT_NOT_NULL(strstr(js, "additionalContext"));
+    /* file_path is the key hook-augment's default dialect reads; OpenCode's
+     * read tool argues filePath, so the adapter must map it. */
+    ASSERT_NOT_NULL(strstr(js, "file_path: filePath"));
+    /* Session context may only be injected once per session id. */
+    ASSERT_NOT_NULL(strstr(js, "seen.has(sid)"));
+    free(js);
+    PASS();
+}
+
+/* #2077/#2089/#2204: the two OpenCode runtimes read different entries of the
+ * default export. 1.18.x dispatches the hooks returned by `server(ctx)`; 2.x
+ * ignores `server` and calls `setup(ctx)`, whose context provides the tool hook
+ * domain. The registration fails open, and the server() tool hook yields once
+ * it is registered. OpenCode 2 adds no note to a compaction (pinned by the
+ * compaction test below). */
+TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "export default {"));
+    ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
+    /* OpenCode 1.18.x server runtime. */
+    ASSERT_NOT_NULL(strstr(js, "server: async (ctx) => {"));
+    /* OpenCode 2 registers through the setup context; the domains exist on
+     * 2.x, so setup is no longer the empty placeholder #2089 pinned. */
+    ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.tool.hook('execute.after'"));
+    /* content is the surface the model reads; prefer it over output, and never
+     * synthesize content that would hide the tool's own result. */
+    const char *content_first = strstr(js, "if (typeof result.content === 'string') {");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(content_first);
+    ASSERT_NOT_NULL(output_fallback);
+    ASSERT_TRUE(content_first < output_fallback);
+    ASSERT_NULL(strstr(js, "if (result.content === undefined)"));
+    /* The V2 hooks read the session id with optional chaining (fail open). */
+    ASSERT_NOT_NULL(strstr(js, "event?.sessionID"));
+    /* The plugin instance's location is not the session's location in a
+     * multi-project server: resolve each session's directory. */
+    ASSERT_NOT_NULL(strstr(js, "const dir = await dirFor("));
+    ASSERT_NOT_NULL(strstr(js, "ctx.session.get({ sessionID })"));
+    ASSERT_NOT_NULL(strstr(js, "dirs.has(sessionID)"));
+    ASSERT_NOT_NULL(strstr(js, "if (!dir) return;"));
+    /* No fallback to the plugin instance's location: that is not the session's
+     * location in a multi-project server. */
+    ASSERT_NULL(strstr(js, "ctx?.location?.directory"));
+    ASSERT_NULL(strstr(js, "pendingReinject"));
+    /* The registration fails open; the server() tool hook yields once it is in. */
+    ASSERT_NOT_NULL(strstr(js, "toolHooksRegistered = true;"));
+    ASSERT_NOT_NULL(strstr(js, "if (toolHooksRegistered) return;"));
+    ASSERT_NOT_NULL(strstr(js, "catch {"));
+    ASSERT_NOT_NULL(strstr(js, "event.result = appendResult(event.result, extra);"));
+    /* The empty setup placeholder and the old named export must both be gone. */
+    ASSERT_NULL(strstr(js, "setup() {}"));
+    ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
+    free(js);
+    PASS();
+}
+
+/* #2204: OpenCode 2 gets no note after compaction until a compaction channel has
+ * run on a real 2.x host. A plain object pushed into `event.messages` would be
+ * rejected, if at all, inside OpenCode's own compaction, where the plugin's
+ * try/catch cannot reach it, so an untested channel could break compaction for
+ * every OpenCode 2 user. The note must not reach the system prompt either: not
+ * through `event.system`, and not through a session instruction entry. The
+ * 1.18.x server() path keeps its documented compaction surface. */
+TEST(client_adapter_opencode_v2_adds_no_note_to_the_compaction) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NULL(strstr(js, "ctx.session.hook("));
+    ASSERT_NULL(strstr(js, "event.messages"));
+    ASSERT_NULL(strstr(js, "sessionHooksRegistered"));
+    ASSERT_NULL(strstr(js, ".system"));
+    ASSERT_NULL(strstr(js, "instructions"));
+    ASSERT_NULL(strstr(js, "entry.put"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
+    free(js);
+    PASS();
+}
+
+/* #2204: Tool.Result allows `content: []`. appendResult adds a text part to a
+ * parts array only when the array already holds a part; an empty array falls
+ * through to the string `output` (or the unchanged result), so the note never
+ * becomes the whole content of a tool result. */
+TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    const char *parts =
+        strstr(js, "if (Array.isArray(result.content) && result.content.length > 0) {");
+    const char *add_part = strstr(js, "content.push({ type: 'text', text: extra });");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(parts);
+    ASSERT_NOT_NULL(add_part);
+    ASSERT_NOT_NULL(output_fallback);
+    /* The only part-adding push sits inside the non-empty branch; the string
+     * output fallback, where `content: []` lands, comes after it. */
+    ASSERT_TRUE(parts < add_part);
+    ASSERT_TRUE(add_part < output_fallback);
+    ASSERT_NULL(strstr(add_part + 1, "content.push("));
+    /* No unguarded array branch is left. */
+    ASSERT_NULL(strstr(js, "if (Array.isArray(result.content)) {"));
+    free(js);
+    PASS();
+}
+
+/* augment() is awaited inline inside 'tool.execute.after', so a hook-augment
+ * that never exits would stall every grep/glob/read completion in the host
+ * session until the agent is restarted. The generated plugin must bound the
+ * wait: SIGKILL the child after AUGMENT_TIMEOUT_MS and resolve with '' (fail
+ * open). The promise keeps the first resolution, so the kill-triggered
+ * 'close' event arriving late cannot smuggle in partial output. Stream
+ * errors fire on child.stdin, not the child — the emitted listener and the
+ * guarded end() keep a failed write (EPIPE, ENOENT) from crashing the host
+ * as an unhandled 'error' event (reproduced under Bun 1.4 with a >64KB
+ * payload and a non-reading child). */
+TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "const AUGMENT_TIMEOUT_MS = 10000;"));
+    ASSERT_NOT_NULL(strstr(js, "const timer = setTimeout("));
+    ASSERT_NOT_NULL(strstr(js, "child.kill('SIGKILL');"));
+    /* error and close must both stop the timer once they own the outcome. */
+    ASSERT_NOT_NULL(strstr(js, "clearTimeout(timer);"));
+    /* stream-level failures must not escape as unhandled 'error' events. */
+    ASSERT_NOT_NULL(strstr(js, "child.stdin.on('error', () => {});"));
     free(js);
     PASS();
 }
@@ -1196,6 +1492,8 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_json_schemas_are_exact_and_policy_neutral);
     RUN_TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries);
     RUN_TEST(agent_clients_refuse_foreign_and_preserve_modified_entries);
+    RUN_TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided);
+    RUN_TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability);
     RUN_TEST(agent_clients_remove_only_canonical_and_missing_is_noop);
     RUN_TEST(agent_clients_registry_callbacks_apply_the_selected_schema);
     RUN_TEST(agent_clients_malformed_json_fails_byte_identically);
@@ -1204,7 +1502,16 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_continue_refuses_foreign_same_name_and_nonsequence_section);
     RUN_TEST(client_adapter_pi_registers_every_registry_tool);
     RUN_TEST(client_adapter_pi_default_exports_its_factory_issue1550);
+    RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
+    RUN_TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834);
+    RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
+    RUN_TEST(client_adapter_pi_emits_string_enum_issue2787);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
+    RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
+    RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
+    RUN_TEST(client_adapter_opencode_v2_adds_no_note_to_the_compaction);
+    RUN_TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content);
+    RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

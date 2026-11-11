@@ -60,6 +60,45 @@ TEST(log_level_default) {
     PASS();
 }
 
+TEST(log_level_env_keeps_info_and_debug_opt_in) {
+    CBMLogLevel saved = cbm_log_get_level();
+    cbm_setenv("CBM_LOG_LEVEL", "info", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    /* Restore what the process had: later suites observe INFO records. */
+    cbm_log_set_level(saved);
+    PASS();
+}
+
+TEST(log_startup_policy_keeps_frontends_quiet_and_workers_live) {
+    CBMLogLevel saved = cbm_log_get_level();
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_init_for_process(true, false);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_log_init_for_process(false, true);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "none", 1);
+    cbm_log_init_for_process(false, true);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_for_process(true, false);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    /* Restore what the process had: later suites observe INFO records. */
+    cbm_log_set_level(saved);
+    PASS();
+}
+
 TEST(log_level_set) {
     cbm_log_set_level(CBM_LOG_WARN);
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
@@ -168,7 +207,8 @@ TEST(log_operational_helpers) {
     cbm_log_set_level(CBM_LOG_DEBUG);
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     capture_start();
-    cbm_log_mcp_request("tools/call", "search_graph", false, 1250);
+    cbm_log_mcp_request("tools/call", "search_graph", false, 1250000, 1000000, 250000, false,
+                        false);
     cbm_log_http_request("graph_ui", "GET", "/api/layout", 200, 7, 0, 42);
     const char *output = capture_end();
     cbm_log_set_level(CBM_LOG_INFO);
@@ -177,10 +217,26 @@ TEST(log_operational_helpers) {
     ASSERT(cbm_str_contains_raw(output, "protocol=jsonrpc"));
     ASSERT(cbm_str_contains_raw(output, "method=tools/call"));
     ASSERT(cbm_str_contains_raw(output, "tool=search_graph"));
+    ASSERT(cbm_str_contains_raw(output, "handler_duration_ms=1000"));
+    ASSERT(cbm_str_contains_raw(output, "response_serialization_ms=250"));
+    ASSERT(cbm_str_contains_raw(output, "cancelled=false"));
+    ASSERT(cbm_str_contains_raw(output, "timed_out=false"));
     ASSERT(cbm_str_contains_raw(output, "msg=http.request"));
     ASSERT(cbm_str_contains_raw(output, "method=GET"));
     ASSERT(cbm_str_contains_raw(output, "path=/api/layout"));
     ASSERT(cbm_str_contains_raw(output, "status=200"));
+
+    /* A request that hit its deadline reports status=timeout, even though the
+     * tool result itself is an error. */
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    capture_start();
+    cbm_log_mcp_request("tools/call", "search_code", true, 2000000, 2000000, 0, false, true);
+    output = capture_end();
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(cbm_str_contains_raw(output, "msg=mcp.request"));
+    ASSERT(cbm_str_contains_raw(output, "status=timeout"));
+    ASSERT(cbm_str_contains_raw(output, "timed_out=true"));
     PASS();
 }
 
@@ -285,6 +341,8 @@ TEST(log_level_from_env_invalid_ignored) {
 
 SUITE(log) {
     RUN_TEST(log_level_default);
+    RUN_TEST(log_level_env_keeps_info_and_debug_opt_in);
+    RUN_TEST(log_startup_policy_keeps_frontends_quiet_and_workers_live);
     RUN_TEST(log_level_set);
     RUN_TEST(log_info_output);
     RUN_TEST(log_filtered_by_level);

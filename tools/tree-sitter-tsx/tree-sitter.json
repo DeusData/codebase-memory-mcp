@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "tsx",
+      "camelcase": "TSX",
+      "scope": "source.tsx",
+      "path": ".",
+      "file-types": ["tsx"]
+    }
+  ],
+  "metadata": {
+    "version": "0.23.2-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-typescript's tsx dialect @ 75b3874 (JSX lone-ampersand fix)"
+  }
+}

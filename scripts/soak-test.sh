@@ -66,9 +66,27 @@ CBM_SOAK_MODE="${CBM_SOAK_MODE:-default}"
 RESULTS_DIR="${RESULTS_DIR:-soak-results}"
 mkdir -p "$RESULTS_DIR"
 
-# Isolate daemon coordination from interactive CBM sessions and give this run
-# a deterministic host-side daemon log. Wine needs a Windows-form cache path
-# in the child environment while this Bash harness retains the host path.
+# One latency ceiling judges a slow call (Check 4 below). The per-call read
+# waits past it, so the measured latency, not the read timeout, gives the
+# verdict; a reply that never comes still ends the read. GitHub's
+# windows-11-arm image (2026-10) answers the PowerShell-backed search_code in
+# ~23 s per call (1.1 s for v0.11.0 and v0.12.0 alike on a local Windows ARM64
+# VM), and the old fixed 30 s read failed that leg on one borderline call while
+# the 60 s ceiling itself held.
+SOAK_MAX_QUERY_LATENCY_S=60
+SOAK_CALL_READ_TIMEOUT_S=$((SOAK_MAX_QUERY_LATENCY_S + 30))
+
+# Every product process below must reach a daemon rendezvous this run owns.
+# Only CBM_RUNTIME_DIR moves that rendezvous — a private CBM_CACHE_DIR alone
+# still shares the operator's account daemon (#1691, #1696).
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+
+# Give this run a deterministic host-side daemon log. Wine needs a Windows-form
+# cache path in the child environment while this Bash harness retains the host
+# path.
 #
 # On native Windows the cache CANNOT live under msys /tmp: the server's
 # cache-private executable-identity check walks the cache path's ancestors
@@ -146,7 +164,7 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
         exit 1
     fi
 else
-    SOAK_CACHE_DIR_HOST=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-cache.XXXXXX")
+    SOAK_CACHE_DIR_HOST="$CBM_TEST_CACHE_DIR_HOST"
 fi
 SOAK_CACHE_DIR_VALUE="$SOAK_CACHE_DIR_HOST"
 if [[ "$BINARY" == *.exe ]] && command -v winepath >/dev/null 2>&1; then
@@ -206,7 +224,12 @@ soak_cleanup() {
     if [ -f "$DAEMON_LOG" ]; then
         cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-daemon.log" 2>/dev/null || true
     fi
-    rm -rf -- "$SOAK_PROJECT" "$SOAK_CACHE_DIR_HOST"
+    rm -rf -- "$SOAK_PROJECT"
+    # The helper stops this run's private daemon before removing its root and
+    # leaves the root behind for diagnosis when the daemon will not stop. The
+    # native-Windows cache sits under SOAK_WIN_ROOT, which goes only after the
+    # daemon check because the binary it probes with is the copy inside it.
+    cbm_test_runtime_cleanup "$BINARY"
     [ -z "${SOAK_WIN_ROOT:-}" ] || rm -rf -- "$SOAK_WIN_ROOT"
 }
 
@@ -489,12 +512,13 @@ mcp_call() {
     # Send request to server stdin
     echo "$req" >&3
 
-    # Read and validate one response (wait up to 30s). A JSON-RPC error or
-    # tool-level isError is a failed operation, not a successful round-trip.
+    # Read and validate one response (wait past the latency ceiling, see
+    # SOAK_CALL_READ_TIMEOUT_S). A JSON-RPC error or tool-level isError is a
+    # failed operation, not a successful round-trip.
     local resp=""
     local exit_code=1
     MCP_LAST_RESPONSE=""
-    if read -r -t 30 resp <&4 2>/dev/null; then
+    if read -r -t "$SOAK_CALL_READ_TIMEOUT_S" resp <&4 2>/dev/null; then
         MCP_LAST_RESPONSE="$resp"
         if json_rpc_response_ok "$id" "$resp"; then
             exit_code=0
@@ -807,7 +831,7 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
     SERVER_PID=""
     exec 3>&- 4<&-
     if ! wait_for_daemon_stop "$DAEMON_STOP_COUNT"; then
-        echo "FAIL: last-session crash did not stop the shared daemon"
+        echo "FAIL: last-session crash did not stop the private daemon"
         exit 1
     fi
 
@@ -848,7 +872,7 @@ kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
 if ! wait_for_daemon_stop "$FINAL_DAEMON_STOP_COUNT"; then
-    echo "FAIL: final frontend shutdown did not stop the shared daemon"
+    echo "FAIL: final frontend shutdown did not stop the private daemon"
     PASS=false
 fi
 
@@ -934,9 +958,9 @@ fi
 MAX_LATENCY=$(awk -F, 'NR>1 && $2!="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 MAX_INDEX=$(awk -F, 'NR>1 && $2=="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 echo "Max query latency: ${MAX_LATENCY}ms (index: ${MAX_INDEX}ms)" | tee -a "$SUMMARY"
-# 60s threshold — MSYS2/Wine adds significant overhead to all operations
-if [ "${MAX_LATENCY:-0}" -gt 60000 ] 2>/dev/null; then
-    echo "FAIL: max query latency ${MAX_LATENCY}ms > 60s" | tee -a "$SUMMARY"
+# SOAK_MAX_QUERY_LATENCY_S — MSYS2/Wine adds significant overhead to all operations
+if [ "${MAX_LATENCY:-0}" -gt $((SOAK_MAX_QUERY_LATENCY_S * 1000)) ] 2>/dev/null; then
+    echo "FAIL: max query latency ${MAX_LATENCY}ms > ${SOAK_MAX_QUERY_LATENCY_S}s" | tee -a "$SUMMARY"
     PASS=false
 fi
 

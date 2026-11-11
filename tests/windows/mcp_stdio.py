@@ -148,3 +148,34 @@ class McpServer:
                 self.proc.kill()
             except Exception:
                 pass
+
+
+def wait_projects_with_stats(server, timeout=90.0, poll=1.0):
+    """Poll list_projects until a project row carries node/edge counts.
+
+    index_repository returns when the pipeline finishes, but the project
+    stats are published asynchronously; on slow CI runners the first
+    list_projects can observe the registration row before its counts land
+    (`nodes` absent/None). That window is environmental, not a product
+    regression (#1952), so wait it out instead of failing setup on it.
+
+    Returns (projects, last_text): the parsed project list (possibly [])
+    and the last raw list_projects payload for diagnostics.
+    """
+    deadline = time.time() + timeout
+    last_txt = ""
+    while True:
+        resp = server.call_tool("list_projects", {}, timeout=60)
+        txt, err = server.tool_text(resp)
+        projects = []
+        if not err and txt:
+            last_txt = txt
+            try:
+                projects = json.loads(txt).get("projects") or []
+            except ValueError:
+                projects = []
+        if projects and projects[0].get("nodes") is not None:
+            return projects, last_txt
+        if time.time() >= deadline:
+            return projects, last_txt
+        time.sleep(poll)

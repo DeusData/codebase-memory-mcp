@@ -1,0 +1,32 @@
+{
+  "serverStarted": true,
+  "rpcTool": "get_code_snippet",
+  "monacoReadOnly": true,
+  "decorationCount": 1,
+  "port": 4210,
+  "screenshot": "verification/w0/spike.png",
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w0-spike",
+  "qualifiedName": "codeatlasweb-w0-spike.src.services.userService.createUser",
+  "symbol": "createUser",
+  "filePath": "/Users/bernhard/Desktop/CodeAtlasWeb/fixtures/atlas-sample/src/services/userService.ts",
+  "startLine": 23,
+  "endLine": 36,
+  "callSiteFileLine": 24,
+  "sourceLength": 523,
+  "indexNodes": 76,
+  "indexEdges": 178,
+  "indexNotIndexedFiles": 0,
+  "indexSkipped": 0,
+  "indexParsePartial": 0,
+  "staticProxyPort": 4211,
+  "screenshotBytes": 197383,
+  "timings": {
+    "indexMs": 8295,
+    "serverStartMs": 6898,
+    "totalMs": 17086
+  },
+  "monacoVersion": "0.56.0",
+  "generatedAt": "2026-08-28T16:04:46.094Z",
+  "error": null
+}

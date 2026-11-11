@@ -1,0 +1,255 @@
+{
+  "export": "/tmp/cbm-pr2068-before-c9eic3xv",
+  "commit": "80f4f41f9bcb9daf60afc5f607bcbcba24a4b196",
+  "upstream": "http://127.0.0.1:9749",
+  "port": 9751,
+  "dependencies": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068/graph-ui/node_modules",
+  "config": "/tmp/cbm-pr2068-before-c9eic3xv/preview-vite.config.mjs",
+  "label": "Vorher: unverändertes Originalfrontend vor unserer Arbeit",
+  "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+  "mode": "production Vite preview",
+  "historicalBackend": false,
+  "data": "Current shared daemon and current repository index on port 9749; frontend-only comparison",
+  "dependencyLockMatches": true,
+  "unchangedTrackedFiles": 735,
+  "modifiedTrackedFiles": [],
+  "previewToolSession": 26345,
+  "pid": 88603,
+  "httpChecks": {
+    "html": 200,
+    "allowed-api": 200,
+    "foreign-origin": 403,
+    "foreign-host": 403,
+    "null-origin": 403,
+    "localhost-origin": 200
+  },
+  "sameListProjectsResponseViaProxyAndDirect": true,
+  "configuration": "import base from './graph-ui/vite.config.ts';\nimport { defineConfig, mergeConfig } from 'vite';\nconst origin = 'http://127.0.0.1:9749';\nconst allowedHosts = new Set(['127.0.0.1:9751', 'localhost:9751']);\nconst allowedOrigins = new Set(['http://127.0.0.1:9751', 'http://localhost:9751']);\nfunction allowed(req) {\n    return allowedHosts.has(req.headers.host ?? '') &&\n        (req.headers.origin === undefined || allowedOrigins.has(req.headers.origin));\n}\nfunction enforce(req, res, next) {\n    if (!allowed(req)) {\n        res.writeHead(403, { 'Content-Type': 'application/json' });\n        res.end('{\"error\":\"forbidden preview host or origin\"}');\n        return;\n    }\n    next();\n}\nconst proxy = () => ({\n    target: origin, changeOrigin: true, headers: { Origin: origin },\n    bypass(req, res) {\n        if (!allowed(req)) {\n            res.writeHead(403, { 'Content-Type': 'application/json' });\n            res.end('{\"error\":\"forbidden preview host or origin\"}');\n            return false;\n        }\n        return undefined;\n    },\n});\nexport default defineConfig(mergeConfig(base, {\n    root: new URL('./graph-ui/', import.meta.url).pathname,\n    cacheDir: new URL('./vite-cache/', import.meta.url).pathname,\n    plugins: [{ name: 'comparison-loopback-guard', configureServer(server) {\n        server.middlewares.use(enforce);\n    }, configurePreviewServer(server) { server.middlewares.use(enforce); } }],\n    server: { host: '127.0.0.1', port: 9751, strictPort: true,\n        allowedHosts: ['127.0.0.1', 'localhost'],\n        cors: { origin: [...allowedOrigins] },\n        proxy: { '/rpc': proxy(), '/api': proxy() } },\n    preview: { host: '127.0.0.1', port: 9751, strictPort: true,\n        allowedHosts: ['127.0.0.1', 'localhost'],\n        cors: { origin: [...allowedOrigins] },\n        proxy: { '/rpc': proxy(), '/api': proxy() } },\n}));\n",
+  "buildLog": "/tmp/cbm-pr2068-before-build.log",
+  "browser": {
+    "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+    "errors": [],
+    "requests": [
+      {
+        "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/assets/index-BByjaIk0.js",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/assets/index-BnfK9-0O.css",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/layout?project=cbm-pr2068&max_nodes=5000",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=.github",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=docs",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/ui-log",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/rpc",
+        "method": "POST"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=internal",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=test-infrastructure",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=tests",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=tools",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=.github%2FISSUE_TEMPLATE",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=.github%2Fworkflows",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=docs%2Fdevelopment",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fagents",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fdocs",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Feval",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Ffixtures",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fllm",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fspike",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fsrc",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Ftests",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Ftools",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fverification",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=internal%2Fcbm",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fchocolatey",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fglama",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fgo",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fhomebrew",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fnpm",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fpypi",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fscoop",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fwinget",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts%2Fci",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts%2Fgit-hooks",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts%2Fhooks",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fcli",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fcypher",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fdaemon",
+        "method": "GET"
+      },
+      {
+        "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fdiscover",
+        "method": "GET"
+      }
+    ],
+    "externalAttempts": [],
+    "screenshot": "comparison-before-live.png",
+    "visibleText": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\n40,226\nSYMBOLS\n173,902\nRELATIONS\n15\nMODULES\n928\nFILES LISTED\nMODULES\n\nGroups reported by the index. Select one to focus its relationships.\n\nsrc\n2,576 symbols\ncbm\n2,048 symbols\ncli\n1,025 symbols\nrepro\n1,011 symbols\npipeline\n949 symbols\ntools\n782 symbols\ndaemon\n759 symbols\nfoundation\n535 symbols\nmcp\n497 symbols\ntest_cli\n352 symbols\nstore\n320 symbols\ntree-sitter-arkts\n311 symbols\n12 of 15 shown\nShow more\nARCHITECTURE LAYERS\n\nInferred assignments from the provider.\n\nhas HTTP route definitions\n\napi\nagents\n\nfan-in=0, fan-out=0\n\ninternal\ncbm\n\nfan-in=22, fan-out=180\n\ninternal\ncli\n\nfan-in=47, fan-out=160\n\ninternal\ndaemon\n\nfan-in=19, fan-out=387\n\ninternal\nfixtures\n\nfan-in=0, fan-out=0\n\ninternal\nfoundation\n\nhigh fan-in (727 in, 0 out)\n\ncore\ngo\n\nhas HTTP route definitions\n\napi\n8 of 16 shown\nShow more\nRELATED COMMUNITIES\n\nGroups inferred from call relationships.\n\ntests\n\nfind_resolved, extract_cpp, extract_c, count_resolved, clsp_pattern_method_call_in_ternary_branch\n\n100% cohesion\n\n744 members\ntests\n\nextract_rust, require_resolved, find_resolved, count_resolved, rustlsp_definition_has_decorator\n\n99% cohesion\n\n497 members\ntests\n\nextract, has_def, count_defs_with_label, has_call, find_def\n\n100% cohesion\n\n354 members\ngraph-ui\n\nnode, main, path, main, main\n\n100% cohesion\n\n326 members\nsrc\n\nruntime_test_self_build, cbm_daemon_runtime_client_connect, runtime_test_fixture_finish, cbm_mutex_lock, cbm_mutex_unlock\n\n92% cohesion\n\n310 members\nsrc\n\ncbm_mkdir_p, record_agent_config_error, install_additional_agent_configs, uninstall_additional_agents, cbm_detect_agents\n\n92% cohesion\n\n299 members\ntests\n\ncov_extract, cov_require, cov_lit_char, cov_lit_string_method, cov_lit_bool_method\n\n100% cohesion\n\n284 members\ninternal\n\ncbm_node_text, extract_callee_lang_specific, handle_calls, cbm_find_child_by_kind, push_channel\n\n100% cohesion\n\n226 members\n8 of 12 shown\nShow more\nINDEXED FILES\n.gitattributes\n.github/ISSUE_TEMPLATE/bug_report.yml\n.github/ISSUE_TEMPLATE/config.yml\n.github/ISSUE_TEMPLATE/feature_request.yml\n.github/dependabot.yml\n.github/issue-labeler.yml\n.github/label-actions.yml\n.github/pr-acknowledgement.md\n8 of 928 shown\nShow more\nLANGUAGES\nC · 678\nTypeScript · 377\nBash · 116\nPython · 37\nYAML · 32\nCSS · 13\nJavaScript · 11\nGo · 6\nHTML · 4\nC++ · 4\nSYMBOL KINDS\nFunction · 20,856\nVariable · 12,113\nFile · 1,555\nModule · 1,440\nMacro · 1,284\nField · 1,030\nSection · 633\nInterface · 467\nClass · 212\nMethod · 195\nFolder · 155\nType · 117\nEnvVar · 79\nRoute · 68\nEnum · 10\nStruct · 6\nDecorator · 3\nBranch · 1\nChannel · 1\nProject · 1\nAbout this view\nserver ready\nConnection details"
+  },
+  "verifiedAt": "2026-09-09T20:21:17.008Z"
+}

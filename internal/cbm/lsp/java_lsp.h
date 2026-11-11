@@ -35,6 +35,8 @@
 #include "../cbm.h"
 #include "go_lsp.h" /* CBMLSPDef, CBMResolvedCallArray reused across languages */
 
+#define JAVA_EXT_MEMO 8
+
 /* Java `use`-style import kinds. Mirrors PHP's enum with Java semantics. */
 enum {
     CBM_JAVA_IMPORT_TYPE = 0,      /* import com.foo.Bar; — type import */
@@ -90,6 +92,12 @@ typedef struct {
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
+
+    /* java_receiver_is_external's answers for the packages probed so far
+     * (a few per file), so each costs one registry walk. */
+    const char *ext_memo_pkg[JAVA_EXT_MEMO];
+    bool ext_memo_val[JAVA_EXT_MEMO];
+    int ext_memo_next;
 } JavaLSPContext;
 
 /* ── Initialization / configuration ───────────────────────────────── */
@@ -141,6 +149,16 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
  * walk and resolve. defs include both local + cross-file definitions. */
 void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count);
+
+/* Tier 2 (#1669): build the shared JVM cross registry ONCE per run, then
+ * resolve each file against it with a small own-module overlay. Skips the
+ * per-file registry build that made cross-file LSP O(files x corpus_defs). */
+CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
+void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result,
+                                          const char *source, int source_len, const char *module_qn,
+                                          CBMTypeRegistry *reg, const char **import_names,
+                                          const char **import_qns, int import_count,
+                                          TSTree *cached_tree, CBMResolvedCallArray *out);
 
 void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,

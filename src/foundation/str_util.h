@@ -73,6 +73,22 @@ bool cbm_validate_shell_path_arg(const char *path);
  * Returns true if safe, false if the name could escape the cache directory. */
 bool cbm_validate_project_name(const char *name);
 
+/* Internal stores that live next to the project indexes in the cache
+ * directory. They are exact filenames: a project name may itself begin with
+ * "_" or contain "config", so prefix/substring filters would hide real
+ * projects. */
+#define CBM_CONFIG_DB_FILENAME "_config.db"
+#define CBM_CROSS_REPO_DB_FILENAME "_cross_repo.db"
+
+/* True when a cache-directory entry is one of the internal stores above. */
+bool cbm_is_internal_cache_db(const char *filename);
+
+/* True when a cache-directory entry is a project index: "<name>.db" with a
+ * non-empty stem and not an internal store. The one predicate every
+ * enumeration of the cache directory's .db files uses (list, count,
+ * remove, cross-repo). */
+bool cbm_is_project_index_db(const char *filename);
+
 /* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
  * When snprintf truncates, it returns what it WOULD have written, which can make
  * offset > bufsize. Next call: bufsize - offset wraps unsigned → huge → overflow.
@@ -91,9 +107,16 @@ bool cbm_validate_project_name(const char *name);
         }                                                                            \
     } while (0)
 
+/* Drop a trailing INCOMPLETE UTF-8 sequence from a NUL-terminated buffer in
+ * place (a lead byte whose continuation bytes were cut off). Returns the new
+ * length. Complete sequences and ASCII are left untouched. Use after any
+ * byte-count truncation of text that will be stored or serialised. */
+int cbm_utf8_trim_partial(char *buf);
+
 /* Escape a string for safe embedding in JSON: escapes " \ and control chars.
  * Writes into buf (including NUL). Returns number of chars written (excl NUL).
- * If buf is too small, output is truncated but always NUL-terminated. */
+ * If buf is too small, output is truncated but always NUL-terminated, and it
+ * never ends inside a multibyte UTF-8 sequence. */
 int cbm_json_escape(char *buf, int bufsize, const char *src);
 
 #endif /* CBM_STR_UTIL_H */

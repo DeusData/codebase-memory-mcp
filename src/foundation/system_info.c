@@ -14,11 +14,17 @@
 
 enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
 #include "foundation/log.h"
+#include "foundation/mem_core.h" /* cbm_alloc: one accounted allocation path */
 #include "foundation/platform.h"
 #include "foundation/system_info_internal.h"
-#include <stdint.h> // uint64_t
-#include <stdlib.h> // strtol
+#include <stdatomic.h> // the system-info cache is published across worker threads
+#include <stdint.h>    // uint64_t
+#include <stdlib.h>    // strtol
 #include <string.h>
+
+#ifndef _WIN32
+#include <sys/statvfs.h> /* cbm_fs_free_bytes: free space before we spill into it */
+#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -26,6 +32,7 @@ enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include <mach/mach.h> /* host_statistics64 - reclaimable page accounting */
 #include <sys/sysctl.h>
 #elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <unistd.h>
@@ -261,23 +268,51 @@ static cbm_system_info_t detect_system_windows(void) {
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-static int info_cached = 0;
+/* The cache is published once, by whichever thread gets there first.
+ *
+ * This used to be a plain `if (!info_cached) { cached_info = detect(); }`, which
+ * was fine while only the main thread asked. It stopped being fine when the
+ * memory-relief path started calling cbm_mem_system_under_pressure() from the
+ * extract workers: several threads then raced on the flag AND on the struct,
+ * and a struct assignment is not atomic, so a reader could see half of one.
+ * TSan caught it on all three platforms (system_info.c:284 against :274, from
+ * extract_worker).
+ *
+ * Three states rather than a flag, so the winner of the compare-exchange is the
+ * only writer of cached_info: a loser returns the copy it detected itself,
+ * which is the same answer, and a later reader sees the published struct
+ * through the acquire/release pair. No mutex, so nothing has to be initialised
+ * before first use, and no reader can observe a half-written struct. */
+enum { INFO_EMPTY = 0, INFO_CLAIMED = 1, INFO_READY = 2 };
+static _Atomic int info_state = INFO_EMPTY;
 static cbm_system_info_t cached_info;
 
-cbm_system_info_t cbm_system_info(void) {
-    if (!info_cached) {
+static cbm_system_info_t detect_system_now(void) {
 #ifdef _WIN32
-        cached_info = detect_system_windows();
+    return detect_system_windows();
 #elif defined(__APPLE__)
-        cached_info = detect_system_macos();
+    return detect_system_macos();
 #elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-        cached_info = detect_system_bsd();
+    return detect_system_bsd();
 #else
-        cached_info = detect_system_linux();
+    return detect_system_linux();
 #endif
-        info_cached = SKIP_ONE;
+}
+
+cbm_system_info_t cbm_system_info(void) {
+    if (atomic_load_explicit(&info_state, memory_order_acquire) == INFO_READY) {
+        return cached_info;
     }
-    return cached_info;
+    /* Detection only reads the OS (sysconf/sysctl/GetSystemInfo), so racing
+     * threads doing it twice during startup costs a little and changes nothing. */
+    cbm_system_info_t local = detect_system_now();
+    int expected = INFO_EMPTY;
+    if (atomic_compare_exchange_strong_explicit(&info_state, &expected, INFO_CLAIMED,
+                                                memory_order_acq_rel, memory_order_relaxed)) {
+        cached_info = local;
+        atomic_store_explicit(&info_state, INFO_READY, memory_order_release);
+    }
+    return local;
 }
 
 int cbm_default_worker_count(bool initial) {
@@ -303,4 +338,103 @@ int cbm_default_worker_count(bool initial) {
     /* Incremental: leave headroom for user's apps */
     int workers = info.perf_cores - SKIP_ONE;
     return workers > 0 ? workers : MIN_WORKERS;
+}
+
+/* -- Available RAM --------------------------------------------------
+ *
+ * Bytes the system could hand out right now, or 0 when the platform cannot
+ * answer. Deliberately NOT cached: core counts and total RAM are immutable
+ * hardware facts, but this changes continuously and the entire point is to
+ * observe it DURING an index.
+ *
+ * Why this exists: the indexer decided "out of memory" by comparing its own
+ * RSS against a static fraction of TOTAL ram. That refuses work a machine can
+ * plainly do -- measured 2026-09-13, the linux kernel needs 31.75 GB on a
+ * 48 GB host (66 percent) against a 0.5 default budget, and the same index
+ * completed on the previous release by overshooting to 33.56 GB. Whether
+ * memory is actually scarce is a property of the SYSTEM, not of a constant. */
+size_t cbm_system_available_ram(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return (size_t)status.ullAvailPhys;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    /* free + inactive + purgeable. Counting only free_count would report
+     * pressure on any machine that is merely warm, because inactive and
+     * purgeable pages are reclaimed on demand. */
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    if (host_page_size(host, &page_size) != KERN_SUCCESS || page_size == 0) {
+        return 0;
+    }
+    vm_statistics64_data_t vm_stat = {0};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    uint64_t pages = (uint64_t)vm_stat.free_count + (uint64_t)vm_stat.inactive_count +
+                     (uint64_t)vm_stat.purgeable_count;
+    return (size_t)(pages * (uint64_t)page_size);
+#elif !defined(__NetBSD__) && !defined(__FreeBSD__) && !defined(__OpenBSD__)
+    /* Linux: MemAvailable is the kernel estimate and accounts for reclaimable
+     * slab and page cache, which MemFree does not. */
+    FILE *meminfo = fopen("/proc/meminfo", "re");
+    if (!meminfo) {
+        return 0;
+    }
+    char line[CBM_SZ_256];
+    size_t available = 0;
+    while (fgets(line, sizeof(line), meminfo) != NULL) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            available = (size_t)(kb * (unsigned long long)CBM_SZ_1K);
+            break;
+        }
+    }
+    (void)fclose(meminfo);
+    return available;
+#else
+    return 0; /* BSD: unknown rather than guessed */
+#endif
+}
+
+size_t cbm_fs_free_bytes(const char *path) {
+    if (!path || !path[0]) {
+        return 0;
+    }
+#ifdef _WIN32
+    /* The QUOTA figure, not the volume's: on a disk with per-user quotas the
+     * volume's free space is not what this process may actually write. */
+    ULARGE_INTEGER avail = {0};
+    /* Widened through the memory core rather than cbm_utf8_to_wide(), which
+     * allocates with raw malloc: every allocation in this binary goes through
+     * one accounted path (src/foundation/mem_core.h). */
+    int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (wide_len <= 0) {
+        return 0;
+    }
+    wchar_t *wide = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)wide_len * sizeof(wchar_t));
+    if (!wide) {
+        return 0;
+    }
+    size_t free_bytes = 0;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, wide_len) == wide_len &&
+        GetDiskFreeSpaceExW(wide, &avail, NULL, NULL)) {
+        free_bytes = (size_t)avail.QuadPart;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, wide);
+    return free_bytes;
+#else
+    struct statvfs st;
+    if (statvfs(path, &st) != 0) {
+        return 0;
+    }
+    /* f_bavail, not f_bfree: blocks free for an UNPRIVILEGED writer, which is
+     * what this process is. f_frsize is the fragment size the counts are in. */
+    uint64_t unit = st.f_frsize ? (uint64_t)st.f_frsize : (uint64_t)st.f_bsize;
+    return (size_t)((uint64_t)st.f_bavail * unit);
+#endif
 }

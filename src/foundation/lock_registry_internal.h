@@ -25,6 +25,7 @@ bool cbm_lock_registry_is_retired_for_test(const cbm_lock_registry_t *registry);
 size_t cbm_lock_registry_attempting_waiter_count_for_test(cbm_lock_registry_t *registry);
 uint64_t cbm_lock_registry_condition_wait_call_count_for_test(const cbm_lock_registry_t *registry);
 size_t cbm_lock_registry_condition_waiter_count_for_test(const cbm_lock_registry_t *registry);
+uint64_t cbm_lock_registry_waiter_enqueue_count_for_test(const cbm_lock_registry_t *registry);
 
 typedef enum {
     CBM_LOCK_REGISTRY_RELEASE_RW = 1,

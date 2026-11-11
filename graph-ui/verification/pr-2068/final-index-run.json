@@ -1,0 +1,20 @@
+{
+  "root": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068",
+  "project": "cbm-pr2068",
+  "backup": "/tmp/cbm-2068-before-final2-index-1788990267.db",
+  "startedAt": "2026-09-09T21:44:27Z",
+  "acknowledgement": {
+    "status": "indexing",
+    "slot": 0,
+    "path": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068"
+  },
+  "job": {
+    "slot": 0,
+    "status": "done",
+    "path": "/Users/bernhard/Desktop/codebasememorymcp_branch 2068",
+    "error": ""
+  },
+  "nodes": 42649,
+  "edges": 177320,
+  "finishedObservedAt": "2026-09-09T21:45:03Z"
+}

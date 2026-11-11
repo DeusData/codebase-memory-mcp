@@ -1,5 +1,8 @@
+import contextlib
 import errno
 import hashlib
+import http.server
+import io
 import json
 import os
 import stat
@@ -835,3 +838,361 @@ _cli._publish_runtime_set(
                     False,
                 )
 
+
+class _FakeHttpsResponse:
+    """Minimal stand-in for the opener's response: headers, geturl, read."""
+
+    def __init__(self, body: bytes, headers=None, fail_after_first_chunk=False):
+        self._body = body
+        self._offset = 0
+        self._fail_after_first_chunk = fail_after_first_chunk
+        self.headers = dict(headers or {})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def geturl(self):
+        return "https://example.invalid/release.tar.gz"
+
+    def read(self, size=-1):
+        if self._fail_after_first_chunk and self._offset:
+            raise OSError("connection reset")
+        if size is None or size < 0:
+            size = len(self._body) - self._offset
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+class _ZeroSource:
+    """Reader that yields `size` zero bytes without holding them."""
+
+    def __init__(self, size: int):
+        self._remaining = size
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self._remaining
+        count = min(size, self._remaining)
+        self._remaining -= count
+        return bytes(count)
+
+
+class _CountingSink:
+    def __init__(self):
+        self.written = 0
+
+    def write(self, chunk):
+        self.written += len(chunk)
+        return len(chunk)
+
+
+# The size cap the 0.12.0 wrappers enforced, which refused every release.
+_FORMER_MEMBER_CAP_BYTES = 256 * 1024 * 1024
+
+
+def _write_tar_gz(archive, entries):
+    with tarfile.open(archive, "w:gz") as tf:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+
+def _write_zip(archive, entries):
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+
+
+def _release_entries(names):
+    return [(name, f"payload of {name}".encode()) for name in names]
+
+
+class ArchiveExtractionTests(unittest.TestCase):
+    URL = "https://example.invalid/release.tar.gz"
+
+    def _download(self, response, destination):
+        with mock.patch.object(_cli._HTTPS_OPENER, "open", return_value=response):
+            _cli._download_file(self.URL, destination)
+
+    def test_download_stores_a_body_whose_declared_length_exceeds_the_former_cap(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            destination = os.path.join(root, "release.tar.gz")
+            response = _FakeHttpsResponse(
+                b"payload", {"Content-Length": str(_FORMER_MEMBER_CAP_BYTES + 1)}
+            )
+            self._download(response, destination)
+            with open(destination, "rb") as stored:
+                self.assertEqual(stored.read(), b"payload")
+
+    def test_download_removes_the_partial_file_when_the_body_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = os.path.join(root, "release.tar.gz")
+            response = _FakeHttpsResponse(b"x" * 200000, fail_after_first_chunk=True)
+            with self.assertRaises(OSError):
+                self._download(response, destination)
+            self.assertFalse(os.path.exists(destination))
+
+    def test_unix_tar_rejects_more_members_than_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "members.tar.gz"
+            _write_tar_gz(archive, [("one", b"a"), ("two", b"b"), ("three", b"c")])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with tarfile.open(archive) as tf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_tar(
+                    tf,
+                    str(destination),
+                    ("one", "two", "three"),
+                    ("one",),
+                    max_members=2,
+                )
+            self.assertIn("2-member safety limit", str(raised.exception))
+            self.assertFalse((destination / "one").exists())
+
+    def test_unix_tar_extracts_only_the_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "release.tar.gz"
+            _write_tar_gz(archive, _release_entries(_cli._UNIX_ARCHIVE_NAMES))
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with tarfile.open(archive) as tf:
+                extracted = _cli._safe_extract_tar(
+                    tf,
+                    str(destination),
+                    _cli._UNIX_ARCHIVE_NAMES,
+                    ("codebase-memory-mcp",),
+                )
+            self.assertEqual(extracted, ("codebase-memory-mcp",))
+            self.assertEqual(
+                (destination / "codebase-memory-mcp").read_bytes(),
+                b"payload of codebase-memory-mcp",
+            )
+            self.assertEqual(os.listdir(destination), ["codebase-memory-mcp"])
+
+    def test_archive_copy_accepts_a_member_larger_than_the_former_cap(self):
+        size = _FORMER_MEMBER_CAP_BYTES + 1024 * 1024
+        sink = _CountingSink()
+        copied = _cli._copy_archive_member(
+            _ZeroSource(size), sink, "codebase-memory-mcp", size
+        )
+        self.assertEqual(copied, size)
+        self.assertEqual(sink.written, size)
+
+    def test_archive_copy_rejects_a_member_that_yields_more_than_it_declares(self):
+        with self.assertRaises(SystemExit) as raised:
+            _cli._copy_archive_member(io.BytesIO(b"x" * 100), io.BytesIO(), "member", 10)
+        self.assertIn(
+            "'member' actual size 100 does not match declared size 10",
+            str(raised.exception),
+        )
+
+    def test_archive_member_write_removes_the_partial_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "codebase-memory-mcp")
+            with self.assertRaises(SystemExit):
+                _cli._write_archive_member(
+                    io.BytesIO(b"x" * 100), target, "codebase-memory-mcp", 10
+                )
+            self.assertFalse(os.path.exists(target))
+
+    def test_windows_zip_rejects_more_members_than_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "members.zip"
+            _write_zip(archive, [("one", b"a"), ("two", b"b"), ("three", b"c")])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with zipfile.ZipFile(archive) as zf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_zip(
+                    zf,
+                    str(destination),
+                    ("one", "two", "three"),
+                    ("one",),
+                    max_members=2,
+                )
+            self.assertIn("2-member safety limit", str(raised.exception))
+
+    def test_windows_zip_extracts_only_the_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "release.zip"
+            _write_zip(archive, _release_entries(_cli._WINDOWS_ARCHIVE_NAMES))
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with zipfile.ZipFile(archive) as zf:
+                extracted = _cli._safe_extract_zip(
+                    zf,
+                    str(destination),
+                    _cli._WINDOWS_ARCHIVE_NAMES,
+                    (_cli._WINDOWS_BINARY_NAME,),
+                )
+            self.assertEqual(extracted, (_cli._WINDOWS_BINARY_NAME,))
+            self.assertEqual(
+                (destination / _cli._WINDOWS_BINARY_NAME).read_bytes(),
+                b"payload of codebase-memory-mcp.exe",
+            )
+            self.assertEqual(os.listdir(destination), [_cli._WINDOWS_BINARY_NAME])
+
+
+@contextlib.contextmanager
+def _loopback_server(routes):
+    """Serve `routes` ({path: bytes}) on 127.0.0.1; any other path redirects."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = routes.get(self.path)
+            if body is None:
+                self.send_response(302)
+                self.send_header("Location", "https://example.invalid/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+class DownloadBaseTests(unittest.TestCase):
+    GITHUB_BASE = "https://github.com/DeusData/codebase-memory-mcp/releases/download/v1.2.3"
+
+    def test_unset_or_empty_uses_the_github_release_base(self):
+        self.assertEqual(_cli._download_base("1.2.3", {}), (self.GITHUB_BASE, False))
+        self.assertEqual(
+            _cli._download_base("1.2.3", {"CBM_DOWNLOAD_URL": ""}),
+            (self.GITHUB_BASE, False),
+        )
+
+    def test_https_override_is_accepted(self):
+        for base in (
+            "https://mirror.example/releases/v1",
+            "https://127.0.0.1:8443/fixture",
+        ):
+            with self.subTest(base=base):
+                self.assertEqual(
+                    _cli._download_base("1.2.3", {"CBM_DOWNLOAD_URL": base}),
+                    (base, False),
+                )
+
+    def test_exact_loopback_http_override_is_accepted(self):
+        for base in (
+            "http://localhost",
+            "http://localhost:8080/fixture",
+            "http://127.0.0.1:41234/standard",
+            "http://[::1]:9/x?y#z",
+        ):
+            with self.subTest(base=base):
+                self.assertEqual(
+                    _cli._download_base("1.2.3", {"CBM_DOWNLOAD_URL": base}),
+                    (base, True),
+                )
+
+    def test_non_loopback_http_and_other_schemes_are_refused(self):
+        for base in (
+            "http://example.com/releases",
+            "http://127.0.0.1.example.com/",
+            "http://localhost.example.com:8080/",
+            "http://user@localhost/",
+            "http://127.0.0.2/",
+            "HTTP://localhost/",
+            "file:///tmp/releases",
+            "ftp://localhost/releases",
+            "github.com/DeusData/codebase-memory-mcp",
+        ):
+            with self.subTest(base=base), self.assertRaises(SystemExit) as raised:
+                _cli._download_base("1.2.3", {"CBM_DOWNLOAD_URL": base})
+            self.assertIn(
+                "refusing non-HTTPS download URL (CBM_DOWNLOAD_URL)",
+                str(raised.exception),
+            )
+
+    def test_https_download_refuses_plain_http(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(SystemExit):
+                _cli._download_file(
+                    "http://127.0.0.1/release.tar.gz", os.path.join(root, "a")
+                )
+
+    def test_loopback_download_refuses_a_non_loopback_url(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(SystemExit) as raised:
+                _cli._download_file(
+                    "http://example.invalid/release.tar.gz",
+                    os.path.join(root, "a"),
+                    loopback=True,
+                )
+            self.assertIn("refusing non-loopback HTTP URL", str(raised.exception))
+
+    def test_loopback_download_bypasses_proxies_and_refuses_redirects(self):
+        routes = {"/fixture/archive": b"loopback payload"}
+        # A configured proxy that is not listening: using it would fail.
+        proxy_env = {"http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9"}
+        with _loopback_server(routes) as origin, tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, proxy_env):
+            archive = os.path.join(root, "archive")
+            _cli._download_file(f"{origin}/fixture/archive", archive, loopback=True)
+            with open(archive, "rb") as stored:
+                self.assertEqual(stored.read(), b"loopback payload")
+
+            redirected = os.path.join(root, "redirected")
+            with self.assertRaises(RuntimeError) as raised:
+                _cli._download_file(
+                    f"{origin}/fixture/checksums.txt", redirected, loopback=True
+                )
+            self.assertIn("refusing redirect from loopback download", str(raised.exception))
+            self.assertFalse(os.path.exists(redirected))
+
+    def test_download_fetches_archive_and_checksums_from_the_override(self):
+        os_name = _cli._os_name()
+        arch = _cli._arch()
+        if os_name == "windows":
+            ext, names = "zip", _cli._WINDOWS_ARCHIVE_NAMES
+        else:
+            ext, names = "tar.gz", _cli._UNIX_ARCHIVE_NAMES
+        portable = "-portable" if os_name == "linux" else ""
+        archive_name = f"codebase-memory-mcp-{os_name}-{arch}{portable}.{ext}"
+        with tempfile.TemporaryDirectory() as root:
+            fixture = Path(root) / archive_name
+            if ext == "zip":
+                _write_zip(fixture, _release_entries(names))
+            else:
+                _write_tar_gz(fixture, _release_entries(names))
+            archive_bytes = fixture.read_bytes()
+            digest = hashlib.sha256(archive_bytes).hexdigest()
+            routes = {
+                f"/fixture/{archive_name}": archive_bytes,
+                "/fixture/checksums.txt": f"{digest}  {archive_name}\n".encode(),
+            }
+            cache = Path(root) / "cache"
+            with _loopback_server(routes) as origin, mock.patch.dict(
+                os.environ, {"CBM_DOWNLOAD_URL": f"{origin}/fixture"}
+            ), mock.patch.object(_cli, "_cache_dir", return_value=cache), \
+                    mock.patch.object(_cli, "_verify_candidate"), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                installed = _cli._download("9.9.9")
+            binary_name = (
+                _cli._WINDOWS_BINARY_NAME
+                if os_name == "windows"
+                else "codebase-memory-mcp"
+            )
+            self.assertEqual(
+                installed.read_bytes(), f"payload of {binary_name}".encode()
+            )

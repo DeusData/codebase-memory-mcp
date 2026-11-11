@@ -65,6 +65,12 @@ classes = {(target, variant): "clean" for target in targets for variant in varia
 classes["linux-amd64", "stripped"] = "microsoft-ml"
 classes["darwin-arm64", "stripped"] = "microsoft-ml"
 classes["darwin-arm64", "unstripped"] = "microsoft-ml"
+# windows-amd64 draws the tolerated verdict on ALL THREE candidates, so the
+# SHIPPED binary carries it and the notes must disclose exactly that one. The
+# two targets above keep a clean sibling, so their flagged candidates are
+# rejected and must NOT appear in the notes at all.
+for _variant in variants:
+    classes["windows-amd64", _variant] = "microsoft-ml"
 candidates = []
 results = []
 by_pair = {}
@@ -190,12 +196,18 @@ run_notes "$FIX/current.md" "$FIX/first.md"
 grep -q 'Intro text.' "$FIX/first.md" || fail "content before section was lost"
 grep -q 'Outro text.' "$FIX/first.md" || fail "content after section was lost"
 ! grep -q 'stale data' "$FIX/first.md" || fail "stale section was appended"
-grep -q '24 executable scans' "$FIX/first.md" || fail "candidate scan scope missing"
-grep -q '8 release products' "$FIX/first.md" || fail "product scope missing"
-grep -q '3 candidate(s).*Microsoft' "$FIX/first.md" || fail "tolerated findings not disclosed"
+# Release notes report ONLY the shipped bytes. Rejected candidates stay in the
+# published evidence TSVs; they are development signal, not changelog content.
+grep -q 'verdict for the exact shipped bytes is linked per product' "$FIX/first.md" || \
+  fail "shipped-binary scan scope missing"
+[ "$(grep -c '^| `' "$FIX/first.md")" = "8" ] || fail "product scope missing: expected one row per release product"
+grep -q '1 shipped binary.*Microsoft' "$FIX/first.md" || fail "tolerated finding on a shipped binary not disclosed"
+grep -q 'candidate(s)' "$FIX/first.md" && fail "notes must not count rejected candidates"
 grep -q 'no other decisive engine reported malicious or suspicious' "$FIX/first.md" || fail "non-decisive engines are overstated as clean"
 ! grep -q 'every other engine was clean' "$FIX/first.md" || fail "non-decisive engines are incorrectly described as clean"
-grep -q '| Product | Stripped candidate | Unstripped candidate | Shipped |' "$FIX/first.md" || fail "candidate table missing"
+grep -q '| Product | Shipped binary | VirusTotal verdict |' "$FIX/first.md" || fail "shipped-binary table missing"
+grep -q 'Stripped candidate' "$FIX/first.md" && \
+  fail "release notes must not enumerate rejected candidates"
 grep -q '| `linux-amd64` |' "$FIX/first.md" || fail "Linux product row missing"
 grep -q '| `windows-arm64` |' "$FIX/first.md" || fail "Windows product row missing"
 grep -q 'archive containers were not redundantly submitted' "$FIX/first.md" || fail "no-rescan boundary missing"
@@ -228,4 +240,4 @@ if run_notes "$FIX/reversed.md" "$FIX/reversed-capture.md"; then
   fail "reversed verification markers must fail closed"
 fi
 
-echo 'PASS: release notes reuse all 24 candidate verdicts, disclose selection, and avoid a duplicate scan'
+echo 'PASS: release notes report the shipped binary only, disclose selection, and avoid a duplicate scan'

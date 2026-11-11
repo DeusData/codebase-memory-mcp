@@ -1,0 +1,10 @@
+graph.cpp
+#include <vector>
+namespace g {
+template <typename T> class Graph {
+public:
+  void add(T v) { nodes_.push_back(v); }
+private:
+  std::vector<T> nodes_;
+};
+}

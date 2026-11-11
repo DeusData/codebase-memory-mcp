@@ -311,6 +311,10 @@ static const char *dialect_tool_prefix(cbm_graph_profile_dialect_t dialect) {
         return "codebase-memory-mcp_";
     case CBM_GRAPH_DIALECT_KIRO:
         return "@codebase-memory-mcp/";
+    case CBM_GRAPH_DIALECT_OMP:
+        return "mcp__codebase_memory_mcp_";
+    case CBM_GRAPH_DIALECT_GROK:
+        return "codebase-memory-mcp__";
     default:
         return NULL;
     }
@@ -494,6 +498,23 @@ static bool append_codex_profile(profile_buffer_t *buffer, cbm_graph_tier_t tier
            profile_buffer_append(buffer, "]\n");
 }
 
+/* before_tool_search reproduces the v0.10.8 rendering: #1933 (v0.11.0) added
+ * the tool_search / tool_search_regex permissions, and install/uninstall
+ * must still recognise the older bytes as ours (#2264). */
+static bool append_opencode_profile(profile_buffer_t *buffer, cbm_graph_tier_t tier,
+                                    cbm_graph_access_t access, const char *prompt,
+                                    bool before_tool_search) {
+    return profile_buffer_append(buffer, "---\ndescription: ") &&
+           profile_buffer_append(buffer, profile_description(tier, access)) &&
+           profile_buffer_append(buffer, "\nmode: subagent\npermission:\n  \"*\": deny\n  read: "
+                                         "allow\n  grep: allow\n  glob: allow\n") &&
+           (before_tool_search ||
+            profile_buffer_append(buffer, "  tool_search: allow\n  tool_search_regex: allow\n")) &&
+           (access != CBM_GRAPH_ACCESS_DIRECT ||
+            append_permission_mcp_tools(buffer, CBM_GRAPH_DIALECT_OPENCODE, tier)) &&
+           profile_buffer_append(buffer, "---\n") && profile_buffer_append(buffer, prompt);
+}
+
 static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dialect_t dialect,
                                 cbm_graph_tier_t tier, cbm_graph_access_t access,
                                 const char *binary_path, const char *prompt) {
@@ -543,6 +564,7 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         }
         return true;
     case CBM_GRAPH_DIALECT_OPENCODE:
+        return append_opencode_profile(buffer, tier, access, prompt, false);
     case CBM_GRAPH_DIALECT_KILO:
         if (!profile_buffer_append(buffer, "---\ndescription: ") ||
             !profile_buffer_append(buffer, description) ||
@@ -618,6 +640,27 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             return false;
         }
         return true;
+    case CBM_GRAPH_DIALECT_GROK:
+        /* Grok Build children reach MCP only through the search_tool/use_tool
+         * dispatcher and inherit servers by NAME (mcpInheritance), never by
+         * tool, so the tier allowlist is spelled out in the body as the exact
+         * `server__tool` ids the dispatcher accepts. Handoff inherits nothing. */
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools: read_file, grep, list_dir") ||
+            (direct && !profile_buffer_append(buffer, ", search_tool, use_tool")) ||
+            !profile_buffer_append(
+                buffer, direct ? "\nmcpInheritance:\n  named:\n    - codebase-memory-mcp\n---\n"
+                               : "\nmcpInheritance: none\n---\n") ||
+            (direct && (!profile_buffer_append(
+                            buffer, "Reach the graph only through `search_tool`/`use_tool`. "
+                                    "The only allowed tool ids are ") ||
+                        !append_csv_mcp_tools(buffer, dialect, tier) ||
+                        !profile_buffer_append(
+                            buffer, "; never call any other codebase-memory-mcp tool.\n\n"))) ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     case CBM_GRAPH_DIALECT_AUGMENT:
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "---\n") && profile_buffer_append(buffer, prompt);
@@ -634,6 +677,16 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "tools:\n  - readFile\n---\n") &&
                profile_buffer_append(buffer, prompt);
+    case CBM_GRAPH_DIALECT_OMP:
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools:\n  - read\n  - grep\n  - glob\n") ||
+            (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
+            !profile_buffer_append(
+                buffer, "read-summarize: false\nautoloadSkills: [codebase-memory]\n---\n") ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     default:
         return false;
     }
@@ -665,21 +718,34 @@ char *cbm_render_graph_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_ti
     return profile_buffer_finish(&buffer);
 }
 
-char *cbm_render_graph_profile_codex_rc1(cbm_graph_tier_t tier) {
-    if (!tier_valid(tier)) {
+/* A released-but-superseded rendering, kept only so install/uninstall can
+ * recognise and migrate files an older release wrote. */
+static char *render_released_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_tier_t tier,
+                                     cbm_graph_access_t access) {
+    if (!tier_valid(tier) || !access_valid(access)) {
         return NULL;
     }
-    char *prompt = cbm_render_graph_prompt(tier, CBM_GRAPH_ACCESS_DIRECT);
+    char *prompt = cbm_render_graph_prompt(tier, access);
     if (!prompt) {
         return NULL;
     }
     profile_buffer_t buffer;
     profile_buffer_init(&buffer);
-    bool ok = append_codex_profile(&buffer, tier, CBM_GRAPH_ACCESS_DIRECT, NULL, prompt, true);
+    bool ok = dialect == CBM_GRAPH_DIALECT_OPENCODE
+                  ? append_opencode_profile(&buffer, tier, access, prompt, true)
+                  : append_codex_profile(&buffer, tier, access, NULL, prompt, true);
     free(prompt);
     if (!ok) {
         profile_buffer_discard(&buffer);
         return NULL;
     }
     return profile_buffer_finish(&buffer);
+}
+
+char *cbm_render_graph_profile_opencode_v0108(cbm_graph_tier_t tier, cbm_graph_access_t access) {
+    return render_released_profile(CBM_GRAPH_DIALECT_OPENCODE, tier, access);
+}
+
+char *cbm_render_graph_profile_codex_rc1(cbm_graph_tier_t tier) {
+    return render_released_profile(CBM_GRAPH_DIALECT_CODEX, tier, CBM_GRAPH_ACCESS_DIRECT);
 }

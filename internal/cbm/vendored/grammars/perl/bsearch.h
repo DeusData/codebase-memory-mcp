@@ -69,7 +69,7 @@ is respectively less than, matching, or greater than the array member.
  * have to make lim 3, then halve, obtaining 1, so that we will only
  * look at item 3.
  */
-void *bsearch(const void *key, const void *base0, size_t nmemb, size_t size,
+static void *tsp_bsearch(const void *key, const void *base0, size_t nmemb, size_t size,
               int (*compar)(const void *, const void *)) {
   const char *base = (const char *)base0;
   int lim, cmp;

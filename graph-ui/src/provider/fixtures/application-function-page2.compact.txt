@@ -1,0 +1,28 @@
+rows_refs: 2  (cols: id prefix)
+  0 cbm-pr2068.src.daemon.application.
+  1 src/daemon/application.c
+rows_ref_rule: @N+suffix=prefix+suffix
+rows: 17  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)
+  cbm_daemon_application_client_set_context @0+cbm_daemon_application_client_set_context @1+ "3200" "3254" "false"
+  cbm_daemon_application_client_set_ui_config @0+cbm_daemon_application_client_set_ui_config @1+ "3256" "3288" "false"
+  cbm_daemon_application_client_ui_readiness_proof @0+cbm_daemon_application_client_ui_readiness_proof @1+ "3290" "3320" "false"
+  application_client_text_request_tagged @0+application_client_text_request_tagged @1+ "3322" "3342" "false"
+  application_client_text_request @0+application_client_text_request @1+ "3344" "3350" "false"
+  cbm_daemon_application_client_mcp @0+cbm_daemon_application_client_mcp @1+ "3352" "3357" "false"
+  cbm_daemon_application_client_mcp_tagged @0+cbm_daemon_application_client_mcp_tagged @1+ "3359" "3366" "false"
+  cbm_daemon_application_client_tool @0+cbm_daemon_application_client_tool @1+ "3368" "3390" "false"
+  cbm_daemon_application_client_hook_augment @0+cbm_daemon_application_client_hook_augment @1+ "3392" "3398" "false"
+  application_background_index @0+application_background_index @1+ "3400" "3506" "false"
+  cbm_daemon_application_index @0+cbm_daemon_application_index @1+ "3508" "3511" "false"
+  cbm_daemon_application_watcher_index @0+cbm_daemon_application_watcher_index @1+ "3513" "3516" "false"
+  cbm_daemon_application_active_jobs @0+cbm_daemon_application_active_jobs @1+ "3518" "3531" "false"
+  cbm_daemon_application_job_subscribers @0+cbm_daemon_application_job_subscribers @1+ "3533" "3543" "false"
+  cbm_daemon_application_physical_job_limit @0+cbm_daemon_application_physical_job_limit @1+ "3545" "3553" "false"
+  cbm_daemon_application_worker_memory_budget_bytes @0+cbm_daemon_application_worker_memory_budget_bytes @1+ "3555" "3563" "false"
+  cbm_daemon_application_session_retains_store_for_test @0+cbm_daemon_application_session_retains_store_for_test @1+ "3565" "3570" "false"
+returned: 17
+total: 144
+total_relation: eq
+offset: 127
+has_more: false
+truncated: false
