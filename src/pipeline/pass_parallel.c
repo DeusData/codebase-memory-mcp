@@ -3748,6 +3748,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             if (field_policy == CBM_FIELD_CALL_DROP) {
                 continue;
             }
+            if (field_policy == CBM_FIELD_CALL_AS_USAGE) {
+                cbm_pipeline_emit_field_call_usage(ws->local_edge_buf, source_node, target_node,
+                                                   call);
+                continue;
+            }
             if (field_policy == CBM_FIELD_CALL_BY_OWNER && !arrow_bound) {
                 if (!field_index_built) {
                     field_index_ready =

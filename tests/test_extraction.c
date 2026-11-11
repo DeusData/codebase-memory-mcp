@@ -15892,6 +15892,143 @@ TEST(vb_nested_class_extracted) {
     PASS();
 }
 
+/* Number of calls whose callee is exactly `callee` (has_call matches a
+ * substring, which cannot tell "System" from "System.Windows.Forms.Button"). */
+static int vb_call_count_exact(CBMFileResult *r, const char *callee) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The grammar reads `New A.B.C()` as `New A` plus member accesses; the call
+ * names the whole type, and the `New A` prefix is no call of its own. Without
+ * an argument list no call encloses the chain, so the prefix names it. */
+TEST(vb_new_dotted_type_is_one_constructor_call) {
+    CBMFileResult *r = extract("Class Form1\n"
+                               "    Private Sub InitializeComponent()\n"
+                               "        Me.Button1 = New System.Windows.Forms.Button()\n"
+                               "        Me.ClientSize = New System.Drawing.Size(284, 261)\n"
+                               "        components = New System.ComponentModel.Container\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(vb_call_count_exact(r, "System.Windows.Forms.Button"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System.Drawing.Size"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System.ComponentModel.Container"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A call with arguments parses as array_access_expression (VB writes calls
+ * and indexing alike; coverage from #2885), and the Me/MyClass receiver is
+ * matched by node kind, so its spelling does not matter. */
+TEST(vb_calls_with_arguments_and_any_case_receiver) {
+    CBMFileResult *r = extract("Class Svc\n"
+                               "    Public Sub Run()\n"
+                               "        Dim x = Compute(1, 2)\n"
+                               "        me.Helper()\n"
+                               "        MYCLASS.Other(x)\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Svc.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(vb_call_count_exact(r, "Compute"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "Helper"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "Other"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `Dim a, b As Integer`: every name before an As clause takes its type, and
+ * `As New List(Of String)()` names the constructed type. */
+TEST(vb_field_types_from_as_clauses) {
+    CBMFileResult *r = extract("Class Holder\n"
+                               "    Dim a, b As Integer\n"
+                               "    Private items As New List(Of String)()\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Holder.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int typed = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Field") != 0 || !d->return_type) {
+            continue;
+        }
+        if ((strcmp(d->name, "a") == 0 || strcmp(d->name, "b") == 0) &&
+            strcmp(d->return_type, "Integer") == 0) {
+            typed++;
+        }
+        if (strcmp(d->name, "items") == 0 && strcmp(d->return_type, "List") == 0) {
+            typed++;
+        }
+    }
+    ASSERT_EQ(typed, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Imports with and without an alias (coverage from #2885). */
+TEST(vb_imports_alias_and_path) {
+    CBMFileResult *r = extract("Imports System.Text\n"
+                               "Imports Col = System.Collections.Generic\n"
+                               "Module M\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "M.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int text = 0;
+    int aliased = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (strcmp(imp->module_path, "System.Text") == 0 && strcmp(imp->local_name, "Text") == 0) {
+            text++;
+        }
+        if (strcmp(imp->module_path, "System.Collections.Generic") == 0 &&
+            strcmp(imp->local_name, "Col") == 0) {
+            aliased++;
+        }
+    }
+    ASSERT_EQ(text, 1);
+    ASSERT_EQ(aliased, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Interface members, MustOverride members and a type nested in a type. */
+TEST(vb_interface_abstract_and_nested_members) {
+    CBMFileResult *r = extract("Public Interface IShape\n"
+                               "    Function Area() As Double\n"
+                               "End Interface\n"
+                               "Public MustInherit Class Shape\n"
+                               "    Implements IShape\n"
+                               "    Public MustOverride Function Area() As Double Implements "
+                               "IShape.Area\n"
+                               "    Public Class Unit\n"
+                               "        Public Sub Scale()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Shape.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "IShape"));
+    ASSERT(has_def_qn(r, "t.Shape.IShape.Area"));
+    ASSERT(has_def_qn(r, "t.Shape.Shape.Area"));
+    ASSERT(has_def(r, "Class", "Unit"));
+    ASSERT(has_def(r, "Method", "Scale"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* *Test.vb / *Tests.vb are test files (from #2885). */
 TEST(vb_test_file_names) {
     ASSERT_TRUE(cbm_is_test_file("src/OrderTests.vb", CBM_LANG_VISUALBASIC));
@@ -15994,6 +16131,11 @@ SUITE(extraction) {
     RUN_TEST(vb_handles_and_addhandler_parse);
     RUN_TEST(vb_imports_extracted);
     RUN_TEST(vb_nested_class_extracted);
+    RUN_TEST(vb_new_dotted_type_is_one_constructor_call);
+    RUN_TEST(vb_calls_with_arguments_and_any_case_receiver);
+    RUN_TEST(vb_field_types_from_as_clauses);
+    RUN_TEST(vb_imports_alias_and_path);
+    RUN_TEST(vb_interface_abstract_and_nested_members);
     RUN_TEST(vb_test_file_names);
     RUN_TEST(iris_export_xml_simple_class);
     RUN_TEST(iris_export_xml_classmethod);

@@ -1564,6 +1564,12 @@ cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, cons
     if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
         return CBM_FIELD_CALL_DROP;
     }
+    /* VB.NET writes indexing like a call (`items(0)`, `Me.Cache(key)`), so a
+     * parenthesised name that lands on a Field indexes it or reads a property:
+     * it calls nothing, and it references the Field as C#'s `items[0]` does. */
+    if (caller_lang == CBM_LANG_VISUALBASIC) {
+        return CBM_FIELD_CALL_AS_USAGE;
+    }
     if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
         return CBM_FIELD_CALL_KEEP;
     }

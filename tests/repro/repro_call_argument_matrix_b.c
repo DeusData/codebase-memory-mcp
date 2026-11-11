@@ -1047,7 +1047,7 @@ static const RoutineArgumentCase CHIALISP_CASE = ROUTINE_ARGUMENT_CASE(
     "accept", "watched", 1, 1, 0, "Chialisp list application and symbol-reference vocabulary");
 static const RoutineArgumentCase VISUALBASIC_CASE = ROUTINE_ARGUMENT_CASE(
     "VISUALBASIC", CBM_LANG_VISUALBASIC, "Sample.vb", VISUALBASIC_INSIDE, VISUALBASIC_BARE,
-    "invocation", "Run", "Accept", "watched", 1, 1, 0,
+    "array_access_expression", "Run", "Accept", "watched", 1, 1, 0,
     "VB.NET Module function application with a value argument");
 
 static const ModuleArgumentCase JUST_CASE = MODULE_ARGUMENT_CASE(

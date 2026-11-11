@@ -4745,25 +4745,28 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
         }
         return NULL;
     }
-    // VB.NET: `Inherits A` / `Implements I1, I2` clauses are children of the
-    // class/interface/structure block; each clause holds `type` children.
-    // Generic `(Of T)` suffixes are stripped like the '<' strip elsewhere.
+    // VB.NET: `Inherits A` / `Implements I1, I2` statements are children of the
+    // class/interface/structure declaration, next to its members (the grammar
+    // has no body wrapper), and each statement's named children are the base
+    // type names (simple_name / qualified_name / generic_name). Generic
+    // `(Of T)` suffixes are stripped like the '<' strip elsewhere. A cursor
+    // walks the declaration's children: a WinForms class holds thousands of
+    // members, and indexed child access is O(i) per call.
     if (lang == CBM_LANG_VISUALBASIC) {
         const char *bases[MAX_BASES];
         int base_count = 0;
-        uint32_t nc = ts_node_named_child_count(node);
-        for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
-            TSNode clause = ts_node_named_child(node, i);
+        TSTreeCursor cur = ts_tree_cursor_new(node);
+        bool more = ts_tree_cursor_goto_first_child(&cur);
+        while (more && base_count < MAX_BASES_MINUS_1) {
+            TSNode clause = ts_tree_cursor_current_node(&cur);
+            more = ts_tree_cursor_goto_next_sibling(&cur);
             const char *ck = ts_node_type(clause);
-            if (strcmp(ck, "inherits_clause") != 0 && strcmp(ck, "implements_clause") != 0) {
+            if (strcmp(ck, "inherits_statement") != 0 && strcmp(ck, "implements_statement") != 0) {
                 continue;
             }
             uint32_t tc = ts_node_named_child_count(clause);
             for (uint32_t j = 0; j < tc && base_count < MAX_BASES_MINUS_1; j++) {
                 TSNode ty = ts_node_named_child(clause, j);
-                if (strcmp(ts_node_type(ty), "type") != 0) {
-                    continue;
-                }
                 char *base = cbm_node_text(a, ty, source);
                 if (base && base[0]) {
                     char *paren = strchr(base, '(');
@@ -4774,6 +4777,7 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                 }
             }
         }
+        ts_tree_cursor_delete(&cur);
         if (base_count > 0) {
             const char **result =
                 (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
@@ -8885,17 +8889,6 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
             label = "Interface";
         }
     }
-    // VB.NET: the block-kind names are grammar-specific (interface_block,
-    // enum_block); Module/Structure blocks stay "Class" (a VB Module is a
-    // static-class-like container; Structure matches the C# struct→Class
-    // labeling so .NET sibling languages agree).
-    if (ctx->language == CBM_LANG_VISUALBASIC) {
-        if (strcmp(kind, "interface_block") == 0) {
-            label = "Interface";
-        } else if (strcmp(kind, "enum_block") == 0) {
-            label = "Enum";
-        }
-    }
     // Rust/Swift/D/ArkTS: a struct is a distinct kind from a class — emit the
     // precise "Struct" label rather than collapsing it to "Class". Scoped to
     // these grammar/LSP languages. Rust's struct node is `struct_item`; D's and
@@ -9208,6 +9201,13 @@ static void drop_c_typedefs_shadowed_by_tags(CBMExtractCtx *ctx, int first) {
 
 // Find the body/members node inside a class node
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
+    // VB.NET: class/module/structure/interface/enum declarations have no body
+    // wrapper — member declarations are direct children of the declaration.
+    // The grammar tags every member with a `body` field, so the field lookup
+    // below would return the first member as the body: decide this first.
+    if (lang == CBM_LANG_VISUALBASIC) {
+        return class_node;
+    }
     // Try field names first
     static const char *body_fields[] = {"body", "members", "class_body", "declaration_list", NULL};
     for (const char **f = body_fields; *f; f++) {
@@ -9231,11 +9231,6 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     // Squirrel: class_declaration has no body field — member_declaration nodes
     // (each wrapping a function_declaration) are direct children of the class.
     if (lang == CBM_LANG_SQUIRREL) {
-        return class_node;
-    }
-    // VB.NET: class_block/module_block/structure_block/interface_block have no
-    // body wrapper — member declarations are direct children of the block node.
-    if (lang == CBM_LANG_VISUALBASIC) {
         return class_node;
     }
     // Smali: field_definition nodes are direct children of class_definition (no
@@ -12356,6 +12351,112 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
     return true;
 }
 
+/* VB.NET: the type an `As` clause declares, as text without generic or array
+ * suffixes (`List(Of String)` -> "List", `Integer()` -> "Integer"); NULL when
+ * the clause names none. `As T` carries it in declared_type. `As New T(...)`
+ * holds an object_creation_expression instead, and the grammar reads an empty
+ * argument list after the type (`New List(Of String)()`) as an array rank, so
+ * an array_type there is the constructed type's element_type. */
+static char *vb_as_clause_type(CBMArena *a, TSNode as_clause, const char *source) {
+    TSNode ty = ts_node_child_by_field_name(as_clause, TS_FIELD("declared_type"));
+    if (ts_node_is_null(ty)) {
+        TSNode created = cbm_find_child_by_kind(as_clause, "object_creation_expression");
+        if (ts_node_is_null(created)) {
+            return NULL;
+        }
+        ty = ts_node_child_by_field_name(created, TS_FIELD("type"));
+        if (!ts_node_is_null(ty) && strcmp(ts_node_type(ty), "array_type") == 0) {
+            ty = ts_node_child_by_field_name(ty, TS_FIELD("element_type"));
+        }
+        if (ts_node_is_null(ty)) {
+            return NULL;
+        }
+    }
+    char *text = cbm_node_text(a, ty, source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+    char *paren = strchr(text, '(');
+    if (paren) {
+        *paren = '\0';
+    }
+    return text[0] ? text : NULL;
+}
+
+/* One VB.NET Field def: `name_node` names it, `decl` is the declaration that
+ * holds it (its line span), `type` the As-clause type or NULL. */
+static void vb_push_field(CBMExtractCtx *ctx, TSNode decl, TSNode name_node, const char *type,
+                          const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    def.label = "Field";
+    def.file_path = ctx->rel_path;
+    def.parent_class = class_qn;
+    def.return_type = type;
+    def.start_line = ts_node_start_point(decl).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(decl).row + TS_LINE_OFFSET;
+    def.is_exported = cbm_is_exported(name, ctx->language);
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+enum { VB_PENDING_DECLARATORS = 16 };
+
+/* VB.NET member fields. A property_declaration carries its name and As clause
+ * itself. A field_declaration holds variable_declarators, and in
+ * `Dim a, b As Integer` every name before an As clause takes that clause's
+ * type, so untyped names wait (up to VB_PENDING_DECLARATORS) for the next
+ * clause; a declarator with an initializer and no clause ends the group.
+ * WithEvents controls in a WinForms .Designer.vb are fields of this shape. */
+static void extract_vb_member_fields(CBMExtractCtx *ctx, TSNode child, const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    if (strcmp(ts_node_type(child), "property_declaration") == 0) {
+        TSNode asc = cbm_find_child_by_kind(child, "as_clause");
+        vb_push_field(ctx, child, ts_node_child_by_field_name(child, TS_FIELD("name")),
+                      ts_node_is_null(asc) ? NULL : vb_as_clause_type(a, asc, ctx->source),
+                      class_qn);
+        return;
+    }
+    TSNode pending[VB_PENDING_DECLARATORS];
+    int npending = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(child);
+    bool more = ts_tree_cursor_goto_first_child(&cur);
+    while (more) {
+        TSNode part = ts_tree_cursor_current_node(&cur);
+        more = ts_tree_cursor_goto_next_sibling(&cur);
+        if (strcmp(ts_node_type(part), "variable_declarator") != 0) {
+            continue;
+        }
+        TSNode name_node = ts_node_child_by_field_name(part, TS_FIELD("name"));
+        TSNode asc = cbm_find_child_by_kind(part, "as_clause");
+        bool initialized =
+            !ts_node_is_null(ts_node_child_by_field_name(part, TS_FIELD("initializer")));
+        if (ts_node_is_null(asc) && !initialized && npending < VB_PENDING_DECLARATORS) {
+            pending[npending++] = name_node;
+            continue;
+        }
+        char *type = ts_node_is_null(asc) ? NULL : vb_as_clause_type(a, asc, ctx->source);
+        for (int i = 0; i < npending; i++) {
+            vb_push_field(ctx, child, pending[i], type, class_qn);
+        }
+        npending = 0;
+        vb_push_field(ctx, child, name_node, type, class_qn);
+    }
+    ts_tree_cursor_delete(&cur);
+    for (int i = 0; i < npending; i++) {
+        vb_push_field(ctx, child, pending[i], NULL, class_qn);
+    }
+}
+
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec) {
     if (!spec->field_node_types || !spec->field_node_types[0]) {
@@ -12607,66 +12708,11 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             }
         }
 
-        /* VB.NET shapes:
-         *   - field_declaration > variable_declarator(name, as_clause(type)) —
-         *     possibly several declarators per line (`Dim a, b As Integer`)
-         *   - property_declaration carries name + as_clause directly.
-         * The declared type lives inside the as_clause, not a "type" field on
-         * the declaration node, so the generic paths below never match. */
+        /* VB.NET: the declared type lives inside an `As` clause, not in a
+         * "type" field on the declaration, so the generic paths below never
+         * match (extract_vb_member_fields). */
         if (ctx->language == CBM_LANG_VISUALBASIC) {
-            const char *ck = ts_node_type(child);
-            uint32_t vnc = ts_node_named_child_count(child);
-            for (uint32_t k = 0; k < vnc; k++) {
-                TSNode part = ts_node_named_child(child, k);
-                TSNode vb_name_node = {0};
-                TSNode holder = part;
-                if (strcmp(ck, "property_declaration") == 0) {
-                    /* One def per property: name + as_clause are on `child`. */
-                    vb_name_node = ts_node_child_by_field_name(child, TS_FIELD("name"));
-                    holder = child;
-                } else if (strcmp(ts_node_type(part), "variable_declarator") == 0) {
-                    vb_name_node = ts_node_child_by_field_name(part, TS_FIELD("name"));
-                } else {
-                    continue;
-                }
-                if (ts_node_is_null(vb_name_node)) {
-                    continue;
-                }
-                char *vb_name = cbm_node_text(a, vb_name_node, ctx->source);
-                if (!vb_name || !vb_name[0]) {
-                    continue;
-                }
-                char *vb_type = NULL;
-                TSNode asc = cbm_find_child_by_kind(holder, "as_clause");
-                if (!ts_node_is_null(asc)) {
-                    TSNode ty = ts_node_child_by_field_name(asc, TS_FIELD("type"));
-                    if (ts_node_is_null(ty)) {
-                        /* `As New T(...)` shorthand: type is inside the new field */
-                        TSNode nw = ts_node_child_by_field_name(asc, TS_FIELD("new"));
-                        if (!ts_node_is_null(nw)) {
-                            ty = ts_node_child_by_field_name(nw, TS_FIELD("type"));
-                        }
-                    }
-                    if (!ts_node_is_null(ty)) {
-                        vb_type = cbm_node_text(a, ty, ctx->source);
-                    }
-                }
-                CBMDefinition vdef;
-                memset(&vdef, 0, sizeof(vdef));
-                vdef.name = vb_name;
-                vdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, vb_name);
-                vdef.label = "Field";
-                vdef.file_path = ctx->rel_path;
-                vdef.parent_class = class_qn;
-                vdef.return_type = vb_type;
-                vdef.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
-                vdef.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
-                vdef.is_exported = cbm_is_exported(vb_name, ctx->language);
-                cbm_defs_push(&ctx->result->defs, a, vdef);
-                if (strcmp(ck, "property_declaration") == 0) {
-                    break; /* single def; do not repeat per accessor child */
-                }
-            }
+            extract_vb_member_fields(ctx, child, class_qn);
             continue;
         }
 
@@ -13201,9 +13247,13 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 /* A nested class inside #if/#else is still nested here, and so is
                  * a decorated one (Python `@dataclass class Meta:` in a class
                  * body): the decorated_definition wraps the class_definition. */
+                /* VB.NET wraps a type declared inside a type in a
+                 * type_declaration_in_type node. */
                 if (strcmp(ck, "field_declaration") == 0 ||
                     strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0 ||
                     (ctx->language == CBM_LANG_PYTHON && strcmp(ck, "decorated_definition") == 0) ||
+                    (ctx->language == CBM_LANG_VISUALBASIC &&
+                     strcmp(ck, "type_declaration_in_type") == 0) ||
                     cbm_kind_in_set(child, cbm_conditional_block_types(spec->language))) {
                     ts_nstack_push(&nc_stack, child);
                 }
@@ -13359,7 +13409,7 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
      * `template_body` and Solidity's contract body.  Methods were extracted
      * once by extract_class_methods(), then the generic walk descended through
      * the unrecognized body and extracted them again as free functions.
-     * VB.NET's class_block/module_block/etc. have no body wrapper — this
+     * VB.NET's class/module/structure declarations have no body wrapper — this
      * already routes through find_class_body's CBM_LANG_VISUALBASIC branch,
      * which returns the class node itself, so push_nested_class_nodes below
      * runs on `node` directly and members are not re-walked (and

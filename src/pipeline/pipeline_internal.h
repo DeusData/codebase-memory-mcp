@@ -878,6 +878,12 @@ bool cbm_pipeline_spawn_site(const cbm_gbuf_t *gbuf, CBMLanguage lang, const CBM
 void cbm_pipeline_emit_spawn(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                              const cbm_pipeline_spawn_t *spawn);
 
+/* CBM_FIELD_CALL_AS_USAGE: the USAGE edge from `source` to the Field a call
+ * landed on, with the properties the usage pass writes. Shared by
+ * pass_calls.c and pass_parallel.c. */
+void cbm_pipeline_emit_field_call_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                        const cbm_gbuf_node_t *field, const CBMCall *call);
+
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
  * Resolution order (first hit wins):

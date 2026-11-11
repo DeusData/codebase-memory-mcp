@@ -983,6 +983,15 @@ static int calls_emit_unresolved_service(cbm_pipeline_ctx_t *ctx, const CBMCall 
     return calls_emit_service_call(ctx, call, source_node, svc, NULL, evidence);
 }
 
+void cbm_pipeline_emit_field_call_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                        const cbm_gbuf_node_t *field, const CBMCall *call) {
+    char esc_ref[CBM_SZ_256];
+    cbm_json_escape(esc_ref, sizeof(esc_ref), call->callee_name);
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\"}", esc_ref);
+    cbm_gbuf_insert_edge(gbuf, source->id, field->id, "USAGE", props);
+}
+
 /* Apply the field-call policy after a registry target has been found. */
 static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                                  const CBMResolvedCallArray *lsp_calls,
@@ -993,6 +1002,9 @@ static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const 
     switch (cbm_call_onto_field_policy(lang, call->callee_name, target_node->label,
                                        target_node->file_path)) {
     case CBM_FIELD_CALL_DROP:
+        return NULL;
+    case CBM_FIELD_CALL_AS_USAGE:
+        cbm_pipeline_emit_field_call_usage(ctx->gbuf, source_node, target_node, call);
         return NULL;
     case CBM_FIELD_CALL_BY_OWNER:
         /* An arrow call was already bound this way by registry resolution. */

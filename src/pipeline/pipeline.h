@@ -552,6 +552,7 @@ typedef enum {
     CBM_FIELD_CALL_KEEP = 0, /* not a Field target, or a language this rule leaves alone */
     CBM_FIELD_CALL_DROP,     /* a Field can never be this call's target */
     CBM_FIELD_CALL_BY_OWNER, /* C/C++ member call: the object's type names the Field */
+    CBM_FIELD_CALL_AS_USAGE, /* VB.NET indexing written like a call: a USAGE of the Field */
 } cbm_field_call_policy_t;
 cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
                                                    const char *target_label,

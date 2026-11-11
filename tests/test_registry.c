@@ -1622,6 +1622,12 @@ TEST(call_onto_field_follows_language_and_shape) {
     /* The same language as the Field keeps its resolution too. */
     ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_GO, "s.fn", "Field", "pkg/s.go"),
               CBM_FIELD_CALL_KEEP);
+    /* VB.NET writes indexing like a call: `items(0)` on a Field references it
+     * (a USAGE, as C#'s `items[0]`), it calls nothing. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_VISUALBASIC, "items", "Field", "src/Form1.vb"),
+              CBM_FIELD_CALL_AS_USAGE);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_VISUALBASIC, "Run", "Method", "src/Form1.vb"),
+              CBM_FIELD_CALL_KEEP);
     /* Not a Field target: not this rule's business. */
     ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "main", "Function", "src/main.c"),
               CBM_FIELD_CALL_KEEP);
