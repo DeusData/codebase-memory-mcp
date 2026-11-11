@@ -866,6 +866,34 @@ TEST(contract_visualbasic_indexing_is_a_field_usage) {
     PASS();
 }
 
+/* An enum member is never called. `Refresh()` in a Form calls the framework's
+ * Form.Refresh; the only `Refresh` the project defines is an enum member,
+ * which the short-name registry would hand back. No CALLS edge may land on
+ * it, while `Draw()` stays a call. */
+TEST(contract_visualbasic_call_never_lands_on_enum_member) {
+    static const LangFile f[] = {{"Symbols.vb", "Public Enum Symbol\n"
+                                                "    Refresh\n"
+                                                "    Save\n"
+                                                "End Enum\n"},
+                                 {"MainForm.vb", "Public Class MainForm\n"
+                                                 "    Public Sub Reload()\n"
+                                                 "        Refresh()\n"
+                                                 "        Draw()\n"
+                                                 "    End Sub\n"
+                                                 "    Private Sub Draw()\n"
+                                                 "    End Sub\n"
+                                                 "End Class\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    int enum_call = edges_between_names(store, lp.project, "Reload", "CALLS", "Refresh");
+    int method_call = edges_between_names(store, lp.project, "Reload", "CALLS", "Draw");
+    lang_cleanup(&lp, store);
+    ASSERT_EQ(enum_call, 0);
+    ASSERT_EQ(method_call, 1);
+    PASS();
+}
+
 TEST(contract_all_grammars_in_graph) {
     int n = (int)CBM_GRAMMAR_CASES_COUNT;
     if (n > GRAMMAR_BREADTH_MAX) {
@@ -2072,6 +2100,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_chialisp_constant_resolves_across_files);
     RUN_TEST(contract_visualbasic_winforms_graph);
     RUN_TEST(contract_visualbasic_indexing_is_a_field_usage);
+    RUN_TEST(contract_visualbasic_call_never_lands_on_enum_member);
     RUN_TEST(contract_all_grammars_in_graph);
 
     /* CALLS-edge breadth across non-LSP languages (P5). */

@@ -1642,6 +1642,17 @@ bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_labe
     return strcmp(target_label, "Variable") == 0 || strcmp(target_label, "Field") == 0;
 }
 
+bool cbm_call_never_names_data(CBMLanguage lang) {
+    /* VB.NET's Variables are enum members, and an enum member is never
+     * called: `Refresh()` in a Form calls Form.Refresh, not the `Refresh`
+     * member of some enum the short-name registry finds. Measured on
+     * staxrip/staxrip: 249 of 6,455 VB.NET CALLS edges landed on an enum
+     * member that way. A VB.NET call that lands on a Field never gets here:
+     * cbm_call_onto_field_policy has already made it a USAGE of the Field
+     * (indexing, or a delegate field invoked like a call). */
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_VISUALBASIC;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {

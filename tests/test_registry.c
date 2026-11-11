@@ -1791,6 +1791,18 @@ TEST(java_call_never_binds_data_member) {
     PASS();
 }
 
+/* The language gate both call resolvers share: Java, and VB.NET (whose
+ * Variables are enum members, never called). Languages with callable data
+ * keep their binds. */
+TEST(call_never_names_data_gate) {
+    ASSERT_TRUE(cbm_call_never_names_data(CBM_LANG_JAVA));
+    ASSERT_TRUE(cbm_call_never_names_data(CBM_LANG_VISUALBASIC));
+    ASSERT_FALSE(cbm_call_never_names_data(CBM_LANG_KOTLIN));
+    ASSERT_FALSE(cbm_call_never_names_data(CBM_LANG_C));
+    ASSERT_FALSE(cbm_call_never_names_data(CBM_LANG_CSHARP));
+    PASS();
+}
+
 TEST(generated_member_registers_by_qn_only) {
     /* A generated member (a Java record's implicit accessor) is found by its
      * qualified name, never by a short-name guess. The same member registered
@@ -3473,6 +3485,7 @@ SUITE(registry) {
     RUN_TEST(c_member_access_binds_by_owner_only);
     RUN_TEST(c_member_rule_covers_c_files_and_every_dot_h);
     RUN_TEST(java_call_never_binds_data_member);
+    RUN_TEST(call_never_names_data_gate);
     RUN_TEST(generated_member_registers_by_qn_only);
     RUN_TEST(generated_member_mark_on_defs_and_nodes);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);

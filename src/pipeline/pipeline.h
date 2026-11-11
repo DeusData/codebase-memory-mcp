@@ -590,6 +590,12 @@ const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *me
  * test_registry.c. */
 bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label);
 
+/* The `is_java` gate of cbm_java_suppress_call_to_data_member for a caller
+ * language: Java, and VB.NET, whose Variables are enum members. One gate for
+ * pass_calls.c and pass_parallel.c, so the two resolvers cannot diverge.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_call_never_names_data(CBMLanguage lang);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

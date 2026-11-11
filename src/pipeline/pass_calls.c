@@ -1048,7 +1048,8 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     /* LSP textual fallbacks can also name data, as with static imports. The
      * call is handled: no edge, and no registry fallback after it. */
-    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+    if (cbm_java_suppress_call_to_data_member(cbm_call_never_names_data(lang),
+                                              target_node->label)) {
         return true;
     }
     cbm_resolution_t res = {0};
@@ -1442,10 +1443,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return calls_emit_route_call(ctx, call, source_node, module_qn, imp_keys, imp_vals,
                                      imp_count, route_mount, lang, evidence);
     }
-    /* A Java call never targets data — see cbm_java_suppress_call_to_data_member.
-     * The language gate lives here, as with the guards above, and MUST match
-     * pass_parallel.c exactly or the two resolvers diverge. */
-    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+    /* A Java or VB.NET call never targets data — see
+     * cbm_java_suppress_call_to_data_member. The language gate is
+     * cbm_call_never_names_data, shared with pass_parallel.c so the two
+     * resolvers cannot diverge. */
+    if (cbm_java_suppress_call_to_data_member(cbm_call_never_names_data(lang),
+                                              target_node->label)) {
         return 0;
     }
     /* A bare Go `init(...)` calls a local closure or parameter: never a
