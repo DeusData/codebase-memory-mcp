@@ -15892,6 +15892,14 @@ TEST(vb_nested_class_extracted) {
     PASS();
 }
 
+/* *Test.vb / *Tests.vb are test files (from #2885). */
+TEST(vb_test_file_names) {
+    ASSERT_TRUE(cbm_is_test_file("src/OrderTests.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_TRUE(cbm_is_test_file("src/OrderTest.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_FALSE(cbm_is_test_file("src/Order.vb", CBM_LANG_VISUALBASIC));
+    PASS();
+}
+
 SUITE(extraction) {
 #ifdef _WIN32
     RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
@@ -15986,6 +15994,7 @@ SUITE(extraction) {
     RUN_TEST(vb_handles_and_addhandler_parse);
     RUN_TEST(vb_imports_extracted);
     RUN_TEST(vb_nested_class_extracted);
+    RUN_TEST(vb_test_file_names);
     RUN_TEST(iris_export_xml_simple_class);
     RUN_TEST(iris_export_xml_classmethod);
     RUN_TEST(iris_export_xml_property_parameter_index);

@@ -399,24 +399,32 @@ static const char *cs_throw_types[] = {"throw_statement", "throw_expression", NU
 static const char *cs_decorator_types[] = {"attribute", NULL};
 
 // ==================== VB.NET ====================
-// Node kinds from the patched vb_dotnet grammar (see vendored grammar
-// MANIFEST.md). Sub and Function both parse as method_declaration; a VB
-// Module is a static-class-like container so it rides in class_types (its
-// label is corrected to "Class" via class_label_for_kind's default).
-static const char *vb_func_types[] = {"method_declaration", "constructor_declaration", NULL};
-static const char *vb_class_types[] = {"class_block",     "module_block", "structure_block",
-                                       "interface_block", "enum_block",   NULL};
+// Node kinds from the vendored vbnet grammar (govindbanura/tree-sitter-vbnet
+// with CodeGraph's patch; see vendored grammar MANIFEST.md). Sub and Function
+// both parse as method_declaration, MustOverride members as
+// abstract_method_declaration and Declare members as
+// external_method_declaration. A VB Module is a static-class-like container
+// so it rides in class_types; class_label_for_kind's default labels it, and a
+// Structure, "Class", while interface_declaration/enum_declaration get
+// "Interface"/"Enum" like C#'s. VB uses one parenthesised form for calls and
+// indexing: `F()` parses as invocation_expression, `F(x)` as
+// array_access_expression, so both are call nodes.
+static const char *vb_func_types[] = {"method_declaration",           "constructor_declaration",
+                                      "interface_method_declaration", "abstract_method_declaration",
+                                      "external_method_declaration",  NULL};
+static const char *vb_class_types[] = {"class_declaration",     "module_declaration",
+                                       "structure_declaration", "interface_declaration",
+                                       "enum_declaration",      NULL};
 static const char *vb_module_types[] = {"source_file", NULL};
-static const char *vb_call_types[] = {"invocation", "new_expression", NULL};
+static const char *vb_call_types[] = {"invocation_expression", "array_access_expression",
+                                      "object_creation_expression", NULL};
 static const char *vb_import_types[] = {"imports_statement", NULL};
 static const char *vb_branch_types[] = {
-    "if_statement", "for_statement",         "for_each_statement", "while_statement",
-    "do_statement", "select_case_statement", "try_statement",      NULL};
-static const char *vb_var_types[] = {"field_declaration", "dim_statement", "const_declaration",
-                                     NULL};
+    "if_statement", "for_statement",    "for_each_statement", "while_statement",
+    "do_statement", "select_statement", "try_statement",      NULL};
+static const char *vb_var_types[] = {"field_declaration", "declaration_statement", NULL};
 static const char *vb_field_types[] = {"field_declaration", "property_declaration", NULL};
-static const char *vb_assign_types[] = {"assignment_statement", "compound_assignment_statement",
-                                        NULL};
+static const char *vb_assign_types[] = {"assignment_statement", NULL};
 static const char *vb_throw_types[] = {"throw_statement", NULL};
 static const char *vb_decorator_types[] = {"attribute", NULL};
 

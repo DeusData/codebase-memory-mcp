@@ -1348,6 +1348,7 @@ static int xl_family(CBMLanguage lang) {
         return XL_FAM_JVM;
     case CBM_LANG_CSHARP:
     case CBM_LANG_FSHARP:
+    case CBM_LANG_VISUALBASIC:
         return XL_FAM_DOTNET;
     case CBM_LANG_PHP:
     case CBM_LANG_BLADE:
