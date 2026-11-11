@@ -743,6 +743,59 @@ TEST(resolve_unresolved) {
     PASS();
 }
 
+/* VB.NET names are case-insensitive: a call spelled CALCULATE reaches the
+ * Calculate method (shape from #2885). */
+TEST(visual_basic_call_resolution_is_case_insensitive) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method",
+                          CBM_LANG_VISUALBASIC);
+    cbm_resolution_t res = cbm_registry_resolve_call_scoped(
+        r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_VISUALBASIC, "proj.Worker.Run");
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Worker.Calculate");
+    /* Every segment of a qualified callee is respelled, not only the last. */
+    cbm_registry_add_lang(r, "Helpers", "proj.Helpers.Helpers", "Class", CBM_LANG_VISUALBASIC);
+    cbm_registry_add_lang(r, "Format", "proj.Helpers.Helpers.Format", "Method",
+                          CBM_LANG_VISUALBASIC);
+    res = cbm_registry_resolve_lang(r, "helpers.format", "proj.Worker", NULL, NULL, 0,
+                                    CBM_LANG_VISUALBASIC);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Helpers.Helpers.Format");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The folded retry runs only when the spelling as written finds nothing, so
+ * an exact spelling keeps its own target. */
+TEST(visual_basic_exact_spelling_wins) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "run", "proj.Lower.run", "Method", CBM_LANG_VISUALBASIC);
+    cbm_registry_add_lang(r, "RUN", "proj.Upper.RUN", "Method", CBM_LANG_VISUALBASIC);
+    cbm_resolution_t res =
+        cbm_registry_resolve_lang(r, "RUN", "proj.Upper", NULL, NULL, 0, CBM_LANG_VISUALBASIC);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Upper.RUN");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Only VB.NET folds: C# stays case-sensitive, even next to VB.NET symbols. */
+TEST(case_folding_is_visual_basic_only) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method", CBM_LANG_CSHARP);
+    cbm_registry_add_lang(r, "Total", "proj.Vb.Total", "Method", CBM_LANG_VISUALBASIC);
+    cbm_resolution_t res =
+        cbm_registry_resolve_lang(r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_CSHARP);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    res = cbm_registry_resolve_lang(r, "total", "proj.Worker", NULL, NULL, 0, CBM_LANG_CSHARP);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_many_nodes) {
     cbm_registry_t *r = cbm_registry_new();
     /* Add 500 functions */
@@ -3366,6 +3419,9 @@ SUITE(registry) {
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_qualified_receiver_awareness);
     RUN_TEST(resolve_unresolved);
+    RUN_TEST(visual_basic_call_resolution_is_case_insensitive);
+    RUN_TEST(visual_basic_exact_spelling_wins);
+    RUN_TEST(case_folding_is_visual_basic_only);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */
     RUN_TEST(confidence_band_high);

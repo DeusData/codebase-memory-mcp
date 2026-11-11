@@ -779,7 +779,8 @@ static int edges_between_names(cbm_store_t *store, const char *project, const ch
  * Form1.Designer.vb, a service behind an interface, a derived service.
  * Graph level: IMPLEMENTS vs INHERITS by the base's label, the Handles
  * clause reaching the WithEvents control declared in the other half of the
- * partial class, and a call across files. */
+ * partial class, a call across files, and a call written in another case
+ * (VB.NET names are case-insensitive). */
 TEST(contract_visualbasic_winforms_graph) {
     static const LangFile f[] = {
         {"Form1.Designer.vb", "Partial Class Form1\n"
@@ -794,6 +795,9 @@ TEST(contract_visualbasic_winforms_graph) {
                      "    Private Sub SaveButton_Click(sender As Object, e As EventArgs) "
                      "Handles SaveButton.Click\n"
                      "        service.Save(\"x\")\n"
+                     "        UPDATETITLE()\n"
+                     "    End Sub\n"
+                     "    Private Sub UpdateTitle()\n"
                      "    End Sub\n"
                      "End Class\n"},
         {"CustomerService.vb", "Public Interface ICustomerStore\n"
@@ -816,11 +820,14 @@ TEST(contract_visualbasic_winforms_graph) {
         edges_between_names(store, lp.project, "PremiumService", "INHERITS", "CustomerService");
     int handles = edges_between_names(store, lp.project, "SaveButton_Click", "USAGE", "SaveButton");
     int cross_call = edges_between_names(store, lp.project, "SaveButton_Click", "CALLS", "Save");
+    int folded_call =
+        edges_between_names(store, lp.project, "SaveButton_Click", "CALLS", "UpdateTitle");
     lang_cleanup(&lp, store);
     ASSERT_TRUE(implements >= 1);
     ASSERT_TRUE(inherits >= 1);
     ASSERT_TRUE(handles >= 1);
     ASSERT_TRUE(cross_call >= 1);
+    ASSERT_TRUE(folded_call >= 1);
     PASS();
 }
 
