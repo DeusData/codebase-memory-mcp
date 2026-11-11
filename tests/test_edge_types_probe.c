@@ -1140,8 +1140,9 @@ static int et_qn_has_tail(const char *qn, const char *tail) {
 /* route_qns (optional, NULL-terminated): Route qualified_names that must
  * exist, so a test asserting that a route gets NO handler cannot pass merely
  * because the route itself was never extracted. */
-static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHandles *want,
-                                   int parallel, const char *const *route_qns) {
+static int et_edges_exact_routes(const EtFile *files, int nfiles, const char *edge,
+                                 const EtHandles *want, int parallel,
+                                 const char *const *route_qns) {
     EtProj lp;
     cbm_store_t *store =
         parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
@@ -1153,7 +1154,7 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
     cbm_edge_t *edges = NULL;
     int n = 0;
     int ok = store != NULL &&
-             cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) ==
+             cbm_store_find_edges_by_type(store, lp.project, edge, &edges, &n) ==
                  CBM_STORE_OK &&
              n == wanted;
     for (int i = 0; store && i < n; i++) {
@@ -1171,7 +1172,7 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
         }
         if (!matched) {
             ok = 0;
-            fprintf(stderr, "  [ET-HANDLES] unexpected %s -> %s\n",
+            fprintf(stderr, "  [ET-%s] unexpected %s -> %s\n", edge,
                     have_src && src.qualified_name ? src.qualified_name : "<?>",
                     have_tgt && tgt.name ? tgt.name : "<?>");
         }
@@ -1181,7 +1182,7 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
     for (int wi = 0; wi < wanted; wi++) {
         if (!found[wi]) {
             ok = 0;
-            fprintf(stderr, "  [ET-HANDLES] missing %s -> %s\n", want[wi].handler_tail,
+            fprintf(stderr, "  [ET-%s] missing %s -> %s\n", edge, want[wi].handler_tail,
                     want[wi].route);
         }
     }
@@ -1190,13 +1191,13 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
         if (!store ||
             cbm_store_find_node_by_qn(store, lp.project, route_qns[ri], &route) != CBM_STORE_OK) {
             ok = 0;
-            fprintf(stderr, "  [ET-HANDLES] missing Route %s\n", route_qns[ri]);
+            fprintf(stderr, "  [ET-%s] missing Route %s\n", edge, route_qns[ri]);
         } else {
             cbm_node_free_fields(&route);
         }
     }
     if (!ok) {
-        fprintf(stderr, "  [ET-HANDLES] FAIL (%s path) expected=%d actual=%d\n",
+        fprintf(stderr, "  [ET-%s] FAIL (%s path) expected=%d actual=%d\n", edge,
                 parallel ? "parallel" : "sequential", wanted, n);
     }
     if (edges) cbm_store_free_edges(edges, n);
@@ -1204,8 +1205,148 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
     return ok;
 }
 
+static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHandles *want,
+                                   int parallel, const char *const *route_qns) {
+    return et_edges_exact_routes(files, nfiles, "HANDLES", want, parallel, route_qns);
+}
+
 static int et_handles_exact(const EtFile *files, int nfiles, const EtHandles *want, int parallel) {
     return et_handles_exact_routes(files, nfiles, want, parallel, NULL);
+}
+
+/* Retrofit (#2723): an interface method's @GET("...") declares a request the
+ * client makes. It was minted as a served Route with a HANDLES edge, and every
+ * path without a leading slash collapsed onto "/". The relative path is rooted
+ * (Retrofit resolves it against the base URL); a path from a constant or a
+ * template has no static value and yields no edge rather than a "/" Route. */
+static const EtFile et_retrofit_kotlin[] = {
+    {"src/main/kotlin/com/acme/client/OrderApi.kt",
+     "package com.acme.client\n\n"
+     "import retrofit2.http.Body\n"
+     "import retrofit2.http.GET\n"
+     "import retrofit2.http.POST\n"
+     "import retrofit2.http.Path\n\n"
+     "private const val ORDERS = \"/v1/orders\"\n\n"
+     "interface OrderApi {\n"
+     "    @GET(\"/v1/orders/{id}\")\n"
+     "    suspend fun getOrder(@Path(\"id\") id: String): String\n\n"
+     "    @POST(\"v1/orders\")\n"
+     "    suspend fun createOrder(@Body body: String): String\n\n"
+     "    @GET(ORDERS)\n"
+     "    suspend fun listOrders(): String\n\n"
+     "    @GET(\"$ORDERS/{id}/status\")\n"
+     "    suspend fun getOrderStatus(@Path(\"id\") id: String): String\n"
+     "}\n"}};
+
+static const EtHandles et_retrofit_kotlin_calls[] = {
+    {"OrderApi.getOrder", "/v1/orders/{id}"}, {"OrderApi.createOrder", "/v1/orders"}, {NULL, NULL}};
+
+static const EtHandles et_no_edges[] = {{NULL, NULL}};
+
+TEST(http_calls_retrofit_kotlin_interface_issue2723) {
+    static const char *const qns[] = {"__route__GET__/v1/orders/{}", "__route__POST__/v1/orders",
+                                      NULL};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_edges_exact_routes(et_retrofit_kotlin, 1, "HTTP_CALLS",
+                                          et_retrofit_kotlin_calls, parallel, qns));
+        ASSERT_TRUE(et_handles_exact(et_retrofit_kotlin, 1, et_no_edges, parallel));
+    }
+    PASS();
+}
+
+/* Java Retrofit: the named `value =` form and a full URL are read; a
+ * concatenation is not, so none of its string fragments becomes a path. */
+TEST(http_calls_retrofit_java_interface_issue2723) {
+    static const EtFile f[] = {
+        {"src/main/java/com/acme/jclient/OrderApi.java",
+         "package com.acme.jclient;\n\n"
+         "import retrofit2.Call;\n"
+         "import retrofit2.http.Body;\n"
+         "import retrofit2.http.DELETE;\n"
+         "import retrofit2.http.GET;\n"
+         "import retrofit2.http.POST;\n"
+         "import retrofit2.http.Path;\n\n"
+         "public interface OrderApi {\n"
+         "    String BASE = \"v1\";\n\n"
+         "    @GET(\"v1/orders/{id}\")\n"
+         "    Call<String> getOrder(@Path(\"id\") String id);\n\n"
+         "    @POST(value = \"v1/orders\")\n"
+         "    Call<String> createOrder(@Body String body);\n\n"
+         "    @GET(\"https://status.acme.com/v1/health\")\n"
+         "    Call<String> health();\n\n"
+         "    @DELETE(BASE + \"/orders/{id}\")\n"
+         "    Call<Void> deleteOrder(@Path(\"id\") String id);\n"
+         "}\n"}};
+    static const EtHandles calls[] = {{"OrderApi.getOrder", "/v1/orders/{id}"},
+                                      {"OrderApi.createOrder", "/v1/orders"},
+                                      {"OrderApi.health", "https://status.acme.com/v1/health"},
+                                      {NULL, NULL}};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_edges_exact_routes(f, 1, "HTTP_CALLS", calls, parallel, NULL));
+        ASSERT_TRUE(et_handles_exact(f, 1, et_no_edges, parallel));
+    }
+    PASS();
+}
+
+/* Control: a JAX-RS interface keeps HANDLES. Its @GET is a marker and the path
+ * is a sibling @Path, so it is not read as a Retrofit request (a verb with an
+ * argument) even though it is declared on an interface. */
+TEST(handles_jaxrs_interface_not_retrofit_issue2723) {
+    static const EtFile f[] = {
+        {"src/main/java/com/acme/api/OrderResource.java",
+         "package com.acme.api;\n\n"
+         "import jakarta.ws.rs.GET;\n"
+         "import jakarta.ws.rs.POST;\n"
+         "import jakarta.ws.rs.Path;\n\n"
+         "@Path(\"/v1/orders\")\n"
+         "public interface OrderResource {\n"
+         "    @GET\n"
+         "    @Path(\"/{id}\")\n"
+         "    String get(String id);\n\n"
+         "    @POST\n"
+         "    String create(String body);\n"
+         "}\n"}};
+    static const EtHandles handles[] = {{"OrderResource.get", "/v1/orders/{id}"},
+                                        {"OrderResource.create", "/v1/orders"},
+                                        {NULL, NULL}};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_handles_exact(f, 1, handles, parallel));
+        ASSERT_TRUE(et_edges_exact_routes(f, 1, "HTTP_CALLS", et_no_edges, parallel, NULL));
+    }
+    PASS();
+}
+
+/* Control: Pippo and Rapidoid put the path inside @GET("/x") on a controller
+ * class. Retrofit services must be interfaces, so these keep HANDLES. */
+TEST(handles_verb_path_controller_class_not_retrofit_issue2723) {
+    static const EtFile f[] = {
+        {"src/main/java/com/acme/web/ContactsController.java",
+         "package com.acme.web;\n\n"
+         "import ro.pippo.controller.Controller;\n"
+         "import ro.pippo.controller.GET;\n"
+         "import ro.pippo.controller.POST;\n\n"
+         "public class ContactsController extends Controller {\n"
+         "    @GET(\"/contacts\")\n"
+         "    public void index() {}\n\n"
+         "    @POST(\"/contacts\")\n"
+         "    public void create() {}\n"
+         "}\n"},
+        {"src/main/kotlin/com/acme/web/StatusController.kt",
+         "package com.acme.web\n\n"
+         "import org.rapidoid.annotation.GET\n\n"
+         "class StatusController {\n"
+         "    @GET(\"/status\")\n"
+         "    fun status(): String = \"ok\"\n"
+         "}\n"}};
+    static const EtHandles handles[] = {{"ContactsController.index", "/contacts"},
+                                        {"ContactsController.create", "/contacts"},
+                                        {"StatusController.status", "/status"},
+                                        {NULL, NULL}};
+    for (int parallel = 0; parallel <= 1; parallel++) {
+        ASSERT_TRUE(et_handles_exact(f, 2, handles, parallel));
+        ASSERT_TRUE(et_edges_exact_routes(f, 2, "HTTP_CALLS", et_no_edges, parallel, NULL));
+    }
+    PASS();
 }
 
 /* The exact DATA_FLOWS set, caller -> handler by QN tail. route_qns (NULL-terminated) must
@@ -2871,6 +3012,10 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_jaxrs_java_relative_path);
     RUN_TEST(handles_spring_java_relative_string_not_route);
     RUN_TEST(handles_jaxrs_scala);
+    RUN_TEST(http_calls_retrofit_kotlin_interface_issue2723);
+    RUN_TEST(http_calls_retrofit_java_interface_issue2723);
+    RUN_TEST(handles_jaxrs_interface_not_retrofit_issue2723);
+    RUN_TEST(handles_verb_path_controller_class_not_retrofit_issue2723);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_aspnet_attribute_routes_issue1692);
     RUN_TEST(handles_aspnet_attribute_routes_issue1041);

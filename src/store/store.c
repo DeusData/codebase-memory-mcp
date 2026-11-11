@@ -340,6 +340,26 @@ bool cbm_store_edges_schema_current(cbm_store_t *s) {
     return true;
 }
 
+/* Best-effort probe for the BT-240 index_checkout table. Writable opens run
+ * init_schema (which creates it), so false is expected only on read-only
+ * legacy DBs opened via the query path — those must keep working and simply
+ * report no indexed-checkout identity. */
+static bool index_checkout_table_exists(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                           "AND name = 'index_checkout';",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool has = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return has;
+}
+
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
@@ -495,6 +515,14 @@ static int init_schema(cbm_store_t *s) {
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
         "  hash_records_complete INTEGER NOT NULL DEFAULT 0,"
         "  unresolved_calls_complete INTEGER NOT NULL DEFAULT 0"
+        ");"
+        /* BT-240: the checkout an index was built from. A table of its own,
+         * not an index_coverage_meta column: it is source identity, which the
+         * pinned graph-digest tables deliberately do not bind, and a new
+         * table needs no migration of existing databases. */
+        "CREATE TABLE IF NOT EXISTS index_checkout ("
+        "  project TEXT PRIMARY KEY REFERENCES projects(name) ON DELETE CASCADE,"
+        "  indexed_checkout_sha TEXT NOT NULL"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -3090,6 +3118,7 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
     static const char *cleanup_sql[] = {
         "DELETE FROM index_coverage WHERE project = ?1;",
         "DELETE FROM index_coverage_meta WHERE project = ?1;",
+        "DELETE FROM index_checkout WHERE project = ?1;",
         "DELETE FROM projects WHERE name = ?1 || '::missed';",
     };
     /* doc_link_unresolved exists only in databases published by a build that
@@ -4838,6 +4867,34 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     return CBM_STORE_OK;
 }
 
+/* Record (or, with no sha, clear) the checkout a project's index was built
+ * from. Runs inside the caller's coverage transaction, so a failed replace
+ * keeps the previous identity. */
+static int index_checkout_write(cbm_store_t *s, const char *project, const char *sha) {
+    bool record = sha && sha[0];
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           record ? "INSERT INTO index_checkout (project, indexed_checkout_sha) "
+                                    "VALUES (?1, ?2) ON CONFLICT(project) DO UPDATE SET "
+                                    "indexed_checkout_sha=?2;"
+                                  : "DELETE FROM index_checkout WHERE project = ?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "index checkout write prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    if (record) {
+        bind_text(stmt, ST_COL_2, sha);
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index checkout write");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 /* Materialize once at publication, after replacement and deleted-file pruning.
  * json_each sees a safe marker array for malformed/legacy non-array payloads.
  * The side table cascades with its authoritative coverage rows. */
@@ -4893,7 +4950,7 @@ static int coverage_write_metadata(cbm_store_t *s, const char *project,
             store_set_error_sqlite(s, "coverage meta delete");
             return CBM_STORE_ERR;
         }
-        return CBM_STORE_OK;
+        return index_checkout_write(s, project, NULL);
     }
     char recorded_at[CBM_SZ_64];
     if (meta->recorded_at && meta->recorded_at[0]) {
@@ -4943,7 +5000,7 @@ static int coverage_write_metadata(cbm_store_t *s, const char *project,
         store_set_error_sqlite(s, "coverage meta upsert");
         return CBM_STORE_ERR;
     }
-    return CBM_STORE_OK;
+    return index_checkout_write(s, project, meta->indexed_checkout_sha);
 }
 
 int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
@@ -5218,7 +5275,43 @@ void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     free((char *)meta->index_mode);
     free((char *)meta->recorded_at);
     free((char *)meta->recording_status);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->indexed_checkout_sha);
     memset(meta, 0, sizeof(*meta));
+}
+
+/* Fill out->indexed_checkout_sha from index_checkout. A legacy read-only DB
+ * (query opens skip init_schema) may lack the table: no identity, not an
+ * error. On failure out is cleared. */
+static int index_checkout_read(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out) {
+    if (!index_checkout_table_exists(s)) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT indexed_checkout_sha FROM index_checkout WHERE project = ?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "index checkout read prepare");
+        cbm_store_coverage_meta_clear(out);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *sha = (const char *)sqlite3_column_text(stmt, 0);
+        if (sha && sha[0]) {
+            out->indexed_checkout_sha = cbm_mem_strdup(CBM_MEM_CLASS_STORE, sha);
+            rc = out->indexed_checkout_sha ? SQLITE_DONE : SQLITE_NOMEM;
+        } else {
+            rc = SQLITE_DONE;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index checkout read");
+        cbm_store_coverage_meta_clear(out);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out) {
@@ -5267,7 +5360,7 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
             cbm_store_coverage_meta_clear(out);
             return CBM_STORE_ERR;
         }
-        return CBM_STORE_OK;
+        return index_checkout_read(s, project, out);
     }
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {

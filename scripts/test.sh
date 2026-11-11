@@ -295,6 +295,9 @@ bash "$ROOT/tests/test_activation_diagnostic_contract.sh"
 echo "=== Step 0e3: security gate fail-closed contract ==="
 bash "$ROOT/tests/test_security_gate_fail_closed.sh"
 
+echo "=== Step 0e4: memory-analyzer gate warning-suffix contract (#2442) ==="
+bash "$ROOT/tests/test_lint_mem_gate.sh"
+
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
@@ -315,6 +318,9 @@ bash "$ROOT/tests/test_parallel_harness_contract.sh"
 # real summary functions with fabricated suite logs, so it runs everywhere.
 echo "=== Step 0i2: suite failure-report contract ==="
 bash "$ROOT/tests/test_failure_report_contract.sh"
+
+echo "=== Step 0i3: benchmark harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_benchmark_runtime_isolation_contract.sh"
 
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
@@ -363,6 +369,9 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
+
+echo "=== Step 0x2: installer Android/Termux guard contract (#1202) ==="
+bash "$ROOT/tests/test_install_android_guard.sh"
 
 # Step 0y: the Windows leg must not decide its verdict from an exit status that
 # the ssh/msys2_shell chain can mangle — a channel that turns 0 into 1 can turn

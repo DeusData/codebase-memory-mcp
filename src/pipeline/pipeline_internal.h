@@ -248,6 +248,11 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+/* Freeze Swift declaration/extension ownership after all definitions are registered. */
+void cbm_registry_build_swift_owners(cbm_registry_t *registry, const cbm_gbuf_t *graph,
+                                     const char *repo_path, char **excluded_dirs,
+                                     int excluded_count);
+
 /* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
@@ -362,8 +367,9 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 
 /* Per-worker manifest collection entry. */
 typedef struct {
-    char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
-    char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    char *pkg_name;     /* heap: "@myorg/pkg", "github.com/foo/bar" */
+    char *entry_rel;    /* heap: "packages/pkg/src/index" (no extension) */
+    char *manifest_rel; /* heap: owning SwiftPM manifest, NULL for other ecosystems */
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -935,6 +941,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
+/* Swift target roots plus package boundaries (pkg_name == NULL), using the literal parser. */
+int cbm_pkgmap_scan_swift_targets(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count);
@@ -975,6 +984,23 @@ bool cbm_python_import_path_matches_qn(const char *module_path, const char *name
 bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
                                            const char *resolved_qn, const cbm_gbuf_t *gbuf,
                                            const char *project_name, const char *rel_path);
+
+/* #1128: true when a JS/TS-family member call resolved by `same_module` only
+ * through the lookup that drops its receiver (`resolved_qn` does not end in the
+ * whole callee), while that receiver is bound to an import of the file
+ * (`file_imports`: ES import or CommonJS require), to an AMD dependency
+ * (`receiver_is_amd_dependency`, the extractor's per-call fact), or is a
+ * builtin global of the JS runtime (`console`, `Math`, `JSON`, ...):
+ * `axios.get()` must not bind the `get` this file happens to define. Any other
+ * receiver keeps the edge (`context.push()` onto an object-literal method
+ * stored at module level). The language list is inside the helper, so
+ * pass_calls.c and pass_parallel.c cannot drift. Only the plain-CALLS
+ * fall-through is dropped. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_same_module_bound_receiver(CBMLanguage lang, bool is_method,
+                                             const char *callee_name, const char *resolved_qn,
+                                             const char *strategy,
+                                             const CBMImportArray *file_imports,
+                                             bool receiver_is_amd_dependency);
 
 /* Base-class twin: true when a Python base spelling (`unittest.TestCase`,
  * `TestCase` under `from unittest import TestCase`, `ut.TestCase` under
@@ -1684,8 +1710,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      are preserved and dotted-name collisions are disambiguated before section
  *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
  *      and diagram owners agree.
+ *  13: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *      / route.js under app/ or src/app/ exports, carries the route_path its
+ *      directories name and HANDLES its Route (extract_nextjs.c). An index
+ *      built before has none of these Routes for its unchanged route files,
+ *      so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1878,6 +1909,8 @@ const cbm_test_declarations_t *cbm_pipeline_test_declarations(const cbm_pipeline
 bool cbm_pipeline_project_source_matches(const cbm_pipeline_t *p, const cbm_userconfig_t *fresh);
 const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
 cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
+/* Borrowed checkout identity captured and validated for this pipeline run. */
+const char *cbm_pipeline_indexed_checkout_sha(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

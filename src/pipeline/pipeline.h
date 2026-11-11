@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "cbm.h"                   /* CBMCall for overload selection */
 #include "discover/discover.h"     /* cbm_ignored_file_t (#963) */
 #include "foundation/constants.h"  /* CBM_SZ_512 */
 #include "foundation/hash_table.h" /* CBMHashTable (#1355 pkgmap lookup) */
@@ -56,6 +57,17 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
 /* Apply a validated discovery resource policy. The value is copied. */
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Publication gate. cbm_pipeline_run calls it once, after the last
+ * pre-publication check and immediately before the serving database is
+ * touched (never for a live no-op, which replaces nothing). Returning false
+ * aborts the run with CBM_PIPELINE_ABORT_PRESERVE_DB and the previous
+ * generation stays exactly as it was. A supervised index worker uses it to
+ * claim publication from its supervisor (see the publication fence in
+ * mcp/index_supervisor.h). NULL removes the gate. */
+typedef bool (*cbm_pipeline_publish_gate_fn)(void *context);
+void cbm_pipeline_set_publish_gate(cbm_pipeline_t *p, cbm_pipeline_publish_gate_fn gate,
+                                   void *context);
 
 /* Doc -> code candidates (the doc_candidates setting). Never set, the index
  * mode decides: on for full, off for moderate and fast. The setter makes an
@@ -275,6 +287,19 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
 
+/* Swift-only metadata and label-compatible overload selection. The returned
+ * QNs are borrowed from the registry and all belong to one base callable.
+ * -1 means this name has Swift definitions but no compatible overload. */
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count,
+                                      const char *selector);
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap);
+int cbm_registry_swift_candidates_in_file(const cbm_registry_t *r, const CBMCall *call,
+                                          const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **out, int out_cap);
 /* As cbm_registry_add, recording `lang`: the DETECTED language of the file
  * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
  * veto (cbm_registry_name_guess_vetoed) checks against the caller. Detects no

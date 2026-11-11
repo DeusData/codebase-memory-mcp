@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+163 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -60,8 +60,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Eleven further grammars (`arkts`, `assembly`, `cfml`, `cfscript`, `dotenv`,
-  `haskell`, `javascript`, `pascal`, `pine`, `qml`, `tsx`) are
+- Twelve further grammars (`arkts`, `assembly`, `cfml`, `cfscript`, `dotenv`,
+  `haskell`, `javascript`, `pascal`, `pine`, `qml`, `tsx`, `vbnet`) are
   self-maintained forks that retain their original upstream authors' licenses —
   see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -83,7 +83,28 @@ License summary:
   ([tree-sitter/tree-sitter-haskell](https://github.com/tree-sitter/tree-sitter-haskell),
   MIT, (c) 2014 Max Brunsfeld) is the upstream grammar with one (c) 2026
   DeusData patch that stops an escaped char literal at its closing quote; its
-  grammar source lives in `tools/tree-sitter-haskell/`.
+  grammar source lives in `tools/tree-sitter-haskell/`. `vbnet` is described in its own section below.
+
+### tree-sitter-vbnet (with CodeGraph's real-world VB.NET patch)
+
+- **Project:** [govindbanura/tree-sitter-vbnet](https://github.com/govindbanura/tree-sitter-vbnet)
+- **License:** MIT
+- **Copyright:** (c) 2025 Govind Banura
+- **Patch:** `docs/grammars/tree-sitter-vbnet.patch` from
+  [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)
+  (CodeGraph), MIT, (c) 2026 Colby Mchenry. The patch rewrites much of the
+  grammar and adds the external scanner (`scanner.c`), so CodeGraph's license
+  text ships next to the code as `LICENSE-codegraph`.
+- **Vendored at:** `internal/cbm/vendored/grammars/vbnet/`
+- **Pinned commits:** grammar `538b7087bf80` (v0.1-beta); patch `fe7542b6f6a4`
+- **Notes:** Visual Basic .NET grammar, maintained here as a self-maintained
+  fork: the grammar source, the verbatim patch and the regeneration recipe live
+  in `tools/tree-sitter-vbnet/`, and the parser is generated in this repository
+  with tree-sitter-cli 0.25.10 (upstream checks in no generated sources). One
+  local patch of ours, (c) 2026 DeusData, makes the scanner stop at text that
+  cannot be XML (`tools/tree-sitter-vbnet/patches/xml-literal-tag-syntax.patch`).
+  The grammar is vendored ahead of VB.NET extraction (#1179); provenance hashes
+  are in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ### tree-sitter-plsql
 

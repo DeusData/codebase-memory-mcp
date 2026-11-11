@@ -6,8 +6,9 @@
 # Exports:
 #   ARCH        — target architecture (arm64 / x86_64)
 #   ARCHFLAGS   — "-arch <arch>" on macOS (target slice for clang/ld), empty elsewhere
+#   MAKE        — make program for Makefile.cbm (gmake on FreeBSD, make elsewhere)
 #   NPROC       — number of CPU cores
-#   OS          — darwin / linux / windows
+#   OS          — darwin / linux / windows / freebsd
 
 set -euo pipefail
 
@@ -16,9 +17,21 @@ OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$OS" in
     darwin)  OS="darwin" ;;
     linux)   OS="linux" ;;
+    freebsd*) OS="freebsd" ;;
     mingw*|msys*|cygwin*) OS="windows" ;;
     *)       OS="unknown" ;;
 esac
+
+# ── Select the make program ────────────────────────────────────
+# Makefile.cbm is written in GNU make syntax. FreeBSD ships BSD make as its
+# default make, so builds there run gmake (pkg install gmake); every other
+# platform runs make. Not exported: build.sh sources this file and runs
+# $MAKE in the same shell.
+if [[ "$OS" == "freebsd" ]]; then
+    MAKE="gmake"
+else
+    MAKE="make"
+fi
 
 # ── Detect / override architecture ─────────────────────────────
 # Default: native HARDWARE architecture (not Rosetta-translated).
@@ -128,5 +141,5 @@ fi
 # ── Print environment summary ──────────────────────────────────
 print_env() {
     local context="$1"
-    echo "=== $context: os=$OS arch=$ARCH cores=$NPROC cc=${CC:-default} cxx=${CXX:-default} ==="
+    echo "=== $context: os=$OS arch=$ARCH cores=$NPROC cc=${CC:-default} cxx=${CXX:-default} make=$MAKE ==="
 }

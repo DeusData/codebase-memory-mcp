@@ -79,6 +79,7 @@ codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config set watcher_enabled false
 codebase-memory-mcp config reset auto_index
+codebase-memory-mcp config get install_hooks
 ```
 
 Current keys:
@@ -87,12 +88,18 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) when indexing automatically. |
 | `auto_watch` | `true` | Global switch for MCP session watch registration. On the next refresh or registration request, `true` allows session roots and successful `index_repository` targets to be watched; `false` removes all watches. The background watcher can still run with no registered projects. |
 | `doc_candidates` | `auto` | Score documentation sections against code to store doc↔code candidates (the possible targets of a section, and the sections that may describe a function or file, each with a judged probability). Unset (`auto`), the index mode decides: on for `full` indexes (the default mode), off for `moderate` and `fast`. Set `true` or `false` to choose for every mode; `config reset doc_candidates` returns to `auto`. The scoring grows with sections × functions: under a second up to ~100k functions, ~15 s at ~400k, ~3 minutes on the Linux kernel. Off stores no candidates and leaves the rest of the graph unchanged; on in `fast` mode stores candidates without adding `fast`'s skipped `SIMILAR_TO` / `SEMANTICALLY_RELATED` edges. `index_repository` also takes `doc_candidates` for a single index, which wins over this setting. Applies from the next index. |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Active MCP sessions can register their root project and successful explicit index targets; under `daemon start` those watches outlive the session until the daemon stops, the project is deleted, its directory disappears, or `auto_watch` is set to `false`. `index_status` reports the current state in its `watch` object. |
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
+| `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). Like `index_max_rss_mb`, it stops a worker only before it starts to publish the new index; see [INDEX_RESOURCE_LIMITS.md](INDEX_RESOURCE_LIMITS.md). |
+| `install_hooks` | `true` | Install CBM-managed client hooks. `install --no-hooks` persists `false`; `install --hooks` restores `true`. |
+
+Bare installs and updates respect the stored hook preference. MCP registration, skills, instructions, and profiles remain installed when hooks are disabled.
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
@@ -134,13 +141,53 @@ has not run yet).
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The two `index_max_*` settings are independent and disabled by default. They
+The four `index_max_*` settings are independent and disabled by default. They
 apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
 to `cross-repo-intelligence`, which does not scan repository source files.
-Equality is allowed; exceeding either setting fails the complete index request
-and preserves any previously serving database. See
+Equality is allowed; exceeding any setting fails the complete index request and
+preserves any previously serving database. Worker RSS covers descendants and is
+not the same as the internal `CBM_MEM_BUDGET_MB` allocation budget. Total
+duration is independent of the existing 15-minute no-log-progress timeout. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
+
+### `ignore_worktrees`
+
+Every indexed project is registered under its own absolute root path, so each
+linked worktree becomes a separate permanent index. On machines that create many
+short-lived worktrees, the automatic paths (`auto_index`, and the session hook's
+"index this project first" guidance) turn every throwaway checkout into another
+stored index of what is largely the same repository.
+
+Enable the key to keep those checkouts out of the index:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees true
+```
+
+With it enabled:
+
+- automatic indexing skips a session whose root is a linked worktree;
+- the `hook-augment` context says the worktree is unindexed on purpose instead
+  of telling the agent to run `index_repository`;
+- an explicit `index_repository` call on a linked worktree is refused, and names
+  both ways forward — pass `index_worktree=true` for that one call, or turn the
+  key back off.
+
+The main checkout of the same repository is unaffected, as are ordinary clones
+and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
+file pointing at a gitdir that contains a `commondir` entry.
+
+A subdirectory counts as the worktree it sits in. Detection walks up from the
+given path to the nearest `.git` entry, so `index_repository` on any
+subdirectory of a linked worktree is refused the same way, and a session root or
+hook working directory inside one is treated as that worktree. The walk stops at
+the first `.git` it finds; a main checkout or a submodule ends it as "not a
+worktree". A path outside any git checkout is checked one directory at a time up
+to the filesystem root and is never treated as a worktree. None of this runs
+while the key is off.
+
+The default is `false`, so indexing behavior is unchanged unless you opt in.
 
 ## 3. UI Settings
 
@@ -162,6 +209,8 @@ Current format:
 Notes:
 
 - If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- A bare `daemon start` honors the saved `ui_enabled` value, including `false`. Enable the UI with `codebase-memory-mcp config set ui_enabled true`.
+- On a cold start, `daemon start --open` or `daemon start --port=N` explicitly enables the UI and persists that choice. An already-active daemon keeps its current settings; stop it first to change ports with `--port=N`.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
