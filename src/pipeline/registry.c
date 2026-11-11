@@ -1666,8 +1666,8 @@ void cbm_registry_free(cbm_registry_t *r) {
  *
  * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
  * is new, and it calls this at most once per distinct key. */
-static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn,
-                             bool is_test, CBMLanguage lang) {
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn, bool is_test,
+                             CBMLanguage lang) {
     qn_array_t *arr = cbm_ht_get(r->by_name, key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
@@ -3055,11 +3055,10 @@ static const char *swift_choose_receiver(const cbm_registry_t *r, const char **m
 }
 
 static const char *swift_choose_candidate(const cbm_registry_t *r, const char **matches,
-                                          const uint8_t *match_test, int matched,
-                                          const char *name, const CBMCall *call,
-                                          const char *module_qn, const char **import_vals,
-                                          int import_count, const char **scratch,
-                                          uint8_t *scratch_test) {
+                                          const uint8_t *match_test, int matched, const char *name,
+                                          const CBMCall *call, const char *module_qn,
+                                          const char **import_vals, int import_count,
+                                          const char **scratch, uint8_t *scratch_test) {
     const char *chosen =
         swift_choose_receiver(r, matches, match_test, matched, name, call, module_qn, import_vals,
                               import_count, scratch, scratch_test);
@@ -4781,8 +4780,8 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
     if (have_imports) {
         fcount = filter_import_reachable((const char **)arr->items, qn_test_flags(arr),
                                          qn_lang_flags(arr), arr->count, import_map_vals,
-                                         import_map_count, filtered, filtered_flags,
-                                         filtered_langs, CBM_SZ_256);
+                                         import_map_count, filtered, filtered_flags, filtered_langs,
+                                         CBM_SZ_256);
         fptr = filtered;
         fflags = filtered_flags;
         flangs = filtered_langs;
