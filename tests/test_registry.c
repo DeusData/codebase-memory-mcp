@@ -193,7 +193,7 @@ TEST(registry_free_null) {
 
 TEST(registry_add_and_exists) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function");
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false);
     ASSERT_EQ(cbm_registry_size(r), 1);
     ASSERT_TRUE(cbm_registry_exists(r, "proj.cmd.main"));
     ASSERT_FALSE(cbm_registry_exists(r, "proj.cmd.other"));
@@ -201,10 +201,114 @@ TEST(registry_add_and_exists) {
     PASS();
 }
 
+/* REG_TEST_PENALTY had no direct coverage. Of the registry call sites in this
+ * suite, none registered a symbol the scorer would treat as a test, so the
+ * layer that keeps production code ahead of test code was never exercised.
+ * These three pin it, and pin where the verdict comes from. */
+TEST(registry_prefers_non_test_over_test_candidate) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "helper", "proj.app.helper", "Function", false);
+    cbm_registry_add(r, "helper", "proj.harness.helper", "Function", true);
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "helper", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.app.helper");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The verdict is the caller's, not the QN's spelling. "latest" contains "test",
+ * so the scan this replaces read ordinary production code as a test and pushed
+ * it below a real one; "harness" spells nothing, so the same scan read a test
+ * as production. Both verdicts here are the extractor's, and both are right. */
+TEST(registry_test_verdict_comes_from_the_caller_not_the_qn) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "parse", "proj.latest.parse", "Function", false);
+    cbm_registry_add(r, "parse", "proj.harness.parse", "Function", true);
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "parse", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.latest.parse");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A bucket of one is returned whatever its verdict: the penalty orders
+ * candidates, it does not veto them. */
+TEST(registry_sole_test_candidate_still_resolves) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "only", "proj.harness.only", "Function", true);
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "only", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.harness.only");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The test-double path rule: whole directory segments named fake, mock, mocks,
+ * testing or testutil, and Go files named mock_*.go or fake_*.go. Anchored, so
+ * the substrings the old QN scan tripped on (inspect, latest, contest) and
+ * near-miss names (fakeroot, mockery, testingutil) stay ordinary code. */
+TEST(registry_test_double_path_table) {
+    static const char *const doubles[] = {
+        "pkg/client/fake/clientset.go",
+        "fake/x.go",
+        "internal/mocks/store.go",
+        "pkg/mock/store.go",
+        "pkg/testing/fixtures.go",
+        "internal/testutil/helpers.go",
+        "pkg/mock_store.go",
+        "pkg/fake_clock.go",
+        "mock_store.go",
+        "src/fake/deep/nested/util.py",
+    };
+    static const char *const ordinary[] = {
+        "pkg/inspect/x.go",      "pkg/latest/x.go",      "pkg/contest/x.go", "pkg/fakeroot/x.go",
+        "pkg/mockery/x.go",      "pkg/testingutil/x.go", "pkg/mocking.go",   "pkg/mock_store.py",
+        "pkg/fake_clock.golang", "pkg/fake.go",          "pkg/x/fake",       "pkg/Fake/x.go",
+        "pkg/myfake/x.go",       "pkg/fake-client/x.go", "testing.go",       "",
+    };
+    char why[256];
+    for (size_t i = 0; i < sizeof(doubles) / sizeof(doubles[0]); i++) {
+        if (!cbm_registry_test_double_path(doubles[i])) {
+            snprintf(why, sizeof(why), "expected a test-double path: %s", doubles[i]);
+            FAIL(why);
+        }
+    }
+    for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
+        if (cbm_registry_test_double_path(ordinary[i])) {
+            snprintf(why, sizeof(why), "expected an ordinary path: %s", ordinary[i]);
+            FAIL(why);
+        }
+    }
+    ASSERT_FALSE(cbm_registry_test_double_path(NULL));
+    PASS();
+}
+
+/* The Swift overload choosers score with the verdicts stored at registration,
+ * carried through their own filtered lists. Both overloads fit the call and tie
+ * on proximity; without the verdicts the smaller QN (the test double) would win
+ * the tie. */
+TEST(registry_swift_overload_choice_uses_stored_verdicts) {
+    cbm_registry_t *r = cbm_registry_new();
+    const char *double_qn = "proj.Fixtures.Store.load(path:String)";
+    const char *real_qn = "proj.Zeta.Store.load(path:String)";
+    cbm_registry_add(r, "load", double_qn, "Method", true);
+    cbm_registry_add(r, "load", real_qn, "Method", false);
+    cbm_registry_set_swift_signature(r, double_qn, 0, 1, NULL);
+    cbm_registry_set_swift_signature(r, real_qn, 0, 1, NULL);
+
+    CBMCallArg arg = {.keyword = "path"};
+    CBMCall call = {.callee_name = "load", .args = &arg, .arg_count = 1};
+    const char *out[4] = {0};
+    ASSERT_EQ(cbm_registry_swift_candidates(r, &call, "proj.Caller", NULL, 0, out, 4), 1);
+    ASSERT_STR_EQ(out[0], real_qn);
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(registry_label_of) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Foo", "proj.pkg.Foo", "Class");
-    cbm_registry_add(r, "bar", "proj.pkg.bar", "Function");
+    cbm_registry_add(r, "Foo", "proj.pkg.Foo", "Class", false);
+    cbm_registry_add(r, "bar", "proj.pkg.bar", "Function", false);
 
     ASSERT_STR_EQ(cbm_registry_label_of(r, "proj.pkg.Foo"), "Class");
     ASSERT_STR_EQ(cbm_registry_label_of(r, "proj.pkg.bar"), "Function");
@@ -218,10 +322,10 @@ TEST(registry_label_of) {
  * method's fenced `#field` twin when the class has one; nothing else moves. */
 TEST(registry_value_target_field_twin) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "count", "p.C.count", "Method");
-    cbm_registry_add(r, "count", "p.C.count#field", "Field");
-    cbm_registry_add(r, "size", "p.C.size", "Method");
-    cbm_registry_add(r, "name", "p.C.name", "Field");
+    cbm_registry_add(r, "count", "p.C.count", "Method", false);
+    cbm_registry_add(r, "count", "p.C.count#field", "Field", false);
+    cbm_registry_add(r, "size", "p.C.size", "Method", false);
+    cbm_registry_add(r, "name", "p.C.name", "Field", false);
     ASSERT_STR_EQ(cbm_registry_value_target(r, "p.C.count"), "p.C.count#field");
     ASSERT_STR_EQ(cbm_registry_value_target(r, "p.C.size"), "p.C.size");
     ASSERT_STR_EQ(cbm_registry_value_target(r, "p.C.name"), "p.C.name");
@@ -237,9 +341,9 @@ TEST(registry_value_target_field_twin) {
 
 TEST(registry_find_by_name) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function");
-    cbm_registry_add(r, "main", "proj.srv.main", "Function");
-    cbm_registry_add(r, "helper", "proj.util.helper", "Function");
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false);
+    cbm_registry_add(r, "main", "proj.srv.main", "Function", false);
+    cbm_registry_add(r, "helper", "proj.util.helper", "Function", false);
 
     const char **out = NULL;
     int count = 0;
@@ -258,8 +362,8 @@ TEST(registry_find_by_name) {
 
 TEST(registry_no_duplicates) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function");
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function"); /* duplicate */
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false);
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false); /* duplicate */
     ASSERT_EQ(cbm_registry_size(r), 1);
 
     const char **out = NULL;
@@ -275,7 +379,7 @@ TEST(registry_no_duplicates) {
 
 TEST(resolve_same_module) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "helper", "proj.pkg.service.helper", "Function");
+    cbm_registry_add(r, "helper", "proj.pkg.service.helper", "Function", false);
 
     /* Call "helper" from the same module → should resolve */
     cbm_resolution_t res = cbm_registry_resolve(r, "helper", "proj.pkg.service", NULL, NULL, 0);
@@ -297,7 +401,7 @@ TEST(resolve_same_module) {
  * (false only for a this/super receiver). */
 TEST(resolve_same_module_only_on_self_receiver) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "get", "proj.pkg.service.get", "Function");
+    cbm_registry_add(r, "get", "proj.pkg.service.get", "Function", false);
     const CBMLanguage js = CBM_LANG_JAVASCRIPT;
     const char *mod = "proj.pkg.service";
     CBMImport axios_import = {.local_name = "axios", .module_path = "axios", .is_default = true};
@@ -457,11 +561,11 @@ TEST(resolve_qualified_receiver_awareness) {
     const CBMLanguage js = CBM_LANG_JAVASCRIPT;
 
     /* 1. Register a Method candidate under Class Service: proj.pkg.Service.get */
-    cbm_registry_add(r, "Service", "proj.pkg.Service", "Class");
-    cbm_registry_add(r, "get", "proj.pkg.Service.get", "Method");
+    cbm_registry_add(r, "Service", "proj.pkg.Service", "Class", false);
+    cbm_registry_add(r, "get", "proj.pkg.Service.get", "Method", false);
 
     /* 2. Register a Module axios */
-    cbm_registry_add(r, "axios", "proj.axios", "Module");
+    cbm_registry_add(r, "axios", "proj.axios", "Module", false);
 
     /* Test Case A: Unrelated receiver that is a known module/type -> name-only
      * guess, dropped by the member guard */
@@ -513,7 +617,7 @@ TEST(resolve_qualified_receiver_awareness) {
     /* Test Case F: Function candidate behind an unrelated receiver -> name-only
      * guess, dropped by the member guard */
     /* Register unique Function helper.compute */
-    cbm_registry_add(r, "compute", "proj.pkg.helper.compute", "Function");
+    cbm_registry_add(r, "compute", "proj.pkg.helper.compute", "Function", false);
     {
         cbm_resolution_t res =
             cbm_registry_resolve(r, "unrelated.compute", "proj.app", NULL, NULL, 0);
@@ -530,9 +634,9 @@ TEST(resolve_qualified_receiver_awareness) {
  * Foo::Bar::sub()) where the same sub name exists in multiple packages. */
 TEST(resolve_qualified_disambiguates_same_name) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "save", "proj.lib.App.Alpha.save", "Function");
-    cbm_registry_add(r, "save", "proj.lib.App.Beta.save", "Function");
-    cbm_registry_add(r, "save", "proj.lib.App.Gamma.save", "Function");
+    cbm_registry_add(r, "save", "proj.lib.App.Alpha.save", "Function", false);
+    cbm_registry_add(r, "save", "proj.lib.App.Beta.save", "Function", false);
+    cbm_registry_add(r, "save", "proj.lib.App.Gamma.save", "Function", false);
 
     /* Each fully-qualified call routes to its own package. */
     cbm_resolution_t a =
@@ -573,8 +677,8 @@ TEST(resolve_qualified_disambiguates_same_name) {
  * pick arbitrarily under the high-confidence qualified_suffix strategy. */
 TEST(resolve_qualified_ambiguous_tail_falls_through) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function");
-    cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function");
+    cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function", false);
+    cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function", false);
 
     /* "Foo::Bar::run" tail matches BOTH candidates → not unique → fall through. */
     cbm_resolution_t res =
@@ -592,7 +696,7 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
  * `add` callee could ever reach it. */
 TEST(registry_indexes_by_passed_name_not_qn_tail) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function");
+    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function", false);
 
     cbm_resolution_t res = cbm_registry_resolve(r, "add", "proj.lib.caller", NULL, NULL, 0);
     ASSERT_STR_EQ(res.qualified_name, "proj.lib.add#cfg(test)");
@@ -617,9 +721,9 @@ TEST(registry_indexes_by_passed_name_not_qn_tail) {
  * lookup a bare module reference needs. */
 TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web",
-                     "Class");
-    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module");
+    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web", "Class",
+                     false);
+    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module", false);
 
     cbm_resolution_t tail = cbm_registry_resolve(r, "web", "proj.main", NULL, NULL, 0);
     ASSERT_STR_EQ(tail.qualified_name, "proj.main.resource.aws_instance.web");
@@ -637,7 +741,7 @@ TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
 
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function", false);
 
     /* Import map: "worker" → "proj.pkg.worker" */
     const char *keys[] = {"worker"};
@@ -660,9 +764,9 @@ TEST(resolve_import_map) {
  * file. Regression for the @/lib/auth-style import case. */
 TEST(resolve_import_map_bare_function) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "requireAdmin", "proj.lib.authorization.requireAdmin", "Function");
+    cbm_registry_add(r, "requireAdmin", "proj.lib.authorization.requireAdmin", "Function", false);
     /* Same name in another module — without the fix this is what gets picked. */
-    cbm_registry_add(r, "requireAdmin", "proj.lib.users.requireAdmin", "Function");
+    cbm_registry_add(r, "requireAdmin", "proj.lib.users.requireAdmin", "Function", false);
 
     const char *keys[] = {"requireAdmin"};
     const char *vals[] = {"proj.lib.authorization"};
@@ -683,7 +787,7 @@ TEST(resolve_import_map_bare_function) {
  * Regression for #875. */
 TEST(resolve_import_map_bare_alias) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function");
+    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function", false);
     /* Import map: alias "_scan_bash" → FULL SYMBOL QN (not the module). */
     const char *keys[] = {"_scan_bash"};
     const char *vals[] = {"proj.security_scan.scan_bash"};
@@ -700,10 +804,10 @@ TEST(resolve_import_map_bare_alias) {
  * already on main via #875/#979; this locks the Yui G1 shape. */
 TEST(resolve_import_map_aliased_from_import) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function");
+    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function", false);
     /* Alias ghost must not win if somehow registered. */
     cbm_registry_add(r, "bridge_execute", "proj.services.satori_bridge.gate.bridge_execute",
-                     "Function");
+                     "Function", false);
 
     const char *keys[] = {"bridge_execute"};
     const char *vals[] = {"proj.services.satori_bridge.gate.execute"};
@@ -719,7 +823,7 @@ TEST(resolve_import_map_aliased_from_import) {
 
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
+    cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function", false);
 
     /* Call "UniqueFunc" — only one candidate project-wide */
     cbm_resolution_t res =
@@ -733,7 +837,7 @@ TEST(resolve_unique_name) {
 
 TEST(resolve_unresolved) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "foo", "proj.pkg.foo", "Function");
+    cbm_registry_add(r, "foo", "proj.pkg.foo", "Function", false);
 
     /* Call "nonexistent" — not in registry */
     cbm_resolution_t res = cbm_registry_resolve(r, "nonexistent", "proj.other", NULL, NULL, 0);
@@ -749,15 +853,16 @@ TEST(visual_basic_call_resolution_is_case_insensitive) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
     cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method",
-                          CBM_LANG_VISUALBASIC);
+                          CBM_LANG_VISUALBASIC, false);
     cbm_resolution_t res = cbm_registry_resolve_call_scoped(
         r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_VISUALBASIC, "proj.Worker.Run");
     ASSERT_NOT_NULL(res.qualified_name);
     ASSERT_STR_EQ(res.qualified_name, "proj.Worker.Calculate");
     /* Every segment of a qualified callee is respelled, not only the last. */
-    cbm_registry_add_lang(r, "Helpers", "proj.Helpers.Helpers", "Class", CBM_LANG_VISUALBASIC);
+    cbm_registry_add_lang(r, "Helpers", "proj.Helpers.Helpers", "Class", CBM_LANG_VISUALBASIC,
+                          false);
     cbm_registry_add_lang(r, "Format", "proj.Helpers.Helpers.Format", "Method",
-                          CBM_LANG_VISUALBASIC);
+                          CBM_LANG_VISUALBASIC, false);
     res = cbm_registry_resolve_lang(r, "helpers.format", "proj.Worker", NULL, NULL, 0,
                                     CBM_LANG_VISUALBASIC);
     ASSERT_NOT_NULL(res.qualified_name);
@@ -771,8 +876,8 @@ TEST(visual_basic_call_resolution_is_case_insensitive) {
 TEST(visual_basic_exact_spelling_wins) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add_lang(r, "run", "proj.Lower.run", "Method", CBM_LANG_VISUALBASIC);
-    cbm_registry_add_lang(r, "RUN", "proj.Upper.RUN", "Method", CBM_LANG_VISUALBASIC);
+    cbm_registry_add_lang(r, "run", "proj.Lower.run", "Method", CBM_LANG_VISUALBASIC, false);
+    cbm_registry_add_lang(r, "RUN", "proj.Upper.RUN", "Method", CBM_LANG_VISUALBASIC, false);
     cbm_resolution_t res =
         cbm_registry_resolve_lang(r, "RUN", "proj.Upper", NULL, NULL, 0, CBM_LANG_VISUALBASIC);
     ASSERT_NOT_NULL(res.qualified_name);
@@ -785,8 +890,9 @@ TEST(visual_basic_exact_spelling_wins) {
 TEST(case_folding_is_visual_basic_only) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method", CBM_LANG_CSHARP);
-    cbm_registry_add_lang(r, "Total", "proj.Vb.Total", "Method", CBM_LANG_VISUALBASIC);
+    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method", CBM_LANG_CSHARP,
+                          false);
+    cbm_registry_add_lang(r, "Total", "proj.Vb.Total", "Method", CBM_LANG_VISUALBASIC, false);
     cbm_resolution_t res =
         cbm_registry_resolve_lang(r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_CSHARP);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
@@ -803,7 +909,7 @@ TEST(resolve_many_nodes) {
         char name[32], qn[64];
         snprintf(name, sizeof(name), "func_%d", i);
         snprintf(qn, sizeof(qn), "proj.pkg.func_%d", i);
-        cbm_registry_add(r, name, qn, "Function");
+        cbm_registry_add(r, name, qn, "Function", false);
     }
     ASSERT_EQ(cbm_registry_size(r), 500);
 
@@ -841,8 +947,8 @@ TEST(confidence_band_speculative) {
 
 TEST(resolve_suffix_match) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function", false);
 
     /* Caller in svcA — should prefer svcA via import distance */
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.svcA.caller", NULL, NULL, 0);
@@ -865,7 +971,7 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
     for (int i = 0; i < 300; i++) {
         char qn[64];
         snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
-        cbm_registry_add(r, "flags", qn, "Variable");
+        cbm_registry_add(r, "flags", qn, "Variable", false);
     }
     cbm_resolution_t res = cbm_registry_resolve(r, "flags", "proj.other.caller", NULL, NULL, 0);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
@@ -883,7 +989,7 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
 
 TEST(resolve_import_map_suffix) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Foo", "proj.other.sub.Foo", "Function");
+    cbm_registry_add(r, "Foo", "proj.other.sub.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -905,7 +1011,7 @@ TEST(resolve_is_import_reachable) {
     /* Test import reachability through unique_name confidence penalty.
      * is_import_reachable is static, so we test it indirectly. */
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Helper", "proj.shared.utils.Helper", "Function");
+    cbm_registry_add(r, "Helper", "proj.shared.utils.Helper", "Function", false);
 
     /* With import covering the module → full confidence */
     const char *keys1[] = {"utils"};
@@ -928,7 +1034,7 @@ TEST(resolve_is_import_reachable) {
 TEST(resolve_import_reachable_prefix) {
     /* "proj.handler.sub.Process" should be reachable via import "proj.handler" */
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.handler.sub.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.handler.sub.Process", "Function", false);
 
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
@@ -982,8 +1088,8 @@ TEST(reach_cache_memo_matches_uncached_across_files) {
 
 TEST(negative_import_rejects_unimported) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.billing.Process", "Function");
-    cbm_registry_add(r, "Process", "proj.handler.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.billing.Process", "Function", false);
+    cbm_registry_add(r, "Process", "proj.handler.Process", "Function", false);
 
     /* Import only handler's module — suffix_match should prefer handler */
     const char *keys[] = {"handler"};
@@ -999,8 +1105,8 @@ TEST(negative_import_rejects_unimported) {
 
 TEST(fuzzy_resolve_single_candidate) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
-    cbm_registry_add(r, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
+    cbm_registry_add(r, "ValidateOrder", "svcB.validators.ValidateOrder", "Function", false);
 
     /* FuzzyResolve should find by simple name even with unknown prefix */
     cbm_fuzzy_result_t fr =
@@ -1014,7 +1120,7 @@ TEST(fuzzy_resolve_single_candidate) {
 
 TEST(fuzzy_resolve_nonexistent) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(r, "NonExistent", "svcC.caller", NULL, NULL, 0);
@@ -1026,8 +1132,8 @@ TEST(fuzzy_resolve_nonexistent) {
 
 TEST(fuzzy_resolve_multiple_best_by_distance) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "svcA.handlers.Process", "Function");
-    cbm_registry_add(r, "Process", "svcB.handlers.Process", "Function");
+    cbm_registry_add(r, "Process", "svcA.handlers.Process", "Function", false);
+    cbm_registry_add(r, "Process", "svcB.handlers.Process", "Function", false);
 
     /* Caller in svcA — should prefer svcA */
     cbm_fuzzy_result_t fr =
@@ -1046,7 +1152,7 @@ TEST(fuzzy_resolve_multiple_best_by_distance) {
 
 TEST(fuzzy_resolve_deep_name_extraction) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "DoWork", "myproject.utils.DoWork", "Function");
+    cbm_registry_add(r, "DoWork", "myproject.utils.DoWork", "Function", false);
 
     /* Deeply qualified callee — should extract "DoWork" */
     cbm_fuzzy_result_t fr =
@@ -1071,7 +1177,7 @@ TEST(fuzzy_resolve_empty_registry) {
 
 TEST(fuzzy_resolve_confidence_single) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Handler", "proj.svc.Handler", "Function");
+    cbm_registry_add(r, "Handler", "proj.svc.Handler", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(r, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
@@ -1085,8 +1191,8 @@ TEST(fuzzy_resolve_confidence_single) {
 
 TEST(fuzzy_resolve_confidence_distance) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(r, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
@@ -1100,7 +1206,7 @@ TEST(fuzzy_resolve_confidence_distance) {
 
 TEST(fuzzy_penalty_unreachable_import) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function", false);
 
     /* Import for different module → confidence halved */
     const char *keys[] = {"other"};
@@ -1117,7 +1223,7 @@ TEST(fuzzy_penalty_unreachable_import) {
 
 TEST(fuzzy_no_import_map_passthrough) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function", false);
 
     /* nil import map → full confidence */
     cbm_fuzzy_result_t fr =
@@ -1226,8 +1332,8 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     cbm_registry_t *forward = cbm_registry_new();
     cbm_registry_t *backward = cbm_registry_new();
     for (int i = 0; i < n; i++) {
-        cbm_registry_add(forward, "dev_name", cands[i], labels[i]);
-        cbm_registry_add(backward, "dev_name", cands[n - 1 - i], labels[n - 1 - i]);
+        cbm_registry_add(forward, "dev_name", cands[i], labels[i], false);
+        cbm_registry_add(backward, "dev_name", cands[n - 1 - i], labels[n - 1 - i], false);
     }
 
     /* A far-away caller with no imports: every candidate scores the same. */
@@ -1245,10 +1351,10 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     /* Equal kind: the smaller QN, from either order. */
     cbm_registry_t *lex_a = cbm_registry_new();
     cbm_registry_t *lex_b = cbm_registry_new();
-    cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
-    cbm_registry_add(lex_a, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
-    cbm_registry_add(lex_b, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
-    cbm_registry_add(lex_b, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function", false);
+    cbm_registry_add(lex_a, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function", false);
+    cbm_registry_add(lex_b, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function", false);
+    cbm_registry_add(lex_b, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function", false);
     cbm_resolution_t la =
         cbm_registry_resolve(lex_a, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
     cbm_resolution_t lb =
@@ -1258,9 +1364,9 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
 
     /* Proximity outranks the tie order: the sibling wins over a shallower stranger. */
     cbm_registry_t *proximity = cbm_registry_new();
-    cbm_registry_add(proximity, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
+    cbm_registry_add(proximity, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function", false);
     cbm_registry_add(proximity, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
-                     "Function");
+                     "Function", false);
     cbm_resolution_t nr = cbm_registry_resolve(proximity, "vnic_rq_free",
                                                "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
     ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
@@ -1284,13 +1390,14 @@ TEST(registry_tie_prefers_callable_over_property) {
     cbm_registry_add(
         r, "where",
         "proj.exposed-core.src.main.kotlin.org.jetbrains.exposed.v1.core.AbstractQuery.where",
-        "Variable");
+        "Variable", false);
     cbm_registry_add(r, "where",
                      "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where",
-                     "Method");
+                     "Method", false);
     /* A deeper method still beats a shallower field: kind decides before order. */
-    cbm_registry_add(r, "limit", "proj.exposed-core.Table.limit", "Field");
-    cbm_registry_add(r, "limit", "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit", "Method");
+    cbm_registry_add(r, "limit", "proj.exposed-core.Table.limit", "Field", false);
+    cbm_registry_add(r, "limit", "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit", "Method",
+                     false);
 
     const char *caller =
         "proj.exposed-tests.src.test.kotlin.org.jetbrains.exposed.v1.tests.SelectTests";
@@ -1311,8 +1418,8 @@ TEST(registry_tie_prefers_callable_over_property) {
  * order alone, which is still a pure function of the candidate set (O9). */
 TEST(registry_tie_ignores_nesting_depth) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "filter", "proj.django.template.library.Library.filter", "Method");
-    cbm_registry_add(r, "filter", "proj.django.db.models.query.QuerySet.filter", "Method");
+    cbm_registry_add(r, "filter", "proj.django.template.library.Library.filter", "Method", false);
+    cbm_registry_add(r, "filter", "proj.django.db.models.query.QuerySet.filter", "Method", false);
     cbm_resolution_t f =
         cbm_registry_resolve(r, "filter", "proj.tests.lookup.tests", NULL, NULL, 0);
     ASSERT_STR_EQ(f.qualified_name, "proj.django.db.models.query.QuerySet.filter");
@@ -1334,23 +1441,25 @@ TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
     cbm_registry_add_lang(
         r, "MemoryStream",
         "proj.src.libraries.System.Runtime.ref.System.Runtime.MemoryStream.MemoryStream", "Method",
-        CBM_LANG_CSHARP);
+        CBM_LANG_CSHARP, false);
     cbm_registry_add_lang(
         r, "MemoryStream",
         "proj.src.libraries.System.Private.CoreLib.src.System.IO.MemoryStream.MemoryStream",
-        "Method", CBM_LANG_CSHARP);
+        "Method", CBM_LANG_CSHARP, false);
     /* Equal depth, "ref" sorts before "src" (WithCancellation). */
     cbm_registry_add_lang(r, "WithCancellation",
                           "proj.src.libraries.System.Linq.Parallel.ref.System.Linq."
                           "ParallelEnumerable.WithCancellation",
-                          "Method", CBM_LANG_CSHARP);
+                          "Method", CBM_LANG_CSHARP, false);
     cbm_registry_add_lang(r, "WithCancellation",
                           "proj.src.libraries.System.Linq.Parallel.src.System.Linq."
                           "ParallelEnumerable.WithCancellation",
-                          "Method", CBM_LANG_CSHARP);
+                          "Method", CBM_LANG_CSHARP, false);
     /* Not C#: a `ref` directory gets no special treatment. */
-    cbm_registry_add_lang(r, "resolve", "proj.lib.ref.Resolver.resolve", "Method", CBM_LANG_JAVA);
-    cbm_registry_add_lang(r, "resolve", "proj.lib.src.Resolver.resolve", "Method", CBM_LANG_JAVA);
+    cbm_registry_add_lang(r, "resolve", "proj.lib.ref.Resolver.resolve", "Method", CBM_LANG_JAVA,
+                          false);
+    cbm_registry_add_lang(r, "resolve", "proj.lib.src.Resolver.resolve", "Method", CBM_LANG_JAVA,
+                          false);
 
     const char *caller = "proj.src.libraries.System.Security.Cryptography.src.CapiHelper";
     cbm_resolution_t ms = cbm_registry_resolve(r, "MemoryStream", caller, NULL, NULL, 0);
@@ -1406,10 +1515,10 @@ static cbm_resolution_t xl_resolve(const cbm_registry_t *r, CBMLanguage lang, co
 
 TEST(name_guess_vetoed_across_languages) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add_lang(r, "get", "builtins.dict.get", "Method", CBM_LANG_PYTHON);
-    cbm_registry_add_lang(r, "patch", "proj.web.Panel.patch", "Function", CBM_LANG_TSX);
-    cbm_registry_add_lang(r, "patch", "proj.api.client.patch", "Function", CBM_LANG_PYTHON);
-    cbm_registry_add(r, "legacy", "proj.x.legacy", "Function"); /* unknown language */
+    cbm_registry_add_lang(r, "get", "builtins.dict.get", "Method", CBM_LANG_PYTHON, false);
+    cbm_registry_add_lang(r, "patch", "proj.web.Panel.patch", "Function", CBM_LANG_TSX, false);
+    cbm_registry_add_lang(r, "patch", "proj.api.client.patch", "Function", CBM_LANG_PYTHON, false);
+    cbm_registry_add(r, "legacy", "proj.x.legacy", "Function", false); /* unknown language */
 
     /* JS `app.get`: the only "get" is Python's -> EMPTY, not unique_name. */
     cbm_resolution_t res = xl_resolve(r, CBM_LANG_JAVASCRIPT, "app.get", "proj.app");
@@ -1455,10 +1564,11 @@ TEST(name_guess_vetoed_across_languages) {
 TEST(same_module_vetoed_across_languages) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add_lang(r, "reducer_worker", "proj.tests.cov.reducer_worker", "Function",
-                          CBM_LANG_PYTHON);
+                          CBM_LANG_PYTHON, false);
     cbm_registry_add_lang(r, "reducer_worker", "proj.other.reducer_worker", "Function",
-                          CBM_LANG_PYTHON);
-    cbm_registry_add_lang(r, "stat_child", "proj.tests.cov.stat_child", "Function", CBM_LANG_C);
+                          CBM_LANG_PYTHON, false);
+    cbm_registry_add_lang(r, "stat_child", "proj.tests.cov.stat_child", "Function", CBM_LANG_C,
+                          false);
 
     cbm_resolution_t res =
         cbm_registry_resolve(r, "reducer_worker", "proj.tests.cov", NULL, NULL, 0);
@@ -1615,11 +1725,11 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
      * A bare C call never names a member, so its Field namesakes do not
      * compete: the function is the unique name it was in v0.11.0. */
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add_lang(r, "put_page", "proj.include.linux.mm.put_page", "Function",
-                          CBM_LANG_CPP);
+    cbm_registry_add_lang(r, "put_page", "proj.include.linux.mm.put_page", "Function", CBM_LANG_CPP,
+                          false);
     cbm_registry_add_lang(r, "put_page",
                           "proj.arch.arm64.include.asm.kvm_pgtable.kvm_pgtable_mm_ops.put_page",
-                          "Field", CBM_LANG_CPP);
+                          "Field", CBM_LANG_CPP, false);
     const char *mod = "proj.arch.arm64.kernel.elfcore";
     cbm_resolution_t res =
         cbm_registry_resolve_call_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_C);
@@ -1634,13 +1744,14 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
     /* A name only members carry is no bare C call target at all -- neither a
      * struct member nor a C++ method: redis's libc `read()` became the unique
      * name of a Qt adapter's `read` Method once only Fields were set aside. */
-    cbm_registry_add_lang(r, "on_close", "proj.net.sock.sock_ops.on_close", "Field", CBM_LANG_C);
+    cbm_registry_add_lang(r, "on_close", "proj.net.sock.sock_ops.on_close", "Field", CBM_LANG_C,
+                          false);
     res = cbm_registry_resolve_call_lang(r, "on_close", mod, NULL, NULL, 0, CBM_LANG_C);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
     cbm_registry_add_lang(r, "read", "proj.deps.hiredis.adapters.qt.RedisQtAdapter.read", "Method",
-                          CBM_LANG_CPP);
-    cbm_registry_add_lang(r, "read", "proj.src.connection.ConnectionType.read", "Field",
-                          CBM_LANG_C);
+                          CBM_LANG_CPP, false);
+    cbm_registry_add_lang(r, "read", "proj.src.connection.ConnectionType.read", "Field", CBM_LANG_C,
+                          false);
     res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_C);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
     /* C++ still reaches the method by name. */
@@ -1711,12 +1822,12 @@ TEST(unique_field_qn_needs_exactly_one_field_of_that_name) {
      * the same name is not a candidate for a member at all. */
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "only_here", "proj.a.Alpha.only_here", "Field");
-    cbm_registry_add(r, "count", "proj.a.Alpha.count", "Field");
-    cbm_registry_add(r, "count", "proj.b.Beta.count", "Field");
-    cbm_registry_add(r, "close", "proj.cb.Callbacks.close", "Field");
-    cbm_registry_add(r, "close", "proj.io.close", "Function");
-    cbm_registry_add(r, "lonely_fn", "proj.io.lonely_fn", "Function");
+    cbm_registry_add(r, "only_here", "proj.a.Alpha.only_here", "Field", false);
+    cbm_registry_add(r, "count", "proj.a.Alpha.count", "Field", false);
+    cbm_registry_add(r, "count", "proj.b.Beta.count", "Field", false);
+    cbm_registry_add(r, "close", "proj.cb.Callbacks.close", "Field", false);
+    cbm_registry_add(r, "close", "proj.io.close", "Function", false);
+    cbm_registry_add(r, "lonely_fn", "proj.io.lonely_fn", "Function", false);
 
     const char *only = cbm_registry_unique_field_qn(r, "only_here");
     ASSERT_NOT_NULL(only);
@@ -1817,7 +1928,7 @@ TEST(generated_member_registers_by_qn_only) {
     ASSERT_EQ(n, 0);
     cbm_resolution_t res = cbm_registry_resolve(r, "v.y", "proj.app.Caller", NULL, NULL, 0);
     ASSERT_NULL(res.qualified_name);
-    cbm_registry_add(r, "x", "proj.geo.Point.Point.x", "Method");
+    cbm_registry_add(r, "x", "proj.geo.Point.Point.x", "Method", false);
     res = cbm_registry_resolve(r, "v.x", "proj.app.Caller", NULL, NULL, 0);
     ASSERT_STR_EQ(res.qualified_name, "proj.geo.Point.Point.x");
     /* Degenerate input registers nothing. */
@@ -2474,8 +2585,8 @@ TEST(go_suppress_keeps_typed_and_import_aware_matches) {
  * Signal.send). Regression guard for #1000. */
 TEST(resolve_import_map_alias_with_suffix_hits_method) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable");
-    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method");
+    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable", false);
+    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method", false);
     const char *keys[] = {"user_logged_in"};
     const char *vals[] = {"proj.auth.signals.user_logged_in"};
     cbm_resolution_t res =
@@ -2489,7 +2600,7 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
 TEST(swift_overload_labels_defaults_and_trailing_closure) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    cbm_registry_add(r, "Service", "proj.Service", "Class", false);
     const char *qns[] = {
         "proj.Service.work(flag:Bool)",
         "proj.Service.work(name:String)",
@@ -2520,7 +2631,7 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
                            "combine", "repeated", "repeated", "unlabeled"};
     const uint8_t counts[] = {1, 1, 1, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2};
     for (int i = 0; i < 22; i++) {
-        cbm_registry_add(r, names[i], qns[i], "Method");
+        cbm_registry_add(r, names[i], qns[i], "Method", false);
         uint64_t defaults = (i == 5 || i == 15)  ? UINT64_C(1) << 1
                             : i == 17 || i >= 19 ? UINT64_C(1)
                                                  : 0;
@@ -2531,7 +2642,7 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
     const char *generic_qns[] = {"proj.Service.constrained<T;where T==()=>Void>(_:T)",
                                  "proj.Service.constrained<T>(_:T)async"};
     for (int i = 0; i < 2; i++) {
-        cbm_registry_add(r, "constrained", generic_qns[i], "Method");
+        cbm_registry_add(r, "constrained", generic_qns[i], "Method", false);
         cbm_registry_set_swift_signature(r, generic_qns[i], 0, 1, NULL);
     }
     CBMCallArg generic_arg = {0};
@@ -2539,7 +2650,7 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
         .callee_name = "Service.constrained", .args = &generic_arg, .arg_count = 1};
     ASSERT_EQ(cbm_registry_swift_candidates(r, &generic_call, "proj.Caller", NULL, 0, out, 8), 2);
     const char *nested = "proj.Service.nested<T,U;where T==Box<[Int]>,U==()=>Void>(_:T)=>Int";
-    cbm_registry_add(r, "nested", nested, "Method");
+    cbm_registry_add(r, "nested", nested, "Method", false);
     cbm_registry_set_swift_signature(r, nested, 0, 1, NULL);
     generic_call.callee_name = "Service.nested";
     ASSERT_EQ(cbm_registry_swift_candidates(r, &generic_call, "proj.Caller", NULL, 0, out, 8), 1);
@@ -2547,7 +2658,7 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
     const char *returns[] = {"proj.Service.pick()=>Int",
                              "proj.Service.pick()async=>(A/Item)=>B/Item"};
     for (int i = 0; i < 2; i++) {
-        cbm_registry_add(r, "pick", returns[i], "Method");
+        cbm_registry_add(r, "pick", returns[i], "Method", false);
         cbm_registry_set_swift_signature(r, returns[i], 0, 0, NULL);
     }
     CBMCall returned = {.callee_name = "Service.pick"};
@@ -2555,7 +2666,7 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
     const char *malformed[] = {"proj.Service.bad()=>", "proj.Service.bad()=>[Int",
                                "proj.Service.bad()=>Int)"};
     for (int i = 0; i < 3; i++) {
-        cbm_registry_add(r, "bad", malformed[i], "Method");
+        cbm_registry_add(r, "bad", malformed[i], "Method", false);
         cbm_registry_set_swift_signature(r, malformed[i], 0, 0, NULL);
     }
     returned.callee_name = "Service.bad";
@@ -2564,7 +2675,7 @@ TEST(swift_overload_labels_defaults_and_trailing_closure) {
     for (int i = 0; i < 2; i++) {
         char qn[128];
         snprintf(qn, sizeof(qn), "proj.Service.%s(_:A,_:A)=>Bool", operators[i]);
-        cbm_registry_add(r, operators[i], qn, "Method");
+        cbm_registry_add(r, operators[i], qn, "Method", false);
         cbm_registry_set_swift_signature(r, qn, 0, 2, NULL);
         CBMCallArg operands[2] = {{0}};
         CBMCall operation = {.callee_name = operators[i], .args = operands, .arg_count = 2};
@@ -2728,14 +2839,14 @@ TEST(swift_manifest_root_targets_respect_nested_package_boundaries) {
     const char *methods[] = {"proj.Root.Ext.Service.run()", "proj.Nested.Ext.Service.run()",
                              "proj.Unknown.Ext.Service.run()"};
     for (int i = 0; i < 5; i++) {
-        cbm_registry_add(r, "Service", qns[i], "Class");
+        cbm_registry_add(r, "Service", qns[i], "Class", false);
         ASSERT_GT(cbm_gbuf_upsert_node(graph, "Class", "Service", qns[i], files[i], 1, 3,
                                        i == 0 || i == 2 ? "{\"swift_type_path\":\"Service\"}"
                                                         : "{\"swift_extension\":\"Service\"}"),
                   0);
     }
     for (int i = 0; i < 3; i++) {
-        cbm_registry_add(r, "run", methods[i], "Method");
+        cbm_registry_add(r, "run", methods[i], "Method", false);
         cbm_registry_set_swift_signature(r, methods[i], 0, 0, "()");
     }
     cbm_registry_build_swift_owners(r, graph, root, NULL, 0);
@@ -2772,12 +2883,12 @@ TEST(swift_receiver_resolution_is_independent_of_registration_order) {
     for (int reverse = 0; reverse < 2; reverse++) {
         cbm_registry_t *r = cbm_registry_new();
         ASSERT_NOT_NULL(r);
-        cbm_registry_add(r, "Service", "proj.alpha.Service", "Class");
-        cbm_registry_add(r, "Service", "proj.beta.Service", "Class");
+        cbm_registry_add(r, "Service", "proj.alpha.Service", "Class", false);
+        cbm_registry_add(r, "Service", "proj.beta.Service", "Class", false);
         const char *first = reverse ? beta : alpha;
         const char *second = reverse ? alpha : beta;
-        cbm_registry_add(r, "work", first, "Method");
-        cbm_registry_add(r, "work", second, "Method");
+        cbm_registry_add(r, "work", first, "Method", false);
+        cbm_registry_add(r, "work", second, "Method", false);
         cbm_registry_set_swift_signature(r, first, 0, 1, NULL);
         cbm_registry_set_swift_signature(r, second, 0, 1, NULL);
 
@@ -2796,11 +2907,11 @@ TEST(swift_receiver_resolution_is_independent_of_registration_order) {
 TEST(swift_multiple_trailing_closures_match_labels) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    cbm_registry_add(r, "Service", "proj.Service", "Class", false);
     const char *one_qn = "proj.Service.handle(completion:()=>Void)";
     const char *two_qn = "proj.Service.handle(completion:()=>Void,onError:()=>Void)";
-    cbm_registry_add(r, "handle", one_qn, "Method");
-    cbm_registry_add(r, "handle", two_qn, "Method");
+    cbm_registry_add(r, "handle", one_qn, "Method", false);
+    cbm_registry_add(r, "handle", two_qn, "Method", false);
     cbm_registry_set_swift_signature(r, one_qn, 0, 1, NULL);
     cbm_registry_set_swift_signature(r, two_qn, 0, 2, NULL);
 
@@ -2833,7 +2944,7 @@ TEST(swift_multiple_trailing_closures_match_labels) {
      * closure can skip an earlier defaulted closure and bind the required one. */
     const char *delayed_qn =
         "proj.Service.delayed(onDismiss:(()=>Void)?,content:()=>Void,onError:(()=>Void)?)";
-    cbm_registry_add(r, "delayed", delayed_qn, "Method");
+    cbm_registry_add(r, "delayed", delayed_qn, "Method", false);
     cbm_registry_set_swift_signature(r, delayed_qn, (UINT64_C(1) << 0) | (UINT64_C(1) << 2), 3,
                                      NULL);
     call.callee_name = "Service.delayed";
@@ -2850,9 +2961,9 @@ TEST(swift_multiple_trailing_closures_match_labels) {
 TEST(swift_repeated_labels_skip_default_before_next_trailing_label) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    cbm_registry_add(r, "Service", "proj.Service", "Class", false);
     const char *qn = "proj.Service.repeated(a:()=>Void,b:()=>Void,a:()=>Void,b:()=>Void)";
-    cbm_registry_add(r, "repeated", qn, "Method");
+    cbm_registry_add(r, "repeated", qn, "Method", false);
     cbm_registry_set_swift_signature(r, qn, (UINT64_C(1) << 0) | (UINT64_C(1) << 3), 4, NULL);
     const char *labels[3] = {NULL, "a", "b"};
     CBMCall call = {.callee_name = "Service.repeated",
@@ -2871,9 +2982,9 @@ TEST(swift_repeated_labels_skip_default_before_next_trailing_label) {
 TEST(swift_repeated_labels_do_not_skip_default_past_next_trailing_label) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    cbm_registry_add(r, "Service", "proj.Service", "Class", false);
     const char *qn = "proj.Service.repeated(a:()=>Void,b:()=>Void,a:()=>Void,b:()=>Void)";
-    cbm_registry_add(r, "repeated", qn, "Method");
+    cbm_registry_add(r, "repeated", qn, "Method", false);
     cbm_registry_set_swift_signature(r, qn, (UINT64_C(1) << 0) | (UINT64_C(1) << 1), 4, NULL);
     const char *labels[2] = {NULL, "b"};
     CBMCall call = {.callee_name = "Service.repeated",
@@ -2893,9 +3004,9 @@ TEST(swift_repeated_labels_do_not_skip_default_past_next_trailing_label) {
 TEST(swift_variadic_trailing_closures_do_not_precede_parenthesized_argument) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    cbm_registry_add(r, "Service", "proj.Service", "Class", false);
     const char *qn = "proj.Service.f(callbacks:(()=>Void)~,flag:Bool,done:()=>Void)";
-    cbm_registry_add(r, "f", qn, "Method");
+    cbm_registry_add(r, "f", qn, "Method", false);
     cbm_registry_set_swift_signature(r, qn, UINT64_C(1) << 1, 3, NULL);
     CBMCallArg arg = {.keyword = "flag"};
     const char *labels[2] = {NULL, "done"};
@@ -2916,17 +3027,17 @@ TEST(swift_variadic_trailing_closures_do_not_precede_parenthesized_argument) {
 TEST(swift_overloaded_bucket_fails_closed) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Service", "proj.Service", "Class");
+    cbm_registry_add(r, "Service", "proj.Service", "Class", false);
     const char *first_qn = "proj.Service.work(flag:Bool)";
-    cbm_registry_add(r, "work", first_qn, "Method");
+    cbm_registry_add(r, "work", first_qn, "Method", false);
     cbm_registry_set_swift_signature(r, first_qn, 0, 1, NULL);
     const char *other = "proj.Other.work(flag:Bool)";
-    cbm_registry_add(r, "work", other, "Method");
+    cbm_registry_add(r, "work", other, "Method", false);
     cbm_registry_set_swift_signature(r, other, 0, 1, NULL);
     char qns[256][64];
     for (int i = 1; i < 256; i++) {
         snprintf(qns[i], sizeof(qns[i]), "proj.Other%d.work(flag:Bool)", i);
-        cbm_registry_add(r, "work", qns[i], "Method");
+        cbm_registry_add(r, "work", qns[i], "Method", false);
         cbm_registry_set_swift_signature(r, qns[i], 0, 1, NULL);
     }
     CBMCall call = {.callee_name = "Service.work"};
@@ -2992,11 +3103,11 @@ TEST(python_symbol_scope_len_preserves_file_identity) {
 TEST(registry_python_package_scope_is_explicit) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Field", "proj.forms.fields.Field", "Class");
-    cbm_registry_add(r, "Field", "proj.db.fields.Field", "Class");
-    cbm_registry_add(r, "Field", "proj.db.fields.__init__.Field", "Class");
-    cbm_registry_add(r, "Field", "proj.db.plain.Field", "Class");
-    cbm_registry_add(r, "Field", "proj.db.index.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.forms.fields.Field", "Class", false);
+    cbm_registry_add(r, "Field", "proj.db.fields.Field", "Class", false);
+    cbm_registry_add(r, "Field", "proj.db.fields.__init__.Field", "Class", false);
+    cbm_registry_add(r, "Field", "proj.db.plain.Field", "Class", false);
+    cbm_registry_add(r, "Field", "proj.db.index.Field", "Class", false);
     const char *keys[] = {"forms"};
     const char *vals[] = {"proj.forms"};
     const char *module = "proj.db.fields.__init__";
@@ -3028,11 +3139,11 @@ TEST(registry_python_package_scope_is_explicit) {
 TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Field", "proj.vendor.Field", "Class");
-    cbm_registry_add(r, "Field", "proj.pkg.Field", "Class");
-    cbm_registry_add(r, "Field", "proj.pkg.__init__.Field", "Class");
-    cbm_registry_add(r, "choose", "proj.pkg.__init__.child.choose", "Function");
-    cbm_registry_add(r, "choose", "proj.pkg.peer.choose", "Function");
+    cbm_registry_add(r, "Field", "proj.vendor.Field", "Class", false);
+    cbm_registry_add(r, "Field", "proj.pkg.Field", "Class", false);
+    cbm_registry_add(r, "Field", "proj.pkg.__init__.Field", "Class", false);
+    cbm_registry_add(r, "choose", "proj.pkg.__init__.child.choose", "Function", false);
+    cbm_registry_add(r, "choose", "proj.pkg.peer.choose", "Function", false);
     const char *keys[] = {"Field"};
     const char *vals[] = {"proj.vendor.Field"};
     bool seeded = cbm_registry_size(r) == 5;
@@ -3056,14 +3167,14 @@ TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
 TEST(registry_python_scope_cache_modes_and_raw_lineage) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
-    cbm_registry_add(r, "Entry", "proj.pkg.Entry", "Function");
-    cbm_registry_add(r, "Entry", "proj.pkg.__init__.Entry", "Function");
-    cbm_registry_add(r, "Reject", "proj.pkg.Reject", "Table");
-    cbm_registry_add(r, "Reject", "proj.pkg.__init__.Reject", "Function");
-    cbm_registry_add(r, "Accept", "proj.pkg.Accept", "Function");
-    cbm_registry_add(r, "Accept", "proj.pkg.__init__.Accept", "Table");
-    cbm_registry_add(r, "Relation", "proj.pkg.Relation", "View");
-    cbm_registry_add(r, "Relation", "proj.pkg.__init__.Relation", "Table");
+    cbm_registry_add(r, "Entry", "proj.pkg.Entry", "Function", false);
+    cbm_registry_add(r, "Entry", "proj.pkg.__init__.Entry", "Function", false);
+    cbm_registry_add(r, "Reject", "proj.pkg.Reject", "Table", false);
+    cbm_registry_add(r, "Reject", "proj.pkg.__init__.Reject", "Function", false);
+    cbm_registry_add(r, "Accept", "proj.pkg.Accept", "Function", false);
+    cbm_registry_add(r, "Accept", "proj.pkg.__init__.Accept", "Table", false);
+    cbm_registry_add(r, "Relation", "proj.pkg.Relation", "View", false);
+    cbm_registry_add(r, "Relation", "proj.pkg.__init__.Relation", "Table", false);
     bool seeded = cbm_registry_size(r) == 8;
     bool correct = true;
     /* Each cache lifetime has one fixed module/import map. Alternate modes in
@@ -3141,12 +3252,12 @@ TEST(registry_python_scope_complete_candidate_boundaries) {
         int tn = snprintf(target, sizeof(target), "%s.%s", scope, name);
         bool shape = mn > 0 && (size_t)mn < sizeof(module) && tn > 0 && (size_t)tn == lengths[i] &&
                      (size_t)tn < sizeof(target);
-        cbm_registry_add(r, name, target, "Function");
+        cbm_registry_add(r, name, target, "Function", false);
         if (lengths[i] > 511) {
             char truncated[512];
             memcpy(truncated, target, sizeof(truncated) - 1);
             truncated[sizeof(truncated) - 1] = '\0';
-            cbm_registry_add(r, "truncated_decoy", truncated, "Function");
+            cbm_registry_add(r, "truncated_decoy", truncated, "Function", false);
         }
         const char *canonical = registry_scope_canonical(r, name, target);
         cbm_resolution_t python =
@@ -3173,7 +3284,7 @@ TEST(registry_python_scope_qualified_terminal_bucket_uncapped) {
         char qn[80];
         int n = snprintf(qn, sizeof(qn), "proj.noise%d.perform", i);
         shape = n > 0 && (size_t)n < sizeof(qn) && shape;
-        cbm_registry_add(r, "perform", qn, "Method");
+        cbm_registry_add(r, "perform", qn, "Method", false);
     }
     char scope[1024];
     memcpy(scope, "proj.", 5);
@@ -3191,7 +3302,7 @@ TEST(registry_python_scope_qualified_terminal_bucket_uncapped) {
         int pn = snprintf(prefixed, sizeof(prefixed), "receiver.%s", names[i]);
         shape = tn > 0 && (size_t)tn < sizeof(target) && pn > 0 && (size_t)pn < sizeof(prefixed) &&
                 shape;
-        cbm_registry_add(r, "perform", target, "Method");
+        cbm_registry_add(r, "perform", target, "Method", false);
         const char *canonical = registry_scope_canonical(r, "perform", target);
         cbm_resolution_t direct =
             cbm_registry_resolve_lang(r, names[i], module, NULL, NULL, 0, CBM_LANG_PYTHON);
@@ -3225,13 +3336,13 @@ TEST(registry_python_function_local_is_exact_only_issue1548) {
         {"Inner", "proj.web.Outer.Inner", "Class"},
     };
     for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
-        cbm_registry_add_lang_in_module(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_PYTHON,
-                                        web);
+        cbm_registry_add_lang_in_module(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_PYTHON, web,
+                                        false);
     }
     cbm_registry_add_lang_in_module(r, "f", "proj.ts.f", "Function", CBM_LANG_TYPESCRIPT,
-                                    strlen("proj.ts"));
+                                    strlen("proj.ts"), false);
     cbm_registry_add_lang_in_module(r, "g", "proj.ts.f.g", "Function", CBM_LANG_TYPESCRIPT,
-                                    strlen("proj.ts"));
+                                    strlen("proj.ts"), false);
 
     static const char *const local[] = {"proj.web.create_app.index", "proj.web.create_app.Settings",
                                         "proj.web.create_app.Settings.value"};
@@ -3283,7 +3394,7 @@ TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
     };
     for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
         cbm_registry_add_lang_in_module(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_PYTHON,
-                                        strlen("proj.m"));
+                                        strlen("proj.m"), false);
     }
 
     /* In method Tree.visit, `visit` is its nested def; so it is inside that
@@ -3325,17 +3436,17 @@ TEST(registry_python_local_bound_at_own_file_issue1548) {
         cbm_registry_t *r = cbm_registry_new();
         if (order == 0) {
             cbm_registry_add_lang_in_module(r, "layout", "proj.pkg.layout", "Function",
-                                            CBM_LANG_PYTHON, init_prefix);
+                                            CBM_LANG_PYTHON, init_prefix, false);
         }
         cbm_registry_add_lang_in_module(r, "Layout", "proj.pkg.layout.Layout", "Class",
-                                        CBM_LANG_PYTHON, mod_prefix);
+                                        CBM_LANG_PYTHON, mod_prefix, false);
         cbm_registry_add_lang_in_module(r, "create", "proj.pkg.layout.Layout.create", "Method",
-                                        CBM_LANG_PYTHON, mod_prefix);
+                                        CBM_LANG_PYTHON, mod_prefix, false);
         cbm_registry_add_lang_in_module(r, "make", "proj.pkg.layout.make", "Function",
-                                        CBM_LANG_PYTHON, mod_prefix);
+                                        CBM_LANG_PYTHON, mod_prefix, false);
         if (order == 1) {
             cbm_registry_add_lang_in_module(r, "layout", "proj.pkg.layout", "Function",
-                                            CBM_LANG_PYTHON, init_prefix);
+                                            CBM_LANG_PYTHON, init_prefix, false);
         }
         static const char *const nameable[][2] = {{"Layout", "proj.pkg.layout.Layout"},
                                                   {"create", "proj.pkg.layout.Layout.create"},
@@ -3403,6 +3514,11 @@ SUITE(registry) {
     RUN_TEST(registry_create_free);
     RUN_TEST(registry_free_null);
     RUN_TEST(registry_add_and_exists);
+    RUN_TEST(registry_prefers_non_test_over_test_candidate);
+    RUN_TEST(registry_test_verdict_comes_from_the_caller_not_the_qn);
+    RUN_TEST(registry_sole_test_candidate_still_resolves);
+    RUN_TEST(registry_test_double_path_table);
+    RUN_TEST(registry_swift_overload_choice_uses_stored_verdicts);
     RUN_TEST(registry_label_of);
     RUN_TEST(registry_value_target_field_twin);
     RUN_TEST(registry_find_by_name);

@@ -521,13 +521,16 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge.
-     * A generated member is registered by qualified name only, at all three. */
+     * A generated member is registered by qualified name only, at all three.
+     * The registry's test verdict is the extractor's OR the test-double path
+     * rule (cbm_registry_test_double_path) on the node's file, at all three. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         if (cbm_def_props_generated(def->extra_props)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
-                                            def->label, lang, module_prefix_len);
+                                            def->label, lang, module_prefix_len,
+                                            def->is_test || cbm_registry_test_double_path(def_rel));
         }
         if (def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,

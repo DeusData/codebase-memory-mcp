@@ -16029,11 +16029,35 @@ TEST(vb_interface_abstract_and_nested_members) {
     PASS();
 }
 
-/* *Test.vb / *Tests.vb are test files (from #2885). */
+/* is_test of the Method `Run` the source below defines, extracted as `path`;
+ * -1 when no such Method was extracted. */
+static int vb_run_method_is_test(const char *path) {
+    CBMFileResult *r = extract("Public Class OrderTests\n"
+                               "    Public Sub Run()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", path);
+    int verdict = -1;
+    for (int i = 0; r && i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "Run") == 0) {
+            verdict = d->is_test ? 1 : 0;
+        }
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+    return verdict;
+}
+
+/* *Test.vb / *Tests.vb are test files (from #2885), and that verdict reaches
+ * the methods they define: the registry ranks on it (#2427). */
 TEST(vb_test_file_names) {
     ASSERT_TRUE(cbm_is_test_file("src/OrderTests.vb", CBM_LANG_VISUALBASIC));
     ASSERT_TRUE(cbm_is_test_file("src/OrderTest.vb", CBM_LANG_VISUALBASIC));
     ASSERT_FALSE(cbm_is_test_file("src/Order.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_EQ(vb_run_method_is_test("src/OrderTests.vb"), 1);
+    ASSERT_EQ(vb_run_method_is_test("src/Order.vb"), 0);
     PASS();
 }
 
