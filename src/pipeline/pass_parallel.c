@@ -1826,15 +1826,17 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c) — see pass_definitions.c for the per-label rationale, for
      * the generated member registered by qualified name only, and for the
-     * test-double path rule, judged on the path the def's node stores. */
+     * test verdict (the extractor's, its file rule, the test-double path
+     * rule), judged on the path the def's node stores. */
     if (cbm_label_is_registry_symbol(def->label)) {
         if (cbm_def_props_generated(def->extra_props)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
             const char *def_rel = def->file_path ? def->file_path : rel;
+            bool is_test = def->is_test || cbm_is_test_file(def_rel, lang) ||
+                           cbm_registry_test_double_path(def_rel);
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
-                                            def->label, lang, module_prefix_len,
-                                            def->is_test || cbm_registry_test_double_path(def_rel));
+                                            def->label, lang, module_prefix_len, is_test);
         }
         if (def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
