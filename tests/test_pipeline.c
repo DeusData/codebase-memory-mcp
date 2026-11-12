@@ -6861,6 +6861,52 @@ TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental) {
     PASS();
 }
 
+/* Test code ranks test candidates like any other: the test penalty is for
+ * production callers. kafka's clients tests call `new MockTime()`, meaning the
+ * clients test helper next to them; with every test-file definition ranked as
+ * test, a same-named class in a test-support module under src/main (which no
+ * test rule marks) won instead. For a test caller no candidate takes the
+ * penalty, so proximity picks the helper again, in the full index and on both
+ * incremental routes. */
+TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tcaller_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "clients/src/test/java/org/acme/clients/ClientTest.java";
+    static const char caller[] = "package org.acme.clients;\n\n"
+                                 "public class ClientTest {\n"
+                                 "    Object make() { return new MockTime(); }\n"
+                                 "}\n";
+    static const char helper_path[] = "clients/src/test/java/org/acme/common/utils/MockTime.java";
+    static const char support_path[] =
+        "streams/test-utils/src/main/java/org/acme/streams/TopologyTestDriver.java";
+    write_temp_file(tmp, helper_path,
+                    "package org.acme.common.utils;\n\npublic class MockTime {}\n");
+    write_temp_file(tmp, support_path,
+                    "package org.acme.streams;\n\npublic class TopologyTestDriver {\n"
+                    "    static class MockTime {\n        MockTime() {}\n    }\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "make", "MockTime", helper_path, support_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "make", "MockTime", helper_path, support_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -34732,6 +34778,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental);
     RUN_TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental);
     RUN_TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
