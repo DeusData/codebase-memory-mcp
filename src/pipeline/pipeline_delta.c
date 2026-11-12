@@ -623,6 +623,28 @@ static char *delta_generated_props(const char *props, const char *generated) {
     return out;
 }
 
+/* `props` (a JSON object) with the extractor's test verdict added as
+ * `"is_test":true` (CBM_MEM_CLASS_OTHER; the caller frees), NULL on allocation
+ * failure. The incremental registry seed reads the verdict back
+ * (cbm_node_is_test) so a re-resolved caller ranks a test definition below
+ * real code exactly as the full build does; an absent key reads as false. */
+static char *delta_test_props(const char *props) {
+    static const char member[] = "\"is_test\":true";
+    size_t pl = props ? strlen(props) : 0;
+    bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
+    size_t cap = pl + sizeof(member) + CBM_SZ_4;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    if (has_members) {
+        snprintf(out, cap, "%.*s,%s}", (int)(pl - SKIP_ONE), props, member);
+    } else {
+        snprintf(out, cap, "{%s}", member);
+    }
+    return out;
+}
+
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
@@ -673,7 +695,13 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * And a generated member's mark (a Java record's implicit accessor, a
      * Method node): the registry seed reads it to register the member by
      * qualified name only, as the full build does (cbm_node_props_generated);
-     * without it the proxy came back into the short-name index. */
+     * without it the proxy came back into the short-name index.
+     *
+     * And the extractor's test verdict: the registry seed reads it back
+     * (cbm_node_is_test) to rank a test definition below real code, as the
+     * full build does with CBMDefinition.is_test; without it every proxy
+     * scored as production and a re-resolved caller could bind a test helper
+     * the full build ranks last. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -702,7 +730,8 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " THEN json_extract(properties, '$.parent_class') END,"
             " CASE WHEN label = 'Method'"
             " AND instr(properties, '\"" CBM_PROP_GENERATED "\"') > 0"
-            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END"
+            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END,"
+            " instr(properties, '\"is_test\":true') > 0"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -727,14 +756,27 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         int end_line = sqlite3_column_int(stmt, 7);
         const char *parent = (const char *)sqlite3_column_text(stmt, 8);
         const char *generated = (const char *)sqlite3_column_text(stmt, 9);
+        bool is_test = sqlite3_column_int(stmt, 10) != 0;
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
         char *generated_props = delta_generated_props(props, generated);
+        const char *seed_props = generated_props ? generated_props : props;
+        char *test_props = is_test ? delta_test_props(seed_props) : NULL;
+        if (is_test && !test_props) {
+            /* A proxy without its verdict would rank as production code;
+             * the run cannot be trusted, as with an id mismatch below. */
+            cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
+            cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
+            sqlite3_finalize(stmt);
+            cbm_log_error("delta.preseed_verdict_alloc_failed", "qn", qn ? qn : "");
+            return -1;
+        }
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
         int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
-                                           end_line, generated_props ? generated_props : props);
+                                           end_line, test_props ? test_props : seed_props);
+        cbm_free(CBM_MEM_CLASS_OTHER, test_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
         if (got != id) {
