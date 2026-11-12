@@ -973,6 +973,14 @@ def main():
                 "cache-root conflict did not emit visible remediation guidance: "
                 + repr(mismatched_result.stderr),
             )
+            check(
+                'requested cache: ' + json.dumps(str(mismatched_cache.resolve()))
+                in mismatched_result.stderr
+                and 'daemon cache: ' + json.dumps(str(cache.resolve()))
+                in mismatched_result.stderr,
+                "cache-root conflict did not name both canonical paths: "
+                + repr(mismatched_result.stderr),
+            )
             wait_until(
                 lambda: any(
                     item.get("reason") == "cache_root"

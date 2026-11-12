@@ -280,6 +280,7 @@ struct cbm_daemon_runtime_service {
 
     char semantic_version[CBM_DAEMON_VERSION_TEXT_SIZE];
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char cache_directory[CBM_DAEMON_STATUS_CACHE_PATH_SIZE];
     cbm_daemon_build_identity_t identity;
     runtime_process_image_reference_t active_image;
     /* Guarded by mutex. Retained references keep each verified inode alive,
@@ -357,6 +358,11 @@ static uint64_t runtime_deadline_after(uint32_t timeout_ms) {
         return UINT64_MAX;
     }
     return now_ms + (uint64_t)timeout_ms;
+}
+
+static uint32_t runtime_timeout_remaining(uint64_t deadline_ms) {
+    uint64_t now_ms = cbm_now_ms();
+    return now_ms < deadline_ms ? (uint32_t)(deadline_ms - now_ms) : 0;
 }
 
 static uint32_t runtime_ephemeral_linger_timeout_ms(void) {
@@ -2132,13 +2138,17 @@ static void runtime_control_collect_clients_locked(cbm_daemon_runtime_service_t 
 }
 
 static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
-                                         const uint8_t *payload, uint32_t length) {
+                                         const uint8_t *payload, uint32_t length,
+                                         cbm_daemon_runtime_operation_t operation) {
     cbm_daemon_runtime_service_t *service = worker->service;
     char requested_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     bool peer_verified =
         runtime_control_request_decode(payload, length, requested_build) &&
         runtime_activation_peer_matches_claim(service, worker->peer_process_id, requested_build);
-    uint8_t response[CBM_DAEMON_STATUS_RESPONSE_SIZE];
+    uint8_t response[CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE];
+    uint32_t response_size = operation == CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS
+                                 ? CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE
+                                 : CBM_DAEMON_STATUS_RESPONSE_SIZE;
     memset(response, 0, sizeof(response));
     if (peer_verified) {
         uint8_t count = 0U;
@@ -2173,9 +2183,13 @@ static void runtime_worker_handle_status(cbm_daemon_runtime_worker_t *worker,
                        service->identity.semantic_version ? service->identity.semantic_version
                                                           : "");
         cbm_mutex_unlock(&service->mutex);
+        if (operation == CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS) {
+            memcpy(response + CBM_DAEMON_STATUS_RESPONSE_SIZE, service->cache_directory,
+                   sizeof(service->cache_directory));
+        }
     }
-    (void)runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE, CBM_DAEMON_RUNTIME_OP_STATUS,
-                                    response, (uint32_t)sizeof(response));
+    (void)runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE, operation, response,
+                                    response_size);
     runtime_worker_finish(worker);
 }
 
@@ -2377,8 +2391,9 @@ static void *runtime_connection_worker(void *opaque) {
         free(payload);
         return NULL;
     }
-    if (frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS) {
-        runtime_worker_handle_status(worker, payload, frame.length);
+    if (frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS ||
+        frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS) {
+        runtime_worker_handle_status(worker, payload, frame.length, frame.flags);
         free(payload);
         return NULL;
     }
@@ -2919,6 +2934,15 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
         memcpy(service->semantic_version, config->identity.semantic_version, version_length + 1);
         memcpy(service->build_fingerprint, config->identity.build_fingerprint, build_length + 1);
     }
+    if (config->cache_directory) {
+        size_t cache_length = 0;
+        copied_identity = copied_identity &&
+                          runtime_bounded_length(config->cache_directory,
+                                                 sizeof(service->cache_directory), &cache_length);
+        if (copied_identity) {
+            memcpy(service->cache_directory, config->cache_directory, cache_length + sizeof(char));
+        }
+    }
     service->identity.semantic_version = service->semantic_version;
     service->identity.build_fingerprint = service->build_fingerprint;
     service->identity.protocol_abi = config->identity.protocol_abi;
@@ -3269,15 +3293,17 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
     if (written <= 0 || (size_t)written != CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U) {
         return false;
     }
+    uint64_t deadline = runtime_deadline_after(timeout_ms);
     cbm_daemon_ipc_connection_t *connection = cbm_daemon_ipc_connect(endpoint, timeout_ms);
     bool sent =
         connection && cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST, operation,
                                                 request, (uint32_t)sizeof(request));
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;
-    int received = sent ? cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms,
-                                                               response_size, &frame, &payload)
-                        : 0;
+    int received =
+        sent ? cbm_daemon_ipc_receive_frame_bounded(connection, runtime_timeout_remaining(deadline),
+                                                    response_size, &frame, &payload)
+             : 0;
     if (muted_holder_pid_out && sent &&
         (received != 1 || (frame.type == CBM_DAEMON_FRAME_RESPONSE && frame.flags != operation))) {
         /* Connected but not served: either total silence (dead runtime), or a
@@ -3304,20 +3330,8 @@ static uint32_t runtime_control_read_u32(const uint8_t *bytes) {
            (uint32_t)bytes[3];
 }
 
-bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                       const cbm_daemon_build_identity_t *identity,
-                                       uint32_t timeout_ms,
-                                       cbm_daemon_runtime_status_t *status_out) {
-    if (!status_out) {
-        return false;
-    }
-    memset(status_out, 0, sizeof(*status_out));
-    uint8_t *payload = NULL;
-    if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STATUS, timeout_ms,
-                                      CBM_DAEMON_STATUS_RESPONSE_SIZE, &payload,
-                                      &status_out->muted_endpoint_holder_pid)) {
-        return false;
-    }
+static void runtime_status_response_decode(const uint8_t *payload,
+                                           cbm_daemon_runtime_status_t *status_out) {
     status_out->permanent = (payload[1] & 0x01U) != 0U;
     status_out->stopping = (payload[1] & 0x02U) != 0U;
     status_out->committed_clients = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
@@ -3332,8 +3346,64 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     status_out->build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1U] = '\0';
     memcpy(status_out->semantic_version, payload + 109U, sizeof(status_out->semantic_version));
     status_out->semantic_version[sizeof(status_out->semantic_version) - 1U] = '\0';
+}
+
+static bool runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                   const cbm_daemon_build_identity_t *identity, uint32_t timeout_ms,
+                                   cbm_daemon_runtime_status_t *status_out, char *cache_directory) {
+    if (!status_out) {
+        return false;
+    }
+    memset(status_out, 0, sizeof(*status_out));
+    uint8_t *payload = NULL;
+    cbm_daemon_runtime_operation_t operation =
+        cache_directory ? CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS : CBM_DAEMON_RUNTIME_OP_STATUS;
+    uint32_t response_size =
+        cache_directory ? CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE : CBM_DAEMON_STATUS_RESPONSE_SIZE;
+    if (!runtime_control_request_send(
+            endpoint, identity, operation, timeout_ms, response_size, &payload,
+            cache_directory ? NULL : &status_out->muted_endpoint_holder_pid)) {
+        return false;
+    }
+    bool valid = !cache_directory || memchr(payload + CBM_DAEMON_STATUS_RESPONSE_SIZE, '\0',
+                                            CBM_DAEMON_STATUS_CACHE_PATH_SIZE);
+    if (valid) {
+        runtime_status_response_decode(payload, status_out);
+        if (cache_directory) {
+            memcpy(cache_directory, payload + CBM_DAEMON_STATUS_RESPONSE_SIZE,
+                   CBM_DAEMON_STATUS_CACHE_PATH_SIZE);
+        }
+    }
     free(payload);
-    return true;
+    return valid;
+}
+
+bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                       const cbm_daemon_build_identity_t *identity,
+                                       uint32_t timeout_ms,
+                                       cbm_daemon_runtime_status_t *status_out) {
+    return runtime_request_status(endpoint, identity, timeout_ms, status_out, NULL);
+}
+
+bool cbm_daemon_runtime_request_status_details(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                               const cbm_daemon_build_identity_t *identity,
+                                               uint32_t timeout_ms,
+                                               cbm_daemon_runtime_status_details_t *details_out) {
+    if (!details_out) {
+        return false;
+    }
+    memset(details_out, 0, sizeof(*details_out));
+    if (timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER) {
+        return false;
+    }
+    uint64_t deadline = runtime_deadline_after(timeout_ms);
+    if (runtime_request_status(endpoint, identity, timeout_ms, &details_out->status,
+                               details_out->cache_directory)) {
+        return true;
+    }
+    uint32_t remaining = runtime_timeout_remaining(deadline);
+    return remaining > 0 &&
+           cbm_daemon_runtime_request_status(endpoint, identity, remaining, &details_out->status);
 }
 
 /* "; CBM sessions using it: pids 1, 2 and 3 more" — empty when none are known. */

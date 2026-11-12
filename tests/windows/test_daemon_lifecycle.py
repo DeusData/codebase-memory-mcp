@@ -9,6 +9,8 @@ Guards the PR #1139 daemon-control surface at the product level:
 * A cold one-shot ``cli`` command is quiet by default; ``cli --verbose`` opts
   into the startup-tax hint.
 * ``daemon stop`` on an idle daemon stops it; a second ``stop`` is idempotent.
+* Cache mismatches name both canonical paths; if STATUS is unavailable, the
+  fingerprint fallback explains that the paths are unavailable or unverified.
 
 Every path carries a kill-by-pid backstop so a stuck daemon can never hang the
 suite (the Windows leg's test-infra hang sensitivity is on record).
@@ -18,11 +20,13 @@ Exit code: 0 == lifecycle behaves (green), 1 == regression, 2 == setup error.
 Usage:
     python test_daemon_lifecycle.py <path-to-codebase-memory-mcp[.exe]>
 """
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def runtime_for(cache):
@@ -57,6 +61,116 @@ def force_kill(pid):
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=30)
     else:
         subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=30)
+
+
+def check_cache_conflict_paths(binary, cache, work):
+    def filesystem_path(path):
+        # Exercise CBM's own long-path support regardless of the runner's
+        # LongPathsEnabled policy; Python setup/inspection uses explicit Win32 paths.
+        if os.name == "nt":
+            absolute = os.path.abspath(path)
+            return "\\\\?\\UNC\\" + absolute[2:] if absolute.startswith("\\\\") else "\\\\?\\" + absolute
+        return path
+
+    # Cache roots must share a rendezvous, or the mismatch would never occur.
+    shared_runtime = {"CBM_RUNTIME_DIR": runtime_for(cache), "CBM_STARTUP_TIMEOUT_MS": "1000"}
+    paths = [os.path.join(work, "cache-中文 space")]
+    for length in (259, 260, 261, 1024):
+        path = os.path.join(work, "cache-length-%d" % length)
+        while len(path) < length:
+            remaining = length - len(path)
+            if remaining == 1:
+                path += "x"
+            else:
+                path = os.path.join(path, "x" * min(32, remaining - 1))
+        paths.append(path)
+    if os.name != "nt":
+        # Windows forbids these filename characters; POSIX must escape them.
+        paths.append(os.path.join(work, 'cache-line\nbreak\t"\x1b'))
+
+    for requested in paths:
+        os.makedirs(filesystem_path(requested), exist_ok=True)
+        for args in (["cli", "list_projects"], []):  # [] enters the MCP frontend
+            result = run_cli(binary, requested, args, extra_env=shared_runtime)
+            text = output_text(result)
+            if result.returncode == 0:
+                raise AssertionError("different cache root unexpectedly admitted")
+            for label, path in (("requested cache", requested), ("daemon cache", cache)):
+                canonical = os.path.realpath(filesystem_path(path)).replace("\\", "/")
+                if canonical.startswith("//?/UNC/"):
+                    canonical = "//" + canonical[8:]
+                elif canonical.startswith("//?/"):
+                    canonical = canonical[4:]
+                expected = label + ": " + json.dumps(canonical, ensure_ascii=False)
+                if expected not in text:
+                    raise AssertionError("missing complete escaped cache path %r in %r"
+                                         % (expected, text))
+            if "different cache directory" not in text or "CBM_CACHE_DIR" not in text:
+                raise AssertionError("cache mismatch lost its explanation or remedy")
+            if "Cache paths unavailable or unverified." in text:
+                raise AssertionError("resolved paths were incorrectly marked unavailable")
+        log = os.path.join(requested, "logs", "daemon-conflicts.ndjson")
+        with open(filesystem_path(log), encoding="utf-8") as stream:
+            events = [json.loads(line) for line in stream if line.strip()]
+        if not any(event.get("reason") == "cache_root" for event in events):
+            raise AssertionError("cache mismatch was not recorded")
+        for event in events:
+            for key in ("active_cache", "requested_cache"):
+                if not re.fullmatch(r"[0-9a-f]{64}", event.get(key, "")):
+                    raise AssertionError("conflict log must retain cache fingerprints")
+    healthy = run_cli(binary, cache, ["cli", "list_projects"])
+    if healthy.returncode != 0:
+        raise AssertionError("cache rejection disturbed the active daemon")
+
+
+def check_cache_conflict_fallback(binary, work):
+    active = os.path.join(work, "cache-fallback-active")
+    requested = os.path.join(work, "cache-fallback-requested")
+    runtime = runtime_for(active)
+    shared = {"CBM_RUNTIME_DIR": runtime, "CBM_STARTUP_TIMEOUT_MS": "1000"}
+    env = dict(os.environ, CBM_CACHE_DIR=active, **shared)
+    # An index command waiting for piped arguments owns a cohort lease but
+    # has not connected to a daemon. This makes STATUS genuinely unavailable.
+    owner = subprocess.Popen([binary, "cli", "index_repository"], env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            if owner.poll() is not None:
+                raise AssertionError("cohort owner exited before reading its arguments")
+            written = False
+            for directory, _, files in os.walk(runtime):
+                if "cbm-version-cohort-lifetime-v1.lock" in files:
+                    path = os.path.join(directory, "cbm-version-cohort-lifetime-v1.lock")
+                    written = os.path.getsize(path) > 1
+            if written:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("cohort owner did not publish its identity")
+            time.sleep(0.02)
+        for args in ([], ["cli", "list_projects"]):
+            result = run_cli(binary, requested, args, extra_env=shared)
+            text = output_text(result)
+            if result.returncode == 0 or not re.search(
+                    r"active cache [0-9a-f]{64}; requested cache [0-9a-f]{64}", text):
+                raise AssertionError("fallback lost the cache conflict fingerprints: " + text)
+            if "Cache paths unavailable or unverified." not in text:
+                raise AssertionError("fingerprint fallback did not explain missing paths: " + text)
+            if "requested cache:" in text or "daemon cache:" in text:
+                raise AssertionError("fallback claimed an unverified cache path")
+        status = run_cli(binary, active, ["daemon", "status"], extra_env=shared)
+        if status.returncode == 0 or "not running" not in output_text(status):
+            raise AssertionError("fallback probe started a daemon")
+    finally:
+        owner.terminate()
+        try:
+            owner.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            owner.kill()
+            owner.wait(timeout=5)
+        for stream in (owner.stdin, owner.stdout, owner.stderr):
+            stream.close()
 
 
 def main():
@@ -126,6 +240,9 @@ def main():
             return 1
         print("PASS: warm cli recycled the daemon; daemon survived its client")
 
+        check_cache_conflict_paths(binary, cache, work)
+        print("PASS: cache mismatch paths survive Unicode, escaping and long paths")
+
         stop = run_cli(binary, cache, ["daemon", "stop"])
         if stop.returncode != 0:
             print("RED: `daemon stop` on an idle daemon failed:\n%s"
@@ -138,6 +255,9 @@ def main():
             return 1
         print("PASS: stop retired the idle daemon; second stop was idempotent")
         daemon_pid = 0
+
+        check_cache_conflict_fallback(binary, work)
+        print("PASS: fingerprint fallback explains unavailable paths for CLI and MCP")
 
         if not ui_build:
             print("SKIP: non-UI binary cannot exercise the UI-configuration refusal")

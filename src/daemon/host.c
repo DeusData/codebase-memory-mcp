@@ -1153,6 +1153,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     cbm_daemon_runtime_service_config_t runtime_config = {
         .endpoint = config->endpoint,
         .identity = config->identity,
+        .cache_directory = cbm_resolve_cache_dir(),
         .conflict_log_path = conflict_log,
         .conflict_log_cap_bytes = HOST_CONFLICT_LOG_CAP,
         .max_clients = HOST_MAX_CLIENTS,
