@@ -76,6 +76,9 @@ static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] =
     {CBM_AGENT_CLIENT_OMP, "omp", "Oh My Pi (omp)", CBM_AGENT_STABLE,
      CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "omp", agent_install_callback,
      agent_remove_callback},
+    {CBM_AGENT_CLIENT_AGENTTY, "agentty", "agentty", CBM_AGENT_STABLE,
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL, "agentty", agent_install_callback,
+     agent_remove_callback},
 };
 
 size_t cbm_agent_client_count(void) {
@@ -601,6 +604,14 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
             int written = snprintf(path_out, path_out_size, "%s", options->cody_config_path);
             return written >= 0 && (size_t)written < path_out_size ? 0 : -1;
         }
+    case CBM_AGENT_CLIENT_AGENTTY:
+        /* $AGENTTY_MCP_CONFIG names the one file agentty reads instead of
+         * ~/.agentty/mcp.json, so install and uninstall must target it. */
+        if (options->agentty_mcp_config && options->agentty_mcp_config[0]) {
+            int written = snprintf(path_out, path_out_size, "%s", options->agentty_mcp_config);
+            return written >= 0 && (size_t)written < path_out_size ? 0 : -1;
+        }
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".agentty/mcp.json");
     default:
         return -1;
     }
@@ -663,6 +674,8 @@ static int agent_client_marker_path(cbm_agent_client_id_t id,
         return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent");
     case CBM_AGENT_CLIENT_PI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pi/agent");
+    case CBM_AGENT_CLIENT_AGENTTY:
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".agentty");
     default:
         return 1;
     }
@@ -1466,6 +1479,7 @@ static bool agent_json_client(cbm_agent_client_id_t id) {
     case CBM_AGENT_CLIENT_IBM_BOB_SHELL:
     case CBM_AGENT_CLIENT_POCHI:
     case CBM_AGENT_CLIENT_SOURCEGRAPH_CODY:
+    case CBM_AGENT_CLIENT_AGENTTY:
         return true;
     case CBM_AGENT_CLIENT_CONTINUE:
     case CBM_AGENT_CLIENT_PI:

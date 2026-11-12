@@ -2042,7 +2042,7 @@ static bool attach_missed_graph(yyjson_mut_doc *mdoc, yyjson_mut_val *mroot, cbm
         return false;
     }
     yyjson_doc *mldoc = yyjson_read(mjson, strlen(mjson), 0);
-    free(mjson);
+    cbm_layout_free_json(mjson);
     if (!mldoc) {
         return false;
     }
@@ -2164,7 +2164,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             return;
         }
         cbm_http_replyf(c, 200, g_cors_json, "%s", scoped_json);
-        free(scoped_json);
+        cbm_layout_free_json(scoped_json);
         return;
     }
 
@@ -2200,13 +2200,13 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     if (linked_count == 0 && missed_graph) {
         cbm_store_close(store);
         cbm_http_replyf(c, 200, g_cors_json, "%s", primary_json);
-        free(primary_json);
+        cbm_layout_free_json(primary_json);
         return;
     }
 
     /* Parse primary JSON and append missed_graph + linked_projects */
     yyjson_doc *pdoc = yyjson_read(primary_json, strlen(primary_json), 0);
-    free(primary_json);
+    cbm_layout_free_json(primary_json);
     if (!pdoc) {
         cbm_store_close(store);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON parse failed\"}");
@@ -2258,7 +2258,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
         /* Parse linked project layout */
         yyjson_doc *lpdoc = yyjson_read(lp_json, strlen(lp_json), 0);
-        free(lp_json);
+        cbm_layout_free_json(lp_json);
         if (!lpdoc) {
             cbm_store_close(lp_store);
             free(linked[li]);

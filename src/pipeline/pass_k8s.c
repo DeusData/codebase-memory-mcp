@@ -20,10 +20,12 @@
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
 #include "cbm.h"
-#include "helpers.h"               /* cbm_kind_in_set_free_cache */
-#include "foundation/slab_alloc.h" /* cbm_slab_destroy_thread */
-#include "foundation/platform.h"   /* cbm_default_worker_count */
-#include "foundation/str_util.h"   /* cbm_json_escape */
+#include "helpers.h"                /* cbm_kind_in_set_free_cache */
+#include "foundation/slab_alloc.h"  /* cbm_slab_destroy_thread */
+#include "foundation/platform.h"    /* cbm_default_worker_count */
+#include "foundation/str_util.h"    /* cbm_json_escape */
+#include "foundation/json_writer.h" /* cbm_json_writer_allocator */
+#include "pipeline/helm_template.h"
 #include "pipeline/worker_pool.h"
 
 #include <ctype.h>
@@ -1103,15 +1105,19 @@ static void k8s_bundles_free(k8s_bundles_t *b) {
 }
 
 /* A Helm chart's directory bundles the plain manifests below it. */
-static void k8s_chart_dir_add(k8s_bundles_t *b, const char *chart_yaml) {
-    char dir[CBM_SZ_1K];
-    k8s_dirname(chart_yaml, dir, sizeof(dir));
+static void k8s_chart_dir_register(k8s_bundles_t *b, const char *dir) {
     if (b->charts && !cbm_ht_get(b->charts, dir)) {
         char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir);
         if (owned) {
             cbm_ht_set(b->charts, owned, owned);
         }
     }
+}
+
+static void k8s_chart_dir_add(k8s_bundles_t *b, const char *chart_yaml) {
+    char dir[CBM_SZ_1K];
+    k8s_dirname(chart_yaml, dir, sizeof(dir));
+    k8s_chart_dir_register(b, dir);
 }
 
 /* Build the kustomize bundles (call once every manifest and kustomization is
@@ -1285,6 +1291,9 @@ typedef struct {
     int64_t node;
     char *image;
     char *container; /* NULL: unnamed */
+    int line;        /* the image's line */
+    int start_line;  /* the container's lines */
+    int end_line;
 } k8s_img_t;
 
 /* A patch a kustomization states (extract_k8s.c PATCH fact): what it names
@@ -1482,8 +1491,12 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
         } else if (x->fact == CBM_K8S_FACT_IMAGE) {
             if (x->name && k8s_grow((void **)&f->imgs, &f->img_cap, f->img_n, sizeof(*f->imgs))) {
                 f->imgs[f->img_n++] = (k8s_img_t){
-                    node, cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
-                    x->container ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->container) : NULL};
+                    node,
+                    cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name),
+                    x->container ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->container) : NULL,
+                    x->line,
+                    x->start_line,
+                    x->end_line};
             }
         } else if (x->fact == CBM_K8S_FACT_ENV) {
             if (x->name && k8s_grow((void **)&f->envs, &f->env_cap, f->env_n, sizeof(*f->envs))) {
@@ -2772,6 +2785,27 @@ static void k8s_link_local_deps(cbm_pipeline_ctx_t *ctx, k8s_local_deps_t *deps)
  * `file://` dependency (once all charts are read), otherwise to the external
  * Chart node of the dependency's repository and name, the repository also on
  * the edge. */
+/* The Chart node `name` defined by chart file `rel_path` (a Chart.yaml, a
+ * werf.yaml), its File node DEFINES it; 0 on failure. */
+static int64_t k8s_chart_upsert(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *name,
+                                const char *props) {
+    char *chart_qn = cbm_infra_qn(ctx->project_name, rel_path, "helm-chart", NULL);
+    if (!chart_qn) {
+        return 0;
+    }
+    int64_t chart_id =
+        cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, chart_qn, rel_path, SKIP_ONE, 0, props);
+    free(chart_qn);
+
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, file_qn) : NULL;
+    if (file_node && chart_id > 0) {
+        cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, chart_id, "DEFINES", "{}");
+    }
+    free(file_qn);
+    return chart_id > 0 ? chart_id : 0;
+}
+
 static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
                               k8s_local_deps_t *local_deps) {
     cbm_helm_chart_t hc;
@@ -2781,24 +2815,14 @@ static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, con
     }
 
     const char *cname = hc.chart_name[0] ? hc.chart_name : k8s_basename(rel_path);
-    char *chart_qn = cbm_infra_qn(ctx->project_name, rel_path, "helm-chart", NULL);
-    if (!chart_qn) {
+    int64_t chart_id = k8s_chart_upsert(ctx, rel_path, cname, "{\"source\":\"helm\"}");
+    if (chart_id <= 0) {
         cbm_helm_chart_free(&hc);
         return;
     }
-    int64_t chart_id = cbm_gbuf_upsert_node(ctx->gbuf, "Chart", cname, chart_qn, rel_path, SKIP_ONE,
-                                            0, "{\"source\":\"helm\"}");
-    free(chart_qn);
-
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, file_qn) : NULL;
-    if (file_node && chart_id > 0) {
-        cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, chart_id, "DEFINES", "{}");
-    }
-    free(file_qn);
 
     int dep_edges = 0;
-    for (int i = 0; i < hc.dep_count && chart_id > 0; i++) {
+    for (int i = 0; i < hc.dep_count; i++) {
         const cbm_helm_dep_t *dep = &hc.deps[i];
         if (k8s_is_file_repository(dep->repository)) {
             k8s_local_deps_push(local_deps, chart_id, rel_path, ctx->project_name, dep);
@@ -2810,6 +2834,106 @@ static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, con
     }
     cbm_helm_chart_free(&hc);
     cbm_log_info("pass.k8s.helm", "file", rel_path, "deps", itoa_k8s(dep_edges));
+}
+
+/* ── werf chart handler ──────────────────────────────────────────── */
+
+/* werf (werf.io) deploys the Helm chart in the `.helm` directory beside its
+ * werf.yaml; that chart needs no Chart.yaml, werf names it after its project.
+ * A `.helm` with a Chart.yaml is an ordinary chart. A custom
+ * deploy.helmChartDir is not followed. */
+static bool is_werf_file(const char *base) {
+    return strcmp(base, "werf.yaml") == 0 || strcmp(base, "werf.yml") == 0;
+}
+
+bool cbm_werf_helm_dir(const char *repo_path, const char *dir) {
+    const char *base = k8s_basename(dir);
+    if (!repo_path || strcmp(base, ".helm") != 0) {
+        return false;
+    }
+    char path[CBM_SZ_4K];
+    snprintf(path, sizeof(path), "%s/%s", repo_path, dir);
+    if (!cbm_is_dir(path)) {
+        return false;
+    }
+    static const char *const charts[] = {"Chart.yaml", "Chart.yml"};
+    for (size_t i = 0; i < sizeof(charts) / sizeof(charts[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s/%s", repo_path, dir, charts[i]);
+        if (cbm_file_exists(path)) {
+            return false;
+        }
+    }
+    size_t parent = (size_t)(base - dir);
+    static const char *const werfs[] = {"werf.yaml", "werf.yml"};
+    for (size_t i = 0; i < sizeof(werfs) / sizeof(werfs[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%.*s%s", repo_path, (int)parent, dir, werfs[i]);
+        if (cbm_file_exists(path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The literal top-level `project:` of a werf.yaml's first document into out,
+ * "" when there is none or it is templated. */
+static void k8s_werf_project(const char *src, char *out, size_t out_sz) {
+    out[0] = '\0';
+    bool seen_key = false;
+    for (const char *p = src; p && *p;) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        if (len >= K8S_SLEN("---") && strncmp(p, "---", K8S_SLEN("---")) == 0 && seen_key) {
+            return;
+        }
+        if (isalpha((unsigned char)p[0])) {
+            seen_key = true;
+        }
+        if (len > K8S_SLEN("project:") && strncmp(p, "project:", K8S_SLEN("project:")) == 0) {
+            /* the value: [b, e) of the line, a comment and quotes removed */
+            size_t b = K8S_SLEN("project:");
+            size_t e = len;
+            while (b < e && (p[b] == ' ' || p[b] == '\t')) {
+                b++;
+            }
+            for (size_t i = b; i < e; i++) {
+                if (p[i] == '#') {
+                    e = i;
+                }
+            }
+            while (e > b && isspace((unsigned char)p[e - SKIP_ONE])) {
+                e--;
+            }
+            if (e >= b + PAIR_LEN && (p[b] == '"' || p[b] == '\'') && p[e - SKIP_ONE] == p[b]) {
+                b++;
+                e--;
+            }
+            if (e > b && e - b < out_sz && !memchr(p + b, '{', e - b)) {
+                memcpy(out, p + b, e - b);
+                out[e - b] = '\0';
+            }
+            return;
+        }
+        p = eol ? eol + SKIP_ONE : NULL;
+    }
+}
+
+/* A werf.yaml beside a `.helm` chart dir: a Chart named after its project
+ * {source: werf}, defined by werf.yaml, and the chart dir into `chart_dir`.
+ * False when it has no such chart. */
+static bool handle_werf_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
+                              char *chart_dir, size_t chart_dir_sz) {
+    char dir[CBM_SZ_1K];
+    k8s_dirname(rel_path, dir, sizeof(dir));
+    snprintf(chart_dir, chart_dir_sz, "%s%s.helm", dir, dir[0] ? "/" : "");
+    if (!cbm_werf_helm_dir(ctx->repo_path, chart_dir)) {
+        return false;
+    }
+    char project[CBM_HELM_NAME_MAX];
+    k8s_werf_project(source, project, sizeof(project));
+    const char *cname = project[0] ? project : k8s_basename(rel_path);
+    int64_t chart_id = k8s_chart_upsert(ctx, rel_path, cname, "{\"source\":\"werf\"}");
+    cbm_log_info("pass.k8s.werf", "file", rel_path, "chart", cname);
+    return chart_id > 0;
 }
 
 /* ── Dependency-manifest handler (go.mod / requirements.txt) ──────── */
@@ -2969,7 +3093,7 @@ static void handle_dep_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
  * the sequential loop did. Sequentially the pass re-read and re-parsed every
  * YAML manifest on one thread -- 1.1 s of the Go corpus (6,275 manifests;
  * profile + waste sanitizer, 2026-09-17). */
-typedef enum { K8S_SKIP = 0, K8S_DEP, K8S_HELM, K8S_MANIFEST, K8S_KUSTOMIZE } k8s_kind_t;
+typedef enum { K8S_SKIP = 0, K8S_DEP, K8S_HELM, K8S_WERF, K8S_MANIFEST, K8S_KUSTOMIZE } k8s_kind_t;
 
 typedef struct {
     k8s_kind_t kind;
@@ -3153,6 +3277,8 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
         }
         if (is_helm_chart_file(base)) {
             out->kind = K8S_HELM;
+        } else if (is_werf_file(base)) {
+            out->kind = K8S_WERF;
         } else if (cbm_is_k8s_manifest(base, out->source)) {
             /* Always re-extract with CBM_LANG_K8S regardless of any cached
              * result: cached results were produced during the parallel YAML
@@ -3610,12 +3736,26 @@ static void k8s_deploys_edge(k8s_dep_link_t *l, int64_t src, int64_t tgt, const 
     }
 }
 
-/* The Chart node of chart dir `dir`, 0 when it is none. */
+/* The Chart node of chart dir `dir`, 0 when it is none: its Chart.yaml's, or
+ * for a werf `.helm` dir the one its werf.yaml defines. */
 static int64_t k8s_chart_node(k8s_dep_link_t *l, const char *dir) {
     static const char *const names[] = {"Chart.yaml", "Chart.yml"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         char path[CBM_SZ_1K];
         snprintf(path, sizeof(path), "%s%s%s", dir, dir[0] ? "/" : "", names[i]);
+        int64_t id = k8s_first_id(l->charts, path);
+        if (id > 0) {
+            return id;
+        }
+    }
+    const char *base = k8s_basename(dir);
+    if (strcmp(base, ".helm") != 0) {
+        return 0;
+    }
+    static const char *const werfs[] = {"werf.yaml", "werf.yml"};
+    for (size_t i = 0; i < sizeof(werfs) / sizeof(werfs[0]); i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%.*s%s", (int)(base - dir), dir, werfs[i]);
         int64_t id = k8s_first_id(l->charts, path);
         if (id > 0) {
             return id;
@@ -3661,8 +3801,10 @@ static bool k8s_chart_values_file(const char *rel, const char *dir) {
 
 /* A chart deploys what its templates render: Chart -DEPLOYS {via: chart}->
  * each Resource of <chart>/templates/ -- its nearest enclosing chart, so a
- * subchart's objects are the subchart's. Its values files (values.yaml,
- * values-<x>.yaml beside Chart.yaml) CONFIGURE {strategy: helm_values} it. */
+ * subchart's objects are the subchart's -- and each CRD of <chart>/crds/,
+ * which Helm installs first ({via: chart, phase: crds}). Its values files
+ * (values.yaml, values-<x>.yaml beside Chart.yaml) CONFIGURE {strategy:
+ * helm_values} it. */
 static void k8s_link_chart_contents(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b) {
     if (!b->charts || cbm_ht_count(b->charts) == 0) {
         return;
@@ -3691,9 +3833,14 @@ static void k8s_link_chart_contents(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b) {
             }
             if (k == 0) {
                 char tpl[CBM_SZ_1K];
+                char crd[CBM_SZ_1K];
                 snprintf(tpl, sizeof(tpl), "%s%stemplates/", dir, dir[0] ? "/" : "");
+                snprintf(crd, sizeof(crd), "%s%scrds/", dir, dir[0] ? "/" : "");
                 if (strncmp(fp, tpl, strlen(tpl)) == 0) {
                     k8s_deploys_edge(&l, chart, nodes[i]->id, "{\"via\":\"chart\"}");
+                } else if (strncmp(fp, crd, strlen(crd)) == 0) {
+                    k8s_deploys_edge(&l, chart, nodes[i]->id,
+                                     "{\"via\":\"chart\",\"phase\":\"crds\"}");
                 }
             } else if (k8s_chart_values_file(fp, dir)) {
                 cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, chart, "CONFIGURES",
@@ -3709,19 +3856,1188 @@ static void k8s_link_chart_contents(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b) {
     }
 }
 
-/* Each Image a chart's objects name literally (their USAGE {ref: image}, after
+/* ── Helm template images (PHASE 2 P2.5) ─────────────────────────────
+ *
+ * A chart template's container image is a placeholder in the skeleton
+ * (`<.Values.image.repository>`): it is rendered here (helm_template.c) from
+ * the chart's own values.yaml, its Chart.yaml (.Chart) and the defines of its
+ * chart family -- what `helm template` writes with the chart's defaults. The
+ * object then USES the Image {ref: image, default_of: the values keys read},
+ * an image nothing else in the repository changes but a release can. A
+ * parent chart that changes it for its subchart (its `<sub>:` values, its
+ * `global:`) DEPLOYS the Image it makes {via: chart, ref: image,
+ * override_of}. A value that does not render (helm_template.h: UNKNOWN) or
+ * is no image reference names none. */
+
+typedef struct {
+    int64_t node;
+    char *file;
+    char *container; /* NULL: unnamed */
+    int start_line;
+    int end_line;
+} k8s_timg_t;
+
+typedef struct {
+    char *dir;
+    int64_t chart;
+    cbm_helm_chart_meta_t meta;
+    yyjson_mut_val *chart_yaml; /* NULL: none */
+    yyjson_mut_val *values;     /* NULL: values.yaml does not parse (nothing renders) */
+} k8s_hchart_t;
+
+/* A template file of a chart family (its defines). */
+typedef struct {
+    char *file;
+    char *family;
+} k8s_htpl_t;
+
+/* One rendered image of an object (or a chart / release). */
+typedef struct {
+    int64_t src;
+    int64_t img;
+    const char *ref;
+    const char *container;
+    const char *keys; /* JSON array; NULL: none */
+} k8s_himg_t;
+
+typedef struct {
+    k8s_himg_t *v;
+    int n;
+    int cap;
+    CBMHashTable *seen; /* "src:img" of each v (keys cbm_alloc'd): one look-up a push */
+} k8s_himgs_t;
+
+typedef struct {
+    yyjson_mut_doc *doc;
+    CBMArena a;
+    CBMHashTable *charts;  /* chart dir -> k8s_hchart_t* */
+    CBMHashTable *defines; /* family dir -> cbm_helm_defines_t* */
+    k8s_htpl_t *tpls;
+    int ntpl;
+    bool tpls_read;
+    k8s_timg_t *t;
+    int nt;
+    int tcap;
+    k8s_himgs_t dflt; /* the containers' images with the defaults */
+    int edges;
+} k8s_helm_t;
+
+/* The templated images of the facts, kept past them. */
+static void k8s_helm_collect(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f, k8s_helm_t *h) {
+    for (int i = 0; i < f->img_n; i++) {
+        const k8s_img_t *im = &f->imgs[i];
+        const cbm_gbuf_node_t *n =
+            strchr(im->image, '<') ? cbm_gbuf_find_by_id(ctx->gbuf, im->node) : NULL;
+        if (!n || !n->file_path || im->start_line <= 0) {
+            continue;
+        }
+        if (!k8s_grow((void **)&h->t, &h->tcap, h->nt, sizeof(*h->t))) {
+            return;
+        }
+        h->t[h->nt++] = (k8s_timg_t){im->node, cbm_arena_strdup(&h->a, n->file_path),
+                                     im->container ? cbm_arena_strdup(&h->a, im->container) : NULL,
+                                     im->start_line, im->end_line};
+    }
+}
+
+/* Repository file `rel`, read only when discovery took it in: a values file,
+ * a Chart.yaml, a kustomize valuesFile named by path is never a symlink or
+ * under one -- nothing is read from outside the repository. */
+static char *k8s_repo_read(cbm_pipeline_ctx_t *ctx, const char *rel, int *len) {
+    if (!cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, rel)) {
+        return NULL;
+    }
+    char path[CBM_SZ_4K];
+    int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return NULL;
+    }
+    char *buf = k8s_read_file(path, len);
+    cbm_path_info_t info;
+    if (!buf && cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_regular &&
+        !info.is_symlink && info.size == 0) {
+        /* an empty file is read: empty text (padded like every read) */
+        enum { CBM_TS_EMPTY_PAD = 16 };
+        buf = cbm_calloc(CBM_MEM_CLASS_OTHER, CBM_TS_EMPTY_PAD);
+        *len = 0;
+    }
+    return buf;
+}
+
+/* Is repository path `rel` there, or can that not be told (a link is
+ * reported, never followed; only a path proven absent is not there)? */
+static bool k8s_repo_has(cbm_pipeline_ctx_t *ctx, const char *rel) {
+    char path[CBM_SZ_4K];
+    int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
+    cbm_path_info_t info;
+    return n > 0 && (size_t)n < sizeof(path) &&
+           cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_ABSENT;
+}
+
+/* A file of `dir` (one of `names`), parsed as values; *found when one exists.
+ * *unread when one is there but is not read (a symlink, too large): what it
+ * holds is unknown, which is not the same as no file. */
+static yyjson_mut_val *k8s_helm_yaml(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, const char *dir,
+                                     const char *const *names, bool *found, bool *unread) {
+    *found = false;
+    *unread = false;
+    for (int i = 0; names[i]; i++) {
+        char rel[CBM_SZ_1K];
+        snprintf(rel, sizeof(rel), "%s%s%s", dir, dir[0] ? "/" : "", names[i]);
+        int len = 0;
+        char *src = k8s_repo_read(ctx, rel, &len);
+        if (!src) {
+            if (k8s_repo_has(ctx, rel)) {
+                *found = true;
+                *unread = true;
+                return NULL;
+            }
+            continue;
+        }
+        *found = true;
+        yyjson_mut_val *v = cbm_helm_values_parse(h->doc, src, (size_t)len);
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+        return v;
+    }
+    return NULL;
+}
+
+static const char *k8s_helm_meta_str(yyjson_mut_val *obj, const char *key) {
+    yyjson_mut_val *v = yyjson_mut_is_obj(obj) ? yyjson_mut_obj_get(obj, key) : NULL;
+    return yyjson_mut_is_str(v) ? yyjson_mut_get_str(v) : NULL;
+}
+
+/* The chart of chart dir `dir` with its metadata and default values. */
+static k8s_hchart_t *k8s_helm_chart(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, k8s_dep_link_t *l,
+                                    const char *dir) {
+    k8s_hchart_t *c = cbm_ht_get(h->charts, dir);
+    if (c) {
+        return c;
+    }
+    c = cbm_arena_calloc(&h->a, sizeof(*c));
+    if (!c) {
+        return NULL;
+    }
+    c->dir = cbm_arena_strdup(&h->a, dir);
+    c->chart = k8s_chart_node(l, dir);
+    static const char *const CHART[] = {"Chart.yaml", "Chart.yml", NULL};
+    static const char *const VALUES[] = {"values.yaml", "values.yml", NULL};
+    bool found = false;
+    bool chart_unread = false;
+    bool values_unread = false;
+    c->chart_yaml = k8s_helm_yaml(ctx, h, dir, CHART, &found, &chart_unread);
+    yyjson_mut_val *vals = k8s_helm_yaml(ctx, h, dir, VALUES, &found, &values_unread);
+    /* a Chart.yaml or values file there but not read: the chart's values are
+     * unknown (it renders nothing), never empty */
+    c->values = chart_unread || values_unread ? NULL : found ? vals : yyjson_mut_obj(h->doc);
+    const cbm_gbuf_node_t *cn = c->chart > 0 ? cbm_gbuf_find_by_id(ctx->gbuf, c->chart) : NULL;
+    const char *name = k8s_helm_meta_str(c->chart_yaml, "name");
+    c->meta.name = name ? name : cn && cn->name ? cbm_arena_strdup(&h->a, cn->name) : NULL;
+    c->meta.version = k8s_helm_meta_str(c->chart_yaml, "version");
+    c->meta.app_version = k8s_helm_meta_str(c->chart_yaml, "appVersion");
+    cbm_ht_set(h->charts, c->dir, c);
+    return c;
+}
+
+static bool k8s_helm_tpl_ext(const char *p) {
+    static const char *const EXT[] = {".yaml", ".yml", ".tpl", ".gotmpl", ".txt", ".json"};
+    for (size_t i = 0; i < sizeof(EXT) / sizeof(EXT[0]); i++) {
+        if (k8s_has_suffix(p, EXT[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The defines of chart family `family`: every template (<chart>/templates/)
+ * of its charts, read from disk. */
+static const cbm_helm_defines_t *k8s_helm_defines(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b,
+                                                  k8s_helm_t *h, const char *family) {
+    cbm_helm_defines_t *d = cbm_ht_get(h->defines, family);
+    if (d) {
+        return d;
+    }
+    if (!h->tpls_read) {
+        h->tpls_read = true;
+        const cbm_gbuf_node_t **files = NULL;
+        int n = 0;
+        if (cbm_gbuf_find_by_label(ctx->gbuf, "File", &files, &n) == 0 && n > 0) {
+            h->tpls = cbm_arena_alloc(&h->a, (size_t)n * sizeof(*h->tpls));
+            for (int i = 0; h->tpls && i < n; i++) {
+                const char *fp = files[i]->file_path;
+                char dir[CBM_SZ_1K];
+                char fam[CBM_SZ_1K];
+                char tdir[CBM_SZ_1K];
+                if (!fp || !k8s_helm_tpl_ext(fp) || !k8s_chart_of(b, fp, dir, sizeof(dir))) {
+                    continue;
+                }
+                snprintf(tdir, sizeof(tdir), "%s%stemplates/", dir, dir[0] ? "/" : "");
+                if (strncmp(fp, tdir, strlen(tdir)) != 0) {
+                    continue;
+                }
+                k8s_chart_family(b, dir, fam, sizeof(fam));
+                h->tpls[h->ntpl++] =
+                    (k8s_htpl_t){cbm_arena_strdup(&h->a, fp), cbm_arena_strdup(&h->a, fam)};
+            }
+        }
+    }
+    d = cbm_helm_defines_new();
+    if (!d) {
+        return NULL;
+    }
+    for (int i = 0; i < h->ntpl; i++) {
+        if (strcmp(h->tpls[i].family, family) != 0) {
+            continue;
+        }
+        int len = 0;
+        char *src = k8s_repo_read(ctx, h->tpls[i].file, &len);
+        if (src) {
+            cbm_helm_defines_add(d, h->tpls[i].file, src, (size_t)len);
+            cbm_free(CBM_MEM_CLASS_OTHER, src);
+        }
+    }
+    cbm_ht_set(h->defines, cbm_arena_strdup(&h->a, family), d);
+    return d;
+}
+
+static void k8s_helm_free_defines(const char *key, void *value, void *ud) {
+    (void)key;
+    (void)ud;
+    cbm_helm_defines_free(value);
+}
+
+static int k8s_timg_cmp(const void *x, const void *y) {
+    const k8s_timg_t *a = x;
+    const k8s_timg_t *b = y;
+    int c = strcmp(a->file, b->file);
+    return c ? c : a->start_line - b->start_line;
+}
+
+/* Does template line `line` (1-based) of src hold an `image:` key? */
+static bool k8s_helm_image_line(const char *src, size_t len, const uint32_t *starts, int line) {
+    size_t k = starts[line - SKIP_ONE];
+    while (k < len && (src[k] == ' ' || src[k] == '\t')) {
+        k++;
+    }
+    if (k + SKIP_ONE < len && src[k] == '-' && src[k + SKIP_ONE] == ' ') {
+        k++;
+        while (k < len && src[k] == ' ') {
+            k++;
+        }
+    }
+    return k + strlen("image:") <= len && memcmp(src + k, "image:", strlen("image:")) == 0;
+}
+
+/* The probes of a template's templated images [from, to): each `image:`
+ * line inside a container (both branches of an if / else among them). */
+static int k8s_helm_probes(k8s_helm_t *h, const k8s_timg_t *t, int from, int to, const char *src,
+                           size_t len, cbm_helm_probe_t **out) {
+    int nl = SKIP_ONE;
+    for (size_t i = 0; i < len; i++) {
+        nl += src[i] == '\n';
+    }
+    uint32_t *starts = cbm_arena_alloc(&h->a, (size_t)nl * sizeof(*starts));
+    if (!starts) {
+        return 0;
+    }
+    int k = 0;
+    starts[k++] = 0;
+    for (size_t i = 0; i < len && k < nl; i++) {
+        if (src[i] == '\n') {
+            starts[k++] = (uint32_t)(i + SKIP_ONE);
+        }
+    }
+    int cap = 0;
+    for (int i = from; i < to; i++) {
+        cap += t[i].end_line - t[i].start_line + SKIP_ONE;
+    }
+    cbm_helm_probe_t *p = cap ? cbm_arena_calloc(&h->a, (size_t)cap * sizeof(*p)) : NULL;
+    int np = 0;
+    for (int i = from; p && i < to; i++) {
+        for (int line = t[i].start_line; line <= t[i].end_line && line <= k; line++) {
+            bool dup = false;
+            for (int j = 0; j < np && !dup; j++) {
+                dup = p[j].line == line;
+            }
+            if (!dup && k8s_helm_image_line(src, len, starts, line)) {
+                p[np++].line = line;
+            }
+        }
+    }
+    *out = p;
+    return np;
+}
+
+static yyjson_mut_val *k8s_helm_dig(yyjson_mut_val *v, const char *path) {
+    const char *p = path;
+    while (v && *p) {
+        const char *dot = strchr(p, '.');
+        size_t kl = dot ? (size_t)(dot - p) : strlen(p);
+        v = yyjson_mut_is_obj(v) ? yyjson_mut_obj_getn(v, p, kl) : NULL;
+        p += kl + (dot ? SKIP_ONE : 0);
+    }
+    return v;
+}
+
+/* Is values key path `key` (dot-joined, `\.` escaped) set in `v`? */
+static bool k8s_helm_sets(k8s_helm_t *h, yyjson_mut_val *v, const char *key) {
+    char *part = cbm_arena_alloc(&h->a, strlen(key) + SKIP_ONE); /* a key is never cut */
+    const char *p = key;
+    while (v && part && *p) {
+        size_t k = 0;
+        while (*p && *p != '.' && *p != '[') {
+            if (*p == '\\' && p[1]) {
+                p++;
+            }
+            part[k++] = *p++;
+        }
+        part[k] = '\0';
+        v = yyjson_mut_is_obj(v) ? yyjson_mut_obj_get(v, part) : NULL;
+        while (v && *p == '[') {
+            long idx = strtol(p + SKIP_ONE, (char **)&p, 10);
+            p += *p == ']' ? SKIP_ONE : 0;
+            v = yyjson_mut_is_arr(v) ? yyjson_mut_arr_get(v, (size_t)idx) : NULL;
+        }
+        if (*p == '.') {
+            p++;
+        }
+    }
+    return v != NULL;
+}
+
+/* The values keys of JSON array `keys` that `overlay` sets (relative to
+ * the chart), prefixed by `prefix` -- as a JSON array; NULL: none. */
+static const char *k8s_helm_overridden(k8s_helm_t *h, const char *keys, yyjson_mut_val *overlay,
+                                       yyjson_mut_val *globals, const char *prefix) {
+    if (!keys) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(keys, strlen(keys), 0);
+    yyjson_val *arr = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *out = NULL;
+    if (yyjson_is_arr(arr)) {
+        size_t idx, max;
+        yyjson_val *k;
+        yyjson_arr_foreach(arr, idx, max, k) {
+            const char *key = yyjson_get_str(k);
+            bool global = key && strncmp(key, "global.", strlen("global.")) == 0;
+            bool set = key && (global ? k8s_helm_sets(h, globals, key + strlen("global."))
+                                      : k8s_helm_sets(h, overlay, key));
+            if (!set) {
+                continue;
+            }
+            /* JSON escaping writes at most 6 bytes a byte */
+            int en = (int)(strlen(key) * 6 + SKIP_ONE);
+            char *esc = cbm_arena_alloc(&h->a, (size_t)en);
+            if (!esc) {
+                out = NULL;
+                break;
+            }
+            cbm_json_escape(esc, en, key);
+            out = cbm_arena_sprintf(&h->a, "%s%s\"%s%s%s\"", out ? out : "[", out ? "," : "",
+                                    global || !prefix ? "" : prefix, global || !prefix ? "" : ".",
+                                    esc);
+        }
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return out ? cbm_arena_sprintf(&h->a, "%s]", out) : NULL;
+}
+
+static void k8s_himg_push(k8s_himgs_t *l, k8s_himg_t x) {
+    char key[CBM_SZ_64];
+    snprintf(key, sizeof(key), "%lld:%lld", (long long)x.src, (long long)x.img);
+    if (!l->seen) {
+        l->seen = cbm_ht_create(0);
+    }
+    if (!l->seen || cbm_ht_get(l->seen, key)) {
+        return; /* the first (in file order) of the same Image stands for it */
+    }
+    size_t kl = strlen(key) + SKIP_ONE;
+    char *k = cbm_alloc(CBM_MEM_CLASS_OTHER, kl);
+    if (!k || !k8s_grow((void **)&l->v, &l->cap, l->n, sizeof(*l->v))) {
+        cbm_free(CBM_MEM_CLASS_OTHER, k);
+        return;
+    }
+    memcpy(k, key, kl);
+    cbm_ht_set(l->seen, k, (void *)(uintptr_t)SKIP_ONE);
+    l->v[l->n++] = x;
+}
+
+static void k8s_himg_key_free(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void k8s_himgs_free(k8s_himgs_t *l) {
+    if (l->seen) {
+        cbm_ht_foreach(l->seen, k8s_himg_key_free, NULL);
+        cbm_ht_free(l->seen);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, l->v);
+    *l = (k8s_himgs_t){0};
+}
+
+/* Does `src` USE Image `img` already by a literal reference? */
+static bool k8s_helm_literal_use(cbm_pipeline_ctx_t *ctx, int64_t src, int64_t img) {
+    const cbm_gbuf_edge_t **es = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, src, "USAGE", &es, &n) != 0) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (es[i]->target_id == img && es[i]->properties_json &&
+            strstr(es[i]->properties_json, "\"ref\":\"image\"")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The captures of probes within [first, last] lines, as images of `src`. */
+static void k8s_helm_take(cbm_pipeline_ctx_t *ctx, const cbm_helm_probe_t *p, int np, int first,
+                          int last, int64_t src, const char *container, k8s_himgs_t *out) {
+    for (int i = 0; i < np; i++) {
+        if (p[i].line < first || p[i].line > last) {
+            continue;
+        }
+        for (int c = 0; c < p[i].n; c++) {
+            const char *ref = p[i].image[c];
+            int64_t img = ref && cbm_image_ref_valid(ref) ? cbm_pipeline_image_node(ctx, ref) : 0;
+            if (img > 0) {
+                k8s_himg_push(out, (k8s_himg_t){src, img, ref, container, p[i].keys[c]});
+            }
+        }
+    }
+}
+
+/* The images of templated containers [from, to) of one template, rendered
+ * with `values` (NULL: the chart's own). */
+static void k8s_helm_render(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, k8s_bundles_t *b,
+                            const k8s_hchart_t *c, const char *as_name, const char *full,
+                            const k8s_timg_t *t, int from, int to, yyjson_mut_val *values,
+                            const char *src, size_t len, cbm_helm_probe_t *probes, int np) {
+    char fam[CBM_SZ_1K];
+    k8s_chart_family(b, c->dir, fam, sizeof(fam));
+    const cbm_helm_defines_t *defs = k8s_helm_defines(ctx, b, h, fam);
+    /* a subchart a dependency aliases is .Chart.Name = its alias (Helm's
+     * getAliasDependency) */
+    cbm_helm_chart_meta_t meta = c->meta;
+    meta.name = as_name ? as_name : meta.name;
+    /* .Template.BasePath: the chart's path (full) and templates/, as Helm */
+    meta.base_path = full ? cbm_arena_sprintf(&h->a, "%s/templates", full) : NULL;
+    meta.dir = c->dir;
+    cbm_helm_render(&h->a, t[from].file, src, len, values ? values : c->values, &meta, defs, probes,
+                    np);
+    (void)to;
+}
+
+static void k8s_helm_emit_uses(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, const k8s_himgs_t *l) {
+    for (int i = 0; i < l->n; i++) {
+        const k8s_himg_t *x = &l->v[i];
+        if (k8s_helm_literal_use(ctx, x->src, x->img)) {
+            continue; /* a literal reference of the object wins */
+        }
+        char esc[CBM_SZ_1K];
+        char cesc[CBM_SZ_512];
+        cbm_json_escape(esc, (int)sizeof(esc), x->ref);
+        cbm_json_escape(cesc, (int)sizeof(cesc), x->container ? x->container : "-");
+        const char *props = cbm_arena_sprintf(
+            &h->a, "{\"ref\":\"image\",\"image\":\"%s\",\"container\":\"%s\"%s%s}", esc, cesc,
+            x->keys ? ",\"default_of\":" : "", x->keys ? x->keys : "");
+        if (props) {
+            cbm_gbuf_insert_edge(ctx->gbuf, x->src, x->img, "USAGE", props);
+            h->edges++;
+        }
+    }
+}
+
+/* Chart `from` -DEPLOYS {via, ref: image, image, override_of}-> the images an
+ * overlay changed: rendered there, absent from the defaults' images. */
+static void k8s_helm_emit_overrides(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, int64_t from,
+                                    const char *via, const k8s_himgs_t *dflt,
+                                    const k8s_himgs_t *got, yyjson_mut_val *overlay,
+                                    yyjson_mut_val *globals, const char *prefix,
+                                    k8s_himgs_t *emitted) {
+    for (int i = 0; i < got->n; i++) {
+        const k8s_himg_t *x = &got->v[i];
+        bool same = false;
+        for (int j = 0; j < dflt->n && !same; j++) {
+            same = dflt->v[j].src == x->src && dflt->v[j].img == x->img &&
+                   strcmp(dflt->v[j].ref, x->ref) == 0;
+        }
+        const char *ovr = k8s_helm_overridden(h, x->keys, overlay, globals, prefix);
+        if (same || !ovr || from <= 0) {
+            continue;
+        }
+        k8s_himg_t e = {from, x->img, x->ref, NULL, ovr};
+        int before = emitted->n;
+        k8s_himg_push(emitted, e);
+        if (emitted->n == before) {
+            continue;
+        }
+        char esc[CBM_SZ_1K];
+        cbm_json_escape(esc, (int)sizeof(esc), x->ref);
+        const char *props = cbm_arena_sprintf(
+            &h->a, "{\"via\":\"%s\",\"ref\":\"image\",\"image\":\"%s\",\"override_of\":%s}", via,
+            esc, ovr);
+        if (props) {
+            cbm_gbuf_insert_edge(ctx->gbuf, from, x->img, "DEPLOYS", props);
+            h->edges++;
+        }
+    }
+}
+
+/* The chart dirs enclosing chart dir `dir`, nearest first (arena). */
+static int k8s_helm_ancestors(k8s_helm_t *h, k8s_bundles_t *b, const char *dir, const char ***out) {
+    int n = 0;
+    int cap = 0;
+    const char **v = NULL;
+    char cur[CBM_SZ_1K];
+    snprintf(cur, sizeof(cur), "%s", dir);
+    while (cur[0]) {
+        char up[CBM_SZ_1K];
+        if (!k8s_chart_of(b, cur, up, sizeof(up))) {
+            break;
+        }
+        if (n == cap) {
+            cap = cap ? cap * PAIR_LEN : CBM_SZ_16;
+            const char **g = cbm_arena_alloc(&h->a, (size_t)cap * sizeof(*g));
+            if (!g) {
+                break;
+            }
+            if (n) {
+                memcpy(g, v, (size_t)n * sizeof(*g));
+            }
+            v = g;
+        }
+        v[n++] = cbm_arena_strdup(&h->a, up);
+        snprintf(cur, sizeof(cur), "%s", up);
+    }
+    *out = v;
+    return n;
+}
+
+/* The dependency of `parent`'s Chart.yaml naming `sub` (by name), NULL: none. */
+static yyjson_mut_val *k8s_helm_dep(const k8s_hchart_t *parent, const k8s_hchart_t *sub) {
+    yyjson_mut_val *deps = yyjson_mut_is_obj(parent->chart_yaml)
+                               ? yyjson_mut_obj_get(parent->chart_yaml, "dependencies")
+                               : NULL;
+    if (yyjson_mut_is_arr(deps) && sub->meta.name) {
+        size_t idx, max;
+        yyjson_mut_val *d;
+        yyjson_mut_arr_foreach(deps, idx, max, d) {
+            const char *name = k8s_helm_meta_str(d, "name");
+            if (name && strcmp(name, sub->meta.name) == 0) {
+                return d;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Is the subchart a dependency disables in the parent's values `vals` (its
+ * `condition`: the first of its comma-separated paths that holds a bool)? */
+static bool k8s_helm_disabled(k8s_helm_t *h, yyjson_mut_val *dep, yyjson_mut_val *vals) {
+    const char *cond = dep ? k8s_helm_meta_str(dep, "condition") : NULL;
+    for (const char *p = cond; p && *p;) {
+        const char *comma = strchr(p, ',');
+        size_t l = comma ? (size_t)(comma - p) : strlen(p);
+        char *path = cbm_arena_strndup(&h->a, p, l);
+        yyjson_mut_val *v = path ? k8s_helm_dig(vals, path) : NULL;
+        if (yyjson_mut_is_bool(v)) {
+            return !yyjson_mut_get_bool(v);
+        }
+        p += l + (comma ? SKIP_ONE : 0);
+    }
+    return false;
+}
+
+/* The values chart dir `dir` renders with when chart dir `top` deploys it
+ * with values `top_vals` (NULL: top's defaults): down the charts between
+ * them, each subchart's defaults with its parent's `<alias>:` values and
+ * `global:` coalesced over them (Helm's coalesce; a subchart always has a
+ * `global`). *path gets dir's key path from top ("" for top itself), *as_name
+ * the name dir's chart is included under (its alias; NULL for top), *full its
+ * chart path as Helm's ChartFullPath (top's name, then `/charts/<as_name>`
+ * per chart down; NULL: not known). NULL: a dependency condition disables it,
+ * or a values file does not parse. */
+static yyjson_mut_val *k8s_helm_context(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, k8s_bundles_t *b,
+                                        k8s_dep_link_t *l, const char *dir, const char *top,
+                                        yyjson_mut_val *top_vals, const char **path,
+                                        const char **as_name, const char **full) {
+    const char **anc = NULL;
+    int na = k8s_helm_ancestors(h, b, dir, &anc);
+    int ti = -SKIP_ONE; /* top's index among the ancestors; na: dir itself */
+    if (strcmp(dir, top) == 0) {
+        ti = na;
+    } else {
+        for (int i = 0; i < na && ti < 0; i++) {
+            ti = strcmp(anc[i], top) == 0 ? i : ti;
+        }
+    }
+    *path = "";
+    *as_name = NULL;
+    *full = NULL;
+    if (ti < 0) {
+        return NULL;
+    }
+    k8s_hchart_t *cur_chart = k8s_helm_chart(ctx, h, l, top);
+    if (!cur_chart || !cur_chart->values) {
+        return NULL;
+    }
+    *full = cur_chart->meta.name;
+    yyjson_mut_val *cur = top_vals ? cbm_helm_values_coalesce(h->doc, cur_chart->values, top_vals)
+                                   : cur_chart->values;
+    for (int i = (ti == na ? na : ti) - SKIP_ONE; i >= -SKIP_ONE && ti != na; i--) {
+        k8s_hchart_t *child = k8s_helm_chart(ctx, h, l, i >= 0 ? anc[i] : dir);
+        if (!child || !child->values) {
+            return NULL;
+        }
+        yyjson_mut_val *dep = k8s_helm_dep(cur_chart, child);
+        if (k8s_helm_disabled(h, dep, cur)) {
+            return NULL;
+        }
+        const char *alias = dep ? k8s_helm_meta_str(dep, "alias") : NULL;
+        alias = alias ? alias : child->meta.name;
+        if (!alias) {
+            return NULL;
+        }
+        *path = (*path)[0] ? cbm_arena_sprintf(&h->a, "%s.%s", *path, alias)
+                           : cbm_arena_strdup(&h->a, alias);
+        *as_name = alias;
+        *full = *full ? cbm_arena_sprintf(&h->a, "%s/charts/%s", *full, alias) : NULL;
+        yyjson_mut_val *sub = yyjson_mut_is_obj(cur) ? yyjson_mut_obj_get(cur, alias) : NULL;
+        yyjson_mut_val *next = cbm_helm_values_coalesce(h->doc, child->values, sub);
+        yyjson_mut_val *pg = yyjson_mut_is_obj(cur) ? yyjson_mut_obj_get(cur, "global") : NULL;
+        yyjson_mut_val *cg = next ? yyjson_mut_obj_get(next, "global") : NULL;
+        yyjson_mut_val *g = cbm_helm_values_coalesce(h->doc, cg, pg); /* the parent's win */
+        if (!next || !g) {
+            return NULL;
+        }
+        (void)yyjson_mut_obj_remove_key(next, "global");
+        yyjson_mut_obj_add(next, yyjson_mut_strcpy(h->doc, "global"), g);
+        cur = next;
+        cur_chart = child;
+    }
+    return cur;
+}
+
+/* Render the templated containers [from, to) of one template with `vals`
+ * and take each container's images. */
+static void k8s_helm_images_of(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, k8s_bundles_t *b,
+                               const k8s_hchart_t *c, const char *as_name, const char *full,
+                               int from, int to, yyjson_mut_val *vals, const char *src, size_t len,
+                               cbm_helm_probe_t *probes, int np, k8s_himgs_t *out) {
+    k8s_helm_render(ctx, h, b, c, as_name, full, h->t, from, to, vals, src, len, probes, np);
+    for (int i = from; i < to; i++) {
+        k8s_helm_take(ctx, probes, np, h->t[i].start_line, h->t[i].end_line, h->t[i].node,
+                      h->t[i].container, out);
+    }
+}
+
+/* Every templated container's images with its chart family's defaults --
+ * what `helm template <family root>` renders. */
+static void k8s_helm_link_defaults(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8s_helm_t *h) {
+    if (h->nt == 0 || !ctx->repo_path) {
+        return;
+    }
+    qsort(h->t, (size_t)h->nt, sizeof(*h->t), k8s_timg_cmp);
+    k8s_dep_link_t l = {.ctx = ctx, .charts = k8s_index_by_file(ctx, "Chart")};
+    k8s_himgs_t uses = {0};
+    for (int from = 0; from < h->nt;) {
+        int to = from + SKIP_ONE;
+        while (to < h->nt && strcmp(h->t[to].file, h->t[from].file) == 0) {
+            to++;
+        }
+        char dir[CBM_SZ_1K];
+        char fam[CBM_SZ_1K];
+        k8s_hchart_t *c = k8s_chart_of(b, h->t[from].file, dir, sizeof(dir))
+                              ? k8s_helm_chart(ctx, h, &l, dir)
+                              : NULL;
+        const char *path = NULL;
+        const char *as_name = NULL;
+        const char *full = NULL;
+        yyjson_mut_val *vals = NULL;
+        if (c) {
+            k8s_chart_family(b, c->dir, fam, sizeof(fam));
+            vals = k8s_helm_context(ctx, h, b, &l, c->dir, fam, NULL, &path, &as_name, &full);
+        }
+        int len = 0;
+        char *src = vals ? k8s_repo_read(ctx, h->t[from].file, &len) : NULL;
+        cbm_helm_probe_t *probes = NULL;
+        int np = src ? k8s_helm_probes(h, h->t, from, to, src, (size_t)len, &probes) : 0;
+        if (np > 0) {
+            k8s_helm_images_of(ctx, h, b, c, as_name, full, from, to, vals, src, (size_t)len,
+                               probes, np, &uses);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, src);
+        from = to;
+    }
+    k8s_helm_emit_uses(ctx, h, &uses);
+    h->dflt = uses; /* the release views compare against these */
+    k8s_free_index(l.charts);
+}
+
+/* ── Release images ───────────────────────────────────────────────────
+ *
+ * A release (a Flux HelmRelease's spec.values, a kustomize helmCharts
+ * entry's valuesFile + valuesInline, a Terraform helm_release's values +
+ * set) renders its chart with its values over the defaults. Of a chart in
+ * the repository the templates render again: each image that differs from
+ * the defaults' is the release's own -- release -DEPLOYS {via, ref: image,
+ * image, override_of: the keys it set that the image read}-> Image. A chart
+ * outside the repository has no templates here: its images are read from the
+ * release values by convention -- a mapping with `repository` (and `tag` /
+ * `digest` / `registry`) whose reference names a registry host; one without
+ * a host names none (no host is invented) -- {inferred: values, values_key}. */
+
+/* The chart dir of local Chart node `cn` (a werf chart: its `.helm`). */
+static bool k8s_helm_chart_dir(const cbm_gbuf_node_t *cn, char *out, size_t sz) {
+    if (!cn->file_path) {
+        return false;
+    }
+    k8s_dirname(cn->file_path, out, sz);
+    const char *base = k8s_basename(cn->file_path);
+    if (strcmp(base, "werf.yaml") == 0 || strcmp(base, "werf.yml") == 0) {
+        size_t l = strlen(out);
+        snprintf(out + l, sz - l, "%s.helm", l ? "/" : "");
+    }
+    return true;
+}
+
+/* A local chart's images rendered with release values `rv`, against the
+ * defaults. */
+static void k8s_helm_release_local(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8s_helm_t *h,
+                                   k8s_dep_link_t *l, int64_t src, const char *via, const char *top,
+                                   yyjson_mut_val *rv, k8s_himgs_t *emitted) {
+    size_t tl = strlen(top);
+    for (int from = 0; from < h->nt;) {
+        int to = from + SKIP_ONE;
+        while (to < h->nt && strcmp(h->t[to].file, h->t[from].file) == 0) {
+            to++;
+        }
+        char dir[CBM_SZ_1K];
+        bool in =
+            k8s_chart_of(b, h->t[from].file, dir, sizeof(dir)) &&
+            (strcmp(dir, top) == 0 || (tl == 0 || (strncmp(dir, top, tl) == 0 && dir[tl] == '/')));
+        k8s_hchart_t *c = in ? k8s_helm_chart(ctx, h, l, dir) : NULL;
+        const char *path = NULL;
+        const char *as_name = NULL;
+        const char *full = NULL;
+        yyjson_mut_val *vals =
+            c ? k8s_helm_context(ctx, h, b, l, dir, top, rv, &path, &as_name, &full) : NULL;
+        int len = 0;
+        char *srcs = vals ? k8s_repo_read(ctx, h->t[from].file, &len) : NULL;
+        cbm_helm_probe_t *probes = NULL;
+        int np = srcs ? k8s_helm_probes(h, h->t, from, to, srcs, (size_t)len, &probes) : 0;
+        if (np > 0) {
+            k8s_himgs_t got = {0};
+            k8s_helm_images_of(ctx, h, b, c, as_name, full, from, to, vals, srcs, (size_t)len,
+                               probes, np, &got);
+            yyjson_mut_val *overlay = path && path[0] ? k8s_helm_dig(rv, path) : rv;
+            yyjson_mut_val *globals = yyjson_mut_obj_get(rv, "global");
+            k8s_helm_emit_overrides(ctx, h, src, via, &h->dflt, &got, overlay, globals,
+                                    path && path[0] ? path : NULL, emitted);
+            k8s_himgs_free(&got);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, srcs);
+        from = to;
+    }
+}
+
+/* Does image reference `ref` name a registry host (its first path part has
+ * a `.` or `:`, or is localhost)? */
+static bool k8s_helm_has_host(const char *ref) {
+    const char *slash = strchr(ref, '/');
+    if (!slash) {
+        return false;
+    }
+    size_t fl = (size_t)(slash - ref);
+    return memchr(ref, '.', fl) || memchr(ref, ':', fl) ||
+           (fl == strlen("localhost") && strncmp(ref, "localhost", fl) == 0);
+}
+
+/* The images release values `v` name by convention (see above). */
+static void k8s_helm_convention(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h, int64_t src,
+                                const char *via, yyjson_mut_val *v, const char *path,
+                                k8s_himgs_t *emitted) {
+    size_t idx, max;
+    if (yyjson_mut_is_arr(v)) {
+        yyjson_mut_val *it;
+        yyjson_mut_arr_foreach(v, idx, max, it) {
+            k8s_helm_convention(ctx, h, src, via, it,
+                                cbm_arena_sprintf(&h->a, "%s[%zu]", path ? path : "", idx),
+                                emitted);
+        }
+        return;
+    }
+    if (!yyjson_mut_is_obj(v)) {
+        return;
+    }
+    yyjson_mut_val *repo = yyjson_mut_obj_get(v, "repository");
+    if (yyjson_mut_is_str(repo) && yyjson_mut_get_len(repo) > 0) {
+        char reg[CBM_SZ_512] = "";
+        char tag[CBM_SZ_256] = "";
+        char dig[CBM_SZ_256] = "";
+        yyjson_mut_val *r = yyjson_mut_obj_get(v, "registry");
+        yyjson_mut_val *tg = yyjson_mut_obj_get(v, "tag");
+        yyjson_mut_val *dg = yyjson_mut_obj_get(v, "digest");
+        bool ok = (!r || yyjson_mut_is_null(r) || cbm_helm_scalar_text(r, reg, sizeof(reg))) &&
+                  (!tg || yyjson_mut_is_null(tg) || cbm_helm_scalar_text(tg, tag, sizeof(tag))) &&
+                  (!dg || yyjson_mut_is_null(dg) || cbm_helm_scalar_text(dg, dig, sizeof(dig)));
+        const char *ref = ok ? cbm_arena_sprintf(&h->a, "%s%s%s%s%s", reg, reg[0] ? "/" : "",
+                                                 yyjson_mut_get_str(repo),
+                                                 dig[0]   ? "@"
+                                                 : tag[0] ? ":"
+                                                          : "",
+                                                 dig[0] ? dig : tag)
+                             : NULL;
+        int64_t img = ref && k8s_helm_has_host(ref) && cbm_image_ref_valid(ref)
+                          ? cbm_pipeline_image_node(ctx, ref)
+                          : 0;
+        int before = emitted->n;
+        if (img > 0) {
+            k8s_himg_push(emitted, (k8s_himg_t){src, img, ref, NULL, NULL});
+        }
+        if (emitted->n > before) {
+            char esc[CBM_SZ_1K];
+            char kesc[CBM_SZ_1K];
+            cbm_json_escape(esc, (int)sizeof(esc), ref);
+            cbm_json_escape(kesc, (int)sizeof(kesc), path ? path : "");
+            const char *props = cbm_arena_sprintf(
+                &h->a,
+                "{\"via\":\"%s\",\"ref\":\"image\",\"image\":\"%s\",\"inferred\":\"values\","
+                "\"values_key\":\"%s\"}",
+                via, esc, kesc);
+            if (props) {
+                cbm_gbuf_insert_edge(ctx->gbuf, src, img, "DEPLOYS", props);
+                h->edges++;
+            }
+        }
+    }
+    yyjson_mut_val *k;
+    yyjson_mut_val *child;
+    yyjson_mut_obj_foreach(v, idx, max, k, child) {
+        if (!yyjson_mut_is_obj(child) && !yyjson_mut_is_arr(child)) {
+            continue;
+        }
+        const char *key = yyjson_mut_get_str(k);
+        const char *cp = path && path[0] ? cbm_arena_sprintf(&h->a, "%s.%s", path, key)
+                                         : cbm_arena_strdup(&h->a, key);
+        k8s_helm_convention(ctx, h, src, via, child, cp, emitted);
+    }
+}
+
+/* One release of Chart node `chart` with values `rv`. */
+static void k8s_helm_release(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8s_helm_t *h,
+                             k8s_dep_link_t *l, int64_t src, const char *via, int64_t chart,
+                             yyjson_mut_val *rv) {
+    const cbm_gbuf_node_t *cn = chart > 0 ? cbm_gbuf_find_by_id(ctx->gbuf, chart) : NULL;
+    if (!cn || !yyjson_mut_is_obj(rv) || src <= 0) {
+        return;
+    }
+    k8s_himgs_t emitted = {0};
+    char dir[CBM_SZ_1K];
+    if (cbm_pipeline_chart_is_external(cn)) {
+        k8s_helm_convention(ctx, h, src, via, rv, NULL, &emitted);
+    } else if (k8s_helm_chart_dir(cn, dir, sizeof(dir)) && b->charts &&
+               cbm_ht_get(b->charts, dir)) {
+        k8s_helm_release_local(ctx, b, h, l, src, via, dir, rv, &emitted);
+    }
+    k8s_himgs_free(&emitted);
+}
+
+/* A node's document (lines start_line..end_line of its file) as values. */
+static yyjson_mut_val *k8s_helm_node_yaml(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h,
+                                          const cbm_gbuf_node_t *n) {
+    int len = 0;
+    char *src = n->file_path ? k8s_repo_read(ctx, n->file_path, &len) : NULL;
+    if (!src) {
+        return NULL;
+    }
+    size_t b = 0;
+    size_t e = (size_t)len;
+    int line = SKIP_ONE;
+    for (size_t i = 0; i < (size_t)len && n->start_line > 0; i++) {
+        if (src[i] != '\n') {
+            continue;
+        }
+        line++;
+        if (line == n->start_line) {
+            b = i + SKIP_ONE;
+        }
+        if (n->end_line > 0 && line == n->end_line + SKIP_ONE) {
+            e = i;
+            break;
+        }
+    }
+    yyjson_mut_val *v = b <= e ? cbm_helm_values_parse(h->doc, src + b, e - b) : NULL;
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    return v;
+}
+
+/* String property `key` of edge properties `props` into out; false: none. */
+static bool k8s_json_str(const char *props, const char *key, char *out, size_t sz) {
+    out[0] = '\0';
+    yyjson_doc *d = props ? yyjson_read(props, strlen(props), 0) : NULL;
+    yyjson_val *v = d ? yyjson_obj_get(yyjson_doc_get_root(d), key) : NULL;
+    bool ok = yyjson_is_str(v);
+    if (ok) {
+        snprintf(out, sz, "%s", yyjson_get_str(v));
+    }
+    if (d) {
+        yyjson_doc_free(d);
+    }
+    return ok;
+}
+
+/* Does field `key` of `obj` give a value (a non-null scalar, a non-empty list
+ * or map)? */
+static bool k8s_helm_gives(yyjson_mut_val *obj, const char *key) {
+    yyjson_mut_val *v = yyjson_mut_is_obj(obj) ? yyjson_mut_obj_get(obj, key) : NULL;
+    if (!v || yyjson_mut_is_null(v)) {
+        return false;
+    }
+    if (yyjson_mut_is_arr(v)) {
+        return yyjson_mut_arr_size(v) > 0;
+    }
+    if (yyjson_mut_is_obj(v)) {
+        return yyjson_mut_obj_size(v) > 0;
+    }
+    return !yyjson_mut_is_str(v) || yyjson_mut_get_len(v) > 0;
+}
+
+/* A HelmRelease's values: spec.values; NULL when there are none -- or when a
+ * source not read also gives some (valuesFrom, the chart's valuesFiles, a
+ * postRenderer that may patch the images): its images are then unknown. */
+static yyjson_mut_val *k8s_helm_flux_values(yyjson_mut_val *docv) {
+    yyjson_mut_val *spec = yyjson_mut_is_obj(docv) ? yyjson_mut_obj_get(docv, "spec") : NULL;
+    yyjson_mut_val *chart = yyjson_mut_is_obj(spec) ? yyjson_mut_obj_get(spec, "chart") : NULL;
+    yyjson_mut_val *cspec = yyjson_mut_is_obj(chart) ? yyjson_mut_obj_get(chart, "spec") : NULL;
+    if (k8s_helm_gives(spec, "valuesFrom") || k8s_helm_gives(spec, "postRenderers") ||
+        k8s_helm_gives(cspec, "valuesFiles") || k8s_helm_gives(cspec, "valuesFile")) {
+        return NULL;
+    }
+    return yyjson_mut_is_obj(spec) ? yyjson_mut_obj_get(spec, "values") : NULL;
+}
+
+/* A kustomize helmCharts entry's values: valuesFile, then valuesInline over
+ * it; NULL when neither -- or when a part is not read (additionalValuesFiles,
+ * a valuesMerge other than the default override, a valuesFile that cannot be
+ * read): its images are then unknown. */
+static yyjson_mut_val *k8s_helm_kustomize_values(cbm_pipeline_ctx_t *ctx, k8s_helm_t *h,
+                                                 const cbm_gbuf_node_t *kust, const char *props) {
+    char chart[CBM_SZ_512] = "";
+    char release[CBM_SZ_512] = "";
+    char vfile[CBM_SZ_1K] = "";
+    (void)k8s_json_str(props, "chart", chart, sizeof(chart));
+    (void)k8s_json_str(props, "release", release, sizeof(release));
+    (void)k8s_json_str(props, "values", vfile, sizeof(vfile));
+    int len = 0;
+    char *src = kust->file_path ? k8s_repo_read(ctx, kust->file_path, &len) : NULL;
+    yyjson_mut_val *doc = src ? cbm_helm_values_parse(h->doc, src, (size_t)len) : NULL;
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    /* kustomize runs the kustomization's own transformers over the inflated
+     * chart: images / patches / replacements may change what it deploys */
+    static const char *const TRANSFORMS[] = {
+        "images",       "patches",      "patchesJson6902", "patchesStrategicMerge",
+        "replacements", "transformers", "components",      NULL};
+    for (int i = 0; TRANSFORMS[i]; i++) {
+        if (k8s_helm_gives(doc, TRANSFORMS[i])) {
+            return NULL;
+        }
+    }
+    yyjson_mut_val *charts = yyjson_mut_is_obj(doc) ? yyjson_mut_obj_get(doc, "helmCharts") : NULL;
+    yyjson_mut_val *inline_vals = NULL;
+    size_t idx, max;
+    yyjson_mut_val *c;
+    yyjson_mut_arr_foreach(charts, idx, max, c) {
+        const char *name = k8s_helm_meta_str(c, "name");
+        const char *rel = k8s_helm_meta_str(c, "releaseName");
+        if (name && strcmp(name, chart) == 0 &&
+            (!release[0] || (rel && strcmp(rel, release) == 0))) {
+            const char *merge = k8s_helm_meta_str(c, "valuesMerge");
+            if (k8s_helm_gives(c, "additionalValuesFiles") ||
+                (merge && strcmp(merge, "override") != 0)) {
+                return NULL;
+            }
+            inline_vals = yyjson_mut_obj_get(c, "valuesInline");
+            break;
+        }
+    }
+    yyjson_mut_val *file_vals = NULL;
+    if (vfile[0]) {
+        int fl = 0;
+        char *fs = k8s_repo_read(ctx, vfile, &fl);
+        file_vals = fs ? cbm_helm_values_parse(h->doc, fs, (size_t)fl) : NULL;
+        cbm_free(CBM_MEM_CLASS_OTHER, fs);
+        if (!file_vals) {
+            return NULL; /* a valuesFile not read: the release's values would be partial */
+        }
+    }
+    if (!inline_vals && !file_vals) {
+        return NULL;
+    }
+    return cbm_helm_values_coalesce(h->doc, file_vals, inline_vals);
+}
+
+/* Every release's images: HelmReleases and kustomize helmCharts from their
+ * DEPLOYS edges to a Chart, Terraform helm_releases from the context. */
+static void k8s_helm_link_releases(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, k8s_helm_t *h) {
+    k8s_dep_link_t l = {.ctx = ctx, .charts = k8s_index_by_file(ctx, "Chart")};
+    const cbm_gbuf_edge_t **es = NULL;
+    int n = 0;
+    if (ctx->repo_path && cbm_gbuf_find_edges_by_type(ctx->gbuf, "DEPLOYS", &es, &n) == 0) {
+        /* collected first: release edges are DEPLOYS too */
+        typedef struct {
+            int64_t src;
+            int64_t tgt;
+            const char *props;
+        } k8s_rel_t;
+        k8s_rel_t *rels = n ? cbm_arena_alloc(&h->a, (size_t)n * sizeof(*rels)) : NULL;
+        int nr = 0;
+        for (int i = 0; rels && i < n; i++) {
+            const char *p = es[i]->properties_json;
+            if (p &&
+                (strstr(p, "\"via\":\"helmrelease\"") || strstr(p, "\"via\":\"helmcharts\"")) &&
+                !strstr(p, "\"ref\":")) {
+                rels[nr++] =
+                    (k8s_rel_t){es[i]->source_id, es[i]->target_id, cbm_arena_strdup(&h->a, p)};
+            }
+        }
+        for (int i = 0; i < nr; i++) {
+            const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, rels[i].src);
+            if (!src) {
+                continue;
+            }
+            bool hr = strstr(rels[i].props, "\"via\":\"helmrelease\"") != NULL;
+            yyjson_mut_val *rv = NULL;
+            if (hr) {
+                rv = k8s_helm_flux_values(k8s_helm_node_yaml(ctx, h, src));
+            } else {
+                rv = k8s_helm_kustomize_values(ctx, h, src, rels[i].props);
+            }
+            k8s_helm_release(ctx, b, h, &l, rels[i].src, hr ? "helmrelease" : "helmcharts",
+                             rels[i].tgt, rv);
+        }
+    }
+    for (int i = 0; i < ctx->tf_release_n; i++) {
+        cbm_tf_release_t *r = &ctx->tf_releases[i];
+        if (r->values) {
+            yyjson_doc *jd = yyjson_read(r->values, strlen(r->values), 0);
+            yyjson_mut_val *rv = jd ? yyjson_val_mut_copy(h->doc, yyjson_doc_get_root(jd)) : NULL;
+            if (jd) {
+                yyjson_doc_free(jd);
+            }
+            k8s_helm_release(ctx, b, h, &l, r->src, "terraform", r->chart, rv);
+            cbm_free(CBM_MEM_CLASS_OTHER, r->values);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, ctx->tf_releases);
+    ctx->tf_releases = NULL;
+    ctx->tf_release_n = 0;
+    ctx->tf_release_cap = 0;
+    k8s_free_index(l.charts);
+}
+
+static void k8s_helm_init(k8s_helm_t *h) {
+    *h = (k8s_helm_t){0};
+    cbm_arena_init_lazy(&h->a, CBM_SZ_4K);
+    h->doc = yyjson_mut_doc_new(cbm_json_writer_allocator());
+    h->charts = cbm_ht_create(0);
+    h->defines = cbm_ht_create(0);
+}
+
+static void k8s_helm_free(k8s_helm_t *h) {
+    if (h->defines) {
+        cbm_ht_foreach(h->defines, k8s_helm_free_defines, NULL);
+        cbm_ht_free(h->defines);
+    }
+    if (h->charts) {
+        cbm_ht_free(h->charts);
+    }
+    if (h->doc) {
+        yyjson_mut_doc_free(h->doc);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, h->t);
+    k8s_himgs_free(&h->dflt);
+    cbm_arena_destroy(&h->a);
+    if (h->edges > 0) {
+        cbm_log_info("pass.k8s.helm_images", "edges", itoa_k8s(h->edges));
+    }
+    *h = (k8s_helm_t){0};
+}
+
+/* Each Image a chart's objects use (their USAGE {ref: image}, after
  * pass_docker.c moved references onto component Images): Chart -DEPLOYS
- * {via: chart, ref: image}-> it. A templated image names no Image, and no
- * values default is read. Edges are collected first: inserting while walking
- * a chart's own DEPLOYS edges would grow the list being read. */
+ * {via: chart, ref: image}-> it -- {default_of: the values keys} when every
+ * object of the chart uses it by a rendered default (the keys unioned), none
+ * when one names it literally. Edges are collected first: inserting while
+ * walking a chart's own DEPLOYS edges would grow the list being read. */
+typedef struct {
+    int64_t chart;
+    int64_t img;
+    bool literal;
+    bool lost;  /* a mark that could not be carried whole: no edge, never an unmarked one */
+    char *keys; /* JSON array (cbm_alloc); NULL: none yet */
+} k8s_cimg_t;
+
+/* JSON array `a` (owned, may be NULL) with the strings of JSON array value
+ * `bv` appended once; the result is owned. *lost when one could not be. */
+static char *k8s_keys_union(char *a, yyjson_val *bv, bool *lost) {
+    size_t idx, max;
+    yyjson_val *k;
+    yyjson_arr_foreach(bv, idx, max, k) {
+        const char *s = yyjson_get_str(k);
+        if (!s) {
+            continue;
+        }
+        /* JSON escaping writes at most 6 bytes (\u00XX) a byte */
+        size_t qn = strlen(s) * 6 + PAIR_LEN + SKIP_ONE;
+        char *quoted = cbm_alloc(CBM_MEM_CLASS_OTHER, qn);
+        if (!quoted) {
+            *lost = true;
+            break;
+        }
+        quoted[0] = '"';
+        cbm_json_escape(quoted + SKIP_ONE, (int)(qn - PAIR_LEN), s);
+        size_t ql = strlen(quoted);
+        quoted[ql++] = '"';
+        quoted[ql] = '\0';
+        if (a && strstr(a, quoted)) {
+            cbm_free(CBM_MEM_CLASS_OTHER, quoted);
+            continue;
+        }
+        size_t al = a ? strlen(a) : 0;
+        char *g = cbm_alloc(CBM_MEM_CLASS_OTHER, al + ql + 3);
+        if (!g) {
+            cbm_free(CBM_MEM_CLASS_OTHER, quoted);
+            *lost = true;
+            break;
+        }
+        if (a) {
+            snprintf(g, al + ql + 3, "%.*s,%s]", (int)(al - SKIP_ONE), a, quoted);
+        } else {
+            snprintf(g, ql + 3, "[%s]", quoted);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, quoted);
+        cbm_free(CBM_MEM_CLASS_OTHER, a);
+        a = g;
+    }
+    return a;
+}
+
 static void k8s_link_chart_images(cbm_pipeline_ctx_t *ctx) {
     const cbm_gbuf_node_t **charts = NULL;
     int nc = 0;
     if (cbm_gbuf_find_by_label(ctx->gbuf, "Chart", &charts, &nc) != 0 || nc == 0) {
         return;
     }
-    int64_t *pairs = NULL;
-    int np = 0;
+    k8s_cimg_t *v = NULL;
+    int n = 0;
     int cap = 0;
     for (int c = 0; c < nc; c++) {
         const cbm_gbuf_edge_t **dep = NULL;
@@ -3748,26 +5064,52 @@ static void k8s_link_chart_images(cbm_pipeline_ctx_t *ctx) {
                     !strstr(up, "\"ref\":\"image\"")) {
                     continue;
                 }
-                if (np + PAIR_LEN > cap) {
-                    int ncap = cap ? cap * PAIR_LEN : CBM_SZ_64;
-                    int64_t *grown =
-                        cbm_realloc(CBM_MEM_CLASS_OTHER, pairs, (size_t)ncap * sizeof(*pairs));
-                    if (!grown) {
+                int at = -SKIP_ONE;
+                for (int i = n - SKIP_ONE; i >= 0 && at < 0; i--) {
+                    at = v[i].chart == charts[c]->id && v[i].img == img->id ? i : at;
+                }
+                if (at < 0) {
+                    if (!k8s_grow((void **)&v, &cap, n, sizeof(*v))) {
                         break;
                     }
-                    pairs = grown;
-                    cap = ncap;
+                    v[n] = (k8s_cimg_t){charts[c]->id, img->id, false, false, NULL};
+                    at = n++;
                 }
-                pairs[np++] = charts[c]->id;
-                pairs[np++] = img->id;
+                /* the USAGE's default_of, read as JSON (a key path may hold `]`) */
+                yyjson_doc *ud = yyjson_read(up, strlen(up), 0);
+                yyjson_val *dv = ud ? yyjson_obj_get(yyjson_doc_get_root(ud), "default_of") : NULL;
+                if (!ud) {
+                    v[at].lost = true;
+                } else if (!dv) {
+                    v[at].literal = true;
+                } else if (yyjson_is_arr(dv)) {
+                    v[at].keys = k8s_keys_union(v[at].keys, dv, &v[at].lost);
+                } else {
+                    v[at].lost = true;
+                }
+                if (ud) {
+                    yyjson_doc_free(ud);
+                }
             }
         }
     }
-    for (int i = 0; i + SKIP_ONE < np; i += PAIR_LEN) {
-        cbm_gbuf_insert_edge(ctx->gbuf, pairs[i], pairs[i + SKIP_ONE], "DEPLOYS",
-                             "{\"via\":\"chart\",\"ref\":\"image\"}");
+    for (int i = 0; i < n; i++) {
+        bool marked = !v[i].literal && v[i].keys;
+        if (!v[i].literal && v[i].lost) {
+            cbm_free(CBM_MEM_CLASS_OTHER, v[i].keys);
+            continue; /* the mark is not whole: no edge rather than an unmarked one */
+        }
+        size_t pn = (marked ? strlen(v[i].keys) : 0) + CBM_SZ_64;
+        char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, pn);
+        if (props) {
+            snprintf(props, pn, "{\"via\":\"chart\",\"ref\":\"image\"%s%s}",
+                     marked ? ",\"default_of\":" : "", marked ? v[i].keys : "");
+            cbm_gbuf_insert_edge(ctx->gbuf, v[i].chart, v[i].img, "DEPLOYS", props);
+            cbm_free(CBM_MEM_CLASS_OTHER, props);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, v[i].keys);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, pairs);
+    cbm_free(CBM_MEM_CLASS_OTHER, v);
 }
 
 /* A HelmRelease whose chartRef names OCIRepository `oci` (its USAGE edge
@@ -3830,7 +5172,7 @@ static void k8s_prop_add(char *out, size_t out_sz, int *w, const char *key, cons
  * namespace, values, line} from the kustomization (its Kustomization
  * Resource, else its File -- the unit a Flux / Argo deploy reaches) to the
  * external Chart of that repository and name. */
-static void k8s_link_kcharts(k8s_dep_link_t *l, const k8s_facts_t *f) {
+static void k8s_link_kcharts(k8s_dep_link_t *l, k8s_bundles_t *b, const k8s_facts_t *f) {
     for (int i = 0; i < f->kchart_n; i++) {
         const k8s_kchart_t *c = &f->kcharts[i];
         if (!c->chart || strchr(c->chart, '/') || strchr(c->chart, '$')) {
@@ -3838,8 +5180,18 @@ static void k8s_link_kcharts(k8s_dep_link_t *l, const k8s_facts_t *f) {
         }
         int64_t src = k8s_first_id(l->kusts, c->kust);
         src = src > 0 ? src : k8s_first_id(l->files, c->kust);
+        /* No repo: the chart in the kustomization's chartHome (charts/). */
+        int64_t local = 0;
+        if (!c->url || !c->url[0]) {
+            char kdir[CBM_SZ_1K];
+            char cdir[CBM_SZ_1K];
+            k8s_dirname(c->kust, kdir, sizeof(kdir));
+            snprintf(cdir, sizeof(cdir), "%s%scharts/%s", kdir, kdir[0] ? "/" : "", c->chart);
+            local = b->charts && cbm_ht_get(b->charts, cdir) ? k8s_chart_node(l, cdir) : 0;
+        }
         char props[CBM_SZ_4K];
-        int w = snprintf(props, sizeof(props), "{\"via\":\"helmcharts\",\"external\":true");
+        int w = snprintf(props, sizeof(props), "{\"via\":\"helmcharts\"%s",
+                         local > 0 ? "" : ",\"external\":true");
         k8s_prop_add(props, sizeof(props), &w, "chart", c->chart);
         k8s_prop_add(props, sizeof(props), &w, "url", c->url);
         k8s_prop_add(props, sizeof(props), &w, "version", c->version);
@@ -3850,7 +5202,8 @@ static void k8s_link_kcharts(k8s_dep_link_t *l, const k8s_facts_t *f) {
             continue;
         }
         snprintf(props + w, sizeof(props) - (size_t)w, ",\"line\":%d}", c->line);
-        k8s_deploys_edge(l, src, k8s_external_chart(l, c->chart, c->url, c->kust), props);
+        k8s_deploys_edge(
+            l, src, local > 0 ? local : k8s_external_chart(l, c->chart, c->url, c->kust), props);
     }
 }
 
@@ -4527,7 +5880,7 @@ static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundl
         k8s_link_chart_refs(&l, &f->srcs[s]);
     }
     if (l.files && l.kusts) {
-        k8s_link_kcharts(&l, f);
+        k8s_link_kcharts(&l, b, f);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)members.items);
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)units.items);
@@ -4603,6 +5956,14 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     k8s_chart_dir_add(&bundles, rel);
                     helm_count++;
                     break;
+                case K8S_WERF: {
+                    char chart_dir[CBM_SZ_1K];
+                    if (handle_werf_chart(ctx, rel, p->source, chart_dir, sizeof(chart_dir))) {
+                        k8s_chart_dir_register(&bundles, chart_dir);
+                        helm_count++;
+                    }
+                    break;
+                }
                 case K8S_KUSTOMIZE:
                     k8s_kusts_push(&kusts, rel, p->source);
                     k8s_kustomize_keep(&facts, rel, p->res);
@@ -4647,6 +6008,9 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_crds(ctx, &bundles, &facts);
     k8s_link_deploys(ctx, &kusts, &bundles, &facts);
     k8s_link_images(ctx, &facts);
+    k8s_helm_t helm;
+    k8s_helm_init(&helm);
+    k8s_helm_collect(ctx, &facts, &helm);
     k8s_link_envs(ctx, &facts);
     k8s_link_patches(ctx, &kusts, &facts);
     k8s_link_renames(ctx, &kusts);
@@ -4657,11 +6021,17 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_local_deps(ctx, &local_deps);
     k8s_link_includes(ctx, &bundles, files, file_count);
     k8s_link_chart_contents(ctx, &bundles);
-    k8s_bundles_free(&bundles);
+    /* The images chart templates render with their values (helm_template.c). */
+    k8s_helm_link_defaults(ctx, &bundles, &helm);
     k8s_kusts_free(&kusts);
     /* Shell and Make deploy commands, against the nodes linked above. */
     cbm_pipeline_pass_shell(ctx, files, file_count);
     cbm_pipeline_pass_terraform(ctx, files, file_count);
+    /* The images releases render (their values over the charts' defaults),
+     * before the image hubs move references. */
+    k8s_helm_link_releases(ctx, &bundles, &helm);
+    k8s_helm_free(&helm);
+    k8s_bundles_free(&bundles);
     cbm_pipeline_pass_ansible(ctx, files, file_count);
     cbm_pipeline_pass_docker(ctx, files, file_count);
     /* The Images a chart's objects use, once the image hubs moved them. */

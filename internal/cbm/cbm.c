@@ -16,6 +16,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/perl_lsp.h"
 #include "lsp/py_lsp.h"
+#include "lsp/ruby_lsp.h"
 #include "lsp/ts_lsp.h"
 #include "lsp/cs_lsp.h"
 #include "lsp/java_lsp.h"
@@ -30,6 +31,7 @@
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
 #include "foundation/str_util.h"   // cbm_json_escape — variants file_path
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
+#include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
@@ -1259,7 +1261,9 @@ static int count_params_from_signature(const char *sig) {
  * unlucky in-flight file is never quarantined alone. The env var is set
  * solely by the supervisor during recovery — a no-op on normal runs. */
 static void cbm_index_mark(const char *rel_path, char event) {
-    const char *mf = getenv("CBM_INDEX_MARKER_FILE");
+    char marker_path[CBM_SZ_4K];
+    const char *mf =
+        cbm_safe_getenv("CBM_INDEX_MARKER_FILE", marker_path, sizeof(marker_path), NULL);
     if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
         return;
     }
@@ -1296,7 +1300,9 @@ enum { CBM_QSET_UNINIT = 0, CBM_QSET_INITING = 1, CBM_QSET_INITED = 2 };
 static atomic_int g_quarantine_state = CBM_QSET_UNINIT;
 
 static void cbm_quarantine_load(void) {
-    const char *qf = getenv("CBM_INDEX_QUARANTINE_FILE");
+    char quarantine_path[CBM_SZ_4K];
+    const char *qf = cbm_safe_getenv("CBM_INDEX_QUARANTINE_FILE", quarantine_path,
+                                     sizeof(quarantine_path), NULL);
     if (!qf || !qf[0]) {
         return; /* normal path: empty set */
     }
@@ -3313,6 +3319,108 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
+/* The bytes the grammar parses. PHP that leaves PHP mode (`?> markup <?php`)
+ * is parsed with its markup blanked (#2000); the rewrite keeps the length and
+ * every line break, so offsets and line numbers still refer to the file on
+ * disk. Every other language parses the file as it is. */
+static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const char *source,
+                                       int source_len) {
+    if (language == CBM_LANG_PHP) {
+        return cbm_php_mask_inline_html(a, source, source_len);
+    }
+    return source;
+}
+
+/* The Swift grammar rejects conditional directives in type bodies. Mask only
+ * real AST directive tokens, so strings/comments and source coordinates survive. */
+static bool swift_mask_conditional_node(CBMArena *a, TSNode node, const char *source,
+                                        int source_len, char **masked) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "#if") == 0 || strcmp(kind, "#elseif") == 0 || strcmp(kind, "#else") == 0 ||
+        strcmp(kind, "#endif") == 0) {
+        if (!*masked) {
+            *masked = cbm_arena_strndup(a, source, (size_t)source_len);
+            if (!*masked) {
+                return false;
+            }
+        }
+        for (uint32_t i = ts_node_start_byte(node);
+             i < (uint32_t)source_len && source[i] != '\n' && source[i] != '\r'; i++) {
+            (*masked)[i] = ' ';
+        }
+    } else if (*masked &&
+               (strcmp(kind, "comment") == 0 || strcmp(kind, "multiline_comment") == 0)) {
+        for (uint32_t i = ts_node_start_byte(node);
+             i < ts_node_end_byte(node) && i < (uint32_t)source_len; i++) {
+            (*masked)[i] = source[i];
+        }
+    }
+    return true;
+}
+
+static const char *swift_mask_conditional_directives(CBMArena *a, TSNode root, const char *source,
+                                                     int source_len) {
+    char *masked = NULL;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool more = true;
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (!swift_mask_conditional_node(a, node, source, source_len, &masked)) {
+            break;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return masked ? masked : source;
+}
+
+/* Lines the error regions of this tree cover; a region past the cap counts one. */
+static uint64_t swift_error_lines(TSTree *tree, const char *source, int source_len) {
+    cbm_error_regions_t regions = {{0}, {0}, 0, 0};
+    cbm_collect_error_regions(ts_tree_root_node(tree), &regions, source, source_len);
+    uint64_t lines = (uint64_t)regions.dropped;
+    for (int i = 0; i < regions.count; i++) {
+        lines += regions.ends[i] - regions.starts[i] + SKIP_ONE;
+    }
+    return lines;
+}
+
+/* Masking can also make a file read worse: an `#error` line from a dropped
+ * branch stays in a type body. Keep the re-parse only when its error regions
+ * cover no more lines than the first parse's (#2061). Counting regions instead
+ * would reject a re-parse that splits one large region into a few small ones. */
+static TSTree *swift_retry_conditional_parse(CBMArena *a, TSParser *parser, TSTree *tree,
+                                             CBMLanguage language, const char *source,
+                                             int source_len, TSParseOptions opts) {
+    if (!tree || language != CBM_LANG_SWIFT || !ts_node_has_error(ts_tree_root_node(tree))) {
+        return tree;
+    }
+    const char *masked =
+        swift_mask_conditional_directives(a, ts_tree_root_node(tree), source, source_len);
+    if (masked == source) {
+        return tree;
+    }
+    ts_parser_reset(parser);
+    TSTree *retry = cbm_parse_source(parser, masked, (uint32_t)source_len, opts);
+    if (retry && swift_error_lines(retry, masked, source_len) <=
+                     swift_error_lines(tree, source, source_len)) {
+        ts_tree_delete(tree);
+        return retry;
+    }
+    if (retry) {
+        ts_tree_delete(retry);
+    }
+    return tree;
+}
+
 /* Initial block for the per-file traversal scratch arena, chosen by measuring
  * arena_grow on a 14k-file TypeScript tree: it fires on one file in 12,000 at
  * both this size and at 1 MB, and on most files at 256 KB, where the two
@@ -3616,6 +3724,61 @@ int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
 }
 #endif
 
+/* Extension visibility uses the file's direct imports, including imports
+ * written after a type declaration. The joined text is shared by its types. */
+static void cbm_swift_type_imports(CBMFileResult *result, CBMLanguage language) {
+    if (language != CBM_LANG_SWIFT) {
+        return;
+    }
+    size_t length = SKIP_ONE;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *path = result->imports.items[i].module_path;
+        if (path && path[0]) {
+            length += strlen(path) + SKIP_ONE;
+        }
+    }
+    char *imports = cbm_arena_alloc(&result->arena, length);
+    if (!imports) {
+        return;
+    }
+    size_t used = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *path = result->imports.items[i].module_path;
+        if (!path || !path[0]) {
+            continue;
+        }
+        if (used) {
+            imports[used++] = '|';
+        }
+        size_t n = strlen(path);
+        memcpy(imports + used, path, n);
+        used += n;
+    }
+    imports[used] = '\0';
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *def = &result->defs.items[i];
+        size_t count = 0;
+        bool is_type = false;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+            is_type = is_type || strcmp(kv[0], "swift_type_path") == 0 ||
+                      strcmp(kv[0], "swift_extension") == 0;
+            count += PAIR_LEN;
+        }
+        if (!is_type) {
+            continue;
+        }
+        const char **props =
+            cbm_arena_alloc(&result->arena, (count + PAIR_LEN + SKIP_ONE) * sizeof(*props));
+        if (props) {
+            memcpy(props, def->extra_props, count * sizeof(*props));
+            props[count] = "swift_imports";
+            props[count + SKIP_ONE] = imports;
+            props[count + PAIR_LEN] = NULL;
+            def->extra_props = props;
+        }
+    }
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -3733,6 +3896,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return result;
     }
 
+    source = extract_parse_bytes(a, language, source, source_len);
+
     // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
     // merge overflows a small stack during the parse (see
     // cbm_source_nesting_exceeds). Scoped to Perl: its ambiguous call grammar is
@@ -3794,6 +3959,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
+    tree = swift_retry_conditional_parse(a, parser, tree, language, source, source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
@@ -3881,6 +4047,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     cbm_extract_imports(&ctx);
     cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
+    cbm_swift_type_imports(result, language);
     if (cbm_lang_needs_cpp_branch_views(language)) {
         extract_cpp_branch_views(&ctx, ts_lang, timeout_micros);
     }
@@ -3902,6 +4069,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // OpenAPI operations as Routes (self-gated: API description documents).
     cbm_extract_openapi(&ctx);
 
+    // Next.js App Router handlers' routes (self-gated: app/**/route.ts and route.js).
+    cbm_extract_nextjs_routes(&ctx);
+
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {
         cbm_extract_k8s(&ctx);
@@ -3919,7 +4089,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     uint64_t lsp_start = now_ns();
     if (!result->lsp_skipped) {
         if (language == CBM_LANG_GO) {
-            cbm_run_go_lsp(a, result, source, source_len, root);
+            cbm_run_go_lsp(a, result, source, source_len, root, rel_path);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
             if (!cbm_run_c_lsp_with_test_owners(a, result, source, source_len, root,
@@ -3942,6 +4112,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         }
         if (language == CBM_LANG_PERL) {
             cbm_run_perl_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_RUBY) {
+            cbm_run_ruby_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_PYTHON) {
             cbm_run_py_lsp(a, result, source, source_len, root);
