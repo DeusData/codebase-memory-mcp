@@ -32,10 +32,11 @@
  * fields of its own struct declaration and the methods of its own interface
  * declaration: nothing promoted through embedding.
  *
- * Binding. The graph keeps one node per qualified name, Go method nodes have
- * a FLAT name (<dir>.<Method>), and <dir> is the directory, not the package
- * clause: functions, methods of every receiver, types and values of one name,
- * in every file of the directory, share one node, and the node is ONE of those
+ * Binding. The graph keeps one node per qualified name, and <dir> is the
+ * directory, not the package clause. Go method nodes are receiver-qualified
+ * (<dir>.<Recv>.<Method>, #1913) and are found through their receiver only.
+ * Functions, types and values of one name, in every file of the directory,
+ * share one node <dir>.<name>, and the node is ONE of those
  * declarations (cbm_gbuf_upsert_node keeps the smallest file path, then the
  * last line). So a reference binds only when the node IS the entity it names:
  * the node's file is a file of the named package, the declaration that keeps
@@ -59,7 +60,7 @@
  * not), missing (a repository package that does not declare the name; an
  * import path inside a module without a package there), graph_gap (declared,
  * but the node is another declaration's or absent: block variables, later
- * names of a declaration, embedded fields, methods that lost the flat name;
+ * names of a declaration, embedded fields;
  * also an undeclared name in a package with a parse error), test_only_target
  * (product code naming a declaration that only test files have), ambiguous
  * (several modules or packages fit; a name declared as two kinds; a name two
@@ -1063,7 +1064,7 @@ static void go_record_decl(go_index_t *ix, go_file_t *file, char **f, int nf) {
         FIELD_FIELDS = 4,
         IM_FIELDS = 3
     };
-    enum { F_OWNER = 2, T_ALIAS = 3, T_OWNER = 4, V_OWNER = 2, M_OWNER = 3, FIELD_NODE = 3 };
+    enum { F_OWNER = 2, T_ALIAS = 3, T_OWNER = 4, V_OWNER = 2, FIELD_NODE = 3 };
     char kind = f[0][0];
     if (nf < IM_FIELDS || !go_name_ok(f[SKIP_ONE])) {
         return;
@@ -1078,10 +1079,12 @@ static void go_record_decl(go_index_t *ix, go_file_t *file, char **f, int nf) {
         go_add_sym(ix, file, GO_KIND_VALUE, f[SKIP_ONE], NULL);
         go_add_claim(ix, file, GO_KIND_VALUE, f[SKIP_ONE], NULL, f[V_OWNER]);
     } else if (kind == 'M' && nf == M_FIELDS && go_name_ok(f[PAIR_LEN])) {
+        /* #1913: a method is found through its receiver only; it claims no
+         * flat <dir>.<name> (its record says w `-`), so a type, function or
+         * value of the same name keeps that node. */
         if (strcmp(f[SKIP_ONE], "?") != 0) {
             go_add_member(ix, file, GO_MEM_METHOD, f[SKIP_ONE], f[PAIR_LEN], true);
         }
-        go_add_claim(ix, file, GO_KIND_METHOD, f[PAIR_LEN], f[SKIP_ONE], f[M_OWNER]);
     } else if (kind == 'f' && nf == FIELD_FIELDS && go_name_ok(f[PAIR_LEN])) {
         go_add_member(ix, file, GO_MEM_FIELD, f[SKIP_ONE], f[PAIR_LEN], f[FIELD_NODE][0] == '1');
     } else if (kind == 'm' && nf == IM_FIELDS && go_name_ok(f[PAIR_LEN])) {
@@ -1342,9 +1345,9 @@ static const cbm_gbuf_node_t *go_member_node(const go_ctx_t *c, const go_pkg_t *
     return (fm && (fm->node_kinds & kind)) ? n : NULL;
 }
 
-/* The node of the method `recv.name`: its receiver-qualified node, else the
- * flat node <dir>.<name> when the method is the one that kept it (the last
- * declaration of that name in the node's file). */
+/* The node of the method `recv.name`: its receiver-qualified node. The flat
+ * fallback below (the method that kept <dir>.<name>) is unreachable since
+ * #1913: no method record claims a flat name any more. */
 static const cbm_gbuf_node_t *go_method_node(const go_ctx_t *c, const go_pkg_t *pkg, go_str_t recv,
                                              go_str_t name) {
     const cbm_gbuf_node_t *qualified = go_member_node(c, pkg, GO_MEM_METHOD, recv, name);

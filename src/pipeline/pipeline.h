@@ -19,8 +19,10 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-#include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
-#include "foundation/constants.h" /* CBM_SZ_512 */
+#include "cbm.h"                   /* CBMCall for overload selection */
+#include "discover/discover.h"     /* cbm_ignored_file_t (#963) */
+#include "foundation/constants.h"  /* CBM_SZ_512 */
+#include "foundation/hash_table.h" /* CBMHashTable (#1355 pkgmap lookup) */
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -56,6 +58,17 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Apply a validated discovery resource policy. The value is copied. */
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
 
+/* Publication gate. cbm_pipeline_run calls it once, after the last
+ * pre-publication check and immediately before the serving database is
+ * touched (never for a live no-op, which replaces nothing). Returning false
+ * aborts the run with CBM_PIPELINE_ABORT_PRESERVE_DB and the previous
+ * generation stays exactly as it was. A supervised index worker uses it to
+ * claim publication from its supervisor (see the publication fence in
+ * mcp/index_supervisor.h). NULL removes the gate. */
+typedef bool (*cbm_pipeline_publish_gate_fn)(void *context);
+void cbm_pipeline_set_publish_gate(cbm_pipeline_t *p, cbm_pipeline_publish_gate_fn gate,
+                                   void *context);
+
 /* Doc -> code candidates (the doc_candidates setting). Never set, the index
  * mode decides: on for full, off for moderate and fast. The setter makes an
  * explicit choice that wins in every mode. Off skips scoring documentation
@@ -70,6 +83,23 @@ bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p);
 /* Copy the exact discovery violation from the most recent run. */
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
+/* Mark work that runs without a waiting user. Background pipelines reserve
+ * CPU headroom; foreground pipelines retain the initial-index all-core policy. */
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background);
+
+/* Resolve the worker policy for this pipeline, including environment and
+ * crash-recovery overrides. */
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p);
+
+/* Background width from the foreground width and the headroom width: the
+ * headroom, floored at two whenever the foreground width is two or more so an
+ * automatic refresh keeps the parallel route. */
+int cbm_pipeline_background_worker_width(int foreground, int headroom);
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_worker_count_test_reset(void);
+int cbm_pipeline_worker_count_test_last(void);
+#endif
 
 /* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
  * when the run succeeded / did not reach post-publish export. Used to
@@ -253,17 +283,45 @@ cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
 /* Register a function/method/class. All strings are copied. The entry's
- * language is unknown, so name-based resolution never filters it out. */
+ * language is unknown, so name-based resolution never filters it out.
+ * `is_test` is the extractor's verdict for this symbol (CBMDefinition.is_test:
+ * the file's test-ness OR the definition's own test attributes). The registry
+ * stores it and scores with it; it does not derive test-ness from the QN. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label);
+                      const char *label, bool is_test);
 
+/* The test-double path rule, for the registry's ranking only: true when the
+ * repo-relative path of a symbol's defining file has a directory segment named
+ * exactly `fake`, `mock`, `mocks`, `testing` or `testutil`, or its file name
+ * matches `mock_*.go` or `fake_*.go`. Go projects keep generated fake
+ * clientsets and mock packages in ordinary files the extractor rightly does
+ * not call tests; a call should still prefer real code over them. The three
+ * registry seeders (pass_definitions.c, pass_parallel.c,
+ * pipeline_incremental.c) pass the extractor's verdict OR this, so full and
+ * incremental indexes rank alike. It never decides what a node is: the stored
+ * is_test property, TESTS edges and importance stay with cbm_is_test_path. */
+bool cbm_registry_test_double_path(const char *rel_path);
+
+/* Swift-only metadata and label-compatible overload selection. The returned
+ * QNs are borrowed from the registry and all belong to one base callable.
+ * -1 means this name has Swift definitions but no compatible overload. */
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count,
+                                      const char *selector);
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap);
+int cbm_registry_swift_candidates_in_file(const cbm_registry_t *r, const CBMCall *call,
+                                          const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **out, int out_cap);
 /* As cbm_registry_add, recording `lang`: the DETECTED language of the file
  * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
  * veto (cbm_registry_name_guess_vetoed) checks against the caller. Detects no
  * function-local symbols: that needs the defining file's module QN, see
  * cbm_registry_add_lang_in_module. */
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
-                           const char *label, CBMLanguage lang);
+                           const char *label, CBMLanguage lang, bool is_test);
 
 /* As cbm_registry_add_lang. A Python symbol declared inside a function body of
  * its own file (cbm_registry_qn_is_function_local, bounded by
@@ -275,7 +333,25 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
  * indexes agree. 0 = no local detection. */
 void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
                                      const char *qualified_name, const char *label,
-                                     CBMLanguage lang, size_t module_prefix_len);
+                                     CBMLanguage lang, size_t module_prefix_len, bool is_test);
+
+/* Register a symbol for exact (qualified-name) lookups only: it is never
+ * offered to the short-name strategies (unique_name, suffix_match,
+ * field_type_hint, fuzzy). For a generated member (cbm_def_props_generated),
+ * which the source never spells, so only a type-aware resolver that knows its
+ * owner may bind it. The three graph registration sites route such a symbol
+ * here instead of cbm_registry_add_lang_in_module. */
+void cbm_registry_add_qn_only(cbm_registry_t *r, const char *qualified_name, const char *label);
+
+/* True when a definition's extra_props (key, value, ..., NULL) carry the
+ * generated-member key (cbm.h CBM_PROP_GENERATED), e.g. a Java record's
+ * implicit accessor. Pure; unit-tested in test_registry.c. */
+bool cbm_def_props_generated(const char *const *extra_props);
+
+/* The stored-node twin of cbm_def_props_generated, for the incremental
+ * registry seed: true when a node's properties JSON carries that key as a
+ * string property. Pure; unit-tested in test_registry.c. */
+bool cbm_node_props_generated(const char *properties_json);
 
 /* True when code in `caller` can call a symbol defined in `target` by bare
  * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
@@ -411,6 +487,44 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
+/* #1355: drop a project-wide same-name guess (suffix_match / unique_name /
+ * field_type_hint / fuzzy) for a BARE call whose name the calling file binds to
+ * a NON-RELATIVE (package) import that resolved to nothing in the graph —
+ * `import { eq } from "drizzle-orm"` must not make `eq(...)` a CALLS edge to an
+ * unrelated project `eq`. A name the import map does bind, a relative
+ * specifier, a member/qualified callee, and every import-/receiver-aware
+ * strategy are all kept. `indexed_packages` is the pipeline package map: a
+ * specifier naming a package the tree itself declares (a workspace sibling)
+ * counts as in-tree and is kept too; NULL disables that check.
+ * `declared_packages` is the pipeline namespace map and does the same job for
+ * package-path specifiers, which have no in-tree/external shape of their own:
+ * `import org.example.util.assertThing` is kept when some indexed file
+ * declares `package org.example.util`; NULL disables that check.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
+                                         const CBMImportArray *file_imports,
+                                         const char **import_map_keys, int import_map_count,
+                                         const CBMHashTable *indexed_packages,
+                                         const CBMHashTable *declared_packages);
+
+/* Go analog of the TS/JS guard, same failure class: a selector call whose
+ * receiver the Go LSP could not type must not be bound by a receiver-blind
+ * short-name strategy. Drops suffix_match / fuzzy always, and unique_name only
+ * when its confidence is import-unreachability-penalized (the stdlib/vendor
+ * hijack shape). field_type_hint is deliberately NOT dropped for Go — struct
+ * fields carry declared types, so the hint is receiver-aware there. */
+bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
+                                       double confidence);
+
+/* A bare Go `init` (a call or reference that is not the member half of a
+ * selector) is always a local name: Go forbids referring to a package init
+ * function, and a method or field needs a selector. True when such a name
+ * resolved onto a Function (every Go Function named init is a package init;
+ * any registry strategy) or onto a Method or Field found by a weak short-name
+ * strategy. lsp_* answers are kept. Go only. Pure; unit-tested in
+ * test_registry.c; wired in pass_calls.c, pass_usages.c and pass_parallel.c. */
+bool cbm_go_suppress_bare_init_bind(bool is_go, bool is_member, const char *name,
+                                    const char *strategy, const char *target_label);
 
 /* Import-binding counterpart (#2127). True when the callee's root identifier
  * is bound by an import of this file whose module chain contradicts the
@@ -438,13 +552,14 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
  * unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
 
-/* #1942: a bare (dot-less) Go reference can never denote a struct field —
- * field access is always a selector expression, and selector references
- * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a
- * Field when the reference text carries no '.'. Go only: other OO languages
- * legitimately reference their own members bare inside method bodies. Pure;
- * unit-tested in test_registry.c. */
-bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
+/* #1942/#2666: a bare Go or C reference can never denote a struct field —
+ * field access is always a selector expression (or, in C, a designator), and
+ * the member half of one is recorded as is_member_access. Drops a
+ * READS/WRITES/USAGE bind whose target is a Field when the reference was not
+ * the member half of a selector. Go and C only: other OO languages (and C++,
+ * which every `.h` is parsed as) legitimately reference their own members
+ * bare inside method bodies. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_bare_field_ref(CBMLanguage lang, bool is_member_access, const char *target_label);
 
 /* What to do with a call whose registry resolution landed on a Field node.
  * Pure; unit-tested in test_registry.c. */
@@ -482,6 +597,13 @@ bool cbm_c_member_rule_file(CBMLanguage lang, const char *rel_path);
  * a member); NULL when none or several do. */
 const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name);
 
+/* A Java call expression never names data: `p.x()` is a method invocation
+ * whatever `x` spells elsewhere in the project. Drops a CALLS bind whose
+ * target is a Variable or Field. Java only — Kotlin properties and C function
+ * pointers are callable names that are not methods. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 
@@ -495,6 +617,8 @@ const char *cbm_registry_value_target(const cbm_registry_t *r, const char *qn);
  * Caller does NOT free the array (owned by registry). */
 int cbm_registry_find_by_name(const cbm_registry_t *r, const char *name, const char ***out,
                               int *count);
+
+bool cbm_registry_has_type_named(const cbm_registry_t *r, const char *name);
 
 /* Return total number of entries. */
 int cbm_registry_size(const cbm_registry_t *r);

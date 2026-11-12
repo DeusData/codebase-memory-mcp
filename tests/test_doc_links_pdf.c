@@ -1087,8 +1087,9 @@ TEST(pdf_links_pipeline) {
     ASSERT_NOT_NULL(strstr(props, "\"line\":1"));
     /* qualified names (pdf_qn) passed a second held-out audit (97 of 99
      * correct, Wilson 95 % low 0.929) once a member whose QN leaves its owner
-     * out binds only through the owner. A Go method through its receiver: */
-    dm_edge(db, "docs.design.page_1", "pkg.server.Serve", props, sizeof(props), &n);
+     * out binds only through the owner. A Go method through its receiver
+     * (receiver-qualified QN since index format 4): */
+    dm_edge(db, "docs.design.page_1", "pkg.server.Handler.Serve", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
     ASSERT_NOT_NULL(strstr(props, "\"syntax\":\"pdf_qn\""));
     ASSERT_NOT_NULL(strstr(props, "\"tier\":\"unique\""));
@@ -1142,10 +1143,12 @@ TEST(pdf_links_pipeline) {
     PASS();
 }
 
-/* A held-out finding of the PDF audit: a Go method's QN has no receiver, so
+/* A held-out finding of the PDF audit: a Go method's QN had no receiver, so
  * `time.Now` (the standard library's function, in a spec) matched the method
  * Now of a type that the repository's own package time declares. A method is
- * named through its owner: `time.Provider.Now` still binds it. */
+ * named through its owner: `time.Provider.Now` still binds it. Since index
+ * format 4 the QN carries the receiver (pkg.time.Provider.Now), and both
+ * directions are checked against that node. */
 TEST(pdf_qn_method_through_owner) {
     cbm_doclink_test_set_ships(CBM_DOCLINK_PDF_QN, true);
     char tmp[256];
@@ -1169,9 +1172,9 @@ TEST(pdf_qn_method_through_owner) {
     ASSERT_EQ(dm_index(repo, db, NULL), 0);
     char props[512];
     int n;
-    dm_edge(db, "docs.spec.page_1", "pkg.time.Now", props, sizeof(props), &n);
+    dm_edge(db, "docs.spec.page_1", "pkg.time.Provider.Now", props, sizeof(props), &n);
     ASSERT_EQ(n, 0);
-    dm_edge(db, "docs.spec.page_2", "pkg.time.Now", props, sizeof(props), &n);
+    dm_edge(db, "docs.spec.page_2", "pkg.time.Provider.Now", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
     ASSERT_NOT_NULL(strstr(props, "\"syntax\":\"pdf_qn\""));
     th_cleanup(tmp);
