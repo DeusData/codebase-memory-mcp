@@ -974,9 +974,11 @@ def main():
                 + repr(mismatched_result.stderr),
             )
             check(
-                'requested cache: ' + json.dumps(str(mismatched_cache.resolve()))
+                "requested cache: "
+                + json.dumps(str(mismatched_cache.resolve()), ensure_ascii=False)
                 in mismatched_result.stderr
-                and 'daemon cache: ' + json.dumps(str(cache.resolve()))
+                and "daemon cache: "
+                + json.dumps(str(cache.resolve()), ensure_ascii=False)
                 in mismatched_result.stderr,
                 "cache-root conflict did not name both canonical paths: "
                 + repr(mismatched_result.stderr),

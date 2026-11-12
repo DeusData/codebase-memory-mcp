@@ -44,9 +44,10 @@ def run_cli(binary, cache, args, timeout=60, extra_env=None):
     # Daemon coordination is account-wide and CBM_CACHE_DIR does not move the
     # rendezvous; a private CBM_RUNTIME_DIR per cache is what isolates a call
     # from every other daemon on the account (and makes a cold call cold).
-    env["CBM_RUNTIME_DIR"] = runtime_for(cache)
     if extra_env:
         env.update(extra_env)
+    if not extra_env or "CBM_RUNTIME_DIR" not in extra_env:
+        env["CBM_RUNTIME_DIR"] = runtime_for(cache)
     return subprocess.run([binary] + args, capture_output=True, timeout=timeout, env=env)
 
 
