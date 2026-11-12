@@ -89,4 +89,56 @@ echo "alpha" > "$TMP/run_all.only"
 
 [ "$(python3 "$SEL" suites "$TMP/run_all.json")" = "*" ] || fail "suites of a run-all answer"
 [ "$(python3 "$SEL" suites "$TMP/lane_run_all.json")" = "*" ] || fail "suites of a run-all lane (suites: null)"
+
+# --whole-suites: the portable view for the legs the coverage is not recorded
+# on. A listed suite runs whole there: its per-test tokens collapse to the
+# suite, and one the answer did not select is added, optional (a build without
+# it drops it); the answer's own required suites stay required.
+answer portable '{"lane":"unit","decision":"selected","suites":[
+  {"suite":"alpha","mode":"whole","whole_reason":["CONDITIONAL","STATIC"]},
+  {"suite":"beta","mode":"tests","tests":[{"test":"b_one"},{"test":"b_two"}]},
+  {"suite":"delta","mode":"tests","tests":[{"test":"d_one"}]}],
+  "runner_filter":{"encoding":"cbm-test-only-lines","value":"alpha\nbeta:b_one\nbeta:b_two\ndelta:d_one\n"}}'
+printf 'beta\ngamma\n' > "$TMP/whole.txt"
+rc=0
+python3 "$SEL" filter "$TMP/portable.json" --lane unit --whole-suites "$TMP/whole.txt" \
+    --out "$TMP/portable.only" --optional-out "$TMP/portable.optional" 2> /dev/null || rc=$?
+[ "$rc" = 0 ] || fail "the portable view did not narrow (exit $rc)"
+[ "$(cat "$TMP/portable.only")" = "$(printf 'alpha\nbeta\ndelta:d_one\ngamma')" ] ||
+    fail "portable view lines: $(cat "$TMP/portable.only")"
+[ "$(cat "$TMP/portable.optional")" = "$(printf 'alpha\ngamma')" ] ||
+    fail "portable view optional suites: $(cat "$TMP/portable.optional")"
+printf 'beta:b_one\n' > "$TMP/whole-bad.txt"
+rc=0
+python3 "$SEL" filter "$TMP/portable.json" --lane unit --whole-suites "$TMP/whole-bad.txt" \
+    --out "$TMP/portable-bad.only" 2> /dev/null || rc=$?
+case "$rc" in 0 | 11) fail "an unusable whole-suite list narrowed (exit $rc)" ;; esac
+[ ! -e "$TMP/portable-bad.only" ] || fail "an unusable whole-suite list left a filter file"
+
+# platform-suites: a suite is platform-specific when its file, at any given
+# revision, holds SKIP_PLATFORM( or an OS/architecture #if, or the runner
+# registers it under one. Removing the marker at HEAD does not declassify.
+PS="$TMP/ps-repo"
+mkdir -p "$PS/tests"
+git -C "$PS" -c init.templateDir= init -q
+printf '%s\n' 'int main(void) {' '    RUN_SELECTED_SUITE(plain);' '#ifndef _WIN32' \
+    '    RUN_SELECTED_SUITE(posix_only);' '#endif' '#if defined(CBM_TEST_COVERAGE)' \
+    '    RUN_SELECTED_SUITE(seamed);' '#endif' '}' > "$PS/tests/test_main.c"
+printf '%s\n' '#ifdef __APPLE__' 'static int mac(void) { return 1; }' '#endif' \
+    'SUITE(gated) {' '}' > "$PS/tests/test_gated.c"
+printf '%s\n' 'TEST(t) {' '    SKIP_PLATFORM("windows only");' '}' 'SUITE(skipping) {' '}' \
+    > "$PS/tests/test_skipping.c"
+printf '%s\n' '#if FOO_LINUX_FEATURE' '#endif' 'void suite_plain(void) {' '}' \
+    > "$PS/tests/test_plain.c"
+git -C "$PS" add -A && git -C "$PS" -c user.name=t -c user.email=t@t commit -qm base
+printf '%s\n' 'SUITE(gated) {' '}' > "$PS/tests/test_gated.c"
+git -C "$PS" -c user.name=t -c user.email=t@t commit -qam "drop the conditional"
+[ "$(python3 "$SEL" platform-suites --repo "$PS" --rev HEAD^1 --rev HEAD)" = \
+    "$(printf 'gated\nposix_only\nskipping')" ] ||
+    fail "platform suites: $(python3 "$SEL" platform-suites --repo "$PS" --rev HEAD^1 --rev HEAD)"
+[ "$(python3 "$SEL" platform-suites --repo "$PS" --rev HEAD)" = "$(printf 'posix_only\nskipping')" ] ||
+    fail "platform suites at HEAD alone"
+rc=0
+python3 "$SEL" platform-suites --repo "$PS" --rev no-such-rev > /dev/null 2>&1 || rc=$?
+[ "$rc" = 1 ] || fail "an unknown revision must exit 1, got $rc"
 echo "test-impact selection: all cases passed"
