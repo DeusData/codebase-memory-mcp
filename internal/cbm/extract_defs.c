@@ -12377,10 +12377,13 @@ static char *vb_as_clause_type(CBMArena *a, TSNode as_clause, const char *source
         return NULL;
     }
     char *paren = strchr(text, '(');
+    if (paren == text) {
+        return NULL;
+    }
     if (paren) {
         *paren = '\0';
     }
-    return text[0] ? text : NULL;
+    return text;
 }
 
 /* One VB.NET Field def: `name_node` names it, `decl` is the declaration that

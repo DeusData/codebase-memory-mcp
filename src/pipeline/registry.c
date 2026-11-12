@@ -1930,13 +1930,15 @@ static bool vb_canonical_callee(const cbm_registry_t *r, const char *callee, cha
     bool changed = false;
     const char *seg = callee;
     for (;;) {
-        const char *dot = strchr(seg, '.');
-        size_t len = dot ? (size_t)(dot - seg) : strlen(seg);
+        size_t len = strcspn(seg, ".");
+        const char *dot = seg[len] == '.' ? seg + len : NULL;
         char folded[CBM_SZ_512];
         const char *canon = vb_fold(seg, len, folded, sizeof(folded))
                                 ? (const char *)cbm_ht_get(r->vb_folded, folded)
                                 : NULL;
-        if (o + len + SKIP_ONE >= cap) {
+        /* o < cap holds here, so cap - o - SKIP_ONE cannot wrap: room for the
+         * segment plus its '.' or the terminating NUL. */
+        if (len >= cap - o - SKIP_ONE) {
             return false;
         }
         if (canon && strncmp(canon, seg, len) != 0) {
