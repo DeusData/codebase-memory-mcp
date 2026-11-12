@@ -260,7 +260,8 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            CBMLanguage lang);
 /* The CALLS variant: as cbm_registry_resolve_lang, except that a bare C call
  * (no `.` / `->`) does not consider Field or Method nodes, which it can never
- * call. */
+ * call, and that in a C# file a built-in type keyword root (`int.TryParse`)
+ * names a type for the receiver chain check (#2121). */
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
@@ -656,6 +657,12 @@ static inline bool cbm_pipeline_test_force_def_modules_null(const cbm_pipeline_c
 typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
 CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
                                            int i, cbm_result_want_fn want, bool *loaded);
+/* True when a graph-buffer node carries is_test:true in its properties JSON.
+ * The incremental registry seed has only the persisted node, not the
+ * CBMDefinition the definition passes hand to cbm_registry_add, and both must
+ * give the registry the same verdict for the same symbol. */
+bool cbm_node_is_test(const cbm_gbuf_node_t *n);
+
 void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
 
 /* Log the store counters, close and delete the store, drop the latch. */

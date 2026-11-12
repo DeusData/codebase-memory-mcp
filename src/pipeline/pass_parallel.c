@@ -1816,7 +1816,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 /* `file_node_id` is the defining file's node id (0 when it has none), looked up
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
-static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
                                  int64_t file_node_id, CBMLanguage lang, size_t module_prefix_len,
                                  int *reg_entries) {
     int edges = 0;
@@ -1824,14 +1824,17 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         return 0;
     }
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
-     * (helpers.c) — see pass_definitions.c for the per-label rationale, and
-     * for the generated member registered by qualified name only. */
+     * (helpers.c) — see pass_definitions.c for the per-label rationale, for
+     * the generated member registered by qualified name only, and for the
+     * test-double path rule, judged on the path the def's node stores. */
     if (cbm_label_is_registry_symbol(def->label)) {
         if (cbm_def_props_generated(def->extra_props)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
+            const char *def_rel = def->file_path ? def->file_path : rel;
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
-                                            def->label, lang, module_prefix_len);
+                                            def->label, lang, module_prefix_len,
+                                            def->is_test || cbm_registry_test_double_path(def_rel));
         }
         if (def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
@@ -2050,7 +2053,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                        : 0;
             for (int d = 0; d < result->defs.count; d++) {
                 defines_edges +=
-                    register_and_link_def(ctx, &result->defs.items[d], file_node_id,
+                    register_and_link_def(ctx, &result->defs.items[d], rel, file_node_id,
                                           files[i].language, py_prefix_len, &reg_entries);
             }
         }

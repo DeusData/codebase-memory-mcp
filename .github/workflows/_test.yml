@@ -467,7 +467,14 @@ jobs:
         run: scripts/ci/msan-lane.sh build
 
       - name: MSan suite (exclusions per scripts/msan.sh)
-        run: scripts/ci/msan-lane.sh run
+        # Reduce mmap ASLR entropy on the host first, as the TSan leg does: with
+        # the runner kernel's higher default the MSan runtime tries to re-exec
+        # itself with ADDR_NO_RANDOMIZE, which the container's seccomp profile
+        # refuses, and it aborts ("CHECK failed: msan_linux.cpp:193 ...
+        # personality") before any test runs. The container shares this kernel.
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+          scripts/ci/msan-lane.sh run
 
   # macOS leak coverage. LeakSanitizer runs by default under ASan on Linux, so
   # test-unix's ubuntu legs have always had it; on macOS it is off by default
