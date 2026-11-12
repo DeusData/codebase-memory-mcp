@@ -6657,6 +6657,132 @@ TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full) {
     PASS();
 }
 
+/* #2427 rank probes: one bare call, two same-named candidates, and the
+ * registry's test ranking alone decides which one the call binds. Three runs
+ * on one database: a full index, then a comment-only edit of the caller on
+ * the closure-repair route, then another on the forced legacy-partial route.
+ * Both incremental routes re-resolve the caller against a registry seeded from
+ * stored nodes rather than the extractor's definitions, which is where a
+ * seeder that loses the verdict shows. */
+typedef struct {
+    int want[3];
+    int other[3];
+    cbm_incremental_route_t route[3];
+} rank_probe_t;
+
+static int rank_probe_count(const char *db, const char *project, const char *source,
+                            const char *target, const char *file) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        return -1;
+    }
+    int n = named_edge_to_file_count(s, project, "CALLS", source, target, file);
+    cbm_store_close(s);
+    return n;
+}
+
+static void rank_probe(const char *tmp, const char *caller_path, const char *caller_src,
+                       const char *source, const char *target, const char *want_file,
+                       const char *other_file, rank_probe_t *out) {
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rank.db", tmp);
+    for (int run = 0; run < 3; run++) {
+        out->want[run] = -1;
+        out->other[run] = -1;
+        out->route[run] = CBM_INCREMENTAL_ROUTE_NONE;
+        if (run > 0) {
+            char edited[512];
+            snprintf(edited, sizeof(edited), "%s// edit %d\n", caller_src, run);
+            write_temp_file(tmp, caller_path, edited);
+        }
+        cbm_pipeline_incremental_test_reset_faults();
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        if (run == 2) {
+            cbm_pipeline_incremental_test_force_legacy_partial_once();
+        }
+#endif
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        if (!p) {
+            return;
+        }
+        int rc = cbm_pipeline_run(p);
+        out->route[run] = cbm_pipeline_incremental_test_last_route();
+        char project[256];
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        if (rc != 0) {
+            return;
+        }
+        out->want[run] = rank_probe_count(db, project, source, target, want_file);
+        out->other[run] = rank_probe_count(db, project, source, target, other_file);
+    }
+}
+
+/* "latest" spells "test", so the QN scan the extractor's verdict replaced
+ * ranked the production Parse below a helper in a _test.go file, whose Go QN
+ * names only its package and so spells nothing. The verdict ranks them the
+ * right way round, and both incremental routes must read the same verdict
+ * back from the stored nodes: the closure-repair proxies once carried no
+ * is_test, every candidate scored as production, and the smaller QN -- the
+ * test helper -- won. */
+TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_verdict_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package app\n\nfunc Run() int { return Parse() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "latest/parse.go", "package latest\n\nfunc Parse() int { return 1 }\n");
+    write_temp_file(tmp, "harness/parse_test.go",
+                    "package harness\n\nfunc Parse() int { return 2 }\n");
+    write_temp_file(tmp, "app/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "app/run.go", caller, "Run", "Parse", "latest/parse.go",
+               "harness/parse_test.go", &r);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* A generated fake beside its callers: client/fake shares more of the caller's
+ * package path than the real store does, so on the extractor's verdict alone
+ * (a fake is not a test file) the fake wins on proximity. The test-double path
+ * rule ranks it last in the full index and, through the incremental seed's own
+ * use of the rule, on both incremental routes. */
+TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_double_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package client\n\nfunc Run() int { return Load() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "store/load.go", "package store\n\nfunc Load() int { return 1 }\n");
+    write_temp_file(tmp, "client/fake/load.go", "package fake\n\nfunc Load() int { return 2 }\n");
+    write_temp_file(tmp, "client/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "client/run.go", caller, "Run", "Load", "store/load.go", "client/fake/load.go",
+               &r);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -22146,7 +22272,7 @@ static int python_typed_field_scope_case(bool external) {
     if (result && reg && gbuf && result->field_types.count == 1) {
         for (int i = 0; i < result->defs.count; i++) {
             const CBMDefinition *def = &result->defs.items[i];
-            cbm_registry_add(reg, def->name, def->qualified_name, def->label);
+            cbm_registry_add(reg, def->name, def->qualified_name, def->label, false);
         }
         const char **keys = NULL;
         const char **vals = NULL;
@@ -28113,8 +28239,8 @@ TEST(helm_parse_chart_many_dependencies) {
 
 TEST(registry_resolve_single_candidate) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
-    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
+    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function", false);
 
     /* Normal resolve unique name */
     cbm_resolution_t r = cbm_registry_resolve(reg, "CreateOrder", "svcC.caller", NULL, NULL, 0);
@@ -28132,7 +28258,7 @@ TEST(registry_resolve_single_candidate) {
 
 TEST(registry_fuzzy_nonexistent) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "NonExistent", "svcC.caller", NULL, NULL, 0);
@@ -28144,8 +28270,8 @@ TEST(registry_fuzzy_nonexistent) {
 
 TEST(registry_fuzzy_multiple_best_by_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function");
-    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function");
+    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function", false);
 
     /* Caller in svcA → prefer svcA */
     cbm_fuzzy_result_t fr =
@@ -28164,7 +28290,7 @@ TEST(registry_fuzzy_multiple_best_by_distance) {
 
 TEST(registry_fuzzy_simple_name_extraction) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function");
+    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function", false);
 
     /* Deeply qualified name → extract "DoWork" */
     cbm_fuzzy_result_t fr = cbm_registry_fuzzy_resolve(reg, "some.deep.module.DoWork",
@@ -28189,8 +28315,8 @@ TEST(registry_fuzzy_empty) {
 
 TEST(registry_exists) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method");
+    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method", false);
 
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Foo"));
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Bar"));
@@ -28203,7 +28329,7 @@ TEST(registry_exists) {
 
 TEST(registry_confidence_import_map) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -28218,7 +28344,7 @@ TEST(registry_confidence_import_map) {
 
 TEST(registry_confidence_import_map_suffix) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -28233,7 +28359,7 @@ TEST(registry_confidence_import_map_suffix) {
 
 TEST(registry_confidence_same_module) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Foo", "proj.pkg", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Foo");
@@ -28246,7 +28372,7 @@ TEST(registry_confidence_same_module) {
 
 TEST(registry_confidence_unique_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
@@ -28259,8 +28385,8 @@ TEST(registry_confidence_unique_name) {
 
 TEST(registry_confidence_suffix_match) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
@@ -28276,7 +28402,7 @@ TEST(registry_confidence_suffix_match) {
  * wrong target — and with one candidate it won the top name-only confidence. */
 TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable", false);
 
     cbm_resolution_t r =
         cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
@@ -28290,8 +28416,8 @@ TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
  * the final name and import distance picks the winner. */
 TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
-    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable", false);
+    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable", false);
 
     cbm_resolution_t r =
         cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
@@ -28305,7 +28431,7 @@ TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
  * so Calendar really is in the receiver chain. */
 TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method");
+    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Calendar.utcGregorian.startOfDayUTC",
                                               "HomeboxUI.Stats", NULL, NULL, 0);
@@ -28325,7 +28451,7 @@ TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
 TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "putList", "org.elasticsearch.common.settings.Settings.Builder.putList",
-                     "Method");
+                     "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Settings.builder().putList", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
@@ -28336,7 +28462,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
      * .toBuilder().setWarningsHandler -> RequestOptions.Builder.setWarningsHandler. */
     cbm_registry_add(reg, "setWarningsHandler",
                      "org.elasticsearch.client.RequestOptions.Builder.setWarningsHandler",
-                     "Method");
+                     "Method", false);
     r = cbm_registry_resolve(reg, "RequestOptions.DEFAULT.toBuilder().setWarningsHandler",
                              "org.elasticsearch.client.Rest", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name,
@@ -28352,7 +28478,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
 TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "getEncoder", "org.elasticsearch.index.codec.DocOffsetsCodec.getEncoder",
-                     "Method");
+                     "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Base64.getEncoder", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
@@ -28362,7 +28488,7 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
      * org.elasticsearch.common.Math.toIntExact through "Math" appearing as an
      * ancestry segment ONLY IF that segment really is the type — here it is, and
      * that is the correct outcome (the project's own Math.toIntExact). */
-    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method");
+    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method", false);
     r = cbm_registry_resolve(reg, "Math.toIntExact", "org.elasticsearch.index.IndexSettings", NULL,
                              NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.Math.toIntExact");
@@ -28375,7 +28501,7 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
  * must not look at it, or every ordinary vm.load style call would be refused. */
 TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method");
+    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "vm.load", "HomeboxUI.Views", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "HomeboxUI.EntityListViewModel.load");
@@ -28391,7 +28517,7 @@ TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
  * the CALLS entry point both resolvers share, for a C# file. */
 TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method");
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "int.TryParse", "tmp.Demo", NULL, NULL,
                                                         0, CBM_LANG_CSHARP);
@@ -28412,7 +28538,7 @@ TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121) {
  * (which would pass through for the wrong reason). */
 TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "TryParse", "tmp.int.TryParse", "Method");
+    cbm_registry_add(reg, "TryParse", "tmp.int.TryParse", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "int.TryParse", "tmp.Demo", NULL, NULL,
                                                         0, CBM_LANG_CSHARP);
@@ -28431,7 +28557,7 @@ TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121) {
  * pinning the other side of the gate. */
 TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method");
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "object.TryParse", "tmp.Demo", NULL,
                                                         NULL, 0, CBM_LANG_PYTHON);
@@ -28441,7 +28567,7 @@ TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
     /* A Go call and the language-blind cbm_registry_resolve read a second
      * keyword spelling as a value root as well. */
     cbm_registry_t *reg2 = cbm_registry_new();
-    cbm_registry_add(reg2, "Join", "tmp.Decoys.Joiner.Join", "Method");
+    cbm_registry_add(reg2, "Join", "tmp.Decoys.Joiner.Join", "Method", false);
     cbm_resolution_t r2 =
         cbm_registry_resolve_call_lang(reg2, "string.Join", "tmp.Demo", NULL, NULL, 0, CBM_LANG_GO);
     ASSERT_STR_EQ(r2.qualified_name, "tmp.Decoys.Joiner.Join");
@@ -28463,7 +28589,7 @@ TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
  * words that can only name a type. */
 TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Invoke", "tmp.Handlers.Handler.Invoke", "Method");
+    cbm_registry_add(reg, "Invoke", "tmp.Handlers.Handler.Invoke", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "dynamic.Invoke", "tmp.Demo", NULL,
                                                         NULL, 0, CBM_LANG_CSHARP);
@@ -28477,7 +28603,7 @@ TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121) {
 /* An unqualified callee has no chain at all and must pass through unchanged. */
 TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function");
+    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "helper", "proj.other", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.helper");
@@ -28489,7 +28615,7 @@ TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
 
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
@@ -28503,8 +28629,8 @@ TEST(registry_fuzzy_confidence_single) {
 
 TEST(registry_fuzzy_confidence_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
@@ -28518,8 +28644,8 @@ TEST(registry_fuzzy_confidence_distance) {
 
 TEST(registry_negative_import_rejects) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function", false);
 
     /* Import only handler's module → should prefer handler */
     const char *keys[] = {"handler"};
@@ -28533,7 +28659,7 @@ TEST(registry_negative_import_rejects) {
 
 TEST(registry_fuzzy_import_penalty) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", false);
 
     /* Has imports but billing not imported → confidence halved */
     const char *keys[] = {"other"};
@@ -28550,7 +28676,7 @@ TEST(registry_fuzzy_import_penalty) {
 
 TEST(registry_fuzzy_no_import_map_passthrough) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", false);
 
     /* NULL import map → no penalty, full fuzzy confidence */
     cbm_fuzzy_result_t fr =
@@ -28564,10 +28690,10 @@ TEST(registry_fuzzy_no_import_map_passthrough) {
 
 TEST(registry_find_by_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", false);
 
     /* FindByName returns all entries for "Foo" */
     const char **foos = NULL;
@@ -29527,10 +29653,10 @@ TEST(registry_is_import_reachable) {
 /* Port of FindEndingWith portion from Go TestFunctionRegistry in pipeline_test.go */
 TEST(registry_find_ending_with) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", false);
 
     /* FindEndingWith "DataProcessor.transform" → 1 match */
     const char **matches = NULL;
@@ -34798,6 +34924,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
     RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
+    RUN_TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
