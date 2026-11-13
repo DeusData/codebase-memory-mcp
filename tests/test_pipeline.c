@@ -9221,6 +9221,125 @@ TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds) {
     PASS();
 }
 
+/* The latin-1 'é' of the fixtures below, as the strict JSON reader returns it. */
+#define NON_UTF8_REPLACED "caf\xef\xbf\xbd"
+
+/* True when some string in value, at any depth, contains needle. */
+static bool non_utf8_json_has(yyjson_val *value, const char *needle) {
+    const char *text = yyjson_get_str(value);
+    if (text) {
+        return strstr(text, needle) != NULL;
+    }
+    size_t index, count;
+    yyjson_val *key, *item;
+    if (yyjson_is_arr(value)) {
+        yyjson_arr_foreach(value, index, count, item) {
+            if (non_utf8_json_has(item, needle)) {
+                return true;
+            }
+        }
+    }
+    if (yyjson_is_obj(value)) {
+        yyjson_obj_foreach(value, index, count, key, item) {
+            if (non_utf8_json_has(item, needle)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* -1: absent or not strict JSON; 0: strict without the replaced text; 1: with it. */
+static int non_utf8_json_state(const char *json) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc) {
+        return -1;
+    }
+    int found = non_utf8_json_has(yyjson_doc_get_root(doc), NON_UTF8_REPLACED) ? 1 : 0;
+    yyjson_doc_free(doc);
+    return found;
+}
+
+typedef struct {
+    int surface_rows;
+    int surface_state[3]; /* a.ts, b.ts, c.py */
+    bool unresolved_complete;
+    int unresolved_state; /* b.ts's unresolved_calls detail */
+} non_utf8_outcome_t;
+
+static void non_utf8_read_outcome(cbm_store_t *store, const char *project,
+                                  non_utf8_outcome_t *out) {
+    static const char *paths[] = {"a.ts", "b.ts", "c.py"};
+    cbm_lsp_surface_row_t *surfaces = NULL;
+    if (cbm_store_get_lsp_surfaces(store, project, &surfaces, &out->surface_rows) != CBM_STORE_OK) {
+        out->surface_rows = -1;
+    }
+    for (int i = 0; i < out->surface_rows; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (strcmp(surfaces[i].rel_path, paths[j]) == 0) {
+                out->surface_state[j] = non_utf8_json_state(surfaces[i].defs_json);
+            }
+        }
+    }
+    cbm_store_free_lsp_surfaces(surfaces, out->surface_rows);
+    cbm_coverage_meta_t meta = {0};
+    out->unresolved_complete = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
+                               meta.unresolved_calls_complete;
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get_path(store, project, "b.ts", &rows, &row_count) == CBM_STORE_OK) {
+        for (int i = 0; i < row_count; i++) {
+            if (strcmp(rows[i].kind, "unresolved_calls") == 0) {
+                out->unresolved_state = non_utf8_json_state(rows[i].detail);
+            }
+        }
+    }
+    cbm_store_free_coverage(rows, row_count);
+}
+
+/* Source text is not always UTF-8. A latin-1 'é' that names a TS method reaches
+ * both that file's LSP surface and the caller of its unresolved call; one in a
+ * Python __all__ string reaches the namespace surface. The strict writer refused
+ * each document, which cost the repository every surface row and switched off
+ * unresolved-call capture for the run. Each is now strict JSON with U+FFFD. */
+TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture) {
+    char tmp[256] = "/tmp/cbm_non_utf8_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.ts", "export function ok(): number { return 1; }\n");
+    write_temp_file(tmp, "b.ts", "class A {\n  \"caf\xe9\"(): void { missing(); }\n}\n");
+    write_temp_file(tmp, "c.py", "__all__ = ['caf\xe9']\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/non_utf8.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    non_utf8_outcome_t outcome = {.surface_state = {-1, -1, -1}, .unresolved_state = -1};
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    if (store) {
+        non_utf8_read_outcome(store, project, &outcome);
+        cbm_store_close(store);
+    }
+    th_rmtree(tmp);
+    if (outcome.surface_rows != 3 || !outcome.unresolved_complete) {
+        fprintf(stderr, "  [non-utf8] rc=%d surfaces=%d states=%d,%d,%d complete=%d detail=%d\n",
+                rc, outcome.surface_rows, outcome.surface_state[0], outcome.surface_state[1],
+                outcome.surface_state[2], outcome.unresolved_complete, outcome.unresolved_state);
+    }
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(outcome.surface_rows, 3);
+    ASSERT_EQ(outcome.surface_state[0], 0);
+    ASSERT_EQ(outcome.surface_state[1], 1);
+    ASSERT_EQ(outcome.surface_state[2], 1);
+    ASSERT_TRUE(outcome.unresolved_complete);
+    ASSERT_EQ(outcome.unresolved_state, 1);
+    PASS();
+}
+
 /* Metadata participates in exact-input compatibility. Old coverage schema or
  * an upgrade to a more comprehensive discovery/index mode must force a
  * complete replacement even when every semantic-input byte is unchanged; the
@@ -35612,6 +35731,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
     RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
+    RUN_TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
     RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);
