@@ -6745,6 +6745,168 @@ TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental) {
     PASS();
 }
 
+/* A fresh full index of the probe's files through the parallel driver: `pad`
+ * filler scripts take the file count past MIN_FILES_FOR_PARALLEL and
+ * CBM_WORKERS selects pass_parallel.c, whose registry seeder the small
+ * fixture's sequential full run never reaches. */
+static void rank_probe_parallel(const char *tmp, const char *source, const char *target,
+                                const char *want_file, const char *other_file, int *want,
+                                int *other) {
+    *want = -1;
+    *other = -1;
+    for (int i = 0; i < 55; i++) {
+        char path[64];
+        char body[96];
+        snprintf(path, sizeof(path), "pad/rank_pad_%02d.js", i);
+        snprintf(body, sizeof(body), "function rankPad%02d() { return %d; }\n", i, i);
+        write_temp_file(tmp, path, body);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rank_parallel.db", tmp);
+    XlangEnvSave save = xlang_env_select(true);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    char project[256];
+    snprintf(project, sizeof(project), "%s", p ? cbm_pipeline_project_name(p) : "");
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&save);
+    if (rc != 0) {
+        return;
+    }
+    *want = rank_probe_count(db, project, source, target, want_file);
+    *other = rank_probe_count(db, project, source, target, other_file);
+}
+
+/* Every definition in a test file ranks as test, not only its callables. The
+ * extractor gives a definition the file's test verdict only for functions,
+ * methods and the module, so a package-level variable in a _test.go file
+ * carries is_test=false. On that verdict alone the variable, one package
+ * nearer the caller, beat the production function on proximity. The registry
+ * applies the extractor's own file rule (cbm_is_test_file) as well, in the
+ * full index and on both incremental routes. */
+TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tfvar_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package app\n\nfunc Run() int { return Parse() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "lib/parse.go", "package lib\n\nfunc Parse() int { return 1 }\n");
+    write_temp_file(tmp, "app/sub/parse_test.go",
+                    "package sub\n\nvar Parse = func() int { return 2 }\n");
+    write_temp_file(tmp, "app/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "app/run.go", caller, "Run", "Parse", "lib/parse.go", "app/sub/parse_test.go",
+               &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "Run", "Parse", "lib/parse.go", "app/sub/parse_test.go", &par_want,
+                        &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* The same for a class, in the layout of a multi-module Java build: a class
+ * nested in a test under streams/src/test shares more of the caller's path
+ * than the production class in another module, and carries is_test=false. The
+ * QN scan #2427 replaced caught it by the "Test" in RunTest; the file rule
+ * catches it by the src/test directory, as the extractor's own verdict does. */
+TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tfcls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "streams/src/main/java/org/acme/streams/Run.java";
+    static const char caller[] = "package org.acme.streams;\n\n"
+                                 "public class Run {\n"
+                                 "    Object go() { return new Codec(); }\n"
+                                 "}\n";
+    static const char prod_path[] = "clients/src/main/java/org/acme/clients/Codec.java";
+    static const char test_path[] = "streams/src/test/java/org/acme/streams/RunTest.java";
+    write_temp_file(tmp, prod_path, "package org.acme.clients;\n\npublic class Codec {}\n");
+    write_temp_file(tmp, test_path,
+                    "package org.acme.streams;\n\npublic class RunTest {\n"
+                    "    static class Codec {}\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "go", "Codec", prod_path, test_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "go", "Codec", prod_path, test_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* Test code ranks test candidates like any other: the test penalty is for
+ * production callers. kafka's clients tests call `new MockTime()`, meaning the
+ * clients test helper next to them; with every test-file definition ranked as
+ * test, a same-named class in a test-support module under src/main (which no
+ * test rule marks) won instead. For a test caller no candidate takes the
+ * penalty, so proximity picks the helper again, in the full index and on both
+ * incremental routes. */
+TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tcaller_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "clients/src/test/java/org/acme/clients/ClientTest.java";
+    static const char caller[] = "package org.acme.clients;\n\n"
+                                 "public class ClientTest {\n"
+                                 "    Object make() { return new MockTime(); }\n"
+                                 "}\n";
+    static const char helper_path[] = "clients/src/test/java/org/acme/common/utils/MockTime.java";
+    static const char support_path[] =
+        "streams/test-utils/src/main/java/org/acme/streams/TopologyTestDriver.java";
+    write_temp_file(tmp, helper_path,
+                    "package org.acme.common.utils;\n\npublic class MockTime {}\n");
+    write_temp_file(tmp, support_path,
+                    "package org.acme.streams;\n\npublic class TopologyTestDriver {\n"
+                    "    static class MockTime {\n        MockTime() {}\n    }\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "make", "MockTime", helper_path, support_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "make", "MockTime", helper_path, support_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -9018,6 +9180,125 @@ TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds) {
     cbm_pipeline_free(unchanged);
     cbm_pipeline_incremental_test_reset_faults();
     th_rmtree(tmp);
+    PASS();
+}
+
+/* The latin-1 'é' of the fixtures below, as the strict JSON reader returns it. */
+#define NON_UTF8_REPLACED "caf\xef\xbf\xbd"
+
+/* True when some string in value, at any depth, contains needle. */
+static bool non_utf8_json_has(yyjson_val *value, const char *needle) {
+    const char *text = yyjson_get_str(value);
+    if (text) {
+        return strstr(text, needle) != NULL;
+    }
+    size_t index, count;
+    yyjson_val *key, *item;
+    if (yyjson_is_arr(value)) {
+        yyjson_arr_foreach(value, index, count, item) {
+            if (non_utf8_json_has(item, needle)) {
+                return true;
+            }
+        }
+    }
+    if (yyjson_is_obj(value)) {
+        yyjson_obj_foreach(value, index, count, key, item) {
+            if (non_utf8_json_has(item, needle)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* -1: absent or not strict JSON; 0: strict without the replaced text; 1: with it. */
+static int non_utf8_json_state(const char *json) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc) {
+        return -1;
+    }
+    int found = non_utf8_json_has(yyjson_doc_get_root(doc), NON_UTF8_REPLACED) ? 1 : 0;
+    yyjson_doc_free(doc);
+    return found;
+}
+
+typedef struct {
+    int surface_rows;
+    int surface_state[3]; /* a.ts, b.ts, c.py */
+    bool unresolved_complete;
+    int unresolved_state; /* b.ts's unresolved_calls detail */
+} non_utf8_outcome_t;
+
+static void non_utf8_read_outcome(cbm_store_t *store, const char *project,
+                                  non_utf8_outcome_t *out) {
+    static const char *paths[] = {"a.ts", "b.ts", "c.py"};
+    cbm_lsp_surface_row_t *surfaces = NULL;
+    if (cbm_store_get_lsp_surfaces(store, project, &surfaces, &out->surface_rows) != CBM_STORE_OK) {
+        out->surface_rows = -1;
+    }
+    for (int i = 0; i < out->surface_rows; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (strcmp(surfaces[i].rel_path, paths[j]) == 0) {
+                out->surface_state[j] = non_utf8_json_state(surfaces[i].defs_json);
+            }
+        }
+    }
+    cbm_store_free_lsp_surfaces(surfaces, out->surface_rows);
+    cbm_coverage_meta_t meta = {0};
+    out->unresolved_complete = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
+                               meta.unresolved_calls_complete;
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get_path(store, project, "b.ts", &rows, &row_count) == CBM_STORE_OK) {
+        for (int i = 0; i < row_count; i++) {
+            if (strcmp(rows[i].kind, "unresolved_calls") == 0) {
+                out->unresolved_state = non_utf8_json_state(rows[i].detail);
+            }
+        }
+    }
+    cbm_store_free_coverage(rows, row_count);
+}
+
+/* Source text is not always UTF-8. A latin-1 'é' that names a TS method reaches
+ * both that file's LSP surface and the caller of its unresolved call; one in a
+ * Python __all__ string reaches the namespace surface. The strict writer refused
+ * each document, which cost the repository every surface row and switched off
+ * unresolved-call capture for the run. Each is now strict JSON with U+FFFD. */
+TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture) {
+    char tmp[256] = "/tmp/cbm_non_utf8_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.ts", "export function ok(): number { return 1; }\n");
+    write_temp_file(tmp, "b.ts", "class A {\n  \"caf\xe9\"(): void { missing(); }\n}\n");
+    write_temp_file(tmp, "c.py", "__all__ = ['caf\xe9']\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/non_utf8.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    non_utf8_outcome_t outcome = {.surface_state = {-1, -1, -1}, .unresolved_state = -1};
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    if (store) {
+        non_utf8_read_outcome(store, project, &outcome);
+        cbm_store_close(store);
+    }
+    th_rmtree(tmp);
+    if (outcome.surface_rows != 3 || !outcome.unresolved_complete) {
+        fprintf(stderr, "  [non-utf8] rc=%d surfaces=%d states=%d,%d,%d complete=%d detail=%d\n",
+                rc, outcome.surface_rows, outcome.surface_state[0], outcome.surface_state[1],
+                outcome.surface_state[2], outcome.unresolved_complete, outcome.unresolved_state);
+    }
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(outcome.surface_rows, 3);
+    ASSERT_EQ(outcome.surface_state[0], 0);
+    ASSERT_EQ(outcome.surface_state[1], 1);
+    ASSERT_EQ(outcome.surface_state[2], 1);
+    ASSERT_TRUE(outcome.unresolved_complete);
+    ASSERT_EQ(outcome.unresolved_state, 1);
     PASS();
 }
 
@@ -34614,6 +34895,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
     RUN_TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental);
     RUN_TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -35130,6 +35414,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
     RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
+    RUN_TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
     RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);
