@@ -1531,16 +1531,16 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
  * a module at exactly that path (styles.css, also beside styles.css.ts), then
  * a dotted-name module at that path plus a module extension (theme.css.ts
  * imported as ~/theme.css), then the extension drops. A bundler ?query or a
- * #fragment is not part of the extension. Unknown suffixes such as
- * cat.service stay intact. The shared alias resolver is unchanged, so doc
- * links keep the file identity they had. */
+ * #fragment on the basename is not part of the extension; a `?` in a folder
+ * name is part of the path. Unknown suffixes such as cat.service stay intact. The shared alias
+ * resolver is unchanged, so doc links keep the file identity they had. */
 static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, char *aliased) {
-    char *query = strchr(aliased, '?');
+    char *slash = strrchr(aliased, '/');
+    char *base = slash ? slash + SKIP_ONE : aliased;
+    char *query = strchr(base, '?');
     if (query) {
         *query = '\0';
     }
-    const char *slash = strrchr(aliased, '/');
-    const char *base = slash ? slash + SKIP_ONE : aliased;
     char *ext = strrchr(base, '.');
     char *fragment = ext ? strchr(ext, '#') : NULL;
     if (fragment) {

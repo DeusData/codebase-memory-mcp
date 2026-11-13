@@ -653,7 +653,8 @@ TEST(ei_typescript_dotted_alias_import_targets_source_module) {
         ASSERT_NOT_NULL(target);
         ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
         saw_import = true;
-        target_ok = target->file_path && strcmp(target->file_path, service_path) == 0;
+        target_ok = target->file_path && strcmp(target->file_path, service_path) == 0 &&
+                    target->label && strcmp(target->label, "Module") == 0;
         cbm_store_free_nodes(target, 1);
     }
     cbm_store_free_edges(edges, edge_count);
@@ -663,6 +664,29 @@ TEST(ei_typescript_dotted_alias_import_targets_source_module) {
     ASSERT_TRUE(target_ok);
     PASS();
 }
+
+#ifndef _WIN32
+/* A `?` in a folder name is part of the path, not a bundler query: the alias
+ * import ~/dir?name/file names src/dir?name/file.ts, never src/dir.ts.
+ * Windows file names cannot hold `?`. */
+TEST(ei_typescript_alias_import_keeps_question_mark_folder) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/dir?name/file.ts", "export const wanted = 1;\n"},
+        {"src/dir.ts", "export const decoy = 2;\n"},
+        {"src/user.ts", "import { wanted } from '~/dir?name/file';\n"
+                        "export const u = wanted;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/user.ts", "src/dir?name/file.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 1, "Module"));
+    PASS();
+}
+#endif
 
 /* The alias branch keeps a dotted basename, but an alias import of a non-JS
  * file still names that file: `~/styles/globals.css` and the bundler query
@@ -2642,6 +2666,9 @@ SUITE(edge_imports) {
     RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
     RUN_TEST(ei_typescript_dotted_alias_import_targets_source_module);
     RUN_TEST(ei_typescript_alias_import_non_js_file_targets_its_module);
+#ifndef _WIN32
+    RUN_TEST(ei_typescript_alias_import_keeps_question_mark_folder);
+#endif
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);
