@@ -1532,8 +1532,17 @@ lint-memory-core:
 	@echo "=== memory-core linter ==="
 	@python3 scripts/lint-memory-core.py
 
+# Vendored tree-sitter scanners keep their state in the payload their create()
+# returns, one per parser. A file-scope variable is one object shared by every
+# parser in the process, and the indexer runs one per worker thread: properties
+# and jsonnet both made the graph differ run to run that way. Exceptions, each
+# argued, are in scripts/lint-vendored-scanners-whitelist.txt.
+lint-vendored-scanners:
+	@echo "=== vendored scanner state ==="
+	@python3 scripts/lint-vendored-scanners.py
+
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
-lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core
+lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core lint-vendored-scanners
 	@echo "=== CI linters passed ==="
 
 # ── Local memory-diagnostic lanes (not PR-CI gates by decision: the diag
