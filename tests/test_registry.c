@@ -1732,7 +1732,7 @@ TEST(registry_receiver_gate_judges_value_receivers) {
     cbm_registry_add_lang(r, "withVoters", with, "Method", CBM_LANG_CSHARP, false);
     cbm_registry_add_lang(r, "setName", set_name, "Method", CBM_LANG_CSHARP, false);
     cbm_registry_add_lang(r, "numPartitions", parts, "Method", CBM_LANG_CSHARP, false);
-    cbm_registry_add_lang(r, "shutdown", guard, "Method", CBM_LANG_RUST, false);
+    cbm_registry_add_lang(r, "shutdown", guard, "Method", CBM_LANG_CPP, false);
     const CBMLanguage cs = CBM_LANG_CSHARP;
 
     /* Nothing ties `tp` to ConsumerRecord: refused on the CALLS path, while
@@ -1769,7 +1769,7 @@ TEST(registry_receiver_gate_judges_value_receivers) {
                                          0, cs);
     ASSERT_TRUE(gate_bound(&res, clean));
     res = cbm_registry_resolve_call_lang(r, "otel_guard.shutdown", "proj.src.shipping.src.main",
-                                         NULL, NULL, 0, CBM_LANG_RUST);
+                                         NULL, NULL, 0, CBM_LANG_CPP);
     ASSERT_TRUE(gate_bound(&res, guard));
     res = cbm_registry_resolve_call_lang(r, "$logger.setName", mod, NULL, NULL, 0, cs);
     ASSERT_TRUE(gate_bound(&res, set_name));
@@ -1787,51 +1787,75 @@ TEST(registry_receiver_gate_judges_value_receivers) {
     res = cbm_registry_resolve_call_lang(r, "topic.numPartitions", mod, NULL, NULL, 0, cs);
     ASSERT_TRUE(gate_bound(&res, parts));
 
-    /* C: a member call landing on a struct member is decided by the C member
-     * resolver from the object's type. */
+    /* C++ (and C): a member call landing on a struct member is decided by the C
+     * member resolver from the object's type. */
     const char *c_mod = "proj.src.redis";
     cbm_registry_add_lang(r, "mallocFn", "proj.deps.hiredis.alloc.hiredisAllocFuncs.mallocFn",
-                          "Field", CBM_LANG_C, false);
+                          "Field", CBM_LANG_CPP, false);
     res = cbm_registry_resolve_call_lang(r, "hiredisAllocFns.mallocFn", c_mod, NULL, NULL, 0,
-                                         CBM_LANG_C);
+                                         CBM_LANG_CPP);
     ASSERT_TRUE(gate_bound(&res, "proj.deps.hiredis.alloc.hiredisAllocFuncs.mallocFn"));
+    /* C++: a candidate whose owner type the caller's own file declares (a class
+     * re-declared above `Widget w(n); w.get_id()`); refused from a file that
+     * declares no Widget. */
+    const char *get_id = "proj.src.widget.Widget.get_id";
+    cbm_registry_add_lang(r, "get_id", get_id, "Method", CBM_LANG_CPP, false);
+    cbm_registry_add_lang(r, "Widget", "proj.src.main.Widget", "Class", CBM_LANG_CPP, false);
+    res =
+        cbm_registry_resolve_call_lang(r, "w.get_id", "proj.src.main", NULL, NULL, 0, CBM_LANG_CPP);
+    ASSERT_TRUE(gate_bound(&res, get_id));
+    res = cbm_registry_resolve_call_lang(r, "w.get_id", "proj.src.other", NULL, NULL, 0,
+                                         CBM_LANG_CPP);
+    ASSERT_TRUE(gate_empty(&res));
     cbm_registry_free(r);
     PASS();
 }
 
-/* By measured language: Scala keeps its unique_name binds and has only its
- * suffix_match picks judged; Java, Kotlin and Ruby are left out of the gate. */
-TEST(registry_receiver_gate_judges_only_suffix_picks_on_the_jvm) {
+/* The gate runs by measured language (an allowlist). Whole for Go and Elixir:
+ * a unique_name bind is judged too. Suffix-only for Scala, Rust and PHP: they
+ * keep their unique_name binds and only a suffix_match pick is judged. Off
+ * for every other language -- measured below the bar (Java, Kotlin, Swift,
+ * Ruby, Objective-C), refusing nothing (C, Dart), or not measured (Zig). */
+TEST(registry_receiver_gate_runs_by_measured_language) {
     cbm_registry_t *r = cbm_registry_new();
     const char *mod = "proj.streams.src.main.scala.org.acme.streams";
     const char *consumer =
         "proj.clients.src.main.java.org.acme.clients.consumer.ConsumerRecord.topic";
     const char *producer =
         "proj.clients.src.main.java.org.acme.clients.producer.ProducerRecord.topic";
+    static const CBMLanguage full[] = {CBM_LANG_GO, CBM_LANG_ELIXIR};
+    static const CBMLanguage suffix_only[] = {CBM_LANG_SCALA, CBM_LANG_RUST, CBM_LANG_PHP};
+    static const CBMLanguage off[] = {CBM_LANG_JAVA, CBM_LANG_KOTLIN, CBM_LANG_SWIFT, CBM_LANG_RUBY,
+                                      CBM_LANG_OBJC, CBM_LANG_C,      CBM_LANG_DART,  CBM_LANG_ZIG};
     cbm_registry_add_lang(r, "topic", consumer, "Method", CBM_LANG_JAVA, false);
-    /* One definition of the name: kept on the JVM, refused elsewhere. */
-    cbm_resolution_t res =
-        cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_SCALA);
-    ASSERT_TRUE(gate_bound(&res, consumer));
-    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_JAVA);
-    ASSERT_TRUE(gate_bound(&res, consumer));
-    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_GO);
-    ASSERT_TRUE(gate_empty(&res));
-    /* Two: Scala's proximity pick between them is refused unless the receiver
-     * names its owner; Java and Kotlin keep theirs. */
+    /* One definition of the name: refused only where the gate is whole. */
+    cbm_resolution_t res;
+    for (size_t i = 0; i < sizeof(full) / sizeof(full[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, full[i]);
+        ASSERT_TRUE(gate_empty(&res));
+    }
+    for (size_t i = 0; i < sizeof(suffix_only) / sizeof(suffix_only[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, suffix_only[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, off[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    /* Two: the proximity pick between them is refused where the gate runs,
+     * unless the receiver names its owner; the other languages keep theirs. */
     cbm_registry_add_lang(r, "topic", producer, "Method", CBM_LANG_JAVA, false);
-    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_SCALA);
-    ASSERT_TRUE(gate_empty(&res));
-    res = cbm_registry_resolve_call_lang(r, "consumerRecord.topic", mod, NULL, NULL, 0,
-                                         CBM_LANG_SCALA);
-    ASSERT_TRUE(gate_bound(&res, consumer));
-    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_JAVA);
-    ASSERT_TRUE(gate_bound(&res, consumer));
-    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_KOTLIN);
-    ASSERT_TRUE(gate_bound(&res, consumer));
-    /* Ruby is left out too. */
-    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_RUBY);
-    ASSERT_TRUE(gate_bound(&res, consumer));
+    for (size_t i = 0; i < sizeof(suffix_only) / sizeof(suffix_only[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, suffix_only[i]);
+        ASSERT_TRUE(gate_empty(&res));
+        res = cbm_registry_resolve_call_lang(r, "consumerRecord.topic", mod, NULL, NULL, 0,
+                                             suffix_only[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, off[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
     cbm_registry_free(r);
     PASS();
 }
@@ -3676,7 +3700,7 @@ SUITE(registry) {
     RUN_TEST(go_bare_init_never_binds_init_namesake);
     RUN_TEST(c_bare_ref_never_binds_field);
     RUN_TEST(registry_receiver_gate_judges_value_receivers);
-    RUN_TEST(registry_receiver_gate_judges_only_suffix_picks_on_the_jvm);
+    RUN_TEST(registry_receiver_gate_runs_by_measured_language);
     RUN_TEST(registry_receiver_gate_judges_type_roots_at_import_fallback);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);

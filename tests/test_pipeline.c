@@ -7002,10 +7002,11 @@ static void gate_fixture(const char *tmp) {
  * between two same-named methods for `tp.topicName()` (kafka's `tp.topic()`
  * shape), and Go's `strings.Join` onto the project's one Join. Kept: the
  * Scala receiver named after its owner, and a C call through a
- * function-pointer member, which the C member resolver types. A veto, not a
- * re-pick: a refused call stays unresolved. Full index (sequential and
- * parallel) and both incremental routes. Java is left out of the gate (the
- * registry test pins that); the Java files only share the fixture. */
+ * function-pointer member, which the C member resolver types (C is off the
+ * gate's allowlist). A veto, not a re-pick: a refused call stays unresolved.
+ * Full index (sequential and parallel) and both incremental routes. Java is
+ * off the allowlist too (the registry test pins every language's scope); the
+ * Java files only share the fixture. */
 TEST(pipeline_registry_receiver_gate_full_and_incremental) {
     static const struct {
         const char *source;

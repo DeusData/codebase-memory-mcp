@@ -2844,8 +2844,10 @@ static const char *gate_first_dot(const char *callee_name) {
  *   - it lives in the caller's own module (a class beside the caller, a nested
  *     class of its file);
  *   - it is reachable through the file's imports;
- *   - or, for a C or C++ call onto a struct member, the C member resolver
- *     decides it from the object's type (cbm_call_onto_field_policy).
+ *   - or, in C and C++, the C member resolver decides a call onto a struct
+ *     member from the object's type (cbm_call_onto_field_policy), and a
+ *     candidate whose owner type the caller's own file declares
+ *     (caller_declares_owner) is that type's member.
  * When another candidate is the field-type hint's own pick (its owner is the
  * receiver's name capitalized) the call is left as before, for the parallel
  * resolver to re-pick. Otherwise the guess is refused: a veto, never a
@@ -2857,6 +2859,33 @@ static const char *gate_first_dot(const char *callee_name) {
  * same_module, qualified_suffix and lsp_* -- is untouched. `lang` is the
  * calling file's language (CALLS path only); a C# keyword root
  * (`int.TryParse`) is a type there. */
+/* C and C++: the caller's own file declares the candidate's owner type -- a
+ * class re-declared or declared ahead of its use in the calling translation
+ * unit (`class Widget { public: int get_id() const; };` above `Widget w(n);
+ * w.get_id()`). The C++ resolver types the receiver against that declaration,
+ * whose methods have no definition to bind; the candidate is the type's
+ * definition elsewhere. */
+static bool caller_declares_owner(const cbm_registry_t *r, const char *chosen,
+                                  const char *module_qn) {
+    const char *last = strrchr(chosen, '.');
+    if (!last || !module_qn || !module_qn[0]) {
+        return false;
+    }
+    const char *owner = last;
+    while (owner > chosen && owner[-1] != '.') {
+        owner--;
+    }
+    if (owner == chosen || owner == last) {
+        return false;
+    }
+    char qn[CBM_SZ_1K];
+    int n = snprintf(qn, sizeof(qn), "%s.%.*s", module_qn, (int)(last - owner), owner);
+    if (n < 0 || (size_t)n >= sizeof(qn)) {
+        return false;
+    }
+    return cbm_label_is_type_like(cbm_registry_label_of(r, qn));
+}
+
 static bool value_receiver_blind(const cbm_registry_t *r, const qn_array_t *arr,
                                  const char *callee_name, const char *chosen, const char *module_qn,
                                  const char **import_vals, int import_count, CBMLanguage lang) {
@@ -2890,6 +2919,9 @@ static bool value_receiver_blind(const cbm_registry_t *r, const qn_array_t *arr,
         if (label && strcmp(label, "Field") == 0) {
             return false; /* CBM_FIELD_CALL_BY_OWNER: the C member resolver decides */
         }
+        if (caller_declares_owner(r, chosen, module_qn)) {
+            return false;
+        }
     }
     if (gate_chain_any(callee_name, seg_names_ancestry, chosen)) {
         return false;
@@ -2904,42 +2936,35 @@ static bool value_receiver_blind(const cbm_registry_t *r, const qn_array_t *arr,
     return true;
 }
 
-/* Where the receiver gate applies, by the calling file's language. Measured
- * per language on hand-read samples of the edges it refuses (the share that
- * were wrong): Go, C++, C#, Lua, Tcl, Groovy and the rest clear 85%, and the
- * gate is whole there. Scala keeps its unique_name binds -- a project's one
- * method of a name is mostly what an untyped receiver means there -- and only
- * its suffix_match picks, a choice among same-named candidates by path
- * proximity alone, are judged. Java stays below the bar even then: most of
- * the right edges it would refuse sit behind a receiver that is a method's
- * return value, which only the LSP can type. Kotlin is unmeasured. Ruby is
- * duck-typed: its project-unique method names (`id.sampled?`) are mostly
- * what the call means. All three are left out. So are the languages with
- * their own member-call guard after resolution (Python and the JS/TS family:
- * cbm_suppress_weak_member_match; Perl: cbm_perl_suppress_generic_match) and
- * PHP's vendor- and namespace-aware resolution: the gate refused nothing
- * there that their guard keeps, and refusing before resolution skipped the
- * URL-argument HTTP classification their guards leave in place. */
+/* Where the receiver gate applies, by the calling file's language: an
+ * allowlist by measurement. A language is listed only where a hand-read
+ * seeded sample of the calls the gate refuses there, on a real corpus, was
+ * at least ~85% wrong. GATE_FULL: both its unique_name binds and its
+ * suffix_match picks cleared that. GATE_SUFFIX_ONLY: only the suffix_match
+ * picks (a choice among same-named candidates by path proximity alone) did,
+ * so the language keeps its unique_name binds. Every other language -- the
+ * ones measured below the bar (Java, Kotlin, Swift, Ruby, Objective-C), the
+ * ones where it refused nothing (C, Dart, and the languages with their own
+ * member-call guard after resolution: Python, the JS/TS family, Perl), and
+ * every language not measured -- keeps its name-only binds. */
 typedef enum { GATE_OFF, GATE_SUFFIX_ONLY, GATE_FULL } gate_scope_t;
 
 static gate_scope_t gate_scope(CBMLanguage lang) {
     switch (lang) {
-    case CBM_LANG_JAVA:
-    case CBM_LANG_KOTLIN:
-    case CBM_LANG_RUBY:
-    case CBM_LANG_PYTHON:
-    case CBM_LANG_JAVASCRIPT:
-    case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX:
-    case CBM_LANG_ARKTS:
-    case CBM_LANG_PERL:
-    case CBM_LANG_PHP:
-    case CBM_LANG_COUNT: /* not a CALLS resolve */
-        return GATE_OFF;
+    case CBM_LANG_GO:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_LUA:
+    case CBM_LANG_TCL:
+    case CBM_LANG_GROOVY:
+    case CBM_LANG_ELIXIR:
+        return GATE_FULL;
     case CBM_LANG_SCALA:
+    case CBM_LANG_RUST:
+    case CBM_LANG_PHP:
         return GATE_SUFFIX_ONLY;
     default:
-        return GATE_FULL;
+        return GATE_OFF;
     }
 }
 
