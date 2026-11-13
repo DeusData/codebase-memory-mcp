@@ -147,6 +147,44 @@ static const char *PERL_MALFORMED = "package Broken;\n"
                                     "} ] } ]\n"
                                     "sub after_error { return 2; }\n";
 
+/* #1261: a `Language = python` method body is lexed by the ObjectScript
+ * grammar's external scanner. Up to intersystems/tree-sitter-objectscript
+ * a7ffcdf it only balanced braces, so a brace inside a Python string, comment
+ * or docstring ran the body past its closing `}` and the following methods were
+ * lost in an ERROR region. Since upstream v1.9.15 the scanner lexes these
+ * bodies with Python's string, triple-quote and `#`-comment rules. */
+static const char *OBJECTSCRIPT_PYTHON_BODY_BRACES =
+    "Class Demo.Py Extends %RegisteredObject\n"
+    "{\n"
+    "ClassMethod Fmt() As %String [ Language = python ]\n"
+    "{\n"
+    "    s = \"open { only\"\n"
+    "    return s\n"
+    "}\n"
+    "ClassMethod Note() As %String [ Language = python ]\n"
+    "{\n"
+    "    # a } in a comment\n"
+    "    return 'x'\n"
+    "}\n"
+    "ClassMethod Doc() As %String [ Language = python ]\n"
+    "{\n"
+    "    \"\"\"docstring with { and no close\"\"\"\n"
+    "    return 'y'\n"
+    "}\n"
+    "ClassMethod After() As %String\n"
+    "{\n"
+    "    Quit \"after\"\n"
+    "}\n"
+    "}\n";
+
+/* The refreshed scanner must still report a Python body that never closes. */
+static const char *OBJECTSCRIPT_PYTHON_BODY_UNCLOSED =
+    "Class Demo.Broken Extends %RegisteredObject\n"
+    "{\n"
+    "ClassMethod Fmt() As %String [ Language = python ]\n"
+    "{\n"
+    "    return \"x\"\n";
+
 /* ── Tests ────────────────────────────────────────────────────────────────── */
 
 TEST(c_ifdef_split_brace_sets_parse_incomplete) {
@@ -572,6 +610,40 @@ TEST(perl_malformed_source_remains_partial_issue1838) {
     ASSERT_TRUE(r->parse_incomplete);
     ASSERT_GTE(r->error_region_count, 1);
     ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(objectscript_python_body_braces_parse_completely_issue1261) {
+    CBMFileResult *r =
+        do_extract(OBJECTSCRIPT_PYTHON_BODY_BRACES, CBM_LANG_OBJECTSCRIPT_UDL, "Py.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool partial = r->parse_incomplete;
+    int error_regions = r->error_region_count;
+    bool all_methods =
+        has_def(r, "Fmt") && has_def(r, "Note") && has_def(r, "Doc") && has_def(r, "After");
+    if (partial || error_regions != 0 || !all_methods) {
+        fprintf(stderr,
+                "  ObjectScript Python-body result: partial=%d regions=%d ranges=%s "
+                "Fmt=%d Note=%d Doc=%d After=%d\n",
+                partial, error_regions, r->error_ranges ? r->error_ranges : "(none)",
+                has_def(r, "Fmt"), has_def(r, "Note"), has_def(r, "Doc"), has_def(r, "After"));
+        cbm_free_result(r);
+        FAIL("braces inside Python strings, comments and docstrings must not run a "
+             "Language = python body past its closing brace");
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(objectscript_unclosed_python_body_remains_partial_issue1261) {
+    CBMFileResult *r =
+        do_extract(OBJECTSCRIPT_PYTHON_BODY_UNCLOSED, CBM_LANG_OBJECTSCRIPT_UDL, "Broken.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
     cbm_free_result(r);
     PASS();
 }
@@ -2378,6 +2450,8 @@ SUITE(parse_coverage) {
     RUN_TEST(c_clean_file_stays_unflagged_after_refinement);
     RUN_TEST(perl_format_followed_by_named_sub_is_complete_issue1838);
     RUN_TEST(perl_malformed_source_remains_partial_issue1838);
+    RUN_TEST(objectscript_python_body_braces_parse_completely_issue1261);
+    RUN_TEST(objectscript_unclosed_python_body_remains_partial_issue1261);
     RUN_TEST(dockerfile_trailing_blank_at_eof_not_flagged_issue1746);
     RUN_TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
