@@ -50,6 +50,8 @@
 #include "cbm.h"
 #include "discover/discover.h"
 #include "lang_specs.h"
+#include "lsp/lsp_name_rows.h"
+#include "lsp/lsp_work.h"
 #include "lsp/py_lsp.h"
 #include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -1903,6 +1905,551 @@ TEST(complexity_go_route_bindings_are_near_linear) {
     PASS();
 }
 
+/* ── Language passes: imports and registrations found by name ───────────
+ * Extraction runs the file's own language pass in-process. Its searches of the
+ * import table and the registry charge lsp_work.h, one step per row compared or
+ * copied, so a pass that searches per definition or per use shows about 4x when
+ * the rows double, and one that asks by name about 2x. */
+static uint64_t cx_fnv(uint64_t hash, const char *text) {
+    for (const char *at = text ? text : "\x01"; *at; at++)
+        hash = (hash ^ (unsigned char)*at) * UINT64_C(0x100000001B3);
+    return (hash ^ 0xff) * UINT64_C(0x100000001B3);
+}
+
+/* What the pass resolved, in order: a change of answer changes this digest. */
+static uint64_t cx_resolved_digest(const CBMResolvedCallArray *calls) {
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (int i = 0; i < calls->count; i++) {
+        const CBMResolvedCall *call = &calls->items[i];
+        char numbers[64];
+        snprintf(numbers, sizeof(numbers), "%d:%u:%u:%.3f", (int)call->kind, call->site_start_byte,
+                 call->site_end_byte, (double)call->confidence);
+        hash = cx_fnv(hash, call->caller_qn);
+        hash = cx_fnv(hash, call->callee_qn);
+        hash = cx_fnv(hash, call->strategy);
+        hash = cx_fnv(hash, call->reason);
+        hash = cx_fnv(hash, numbers);
+    }
+    return hash;
+}
+
+static uint64_t cx_lsp_steps_of(CBMLanguage language, const char *path, const char *source,
+                                int *resolved, uint64_t *digest) {
+    (void)cbm_lsp_work_take();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), language, "test", path, 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    *resolved = result ? result->resolved_calls.count : -1;
+    *digest = result ? cx_resolved_digest(&result->resolved_calls) : 0;
+    if (!result || result->lsp_skipped)
+        work = 0;
+    if (result)
+        cbm_free_result(result);
+    return work;
+}
+
+static uint64_t cx_extract_lsp_steps(CBMLanguage language, const char *path, const char *head,
+                                     CxLineFn line, const char *tail, int lines, int *resolved,
+                                     uint64_t *digest) {
+    char *source = cx_lines_text(head, line, tail, lines);
+    if (!source)
+        return 0;
+    uint64_t work = cx_lsp_steps_of(language, path, source, resolved, digest);
+    free(source);
+    return work;
+}
+
+/* Steps at twice the rows over steps at CX_BINDING_LINES rows; *base gets the latter.
+ * The resolved rows and their digest are printed so two builds can be compared. */
+static double cx_pass_ratio(CBMLanguage language, const char *path, const char *head, CxLineFn line,
+                            const char *tail, uint64_t *base) {
+    int resolved[2];
+    uint64_t digest[2];
+    uint64_t first = cx_extract_lsp_steps(language, path, head, line, tail, CX_BINDING_LINES,
+                                          &resolved[0], &digest[0]);
+    uint64_t second = cx_extract_lsp_steps(language, path, head, line, tail, CX_BINDING_LINES * 2,
+                                           &resolved[1], &digest[1]);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s lsp steps %llu -> %llu (ratio %.2f); resolved %d/%016llx, %d/%016llx\n", path,
+           (unsigned long long)first, (unsigned long long)second, ratio, resolved[0],
+           (unsigned long long)digest[0], resolved[1], (unsigned long long)digest[1]);
+    *base = first;
+    return ratio;
+}
+
+/* The table says the same whichever way a name is found. */
+TEST(complexity_name_rows_answer_as_a_scan_does) {
+    enum { COUNT = 64 };
+    const char *names[COUNT];
+    char storage[COUNT][8];
+    for (int i = 0; i < COUNT; i++) {
+        snprintf(storage[i], sizeof(storage[i]), "n%d", i % 7);
+        names[i] = i % 11 == 5 ? NULL : storage[i];
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMNameRows rows = {0};
+    bool same = true;
+    /* Both short of the threshold and past it; the table may grow between questions. */
+    for (int count = 1; count <= COUNT; count++) {
+        for (int v = 0; v < 8; v++) {
+            char name[8];
+            snprintf(name, sizeof(name), "n%d", v);
+            int expected = -1;
+            for (int i = 0; i < count && expected < 0; i++)
+                if (names[i] && !strcmp(names[i], name))
+                    expected = i;
+            int got = cbm_name_rows_first(&rows, &arena, names, count, name);
+            while (same && expected >= 0) {
+                same = got == expected;
+                int after = -1;
+                for (int i = expected + 1; i < count && after < 0; i++)
+                    if (names[i] && !strcmp(names[i], name))
+                        after = i;
+                got = cbm_name_rows_next(&rows, names, count, name, got);
+                expected = after;
+            }
+            same = same && got == -1;
+        }
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(same);
+    PASS();
+}
+
+/* Python's own pass copied its import table on every import, joined each import
+ * to every import statement of the module and each statement's items to every
+ * import, and scanned the table for each reference. */
+static const char *cx_line_py_import_pair(char *out, size_t cap, int i) {
+    snprintf(out, cap, "import pkg_%d.part\nfrom mod_%d import name_%d\nname_%d()\n", i, i, i, i);
+    return out;
+}
+static const char *cx_line_py_from_item(char *out, size_t cap, int i) {
+    snprintf(out, cap, "    name_%d,\n", i);
+    return out;
+}
+TEST(complexity_python_pass_import_join_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_pass_ratio(CBM_LANG_PYTHON, "pairs.py", "", cx_line_py_import_pair, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+/* One statement can hold them all: generated SDK packages re-export thousands of names. */
+TEST(complexity_python_pass_wide_from_import_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_PYTHON, "reexport.py", "from .models import (\n",
+                                 cx_line_py_from_item, ")\n", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Imports, then a use of each: every use scanned the imports. */
+typedef struct {
+    CBMLanguage language;
+    const char *path, *head, *imported, *middle, *used, *tail;
+} CxImportShape;
+
+static uint64_t cx_import_shape_steps(const CxImportShape *shape, int lines, int *resolved,
+                                      uint64_t *digest) {
+    size_t room = strlen(shape->head) + strlen(shape->middle) + strlen(shape->tail) +
+                  (size_t)lines * CX_BINDING_LINE_ROOM * 2 + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = (size_t)snprintf(source, room, "%s", shape->head);
+    for (int i = 0; i < lines; i++)
+        length += (size_t)snprintf(source + length, room - length, shape->imported, i, i);
+    length += (size_t)snprintf(source + length, room - length, "%s", shape->middle);
+    for (int i = 0; i < lines; i++)
+        length += (size_t)snprintf(source + length, room - length, shape->used, i, i);
+    (void)snprintf(source + length, room - length, "%s", shape->tail);
+    uint64_t work = cx_lsp_steps_of(shape->language, shape->path, source, resolved, digest);
+    free(source);
+    return work;
+}
+
+static double cx_import_shape_ratio(const CxImportShape *shape, int lines, uint64_t *base) {
+    int resolved[2];
+    uint64_t digest[2];
+    uint64_t first = cx_import_shape_steps(shape, lines, &resolved[0], &digest[0]);
+    uint64_t second = cx_import_shape_steps(shape, lines * 2, &resolved[1], &digest[1]);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s lsp steps %llu -> %llu (ratio %.2f); resolved %d/%016llx, %d/%016llx\n",
+           shape->path, (unsigned long long)first, (unsigned long long)second, ratio, resolved[0],
+           (unsigned long long)digest[0], resolved[1], (unsigned long long)digest[1]);
+    *base = first;
+    return ratio;
+}
+
+TEST(complexity_go_import_uses_are_linear) {
+    static const CxImportShape shape = {CBM_LANG_GO,
+                                        "uses.go",
+                                        "package p\nimport (\n",
+                                        "\tq%d \"example.com/q%d\"\n",
+                                        ")\nfunc F() {\n",
+                                        "\tq%d.G()\n",
+                                        "}\n"};
+    uint64_t base = 0;
+    double ratio = cx_import_shape_ratio(&shape, CX_BINDING_LINES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Go's own pass looked for each method's receiver among all the file's types, and
+ * patched each alias, interface and struct after a scan of the registry. */
+static const char *cx_line_go_types(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "type T%d struct{ A int }\ntype U%d = T%d\ntype I%d interface{ M() int }\n"
+             "func (t T%d) M() int { return t.A }\n",
+             i, i, i, i, i);
+    return out;
+}
+TEST(complexity_go_pass_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_pass_ratio(CBM_LANG_GO, "types.go", "package p\n", cx_line_go_types, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each generic function patched the first registration of its name after a scan. */
+static const char *cx_line_go_generic(char *out, size_t cap, int i) {
+    snprintf(out, cap, "func F%d[T any](a T) T { return a }\n", i);
+    return out;
+}
+TEST(complexity_go_generic_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_pass_ratio(CBM_LANG_GO, "generic.go", "package p\n", cx_line_go_generic, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+TEST(complexity_java_import_uses_are_linear) {
+    static const CxImportShape shape = {CBM_LANG_JAVA,
+                                        "Uses.java",
+                                        "",
+                                        "import p.q%d.R%d;\n",
+                                        "public class Uses { void f() {\n",
+                                        "  R%d.call();\n",
+                                        "} }\n"};
+    uint64_t base = 0;
+    double ratio = cx_import_shape_ratio(&shape, CX_BINDING_LINES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+/* Each call also does work that does not grow with the file (it asks the standard
+ * library), so the static imports' scan only dominates at a larger size. */
+TEST(complexity_java_static_import_uses_are_linear) {
+    enum { STATIC_IMPORT_LINES = 4500 };
+    static const CxImportShape shape = {CBM_LANG_JAVA,
+                                        "Statics.java",
+                                        "",
+                                        "import static p.Q%d.m%d;\n",
+                                        "public class Statics { void f() {\n",
+                                        "  m%d();\n",
+                                        "} }\n"};
+    uint64_t base = 0;
+    double ratio = cx_import_shape_ratio(&shape, STATIC_IMPORT_LINES, &base);
+    ASSERT_GTE(base, (uint64_t)STATIC_IMPORT_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Java's own pass looked for each class among all registered types to fill its
+ * bases and fields, and for each method among all registered functions. */
+static const char *cx_line_java_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class C%d extends B { int f; void m(int a) { } }\n", i);
+    return out;
+}
+TEST(complexity_java_class_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_JAVA, "Classes.java", "", cx_line_java_class, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A type name no import explains looked through every registered type. */
+static const char *cx_line_java_unknown_type(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class A%d { Unknown%d field; Unknown%d get() { return field; } }\n", i, i,
+             i);
+    return out;
+}
+TEST(complexity_java_short_name_fallback_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_pass_ratio(CBM_LANG_JAVA, "Types.java", "", cx_line_java_unknown_type, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* The tail index must answer what the scan answers, duplicates and later indexes included. */
+static int cx_type_row(const CBMTypeRegistry *reg, const char *name) {
+    const CBMRegisteredType *found = cbm_registry_lookup_type(reg, name);
+    return found ? (int)(found - reg->types) : -1;
+}
+static int cx_func_row(const CBMTypeRegistry *reg, const char *name) {
+    const CBMRegisteredFunc *found = cbm_registry_lookup_func(reg, name);
+    return found ? (int)(found - reg->funcs) : -1;
+}
+TEST(complexity_registry_tail_answers_as_a_scan_does) {
+    enum { ROWS = 600, NAMES = 250, INDEX_AT = 200, PROBE_STEP = 37 };
+    CBMArena arena, tail_arena, idx_arena;
+    cbm_arena_init(&arena);
+    cbm_arena_init(&tail_arena);
+    cbm_arena_init(&idx_arena);
+    CBMTypeRegistry with, without;
+    cbm_registry_init(&with, &arena);
+    cbm_registry_init(&without, &arena);
+    with.tail_arena = &tail_arena;
+    bool memo_used = false;
+    bool func_memo_used = false;
+    for (int i = 0; i < ROWS; i++) {
+        char name[CX_BINDING_LINE_ROOM];
+        snprintf(name, sizeof(name), "t%d", i % NAMES);
+        const char *qn = cbm_arena_strdup(&arena, name);
+        CBMRegisteredType type = {.qualified_name = qn, .short_name = qn};
+        CBMRegisteredFunc func = {.qualified_name = qn, .short_name = qn};
+        cbm_registry_add_type(&with, type);
+        cbm_registry_add_type(&without, type);
+        cbm_registry_add_func(&with, func);
+        cbm_registry_add_func(&without, func);
+        if (i == INDEX_AT) {
+            cbm_registry_finalize_into(&with, &idx_arena);
+            cbm_registry_finalize_into(&without, &idx_arena);
+        }
+        memo_used = memo_used || with.type_tail.synced > with.type_tail.start;
+        func_memo_used = func_memo_used || with.func_tail.synced > with.func_tail.start;
+        for (int probe = 0; probe < NAMES + PROBE_STEP; probe += PROBE_STEP) {
+            char ask[CX_BINDING_LINE_ROOM];
+            snprintf(ask, sizeof(ask), "t%d", probe);
+            ASSERT_EQ(cx_type_row(&with, ask), cx_type_row(&without, ask));
+            ASSERT_EQ(cx_func_row(&with, ask), cx_func_row(&without, ask));
+            const CBMRegisteredType *own_with = cbm_registry_first_own_type(&with, ask);
+            const CBMRegisteredType *own_without = cbm_registry_first_own_type(&without, ask);
+            ASSERT_EQ(own_with ? (int)(own_with - with.types) : -1,
+                      own_without ? (int)(own_without - without.types) : -1);
+            const CBMRegisteredFunc *fn_with = cbm_registry_first_own_func(&with, ask);
+            const CBMRegisteredFunc *fn_without = cbm_registry_first_own_func(&without, ask);
+            ASSERT_EQ(fn_with ? (int)(fn_with - with.funcs) : -1,
+                      fn_without ? (int)(fn_without - without.funcs) : -1);
+        }
+    }
+    ASSERT_TRUE(memo_used);
+    ASSERT_TRUE(func_memo_used);
+    cbm_arena_destroy(&idx_arena);
+    cbm_arena_destroy(&tail_arena);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+TEST(complexity_kotlin_import_uses_are_linear) {
+    static const CxImportShape shape = {
+        CBM_LANG_KOTLIN, "uses.kt",        "package p\n", "import q.r%d.S%d\n",
+        "fun f() {\n",   "  S%d.call()\n", "}\n"};
+    uint64_t base = 0;
+    double ratio = cx_import_shape_ratio(&shape, CX_BINDING_LINES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A file of classes: each one's registration looked at all that were registered before. */
+static const char *cx_line_kotlin_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class C%d { val x: Int = 1\n fun f(a: Int): Int = a }\n", i);
+    return out;
+}
+TEST(complexity_kotlin_class_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_KOTLIN, "classes.kt", "package p\n", cx_line_kotlin_class,
+                                 "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+TEST(complexity_ts_import_uses_are_linear) {
+    static const CxImportShape typescript = {
+        CBM_LANG_TYPESCRIPT, "uses.ts", "", "import { n_%d } from './m_%d';\n", "",
+        "n_%d();\n",         ""};
+    static const CxImportShape javascript = {
+        CBM_LANG_JAVASCRIPT, "uses.js", "", "import { n_%d } from './m_%d.js';\n", "",
+        "n_%d();\n",         ""};
+    uint64_t ts_base = 0;
+    uint64_t js_base = 0;
+    double ts_ratio = cx_import_shape_ratio(&typescript, CX_BINDING_LINES, &ts_base);
+    double js_ratio = cx_import_shape_ratio(&javascript, CX_BINDING_LINES, &js_base);
+    ASSERT_GTE(ts_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_GTE(js_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ts_ratio >= CX_RATIO_LO && ts_ratio <= CX_RATIO_HI);
+    ASSERT_TRUE(js_ratio >= CX_RATIO_LO && js_ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* TypeScript's own pass listed each type's methods by scanning every function,
+ * and patched each class, alias, JSDoc signature and inferred return after a
+ * scan of the registry. */
+static const char *cx_line_ts_class(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "export class C%d { x: number = 1; m(a: number): number { return a; } }\n"
+             "type A%d = C%d;\n",
+             i, i, i);
+    return out;
+}
+TEST(complexity_ts_class_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_pass_ratio(CBM_LANG_TYPESCRIPT, "classes.ts", "", cx_line_ts_class, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+static const char *cx_line_js_function_pair(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "/** @returns {number} */\nfunction f_%d(a) { return g_%d(a); }\n"
+             "function g_%d(b) { return b; }\n",
+             i, i, i);
+    return out;
+}
+TEST(complexity_js_pass_registry_lookups_are_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_JAVASCRIPT, "pairs.js", "export {};\n",
+                                 cx_line_js_function_pair, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+TEST(complexity_rust_import_uses_are_linear) {
+    static const CxImportShape shape = {
+        CBM_LANG_RUST,  "uses.rs",      "",   "use crate::m%d::f%d;\n",
+        "fn run() {\n", "    f%d();\n", "}\n"};
+    uint64_t base = 0;
+    double ratio = cx_import_shape_ratio(&shape, CX_BINDING_LINES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Rust's registry build patched each trait, impl method and free function after a
+ * scan of every registered type or function. */
+static const char *cx_line_rust_items(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "pub trait T%d { fn m(&self); }\nimpl S%d { pub fn n(&self) -> i32 { 1 } }\n"
+             "fn f%d() -> i32 { 1 }\n",
+             i, i, i);
+    return out;
+}
+TEST(complexity_rust_pass_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_RUST, "items.rs", "", cx_line_rust_items, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each derive and each struct's fields looked for their type among all registered. */
+static const char *cx_line_rust_derive(char *out, size_t cap, int i) {
+    snprintf(out, cap, "#[derive(Clone, Debug)]\npub struct S%d { pub a: i32 }\n", i);
+    return out;
+}
+TEST(complexity_rust_derive_registration_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_RUST, "derive.rs", "", cx_line_rust_derive, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* C#'s own pass patched each method's parameters and return type, and each class's
+ * fields, after a scan of every registered function or type. Every definition also
+ * does work of its own, so the scans show at this size. */
+static const char *cx_line_csharp_methods(char *out, size_t cap, int i) {
+    snprintf(out, cap,
+             "class C%d { public int X; int F(int a) { return a; } int G() { return 1; } "
+             "int H() { return 1; } }\n",
+             i);
+    return out;
+}
+TEST(complexity_csharp_pass_registration_is_linear) {
+    enum { CSHARP_LINES = 3000 };
+    int resolved[2];
+    uint64_t digest[2];
+    uint64_t first = cx_extract_lsp_steps(CBM_LANG_CSHARP, "methods.cs", "", cx_line_csharp_methods,
+                                          "", CSHARP_LINES, &resolved[0], &digest[0]);
+    uint64_t second =
+        cx_extract_lsp_steps(CBM_LANG_CSHARP, "methods.cs", "", cx_line_csharp_methods, "",
+                             CSHARP_LINES * 2, &resolved[1], &digest[1]);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    methods.cs lsp steps %llu -> %llu (ratio %.2f); resolved %d/%016llx, %d/%016llx\n",
+           (unsigned long long)first, (unsigned long long)second, ratio, resolved[0],
+           (unsigned long long)digest[0], resolved[1], (unsigned long long)digest[1]);
+    ASSERT_GTE(first, (uint64_t)CSHARP_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+TEST(complexity_php_import_uses_are_linear) {
+    static const CxImportShape shape = {CBM_LANG_PHP,
+                                        "uses.php",
+                                        "<?php\nnamespace App;\n",
+                                        "use Lib\\A%d;\n",
+                                        "function f() {\n",
+                                        "  A%d::go();\n",
+                                        "}\n"};
+    uint64_t base = 0;
+    double ratio = cx_import_shape_ratio(&shape, CX_BINDING_LINES, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A call to a name nothing declares looked through every registered function. */
+static const char *cx_line_php_unknown_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "function f_%d() { return g_%d(); }\n", i, i);
+    return out;
+}
+TEST(complexity_php_short_name_fallback_is_linear) {
+    uint64_t base = 0;
+    double ratio =
+        cx_pass_ratio(CBM_LANG_PHP, "calls.php", "<?php\n", cx_line_php_unknown_call, "", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each method's declared or documented return type patched its registration after
+ * a scan of every registered function. The classes sit in namespace blocks of a
+ * hundred: the class walk's fixed stack skips the children of a node wider than
+ * it holds (php_lsp_collect_class_fields), so one flat list would not grow. */
+enum { CX_PHP_CLASS_GROUP = 100 };
+static const char *cx_line_php_returns(char *out, size_t cap, int i) {
+    int at = 0;
+    if (i > 0 && i % CX_PHP_CLASS_GROUP == 0)
+        at = snprintf(out, cap, "}\nnamespace N%d {\n", i / CX_PHP_CLASS_GROUP);
+    snprintf(out + at, cap - (size_t)at,
+             "class C%d { function m(): int { return 1; }\n/** @return int */\n"
+             "function n() { return 1; } }\n",
+             i);
+    return out;
+}
+TEST(complexity_php_method_returns_are_linear) {
+    uint64_t base = 0;
+    double ratio = cx_pass_ratio(CBM_LANG_PHP, "returns.php", "<?php\nnamespace N0 {\n",
+                                 cx_line_php_returns, "}\n", &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
@@ -1922,4 +2469,27 @@ SUITE(complexity) {
     RUN_TEST(complexity_spawn_match_is_linear_in_a_files_imports);
     RUN_TEST(complexity_spawn_file_index_answers_as_the_rows_do);
     RUN_TEST(complexity_go_route_bindings_are_near_linear);
+    RUN_TEST(complexity_name_rows_answer_as_a_scan_does);
+    RUN_TEST(complexity_python_pass_import_join_is_linear);
+    RUN_TEST(complexity_python_pass_wide_from_import_is_linear);
+    RUN_TEST(complexity_go_import_uses_are_linear);
+    RUN_TEST(complexity_go_pass_registration_is_linear);
+    RUN_TEST(complexity_go_generic_registration_is_linear);
+    RUN_TEST(complexity_java_import_uses_are_linear);
+    RUN_TEST(complexity_java_static_import_uses_are_linear);
+    RUN_TEST(complexity_java_class_registration_is_linear);
+    RUN_TEST(complexity_java_short_name_fallback_is_linear);
+    RUN_TEST(complexity_registry_tail_answers_as_a_scan_does);
+    RUN_TEST(complexity_kotlin_import_uses_are_linear);
+    RUN_TEST(complexity_kotlin_class_registration_is_linear);
+    RUN_TEST(complexity_ts_import_uses_are_linear);
+    RUN_TEST(complexity_ts_class_registration_is_linear);
+    RUN_TEST(complexity_js_pass_registry_lookups_are_linear);
+    RUN_TEST(complexity_rust_import_uses_are_linear);
+    RUN_TEST(complexity_rust_pass_registration_is_linear);
+    RUN_TEST(complexity_rust_derive_registration_is_linear);
+    RUN_TEST(complexity_csharp_pass_registration_is_linear);
+    RUN_TEST(complexity_php_import_uses_are_linear);
+    RUN_TEST(complexity_php_short_name_fallback_is_linear);
+    RUN_TEST(complexity_php_method_returns_are_linear);
 }
