@@ -369,7 +369,7 @@ Use the graph to explain which tests a change reaches, and use that evidence to 
 
 **Narrowing currently supports C/C++ family code with this repository's test conventions or declared equivalents.** It is not general test selection for every language CBM indexes. Missing, stale, incompatible, or incomplete evidence broadens the selection or returns `run_all`; static reachability without admitted coverage never omits a suite. Begin with report-only shadow mode and validate your harness before enabling gating.
 
-In this repository, test narrowing is wired to the Linux x86_64 test leg when `TEST_IMPACT_MODE=gate`; release and dry-run workflows retain full execution. See the [Smart CI guide](docs/SMART_CI.md) for supported conventions, coverage admission, setup, version requirements, and fallback behavior.
+In this repository, test narrowing is on for every PR unless `TEST_IMPACT_MODE` says otherwise: the Linux x86_64 test leg runs the selection, and the arm64, macOS and Windows legs run it with every platform-specific suite whole; release and dry-run workflows retain full execution. See the [Smart CI guide](docs/SMART_CI.md) for supported conventions, coverage admission, setup, version requirements, and fallback behavior.
 
 ### Edge types (selected)
 - `CALLS`: a callable is invoked at the source site

@@ -2474,6 +2474,61 @@ TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown) {
     PASS();
 }
 
+/* Two manifests can declare the same package name: a repository's own go.mod
+ * and a test fixture's copy of it. Which extraction worker parses which manifest
+ * is thread scheduling, so the package map must not depend on it. The manifest
+ * nearest the repository root wins, and an equal depth is settled by path.
+ * Found on cli/cli, where the fixture won in about one index run in thirty and
+ * the IMPORTS edges fell from 3,869 to 690. */
+static char *ei_pkgmap_winner(const char *first_worker_manifest,
+                              const char *second_worker_manifest) {
+    static const char go_mod[] = "module github.com/acme/tool/v2\n\ngo 1.22\n";
+    cbm_pkg_entries_t workers[2];
+    cbm_pkg_entries_init(&workers[0]);
+    cbm_pkg_entries_init(&workers[1]);
+    bool parsed = cbm_pkgmap_try_parse("go.mod", first_worker_manifest, go_mod, (int)strlen(go_mod),
+                                       &workers[0]) &&
+                  cbm_pkgmap_try_parse("go.mod", second_worker_manifest, go_mod,
+                                       (int)strlen(go_mod), &workers[1]);
+    CBMHashTable *map = parsed ? cbm_pkgmap_build(workers, 2, "proj") : NULL;
+    const char *qn = map ? (const char *)cbm_ht_get(map, "github.com/acme/tool/v2") : NULL;
+    char *winner = qn ? strdup(qn) : NULL;
+    if (map) {
+        cbm_pkgmap_free(map);
+    }
+    cbm_pkg_entries_free(&workers[0]);
+    cbm_pkg_entries_free(&workers[1]);
+    return winner;
+}
+
+TEST(ei_pkgmap_duplicate_package_name_prefers_root_manifest_in_any_worker_order) {
+    char *want = cbm_pipeline_fqn_module("proj", "");
+    char *root_first = ei_pkgmap_winner("go.mod", ".github/codeql/tests/fixture/go.mod");
+    char *fixture_first = ei_pkgmap_winner(".github/codeql/tests/fixture/go.mod", "go.mod");
+    bool root_first_ok = want && root_first && strcmp(root_first, want) == 0;
+    bool fixture_first_ok = want && fixture_first && strcmp(fixture_first, want) == 0;
+    free(want);
+    free(root_first);
+    free(fixture_first);
+    ASSERT_TRUE(root_first_ok);
+    ASSERT_TRUE(fixture_first_ok);
+    PASS();
+}
+
+TEST(ei_pkgmap_duplicate_package_name_at_equal_depth_is_settled_by_path) {
+    char *want = cbm_pipeline_fqn_module("proj", "examples/alpha");
+    char *alpha_first = ei_pkgmap_winner("examples/alpha/go.mod", "examples/beta/go.mod");
+    char *beta_first = ei_pkgmap_winner("examples/beta/go.mod", "examples/alpha/go.mod");
+    bool alpha_first_ok = want && alpha_first && strcmp(alpha_first, want) == 0;
+    bool beta_first_ok = want && beta_first && strcmp(beta_first, want) == 0;
+    free(want);
+    free(alpha_first);
+    free(beta_first);
+    ASSERT_TRUE(alpha_first_ok);
+    ASSERT_TRUE(beta_first_ok);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -2581,4 +2636,6 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_binding_snapshot_requires_current_complete_evidence);
     RUN_TEST(ei_php_binding_snapshot_groups_kinds_and_invalidates_failed_rebuild);
     RUN_TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown);
+    RUN_TEST(ei_pkgmap_duplicate_package_name_prefers_root_manifest_in_any_worker_order);
+    RUN_TEST(ei_pkgmap_duplicate_package_name_at_equal_depth_is_settled_by_path);
 }

@@ -854,8 +854,9 @@ TEST(visual_basic_call_resolution_is_case_insensitive) {
     ASSERT_NOT_NULL(r);
     cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method",
                           CBM_LANG_VISUALBASIC, false);
-    cbm_resolution_t res = cbm_registry_resolve_call_scoped(
-        r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_VISUALBASIC, "proj.Worker.Run");
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_scoped(r, "CALCULATE", "proj.Worker", NULL, NULL, 0,
+                                         CBM_LANG_VISUALBASIC, "proj.Worker.Run", false);
     ASSERT_NOT_NULL(res.qualified_name);
     ASSERT_STR_EQ(res.qualified_name, "proj.Worker.Calculate");
     /* Every segment of a qualified callee is respelled, not only the last. */

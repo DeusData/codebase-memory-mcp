@@ -284,9 +284,12 @@ void cbm_registry_free(cbm_registry_t *r);
 
 /* Register a function/method/class. All strings are copied. The entry's
  * language is unknown, so name-based resolution never filters it out.
- * `is_test` is the extractor's verdict for this symbol (CBMDefinition.is_test:
- * the file's test-ness OR the definition's own test attributes). The registry
- * stores it and scores with it; it does not derive test-ness from the QN. */
+ * `is_test` is the caller's test verdict for this symbol: the seeders pass the
+ * extractor's (CBMDefinition.is_test: a definition's own test attributes, and
+ * for functions, methods and the module the file's test-ness) OR the
+ * extractor's file rule (cbm_is_test_file) OR cbm_registry_test_double_path.
+ * The registry stores it and scores with it; it does not derive test-ness
+ * from the QN. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label, bool is_test);
 
@@ -297,8 +300,10 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
  * clientsets and mock packages in ordinary files the extractor rightly does
  * not call tests; a call should still prefer real code over them. The three
  * registry seeders (pass_definitions.c, pass_parallel.c,
- * pipeline_incremental.c) pass the extractor's verdict OR this, so full and
- * incremental indexes rank alike. It never decides what a node is: the stored
+ * pipeline_incremental.c) pass the extractor's verdict OR its file rule
+ * (cbm_is_test_file, so every definition in a test file ranks as test, not
+ * only its callables) OR this, so full and incremental indexes rank alike.
+ * Neither path rule decides what a node is: the stored
  * is_test property, TESTS edges and importance stay with cbm_is_test_path. */
 bool cbm_registry_test_double_path(const char *rel_path);
 

@@ -138,9 +138,10 @@ KOTLIN_DEDUP_TEST_DEFINE = -DCBM_KOTLIN_DEDUP_TEST_API=1
 CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
 INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
 COVERAGE_MARKER_TEST_DEFINE = -DCBM_COVERAGE_MARKER_TEST_API=1
+MEM_CORE_TEST_DEFINE = -DCBM_MEM_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
+	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
 	-g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS)
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS) \
 	$(CXX_STDLIB_FLAGS)
@@ -160,7 +161,7 @@ TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
 # macro of ours.
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
 	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
-	$(COVERAGE_MARKER_TEST_DEFINE) \
+	$(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) \
 	-DCBM_SANITIZED_BUILD=1 -g -O1 $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -DCBM_SANITIZED_BUILD=1 -g -O1 \
                 $(TSAN_SANITIZE)
@@ -1532,8 +1533,17 @@ lint-memory-core:
 	@echo "=== memory-core linter ==="
 	@python3 scripts/lint-memory-core.py
 
+# Vendored tree-sitter scanners keep their state in the payload their create()
+# returns, one per parser. A file-scope variable is one object shared by every
+# parser in the process, and the indexer runs one per worker thread: properties
+# and jsonnet both made the graph differ run to run that way. Exceptions, each
+# argued, are in scripts/lint-vendored-scanners-whitelist.txt.
+lint-vendored-scanners:
+	@echo "=== vendored scanner state ==="
+	@python3 scripts/lint-vendored-scanners.py
+
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
-lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core
+lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core lint-vendored-scanners
 	@echo "=== CI linters passed ==="
 
 # ── Local memory-diagnostic lanes (not PR-CI gates by decision: the diag

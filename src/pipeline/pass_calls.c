@@ -1073,18 +1073,20 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
 
 /* Vendor receivers, Java library receivers and cross-language name guesses
  * cannot bind project calls. Keep the registry policy shared with the
- * parallel resolver. */
+ * parallel resolver. `caller_test`: cbm_pipeline_caller_is_test of the
+ * calling definition. */
 static cbm_resolution_t calls_registry_resolution(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                                   const char *module_qn, const char **imp_keys,
                                                   const char **imp_vals, int imp_count,
                                                   CBMLanguage lang, bool rust_external,
-                                                  bool php_vendor_call, bool java_external) {
+                                                  bool php_vendor_call, bool java_external,
+                                                  bool caller_test) {
     cbm_resolution_t res = {0};
     if (!rust_external && !php_vendor_call && !java_external) {
         /* Python LEGB fallback first (MUST match pass_parallel.c). */
-        res =
-            cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn, imp_keys,
-                                             imp_vals, imp_count, lang, call->enclosing_func_qn);
+        res = cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn,
+                                               imp_keys, imp_vals, imp_count, lang,
+                                               call->enclosing_func_qn, caller_test);
         /* Cross-language veto: a name-only guess never binds another
          * language's symbol (a JS app.get must not become Python's
          * builtins.dict.get). The vetoed answer becomes EMPTY here, before
@@ -1252,7 +1254,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     cbm_resolution_t res = {0};
     if (swift_candidates >= 0) {
         res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
-                                        rust_external, php_vendor_call, java_external);
+                                        rust_external, php_vendor_call, java_external,
+                                        cbm_pipeline_caller_is_test(source_node, rel, lang));
     }
     /* `p->open(fd)`: the registry does not split a callee on the arrow, and a
      * member is not a name it could resolve anyway. The object's type decides,

@@ -926,6 +926,123 @@ TEST(test_impact_engine_reached_role_handler_is_no_way_into_main) {
     PASS();
 }
 
+/* ── Roles that start roles ──────────────────────────────────────────
+ * A role handler may start another role's child by naming its literal, as
+ * the real runner's __cbm_rss_tree_root starts __cbm_rss_tree_hold. No test
+ * names the started role, yet its spawners are known: those of the role that
+ * starts it. */
+static const char tie_started_handlers[] = "int lib_fourth(void);\n"
+                                           "static int role_hold(int argc, char **argv) {\n"
+                                           "    return argc > 9 ? lib_fourth() : 0;\n"
+                                           "}\n"
+                                           "static int role_root(int argc, char **argv) {\n"
+                                           "    const char *child = \"__fx_hold_role\";\n"
+                                           "    return child[0] == '_' ? argc : 0;\n"
+                                           "}\n";
+
+/* A suite of one test that names `literal` and one that names nothing. */
+static void tie_spawning_suite(char *out, size_t cap, const char *suite, const char *literal) {
+    snprintf(out, cap,
+             "TEST(%s_spawns) {\n"
+             "    const char *argv1 = \"%s\";\n"
+             "    return argv1[0] == '_' ? 0 : 1;\n"
+             "}\n"
+             "TEST(%s_plain) {\n"
+             "    return 0;\n"
+             "}\n"
+             "SUITE(%s) {\n"
+             "    RUN_TEST(%s_spawns);\n"
+             "    RUN_TEST(%s_plain);\n"
+             "}\n",
+             suite, literal, suite, suite, suite, suite);
+}
+
+/* The role fixture plus the started pair, suite gamma naming `gamma_names`
+ * and suite delta naming `delta_names`; the answer for a change that reaches
+ * only the started role's handler (NULL on a fixture failure). */
+static char *tie_answer_started(tie_fixture_t *fx, const char *gamma_names,
+                                const char *delta_names) {
+    char a[4096];
+    char b[4096];
+    char runner[4096];
+    char gamma[1024];
+    char delta[1024];
+    tie_spawning_suite(gamma, sizeof(gamma), "gamma", gamma_names);
+    tie_spawning_suite(delta, sizeof(delta), "delta", delta_names);
+    if (!tie_runner_with(a, sizeof(a), "    return lib_other();\n}\n", tie_started_handlers) ||
+        !tie_insert(b, sizeof(b), a, "    TF_ROLE(0, \"__fx_orphan_role\", role_orphan),\n",
+                    "    TF_ROLE(0, \"__fx_root_role\", role_root),\n"
+                    "    TF_ROLE(0, \"__fx_hold_role\", role_hold),\n") ||
+        !tie_insert(runner, sizeof(runner), b, "    RUN_SELECTED_SUITE(matrix);\n",
+                    "    RUN_SELECTED_SUITE(gamma);\n    RUN_SELECTED_SUITE(delta);\n")) {
+        return NULL;
+    }
+    static const char lib[] = "int lib_value(void) {\n    return 1;\n}\n"
+                              "int lib_other(void) {\n    return 2;\n}\n"
+                              "int lib_third(void) {\n    return 3;\n}\n";
+    char base_lib[512];
+    char changed_lib[512];
+    snprintf(base_lib, sizeof(base_lib), "%sint lib_fourth(void) {\n    return 4;\n}\n", lib);
+    snprintf(changed_lib, sizeof(changed_lib), "%sint lib_fourth(void) {\n    return 4 + 0;\n}\n",
+             lib);
+    const char *const files[] = {"tests/test_main.c",   runner,
+                                 "tests/test_beta.c",   tie_roles_beta,
+                                 "tests/test_matrix.c", tie_roles_matrix,
+                                 "tests/test_gamma.c",  gamma,
+                                 "tests/test_delta.c",  delta,
+                                 "src/lib.c",           base_lib};
+    if (!tie_open_files(fx, files, 6) || !tie_write(fx, "src/lib.c", changed_lib) ||
+        !tie_commit(fx, "change lib_fourth")) {
+        return NULL;
+    }
+    char *json = tie_answer(fx);
+    if (json) {
+        printf("  note: %s\n", tie_last_note);
+    }
+    return json;
+}
+
+/* A change reaching a role that only another role's handler starts selects
+ * the tests that spawn the starting role — no veto — together with any test
+ * that names the started role itself. A starting role no test names is still
+ * a veto, and its note names both roles and the chain to the change. */
+TEST(test_impact_engine_role_started_by_a_role_selects_its_spawners) {
+    tie_fixture_t fx;
+    char *json = tie_answer_started(&fx, "__fx_root_role", "__fx_elsewhere");
+    ASSERT_NOT_NULL(json);
+    if (tie_top_decision(json, "run_all") || !tie_suite_has(json, "gamma", "STATIC")) {
+        printf("  %.1600s\n", json);
+    }
+    ASSERT_FALSE(tie_top_decision(json, "run_all"));
+    ASSERT_NULL(strstr(json, "RUNNER_REACHED"));
+    ASSERT_TRUE(tie_suite_has(json, "gamma", "STATIC")); /* spawns the starting role */
+    ASSERT_FALSE(tie_suite_has(json, "delta", "STATIC"));
+    ASSERT_FALSE(tie_suite_has(json, "alpha", "STATIC"));
+    free(json);
+    tie_close(&fx);
+
+    /* The started role named directly as well: both spawners run. */
+    json = tie_answer_started(&fx, "__fx_root_role", "__fx_hold_role");
+    ASSERT_NOT_NULL(json);
+    ASSERT_FALSE(tie_top_decision(json, "run_all"));
+    ASSERT_TRUE(tie_suite_has(json, "gamma", "STATIC"));
+    ASSERT_TRUE(tie_suite_has(json, "delta", "STATIC"));
+    free(json);
+    tie_close(&fx);
+
+    /* Nobody spawns the starting role: its spawners are unknown. */
+    json = tie_answer_started(&fx, "__fx_elsewhere", "__fx_elsewhere");
+    ASSERT_NOT_NULL(json);
+    ASSERT_TRUE(tie_top_decision(json, "run_all"));
+    ASSERT_NOT_NULL(strstr(json, "RUNNER_REACHED"));
+    ASSERT_NOT_NULL(strstr(tie_last_note,
+                           "role __fx_root_role, which no test names (it starts "
+                           "__fx_hold_role): test_main.role_hold -> lib.lib_fourth"));
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
 /* A parse gap hides the edges written in its lines: a helper whose broken
  * line calls the changed function has no CALLS edge to it. The gap's text
  * still names the function, so the helper is reached, and with it the test
@@ -955,6 +1072,104 @@ TEST(test_impact_engine_parse_gaps_reach_what_they_name) {
         printf("  %.900s\n", json);
     }
     ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC"));
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
+/* A gap names only what its text can call or read: a reached function,
+ * variable or macro (user decision R155, 2026-11-11). The word of a changed
+ * struct field (`used`) or a very short name (`nn`) written in an unrelated
+ * function's gap names nothing, and a gap outside every definition reaches the
+ * definitions written on its own lines, never its whole file. Matching every
+ * reached name and seeding whole files fired hundreds of gaps per change in
+ * this repository and reached the runner's main through the memory core. */
+static const char tie_gaps_main[] = "#include \"test_framework.h\"\n"
+                                    "int main(int argc, char **argv) {\n"
+                                    "    RUN_SELECTED_SUITE(alpha);\n"
+                                    "    RUN_SELECTED_SUITE(beta);\n"
+                                    "    RUN_SELECTED_SUITE(gamma);\n"
+                                    "    RUN_SELECTED_SUITE(delta);\n"
+                                    "    RUN_SELECTED_SUITE(epsilon);\n"
+                                    "    return 0;\n"
+                                    "}\n";
+
+/* One test that calls `fn`, as the whole suite `suite`. */
+static void tie_calling_suite(char *out, size_t cap, const char *suite, const char *fn) {
+    snprintf(out, cap,
+             "int %s(void);\n"
+             "TEST(%s_calls) {\n"
+             "    return %s() == 0 ? 0 : 1;\n"
+             "}\n"
+             "SUITE(%s) {\n"
+             "    RUN_TEST(%s_calls);\n"
+             "}\n",
+             fn, suite, fn, suite, suite);
+}
+
+TEST(test_impact_engine_parse_gaps_name_only_reached_functions) {
+    static const char lib[] = "struct counts {\n    int used;\n};\n"
+                              "int nn = 1;\n"
+                              "int lib_value(void) {\n    return 1;\n}\n"
+                              "int lib_other(void) {\n    return 2;\n}\n";
+    static const char changed[] = "struct counts {\n    long used;\n};\n"
+                                  "int nn = 2;\n"
+                                  "int lib_value(void) {\n    return 1 + 0;\n}\n"
+                                  "int lib_other(void) {\n    return 2;\n}\n";
+    static const char gapped[] = "int lib_value(void);\n"
+                                 "int helper_named(void) {\n"
+                                 "    int x = 0;\n"
+                                 "    x = (lib_value() ;\n"
+                                 "    return x;\n"
+                                 "}\n"
+                                 "int helper_field(void) {\n"
+                                 "    int used = 0;\n"
+                                 "    used = (used + ;\n"
+                                 "    return used;\n"
+                                 "}\n"
+                                 "int helper_short(void) {\n"
+                                 "    int nn = 0;\n"
+                                 "    nn = (nn + ;\n"
+                                 "    return nn;\n"
+                                 "}\n";
+    /* The shape of src/foundation/mem_core.c:110: a declaration the parser
+     * cannot read, outside every definition (no node holds its line). */
+    static const char table[] = "int lib_value(void);\n"
+                                "int far_away(void) {\n"
+                                "    return 0;\n"
+                                "}\n"
+                                "static _Thread_local int tl_x[lib_value];\n";
+    char beta[512];
+    char gamma[512];
+    char delta[512];
+    char epsilon[512];
+    tie_calling_suite(beta, sizeof(beta), "beta", "helper_named");
+    tie_calling_suite(gamma, sizeof(gamma), "gamma", "far_away");
+    tie_calling_suite(delta, sizeof(delta), "delta", "helper_field");
+    tie_calling_suite(epsilon, sizeof(epsilon), "epsilon", "helper_short");
+    const char *const files[] = {
+        "tests/test_main.c",    tie_gaps_main, "tests/test_beta.c",  beta,
+        "tests/test_gamma.c",   gamma,         "tests/test_delta.c", delta,
+        "tests/test_epsilon.c", epsilon,       "src/lib.c",          lib,
+        "src/gapped.c",         gapped,        "src/table.c",        table};
+    tie_fixture_t fx;
+    ASSERT_TRUE(tie_open_files(&fx, files, 8));
+    ASSERT_TRUE(tie_write(&fx, "src/lib.c", changed));
+    ASSERT_TRUE(tie_commit(&fx, "change lib_value, the field, the short global"));
+    char *json = tie_answer(&fx);
+    ASSERT_NOT_NULL(json);
+    bool want = tie_suite_has(json, "alpha", "STATIC") && tie_suite_has(json, "beta", "STATIC") &&
+                !tie_suite_has(json, "gamma", "STATIC") &&
+                !tie_suite_has(json, "delta", "STATIC") &&
+                !tie_suite_has(json, "epsilon", "STATIC");
+    if (!want) {
+        printf("  note: %s\n  %.2400s\n", tie_last_note, json);
+    }
+    ASSERT_TRUE(tie_suite_has(json, "alpha", "STATIC"));    /* calls lib_value */
+    ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC"));     /* its helper's gap names lib_value */
+    ASSERT_FALSE(tie_suite_has(json, "gamma", "STATIC"));   /* a file-scope gap's file */
+    ASSERT_FALSE(tie_suite_has(json, "delta", "STATIC"));   /* gap word = a changed field */
+    ASSERT_FALSE(tie_suite_has(json, "epsilon", "STATIC")); /* gap word = a 2-letter global */
     free(json);
     tie_close(&fx);
     PASS();
@@ -1259,7 +1474,9 @@ SUITE(test_impact_engine) {
     RUN_TEST(test_impact_engine_runner_helper_names_no_spawner);
     RUN_TEST(test_impact_engine_field_call_is_no_way_into_main);
     RUN_TEST(test_impact_engine_reached_role_handler_is_no_way_into_main);
+    RUN_TEST(test_impact_engine_role_started_by_a_role_selects_its_spawners);
     RUN_TEST(test_impact_engine_parse_gaps_reach_what_they_name);
+    RUN_TEST(test_impact_engine_parse_gaps_name_only_reached_functions);
     RUN_TEST(test_impact_engine_admitted_coverage_narrows_only_when_verified);
     RUN_TEST(test_impact_engine_coverage_reaches_unmapped_code_through_mapped_callers);
 }

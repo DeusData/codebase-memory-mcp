@@ -46,6 +46,23 @@ The **canonical provenance record** — upstream repository, pinned commit, and
 cross-registry verification status for every grammar — is
 [`internal/cbm/vendored/grammars/MANIFEST.md`](internal/cbm/vendored/grammars/MANIFEST.md).
 
+**Local modification** (`internal/cbm/vendored/grammars/jsonnet/scanner.c`,
+upstream [sourcegraph/tree-sitter-jsonnet](https://github.com/sourcegraph/tree-sitter-jsonnet)
+@ `ddd075f1939a`): upstream keeps the external scanner's state (inside a
+string, and which quote) in file-scope globals, so every parser in the process
+shares one copy, and its deserialize ignores the zero-length call that starts a
+parse, so each parse inherits whatever the previous one left. Indexing workers
+parse in parallel, so concurrent jsonnet parses corrupted each other's strings:
+a different set of files came back `parse_partial` on every index, with their
+definitions and edges. A file ending inside an unterminated string also left
+every later `|||` text block in the process unparseable. The CBM patch moves the
+state into a per-parser payload allocated by `..._external_scanner_create()` and
+resets it at the start of every deserialize; lexing logic and the serialized
+state are unchanged. It is recorded with the other scanner patches in
+MANIFEST.md's "Local source patches" table and pinned by
+`scripts/vendored-checksums.txt`. **On re-vendor: re-apply this patch**;
+`make -f Makefile.cbm lint-vendored-scanners` fails while the globals are back.
+
 License summary:
 
 - Nearly all grammars are **MIT**-licensed.
@@ -60,8 +77,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Eleven further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`, `vbnet`) are
+- Twelve further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `sql`, `tsx`, `vbnet`) are
   self-maintained forks that retain their original upstream authors' licenses —
   see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -79,8 +96,13 @@ License summary:
   ([Isopod/tree-sitter-pascal](https://github.com/Isopod/tree-sitter-pascal),
   MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
   DeusData patch that accepts non-ASCII letters in identifiers; its grammar
-  source lives in `tools/tree-sitter-pascal/`. `vbnet` is described in its own
-  section below.
+  source lives in `tools/tree-sitter-pascal/`. `sql`
+  ([DerekStride/tree-sitter-sql](https://github.com/DerekStride/tree-sitter-sql),
+  MIT, (c) 2021 Derek Stride) is the upstream grammar with one (c) 2026
+  DeusData patch that accepts the SQLite syntax of real migration files
+  (PRAGMA, AUTOINCREMENT, WITHOUT ROWID, trigger bodies, virtual tables); its
+  grammar source lives in `tools/tree-sitter-sql/`. `vbnet` is described in its
+  own section below.
 
 ### tree-sitter-vbnet (with CodeGraph's real-world VB.NET patch)
 
