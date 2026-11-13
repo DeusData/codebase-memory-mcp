@@ -3,6 +3,8 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/str_util.h"
+#include "foundation/json_writer.h"
+#include <math.h>
 
 static CBMArena a;
 
@@ -504,7 +506,54 @@ TEST(snprintf_append_multiple_sequential) {
     PASS();
 }
 
+/* A valid document keeps the strict writer's exact bytes. One the strict writer
+ * refuses over bytes that are not UTF-8 is still strict JSON, each such byte an
+ * escaped U+FFFD. Any other refusal stays a refusal. */
+TEST(json_write_text_keeps_valid_documents_and_repairs_refused_ones) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    ASSERT(yyjson_mut_obj_add_strcpy(doc, root, "plain", "caf\xc3\xa9"));
+    size_t length = 0;
+    char *json = cbm_json_write_text(doc, cbm_json_writer_allocator(), &length);
+    ASSERT_STR_EQ(json, "{\"plain\":\"caf\xc3\xa9\"}");
+    ASSERT_EQ((int)length, (int)strlen(json));
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+
+    yyjson_mut_val *list = yyjson_mut_arr(doc);
+    ASSERT(yyjson_mut_obj_add_val(doc, root, "list", list));
+    ASSERT(yyjson_mut_arr_add_strcpy(doc, list, "x\xe9"));
+    ASSERT(yyjson_mut_obj_add_strcpy(doc, root, "k\xe9y", "\xe2\x82"));
+    ASSERT(yyjson_mut_write(doc, 0, NULL) == NULL);
+    json = cbm_json_write_text(doc, cbm_json_writer_allocator(), &length);
+    ASSERT_STR_EQ(json, "{\"plain\":\"caf\\u00E9\",\"list\":[\"x\\uFFFD\"],"
+                        "\"k\\uFFFDy\":\"\\uFFFD\\uFFFD\"}");
+    ASSERT_EQ((int)length, (int)strlen(json));
+    yyjson_doc *strict = yyjson_read(json, length, 0);
+    ASSERT_NOT_NULL(strict);
+    yyjson_val *back = yyjson_doc_get_root(strict);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(back, "plain")), "caf\xc3\xa9");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_obj_get(back, "list"), 0)), "x\xef\xbf\xbd");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(back, "k\xef\xbf\xbdy")),
+                  "\xef\xbf\xbd\xef\xbf\xbd");
+    yyjson_doc_free(strict);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+    yyjson_mut_doc_free(doc);
+
+    yyjson_mut_doc *not_finite = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *not_finite_root = yyjson_mut_obj(not_finite);
+    yyjson_mut_doc_set_root(not_finite, not_finite_root);
+    ASSERT(yyjson_mut_obj_add_real(not_finite, not_finite_root, "n", NAN));
+    ASSERT(cbm_json_write_text(not_finite, NULL, NULL) == NULL);
+    yyjson_mut_doc_free(not_finite);
+    yyjson_mut_doc *empty = yyjson_mut_doc_new(NULL);
+    ASSERT(cbm_json_write_text(empty, NULL, NULL) == NULL);
+    yyjson_mut_doc_free(empty);
+    PASS();
+}
+
 SUITE(str_util) {
+    RUN_TEST(json_write_text_keeps_valid_documents_and_repairs_refused_ones);
     RUN_TEST(path_join_basic);
     RUN_TEST(path_join_trailing_slash);
     RUN_TEST(path_join_leading_slash);
