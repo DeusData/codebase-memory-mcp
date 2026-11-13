@@ -3278,6 +3278,7 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
                                          const cbm_daemon_build_identity_t *identity,
                                          cbm_daemon_runtime_operation_t operation,
                                          uint32_t timeout_ms, uint32_t response_size,
+                                         bool shared_budget,
                                          uint8_t **payload_out, uint64_t *muted_holder_pid_out) {
     *payload_out = NULL;
     if (muted_holder_pid_out) {
@@ -3301,8 +3302,9 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;
     int received =
-        sent ? cbm_daemon_ipc_receive_frame_bounded(connection, runtime_timeout_remaining(deadline),
-                                                    response_size, &frame, &payload)
+        sent ? cbm_daemon_ipc_receive_frame_bounded(
+                   connection, shared_budget ? runtime_timeout_remaining(deadline) : timeout_ms,
+                   response_size, &frame, &payload)
              : 0;
     if (muted_holder_pid_out && sent &&
         (received != 1 || (frame.type == CBM_DAEMON_FRAME_RESPONSE && frame.flags != operation))) {
@@ -3350,7 +3352,8 @@ static void runtime_status_response_decode(const uint8_t *payload,
 
 static bool runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
                                    const cbm_daemon_build_identity_t *identity, uint32_t timeout_ms,
-                                   cbm_daemon_runtime_status_t *status_out, char *cache_directory) {
+                                   cbm_daemon_runtime_status_t *status_out, char *cache_directory,
+                                   bool shared_budget) {
     if (!status_out) {
         return false;
     }
@@ -3361,7 +3364,7 @@ static bool runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint,
     uint32_t response_size =
         cache_directory ? CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE : CBM_DAEMON_STATUS_RESPONSE_SIZE;
     if (!runtime_control_request_send(
-            endpoint, identity, operation, timeout_ms, response_size, &payload,
+            endpoint, identity, operation, timeout_ms, response_size, shared_budget, &payload,
             cache_directory ? NULL : &status_out->muted_endpoint_holder_pid)) {
         return false;
     }
@@ -3382,7 +3385,7 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
                                        const cbm_daemon_build_identity_t *identity,
                                        uint32_t timeout_ms,
                                        cbm_daemon_runtime_status_t *status_out) {
-    return runtime_request_status(endpoint, identity, timeout_ms, status_out, NULL);
+    return runtime_request_status(endpoint, identity, timeout_ms, status_out, NULL, false);
 }
 
 bool cbm_daemon_runtime_request_status_details(const cbm_daemon_ipc_endpoint_t *endpoint,
@@ -3398,12 +3401,12 @@ bool cbm_daemon_runtime_request_status_details(const cbm_daemon_ipc_endpoint_t *
     }
     uint64_t deadline = runtime_deadline_after(timeout_ms);
     if (runtime_request_status(endpoint, identity, timeout_ms, &details_out->status,
-                               details_out->cache_directory)) {
+                               details_out->cache_directory, true)) {
         return true;
     }
     uint32_t remaining = runtime_timeout_remaining(deadline);
     return remaining > 0 &&
-           cbm_daemon_runtime_request_status(endpoint, identity, remaining, &details_out->status);
+           runtime_request_status(endpoint, identity, remaining, &details_out->status, NULL, true);
 }
 
 /* "; CBM sessions using it: pids 1, 2 and 3 more" — empty when none are known. */
@@ -3483,7 +3486,7 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
     memset(result_out, 0, sizeof(*result_out));
     uint8_t *payload = NULL;
     if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STOP, timeout_ms,
-                                      CBM_DAEMON_STOP_RESPONSE_SIZE, &payload, NULL)) {
+                                      CBM_DAEMON_STOP_RESPONSE_SIZE, false, &payload, NULL)) {
         return false;
     }
     result_out->accepted = (payload[1] & 0x01U) != 0U;

@@ -5624,6 +5624,96 @@ static void *runtime_test_legacy_status_thread(void *opaque) {
     return NULL;
 }
 
+/* Exercise both phases of the real transport: a listener appears after part of
+ * the timeout has elapsed, then replies after another part has elapsed. */
+typedef struct {
+    cbm_daemon_ipc_endpoint_t *endpoint;
+    atomic_bool started;
+    bool received;
+} runtime_delayed_control_t;
+
+static void *runtime_test_delayed_control_thread(void *opaque) {
+    runtime_delayed_control_t *server = opaque;
+    const struct timespec delay = {1, 200000000L};
+    atomic_store_explicit(&server->started, true, memory_order_release);
+    (void)cbm_nanosleep(&delay, NULL);
+    cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(server->endpoint);
+    cbm_daemon_ipc_connection_t *connection = NULL;
+    if (listener && cbm_daemon_ipc_accept(listener, RUNTIME_TEST_TIMEOUT_MS, &connection) == 1) {
+        cbm_daemon_frame_t frame = {0};
+        uint8_t *request = NULL;
+        server->received = cbm_daemon_ipc_receive_frame(connection, RUNTIME_TEST_TIMEOUT_MS,
+                                                        &frame, &request) == 1;
+        if (server->received) {
+            (void)cbm_nanosleep(&delay, NULL);
+            uint8_t response[CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE] = {1};
+            uint32_t length = frame.flags == CBM_DAEMON_RUNTIME_OP_STOP
+                                  ? CBM_DAEMON_STOP_RESPONSE_SIZE
+                              : frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS
+                                  ? CBM_DAEMON_STATUS_RESPONSE_SIZE
+                                  : CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE;
+            (void)cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_RESPONSE, frame.flags,
+                                            response, length);
+        }
+        free(request);
+        cbm_daemon_ipc_connection_close(connection);
+    }
+    cbm_daemon_ipc_listener_close(listener);
+    return NULL;
+}
+
+TEST(daemon_runtime_control_timeout_budget_is_specific_to_status_details) {
+    enum { PHASE_TIMEOUT_MS = 2000 };
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    for (int operation = 0; operation < 3; operation++) {
+        char parent[RUNTIME_TEST_PATH_CAP] = {0};
+        char key[CBM_DAEMON_KEY_SIZE] = {0};
+        char runtime_dir[RUNTIME_TEST_PATH_CAP] = {0};
+        bool prepared = th_secure_runtime_parent_new(parent, sizeof(parent), "control-budget") &&
+                        cbm_daemon_rendezvous_key(key);
+        cbm_daemon_ipc_endpoint_t *client = prepared ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
+        cbm_daemon_ipc_endpoint_t *server_endpoint =
+            client ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
+        bool copied = client && runtime_test_copy_path(
+                                    runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(client));
+        runtime_delayed_control_t server = {.endpoint = server_endpoint};
+        atomic_init(&server.started, false);
+        cbm_thread_t thread;
+        bool started = server_endpoint &&
+                       cbm_thread_create(&thread, 0, runtime_test_delayed_control_thread, &server) == 0;
+        bool ready = started && runtime_test_wait_atomic_bool(&server.started, PHASE_TIMEOUT_MS);
+        uint64_t start = cbm_now_ms();
+        bool result = false;
+        if (ready && operation == 0) {
+            cbm_daemon_runtime_status_t status = {0};
+            result = cbm_daemon_runtime_request_status(client, &identity, PHASE_TIMEOUT_MS, &status);
+        } else if (ready && operation == 1) {
+            cbm_daemon_runtime_stop_result_t stop = {0};
+            result = cbm_daemon_runtime_request_stop(client, &identity, PHASE_TIMEOUT_MS, &stop);
+        } else if (ready) {
+            cbm_daemon_runtime_status_details_t details = {0};
+            result = cbm_daemon_runtime_request_status_details(client, &identity,
+                                                               PHASE_TIMEOUT_MS, &details);
+        }
+        uint64_t elapsed = cbm_now_ms() - start;
+        if (started)
+            (void)cbm_thread_join(&thread);
+        cbm_daemon_ipc_endpoint_free(server_endpoint);
+        cbm_daemon_ipc_endpoint_free(client);
+        (void)cbm_rmdir(runtime_dir);
+        (void)cbm_rmdir(parent);
+        ASSERT_TRUE(prepared && copied && started && ready && server.received);
+        if (operation < 2) {
+            ASSERT_TRUE(result);
+            ASSERT_TRUE(elapsed > PHASE_TIMEOUT_MS);
+        } else {
+            ASSERT_FALSE(result);
+        }
+    }
+    PASS();
+}
+
 TEST(daemon_runtime_status_details_falls_back_to_legacy_on_unsupported_or_malformed_reply) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
@@ -5753,6 +5843,7 @@ TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
 }
 
 SUITE(daemon_runtime) {
+    RUN_TEST(daemon_runtime_control_timeout_budget_is_specific_to_status_details);
     RUN_TEST(daemon_runtime_status_details_preserves_long_paths_and_owns_copy);
     RUN_TEST(daemon_runtime_status_details_does_not_disclose_paths_to_forged_peers);
     RUN_TEST(daemon_runtime_status_details_falls_back_to_legacy_on_unsupported_or_malformed_reply);

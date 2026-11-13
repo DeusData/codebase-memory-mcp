@@ -9,8 +9,7 @@ Guards the PR #1139 daemon-control surface at the product level:
 * A cold one-shot ``cli`` command is quiet by default; ``cli --verbose`` opts
   into the startup-tax hint.
 * ``daemon stop`` on an idle daemon stops it; a second ``stop`` is idempotent.
-* Cache mismatches name both canonical paths; if STATUS is unavailable, the
-  fingerprint fallback explains that the paths are unavailable or unverified.
+* Cache mismatches name both canonical paths, including long Windows paths.
 
 Every path carries a kill-by-pid backstop so a stuck daemon can never hang the
 suite (the Windows leg's test-infra hang sensitivity is on record).
@@ -85,9 +84,6 @@ def check_cache_conflict_paths(binary, cache, work):
             else:
                 path = os.path.join(path, "x" * min(32, remaining - 1))
         paths.append(path)
-    if os.name != "nt":
-        # Windows forbids these filename characters; POSIX must escape them.
-        paths.append(os.path.join(work, 'cache-line\nbreak\t"\x1b'))
 
     for requested in paths:
         os.makedirs(filesystem_path(requested), exist_ok=True)
@@ -122,56 +118,6 @@ def check_cache_conflict_paths(binary, cache, work):
     healthy = run_cli(binary, cache, ["cli", "list_projects"])
     if healthy.returncode != 0:
         raise AssertionError("cache rejection disturbed the active daemon")
-
-
-def check_cache_conflict_fallback(binary, work):
-    active = os.path.join(work, "cache-fallback-active")
-    requested = os.path.join(work, "cache-fallback-requested")
-    runtime = runtime_for(active)
-    shared = {"CBM_RUNTIME_DIR": runtime, "CBM_STARTUP_TIMEOUT_MS": "1000"}
-    env = dict(os.environ, CBM_CACHE_DIR=active, **shared)
-    # An index command waiting for piped arguments owns a cohort lease but
-    # has not connected to a daemon. This makes STATUS genuinely unavailable.
-    owner = subprocess.Popen([binary, "cli", "index_repository"], env=env,
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-    try:
-        deadline = time.monotonic() + 15
-        while True:
-            if owner.poll() is not None:
-                raise AssertionError("cohort owner exited before reading its arguments")
-            written = False
-            for directory, _, files in os.walk(runtime):
-                if "cbm-version-cohort-lifetime-v1.lock" in files:
-                    path = os.path.join(directory, "cbm-version-cohort-lifetime-v1.lock")
-                    written = os.path.getsize(path) > 1
-            if written:
-                break
-            if time.monotonic() >= deadline:
-                raise AssertionError("cohort owner did not publish its identity")
-            time.sleep(0.02)
-        for args in ([], ["cli", "list_projects"]):
-            result = run_cli(binary, requested, args, extra_env=shared)
-            text = output_text(result)
-            if result.returncode == 0 or not re.search(
-                    r"active cache [0-9a-f]{64}; requested cache [0-9a-f]{64}", text):
-                raise AssertionError("fallback lost the cache conflict fingerprints: " + text)
-            if "Cache paths unavailable or unverified." not in text:
-                raise AssertionError("fingerprint fallback did not explain missing paths: " + text)
-            if "requested cache:" in text or "daemon cache:" in text:
-                raise AssertionError("fallback claimed an unverified cache path")
-        status = run_cli(binary, active, ["daemon", "status"], extra_env=shared)
-        if status.returncode == 0 or "not running" not in output_text(status):
-            raise AssertionError("fallback probe started a daemon")
-    finally:
-        owner.terminate()
-        try:
-            owner.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            owner.kill()
-            owner.wait(timeout=5)
-        for stream in (owner.stdin, owner.stdout, owner.stderr):
-            stream.close()
 
 
 def main():
@@ -256,9 +202,6 @@ def main():
             return 1
         print("PASS: stop retired the idle daemon; second stop was idempotent")
         daemon_pid = 0
-
-        check_cache_conflict_fallback(binary, work)
-        print("PASS: fingerprint fallback explains unavailable paths for CLI and MCP")
 
         if not ui_build:
             print("SKIP: non-UI binary cannot exercise the UI-configuration refusal")

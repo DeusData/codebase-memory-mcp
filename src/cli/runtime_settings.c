@@ -5,6 +5,9 @@
 #include "foundation/platform.h"
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 #include "daemon/ipc.h"
 #include "ui/config.h"
 #include <sqlite3.h>
@@ -241,6 +244,22 @@ static bool canonical_cache_path(const char *cache, char out[SETTINGS_PATH_CAP],
     return cbm_daemon_ipc_private_directory_secure(out);
 }
 
+int cbm_runtime_settings_open_db(const char *path, sqlite3 **db, int flags) {
+#ifdef _WIN32
+    *db = NULL;
+    wchar_t *wide = cbm_path_to_wide(path);
+    char *extended = wide ? cbm_wide_to_utf8(wide) : NULL;
+    free(wide);
+    if (!extended)
+        return SQLITE_NOMEM;
+    int rc = sqlite3_open_v2(extended, db, flags, "win32-longpath");
+    free(extended);
+    return rc;
+#else
+    return sqlite3_open_v2(path, db, flags, NULL);
+#endif
+}
+
 static sqlite3 *settings_open(const char *cache) {
     if (!cache || !cache[0] || strlen(cache) + 12 >= SETTINGS_PATH_CAP)
         return NULL;
@@ -255,7 +274,8 @@ static sqlite3 *settings_open(const char *cache) {
     if (snprintf(path, sizeof(path), "%s/_config.db", canonical) >= (int)sizeof(path))
         return NULL;
     sqlite3 *db = NULL;
-    if (sqlite3_open(path, &db) != SQLITE_OK) {
+    if (cbm_runtime_settings_open_db(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
+        SQLITE_OK) {
         if (db)
             sqlite3_close(db);
         return NULL;
@@ -477,7 +497,7 @@ void cbm_runtime_settings_reset_for_tests(void) {
  * progress; a live writer takes the busy path instead. */
 static bool settings_recover_hot_journal(const char *path) {
     sqlite3 *db = NULL;
-    bool recovered = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK;
+    bool recovered = cbm_runtime_settings_open_db(path, &db, SQLITE_OPEN_READWRITE) == SQLITE_OK;
     if (recovered) {
         cbm_runtime_settings_wait_for_writers(db);
         recovered =
@@ -505,7 +525,7 @@ static bool settings_recover_hot_journal(const char *path) {
 static sqlite3 *settings_open_snapshot(const char *path, bool *hot_journal) {
     *hot_journal = false;
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+    if (cbm_runtime_settings_open_db(path, &db, SQLITE_OPEN_READONLY) != SQLITE_OK) {
         if (db)
             sqlite3_close(db);
         return NULL;
