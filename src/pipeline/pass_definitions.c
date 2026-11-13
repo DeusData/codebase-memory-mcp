@@ -30,6 +30,7 @@ enum { PD_SWIFT_PROPS_MARGIN = 80 };
 #include "foundation/mem_core.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
+#include "helpers.h" /* cbm_is_test_file */
 #include "arena.h"
 #include "iris_export_xml.h"
 #include "simhash/minhash.h"
@@ -522,15 +523,22 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge.
      * A generated member is registered by qualified name only, at all three.
-     * The registry's test verdict is the extractor's OR the test-double path
-     * rule (cbm_registry_test_double_path) on the node's file, at all three. */
+     * The registry's test verdict is the extractor's, OR the extractor's own
+     * file rule (cbm_is_test_file) on the node's file and language, OR the
+     * test-double path rule (cbm_registry_test_double_path), at all three.
+     * The file rule is needed because the extractor gives a definition the
+     * file's verdict only for functions, methods and the module: a variable,
+     * field or class in a test file keeps is_test=false, and ranked as real
+     * code it beat production candidates on proximity. Ranking only: the
+     * stored is_test property is untouched. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         if (cbm_def_props_generated(def->extra_props)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
+            bool is_test = def->is_test || cbm_is_test_file(def_rel, lang) ||
+                           cbm_registry_test_double_path(def_rel);
             cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name,
-                                            def->label, lang, module_prefix_len,
-                                            def->is_test || cbm_registry_test_double_path(def_rel));
+                                            def->label, lang, module_prefix_len, is_test);
         }
         if (def->qn_sig_off) {
             cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
