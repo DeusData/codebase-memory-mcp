@@ -55,6 +55,7 @@
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "resolve_stats.h"
 #include "store/store.h"
 #include "yyjson/yyjson.h"
 
@@ -1501,6 +1502,150 @@ TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work) {
     PASS();
 }
 
+/* ── One file's extraction, counted ────────────────────────────────────
+ * A shape is a head, CX_BINDING_LINES generated rows and a tail. It is
+ * extracted in-process with a work sink bound (resolve_stats.h), then again
+ * with twice the rows, so a counter speaks for that one file and nothing else:
+ * linear work grows about 2x, a scan per row about 4x. */
+enum { CX_BINDING_LINES = 1500, CX_BINDING_LINE_ROOM = 128 };
+
+typedef const char *(*CxLineFn)(char *out, size_t cap, int i);
+
+static char *cx_lines_text(const char *head, CxLineFn line, const char *tail, int lines) {
+    size_t room = strlen(head) + strlen(tail) + (size_t)lines * CX_BINDING_LINE_ROOM + 1;
+    char *source = malloc(room);
+    if (!source)
+        return NULL;
+    size_t length = (size_t)snprintf(source, room, "%s", head);
+    for (int i = 0; i < lines; i++) {
+        char row[CX_BINDING_LINE_ROOM];
+        length += (size_t)snprintf(source + length, room - length, "%s", line(row, sizeof(row), i));
+    }
+    (void)snprintf(source + length, room - length, "%s", tail);
+    return source;
+}
+
+/* The `stat` work of extracting the shape with `lines` rows; 0 on failure. */
+static uint64_t cx_extract_work(CBMLanguage language, const char *path, const char *head,
+                                CxLineFn line, const char *tail, int lines,
+                                cbm_resolve_stat_t stat) {
+    char *source = cx_lines_text(head, line, tail, lines);
+    if (!source)
+        return 0;
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), language, "test", path, 0, NULL, NULL);
+    cbm_resolve_stats_bind(previous);
+    uint64_t work = result ? cbm_resolve_stats_snapshot(&stats).values[stat] : 0;
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+
+/* Work at twice the rows over work at CX_BINDING_LINES rows; *base gets the latter. */
+static double cx_extract_ratio(CBMLanguage language, const char *path, const char *head,
+                               CxLineFn line, const char *tail, cbm_resolve_stat_t stat,
+                               uint64_t *base) {
+    uint64_t first = cx_extract_work(language, path, head, line, tail, CX_BINDING_LINES, stat);
+    uint64_t second = cx_extract_work(language, path, head, line, tail, CX_BINDING_LINES * 2, stat);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s %s %llu -> %llu (ratio %.2f)\n", path, cbm_resolve_stat_name(stat),
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    *base = first;
+    return ratio;
+}
+
+/* Each C# class looked through the file's top level for a file-scoped namespace. */
+static const char *cx_line_csharp_class(char *out, size_t cap, int i) {
+    snprintf(out, cap, "class C%d { public int X; int F(int a) { return a; } }\n", i);
+    return out;
+}
+TEST(complexity_csharp_namespace_lookup_is_linear) {
+    uint64_t base = 0;
+    double ratio = cx_extract_ratio(CBM_LANG_CSHARP, "classes.cs", "", cx_line_csharp_class, "",
+                                    CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* A definition's parent comes through a short list of cached children; the wide root has to
+ * stay on that list while its narrow children come and go. */
+static const char *cx_line_erlang_function(char *out, size_t cap, int i) {
+    snprintf(out, cap, "%% doc %d\nf_%d(A) -> g_%d(A).\ng_%d(B) -> B.\n", i, i, i, i);
+    return out;
+}
+TEST(complexity_doc_lookup_keeps_a_wide_root_cached) {
+    uint64_t base = 0;
+    double ratio =
+        cx_extract_ratio(CBM_LANG_ERLANG, "funcs.erl", "-module(m).\n", cx_line_erlang_function, "",
+                         CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, &base);
+    ASSERT_GTE(base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Each struct's fields fold into one text, and each struct used to scan the file's defs. */
+static const char *cx_line_go_struct(char *out, size_t cap, int i) {
+    snprintf(out, cap, "type T%d struct {\n\tA int\n\tB string\n}\n", i);
+    return out;
+}
+static uint64_t cx_field_fold_probes(int lines, int *folded) {
+    *folded = 0;
+    char *source = cx_lines_text("package p\n", cx_line_go_struct, "", lines);
+    if (!source)
+        return 0;
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_GO, "p", "a.go", 0, NULL, NULL);
+    uint64_t work = 0;
+    if (result) {
+        CBMFileResult *cache[] = {result};
+        cbm_file_info_t files[] = {{.rel_path = "a.go", .language = CBM_LANG_GO}};
+        char *modules[1] = {NULL};
+        int starts[2] = {0};
+        int count = 0;
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_stats_t stats;
+        cbm_resolve_stats_reset(&stats);
+        cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+        CBMLSPDef *defs =
+            cbm_pxc_collect_all_defs(NULL, &arena, cache, files, 1, "p", modules, &count, starts);
+        cbm_resolve_stats_bind(previous);
+        work = cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+        for (int i = 0; defs && i < count; i++) {
+            if (defs[i].label && !strcmp(defs[i].label, "Struct") && defs[i].field_defs &&
+                !strcmp(defs[i].field_defs, "A:int|B:string")) {
+                (*folded)++;
+            }
+        }
+        free(defs);
+        free(modules[0]);
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
+    free(source);
+    return work;
+}
+TEST(complexity_struct_field_fold_is_linear) {
+    int folded_first = 0;
+    int folded_second = 0;
+    uint64_t first = cx_field_fold_probes(CX_BINDING_LINES, &folded_first);
+    uint64_t second = cx_field_fold_probes(CX_BINDING_LINES * 2, &folded_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    struct field fold probes %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    /* Every struct still folds both its fields, in declaration order. */
+    ASSERT_EQ(folded_first, CX_BINDING_LINES);
+    ASSERT_EQ(folded_second, CX_BINDING_LINES * 2);
+    ASSERT_GTE(first, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
@@ -1512,4 +1657,7 @@ SUITE(complexity) {
     RUN_TEST(complexity_shared_package_growth_stays_linear);
     RUN_TEST(complexity_py_submodule_probe_avoids_registry_scan);
     RUN_TEST(complexity_throughput_report_written);
+    RUN_TEST(complexity_csharp_namespace_lookup_is_linear);
+    RUN_TEST(complexity_doc_lookup_keeps_a_wide_root_cached);
+    RUN_TEST(complexity_struct_field_fold_is_linear);
 }
