@@ -1119,6 +1119,17 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return configured_qn;
     }
 
+    /* C# local functions do not have graph nodes yet. Attribute calls in them
+     * to the enclosing method, whose definition span contains the call site,
+     * rather than to the file node (#2964). */
+    if (ctx->language == CBM_LANG_CSHARP &&
+        strcmp(ts_node_type(node), "local_function_statement") == 0) {
+        if (state->enclosing_func_qn && state->enclosing_func_qn != ctx->module_qn) {
+            return state->enclosing_func_qn;
+        }
+        return NULL;
+    }
+
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
