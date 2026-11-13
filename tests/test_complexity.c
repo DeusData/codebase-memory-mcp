@@ -56,6 +56,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "resolve_stats.h"
+#include "spawn_patterns.h"
 #include "store/store.h"
 #include "yyjson/yyjson.h"
 
@@ -1646,6 +1647,262 @@ TEST(complexity_struct_field_fold_is_linear) {
     PASS();
 }
 
+/* Flat assembly and routines: each statement looks back over its earlier siblings for the
+ * label above it. */
+static const char *cx_line_nasm_instruction(char *out, size_t cap, int i) {
+    snprintf(out, cap, "    mov eax, %d\n", i);
+    return out;
+}
+static const char *cx_line_objectscript_statement(char *out, size_t cap, int i) {
+    snprintf(out, cap, "    Set x = %d\n", i);
+    return out;
+}
+TEST(complexity_flat_preceding_label_is_linear) {
+    uint64_t nasm_base = 0;
+    uint64_t routine_base = 0;
+    double nasm =
+        cx_extract_ratio(CBM_LANG_NASM, "flat.nasm", "global start\nstart:\n",
+                         cx_line_nasm_instruction, "", CBM_RESOLVE_STAT_LOOKUP_PROBES, &nasm_base);
+    double routine = cx_extract_ratio(CBM_LANG_OBJECTSCRIPT_ROUTINE, "Flat.mac", "Main()\n",
+                                      cx_line_objectscript_statement, "",
+                                      CBM_RESOLVE_STAT_LOOKUP_PROBES, &routine_base);
+    ASSERT_GTE(nasm_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_GTE(routine_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(nasm >= CX_RATIO_LO && nasm <= CX_RATIO_HI);
+    ASSERT_TRUE(routine >= CX_RATIO_LO && routine <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Nested declarations: each identifier's usage classifiers climb towards the root, and
+ * Kotlin's grammar gives them little to stop at, so depth d cost d per identifier. */
+enum { CX_NEST_DEPTH = 400 };
+static uint64_t cx_usage_climb_work(int depth) {
+    static const char open[] = "object A {\n", close[] = "}\n";
+    size_t room = (size_t)depth * (sizeof(open) + sizeof(close)) + 1;
+    char *source = malloc(room);
+    if (!source)
+        return 0;
+    size_t length = 0;
+    for (int i = 0; i < depth; i++)
+        length += (size_t)snprintf(source + length, room - length, "%s", open);
+    for (int i = 0; i < depth; i++)
+        length += (size_t)snprintf(source + length, room - length, "%s", close);
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_KOTLIN, "test", "nest.kt", 0, NULL, NULL);
+    uint64_t work = result ? cbm_usage_field_lookup_test_work() : 0;
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    return work;
+}
+TEST(complexity_usage_classifiers_on_deep_nesting_are_linear) {
+    uint64_t first = cx_usage_climb_work(CX_NEST_DEPTH);
+    uint64_t second = cx_usage_climb_work(CX_NEST_DEPTH * 2);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    nest.kt usage climb %llu -> %llu (ratio %.2f)\n", (unsigned long long)first,
+           (unsigned long long)second, ratio);
+    ASSERT_GTE(first, (uint64_t)CX_NEST_DEPTH);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
+/* Every call's spawn check read every import row of its file. A file of N imports and N calls:
+ * a callee no row names, a callee the last rows name, and a bare spawn that needs its module
+ * imported, which only the last row does. */
+enum { CX_SPAWN_NAME = 32 };
+static const char *cx_line_tcl_source_call(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "source");
+    return out;
+}
+static const char *cx_line_py_member_call(char *out, size_t cap, int i) {
+    snprintf(out, cap, "mod_%d.call", i);
+    return out;
+}
+static const char *cx_line_js_spawn_call(char *out, size_t cap, int i) {
+    (void)i;
+    snprintf(out, cap, "spawn");
+    return out;
+}
+/* Probes of `count` calls against `count` rows; *matched gets how many calls matched a spawn. */
+static uint64_t cx_spawn_match_probes(CBMLanguage language, CxLineFn line, const char *last_module,
+                                      int count, int *matched) {
+    *matched = 0;
+    CBMImport *rows = calloc((size_t)count, sizeof(*rows));
+    char *text = malloc((size_t)count * 2 * CX_SPAWN_NAME);
+    if (!rows || !text) {
+        free(rows);
+        free(text);
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        char *local = text + (size_t)i * 2 * CX_SPAWN_NAME;
+        char *path = local + CX_SPAWN_NAME;
+        snprintf(local, CX_SPAWN_NAME, "mod_%d", i);
+        snprintf(path, CX_SPAWN_NAME, "pkg/mod_%d", i);
+        rows[i].local_name = local;
+        rows[i].module_path = i == count - 1 && last_module ? last_module : path;
+    }
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    cbm_spawn_file_begin(rows, count);
+    for (int i = 0; i < count; i++) {
+        char callee[CX_SPAWN_NAME];
+        *matched += cbm_spawn_match(language, line(callee, sizeof(callee), i), rows, count) != NULL;
+    }
+    cbm_spawn_file_end();
+    cbm_resolve_stats_bind(previous);
+    free(rows);
+    free(text);
+    return cbm_resolve_stats_snapshot(&stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES];
+}
+/* Probes at twice the size over probes at CX_BINDING_LINES; *base gets the latter, *matched_ok
+ * whether both sizes matched matches_per_call spawns per call. */
+static double cx_spawn_ratio(const char *label, CBMLanguage language, CxLineFn line,
+                             const char *last_module, int matches_per_call, uint64_t *base,
+                             bool *matched_ok) {
+    int matched_first = 0;
+    int matched_second = 0;
+    uint64_t first =
+        cx_spawn_match_probes(language, line, last_module, CX_BINDING_LINES, &matched_first);
+    uint64_t second =
+        cx_spawn_match_probes(language, line, last_module, CX_BINDING_LINES * 2, &matched_second);
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    %s lookup_probes %llu -> %llu (ratio %.2f, matched %d, %d)\n", label,
+           (unsigned long long)first, (unsigned long long)second, ratio, matched_first,
+           matched_second);
+    *base = first;
+    *matched_ok = matched_first == CX_BINDING_LINES * matches_per_call &&
+                  matched_second == CX_BINDING_LINES * 2 * matches_per_call;
+    return ratio;
+}
+TEST(complexity_spawn_match_is_linear_in_a_files_imports) {
+    uint64_t tcl_base = 0;
+    uint64_t py_base = 0;
+    uint64_t js_base = 0;
+    bool tcl_matched = false;
+    bool py_matched = false;
+    bool js_matched = false;
+    double tcl = cx_spawn_ratio("tcl source", CBM_LANG_TCL, cx_line_tcl_source_call, NULL, 0,
+                                &tcl_base, &tcl_matched);
+    double py = cx_spawn_ratio("py member", CBM_LANG_PYTHON, cx_line_py_member_call, NULL, 0,
+                               &py_base, &py_matched);
+    double js = cx_spawn_ratio("js spawn", CBM_LANG_JAVASCRIPT, cx_line_js_spawn_call,
+                               "child_process", 1, &js_base, &js_matched);
+    ASSERT_TRUE(tcl_matched && py_matched && js_matched);
+    ASSERT_GTE(tcl_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_GTE(py_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_GTE(js_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(tcl >= CX_RATIO_LO && tcl <= CX_RATIO_HI);
+    ASSERT_TRUE(py >= CX_RATIO_LO && py <= CX_RATIO_HI);
+    ASSERT_TRUE(js >= CX_RATIO_LO && js <= CX_RATIO_HI);
+    PASS();
+}
+
+/* The first row with a path answers for a name, whatever its later rows say, and rows the file
+ * did not name are read. Every call asks twice, since the second answer comes from what the
+ * first left behind. */
+enum { CX_SPAWN_LONG_NAME = 1024 };
+TEST(complexity_spawn_file_index_answers_as_the_rows_do) {
+    static const CBMImport rows[] = {
+        {.local_name = NULL, .module_path = "subprocess"},
+        {.local_name = "sp", .module_path = NULL},
+        {.local_name = "sp", .module_path = "subprocess"},
+        {.local_name = "sp", .module_path = "os"},
+        {.local_name = "run", .module_path = "subprocess.run"},
+        {.local_name = "cp", .module_path = "node:child_process"},
+        {.local_name = "spawn", .module_path = "child_process"},
+        {.local_name = "exec", .module_path = "os/exec"},
+        {.local_name = "os", .module_path = "os"},
+        {.local_name = "open3", .module_path = "open3"},
+        {.local_name = "", .module_path = "empty"},
+        {.local_name = "System.Process", .module_path = "System.Process"},
+    };
+    static const CBMImport others[] = {{.local_name = "sp", .module_path = "os"},
+                                       {.local_name = "spawn", .module_path = "fs"}};
+    static const CBMLanguage languages[] = {
+        CBM_LANG_PYTHON, CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_GO,   CBM_LANG_C,
+        CBM_LANG_RUBY,   CBM_LANG_HASKELL,    CBM_LANG_TCL,        CBM_LANG_BASH,
+    };
+    char long_name[CX_SPAWN_LONG_NAME];
+    memset(long_name, 'n', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    const char *const callees[] = {
+        "sp.run",       "sp.check_output",
+        "sp",           "run",
+        "cp.spawn",     "cp.exec",
+        "spawn",        "exec",
+        "exec.Command", "os.exec",
+        "os.system",    "system",
+        "source",       "missing",
+        "missing.run",  "a::b",
+        ".run",         "",
+        "callProcess",  "Open3.popen3",
+        long_name,
+    };
+    int rows_count = (int)(sizeof(rows) / sizeof(rows[0]));
+    int others_count = (int)(sizeof(others) / sizeof(others[0]));
+    int spawns = 0;
+    for (size_t l = 0; l < sizeof(languages) / sizeof(languages[0]); l++) {
+        for (size_t c = 0; c < sizeof(callees) / sizeof(callees[0]); c++) {
+            const cbm_spawn_api_t *read =
+                cbm_spawn_match(languages[l], callees[c], rows, rows_count);
+            const cbm_spawn_api_t *read_other =
+                cbm_spawn_match(languages[l], callees[c], others, others_count);
+            cbm_spawn_file_begin(rows, rows_count);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], rows, rows_count) == read);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], rows, rows_count) == read);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], others, others_count) ==
+                        read_other);
+            ASSERT_TRUE(cbm_spawn_match(languages[l], callees[c], NULL, 0) ==
+                        cbm_spawn_match(languages[l], callees[c], others, 0));
+            cbm_spawn_file_end();
+            spawns += read != NULL;
+        }
+    }
+    /* Both rule families answered, so the comparison is not of NULL with NULL. */
+    ASSERT_GTE(spawns, 8);
+    ASSERT_NOT_NULL(cbm_spawn_match(CBM_LANG_PYTHON, "sp.run", rows, rows_count));
+    ASSERT_NOT_NULL(cbm_spawn_match(CBM_LANG_JAVASCRIPT, "spawn", rows, rows_count));
+    ASSERT_TRUE(cbm_spawn_match(CBM_LANG_JAVASCRIPT, "spawn", others, others_count) == NULL);
+    PASS();
+}
+
+/* A function of route registrations asks, for each, what its receiver was bound to: a
+ * parameter no statement binds, a local bound once at the top, and groups bound just before
+ * their route. Each answer is a binary search, so the work is near linear, not linear. */
+static const char *cx_line_go_route(char *out, size_t cap, int i) {
+    snprintf(out, cap, "  r.GET(\"/p%d\", h)\n", i);
+    return out;
+}
+static const char *cx_line_go_group(char *out, size_t cap, int i) {
+    snprintf(out, cap, "  g%d := r.Group(\"/g%d\")\n  g%d.GET(\"/x\", h)\n", i, i, i);
+    return out;
+}
+TEST(complexity_go_route_bindings_are_near_linear) {
+    uint64_t param_base = 0;
+    uint64_t local_base = 0;
+    uint64_t group_base = 0;
+    double param =
+        cx_extract_ratio(CBM_LANG_GO, "routes.go", "package main\nfunc Register(r Router) {\n",
+                         cx_line_go_route, "}\n", CBM_RESOLVE_STAT_LOOKUP_PROBES, &param_base);
+    double local = cx_extract_ratio(
+        CBM_LANG_GO, "routes.go", "package main\nfunc Register() {\n  r := New()\n",
+        cx_line_go_route, "}\n", CBM_RESOLVE_STAT_LOOKUP_PROBES, &local_base);
+    double group =
+        cx_extract_ratio(CBM_LANG_GO, "routes.go", "package main\nfunc Register(r Router) {\n",
+                         cx_line_go_group, "}\n", CBM_RESOLVE_STAT_LOOKUP_PROBES, &group_base);
+    ASSERT_GTE(param_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_GTE(local_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_GTE(group_base, (uint64_t)CX_BINDING_LINES);
+    ASSERT_TRUE(param >= CX_RATIO_LO && param <= CX_RATIO_HI);
+    ASSERT_TRUE(local >= CX_RATIO_LO && local <= CX_RATIO_HI);
+    ASSERT_TRUE(group >= CX_RATIO_LO && group <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
@@ -1660,4 +1917,9 @@ SUITE(complexity) {
     RUN_TEST(complexity_csharp_namespace_lookup_is_linear);
     RUN_TEST(complexity_doc_lookup_keeps_a_wide_root_cached);
     RUN_TEST(complexity_struct_field_fold_is_linear);
+    RUN_TEST(complexity_flat_preceding_label_is_linear);
+    RUN_TEST(complexity_usage_classifiers_on_deep_nesting_are_linear);
+    RUN_TEST(complexity_spawn_match_is_linear_in_a_files_imports);
+    RUN_TEST(complexity_spawn_file_index_answers_as_the_rows_do);
+    RUN_TEST(complexity_go_route_bindings_are_near_linear);
 }
