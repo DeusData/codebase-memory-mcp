@@ -2856,15 +2856,18 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
      * whether it sits inside a namespace declaration: a block namespace's
      * body, or the compilation-unit siblings after a file-scoped namespace
      * (the grammar may attach those either way). */
-    enum { CS_IMPORT_WALK_MAX = 256 };
-    TSNode stack[CS_IMPORT_WALK_MAX];
-    bool in_ns[CS_IMPORT_WALK_MAX];
-    int top = 0;
-    in_ns[top] = false;
-    stack[top++] = root;
+    typedef struct {
+        TSNode node;
+        bool in_ns;
+    } cs_import_walk_t;
+    enum { CS_IMPORT_WALK_INLINE = 256 };
+    cs_import_walk_t held[CS_IMPORT_WALK_INLINE];
+    cs_import_walk_t *stack = held;
+    int top = 0, capacity = CS_IMPORT_WALK_INLINE;
+    stack[top++] = (cs_import_walk_t){.node = root, .in_ns = false};
     while (top > 0) {
-        TSNode n = stack[--top];
-        bool n_in_ns = in_ns[top];
+        TSNode n = stack[--top].node;
+        bool n_in_ns = stack[top].in_ns;
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
@@ -2964,7 +2967,7 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
         bool child_in_ns = n_in_ns || strcmp(k, "namespace_declaration") == 0 ||
                            strcmp(k, "file_scoped_namespace_declaration") == 0;
         uint32_t cnc = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnc && top < CS_IMPORT_WALK_MAX; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(n, i);
             if (ts_node_is_null(c))
                 continue;
@@ -2973,8 +2976,16 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
                 strcmp(ck, "constructor_declaration") == 0 || strcmp(ck, "block") == 0) {
                 continue;
             }
-            in_ns[top] = child_in_ns;
-            stack[top++] = c;
+            if (top == capacity) {
+                cs_import_walk_t *grown =
+                    cbm_arena_alloc(ctx->arena, (size_t)capacity * 2 * sizeof(*grown));
+                if (!grown)
+                    return;
+                memcpy(grown, stack, (size_t)top * sizeof(*grown));
+                stack = grown;
+                capacity *= 2;
+            }
+            stack[top++] = (cs_import_walk_t){.node = c, .in_ns = child_in_ns};
             /* A file-scoped namespace covers the siblings that follow it. */
             if (strcmp(ck, "file_scoped_namespace_declaration") == 0)
                 child_in_ns = true;
