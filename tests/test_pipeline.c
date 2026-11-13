@@ -6783,6 +6783,168 @@ TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental) {
     PASS();
 }
 
+/* A fresh full index of the probe's files through the parallel driver: `pad`
+ * filler scripts take the file count past MIN_FILES_FOR_PARALLEL and
+ * CBM_WORKERS selects pass_parallel.c, whose registry seeder the small
+ * fixture's sequential full run never reaches. */
+static void rank_probe_parallel(const char *tmp, const char *source, const char *target,
+                                const char *want_file, const char *other_file, int *want,
+                                int *other) {
+    *want = -1;
+    *other = -1;
+    for (int i = 0; i < 55; i++) {
+        char path[64];
+        char body[96];
+        snprintf(path, sizeof(path), "pad/rank_pad_%02d.js", i);
+        snprintf(body, sizeof(body), "function rankPad%02d() { return %d; }\n", i, i);
+        write_temp_file(tmp, path, body);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rank_parallel.db", tmp);
+    XlangEnvSave save = xlang_env_select(true);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    char project[256];
+    snprintf(project, sizeof(project), "%s", p ? cbm_pipeline_project_name(p) : "");
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&save);
+    if (rc != 0) {
+        return;
+    }
+    *want = rank_probe_count(db, project, source, target, want_file);
+    *other = rank_probe_count(db, project, source, target, other_file);
+}
+
+/* Every definition in a test file ranks as test, not only its callables. The
+ * extractor gives a definition the file's test verdict only for functions,
+ * methods and the module, so a package-level variable in a _test.go file
+ * carries is_test=false. On that verdict alone the variable, one package
+ * nearer the caller, beat the production function on proximity. The registry
+ * applies the extractor's own file rule (cbm_is_test_file) as well, in the
+ * full index and on both incremental routes. */
+TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tfvar_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package app\n\nfunc Run() int { return Parse() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "lib/parse.go", "package lib\n\nfunc Parse() int { return 1 }\n");
+    write_temp_file(tmp, "app/sub/parse_test.go",
+                    "package sub\n\nvar Parse = func() int { return 2 }\n");
+    write_temp_file(tmp, "app/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "app/run.go", caller, "Run", "Parse", "lib/parse.go", "app/sub/parse_test.go",
+               &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "Run", "Parse", "lib/parse.go", "app/sub/parse_test.go", &par_want,
+                        &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* The same for a class, in the layout of a multi-module Java build: a class
+ * nested in a test under streams/src/test shares more of the caller's path
+ * than the production class in another module, and carries is_test=false. The
+ * QN scan #2427 replaced caught it by the "Test" in RunTest; the file rule
+ * catches it by the src/test directory, as the extractor's own verdict does. */
+TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tfcls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "streams/src/main/java/org/acme/streams/Run.java";
+    static const char caller[] = "package org.acme.streams;\n\n"
+                                 "public class Run {\n"
+                                 "    Object go() { return new Codec(); }\n"
+                                 "}\n";
+    static const char prod_path[] = "clients/src/main/java/org/acme/clients/Codec.java";
+    static const char test_path[] = "streams/src/test/java/org/acme/streams/RunTest.java";
+    write_temp_file(tmp, prod_path, "package org.acme.clients;\n\npublic class Codec {}\n");
+    write_temp_file(tmp, test_path,
+                    "package org.acme.streams;\n\npublic class RunTest {\n"
+                    "    static class Codec {}\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "go", "Codec", prod_path, test_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "go", "Codec", prod_path, test_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* Test code ranks test candidates like any other: the test penalty is for
+ * production callers. kafka's clients tests call `new MockTime()`, meaning the
+ * clients test helper next to them; with every test-file definition ranked as
+ * test, a same-named class in a test-support module under src/main (which no
+ * test rule marks) won instead. For a test caller no candidate takes the
+ * penalty, so proximity picks the helper again, in the full index and on both
+ * incremental routes. */
+TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tcaller_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "clients/src/test/java/org/acme/clients/ClientTest.java";
+    static const char caller[] = "package org.acme.clients;\n\n"
+                                 "public class ClientTest {\n"
+                                 "    Object make() { return new MockTime(); }\n"
+                                 "}\n";
+    static const char helper_path[] = "clients/src/test/java/org/acme/common/utils/MockTime.java";
+    static const char support_path[] =
+        "streams/test-utils/src/main/java/org/acme/streams/TopologyTestDriver.java";
+    write_temp_file(tmp, helper_path,
+                    "package org.acme.common.utils;\n\npublic class MockTime {}\n");
+    write_temp_file(tmp, support_path,
+                    "package org.acme.streams;\n\npublic class TopologyTestDriver {\n"
+                    "    static class MockTime {\n        MockTime() {}\n    }\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "make", "MockTime", helper_path, support_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "make", "MockTime", helper_path, support_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -34926,6 +35088,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
     RUN_TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental);
     RUN_TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API

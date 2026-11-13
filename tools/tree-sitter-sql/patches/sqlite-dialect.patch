@@ -1,0 +1,187 @@
+diff --git a/grammar/column-lists.js b/grammar/column-lists.js
+index 55d257d70e83c364d875494961944439118fd8b5..2b99c49354039a628fce8b92a7b00119eed80207 100644
+--- a/grammar/column-lists.js
++++ b/grammar/column-lists.js
+@@ -23,7 +23,10 @@ export default {
+   ),
+ 
+   column_definition: $ => prec.left(seq(
+-    field('name', $._column),
++    // cbm fork (#2246): SQLite does not reserve `key`, so it is a common column
++    // name, but after the first column it lexes as the keyword of MySQL's
++    // `KEY name (cols)` index. Accept that keyword as a column name too.
++    field('name', choice($._column, alias($.keyword_key, $.identifier))),
+     field('type', $._type),
+     repeat($._column_constraint),
+   )),
+@@ -153,7 +156,20 @@ export default {
+       seq(optional($.keyword_foreign), $.keyword_key, optional($._if_not_exists)),
+       $.keyword_index,
+     ),
+-    optional(field('name', $.identifier)),
++    // cbm fork (#2246): with `key` also a column name (column_definition), a
++    // type keyword after KEY now lexes as that type, so accept the types that
++    // take no arguments as index names too (MySQL `KEY name (name)`). A type
++    // that takes arguments (int, varchar, time, ...) is not in the list.
++    optional(field('name', choice(
++      $.identifier,
++      ...[
++        'boolean', 'image', 'smallserial', 'serial', 'bigserial', 'money',
++        'smallmoney', 'string', 'text', 'uuid', 'json', 'jsonb', 'xml', 'bytea',
++        'inet', 'date', 'datetime', 'datetime2', 'smalldatetime', 'timestamptz',
++        'interval', 'geometry', 'geography', 'box2d', 'box3d', 'oid', 'name',
++        'regclass', 'regnamespace', 'regproc', 'regtype',
++      ].map((type) => alias($['keyword_' + type], $.identifier)),
++    ))),
+     $.ordered_columns,
+     optional(
+       seq(
+diff --git a/grammar/keywords.js b/grammar/keywords.js
+index 6be9e8940972d69a3c5804cce56666e59be23fd2..a88aef4e2b85037c56f9eb4d2f27b57846b7fdb4 100644
+--- a/grammar/keywords.js
++++ b/grammar/keywords.js
+@@ -96,7 +96,9 @@ export default {
+   keyword_for: _ => make_keyword("for"),
+   keyword_if: _ => make_keyword("if"),
+   keyword_exists: _ => make_keyword("exists"),
+-  keyword_auto_increment: _ => make_keyword("auto_increment"),
++  // cbm fork (#2246): SQLite AUTOINCREMENT. Upstream c042cde1e2a6 (2026-11-08,
++  // after our pin) made exactly this change; drop the hunk on a refresh past it.
++  keyword_auto_increment: _ => choice(make_keyword("auto_increment"),make_keyword("autoincrement")),
+   keyword_generated: _ => make_keyword("generated"),
+   keyword_always: _ => make_keyword("always"),
+   keyword_collate: _ => make_keyword("collate"),
+@@ -282,6 +284,11 @@ export default {
+   keyword_execute: _ => make_keyword("execute"),
+   keyword_procedure: _ => make_keyword("procedure"),
+   keyword_object_id: _ => make_keyword("object_id"),
++  // cbm fork (#2246): SQLite PRAGMA, WITHOUT ROWID and INSERT OR <conflict>
++  keyword_pragma: _ => make_keyword("pragma"),
++  keyword_rowid: _ => make_keyword("rowid"),
++  keyword_abort: _ => make_keyword("abort"),
++  keyword_fail: _ => make_keyword("fail"),
+ 
+   // Hive Keywords
+   keyword_external: _ => make_keyword("external"),
+diff --git a/grammar/statements/create.js b/grammar/statements/create.js
+index 41f54a244e283c38b7fec7b1f1d6e5e8f595e8a8..388c2e8838fc95e1b34877a3eff47ceb2d0d84ee 100644
+--- a/grammar/statements/create.js
++++ b/grammar/statements/create.js
+@@ -8,6 +8,7 @@ export default {
+   _create_statement: $ => seq(
+     choice(
+       $.create_table,
++      alias($._create_virtual_table, $.create_table), // cbm fork (#2246)
+       $.create_view,
+       $.create_materialized_view,
+       $.create_index,
+@@ -77,10 +78,32 @@ export default {
+       paren_list($.table_option, true),
+     ),
+     seq($.keyword_without, $.keyword_oids),
++    seq($.keyword_without, $.keyword_rowid), // cbm fork (#2246): SQLite
+     $.storage_parameters,
+     $.table_option,
+   ),
+ 
++  // cbm fork (#2246): SQLite CREATE VIRTUAL TABLE [IF NOT EXISTS] name
++  // USING module[(arguments)], e.g. an fts5 full-text index. It is a table,
++  // so it is aliased to create_table and extracted like any other.
++  _create_virtual_table: $ => prec.right(seq(
++    $.keyword_create,
++    $.keyword_virtual,
++    $.keyword_table,
++    optional($._if_not_exists),
++    $.object_reference,
++    $.keyword_using,
++    field('module', $.identifier),
++    optional(paren_list($.module_argument, true)),
++  )),
++
++  // a column (fts5 `body`, `body UNINDEXED`, rtree `minX`) or an option
++  // (fts5 `tokenize = 'unicode61'`, `content = ''`, `contentless_delete = 1`)
++  module_argument: $ => choice(
++    seq(field('name', $.identifier), repeat($.identifier)),
++    seq(field('name', $.identifier), '=', field('value', choice($.literal, $.identifier))),
++  ),
++
+   stored_as: $ => seq(
+       $.keyword_stored,
+       $.keyword_as,
+@@ -512,10 +535,20 @@ export default {
+         seq($.keyword_when, wrapped_in_parenthesis($._expression)),
+       ),
+     ),
+-    $.keyword_execute,
+-    choice($.keyword_function, $.keyword_procedure),
+-    $.object_reference,
+-    paren_list(field('parameter', $.term)),
++    choice(
++      seq(
++        $.keyword_execute,
++        choice($.keyword_function, $.keyword_procedure),
++        $.object_reference,
++        paren_list(field('parameter', $.term)),
++      ),
++      // cbm fork (#2246): SQLite runs a BEGIN ... END body, after a WHEN
++      // condition SQLite does not parenthesize
++      seq(
++        optional(seq($.keyword_when, $._expression)),
++        $.block,
++      ),
++    ),
+   ),
+ 
+   _create_trigger_event: $ => choice(
+diff --git a/grammar/statements/index.js b/grammar/statements/index.js
+index 94f0ec628add92d8a258f3441dbc85e551290dec..8f15fbd249086005255a4aee01acbf6f007f4ba4 100644
+--- a/grammar/statements/index.js
++++ b/grammar/statements/index.js
+@@ -84,8 +84,23 @@ export default {
+     $.comment_statement,
+     $.set_statement,
+     $.reset_statement,
++    $.pragma_statement, // cbm fork (#2246)
+   ),
+ 
++  // cbm fork (#2246): SQLite PRAGMA [schema.]name [= value | (value)]
++  pragma_statement: $ => prec.right(seq(
++    $.keyword_pragma,
++    $.object_reference,
++    optional(
++      choice(
++        seq('=', field('value', $._pragma_value)),
++        wrapped_in_parenthesis(field('value', $._pragma_value)),
++      ),
++    ),
++  )),
++
++  _pragma_value: $ => choice($.literal, $.identifier),
++
+   ...create_rules,
+   ...alter_rules,
+   ...drop_rules,
+diff --git a/grammar/statements/insert.js b/grammar/statements/insert.js
+index f241d126b4a5bfcccaad193ca956ccbefa2ae1a6..d78c104c4aae51a467b63ad6aaeb82d95051b827 100644
+--- a/grammar/statements/insert.js
++++ b/grammar/statements/insert.js
+@@ -12,6 +12,19 @@ export default {
+       $.keyword_insert,
+       $.keyword_replace
+     ),
++    // cbm fork (#2246): SQLite INSERT OR {ABORT | FAIL | IGNORE | REPLACE | ROLLBACK}
++    optional(
++      seq(
++        $.keyword_or,
++        choice(
++          $.keyword_abort,
++          $.keyword_fail,
++          $.keyword_ignore,
++          $.keyword_replace,
++          $.keyword_rollback,
++        ),
++      ),
++    ),
+     optional(
+       choice(
+         $.keyword_low_priority,

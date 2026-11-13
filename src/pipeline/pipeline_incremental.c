@@ -1396,9 +1396,11 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     size_t prefix_len = lang == CBM_LANG_PYTHON
                             ? cbm_pipeline_fqn_symbol_prefix_len(seed->project, node->file_path)
                             : 0;
-    /* The full index's verdict: the extractor's (stored as is_test) OR the
-     * test-double path rule on the node's file (pass_definitions.c). */
-    bool is_test = cbm_node_is_test(node) || cbm_registry_test_double_path(node->file_path);
+    /* The full index's verdict (pass_definitions.c): the extractor's (stored
+     * as is_test) OR its file rule on the node's file and the language the
+     * full index extracted it with OR the test-double path rule. */
+    bool is_test = cbm_node_is_test(node) || cbm_is_test_file(node->file_path, lang) ||
+                   cbm_registry_test_double_path(node->file_path);
     cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
                                     lang, prefix_len, is_test);
     if (node->properties_json) {

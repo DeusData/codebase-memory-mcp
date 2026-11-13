@@ -30,6 +30,7 @@ enum {
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
+#include "helpers.h" /* cbm_is_test_file */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,11 @@ bool cbm_node_is_test(const cbm_gbuf_node_t *n) {
         return false;
     }
     return strstr(n->properties_json, "\"is_test\":true") != NULL;
+}
+
+bool cbm_pipeline_caller_is_test(const cbm_gbuf_node_t *source, const char *rel, CBMLanguage lang) {
+    return cbm_node_is_test(source) || cbm_is_test_file(rel, lang) ||
+           cbm_registry_test_double_path(rel);
 }
 
 /* Helper to check suffix. */

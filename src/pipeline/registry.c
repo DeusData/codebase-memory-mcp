@@ -335,15 +335,21 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
  * proximity), ties settled by candidate_outranks_on_tie. `is_test_flags` are
  * the candidates' stored test verdicts, always given: every by-name entry has
  * one, and a filtered subset carries its own copies. `lang_flags` are their
- * languages, or NULL when the caller has none. */
+ * languages, or NULL when the caller has none. `caller_test`: the reference
+ * comes from test or test-double code, which may use test code as freely as
+ * real code, so no candidate takes the test penalty and proximity alone ranks
+ * (kafka: a clients test's `new MockTime()` binds the clients test helper,
+ * not a same-named class in a test-support module). Production references
+ * keep the full penalty. */
 static const char *best_by_import_distance(const cbm_registry_t *r, const char **candidates,
                                            const uint8_t *is_test_flags, const uint8_t *lang_flags,
-                                           int count, const char *module_qn) {
+                                           int count, const char *module_qn, bool caller_test) {
     const char *best = NULL;
     uint8_t best_lang = (uint8_t)CBM_LANG_COUNT;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
-        int score = candidate_score(candidates[i], module_qn, is_test_flags[i] != 0);
+        int score =
+            candidate_score(candidates[i], module_qn, is_test_flags[i] != 0 && !caller_test);
         uint8_t lang = lang_flags ? lang_flags[i] : (uint8_t)CBM_LANG_COUNT;
         if (score > best_score ||
             (score == best_score && best &&
@@ -467,6 +473,7 @@ typedef struct {
     size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
     bool skip_members; /* a C call and a C reference to the same name share it too */
     bool cs_keywords;  /* a C# call and a C# reference to the same name share it too */
+    bool caller_test;  /* a test and a production function of one file share it too */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -2279,10 +2286,11 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-/* Strategy 4: multiple candidates with import filtering. */
+/* Strategy 4: multiple candidates with import filtering. `caller_test`: see
+ * best_by_import_distance. */
 static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
                                                    const char *module_qn, const char **import_vals,
-                                                   int import_count) {
+                                                   int import_count, bool caller_test) {
     const char *filtered[CBM_SZ_256];
     uint8_t filtered_test[CBM_SZ_256];
     uint8_t filtered_lang[CBM_SZ_256];
@@ -2302,16 +2310,17 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best =
-            best_by_import_distance(r, filtered, filtered_test, filtered_lang, fcount, module_qn);
+        const char *best = best_by_import_distance(r, filtered, filtered_test, filtered_lang,
+                                                   fcount, module_qn, caller_test);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
     /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best =
+        best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                qn_lang_flags(arr), arr->count, module_qn, caller_test);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
@@ -2521,11 +2530,12 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
 }
 
 /* Strategies 3.5, 3 and 4 over one same-name candidate set. `lang` reaches
- * receiver_chain_admits only (see there). */
+ * receiver_chain_admits only (see there); `caller_test` reaches
+ * best_by_import_distance only. */
 static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
                                                 const char *callee_name, const char *module_qn,
                                                 const char **import_vals, int import_count,
-                                                CBMLanguage lang) {
+                                                CBMLanguage lang, bool caller_test) {
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -2551,10 +2561,12 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
+        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count,
+                                          caller_test);
     }
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best =
+        best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                qn_lang_flags(arr), arr->count, module_qn, caller_test);
     if (best) {
         if (!receiver_chain_admits(callee_name, best, lang)) {
             return empty_result();
@@ -2574,7 +2586,8 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
  * libc `read()` the unique name of a C++ adapter's Method instead. */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
-                                            int import_count, bool skip_members, CBMLanguage lang) {
+                                            int import_count, bool skip_members, CBMLanguage lang,
+                                            bool caller_test) {
     const char *lookup = simple_name(callee_name);
     const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -2593,19 +2606,20 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
             return empty_result();
         }
         return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count,
-                                       lang);
+                                       lang, caller_test);
     }
-    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count, lang);
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count, lang,
+                                   caller_test);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
  * cbm_registry_resolve owns the per-file cache). `lang`: see
- * receiver_chain_admits. */
+ * receiver_chain_admits; `caller_test`: see best_by_import_distance. */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
                                                size_t scope_len, bool skip_members,
-                                               CBMLanguage lang) {
+                                               CBMLanguage lang, bool caller_test) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -2643,7 +2657,7 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
-                                  skip_members, lang);
+                                  skip_members, lang, caller_test);
     }
     return res;
 }
@@ -2692,12 +2706,13 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
 }
 
 /* call_lang: the calling file's language for a CALLS resolve, CBM_LANG_COUNT
- * for every other one (see receiver_chain_admits). */
+ * for every other one (see receiver_chain_admits). caller_test: the reference
+ * comes from test or test-double code (see best_by_import_distance). */
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
                                                 size_t scope_len, bool skip_members,
-                                                CBMLanguage call_lang) {
+                                                CBMLanguage call_lang, bool caller_test) {
     if (!r || !callee_name) {
         return empty_result();
     }
@@ -2705,17 +2720,18 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
     /* Per-file cache: same callee_name in N call sites → 1 chain walk
      * + N-1 O(1) hash hits. module_qn is constant per file so the
      * cache key only needs callee_name. The chain reads call_lang only as
-     * "is it C#", so that one bit is all the entry has to record. */
+     * "is it C#", so that one bit is all the entry has to record; the
+     * caller's test verdict can differ between two functions of one file. */
     bool cs_keywords = call_lang == CBM_LANG_CSHARP;
     resolve_cache_entry_t *cached =
         _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
     if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members &&
-        cached->cs_keywords == cs_keywords)
+        cached->cs_keywords == cs_keywords && cached->caller_test == caller_test)
         return cached->res;
 
     cbm_resolution_t res =
         registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                               import_map_count, scope_len, skip_members, call_lang);
+                               import_map_count, scope_len, skip_members, call_lang, caller_test);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2737,6 +2753,7 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
         cached->scope_len = scope_len;
         cached->skip_members = skip_members;
         cached->cs_keywords = cs_keywords;
+        cached->caller_test = caller_test;
     } else if (_resolve_cache) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
@@ -2744,6 +2761,7 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
             e->scope_len = scope_len;
             e->skip_members = skip_members;
             e->cs_keywords = cs_keywords;
+            e->caller_test = caller_test;
             char *kdup = strdup(callee_name);
             if (kdup) {
                 cbm_ht_set(_resolve_cache, kdup, e);
@@ -3097,7 +3115,8 @@ static const char *swift_choose_receiver(const cbm_registry_t *r, const char **m
     const char **preferred = reachable_count > 0 ? reachable : receiver_matches;
     const uint8_t *preferred_test = reachable_count > 0 ? reachable_test : receiver_test;
     int preferred_count = reachable_count > 0 ? reachable_count : receiver_count;
-    return best_by_import_distance(r, preferred, preferred_test, NULL, preferred_count, module_qn);
+    return best_by_import_distance(r, preferred, preferred_test, NULL, preferred_count, module_qn,
+                                   false);
 }
 
 static const char *swift_choose_candidate(const cbm_registry_t *r, const char **matches,
@@ -3124,13 +3143,13 @@ static const char *swift_choose_candidate(const cbm_registry_t *r, const char **
     }
     if (reachable_count > 0) {
         chosen = module_qn ? best_by_import_distance(r, reachable, reachable_test, NULL,
-                                                     reachable_count, module_qn)
+                                                     reachable_count, module_qn, false)
                            : reachable[0];
     }
     if (!chosen) {
-        chosen = module_qn
-                     ? best_by_import_distance(r, matches, match_test, NULL, matched, module_qn)
-                     : matches[0];
+        chosen = module_qn ? best_by_import_distance(r, matches, match_test, NULL, matched,
+                                                     module_qn, false)
+                           : matches[0];
     }
     return chosen;
 }
@@ -4494,7 +4513,7 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char **import_map_vals, int import_map_count) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                    import_map_count, module_qn ? strlen(module_qn) : 0, false,
-                                   CBM_LANG_COUNT);
+                                   CBM_LANG_COUNT, false);
 }
 
 static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
@@ -4508,13 +4527,22 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            CBMLanguage lang) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                    import_map_count, lang_scope_len(module_qn, lang), false,
-                                   CBM_LANG_COUNT);
+                                   CBM_LANG_COUNT, false);
 }
 
-cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
-                                                const char *module_qn, const char **import_map_keys,
-                                                const char **import_map_vals, int import_map_count,
-                                                CBMLanguage lang) {
+cbm_resolution_t cbm_registry_resolve_ref(const cbm_registry_t *r, const char *ref_name,
+                                          const char *module_qn, const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          CBMLanguage lang, bool caller_test) {
+    return registry_resolve_scoped(r, ref_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, lang_scope_len(module_qn, lang), false,
+                                   CBM_LANG_COUNT, caller_test);
+}
+
+static cbm_resolution_t resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                          const char *module_qn, const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          CBMLanguage lang, bool caller_test) {
     /* A bare C call never names a member: a struct member is reached through
      * its object (cbm_call_onto_field_policy refuses every Field it lands on)
      * and C has no methods. So its Field and Method namesakes do not compete
@@ -4523,7 +4551,15 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                         !strstr(callee_name, "->");
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                    import_map_count, lang_scope_len(module_qn, lang), skip_members,
-                                   lang);
+                                   lang, caller_test);
+}
+
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang) {
+    return resolve_call_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                             import_map_count, lang, false);
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
@@ -4692,7 +4728,7 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                   import_map_count, module_qn ? strlen(module_qn) : 0, false,
-                                  CBM_LANG_COUNT);
+                                  CBM_LANG_COUNT, false);
 }
 
 /* Python looks a bare name up in the calling def's own scope, then in each
@@ -4750,7 +4786,7 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
                                                   const char **import_map_keys,
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
-                                                  const char *scope_qn) {
+                                                  const char *scope_qn, bool caller_test) {
     if (lang == CBM_LANG_PYTHON) {
         cbm_resolution_t lexical =
             cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
@@ -4758,8 +4794,8 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
             return lexical;
         }
     }
-    return cbm_registry_resolve_call_lang(r, callee_name, module_qn, import_map_keys,
-                                          import_map_vals, import_map_count, lang);
+    return resolve_call_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                             import_map_count, lang, caller_test);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
@@ -4835,8 +4871,9 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     if (fcount == 0) {
         /* No import-reachable — use originals with penalty */
-        const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                                   qn_lang_flags(arr), arr->count, module_qn);
+        const char *best =
+            best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                    qn_lang_flags(arr), arr->count, module_qn, false);
         if (!best) {
             return no_match;
         }
@@ -4850,7 +4887,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
             true};
     }
-    const char *best = best_by_import_distance(r, fptr, fflags, flangs, fcount, module_qn);
+    const char *best = best_by_import_distance(r, fptr, fflags, flangs, fcount, module_qn, false);
     if (!best) {
         return no_match;
     }
