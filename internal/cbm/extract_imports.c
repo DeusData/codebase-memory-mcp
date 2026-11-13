@@ -466,6 +466,51 @@ static void process_py_type_checking_block(CBMExtractCtx *ctx, TSNode if_node) {
     py_drop_rebound_imports(&ctx->result->imports, first, mark, star);
 }
 
+/* An import inside a def body binds a local of that function (#2285): `def f():
+ * from pkg.store import Store; Store().load()`. Record every such import, at
+ * any depth of the body (try/if/with, nested defs), flagged function_scope:
+ * no module-scope import map binds it, and the Python LSP binds it where the
+ * statement stands. A local name a module-level import binds as well stays
+ * unrecorded: every per-name consumer would conflate the two bindings, and
+ * the LSP then binds the function's own import as UNKNOWN (fail closed). An
+ * iterative walk: adversarially deep nesting must not exhaust the stack. */
+static void py_record_function_imports(CBMExtractCtx *ctx) {
+    CBMImportArray *imports = &ctx->result->imports;
+    int module_count = imports->count;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    for (bool walking = true; walking;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool is_def = strcmp(ts_node_type(node), "function_definition") == 0;
+        if (is_def) {
+            TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+            if (!ts_node_is_null(body)) {
+                (void)py_record_subtree_imports(ctx, body);
+            }
+        }
+        if (!is_def && ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (walking && !ts_tree_cursor_goto_next_sibling(&cursor)) {
+            walking = ts_tree_cursor_goto_parent(&cursor);
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    int keep = module_count;
+    for (int i = module_count; i < imports->count; i++) {
+        CBMImport imp = imports->items[i];
+        bool module_bound = false;
+        for (int j = 0; j < module_count && !module_bound; j++) {
+            module_bound = imp.local_name && imports->items[j].local_name &&
+                           strcmp(imp.local_name, imports->items[j].local_name) == 0;
+        }
+        if (!module_bound) {
+            imp.function_scope = true;
+            imports->items[keep++] = imp;
+        }
+    }
+    imports->count = keep;
+}
+
 static void parse_python_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -481,6 +526,7 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+    py_record_function_imports(ctx);
 }
 
 /* A proven same-module function (its OWN_DEF fact and definition), and

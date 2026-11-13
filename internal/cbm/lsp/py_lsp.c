@@ -230,6 +230,7 @@ static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
+static void py_replay_import_statement(PyLSPContext *ctx, TSNode stmt, unsigned char *consumed);
 static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node);
 static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
@@ -2833,6 +2834,22 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ctx->eval_failure || ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);
+
+    /* An import inside a def binds in the current scope, where it stands
+     * (#2285); the module-level replay never reaches it. Extraction records it
+     * flagged function_scope, so it reaches this walk through the LSP import
+     * map only. Several defs may import one name: each statement matches the
+     * entries afresh instead of consuming one. Unmatched, it binds UNKNOWN. */
+    if (strcmp(k, "import_statement") == 0 || strcmp(k, "import_from_statement") == 0) {
+        unsigned char *fresh = NULL;
+        if (ctx->import_count > 0) {
+            fresh = (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)ctx->import_count);
+            if (fresh)
+                memset(fresh, 0, (size_t)ctx->import_count);
+        }
+        py_replay_import_statement(ctx, node, fresh);
+        return;
+    }
 
     if (strcmp(k, "assignment") == 0) {
         TSNode left = ts_node_child_by_field_name(node, "left", 4);

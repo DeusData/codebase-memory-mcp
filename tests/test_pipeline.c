@@ -21683,6 +21683,141 @@ TEST(python_type_checking_typed_field_issue1277_parallel) {
     return check_python_type_checking_typed_field_issue1277(true);
 }
 
+/* #2285: a class imported inside a def types its constructor result there, so
+ * `store = Store(); store.load_local(1)` resolves to Store.load_local exactly
+ * as with the module-level import (the control). The import stays a local of
+ * its def: a sibling def without it gets no edge, an unrelated class with the
+ * same method name gets none, and a local import that shadows a module-level
+ * name keeps the module-level class out of that def only. */
+static int check_python_function_local_import_issue2285(bool parallel) {
+    const char *store = "class Store:\n"
+                        "    def load_top(self, key):\n"
+                        "        return key\n\n"
+                        "    def load_local(self, key):\n"
+                        "        return key\n\n"
+                        "    def load_local_try(self, key):\n"
+                        "        return key\n";
+    const char *other = "class Other:\n"
+                        "    def load_local(self, key):\n"
+                        "        return key\n";
+    const char *top = "from store import Store\n\n"
+                      "def use_top():\n"
+                      "    store = Store()\n"
+                      "    return store.load_top(1)\n";
+    const char *local = "def use_local():\n"
+                        "    from store import Store\n\n"
+                        "    store = Store()\n"
+                        "    return store.load_local(1)\n\n"
+                        "def use_local_try():\n"
+                        "    try:\n"
+                        "        from store import Store\n\n"
+                        "        store = Store()\n"
+                        "        items = store.load_local_try(1)\n"
+                        "    except Exception:\n"
+                        "        return None\n"
+                        "    return items\n\n"
+                        "def no_local_import():\n"
+                        "    store = Store()\n"
+                        "    return store.load_local(1)\n";
+    const char *shadow = "from other import Other\n\n"
+                         "def module_level():\n"
+                         "    return Other().load_local(1)\n\n"
+                         "def shadowed():\n"
+                         "    from store import Store as Other\n"
+                         "    return Other().load_local(1)\n";
+    if (setup_usages_repo("store.py", store, "other.py", other) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    const char *names[] = {"top.py", "local.py", "shadow.py"};
+    const char *bodies[] = {top, local, shadow};
+    char path[512];
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, names[i]);
+        if (th_write_file(path, bodies[i]) != 0) {
+            teardown_usages_repo();
+            FAIL("failed to write fixture");
+        }
+    }
+    if (parallel) {
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/fl_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "fl_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_2285.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int top_ok = -1, local_ok = -1, try_ok = -1, unrelated = -1, leaked = -1;
+    int module_ok = -1, shadow_kept = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        top_ok = count_lsp_calls(s, project, "top.use_top", "store.Store.load_top");
+        local_ok = count_lsp_calls(s, project, "local.use_local", "store.Store.load_local");
+        try_ok = count_lsp_calls(s, project, "local.use_local_try", "store.Store.load_local_try");
+        unrelated = count_calls_with(s, project, "local.use_local", "other.Other.load_local", NULL);
+        leaked =
+            count_calls_with(s, project, "local.no_local_import", "store.Store.load_local", NULL);
+        module_ok = count_lsp_calls(s, project, "shadow.module_level", "other.Other.load_local");
+        shadow_kept =
+            count_calls_with(s, project, "shadow.shadowed", "other.Other.load_local", NULL);
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(top_ok, 1);      /* control: module-level import */
+    ASSERT_EQ(local_ok, 1);    /* import inside the def */
+    ASSERT_EQ(try_ok, 1);      /* import inside a try block of the def */
+    ASSERT_EQ(unrelated, 0);   /* same method name, unrelated class */
+    ASSERT_EQ(leaked, 0);      /* a sibling def does not see the import */
+    ASSERT_EQ(module_ok, 1);   /* control: module-level binding */
+    ASSERT_EQ(shadow_kept, 0); /* the local import shadows it in its own def */
+    PASS();
+}
+
+TEST(python_function_local_import_issue2285) {
+    return check_python_function_local_import_issue2285(false);
+}
+
+TEST(python_function_local_import_issue2285_parallel) {
+    return check_python_function_local_import_issue2285(true);
+}
+
 /* A base class spelled through a root-binding import (`import pkg.mod.nodes`
  * binds `pkg`; `class X(pkg.mod.nodes.Context)`) is the same class as the
  * from-imported spelling. The Python LSP's inheritance view never resolved the
@@ -34907,6 +35042,8 @@ SUITE(pipeline) {
     RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
     RUN_TEST(python_type_checking_typed_field_issue1277);
     RUN_TEST(python_type_checking_typed_field_issue1277_parallel);
+    RUN_TEST(python_function_local_import_issue2285);
+    RUN_TEST(python_function_local_import_issue2285_parallel);
     RUN_TEST(python_dotted_base_inheritance);
     RUN_TEST(python_dotted_base_inheritance_parallel);
     RUN_TEST(pipeline_python_package_reexports_resolve_by_lsp);

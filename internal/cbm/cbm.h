@@ -449,16 +449,20 @@ typedef struct {
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
     bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
                              // binds the name for annotations, never at runtime (#1277)
+    bool function_scope;     // Python: inside a def body -- binds the name in that
+                             // function's scope only, never in the module's (#2285)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 
-/* True when an import binds its local name at runtime. A Python import under
- * `if TYPE_CHECKING:` exists for annotations only: a call through that name
- * cannot happen, so no CALLS import map may bind it (an import_map edge
+/* True when an import binds its local name in the module scope at runtime. A
+ * Python import under `if TYPE_CHECKING:` exists for annotations only: a call
+ * through that name cannot happen. A Python import inside a def binds a local
+ * of that function only: a call elsewhere in the file never goes through it.
+ * Either way no file-wide CALLS import map may bind it (an import_map edge
  * through it would be fabricated by construction). THE one rule every CALLS
- * import-map builder applies. */
+ * import-map builder applies; the Python LSP binds both where they stand. */
 static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
-    return imp && !imp->type_checking_only;
+    return imp && !imp->type_checking_only && !imp->function_scope;
 }
 
 /* Content-only ordered Python namespace facts; no resolved target identities.
