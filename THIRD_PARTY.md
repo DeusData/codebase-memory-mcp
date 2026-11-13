@@ -46,6 +46,23 @@ The **canonical provenance record** — upstream repository, pinned commit, and
 cross-registry verification status for every grammar — is
 [`internal/cbm/vendored/grammars/MANIFEST.md`](internal/cbm/vendored/grammars/MANIFEST.md).
 
+**Local modification** (`internal/cbm/vendored/grammars/jsonnet/scanner.c`,
+upstream [sourcegraph/tree-sitter-jsonnet](https://github.com/sourcegraph/tree-sitter-jsonnet)
+@ `ddd075f1939a`): upstream keeps the external scanner's state (inside a
+string, and which quote) in file-scope globals, so every parser in the process
+shares one copy, and its deserialize ignores the zero-length call that starts a
+parse, so each parse inherits whatever the previous one left. Indexing workers
+parse in parallel, so concurrent jsonnet parses corrupted each other's strings:
+a different set of files came back `parse_partial` on every index, with their
+definitions and edges. A file ending inside an unterminated string also left
+every later `|||` text block in the process unparseable. The CBM patch moves the
+state into a per-parser payload allocated by `..._external_scanner_create()` and
+resets it at the start of every deserialize; lexing logic and the serialized
+state are unchanged. It is recorded with the other scanner patches in
+MANIFEST.md's "Local source patches" table and pinned by
+`scripts/vendored-checksums.txt`. **On re-vendor: re-apply this patch**;
+`make -f Makefile.cbm lint-vendored-scanners` fails while the globals are back.
+
 License summary:
 
 - Nearly all grammars are **MIT**-licensed.
