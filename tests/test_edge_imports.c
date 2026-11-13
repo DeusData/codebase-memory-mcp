@@ -665,6 +665,31 @@ TEST(ei_typescript_dotted_alias_import_targets_source_module) {
     PASS();
 }
 
+/* An import that spells the module extension of a dotted name gets that
+ * file, not the shorter file beside it: ~/tokens.css.ts is tokens.css.ts
+ * (never tokens.css), and ~/worker.task.mjs.ts is worker.task.mjs.ts (never
+ * worker.task.mjs). */
+TEST(ei_typescript_alias_import_spelled_ext_on_dotted_name) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/tokens.css", ":root { --gap: 4px; }\n"},
+        {"src/tokens.css.ts", "export const tokens = { gap: 4 };\n"},
+        {"src/worker.task.mjs", "export function run() {}\n"},
+        {"src/worker.task.mjs.ts", "export function typedRun(): void {}\n"},
+        {"src/a.ts", "import { tokens } from '~/tokens.css.ts';\nexport const a = tokens;\n"},
+        {"src/b.ts", "import { typedRun } from '~/worker.task.mjs.ts';\nexport const b = typedRun;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/a.ts", "src/tokens.css.ts"},
+        {"src/b.ts", "src/worker.task.mjs.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 2, "Module"));
+    PASS();
+}
+
 #ifndef _WIN32
 /* A `?` in a folder name is part of the path, not a bundler query: the alias
  * import ~/dir?name/file names src/dir?name/file.ts, never src/dir.ts.
@@ -2666,6 +2691,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
     RUN_TEST(ei_typescript_dotted_alias_import_targets_source_module);
     RUN_TEST(ei_typescript_alias_import_non_js_file_targets_its_module);
+    RUN_TEST(ei_typescript_alias_import_spelled_ext_on_dotted_name);
 #ifndef _WIN32
     RUN_TEST(ei_typescript_alias_import_keeps_question_mark_folder);
 #endif

@@ -1534,7 +1534,23 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
  * #fragment on the basename is not part of the extension; a `?` in a folder
  * name is part of the path. Unknown suffixes such as cat.service stay intact. The shared alias
  * resolver is unchanged, so doc links keep the file identity they had. */
-static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, char *aliased) {
+static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_path,
+                             char *aliased) {
+    static const char *const module_exts[] = {".ts",  ".tsx", ".js",  ".jsx", ".mjs",
+                                              ".cjs", ".mts", ".cts", ".json"};
+    /* The import spelled a module extension and the alias resolver removed
+     * it: what is left is the whole file stem, dots included
+     * (~/tokens.css.ts names tokens.css.ts, never tokens.css). */
+    size_t mlen = strlen(module_path);
+    size_t alen = strlen(aliased);
+    for (size_t i = 0; i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+        size_t elen = strlen(module_exts[i]);
+        bool spelled = mlen > elen && strcmp(module_path + mlen - elen, module_exts[i]) == 0;
+        bool still_there = alen > elen && strcmp(aliased + alen - elen, module_exts[i]) == 0;
+        if (spelled && !still_there) {
+            return cbm_pipeline_fqn_folder(ctx->project_name, aliased);
+        }
+    }
     char *slash = strrchr(aliased, '/');
     char *base = slash ? slash + SKIP_ONE : aliased;
     char *query = strchr(base, '?');
@@ -1546,8 +1562,6 @@ static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, char *aliased) {
     if (fragment) {
         *fragment = '\0';
     }
-    static const char *const module_exts[] = {".ts",  ".tsx", ".js",  ".jsx", ".mjs",
-                                              ".cjs", ".mts", ".cts", ".json"};
     for (size_t i = 0; ext && i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
         if (strcmp(ext, module_exts[i]) == 0) {
             return cbm_pipeline_fqn_module(ctx->project_name, aliased);
@@ -1603,7 +1617,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         if (amap) {
             char *aliased = cbm_path_alias_resolve(amap, module_path);
             if (aliased) {
-                char *qn = alias_module_qn(ctx, aliased);
+                char *qn = alias_module_qn(ctx, module_path, aliased);
                 free(aliased);
                 return qn;
             }
