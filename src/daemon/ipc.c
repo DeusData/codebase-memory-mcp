@@ -9,6 +9,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/macos_acl.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
@@ -5420,7 +5421,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
      * dot components: the component walk must still reject those itself. */
     bool extended = length >= 240U;
     size_t prefix_length = extended ? 4U : 0U;
-    wchar_t *path = calloc(length + prefix_length + 1U, sizeof(*path));
+    wchar_t *path = cbm_calloc(CBM_MEM_CLASS_OTHER, (length + prefix_length + 1U) * sizeof(*path));
     if (!path) {
         return false;
     }
@@ -5436,7 +5437,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     }
     win_security_t security;
     if (!win_security_init(&security)) {
-        free(path);
+        cbm_free(CBM_MEM_CLASS_OTHER, path);
         return false;
     }
     bool ok = true;
@@ -5509,7 +5510,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     if (ok) {
         ok = win_runtime_directory_secure(path);
     }
-    free(path);
+    cbm_free(CBM_MEM_CLASS_OTHER, path);
     return ok;
 }
 

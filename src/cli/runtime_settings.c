@@ -247,14 +247,16 @@ static bool canonical_cache_path(const char *cache, char out[SETTINGS_PATH_CAP],
 int cbm_runtime_settings_open_db(const char *path, sqlite3 **db, int flags) {
 #ifdef _WIN32
     *db = NULL;
-    wchar_t *wide = cbm_path_to_wide(path);
-    char *extended = wide ? cbm_wide_to_utf8(wide) : NULL;
-    free(wide);
-    if (!extended)
+    wchar_t *wide = cbm_path_to_wide_in(CBM_MEM_CLASS_OTHER, path);
+    if (!wide)
         return SQLITE_NOMEM;
-    int rc = sqlite3_open_v2(extended, db, flags, "win32-longpath");
-    free(extended);
-    return rc;
+    char extended[SETTINGS_PATH_CAP + 8];
+    int converted = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, extended,
+                                        sizeof(extended), NULL, NULL);
+    cbm_free(CBM_MEM_CLASS_OTHER, wide);
+    if (!converted)
+        return SQLITE_CANTOPEN;
+    return sqlite3_open_v2(extended, db, flags, "win32-longpath");
 #else
     return sqlite3_open_v2(path, db, flags, NULL);
 #endif
