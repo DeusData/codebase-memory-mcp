@@ -317,8 +317,7 @@ static bool main_local_cli_mutation_begin_internal(void *context, const char *pr
         cbm_project_lock_lease_t *lease = NULL;
         cbm_private_file_lock_status_t status;
         if (wait) {
-            uint64_t now = cbm_now_ms();
-            uint64_t deadline = now > UINT64_MAX - 100U ? UINT64_MAX : now + 100U;
+            uint64_t deadline = cbm_project_lock_cli_attempt_deadline(cbm_now_ms());
             status = cbm_project_lock_acquire(mutation->manager, project, deadline, NULL, &lease);
         } else {
             status = cbm_project_lock_try_acquire(mutation->manager, project, &lease);

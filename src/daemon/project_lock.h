@@ -10,6 +10,17 @@
 typedef struct cbm_project_lock_manager cbm_project_lock_manager_t;
 typedef struct cbm_project_lock_lease cbm_project_lock_lease_t;
 
+/* A CLI attempt validates several native lock files before it can publish a
+ * lease. Windows path/ACL validation can exceed a 100ms scheduling slice. */
+static inline uint64_t cbm_project_lock_cli_attempt_deadline(uint64_t now_ms) {
+#ifdef _WIN32
+    const uint64_t timeout_ms = 5000U;
+#else
+    const uint64_t timeout_ms = 100U;
+#endif
+    return now_ms > UINT64_MAX - timeout_ms ? UINT64_MAX : now_ms + timeout_ms;
+}
+
 /* Each manager is an independent process-local registry over the endpoint's
  * owner-only runtime directory. Separate CBM processes therefore coordinate
  * through the same native lock files without sharing memory. */
