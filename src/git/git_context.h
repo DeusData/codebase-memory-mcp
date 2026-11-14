@@ -20,6 +20,12 @@ typedef struct {
     char *base_sha;
 } cbm_git_context_t;
 
+typedef struct {
+    bool available;
+    bool dirty;
+    char *head_sha;
+} cbm_git_snapshot_t;
+
 /* True when path is a LINKED git worktree (`git worktree add`) or a
  * subdirectory of one.
  *
@@ -49,6 +55,8 @@ int cbm_git_branch_resolve(const char *path, bool *is_git, char *branch, size_t 
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
+int cbm_git_snapshot_read(const char *path, cbm_git_snapshot_t *out);
+void cbm_git_snapshot_free(cbm_git_snapshot_t *snapshot);
 
 /* Bounded snapshot of the git worktree status for one validated repo root.
  *
