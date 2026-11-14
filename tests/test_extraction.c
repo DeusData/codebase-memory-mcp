@@ -1989,6 +1989,50 @@ TEST(python_type_checking_rebound_in_else_unrecorded_issue1277) {
     PASS();
 }
 
+/* #2285: an import inside a def, at any depth of its body, is recorded flagged
+ * function_scope; a module-level import is not. A def's import of a name the
+ * module binds as well stays unrecorded (the module-level one remains), and a
+ * module-level compound statement's import stays unrecorded as before. */
+TEST(python_function_local_imports_flagged_issue2285) {
+    const char *src = "from pkg.other import Other\n"
+                      "def use_local():\n"
+                      "    from pkg.store import Store\n"
+                      "    return Store().load_local(1)\n"
+                      "class Holder:\n"
+                      "    def method(self):\n"
+                      "        try:\n"
+                      "            import pkg.sub.lib as lib\n"
+                      "        except ImportError:\n"
+                      "            return None\n"
+                      "        def inner():\n"
+                      "            from pkg.deep import Deep\n"
+                      "        return lib\n"
+                      "def shadowed():\n"
+                      "    from pkg.store import Store as Other\n"
+                      "if FLAG:\n"
+                      "    from pkg.flag import Conditional\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "use.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *other = py_find_import(r, "Other");
+    const CBMImport *store = py_find_import(r, "Store");
+    const CBMImport *lib = py_find_import(r, "lib");
+    const CBMImport *deep = py_find_import(r, "Deep");
+    ASSERT_NOT_NULL(other);
+    ASSERT_FALSE(other->function_scope);
+    ASSERT_STR_EQ(other->module_path, "pkg.other.Other"); /* the def's alias is unrecorded */
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(store->function_scope);
+    ASSERT_FALSE(cbm_import_binds_runtime_name(store));
+    ASSERT_NOT_NULL(lib);
+    ASSERT_TRUE(lib->function_scope);
+    ASSERT_NOT_NULL(deep);
+    ASSERT_TRUE(deep->function_scope);
+    ASSERT_NULL(py_find_import(r, "Conditional"));
+    ASSERT_EQ(r->imports.count, 4);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_function) {
     CBMFileResult *r = extract(
         "def greet(name):\n    return f\"Hello {name}\"\n\ndef main():\n    greet(\"World\")\n",
@@ -15818,6 +15862,7 @@ SUITE(extraction) {
     RUN_TEST(python_annotated_instance_fields_exported_issue1277);
     RUN_TEST(python_type_checking_imports_flagged_issue1277);
     RUN_TEST(python_type_checking_rebound_in_else_unrecorded_issue1277);
+    RUN_TEST(python_function_local_imports_flagged_issue2285);
     RUN_TEST(js_function);
     RUN_TEST(js_class);
     RUN_TEST(ts_function);

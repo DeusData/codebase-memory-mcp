@@ -21988,6 +21988,475 @@ TEST(python_type_checking_typed_field_issue1277_parallel) {
     return check_python_type_checking_typed_field_issue1277(true);
 }
 
+/* #2285: a class imported inside a def types its constructor result there, so
+ * `store = Store(); store.load_local(1)` resolves to Store.load_local exactly
+ * as with the module-level import (the control). The import stays a local of
+ * its def: a sibling def without it gets no edge, an unrelated class with the
+ * same method name gets none, and a local import that shadows a module-level
+ * name keeps the module-level class out of that def only. */
+static int check_python_function_local_import_issue2285(bool parallel) {
+    const char *store = "class Store:\n"
+                        "    def load_top(self, key):\n"
+                        "        return key\n\n"
+                        "    def load_local(self, key):\n"
+                        "        return key\n\n"
+                        "    def load_local_try(self, key):\n"
+                        "        return key\n";
+    const char *other = "class Other:\n"
+                        "    def load_local(self, key):\n"
+                        "        return key\n";
+    const char *top = "from store import Store\n\n"
+                      "def use_top():\n"
+                      "    store = Store()\n"
+                      "    return store.load_top(1)\n";
+    const char *local = "def use_local():\n"
+                        "    from store import Store\n\n"
+                        "    store = Store()\n"
+                        "    return store.load_local(1)\n\n"
+                        "def use_local_try():\n"
+                        "    try:\n"
+                        "        from store import Store\n\n"
+                        "        store = Store()\n"
+                        "        items = store.load_local_try(1)\n"
+                        "    except Exception:\n"
+                        "        return None\n"
+                        "    return items\n\n"
+                        "def no_local_import():\n"
+                        "    store = Store()\n"
+                        "    return store.load_local(1)\n";
+    const char *shadow = "from other import Other\n\n"
+                         "def module_level():\n"
+                         "    return Other().load_local(1)\n\n"
+                         "def shadowed():\n"
+                         "    from store import Store as Other\n"
+                         "    return Other().load_local(1)\n";
+    if (setup_usages_repo("store.py", store, "other.py", other) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    const char *names[] = {"top.py", "local.py", "shadow.py"};
+    const char *bodies[] = {top, local, shadow};
+    char path[512];
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, names[i]);
+        if (th_write_file(path, bodies[i]) != 0) {
+            teardown_usages_repo();
+            FAIL("failed to write fixture");
+        }
+    }
+    if (parallel) {
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/fl_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "fl_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_2285.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int top_ok = -1, local_ok = -1, try_ok = -1, unrelated = -1, leaked = -1;
+    int module_ok = -1, shadow_kept = -1, shadow_ctor = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        top_ok = count_lsp_calls(s, project, "top.use_top", "store.Store.load_top");
+        local_ok = count_lsp_calls(s, project, "local.use_local", "store.Store.load_local");
+        try_ok = count_lsp_calls(s, project, "local.use_local_try", "store.Store.load_local_try");
+        unrelated = count_calls_with(s, project, "local.use_local", "other.Other.load_local", NULL);
+        leaked =
+            count_calls_with(s, project, "local.no_local_import", "store.Store.load_local", NULL);
+        module_ok = count_lsp_calls(s, project, "shadow.module_level", "other.Other.load_local");
+        shadow_kept =
+            count_calls_with(s, project, "shadow.shadowed", "other.Other.load_local", NULL);
+        shadow_ctor = count_calls_with(s, project, "shadow.shadowed", "other.Other", NULL);
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(top_ok, 1);      /* control: module-level import */
+    ASSERT_EQ(local_ok, 1);    /* import inside the def */
+    ASSERT_EQ(try_ok, 1);      /* import inside a try block of the def */
+    ASSERT_EQ(unrelated, 0);   /* same method name, unrelated class */
+    ASSERT_EQ(leaked, 0);      /* a sibling def does not see the import */
+    ASSERT_EQ(module_ok, 1);   /* control: module-level binding */
+    ASSERT_EQ(shadow_kept, 0); /* the local import shadows it in its own def */
+    /* Fail closed holds for member calls only: the bare constructor call still
+     * binds the module-level class through the file-wide import map. */
+    ASSERT_EQ(shadow_ctor, 1);
+    PASS();
+}
+
+TEST(python_function_local_import_issue2285) {
+    return check_python_function_local_import_issue2285(false);
+}
+
+TEST(python_function_local_import_issue2285_parallel) {
+    return check_python_function_local_import_issue2285(true);
+}
+
+/* One indexed fixture of the #2285 def-import tests: files[i] = {path, body}. */
+typedef struct {
+    char tmp[256];
+    py_workers_pin_t pin;
+    cbm_pipeline_t *p;
+    cbm_store_t *s;
+    int run_rc;
+} py_def_import_run_t;
+
+static void py_def_import_open(py_def_import_run_t *r, const char *const (*files)[2], int n,
+                               bool parallel) {
+    memset(r, 0, sizeof(*r));
+    r->run_rc = -1;
+    snprintf(r->tmp, sizeof(r->tmp), "/tmp/cbm_py_2285_XXXXXX");
+    if (!cbm_mkdtemp(r->tmp)) {
+        r->tmp[0] = '\0';
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        write_temp_file(r->tmp, files[i][0], files[i][1]);
+    }
+    py_write_padding(r->tmp, "defimp_pad", parallel);
+    r->pin = py_pin_workers(parallel);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/defimp.db", r->tmp);
+    r->p = r->pin.rc == 0 ? cbm_pipeline_new(r->tmp, db_path, CBM_MODE_FULL) : NULL;
+    r->run_rc = r->p ? cbm_pipeline_run(r->p) : -1;
+    r->s = r->run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+}
+
+/* Closes everything; returns the unpin rc. */
+static int py_def_import_close(py_def_import_run_t *r, bool parallel) {
+    if (r->s) {
+        cbm_store_close(r->s);
+    }
+    cbm_pipeline_free(r->p);
+    int rc = py_unpin_workers(parallel, &r->pin);
+    if (r->tmp[0]) {
+        th_rmtree(r->tmp);
+    }
+    return rc;
+}
+
+/* #2285 review: a def's own import of a project name the LSP cannot type (a
+ * decorated function) keeps the name-based fallback. The import never enters
+ * the file-wide import map, which the external-import guard must not read as
+ * "this import resolved outside the project". */
+static int check_python_def_import_name_fallback_issue2285(bool parallel) {
+    static const char *const files[][2] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/outcomes.py", "def _with_exception(t):\n"
+                            "    def decorate(func):\n"
+                            "        func.Exception = t\n"
+                            "        return func\n"
+                            "    return decorate\n\n"
+                            "@_with_exception(RuntimeError)\n"
+                            "def fail(reason=\"\"):\n"
+                            "    raise RuntimeError(reason)\n"},
+        {"pkg/compat.py", "def getfuncargnames(function):\n"
+                          "    try:\n"
+                          "        return function.__code__.co_varnames\n"
+                          "    except AttributeError:\n"
+                          "        from pkg.outcomes import fail\n"
+                          "        fail(\"no code object\")\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 3, parallel);
+    int fallback = -1;
+    if (r.s) {
+        fallback = count_calls_with(r.s, cbm_pipeline_project_name(r.p),
+                                    "pkg.compat.getfuncargnames", "pkg.outcomes.fail", NULL);
+    }
+    bool opened = r.s != NULL;
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(fallback, 1); /* decorated: no LSP type, the name fallback binds it */
+    PASS();
+}
+
+TEST(python_def_import_name_fallback_issue2285) {
+    return check_python_def_import_name_fallback_issue2285(false);
+}
+
+TEST(python_def_import_name_fallback_issue2285_parallel) {
+    return check_python_def_import_name_fallback_issue2285(true);
+}
+
+/* #2285 review: a re-exported name (`from pkg.forms import CharField`, which
+ * pkg/forms/__init__.py re-exports) binds its definition in every def that
+ * imports it, after the module or an earlier def already replayed the same
+ * import. A same-named class elsewhere never gets the call. */
+static int check_python_def_import_reexport_issue2285(bool parallel) {
+    static const char char_field[] = "class CharField:\n"
+                                     "    def __init__(self, max_length):\n"
+                                     "        self.max_length = max_length\n\n"
+                                     "    def clean(self, value):\n"
+                                     "        return value\n";
+    static const char *const files[][2] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/models/__init__.py", ""},
+        {"pkg/forms/fields.py", char_field},
+        {"pkg/models/fields.py", char_field},
+        {"pkg/forms/__init__.py", "from pkg.forms.fields import CharField\n"},
+        {"pkg/use.py", "from pkg.forms import CharField\n\n"
+                       "def reimported_in_def():\n"
+                       "    from pkg.forms import CharField\n"
+                       "    field = CharField(20)\n"
+                       "    return field.clean(2)\n"},
+        {"pkg/use3.py", "def first_def():\n"
+                        "    from pkg.forms import CharField\n"
+                        "    return CharField(40).clean(4)\n\n"
+                        "def second_def():\n"
+                        "    from pkg.forms import CharField\n"
+                        "    return CharField(50).clean(5)\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 7, parallel);
+    int re_init = -1, re_clean = -1, re_wrong = -1, first = -1, second = -1, second_wrong = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        re_init = count_lsp_calls(r.s, project, "pkg.use.reimported_in_def",
+                                  "pkg.forms.fields.CharField.__init__");
+        re_clean = count_lsp_calls(r.s, project, "pkg.use.reimported_in_def",
+                                   "pkg.forms.fields.CharField.clean");
+        re_wrong = count_calls_with(r.s, project, "pkg.use.reimported_in_def",
+                                    "pkg.models.fields.CharField", NULL);
+        first =
+            count_lsp_calls(r.s, project, "pkg.use3.first_def", "pkg.forms.fields.CharField.clean");
+        second = count_lsp_calls(r.s, project, "pkg.use3.second_def",
+                                 "pkg.forms.fields.CharField.clean");
+        second_wrong = count_calls_with(r.s, project, "pkg.use3.second_def",
+                                        "pkg.models.fields.CharField.clean", NULL);
+    }
+    bool opened = r.s != NULL;
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(re_init, 1);  /* after the module-level import of the same name */
+    ASSERT_EQ(re_clean, 1); /* typed by the re-exported class */
+    ASSERT_EQ(re_wrong, 0); /* never the same-named class elsewhere */
+    ASSERT_EQ(first, 1);    /* the first def importing it */
+    ASSERT_EQ(second, 1);   /* a later def importing it again */
+    ASSERT_EQ(second_wrong, 0);
+    PASS();
+}
+
+TEST(python_def_import_reexport_issue2285) {
+    return check_python_def_import_reexport_issue2285(false);
+}
+
+TEST(python_def_import_reexport_issue2285_parallel) {
+    return check_python_def_import_reexport_issue2285(true);
+}
+
+/* #2285 review: `import p.config` inside a method, then
+ * `p.config.create_writer(...)`, keeps its one CALLS edge to the submodule's
+ * function: with the def import only, when the module also imports the root
+ * (`import p`) or a name from it (`from p import helper`), and in a src layout
+ * with a decorated method. The Python LSP does not type an unaliased dotted
+ * import here even at module level (the control), on main as on this branch,
+ * so the edge is a name-based one; this pins that the def's own import never
+ * drops the call. */
+static int check_python_def_dotted_import_issue2285(bool parallel) {
+    static const char *const files[][2] = {
+        {"p/__init__.py", "def helper():\n    return 0\n"},
+        {"p/config/__init__.py", "def create_writer(arg):\n    return arg\n"},
+        {"p/only_def.py", "class Debugger:\n"
+                          "    def init_pdb(self):\n"
+                          "        import p.config\n"
+                          "        return p.config.create_writer(1)\n"},
+        {"p/module_level.py", "import p.config\n\n"
+                              "class Debugger:\n"
+                              "    def init_pdb(self):\n"
+                              "        return p.config.create_writer(0)\n"},
+        {"p/root_import.py", "import p\n\n"
+                             "class Debugger:\n"
+                             "    def init_pdb(self):\n"
+                             "        import p.config\n"
+                             "        return p.config.create_writer(2)\n"},
+        {"p/from_root.py", "from p import helper\n\n"
+                           "class Debugger:\n"
+                           "    def init_pdb(self):\n"
+                           "        import p.config\n"
+                           "        return p.config.create_writer(3)\n"},
+        /* The reported shape: src layout, a decorated method, the module
+         * importing a name from the same submodule. */
+        {"src/q/__init__.py", ""},
+        {"src/q/config/__init__.py", "class Config:\n"
+                                     "    pass\n\n"
+                                     "def create_writer(arg):\n"
+                                     "    return arg\n"},
+        {"src/q/debugging.py", "from q.config import Config\n\n"
+                               "class Debugger:\n"
+                               "    @classmethod\n"
+                               "    def init_pdb(cls):\n"
+                               "        import q.config\n"
+                               "        return q.config.create_writer(4)\n"},
+    };
+    static const char *const callers[][2] = {
+        {"p.module_level.Debugger.init_pdb", "p.config.create_writer"},
+        {"p.only_def.Debugger.init_pdb", "p.config.create_writer"},
+        {"p.root_import.Debugger.init_pdb", "p.config.create_writer"},
+        {"p.from_root.Debugger.init_pdb", "p.config.create_writer"},
+        {"q.debugging.Debugger.init_pdb", "q.config.create_writer"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 9, parallel);
+    int edges[5] = {-1, -1, -1, -1, -1};
+    for (int i = 0; r.s && i < 5; i++) {
+        edges[i] = count_calls_with(r.s, cbm_pipeline_project_name(r.p), callers[i][0],
+                                    callers[i][1], NULL);
+    }
+    bool opened = r.s != NULL;
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(edges[0], 1); /* control: module-level import p.config */
+    ASSERT_EQ(edges[1], 1); /* the def's import only */
+    ASSERT_EQ(edges[2], 1); /* the module also imports the root */
+    ASSERT_EQ(edges[3], 1); /* the module imports a name from the root */
+    ASSERT_EQ(edges[4], 1); /* src layout, decorated method */
+    PASS();
+}
+
+TEST(python_def_dotted_import_issue2285) {
+    return check_python_def_dotted_import_issue2285(false);
+}
+
+TEST(python_def_dotted_import_issue2285_parallel) {
+    return check_python_def_dotted_import_issue2285(true);
+}
+
+/* The target QN of the one INHERITS edge whose source QN ends in src_suffix:
+ * "" when there is none, "<several>" when there are more. Caller frees. */
+static char *py_inherits_target(cbm_store_t *s, const char *project, const char *src_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "INHERITS", &edges, &edge_count);
+    char *found = NULL;
+    size_t ss = strlen(src_suffix);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            if (sl >= ss && strcmp(src.qualified_name + sl - ss, src_suffix) == 0) {
+                free(found);
+                found = strdup(found ? "<several>" : tgt.qualified_name);
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return found ? found : strdup("");
+}
+
+/* #2285 review: sequential and parallel indexing resolve the base of a class
+ * nested in a def the same way. Neither driver's file-wide import map binds a
+ * def's own import, so the base name never resolves through it in one driver
+ * and by a name guess in the other. */
+TEST(python_def_import_nested_base_driver_parity_issue2285) {
+    static const char wrapper[] = "class Wrapper:\n"
+                                  "    def ping(self):\n"
+                                  "        return 1\n";
+    static const char *const files[][2] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/base_a.py", wrapper},
+        {"pkg/base_b.py", wrapper},
+        {"pkg/def_only.py", "def build_one():\n"
+                            "    from pkg.base_b import Wrapper\n\n"
+                            "    class CustomOne(Wrapper):\n"
+                            "        pass\n"
+                            "    return CustomOne\n"},
+        {"pkg/both.py", "from pkg.base_a import Wrapper\n\n"
+                        "def build_two():\n"
+                        "    from pkg.base_b import Wrapper as Base\n\n"
+                        "    class CustomTwo(Base):\n"
+                        "        pass\n"
+                        "    return CustomTwo\n\n"
+                        "def build_three():\n"
+                        "    from pkg.base_b import Wrapper\n\n"
+                        "    class CustomThree(Wrapper):\n"
+                        "        pass\n"
+                        "    return CustomThree\n"},
+    };
+    static const char *const nested[] = {".CustomOne", ".CustomTwo", ".CustomThree"};
+    char *base[2][3] = {{NULL}};
+    int run_rc[2] = {-1, -1};
+    int unpin_rc[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        py_def_import_run_t r;
+        py_def_import_open(&r, files, 5, mode == 1);
+        run_rc[mode] = r.s ? r.run_rc : -1;
+        for (int i = 0; r.s && i < 3; i++) {
+            base[mode][i] = py_inherits_target(r.s, cbm_pipeline_project_name(r.p), nested[i]);
+        }
+        unpin_rc[mode] = py_def_import_close(&r, mode == 1);
+    }
+    bool agree = true;
+    for (int i = 0; i < 3; i++) {
+        /* The project name is the temp dir's, so compare from the package on. */
+        const char *seq = base[0][i] ? strstr(base[0][i], "pkg.") : NULL;
+        const char *par = base[1][i] ? strstr(base[1][i], "pkg.") : NULL;
+        if (!base[0][i] || !base[1][i] || (seq == NULL) != (par == NULL) ||
+            (seq && strcmp(seq, par) != 0)) {
+            printf("  %s: sequential=\"%s\" parallel=\"%s\"\n", nested[i] + 1,
+                   base[0][i] ? base[0][i] : "(not run)", base[1][i] ? base[1][i] : "(not run)");
+            agree = false;
+        }
+    }
+    for (int m = 0; m < 2; m++) {
+        for (int i = 0; i < 3; i++) {
+            free(base[m][i]);
+        }
+    }
+    ASSERT_EQ(run_rc[0], 0);
+    ASSERT_EQ(run_rc[1], 0);
+    ASSERT_EQ(unpin_rc[0], 0);
+    ASSERT_EQ(unpin_rc[1], 0);
+    ASSERT_TRUE(agree);
+    PASS();
+}
+
 /* A base class spelled through a root-binding import (`import pkg.mod.nodes`
  * binds `pkg`; `class X(pkg.mod.nodes.Context)`) is the same class as the
  * from-imported spelling. The Python LSP's inheritance view never resolved the
@@ -35217,6 +35686,15 @@ SUITE(pipeline) {
     RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
     RUN_TEST(python_type_checking_typed_field_issue1277);
     RUN_TEST(python_type_checking_typed_field_issue1277_parallel);
+    RUN_TEST(python_function_local_import_issue2285);
+    RUN_TEST(python_function_local_import_issue2285_parallel);
+    RUN_TEST(python_def_import_name_fallback_issue2285);
+    RUN_TEST(python_def_import_name_fallback_issue2285_parallel);
+    RUN_TEST(python_def_import_reexport_issue2285);
+    RUN_TEST(python_def_import_reexport_issue2285_parallel);
+    RUN_TEST(python_def_dotted_import_issue2285);
+    RUN_TEST(python_def_dotted_import_issue2285_parallel);
+    RUN_TEST(python_def_import_nested_base_driver_parity_issue2285);
     RUN_TEST(python_dotted_base_inheritance);
     RUN_TEST(python_dotted_base_inheritance_parallel);
     RUN_TEST(pipeline_python_package_reexports_resolve_by_lsp);

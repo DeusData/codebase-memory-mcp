@@ -230,6 +230,7 @@ static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
+static void py_replay_import_statement(PyLSPContext *ctx, TSNode stmt, unsigned char *consumed);
 static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node);
 static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
@@ -409,23 +410,28 @@ void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *mo
                                                                             sizeof(const char *));
         const char **qns = (const char **)cbm_arena_alloc(ctx->arena, (size_t)(capacity + 1) *
                                                                           sizeof(const char *));
+        const char **sources =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(const char *));
         unsigned char *kinds =
             (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(unsigned char));
-        if (!names || !qns || !kinds)
+        if (!names || !qns || !sources || !kinds)
             return;
         for (int i = 0; i < ctx->import_count; i++) {
             CBM_LSP_WORK(1);
             names[i] = ctx->import_local_names[i];
             qns[i] = ctx->import_module_qns[i];
+            sources[i] = ctx->import_source_qns[i];
             kinds[i] = ctx->import_kinds ? ctx->import_kinds[i] : 0;
         }
         ctx->import_local_names = names;
         ctx->import_module_qns = qns;
+        ctx->import_source_qns = sources;
         ctx->import_kinds = kinds;
         ctx->import_capacity = capacity;
     }
     ctx->import_local_names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
     ctx->import_module_qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->import_source_qns[ctx->import_count] = ctx->import_module_qns[ctx->import_count];
     ctx->import_kinds[ctx->import_count] = 0;
     ctx->import_local_names[new_count] = NULL;
     ctx->import_module_qns[new_count] = NULL;
@@ -2994,6 +3000,24 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ctx->eval_failure || ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);
+
+    /* An import inside a def binds in the current scope, where it stands
+     * (#2285); the module-level replay never reaches it. Extraction records it
+     * flagged function_scope, so it reaches this walk through the LSP import
+     * map only. Several defs may import one name: each statement matches the
+     * entries afresh instead of consuming one. Unmatched, it binds UNKNOWN. */
+    if (strcmp(k, "import_statement") == 0 || strcmp(k, "import_from_statement") == 0) {
+        if (ctx->import_count > ctx->def_import_consumed_cap) {
+            ctx->def_import_consumed =
+                (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)ctx->import_count);
+            ctx->def_import_consumed_cap = ctx->def_import_consumed ? ctx->import_count : 0;
+        }
+        unsigned char *fresh = ctx->import_count > 0 ? ctx->def_import_consumed : NULL;
+        if (fresh)
+            memset(fresh, 0, (size_t)ctx->import_count);
+        py_replay_import_statement(ctx, node, fresh);
+        return;
+    }
 
     if (strcmp(k, "assignment") == 0) {
         TSNode left = ts_node_child_by_field_name(node, "left", 4);
@@ -5854,7 +5878,10 @@ static void py_replay_import_local(PyLSPContext *ctx, TSNode stmt, const char *l
             !ctx->import_module_qns[i] || strcmp(ctx->import_local_names[i], local) != 0) {
             continue;
         }
-        const char *candidate_qn = ctx->import_module_qns[i];
+        /* Match the path the row was added with: an earlier replay may have
+         * canonicalized import_module_qns[i] to a re-export target, which the
+         * same statement in another def no longer spells (#2285). */
+        const char *candidate_qn = ctx->import_source_qns[i];
         PyDirectImportKind kind = py_import_kind_from_statement(ctx, stmt, local, &candidate_qn);
         if (!py_replayable_import_kind(kind))
             continue;

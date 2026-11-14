@@ -100,7 +100,10 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 
         for (int i = 0; i < result->imports.count; i++) {
             const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+            /* A def's own import (#2285) binds no file-wide name: the parallel
+             * driver's map (cbm_import_binds_runtime_name) skips it as well. */
+            if (!imp->local_name || !imp->local_name[0] || !imp->module_path ||
+                imp->function_scope) {
                 continue;
             }
             char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
@@ -120,7 +123,8 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
         return 0;
     }
 
-    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
+    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties. Only a
+     * file with no extracted import reaches it, so no def's own import does. */
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     free(file_qn);

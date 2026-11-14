@@ -1008,6 +1008,9 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
         if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, callee_name) != 0) {
             continue;
         }
+        if (imp->function_scope) {
+            continue; /* a def's own import never enters the file-wide import map */
+        }
         if (specifier_is_relative(imp->module_path) ||
             specifier_names_indexed_package(indexed_packages, imp->module_path) ||
             specifier_names_declared_package(declared_packages, imp->module_path)) {
