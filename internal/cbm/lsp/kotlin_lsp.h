@@ -48,6 +48,7 @@
 #ifndef CBM_LSP_KOTLIN_LSP_H
 #define CBM_LSP_KOTLIN_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -97,6 +98,7 @@ typedef struct KotlinLSPContext {
     CBMKotlinUseKind *import_kinds;
     int import_count;
     int import_cap;
+    CBMNameRows import_rows; /* import_locals by name, rows in table order */
 
     /* Current declaration context. */
     const char *enclosing_func_qn;      /* function we are resolving inside */

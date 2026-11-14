@@ -7338,6 +7338,36 @@ TEST(cli_extract_binary_from_targz_invalid_data) {
     PASS();
 }
 
+/* The decompression limit keeps a hostile archive from inflating without end.
+ * The same archive is refused over a lowered limit and accepted under the real
+ * one, so the limit is the only reason for the refusal. */
+TEST(cli_update_refuses_an_archive_over_the_decompression_limit) {
+    enum { PAYLOAD = 1 << 20, LIMIT = 1 << 16 };
+    unsigned char *payload = calloc(1, PAYLOAD);
+    ASSERT_NOT_NULL(payload);
+    int archive_len = 0;
+    unsigned char *archive =
+        create_test_targz("codebase-memory-mcp", payload, PAYLOAD, &archive_len);
+    free(payload);
+    ASSERT_NOT_NULL(archive);
+
+    cbm_cli_set_decompress_max_for_test(LIMIT);
+    int over_len = 0;
+    unsigned char *over = cbm_extract_binary_from_targz(archive, archive_len, &over_len);
+    cbm_cli_set_decompress_max_for_test(0);
+    int under_len = 0;
+    unsigned char *under = cbm_extract_binary_from_targz(archive, archive_len, &under_len);
+    free(archive);
+
+    bool refused = over == NULL;
+    free(over);
+    bool accepted = under != NULL && under_len == PAYLOAD;
+    free(under);
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(accepted);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Zip extraction tests
  * ═══════════════════════════════════════════════════════════════════ */
@@ -21668,6 +21698,7 @@ SUITE(cli) {
     RUN_TEST(cli_extract_binary_from_targz);
     RUN_TEST(cli_extract_binary_from_targz_not_found);
     RUN_TEST(cli_extract_binary_from_targz_invalid_data);
+    RUN_TEST(cli_update_refuses_an_archive_over_the_decompression_limit);
     RUN_TEST(cli_extract_binary_from_zip);
     RUN_TEST(cli_extract_binary_from_zip_not_found);
     RUN_TEST(cli_extract_binary_from_zip_path_traversal);

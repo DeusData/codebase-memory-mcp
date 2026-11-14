@@ -3352,6 +3352,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     cbm_pipeline_lsp_field_index_t field_index = {0};
     bool field_index_built = false;
     bool field_index_ready = false;
+    cbm_spawn_file_begin(result->imports.items, result->imports.count);
     for (int c = 0; c < result->calls.count; c++) {
         const CBMCall *call = &result->calls.items[c];
         CBMCallEvidence fallback = {0};
@@ -3831,6 +3832,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         cbm_ht_foreach(lsp_legacy_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_legacy_idx);
     }
+    cbm_spawn_file_end();
     cbm_pipeline_external_import_index_free(&ext_imports);
     cbm_pipeline_lsp_field_index_free(&field_index);
 }

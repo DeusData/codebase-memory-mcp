@@ -7518,6 +7518,14 @@ int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run)
  */
 #ifdef CBM_CLI_ENABLE_TEST_API
 
+/* The most an archive may decompress to. A test lowers it to pin the refusal
+ * without building an archive of hundreds of megabytes. */
+static size_t g_cli_decompress_max = DECOMPRESS_MAX_BYTES;
+
+void cbm_cli_set_decompress_max_for_test(size_t max_bytes) {
+    g_cli_decompress_max = max_bytes ? max_bytes : DECOMPRESS_MAX_BYTES;
+}
+
 /* Decompress gzip data into a malloc'd buffer. Returns NULL on failure.
  * *out_total receives the decompressed size. Caller must free the result. */
 static unsigned char *gzip_decompress(const unsigned char *data, int data_len, size_t *out_total) {
@@ -7535,8 +7543,8 @@ static unsigned char *gzip_decompress(const unsigned char *data, int data_len, s
     if (buf_cap < CLI_BUF_4K) {
         buf_cap = CLI_BUF_4K;
     }
-    if (buf_cap > DECOMPRESS_MAX_BYTES) {
-        buf_cap = DECOMPRESS_MAX_BYTES;
+    if (buf_cap > g_cli_decompress_max) {
+        buf_cap = g_cli_decompress_max;
     }
     unsigned char *decompressed = malloc(buf_cap);
     if (!decompressed) {
@@ -7549,7 +7557,7 @@ static unsigned char *gzip_decompress(const unsigned char *data, int data_len, s
     do {
         if (total >= buf_cap) {
             size_t new_cap = buf_cap * GROWTH_FACTOR;
-            if (new_cap > DECOMPRESS_MAX_BYTES) {
+            if (new_cap > g_cli_decompress_max) {
                 free(decompressed);
                 inflateEnd(&strm);
                 return NULL;
