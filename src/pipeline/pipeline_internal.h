@@ -388,6 +388,8 @@ typedef struct {
     char *pkg_name;     /* heap: "@myorg/pkg", "github.com/foo/bar" */
     char *entry_rel;    /* heap: "packages/pkg/src/index" (no extension) */
     char *manifest_rel; /* heap: owning SwiftPM manifest, NULL for other ecosystems */
+    char *source_rel;   /* heap: the manifest file that yielded this entry; NULL if hand-built */
+    int source_seq;     /* position among that manifest's entries, in the parser's order */
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
