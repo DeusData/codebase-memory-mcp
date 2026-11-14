@@ -1976,25 +1976,11 @@ static int tf_role_env_isolation(int argc, char **argv) {
 }
 
 /* Process-tree memory probe coverage (test_subprocess.c). The root starts ONE
- * descendant that charges a controlled amount of memory, so a tree total can
- * be checked against an allocation only a descendant holds. The descendant
- * publishes its pid by an atomic rename once every page is touched, then
- * blocks until it is killed. The root exits when its descendant dies, so a
- * failed setup ends the tree instead of leaving the test waiting. */
-static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
-    char *end = NULL;
-    long mib = strtol(mib_text, &end, 10);
-    if (!end || *end != '\0' || mib < 0 || mib > 1024) {
-        return 81;
-    }
-    size_t bytes = (size_t)mib * 1024U * 1024U;
-    unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
-    if (bytes > 0 && !block) {
-        return 82;
-    }
-    if (block) {
-        memset(block, 0xA5, bytes);
-    }
+ * descendant that holds a controlled allocation. With a load path, it first
+ * publishes an idle marker and waits for the parent to finish its baseline
+ * sample. It then touches every page and publishes readiness. The root exits
+ * when the descendant dies, including on setup failure. */
+static int tf_rss_tree_publish_ready(const char *ready_path) {
     char staged[1024];
     int length = snprintf(staged, sizeof(staged), "%s.tmp", ready_path);
     FILE *ready = length > 0 && (size_t)length < sizeof(staged) ? cbm_fopen(staged, "wb") : NULL;
@@ -2009,6 +1995,41 @@ static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
     if (fclose(ready) != 0 || rename(staged, ready_path) != 0) {
         return 84;
     }
+    return 0;
+}
+
+static int tf_rss_tree_hold(const char *ready_path, const char *mib_text, const char *load_path) {
+    char *end = NULL;
+    long mib = strtol(mib_text, &end, 10);
+    if (!end || *end != '\0' || mib < 0 || mib > 1024) {
+        return 81;
+    }
+    if (load_path) {
+        char idle_path[1024];
+        int length = snprintf(idle_path, sizeof(idle_path), "%s.idle", ready_path);
+        if (length <= 0 || (size_t)length >= sizeof(idle_path)) {
+            return 83;
+        }
+        int idle_rc = tf_rss_tree_publish_ready(idle_path);
+        if (idle_rc != 0) {
+            return idle_rc;
+        }
+        while (!cbm_file_exists(load_path)) {
+            cbm_usleep(10000);
+        }
+    }
+    size_t bytes = (size_t)mib * 1024U * 1024U;
+    unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
+    if (bytes > 0 && !block) {
+        return 82;
+    }
+    if (block) {
+        memset(block, 0xA5, bytes);
+    }
+    int ready_rc = tf_rss_tree_publish_ready(ready_path);
+    if (ready_rc != 0) {
+        return ready_rc;
+    }
     volatile unsigned char keep = block ? block[bytes - 1] : 0;
     (void)keep;
     for (;;) {
@@ -2021,16 +2042,20 @@ static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
 }
 
 static int tf_role_rss_tree_hold(int argc, char **argv) {
-    return argc == 4 ? tf_rss_tree_hold(argv[2], argv[3]) : -1;
+    if (argc != 4 && argc != 5) {
+        return -1;
+    }
+    return tf_rss_tree_hold(argv[2], argv[3], argc == 5 ? argv[4] : NULL);
 }
 
 static int tf_role_rss_tree_root(int argc, char **argv) {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
         return -1;
     }
 #ifdef _WIN32
     char *self = cbm_module_path_utf8();
-    const char *child_argv[] = {self, "__cbm_rss_tree_hold", argv[2], argv[3], NULL};
+    const char *child_argv[] = {self, "__cbm_rss_tree_hold", argv[2], argv[3],
+                                argc == 5 ? argv[4] : NULL, NULL};
     char command_line[8192];
     bool built = self && cbm_build_win_cmdline(command_line, sizeof(command_line), child_argv);
     wchar_t *wide_self = built ? cbm_utf8_to_wide(self) : NULL;
@@ -2060,7 +2085,7 @@ static int tf_role_rss_tree_root(int argc, char **argv) {
         return 85;
     }
     if (child == 0) {
-        _exit(tf_rss_tree_hold(argv[2], argv[3]));
+        _exit(tf_rss_tree_hold(argv[2], argv[3], argc == 5 ? argv[4] : NULL));
     }
     int status = 0;
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
