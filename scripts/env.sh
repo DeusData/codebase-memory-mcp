@@ -138,8 +138,65 @@ if [[ "${CBM_NO_CCACHE:-0}" != "1" ]] && command -v ccache >/dev/null 2>&1; then
     export CCACHE_COMPILERCHECK=content
 fi
 
+# ── CPU summary (model + SHA-256 instructions) ─────────────────
+# src/foundation/sha256.c hashes on x86 SHA-NI / ARMv8 SHA2 when the CPU has
+# them and on its portable transform otherwise. A sanitized test runner
+# fingerprints its own ~800 MB image that way, so on a runner without those
+# instructions every fingerprint is many times slower; this makes the CPU a
+# hosted job drew visible in its log. Best effort and never fatal: anything
+# unreadable prints "unknown".
+cpu_summary() {
+    local model="" flags="" key="sha_ni" has="unknown"
+    if [[ "$HW_ARCH" == "arm64" || "${MSYSTEM:-}" == "CLANGARM64" ]]; then
+        key="sha2"
+    fi
+    if [[ "$OS" == "darwin" ]]; then
+        model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+        if [[ "$key" == "sha2" ]]; then
+            flags="$(sysctl -n hw.optional.arm.FEAT_SHA256 2>/dev/null || true)"
+            case "$flags" in
+                1) has="yes" ;;
+                0) has="no" ;;
+            esac
+        else
+            flags="$(sysctl -n machdep.cpu.leaf7_features 2>/dev/null || true)"
+            if [[ -n "$flags" ]]; then
+                case " $flags " in
+                    *" SHA "*) has="yes" ;;
+                    *) has="no" ;;
+                esac
+            fi
+        fi
+    elif [[ -r /proc/cpuinfo ]]; then
+        model="$(awk -F': *' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+        # MSYS2's own runtime is x86-64 even on Windows ARM64, so there its
+        # /proc/cpuinfo flags describe the emulated CPU, not the real one.
+        if [[ "${MSYSTEM:-}" != "CLANGARM64" ]]; then
+            flags="$(awk '/^(flags|Features)[[:space:]]*:/ {print; exit}' /proc/cpuinfo 2>/dev/null || true)"
+        fi
+        if [[ -n "$flags" ]]; then
+            case " $flags " in
+                *" $key "*) has="yes" ;;
+                *) has="no" ;;
+            esac
+        fi
+    fi
+    if [[ -z "$model" ]] && command -v lscpu >/dev/null 2>&1; then
+        model="$(lscpu 2>/dev/null | awk -F': *' '/^Model name/ {print $2; exit}' || true)"
+    fi
+    if [[ "$model" == "-" ]]; then
+        model="" # lscpu's placeholder for a CPU part it has no name for
+    fi
+    printf 'cpu="%s" %s=%s' "${model:-unknown}" "$key" "$has"
+}
+
 # ── Print environment summary ──────────────────────────────────
+# print_env CONTEXT [--cpu]: --cpu appends cpu_summary to the same line.
 print_env() {
     local context="$1"
-    echo "=== $context: os=$OS arch=$ARCH cores=$NPROC cc=${CC:-default} cxx=${CXX:-default} make=$MAKE ==="
+    local cpu=""
+    if [[ "${2:-}" == "--cpu" ]]; then
+        cpu=" $(cpu_summary)"
+    fi
+    echo "=== $context: os=$OS arch=$ARCH cores=$NPROC cc=${CC:-default} cxx=${CXX:-default} make=$MAKE$cpu ==="
 }
