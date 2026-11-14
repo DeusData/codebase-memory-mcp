@@ -828,12 +828,7 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
 
 typedef struct {
     bool spawned;
-    bool idle_ready;
-    long idle_pid;
-    cbm_proc_tree_rss_status_t idle_status;
-    uint64_t idle_rss;
     bool ready;
-    long pid;
     cbm_proc_tree_rss_status_t status;
     uint64_t rss;
     bool quiesced;
@@ -845,8 +840,7 @@ static void rss_tree_pause(void) {
     cbm_usleep(10000); /* poll interval only; nothing here is a deadline */
 }
 
-static bool rss_tree_wait_ready(const char *ready_path, cbm_subprocess_t *process,
-                                long *pid_out) {
+static bool rss_tree_wait_ready(const char *ready_path, cbm_subprocess_t *process) {
     for (;;) {
         FILE *ready = cbm_fopen(ready_path, "rb");
         if (ready) {
@@ -854,7 +848,6 @@ static bool rss_tree_wait_ready(const char *ready_path, cbm_subprocess_t *proces
             int fields = fscanf(ready, "%ld", &pid);
             (void)fclose(ready);
             if (fields == 1 && pid > 0) {
-                *pid_out = pid;
                 return true;
             }
         }
@@ -887,26 +880,20 @@ static bool rss_tree_finish(cbm_subprocess_t *process, rss_tree_sample_t *sample
 /* Measure one tree whose descendant holds `mib` MiB, with every non-root
  * member's measurement failing with `member_fault` (0 = real calls). */
 static rss_tree_sample_t rss_tree_sample(int mib, int member_fault) {
-    rss_tree_sample_t sample = {.idle_status = CBM_PROC_TREE_RSS_ERROR,
-                                .status = CBM_PROC_TREE_RSS_ERROR,
+    rss_tree_sample_t sample = {.status = CBM_PROC_TREE_RSS_ERROR,
                                 .final_status = CBM_PROC_TREE_RSS_ERROR,
                                 .final_rss = UINT64_MAX};
     const char *made = th_mktempdir("cbm_rss_tree");
     char dir[256];
     char ready_path[300];
-    char idle_path[320];
-    char load_path[300];
     char mib_text[16];
-    bool phased = mib > 0 && member_fault == 0;
     if (!made || snprintf(dir, sizeof(dir), "%s", made) >= (int)sizeof(dir) ||
-        snprintf(ready_path, sizeof(ready_path), "%s/ready", dir) >= (int)sizeof(ready_path) ||
-        snprintf(idle_path, sizeof(idle_path), "%s.idle", ready_path) >= (int)sizeof(idle_path) ||
-        snprintf(load_path, sizeof(load_path), "%s/load", dir) >= (int)sizeof(load_path)) {
+        snprintf(ready_path, sizeof(ready_path), "%s/ready", dir) >= (int)sizeof(ready_path)) {
         return sample;
     }
     (void)snprintf(mib_text, sizeof(mib_text), "%d", mib);
     const char *argv[] = {cbm_test_program_path, "__cbm_rss_tree_root", ready_path, mib_text,
-                          phased ? load_path : NULL, NULL};
+                          NULL};
     cbm_proc_opts_t opts = {0};
     opts.bin = cbm_test_program_path;
     opts.argv = argv;
@@ -914,19 +901,7 @@ static rss_tree_sample_t rss_tree_sample(int mib, int member_fault) {
     cbm_subprocess_t *process = NULL;
     sample.spawned = cbm_subprocess_spawn(&opts, &process) == 0;
     if (sample.spawned) {
-        bool load_requested = !phased;
-        if (phased) {
-            sample.idle_ready = rss_tree_wait_ready(idle_path, process, &sample.idle_pid);
-            if (sample.idle_ready) {
-                sample.idle_status = cbm_subprocess_tree_rss_bytes(process, &sample.idle_rss);
-                /* Release only after a successful idle measurement. */
-                if (sample.idle_status == CBM_PROC_TREE_RSS_OK && sample.idle_rss > 0) {
-                    FILE *load = cbm_fopen(load_path, "wb");
-                    load_requested = load && fclose(load) == 0;
-                }
-            }
-        }
-        sample.ready = load_requested && rss_tree_wait_ready(ready_path, process, &sample.pid);
+        sample.ready = rss_tree_wait_ready(ready_path, process);
         if (sample.ready) {
             cbm_subprocess_tree_rss_fault_members_for_testing(member_fault);
             sample.status = cbm_subprocess_tree_rss_bytes(process, &sample.rss);
@@ -938,26 +913,27 @@ static rss_tree_sample_t rss_tree_sample(int mib, int member_fault) {
     return sample;
 }
 
-/* Only the descendant allocates, after the parent samples the idle tree and
- * releases it through the load marker. Measure the SAME processes before and
- * after the 128 MiB allocation: independently spawned trees need not have the
- * same executable/sanitizer residency, notably on Windows. Keep the 96 MiB
- * floor so a root-only probe or an untouched allocation cannot pass. */
+/* Only the DESCENDANT allocates, so the difference between two otherwise
+ * identical trees is memory the probe can only have counted by measuring past
+ * the root. 128 MiB touched against a 96 MiB floor leaves room for allocator
+ * and page-rounding noise and none for a root-only total. */
 TEST(subprocess_tree_rss_measures_contained_descendants) {
+    rss_tree_sample_t idle = rss_tree_sample(0, 0);
     rss_tree_sample_t loaded = rss_tree_sample(128, 0);
-    if (loaded.status == CBM_PROC_TREE_RSS_OK && loaded.idle_status == CBM_PROC_TREE_RSS_OK) {
-        printf("    tree rss: idle(pid=%ld)=%llu MiB loaded(pid=%ld)=%llu MiB\n",
-               loaded.idle_pid, (unsigned long long)(loaded.idle_rss / RSS_TREE_MIB),
-               loaded.pid, (unsigned long long)(loaded.rss / RSS_TREE_MIB));
+    if (loaded.status == CBM_PROC_TREE_RSS_OK && idle.status == CBM_PROC_TREE_RSS_OK) {
+        printf("    tree rss: idle=%llu MiB loaded=%llu MiB\n",
+               (unsigned long long)(idle.rss / RSS_TREE_MIB),
+               (unsigned long long)(loaded.rss / RSS_TREE_MIB));
     }
+    ASSERT_TRUE(idle.spawned);
+    ASSERT_TRUE(idle.ready);
+    ASSERT_EQ(idle.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(idle.rss > 0);
     ASSERT_TRUE(loaded.spawned);
-    ASSERT_TRUE(loaded.idle_ready);
-    ASSERT_EQ(loaded.idle_status, CBM_PROC_TREE_RSS_OK);
-    ASSERT_TRUE(loaded.idle_rss > 0);
     ASSERT_TRUE(loaded.ready);
-    ASSERT_EQ(loaded.pid, loaded.idle_pid);
     ASSERT_EQ(loaded.status, CBM_PROC_TREE_RSS_OK);
-    ASSERT_TRUE(loaded.rss >= loaded.idle_rss + 96 * RSS_TREE_MIB);
+    ASSERT_TRUE(loaded.rss >= idle.rss + 96 * RSS_TREE_MIB);
+    ASSERT_TRUE(idle.quiesced);
     ASSERT_TRUE(loaded.quiesced);
     ASSERT_EQ(loaded.final_status, CBM_PROC_TREE_RSS_EMPTY);
     ASSERT_EQ(loaded.final_rss, 0);
