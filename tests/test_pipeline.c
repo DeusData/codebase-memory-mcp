@@ -6907,6 +6907,157 @@ TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental) {
     PASS();
 }
 
+/* The receiver gate's fixture: member calls whose receivers are lambda
+ * parameters nothing types, so every one of them reaches the registry's
+ * name-only exits, a C call through a function-pointer member, and a Go call
+ * on a standard-library package. */
+static const char GATE_CALLER_PATH[] = "streams/src/main/java/org/acme/streams/Assign.java";
+static const char GATE_CALLER[] =
+    "package org.acme.streams;\n\nimport java.util.List;\n\npublic class Assign {\n"
+    "    long count(List<Object> tps, String t) {\n"
+    "        return tps.stream().filter(tp -> tp.topic().equals(t)).count();\n    }\n\n"
+    "    long found(List<Object> repos) {\n"
+    "        return repos.stream().filter(repo -> repo.find() > 0).count();\n    }\n\n"
+    "    long cleaned(List<Object> ms) {\n"
+    "        return ms.stream().filter(cleanerManager -> cleanerManager.cleaningState() > 0)"
+    ".count();\n    }\n\n"
+    "    Object built() {\n        return new RaftContext.Builder().withVoters();\n    }\n\n"
+    "    void named() {\n        new External().setName(\"x\");\n    }\n\n"
+    "    long parts(List<Object> ts) {\n"
+    "        return ts.stream().filter(topic -> topic.numPartitions() > 0).count();\n    }\n"
+    "}\n";
+static const char GATE_C_PATH[] = "csrc/alloc.c";
+static const char GATE_C[] = "#include <stddef.h>\n\n"
+                             "typedef struct allocFuncs {\n    void *(*mallocFn)(size_t);\n} "
+                             "allocFuncs;\n\n"
+                             "static void *plain_malloc(size_t n) { return NULL; }\n\n"
+                             "allocFuncs allocFns = {plain_malloc};\n\n"
+                             "void *my_malloc(size_t n) {\n    return allocFns.mallocFn(n);\n}\n";
+static const char GATE_GO_PATH[] = "gosrc/cmd/main.go";
+static const char GATE_GO[] = "package cmd\n\nimport \"strings\"\n\n"
+                              "func Run(parts []string) string {\n"
+                              "\treturn strings.Join(parts, \",\")\n}\n";
+static const char GATE_RECORD[] =
+    "clients/src/main/java/org/acme/clients/consumer/ConsumerRecord.java";
+static const char GATE_PRODUCER[] =
+    "clients/src/main/java/org/acme/clients/producer/ProducerRecord.java";
+static const char GATE_REPO[] = "clients/src/main/java/org/acme/clients/store/Repo.java";
+static const char GATE_INDEX[] = "core/src/main/java/org/acme/index/Index.java";
+static const char GATE_LOGGER[] = "core/src/main/java/org/acme/log/Logger.java";
+static const char GATE_GO_JOIN[] = "gosrc/util/join.go";
+static const char GATE_SCALA_PATH[] = "streams/src/main/scala/org/acme/streams/Assigner.scala";
+static const char GATE_SCALA[] =
+    "package org.acme.streams\n\nobject Assigner {\n"
+    "  def count(tps: Seq[AnyRef], t: String): Int = tps.count(tp => tp.topicName() == t)\n\n"
+    "  def named(rs: Seq[AnyRef], t: String): Int =\n"
+    "    rs.count(consumerRecordS => consumerRecordS.topicName() == t)\n}\n";
+static const char GATE_SCALA_CONSUMER[] =
+    "clients/src/main/scala/org/acme/clients/consumer/Record.scala";
+static const char GATE_SCALA_PRODUCER[] =
+    "clients/src/main/scala/org/acme/clients/producer/Record.scala";
+
+static void gate_fixture(const char *tmp) {
+    write_temp_file(tmp, GATE_RECORD,
+                    "package org.acme.clients.consumer;\n\npublic class ConsumerRecord {\n"
+                    "    public String topic() { return \"t\"; }\n}\n");
+    write_temp_file(tmp, GATE_PRODUCER,
+                    "package org.acme.clients.producer;\n\npublic class ProducerRecord {\n"
+                    "    public String topic() { return \"p\"; }\n}\n");
+    write_temp_file(tmp, GATE_REPO,
+                    "package org.acme.clients.store;\n\npublic class Repo {\n"
+                    "    public int find() { return 1; }\n}\n");
+    write_temp_file(tmp, GATE_INDEX,
+                    "package org.acme.index;\n\npublic class Index {\n"
+                    "    public int find() { return 2; }\n}\n");
+    write_temp_file(tmp, "core/src/main/java/org/acme/log/LogCleanerManager.java",
+                    "package org.acme.log;\n\npublic class LogCleanerManager {\n"
+                    "    public int cleaningState() { return 1; }\n}\n");
+    write_temp_file(tmp, GATE_LOGGER,
+                    "package org.acme.log;\n\npublic class Logger {\n"
+                    "    public void setName(String name) {}\n}\n");
+    write_temp_file(tmp, "clients/src/main/java/org/acme/clients/RaftContext.java",
+                    "package org.acme.clients;\n\npublic class RaftContext {\n"
+                    "    public static class Builder {\n"
+                    "        public Builder withVoters() { return this; }\n    }\n}\n");
+    write_temp_file(tmp, "streams/src/main/java/org/acme/streams/TopicInfo.java",
+                    "package org.acme.streams;\n\npublic class TopicInfo {\n"
+                    "    public int numPartitions() { return 1; }\n}\n");
+    write_temp_file(tmp, "go.mod", "module example.com/gate\n\ngo 1.22\n");
+    write_temp_file(tmp, GATE_GO_JOIN,
+                    "package util\n\nfunc Join(parts []string) string { return \"\" }\n");
+    write_temp_file(tmp, GATE_SCALA_CONSUMER,
+                    "package org.acme.clients.consumer\n\nclass ConsumerRecordS {\n"
+                    "  def topicName(): String = \"t\"\n}\n");
+    write_temp_file(tmp, GATE_SCALA_PRODUCER,
+                    "package org.acme.clients.producer\n\nclass ProducerRecordS {\n"
+                    "  def topicName(): String = \"p\"\n}\n");
+    write_temp_file(tmp, GATE_CALLER_PATH, GATE_CALLER);
+    write_temp_file(tmp, GATE_SCALA_PATH, GATE_SCALA);
+    write_temp_file(tmp, GATE_C_PATH, GATE_C);
+    write_temp_file(tmp, GATE_GO_PATH, GATE_GO);
+}
+
+/* A member call whose receiver type nothing resolved binds by name only on
+ * evidence that it means the candidate. Refused: Scala's proximity pick
+ * between two same-named methods for `tp.topicName()` (kafka's `tp.topic()`
+ * shape), and Go's `strings.Join` onto the project's one Join. Kept: the
+ * Scala receiver named after its owner, and a C call through a
+ * function-pointer member, which the C member resolver types (C is off the
+ * gate's allowlist). A veto, not a re-pick: a refused call stays unresolved.
+ * Full index (sequential and parallel) and both incremental routes. Java is
+ * off the allowlist too (the registry test pins every language's scope); the
+ * Java files only share the fixture. */
+TEST(pipeline_registry_receiver_gate_full_and_incremental) {
+    static const struct {
+        const char *source;
+        const char *target;
+        const char *file;
+        const char *other;
+        const char *caller_path;
+        const char *caller;
+        int expect;
+    } cases[] = {
+        {"count", "topicName", GATE_SCALA_CONSUMER, GATE_SCALA_PRODUCER, GATE_SCALA_PATH,
+         GATE_SCALA, 0},
+        {"named", "topicName", GATE_SCALA_CONSUMER, GATE_SCALA_PRODUCER, GATE_SCALA_PATH,
+         GATE_SCALA, 1},
+        {"my_malloc", "mallocFn", GATE_C_PATH, GATE_INDEX, GATE_C_PATH, GATE_C, 1},
+        {"Run", "Join", GATE_GO_JOIN, GATE_INDEX, GATE_GO_PATH, GATE_GO, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_gate_%zu_XXXXXX", i);
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        gate_fixture(tmp);
+        rank_probe_t r;
+        rank_probe(tmp, cases[i].caller_path, cases[i].caller, cases[i].source, cases[i].target,
+                   cases[i].file, cases[i].other, &r);
+        int par = -1;
+        int par_other = -1;
+        rank_probe_parallel(tmp, cases[i].source, cases[i].target, cases[i].file, cases[i].other,
+                            &par, &par_other);
+        th_rmtree(tmp);
+        int want = cases[i].expect;
+        bool routes_ok = r.route[1] == CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR;
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        routes_ok = routes_ok && r.route[2] == CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL;
+#endif
+        bool others_zero = r.other[0] == 0 && par_other == 0 && r.other[1] == 0 && r.other[2] == 0;
+        if (r.want[0] != want || par != want || !routes_ok || r.want[1] != want ||
+            r.want[2] != want || !others_zero) {
+            char why[256];
+            snprintf(why, sizeof(why),
+                     "%s -> %s: want %d, got full %d parallel %d closure %d legacy %d, other "
+                     "%d %d %d %d (routes %d %d)",
+                     cases[i].source, cases[i].target, want, r.want[0], par, r.want[1], r.want[2],
+                     r.other[0], par_other, r.other[1], r.other[2], (int)r.route[1],
+                     (int)r.route[2]);
+            FAIL(why);
+        }
+    }
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -28534,15 +28685,17 @@ TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
     ASSERT_STR_EQ(r.strategy, "unique_name");
 
     /* A Go call and the language-blind cbm_registry_resolve read a second
-     * keyword spelling as a value root as well. */
+     * keyword spelling as a value root as well. A Go value receiver binds a
+     * name-only candidate on evidence (the receiver gate): here the candidate
+     * lives in the caller's own module, which a type root would not admit. */
     cbm_registry_t *reg2 = cbm_registry_new();
-    cbm_registry_add(reg2, "Join", "tmp.Decoys.Joiner.Join", "Method", false);
+    cbm_registry_add(reg2, "Join", "tmp.Demo.Joiner.Join", "Method", false);
     cbm_resolution_t r2 =
         cbm_registry_resolve_call_lang(reg2, "string.Join", "tmp.Demo", NULL, NULL, 0, CBM_LANG_GO);
-    ASSERT_STR_EQ(r2.qualified_name, "tmp.Decoys.Joiner.Join");
+    ASSERT_STR_EQ(r2.qualified_name, "tmp.Demo.Joiner.Join");
     ASSERT_STR_EQ(r2.strategy, "unique_name");
     r2 = cbm_registry_resolve(reg2, "string.Join", "tmp.Demo", NULL, NULL, 0);
-    ASSERT_STR_EQ(r2.qualified_name, "tmp.Decoys.Joiner.Join");
+    ASSERT_STR_EQ(r2.qualified_name, "tmp.Demo.Joiner.Join");
     ASSERT_STR_EQ(r2.strategy, "unique_name");
 
     cbm_registry_free(reg);
@@ -28554,15 +28707,16 @@ TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
  * `int`: in receiver position (`dynamic.Invoke(...)`) it is a variable that
  * happens to be called `dynamic`, whose type the chain does not show. In a C#
  * file it must stay an ordinary lower-case value root, like vm.load above, so
- * the call still binds: the control that keeps the keyword list closed to
- * words that can only name a type. */
+ * the call still binds on a value receiver's evidence (here: a candidate in
+ * the caller's own module, which a type root would not admit): the control
+ * that keeps the keyword list closed to words that can only name a type. */
 TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Invoke", "tmp.Handlers.Handler.Invoke", "Method", false);
+    cbm_registry_add(reg, "Invoke", "tmp.Demo.Handler.Invoke", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "dynamic.Invoke", "tmp.Demo", NULL,
                                                         NULL, 0, CBM_LANG_CSHARP);
-    ASSERT_STR_EQ(r.qualified_name, "tmp.Handlers.Handler.Invoke");
+    ASSERT_STR_EQ(r.qualified_name, "tmp.Demo.Handler.Invoke");
     ASSERT_STR_EQ(r.strategy, "unique_name");
 
     cbm_registry_free(reg);
@@ -34898,6 +35052,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental);
     RUN_TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental);
     RUN_TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental);
+    RUN_TEST(pipeline_registry_receiver_gate_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
