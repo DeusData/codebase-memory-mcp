@@ -8,6 +8,7 @@
 #include "foundation/compat_fs.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3238,6 +3239,177 @@ int cbm_toml_remove_legacy_table(const char *file_path, const char *table_name,
     free(existing);
     return result;
 }
+/* A surviving opener is evidence for this table, not permission to adopt a
+ * different command or argument shape. User fields do not weaken ownership. */
+static int toml_codex_recovery_body(const char *data, const toml_section_t *section) {
+    toml_legacy_shape_t shape = {0};
+    int foreign = 0;
+    int multiline_state = TOML_STRING_NONE;
+    size_t cursor = section->body;
+    toml_line_t line;
+    while (toml_next_line(data, section->end, &cursor, &line)) {
+        if (multiline_state == TOML_STRING_NONE && !toml_line_is_blank_or_comment(data, &line)) {
+            toml_assignment_t assignment;
+            int result = toml_parse_assignment(data, &line, &assignment);
+            if (result == TOML_EDIT_OK && !assignment.present) {
+                result = TOML_EDIT_ERR;
+            }
+            if (result == TOML_EDIT_OK && (toml_key_path_is_single(&assignment.key, "command") ||
+                                           toml_key_path_is_single(&assignment.key, "args") ||
+                                           toml_key_path_is_single(&assignment.key, "env_vars"))) {
+                result = toml_legacy_classify_assignment(data, &assignment, &shape, &foreign);
+            }
+            toml_assignment_dispose(&assignment);
+            if (result != TOML_EDIT_OK) {
+                return TOML_EDIT_ERR;
+            }
+        }
+        if (toml_scan_line_strings(data, &line, &multiline_state) != TOML_EDIT_OK) {
+            return TOML_EDIT_ERR;
+        }
+    }
+    return multiline_state == TOML_STRING_NONE && !foreign && toml_legacy_schema_is_owned(&shape)
+               ? TOML_EDIT_OK
+               : TOML_EDIT_ERR;
+}
+
+/* A trailing comment may open the next managed block (SessionStart).
+ * Keep that decoration after our closer, without cutting a string. */
+static int toml_codex_recovery_content_end(const char *data, size_t start, size_t limit,
+                                           size_t *end) {
+    size_t cursor = start;
+    int multiline_state = TOML_STRING_NONE;
+    toml_line_t line;
+    *end = start;
+    while (toml_next_line(data, limit, &cursor, &line)) {
+        if (multiline_state != TOML_STRING_NONE || !toml_line_is_blank_or_comment(data, &line)) {
+            *end = line.full_end;
+        }
+        if (toml_scan_line_strings(data, &line, &multiline_state) != TOML_EDIT_OK) {
+            return TOML_EDIT_ERR;
+        }
+    }
+    return multiline_state == TOML_STRING_NONE ? TOML_EDIT_OK : TOML_EDIT_ERR;
+}
+
+/* Infer only the contiguous owned range. A later piece behind a foreign
+ * section is rejected by the existing whole-file conflict check. */
+static int toml_codex_recovery_end(const char *data, size_t len, const toml_line_t *begin,
+                                   const char *block, size_t block_len, size_t *end) {
+    enum { MCP_PARENT_PART, MCP_SERVER_PART, MCP_PATH_PARTS };
+    toml_section_t declared = {0};
+    toml_section_t owned = {0};
+    size_t first = 0U;
+    int result = TOML_EDIT_ERR;
+    if (toml_section_at(block, 0U, block_len, &declared) != TOML_EDIT_OK ||
+        declared.end != block_len || declared.header.array ||
+        declared.header.path.count != MCP_PATH_PARTS ||
+        strcmp(toml_key_path_segment(&declared.header.path, MCP_PARENT_PART), "mcp_servers") != 0 ||
+        strcmp(toml_key_path_segment(&declared.header.path, MCP_SERVER_PART),
+               "codebase-memory-mcp") != 0 ||
+        toml_section_end(data, begin->full_end, len, &first) != TOML_EDIT_OK ||
+        toml_lines_significant(data, begin->full_end, first) ||
+        toml_section_at(data, first, len, &owned) != TOML_EDIT_OK || owned.header.array ||
+        !toml_key_path_equal(&owned.header.path, &declared.header.path) ||
+        toml_codex_recovery_body(data, &owned) != TOML_EDIT_OK) {
+        goto done;
+    }
+    toml_managed_span_t desired = {.owned = block, .owned_len = block_len};
+    size_t last_body = owned.body;
+    *end = owned.end;
+    result = TOML_EDIT_OK;
+    while (*end < len) {
+        toml_section_t child;
+        if (toml_section_at(data, *end, len, &child) != TOML_EDIT_OK) {
+            result = TOML_EDIT_ERR;
+            break;
+        }
+        int attached = toml_key_path_has_prefix(&child.header.path, &declared.header.path);
+        if (attached) {
+            if (child.header.path.count == declared.header.path.count) {
+                result = TOML_EDIT_ERR;
+            } else {
+                /* Borrow the suffix; its storage belongs to child.header. */
+                toml_key_path_t relative = {
+                    .data = child.header.path.data + declared.header.path.len,
+                    .len = child.header.path.len - declared.header.path.len,
+                    .count = child.header.path.count - declared.header.path.count,
+                };
+                int written = 0;
+                result = toml_declared_writes_key(&desired, &declared, &relative, &written);
+                if (written) {
+                    result = TOML_EDIT_ERR;
+                }
+            }
+            last_body = child.body;
+            *end = child.end;
+        }
+        toml_header_dispose(&child.header);
+        if (!attached || result != TOML_EDIT_OK) {
+            break;
+        }
+    }
+    if (result == TOML_EDIT_OK && *end < len) {
+        result = toml_codex_recovery_content_end(data, last_body, *end, end);
+    }
+done:
+    toml_header_dispose(&owned.header);
+    toml_header_dispose(&declared.header);
+    return result;
+}
+
+int cbm_toml_recover_codex_mcp(const char *file_path, const char *begin_marker,
+                               const char *end_marker, const char *block, int *recovered) {
+    if (!recovered) {
+        return TOML_EDIT_ERR;
+    }
+    *recovered = 0;
+    size_t block_len = 0U;
+    if (!toml_valid_path(file_path) || !toml_valid_marker(begin_marker) ||
+        !toml_valid_marker(end_marker) || strcmp(begin_marker, end_marker) == 0 ||
+        !toml_managed_body_valid(block, begin_marker, end_marker, &block_len)) {
+        return TOML_EDIT_ERR;
+    }
+    toml_buffer_t existing = {0};
+    toml_buffer_t output = {0};
+    toml_file_snapshot_t snapshot;
+    int result = TOML_EDIT_ERR;
+    if (toml_read_file(file_path, &existing.data, &existing.len, &snapshot) != TOML_EDIT_OK ||
+        !toml_text_is_safe(existing.data, existing.len, true)) {
+        goto done;
+    }
+    toml_line_t begin = {0};
+    toml_line_t end = {0};
+    int has_pair = 0;
+    int found = toml_find_markers(existing.data, existing.len, begin_marker, end_marker, &begin,
+                                  &end, &has_pair);
+    if (found == TOML_EDIT_OK || (found == TOML_EDIT_ORPHAN_MARKER && begin.full_end == 0U)) {
+        result = TOML_EDIT_OK;
+        goto done;
+    }
+    size_t owned_end = 0U;
+    if (found != TOML_EDIT_ORPHAN_MARKER ||
+        toml_codex_recovery_end(existing.data, existing.len, &begin, block, block_len,
+                                &owned_end) != TOML_EDIT_OK ||
+        toml_managed_block_conflicts(existing.data, existing.len, begin.start, owned_end, block,
+                                     block_len) != TOML_EDIT_OK) {
+        goto done;
+    }
+    /* The inferred closer consumes no input bytes. Reuse the normal merge,
+     * then publish the complete repair once against the original snapshot. */
+    end.start = end.content_end = end.full_end = owned_end;
+    if (toml_managed_rewrite(existing.data, existing.len, &begin, &end, begin_marker, end_marker,
+                             block, block_len, true, &output) == TOML_EDIT_OK) {
+        result = toml_write_atomic(file_path, existing.data, existing.len, output.data, output.len,
+                                   &snapshot);
+        *recovered = result == TOML_EDIT_OK;
+    }
+done:
+    toml_buffer_dispose(&output);
+    toml_buffer_dispose(&existing);
+    return result;
+}
+
 typedef struct {
     size_t start, end;
 } toml_codex_edit_t;
