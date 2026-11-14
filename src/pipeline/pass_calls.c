@@ -133,7 +133,7 @@ static const cbm_gbuf_node_t *pc_find_by_computed_qn(const cbm_gbuf_t *gbuf, con
     return n;
 }
 
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
+static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path, CBMLanguage language,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count) {
     *out_keys = NULL;
@@ -157,7 +157,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                 continue;
             }
             const cbm_gbuf_node_t *target =
-                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, language, imp, NULL, NULL);
             if (!target) {
                 continue;
             }
@@ -1614,7 +1614,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, files[i].language, result, &imp_keys, &imp_vals, &imp_count);
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -1788,7 +1788,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, files[i].rel_path, files[i].language, result, &imp_keys, &imp_vals,
+                         &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];

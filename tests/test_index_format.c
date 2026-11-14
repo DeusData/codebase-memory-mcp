@@ -459,10 +459,120 @@ TEST(index_format_v2_images_rebuild_without_invented_host) {
     PASS();
 }
 
+/* Format 5 stored no `package` property on File nodes (#2360). An incremental
+ * refresh reads the declared packages of the files it does not re-extract back
+ * from that property, so a format-5 index refreshed in place would resolve a
+ * Scala import into an unchanged package against an incomplete package map and
+ * the fail-closed resolver would drop the edge until the next full index. */
+static const RFile k_scala_files[] = {
+    {"model/src/Target.scala", "package com.acme.model\nobject Target { def build(): Int = 1 }\n"},
+    {"model/src/Aux.scala", "package com.acme.model\nobject Aux { def value: Int = 2 }\n"},
+    {"client/src/Consumer.scala", "package com.acme.client\n"
+                                  "import com.acme.model.Target\n"
+                                  "object Consumer { def run(): Int = Target.build() }\n"},
+};
+
+/* IMPORTS edges from Consumer.scala's File node to a node named Target. */
+static int scala_consumer_target_imports(cbm_store_t *s, const char *project) {
+    cbm_node_t *files = NULL;
+    int nfiles = 0;
+    if (cbm_store_find_nodes_by_name(s, project, "Consumer.scala", &files, &nfiles) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int hits = 0;
+    for (int f = 0; f < nfiles && hits >= 0; f++) {
+        if (!files[f].label || strcmp(files[f].label, "File") != 0) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (cbm_store_find_edges_by_source_type(s, files[f].id, "IMPORTS", &edges, &n) !=
+            CBM_STORE_OK) {
+            hits = -1;
+            break;
+        }
+        for (int e = 0; e < n; e++) {
+            cbm_node_t t = {0};
+            if (cbm_store_find_node_by_id(s, edges[e].target_id, &t) == CBM_STORE_OK && t.name &&
+                strcmp(t.name, "Target") == 0) {
+                hits++;
+            }
+            cbm_node_free_fields(&t);
+        }
+        cbm_store_free_edges(edges, n);
+    }
+    cbm_store_free_nodes(files, nfiles);
+    return hits;
+}
+
+static int scala_files_with_package(cbm_store_t *s) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM nodes WHERE label='File' AND json_valid(properties)"
+                           " AND json_extract(properties, '$.package') IS NOT NULL",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int count = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return count;
+}
+
+TEST(index_format_v5_scala_packages_rebuild) {
+    RProj lp;
+    cbm_store_t *q0 = rh_index_files(&lp, k_scala_files, 3);
+    ASSERT_NOT_NULL(q0);
+    ASSERT_EQ(scala_consumer_target_imports(q0, lp.project), 1);
+    cbm_store_close(q0);
+
+    /* The old shape: no File node carries its package clause. */
+    cbm_store_t *w = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(w);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(w),
+                           "UPDATE nodes SET properties = json_remove(properties, '$.package') "
+                           "WHERE label='File' AND json_valid(properties) "
+                           "AND json_extract(properties, '$.package') IS NOT NULL",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_changes(cbm_store_get_db(w)), 3);
+    ASSERT_EQ(cbm_store_set_format_version(w, 5), CBM_STORE_OK);
+    cbm_store_close(w);
+
+    /* A body-only edit of the importer: refreshed in place, only Consumer.scala
+     * would be re-resolved, against the clauses stored on the other files. */
+    char path[700];
+    snprintf(path, sizeof(path), "%s/client/src/Consumer.scala", lp.tmpdir);
+    FILE *fp = fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("package com.acme.client\n"
+          "import com.acme.model.Target\n"
+          "object Consumer { def run(): Int = Target.build() + 1 }\n",
+          fp);
+    fclose(fp);
+
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_store_t *r = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(scala_consumer_target_imports(r, lp.project), 1);
+    if (!strstr(g_log_buf, "format_change_reindex")) {
+        FAIL("a format-5 index was not routed through the full-reindex path");
+    }
+    ASSERT_EQ(scala_files_with_package(r), 3);
+    int format = -1;
+    ASSERT_EQ(cbm_store_get_format_version(r, &format), CBM_STORE_OK);
+    ASSERT_EQ(format, CBM_INDEX_FORMAT_VERSION);
+    rh_cleanup(&lp, r);
+    PASS();
+}
+
 SUITE(index_format) {
     RUN_TEST(index_format_siblings_distinct_and_searchable);
     RUN_TEST(index_format_legacy_index_rebuilds_and_repairs);
     RUN_TEST(index_format_version_one_rebuilds);
     RUN_TEST(index_format_swift_collisions_and_stale_calls_rebuild);
     RUN_TEST(index_format_v2_images_rebuild_without_invented_host);
+    RUN_TEST(index_format_v5_scala_packages_rebuild);
 }

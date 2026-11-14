@@ -60,7 +60,7 @@ src/pipeline/pass_calls.c	22
 src/pipeline/pass_compile_commands.c	17
 src/pipeline/pass_configlink.c	3
 src/pipeline/pass_cross_repo.c	8
-src/pipeline/pass_definitions.c	11
+src/pipeline/pass_definitions.c	9
 src/pipeline/pass_enrichment.c	15
 src/pipeline/pass_ensemble_routing.c	10
 src/pipeline/pass_githistory.c	27
@@ -68,7 +68,7 @@ src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
 src/pipeline/pass_k8s.c	6
 src/pipeline/pass_lsp_cross.c	49
-src/pipeline/pass_parallel.c	31
+src/pipeline/pass_parallel.c	29
 src/pipeline/pass_pkgmap.c	80
 src/pipeline/pass_semantic.c	3
 src/pipeline/pass_tests.c	3
