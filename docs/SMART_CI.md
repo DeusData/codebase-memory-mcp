@@ -5,9 +5,11 @@ change can reach. This page explains how this repository does it and how
 another repository on GitHub Actions could do the same with the released
 `codebase-memory-mcp` binary.
 
-Status: experimental. Every answer carries `"experimental": true`. The
-selection narrows real test runs only while the repository variable
-`TEST_IMPACT_MODE` is `gate`; otherwise it runs in report-only (shadow) mode.
+Status: experimental. Every answer carries `"experimental": true`. In this
+repository the selection narrows real test runs by default, fork PRs
+included; the repository variable `TEST_IMPACT_MODE` set to anything but
+`gate` turns it off for same-repository PRs (fork PRs get no variables: see
+(d)), and it then runs in report-only (shadow) mode.
 
 > **Read the scope section before you start.** The lane layer is a pattern
 > any repository can copy. The test layer narrows only C/C++ code whose tests
@@ -27,7 +29,7 @@ cannot be affected. When it is unsure, it runs everything:
 - no coverage map, or a coverage map that is not admitted (wrong commit, more
   than 7 days old, made for another platform or harness);
 - a change that reaches the test runner's `main`, or a test-runner role
-  (below) that no test names;
+  (below) that no test names and that no role with known spawners starts;
 - a role table entry the engine cannot read, or a macro naming a role's
   literal that it cannot follow;
 - any failure of the selection job itself.
@@ -40,7 +42,8 @@ Each of these makes the run cost more CI minutes. None of them loses coverage.
 changed files ──► Layer 1: lane selector ──► which CI jobs run
                   (scripts/ci/select-lanes.sh, your own rules)
                                    │
-                                   ▼  (the Linux x86_64 test leg only, in this repo)
+                                   ▼  (every test leg in this repo; off Linux x86_64,
+                                   │   platform-specific suites run whole)
 merge base + PR ─► Layer 2: test-impact engine ─► which suites / tests run
                   (codebase-memory-mcp test-impact select
                    + team-artifact bundle from main)
@@ -251,7 +254,7 @@ everything (`builtin:test-impact-config`).
 
 ```yaml
   select-tests:
-    if: ${{ vars.TEST_IMPACT_MODE == 'gate' }}
+    if: ${{ (vars.TEST_IMPACT_MODE || 'gate') == 'gate' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -263,12 +266,17 @@ everything (`builtin:test-impact-config`).
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The selection scripts come from the merge base, never from the PR.
+      - run: git worktree add --detach "$RUNNER_TEMP/base-tooling" HEAD^1
       - name: Install codebase-memory-mcp
         run: <the pinned install from Prerequisites>
       - id: select
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/test-impact-select.sh --binary "$RUNNER_TEMP/cbm/codebase-memory-mcp" --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
+        run: |
+          "$RUNNER_TEMP/base-tooling/scripts/ci/test-impact-select.sh" --repo "$GITHUB_WORKSPACE" \
+            --binary "$RUNNER_TEMP/cbm/codebase-memory-mcp" \
+            --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
       - if: ${{ steps.select.outputs.selection == 'narrowed' }}
         uses: actions/upload-artifact@<pinned-sha>
         with:
@@ -297,7 +305,10 @@ answer writes:
 - `DIR/test-only.txt`: one token per line, either `suite` (run the whole
   suite) or `suite:test`;
 - `DIR/optional-suites.txt`: selected suites that are registered only under a
-  preprocessor condition. A build may lack them.
+  preprocessor condition. A build may lack them;
+- `DIR/portable/` (with `portable=narrowed`): the same two files for the legs
+  the coverage is not recorded on, where every platform-specific suite runs
+  whole (see below).
 
 Everything else means `all`: a `run_all` answer, an unknown schema or filter
 encoding, a filter that disagrees with the lane's suite list, a crash, and a
@@ -338,24 +349,48 @@ spawner. A reached handler that no test names, a table entry the engine cannot
 read, and a change reaching `main` any other way still run everything; the
 engine note names the call chain into `main`.
 
-**Only the legs the coverage speaks for should narrow.** Here the coverage
-comes from one Linux x86_64 clang-21 producer. Only the Linux x86_64 test leg
-downloads the selection (`runner.os == 'Linux' && runner.arch == 'X64'` in
-`_test.yml`). The arm64, macOS and Windows legs always run everything,
-because code under architecture or platform `#ifdef`s has static evidence
-only there. That leg builds with gcc, not clang: code under a compiler `#if`
-has static evidence only too, and `--platform` names the producer's platform,
-so the engine's platform check admits the map by construction.
+A role handler may start another role's child: `__cbm_rss_tree_root` starts
+`__cbm_rss_tree_hold`. A handler that names another role's literal starts that
+role, so a reached started role is lifted with its starter: the tests that
+name the starter run, and the started role needs no test of its own.
 
-### (d) Flip the variable
+**Platform code narrows only where the coverage speaks for it.** Here the
+coverage comes from one Linux x86_64 clang-21 producer. The Linux x86_64 test
+leg runs the selection as the engine answered it (`runner.os == 'Linux' &&
+runner.arch == 'X64'` in `_test.yml`). The arm64, macOS and Windows legs run
+its portable view (`DIR/portable/`): every platform-specific suite runs whole
+there, selected or not, because code under architecture or platform `#ifdef`s
+has static evidence only on those legs. A suite is platform-specific when its
+test file holds a `SKIP_PLATFORM(` call or an `#if`/`#ifdef` on an OS or
+architecture macro (the two markers `scripts/check-no-test-skips.sh` names for
+a genuinely platform-specific test), at the base or at HEAD, or when the
+runner registers it under such a conditional (`selection.py platform-suites`).
+Platform-neutral suites narrow on every leg. The x86_64 leg builds with gcc,
+not clang: code under a compiler `#if` has static evidence only too, and
+`--platform` names the producer's platform, so the engine's platform check
+admits the map by construction.
 
-Shadow is the default: the variable is unset, `select-tests` is skipped, and
-every test runs. When the evidence is in, set the repository variable:
+### (d) The mode switch
+
+The expression `(vars.TEST_IMPACT_MODE || 'gate') == 'gate'` makes gate the
+default: a pull request from a fork gets no repository variables, so a test of
+`vars.TEST_IMPACT_MODE == 'gate'` alone never narrowed a fork PR. Never move
+the job to `pull_request_target` to get the variables: that runs fork code
+with a write token. Off switches:
 
 ```bash
-gh variable set TEST_IMPACT_MODE --body gate      # gate
-gh variable delete TEST_IMPACT_MODE               # back to shadow
+gh variable set TEST_IMPACT_MODE --body shadow    # same-repository PRs: shadow
+gh variable delete TEST_IMPACT_MODE               # back to the default (gate)
 ```
+
+For fork PRs the off switch is the default in the expression: change `'gate'`
+to `'shadow'` on main, and each PR picks it up with its next merge ref. A
+repository that wants shadow until its evidence is in writes `'shadow'` there
+from the start.
+
+The selection runs the merge base's engine, `test-impact-select.sh` and
+`selection.py` (`--repo` points them at the PR checkout), so a PR cannot
+narrow its own tests by changing them.
 
 Do not add `select-tests` to your required checks or to the aggregate gate.
 When it breaks, PRs cost more minutes. They do not lose coverage.
@@ -439,7 +474,8 @@ map incompatible until the producer publishes a new one.
 
 ## Rollout and evidence
 
-1. **Shadow.** Run (a) and (b). Leave `TEST_IMPACT_MODE` unset.
+1. **Shadow.** Run (a) and (b) with `'shadow'` as the default in the
+   `select-tests` expression (d).
 2. **Measure.** For each PR run, compare `selection-engine.json` with what
    failed in that run's full test legs.
    - A **miss** is a test that failed in the full run but was not selected.
@@ -448,8 +484,8 @@ map incompatible until the producer publishes a new one.
 
    Nothing in this repository computes misses for Layer 2 yet. Layer 1's
    history replay (`replay-selector.sh`) is the model to follow.
-3. **Gate.** Set `TEST_IMPACT_MODE=gate`. Keep the shadow job running, so that
-   the evidence keeps coming.
+3. **Gate.** Make `'gate'` the default (this repository's state). Keep the
+   shadow job running, so that the evidence keeps coming.
 
 **Reading the step summary** (`### test-impact engine`):
 
@@ -469,7 +505,7 @@ Common run-all reasons:
 | `RULE_RUN_ALL` | A `run_all` rule matched (see `run_all_rules`). |
 | `UNMAPPED_FILE` | A changed file matched no rule and is not C-family source. |
 | `RULE_TARGET_UNKNOWN` | A `referencing_tests` path that no test names (without `unreferenced: "ignore"`). |
-| `RUNNER_REACHED` | The change reaches the test runner's `main` (or a child role none of whose literals a test names). |
+| `RUNNER_REACHED` | The change reaches the test runner's `main` (or a child role none of whose literals a test names and that no role with known spawners starts). The engine note names the call chain. |
 | `GIT_UNAVAILABLE` | No git, a shallow clone, or a diff that cannot be read in full. |
 | `CONFIG_INVALID` / `POLICY_UNAVAILABLE` | The merge base's config or rules do not parse. |
 

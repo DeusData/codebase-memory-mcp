@@ -30,6 +30,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/arena.h"
+#include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/mem_core.h"
 #include "foundation/platform.h"
@@ -81,16 +82,16 @@ const char *cbm_confidence_band(double score) {
 
 /* ── Internal types ──────────────────────────────────────────────── */
 
-/* Array of QN strings for byName index, with the test/mock verdict of each
- * name cached beside it: the scorer asked is_test_qn for every candidate of
- * every unresolved call, and the answer depends only on the name, which never
- * changes once registered (waste sanitizer scaling lane, 2026-09-17). Field
- * order and names match CBM_DYN_ARRAY(char *) so cbm_da_push works on it. */
+/* Array of QN strings for byName index, with each entry's test verdict beside
+ * it. The verdict is the extractor's, handed to cbm_registry_add by the caller
+ * that already computed it from the file path and the definition's attributes;
+ * it is stored rather than derived, so every entry always has one. Field order
+ * and names match CBM_DYN_ARRAY(char *) so cbm_da_push works on it. */
 typedef struct {
     char **items;
     int count;
     int cap;
-    uint8_t *is_test; /* is_test_qn(items[i]), one byte per entry */
+    uint8_t *is_test; /* the caller's verdict for items[i], one byte per entry */
     int is_test_cap;
     /* Language of the file that defined items[i] (a CBMLanguage; CBM_LANG_COUNT
      * = unknown, compatible with every caller), one byte per entry. Grown in
@@ -204,84 +205,64 @@ static int common_prefix_len(const char *a, const char *b) {
 
 enum { REG_TEST_PENALTY = 1000 };
 
-/* Check if a qualified name looks like a test/mock path: does it contain any of
- * Test, test, Mock, mock, Stub, stub, Fake, fake, Fixture, spec? One pass that
- * dispatches on the first character instead of ten strstr scans of the whole
- * name (this ran for every candidate of every unresolved call: the scaling
- * lane's x4.0, waste sanitizer 2026-09-17). */
-static bool is_test_qn(const char *qn) {
-    if (!qn) {
-        return false;
-    }
-    for (const char *p = qn; *p; p++) {
-        switch (*p) {
-        case 'T':
-            if (strncmp(p, "Test", 4) == 0) {
-                return true;
-            }
-            break;
-        case 't':
-            if (strncmp(p, "test", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'M':
-            if (strncmp(p, "Mock", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'm':
-            if (strncmp(p, "mock", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'S':
-            if (strncmp(p, "Stub", 4) == 0) {
-                return true;
-            }
-            break;
-        case 's':
-            if (strncmp(p, "stub", 4) == 0 || strncmp(p, "spec", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'F':
-            if (strncmp(p, "Fake", 4) == 0 || strncmp(p, "Fixture", 7) == 0) {
-                return true;
-            }
-            break;
-        case 'f':
-            if (strncmp(p, "fake", 4) == 0) {
-                return true;
-            }
-            break;
-        default:
-            break;
+/* A directory segment that, by name alone, holds test doubles: Go's generated
+ * fake clientsets and listers (pkg/client/.../fake), mock packages, and the
+ * testing / testutil helper packages. Whole segments only, compared exactly. */
+static bool test_double_dir_segment(const char *seg, size_t len) {
+    static const char *const dirs[] = {"fake", "mock", "mocks", "testing", "testutil"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        if (strlen(dirs[i]) == len && memcmp(seg, dirs[i], len) == 0) {
+            return true;
         }
     }
     return false;
 }
 
-/* The cached test verdicts, only when they cover every entry: a failed growth
- * leaves the cache short, and then the scorer asks per candidate as before. */
-static const uint8_t *qn_test_flags(const qn_array_t *arr) {
-    return arr->is_test && arr->is_test_cap >= arr->count ? arr->is_test : NULL;
+/* `base` is a Go file named `prefix`*.go. */
+static bool go_file_with_prefix(const char *base, const char *prefix) {
+    static const char go_ext[] = ".go";
+    size_t blen = strlen(base);
+    size_t plen = strlen(prefix);
+    size_t elen = sizeof(go_ext) - SKIP_ONE;
+    return blen >= plen + elen && strncmp(base, prefix, plen) == 0 &&
+           strcmp(base + blen - elen, go_ext) == 0;
 }
 
-/* The cached candidate languages, under the same coverage rule: both side
- * arrays grow together and share is_test_cap. */
+bool cbm_registry_test_double_path(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    const char *seg = rel_path;
+    for (const char *slash = strchr(seg, '/'); slash; slash = strchr(seg, '/')) {
+        if (test_double_dir_segment(seg, (size_t)(slash - seg))) {
+            return true;
+        }
+        seg = slash + SKIP_ONE;
+    }
+    /* `seg` is the file name now. */
+    return go_file_with_prefix(seg, "mock_") || go_file_with_prefix(seg, "fake_");
+}
+
+/* The stored test verdicts. index_under_name drops an entry it cannot record a
+ * verdict for, so this covers every entry of a non-empty bucket. */
+static const uint8_t *qn_test_flags(const qn_array_t *arr) {
+    return arr->is_test;
+}
+
+/* The stored candidate languages. Both side arrays grow together and share
+ * is_test_cap, and index_under_name drops an entry that does not fit both, so
+ * this covers every entry of a non-empty bucket too. */
 static const uint8_t *qn_lang_flags(const qn_array_t *arr) {
-    return arr->lang && arr->is_test_cap >= arr->count ? arr->lang : NULL;
+    return arr->lang;
 }
 
 /* Score a candidate for tiebreaking. Higher = better.
  * Layer 1: Non-test code preferred over test code (+1000)
  * Layer 2: Namespace proximity via common prefix length (+plen)
- * `is_test` is the cached verdict when the caller has one (-1: ask). */
-static int candidate_score(const char *candidate_qn, const char *module_qn, int is_test) {
+ * `is_test` is the verdict stored for this candidate at registration. */
+static int candidate_score(const char *candidate_qn, const char *module_qn, bool is_test) {
     int score = 0;
-    bool test = is_test >= 0 ? is_test != 0 : is_test_qn(candidate_qn);
-    if (!test) {
+    if (!is_test) {
         score += REG_TEST_PENALTY;
     }
     score += common_prefix_len(candidate_qn, module_qn);
@@ -351,18 +332,24 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
 }
 
 /* Pick candidate with highest composite score (test-deprioritization + namespace
- * proximity), ties settled by candidate_outranks_on_tie. `is_test_flags` and
- * `lang_flags` are the candidates' cached test verdicts and languages, or NULL
- * when the caller has none (a filtered subset carries its own copies). */
+ * proximity), ties settled by candidate_outranks_on_tie. `is_test_flags` are
+ * the candidates' stored test verdicts, always given: every by-name entry has
+ * one, and a filtered subset carries its own copies. `lang_flags` are their
+ * languages, or NULL when the caller has none. `caller_test`: the reference
+ * comes from test or test-double code, which may use test code as freely as
+ * real code, so no candidate takes the test penalty and proximity alone ranks
+ * (kafka: a clients test's `new MockTime()` binds the clients test helper,
+ * not a same-named class in a test-support module). Production references
+ * keep the full penalty. */
 static const char *best_by_import_distance(const cbm_registry_t *r, const char **candidates,
                                            const uint8_t *is_test_flags, const uint8_t *lang_flags,
-                                           int count, const char *module_qn) {
+                                           int count, const char *module_qn, bool caller_test) {
     const char *best = NULL;
     uint8_t best_lang = (uint8_t)CBM_LANG_COUNT;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
         int score =
-            candidate_score(candidates[i], module_qn, is_test_flags ? (int)is_test_flags[i] : -1);
+            candidate_score(candidates[i], module_qn, is_test_flags[i] != 0 && !caller_test);
         uint8_t lang = lang_flags ? lang_flags[i] : (uint8_t)CBM_LANG_COUNT;
         if (score > best_score ||
             (score == best_score && best &&
@@ -485,6 +472,9 @@ typedef struct {
     cbm_resolution_t res;
     size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
     bool skip_members; /* a C call and a C reference to the same name share it too */
+    bool calls_path;   /* a call and a reference to the same name share it too */
+    bool cs_keywords;  /* a C# call and a C# reference to the same name share it too */
+    bool caller_test;  /* a test and a production function of one file share it too */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -1718,11 +1708,11 @@ void cbm_registry_free(cbm_registry_t *r) {
 /* ── Registration ────────────────────────────────────────────────── */
 
 /* Record `owned_qn` in the by-name bucket for `key`, keeping the bucket's
- * is_test flags in step with its entries.
+ * is_test and lang side arrays in step with its entries.
  *
  * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
  * is new, and it calls this at most once per distinct key. */
-static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn,
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn, bool is_test,
                              CBMLanguage lang) {
     qn_array_t *arr = cbm_ht_get(r->by_name, key);
     if (!arr) {
@@ -1732,7 +1722,7 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
     int before = arr->count;
     cbm_da_push(arr, (char *)owned_qn);
     if (arr->count == before) {
-        return; /* the name could not be recorded: no verdict to cache */
+        return; /* the name could not be recorded: no verdict to store */
     }
     if (arr->count > arr->is_test_cap) {
         int want = arr->cap > 0 ? arr->cap : arr->count;
@@ -1743,19 +1733,25 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
             uint8_t *grown_lang =
                 cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->lang, (size_t)want * sizeof(uint8_t));
             /* Both side arrays share is_test_cap: on failure it stays below
-             * count, so this name serves neither cached test verdicts nor
-             * language filtering, exactly the unfiltered answer. */
+             * count, and the entry is dropped below. */
             if (grown_lang) {
                 arr->lang = grown_lang;
                 arr->is_test_cap = want;
             }
         }
     }
-    if (arr->count <= arr->is_test_cap) {
-        arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
-        arr->lang[arr->count - SKIP_ONE] =
-            (uint8_t)(lang >= 0 && lang < CBM_LANG_COUNT ? lang : CBM_LANG_COUNT);
+    if (arr->count > arr->is_test_cap) {
+        /* The verdict can no longer be recomputed from the QN, so an entry
+         * without one would be scored as non-test and outrank real code. Drop
+         * it instead: one missing candidate beats a wrong winner. The language
+         * shares is_test_cap, so the drop covers it as well. */
+        arr->count = before;
+        cbm_log_warn("registry.verdict_alloc_failed", "key", key);
+        return;
     }
+    arr->is_test[arr->count - SKIP_ONE] = is_test ? 1 : 0;
+    arr->lang[arr->count - SKIP_ONE] =
+        (uint8_t)(lang >= 0 && lang < CBM_LANG_COUNT ? lang : CBM_LANG_COUNT);
 }
 
 static bool registry_label_is_callable(const char *label) {
@@ -1843,13 +1839,13 @@ static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_n
 }
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label) {
-    cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0);
+                      const char *label, bool is_test) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0, is_test);
 }
 
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
-                           const char *label, CBMLanguage lang) {
-    cbm_registry_add_lang_in_module(r, name, qualified_name, label, lang, 0);
+                           const char *label, CBMLanguage lang, bool is_test) {
+    cbm_registry_add_lang_in_module(r, name, qualified_name, label, lang, 0, is_test);
 }
 
 /* Python nests defs: a def or class declared in a function body -- a closure,
@@ -1868,7 +1864,7 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
  * index seconds for nothing. */
 void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
                                      const char *qualified_name, const char *label,
-                                     CBMLanguage lang, size_t module_prefix_len) {
+                                     CBMLanguage lang, size_t module_prefix_len, bool is_test) {
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -1912,7 +1908,7 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     const char *derived = simple_name(qualified_name);
     const char *primary =
         name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
-    index_under_name(r, primary, owned_qn, lang);
+    index_under_name(r, primary, owned_qn, is_test, lang);
     /* '#' is a QN fence; no extractor mints one for a REGISTERED definition
      * today (Rust cfg twins are variants of one plain QN; a C macro's QN ends in
      * "#macro", but Macro is no registry label, so it never gets here). A
@@ -1924,7 +1920,7 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
      * signature-qualified callable is filed under `name` already, and its
      * capped suffix may carry a '#' of its own. */
     if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
-        index_under_name(r, name, owned_qn, lang);
+        index_under_name(r, name, owned_qn, is_test, lang);
     }
 }
 
@@ -2283,10 +2279,11 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-/* Strategy 4: multiple candidates with import filtering. */
+/* Strategy 4: multiple candidates with import filtering. `caller_test`: see
+ * best_by_import_distance. */
 static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
                                                    const char *module_qn, const char **import_vals,
-                                                   int import_count) {
+                                                   int import_count, bool caller_test) {
     const char *filtered[CBM_SZ_256];
     uint8_t filtered_test[CBM_SZ_256];
     uint8_t filtered_lang[CBM_SZ_256];
@@ -2295,12 +2292,8 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
         if (is_import_reachable(arr->items[i], import_vals, import_count)) {
-            if (flags) {
-                filtered_test[fcount] = flags[i];
-            }
-            if (langs) {
-                filtered_lang[fcount] = langs[i];
-            }
+            filtered_test[fcount] = flags[i];
+            filtered_lang[fcount] = langs[i];
             filtered[fcount] = arr->items[i];
             fcount++;
         }
@@ -2310,16 +2303,17 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best = best_by_import_distance(r, filtered, flags ? filtered_test : NULL,
-                                                   langs ? filtered_lang : NULL, fcount, module_qn);
+        const char *best = best_by_import_distance(r, filtered, filtered_test, filtered_lang,
+                                                   fcount, module_qn, caller_test);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
     /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best =
+        best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                qn_lang_flags(arr), arr->count, module_qn, caller_test);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
@@ -2384,6 +2378,26 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* True when the first segment of the dotted chain `dotted` is one of C#'s
+ * built-in type keywords (int, string, bool, ...; nint and nuint since C# 9).
+ * Closed list: these words are grammar, not a naming heuristic. `dynamic` is
+ * not on it: the type has no static members, so `dynamic.X` is a variable
+ * named `dynamic` and stays an ordinary lower-case value root. */
+static bool cs_type_keyword_root(const char *dotted) {
+    static const char *const keywords[] = {
+        "bool",  "byte",   "char",  "decimal", "double", "float", "int",   "long",   "nint",
+        "nuint", "object", "sbyte", "short",   "string", "uint",  "ulong", "ushort", "void",
+    };
+    const char *dot = strchr(dotted, '.');
+    size_t len = dot ? (size_t)(dot - dotted) : strlen(dotted);
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strlen(keywords[i]) == len && strncmp(dotted, keywords[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
  * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
  * throw away, and throwing it away binds Foundation's URLSession.shared.data to
@@ -2392,14 +2406,23 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
  * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
  *
- * Only an upper-case first segment is guarded. A lower-case root names a value
- * (vm.load, http.Get, os.path.join) whose declared type the chain does not
- * show, so the chain proves nothing there and the call passes through
- * unchanged. A callee with no separator passes through as well.
+ * Only an upper-case first segment is guarded here. A lower-case root names a
+ * value (vm.load, http.Get, os.path.join) whose declared type the chain does
+ * not show, so the chain proves nothing there and the call passes through
+ * unchanged; on the CALLS path value_receiver_blind judges it instead. A
+ * callee with no separator passes through as well.
  *
- * Language agnostic by design: the registry holds no language, and every
- * language that writes receiver chains gains the same protection. */
-static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+ * One exception, for C# CALLS only (#2121): C# spells its built-in types as
+ * lower-case keywords, so in `int.TryParse` or `string.Join` the root names a
+ * type and gets the same check (cs_type_keyword_root). `lang` is the calling
+ * file's language on the CALLS path (cbm_registry_resolve_call_lang) and
+ * CBM_LANG_COUNT on every other resolve. In Python, JS or Go these words are
+ * ordinary identifiers, so a variable named `object` stays a value root there.
+ *
+ * Otherwise language agnostic by design: every language that writes receiver
+ * chains gains the same protection. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn,
+                                  CBMLanguage lang) {
     /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
      * the same way qualified_suffix_match does. */
     char dotted[CBM_SZ_512];
@@ -2418,7 +2441,8 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
     if (!last_dot) {
         return true; /* bare name — no receiver chain to judge */
     }
-    if (dotted[0] < 'A' || dotted[0] > 'Z') {
+    if ((dotted[0] < 'A' || dotted[0] > 'Z') &&
+        !(lang == CBM_LANG_CSHARP && cs_type_keyword_root(dotted))) {
         return true; /* lower-case root names a value, not a type */
     }
     /* A name written in capitals with underscores is a constant holding a
@@ -2475,16 +2499,504 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
     return false;
 }
 
+/* A receiver ROOT that is the calling object or its class hierarchy: a call
+ * through it names a member the caller's own class defines or inherits, so
+ * its receiver is not unknown. `this_` and `_this` are the local aliases of
+ * `this` generated protobuf code and compiled JavaScript use. Lower-case
+ * spellings only; an upper-case root (Self, Me, MyBase) stays with
+ * receiver_chain_admits as before. */
+static bool self_receiver_root(const char *root, size_t len) {
+    static const char *const roots[] = {"this",  "self",  "cls",   "super", "base",
+                                        "$this", "$self", "this_", "_this"};
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        if (strlen(roots[i]) == len && strncmp(root, roots[i], len) == 0) {
+            return true;
+        }
+    }
+    static const char labelled[] = "this@"; /* Kotlin's this@Outer */
+    return len > sizeof(labelled) - SKIP_ONE && strncmp(root, labelled, sizeof(labelled) - 1) == 0;
+}
+
+static bool ascii_is_upper(char c) {
+    return c >= 'A' && c <= 'Z';
+}
+
+static char ascii_upper(char c) {
+    return c >= 'a' && c <= 'z' ? (char)(c - ('a' - 'A')) : c;
+}
+
+static bool ascii_is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* One receiver-chain segment, normalized for naming: surrounding whitespace,
+ * a constructor's `new `, a call's or an index's trailing `(...)` / `[...]`
+ * dropped, then a field prefix `_` / `m_` and a trailing number
+ * (`context2`). */
+typedef struct {
+    const char *text;
+    size_t len;
+} gate_seg_t;
+
+static gate_seg_t gate_segment(const char *seg, size_t len) {
+    while (len > 0 && ascii_is_space(seg[0])) {
+        seg++;
+        len--;
+    }
+    static const char ctor[] = "new ";
+    if (len > sizeof(ctor) - SKIP_ONE && strncmp(seg, ctor, sizeof(ctor) - SKIP_ONE) == 0) {
+        seg += sizeof(ctor) - SKIP_ONE;
+        len -= sizeof(ctor) - SKIP_ONE;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (seg[i] == '(' || seg[i] == '[' || seg[i] == '<') {
+            len = i;
+            break;
+        }
+    }
+    while (len > 0 && ascii_is_space(seg[len - 1])) {
+        len--;
+    }
+    if (len > 0 && (seg[0] == '_' || seg[0] == '$')) {
+        seg++;
+        len--;
+    }
+    if (len > 2 && seg[0] == 'm' && seg[1] == '_') {
+        seg += 2;
+        len -= 2;
+    }
+    while (len > 1 && seg[len - 1] >= '0' && seg[len - 1] <= '9') {
+        len--;
+    }
+    return (gate_seg_t){seg, len};
+}
+
+/* A name split into words at `_` / `-` and at camel-case boundaries:
+ * fetchSize -> fetch|size, JSONParser -> JSON|parser, flagd_ui -> flagd|ui,
+ * otel_guard -> otel|guard. Compared case-blind, word by word. */
+enum { GATE_WORDS_MAX = 16, GATE_WORDS_MIN_CHARS = 3 };
+
+typedef struct {
+    const char *at[GATE_WORDS_MAX];
+    size_t len[GATE_WORDS_MAX];
+    int n;
+    size_t chars;
+} gate_words_t;
+
+static bool ascii_is_lower_or_digit(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+
+static bool gate_word_sep(char c) {
+    return c == '_' || c == '-' || c == '$';
+}
+
+static void gate_words(const char *s, size_t len, gate_words_t *out) {
+    out->n = 0;
+    out->chars = 0;
+    size_t i = 0;
+    while (i < len && out->n < GATE_WORDS_MAX) {
+        while (i < len && gate_word_sep(s[i])) {
+            i++;
+        }
+        if (i >= len) {
+            break;
+        }
+        size_t start = i++;
+        while (i < len && !gate_word_sep(s[i])) {
+            bool acronym_end = ascii_is_upper(s[i - 1]) && i + SKIP_ONE < len &&
+                               s[i + SKIP_ONE] >= 'a' && s[i + SKIP_ONE] <= 'z';
+            if (ascii_is_upper(s[i]) && (ascii_is_lower_or_digit(s[i - 1]) || acronym_end)) {
+                break;
+            }
+            i++;
+        }
+        out->at[out->n] = s + start;
+        out->len[out->n] = i - start;
+        out->chars += i - start;
+        out->n++;
+    }
+}
+
+static bool gate_word_eq(const gate_words_t *a, int i, const gate_words_t *b, int j) {
+    if (a->len[i] != b->len[j]) {
+        return false;
+    }
+    for (size_t k = 0; k < a->len[i]; k++) {
+        if (ascii_upper(a->at[i][k]) != ascii_upper(b->at[j][k])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool gate_words_equal(const gate_words_t *a, const gate_words_t *b) {
+    if (a->n == 0 || a->n != b->n) {
+        return false;
+    }
+    for (int i = 0; i < a->n; i++) {
+        if (!gate_word_eq(a, i, b, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `a`'s words appear in order among `b`'s, ending on `b`'s last word:
+ * client in Mock|Client, transaction|manager in Transaction|State|Manager. */
+static bool gate_words_end_within(const gate_words_t *a, const gate_words_t *b) {
+    if (a->n == 0 || a->n > b->n || a->chars < GATE_WORDS_MIN_CHARS ||
+        !gate_word_eq(a, a->n - 1, b, b->n - 1)) {
+        return false;
+    }
+    int j = b->n - 2;
+    for (int i = a->n - 2; i >= 0; i--) {
+        while (j >= 0 && !gate_word_eq(a, i, b, j)) {
+            j--;
+        }
+        if (j < 0) {
+            return false;
+        }
+        j--;
+    }
+    return true;
+}
+
+/* A chain segment names an ancestry segment: the same words (`repo` / Repo,
+ * `store` / the store package, `otel_guard` / OtelGuard), or, for a type
+ * (upper-case) ancestry segment, the words of one end within the other's
+ * (`cleanerManager` / LogCleanerManager, `spyLogManager` / LogManager,
+ * `transactionManager` / TransactionStateManager, `client` / MockClient). */
+static bool segment_names(gate_seg_t s, const char *anc, size_t anc_len) {
+    if (s.len == 0 || anc_len == 0) {
+        return false;
+    }
+    gate_words_t sw;
+    gate_words_t aw;
+    gate_words(s.text, s.len, &sw);
+    gate_words(anc, anc_len, &aw);
+    if (gate_words_equal(&sw, &aw)) {
+        return true;
+    }
+    return ascii_is_upper(anc[0]) &&
+           (gate_words_end_within(&sw, &aw) || gate_words_end_within(&aw, &sw));
+}
+
+/* The same words only: a type root (`Scheduler` for the scheduler module,
+ * `FlagdUi` for flagd_ui) names its type exactly. */
+static bool segment_names_exactly(gate_seg_t s, const char *anc, size_t anc_len) {
+    gate_words_t sw;
+    gate_words_t aw;
+    gate_words(s.text, s.len, &sw);
+    gate_words(anc, anc_len, &aw);
+    return gate_words_equal(&sw, &aw);
+}
+
+/* Calls `visit` on each top-level segment of the receiver chain of
+ * `callee_name` (every segment before the final name; dots inside a call's
+ * arguments do not split), and on the receiver a mocking call hands in
+ * (`verify(consumer).commitAsync`, `when(rlm).fetch`, `doReturn(x).when(log)`:
+ * its first argument). Stops and returns true when `visit` does. */
+typedef bool (*gate_visit_fn)(gate_seg_t seg, const char *candidate_qn);
+
+static bool gate_visit_segment(const char *seg, size_t len, gate_visit_fn visit,
+                               const char *candidate_qn) {
+    gate_seg_t s = gate_segment(seg, len);
+    if (s.len > 0 && visit(s, candidate_qn)) {
+        return true;
+    }
+    static const char *const mockers[] = {"verify", "when", "spy", "inOrder"};
+    for (size_t m = 0; m < sizeof(mockers) / sizeof(mockers[0]); m++) {
+        size_t mlen = strlen(mockers[m]);
+        if (s.len != mlen || strncmp(s.text, mockers[m], mlen) != 0) {
+            continue;
+        }
+        const char *open = memchr(seg, '(', len);
+        if (!open) {
+            return false;
+        }
+        const char *arg = open + SKIP_ONE;
+        const char *end = arg;
+        while (end < seg + len && *end != ',' && *end != ')' && *end != '(') {
+            end++;
+        }
+        gate_seg_t a = gate_segment(arg, (size_t)(end - arg));
+        return a.len > 0 && visit(a, candidate_qn);
+    }
+    return false;
+}
+
+static bool gate_chain_any(const char *callee_name, gate_visit_fn visit, const char *candidate_qn) {
+    const char *seg = callee_name;
+    int depth = 0;
+    const char *last_top_dot = NULL;
+    for (const char *p = callee_name; *p; p++) {
+        if (*p == '(' || *p == '[') {
+            depth++;
+        } else if ((*p == ')' || *p == ']') && depth > 0) {
+            depth--;
+        } else if (*p == '.' && depth == 0) {
+            last_top_dot = p;
+        }
+    }
+    if (!last_top_dot) {
+        return false;
+    }
+    depth = 0;
+    for (const char *p = callee_name; p <= last_top_dot; p++) {
+        if (*p == '(' || *p == '[') {
+            depth++;
+        } else if ((*p == ')' || *p == ']') && depth > 0) {
+            depth--;
+        } else if (*p == '.' && depth == 0) {
+            if (gate_visit_segment(seg, (size_t)(p - seg), visit, candidate_qn)) {
+                return true;
+            }
+            seg = p + SKIP_ONE;
+        }
+    }
+    return false;
+}
+
+/* Some ancestry segment of `candidate_qn` (everything before its final name)
+ * is named by `seg` (segment_names). */
+static bool seg_names_ancestry(gate_seg_t seg, const char *candidate_qn) {
+    const char *cand_last = strrchr(candidate_qn, '.');
+    if (!cand_last || cand_last == candidate_qn) {
+        return false;
+    }
+    for (const char *anc = candidate_qn; anc < cand_last;) {
+        const char *anc_end = strchr(anc, '.');
+        if (segment_names(seg, anc, (size_t)(anc_end - anc))) {
+            return true;
+        }
+        anc = anc_end + SKIP_ONE;
+    }
+    return false;
+}
+
+/* As seg_names_ancestry, by segment_names_exactly. */
+static bool seg_names_ancestry_exactly(gate_seg_t seg, const char *candidate_qn) {
+    const char *cand_last = strrchr(candidate_qn, '.');
+    if (!cand_last || cand_last == candidate_qn) {
+        return false;
+    }
+    for (const char *anc = candidate_qn; anc < cand_last;) {
+        const char *anc_end = strchr(anc, '.');
+        if (segment_names_exactly(seg, anc, (size_t)(anc_end - anc))) {
+            return true;
+        }
+        anc = anc_end + SKIP_ONE;
+    }
+    return false;
+}
+
+/* The field-type hint's own convention (try_field_type_hint, pass_parallel.c):
+ * the candidate's owner -- the segment before its final name -- is the
+ * receiver's name capitalized, or that name with an interface `I`. */
+static bool seg_is_hint_owner(gate_seg_t seg, const char *candidate_qn) {
+    const char *last = strrchr(candidate_qn, '.');
+    if (!last || last == candidate_qn) {
+        return false;
+    }
+    const char *owner = last;
+    while (owner > candidate_qn && owner[-1] != '.') {
+        owner--;
+    }
+    size_t olen = (size_t)(last - owner);
+    if (olen == seg.len + SKIP_ONE && owner[0] == 'I') {
+        owner++;
+        olen--;
+    }
+    return olen == seg.len && seg.len > 0 && owner[0] == ascii_upper(seg.text[0]) &&
+           strncmp(owner + SKIP_ONE, seg.text + SKIP_ONE, seg.len - SKIP_ONE) == 0;
+}
+
+/* The first top-level dot of `callee_name` (not one inside a call's
+ * arguments), or NULL. */
+static const char *gate_first_dot(const char *callee_name) {
+    int depth = 0;
+    for (const char *p = callee_name; *p; p++) {
+        if (*p == '(' || *p == '[') {
+            depth++;
+        } else if ((*p == ')' || *p == ']') && depth > 0) {
+            depth--;
+        } else if (*p == '.' && depth == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* receiver_chain_admits judges a chain rooted in a TYPE and lets a lower-case
+ * root through: `tp.topic`, `vm.load`, `os.path.join` name a value or a module
+ * whose type the chain does not show. So on the CALLS path the name alone
+ * chose the target of every such member call the LSP had not typed: kafka's
+ * `tp.topic()` (a TopicPartition) bound ConsumerRecord.topic, the project's
+ * one `topic`, and `new DeleteRecordsPartitionResult().setErrorCode()` a
+ * builder of another type. This is the same gate for those calls, a value root
+ * or a constructor root (`new X(...)`, whose type the chain does name): the
+ * name-only exits (unique_name, suffix_match) bind such a call only on
+ * evidence that it means the chosen candidate --
+ *   - a chain segment names a segment of its ancestry (segment_names: `repo`
+ *     for Repo, `store` for the store package, `cleanerManager` for
+ *     LogCleanerManager, `new RaftContext.Builder()` for RaftContext.Builder);
+ *   - it lives in the caller's own module (a class beside the caller, a nested
+ *     class of its file);
+ *   - it is reachable through the file's imports;
+ *   - or, in C and C++, the C member resolver decides a call onto a struct
+ *     member from the object's type (cbm_call_onto_field_policy), and a
+ *     candidate whose owner type the caller's own file declares
+ *     (caller_declares_owner) is that type's member.
+ * When another candidate is the field-type hint's own pick (its owner is the
+ * receiver's name capitalized) the call is left as before, for the parallel
+ * resolver to re-pick. Otherwise the guess is refused: a veto, never a
+ * re-pick, so a refused call stays unresolved instead of falling to the next
+ * name-only candidate. A self receiver (this, self, cls, super, base, $this,
+ * $self, this_, _this) is not unknown, and a `::` path (a Rust, C++ or PHP
+ * namespace) is not a receiver; both, and a type root, stay with
+ * receiver_chain_admits. Every strategy before these exits -- import_map,
+ * same_module, qualified_suffix and lsp_* -- is untouched. `lang` is the
+ * calling file's language (CALLS path only); a C# keyword root
+ * (`int.TryParse`) is a type there. */
+/* C and C++: the caller's own file declares the candidate's owner type -- a
+ * class re-declared or declared ahead of its use in the calling translation
+ * unit (`class Widget { public: int get_id() const; };` above `Widget w(n);
+ * w.get_id()`). The C++ resolver types the receiver against that declaration,
+ * whose methods have no definition to bind; the candidate is the type's
+ * definition elsewhere. */
+static bool caller_declares_owner(const cbm_registry_t *r, const char *chosen,
+                                  const char *module_qn) {
+    const char *last = strrchr(chosen, '.');
+    if (!last || !module_qn || !module_qn[0]) {
+        return false;
+    }
+    const char *owner = last;
+    while (owner > chosen && owner[-1] != '.') {
+        owner--;
+    }
+    if (owner == chosen || owner == last) {
+        return false;
+    }
+    char qn[CBM_SZ_1K];
+    int n = snprintf(qn, sizeof(qn), "%s.%.*s", module_qn, (int)(last - owner), owner);
+    if (n < 0 || (size_t)n >= sizeof(qn)) {
+        return false;
+    }
+    return cbm_label_is_type_like(cbm_registry_label_of(r, qn));
+}
+
+static bool value_receiver_blind(const cbm_registry_t *r, const qn_array_t *arr,
+                                 const char *callee_name, const char *chosen, const char *module_qn,
+                                 const char **import_vals, int import_count, CBMLanguage lang) {
+    const char *dot = gate_first_dot(callee_name);
+    const char *colons = strstr(callee_name, "::");
+    if (!dot || (colons && colons < dot)) {
+        return false; /* bare name, or a :: path */
+    }
+    const char *start = callee_name;
+    while (ascii_is_space(*start)) {
+        start++;
+    }
+    bool ctor = strncmp(start, "new ", 4) == 0;
+    if (!ctor &&
+        (ascii_is_upper(start[0]) || (lang == CBM_LANG_CSHARP && cs_type_keyword_root(start)))) {
+        return false; /* a type root: receiver_chain_admits */
+    }
+    gate_seg_t root = gate_segment(start, (size_t)(dot - start));
+    if (!ctor && self_receiver_root(root.text, root.len)) {
+        return false;
+    }
+    if (import_count > 0 && is_import_reachable(chosen, import_vals, import_count)) {
+        return false;
+    }
+    size_t mlen = module_qn ? strlen(module_qn) : 0;
+    if (mlen > 0 && strncmp(chosen, module_qn, mlen) == 0 && chosen[mlen] == '.') {
+        return false;
+    }
+    if (lang == CBM_LANG_C || lang == CBM_LANG_CPP) {
+        const char *label = cbm_registry_label_of(r, chosen);
+        if (label && strcmp(label, "Field") == 0) {
+            return false; /* CBM_FIELD_CALL_BY_OWNER: the C member resolver decides */
+        }
+        if (caller_declares_owner(r, chosen, module_qn)) {
+            return false;
+        }
+    }
+    if (gate_chain_any(callee_name, seg_names_ancestry, chosen)) {
+        return false;
+    }
+    if (!ctor && lang != CBM_LANG_GO) { /* the hint never runs for Go */
+        for (int i = 0; i < arr->count; i++) {
+            if (arr->items[i] != chosen && seg_is_hint_owner(root, arr->items[i])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Where the receiver gate applies, by the calling file's language: an
+ * allowlist by measurement. A language is listed only where a hand-read
+ * seeded sample of the calls the gate refuses there, on a real corpus, was
+ * at least ~85% wrong. GATE_FULL: both its unique_name binds and its
+ * suffix_match picks cleared that. GATE_SUFFIX_ONLY: only the suffix_match
+ * picks (a choice among same-named candidates by path proximity alone) did,
+ * so the language keeps its unique_name binds. Every other language -- the
+ * ones measured below the bar (Java, Kotlin, Swift, Ruby, Objective-C), the
+ * ones where it refused nothing (C, Dart, and the languages with their own
+ * member-call guard after resolution: Python, the JS/TS family, Perl), and
+ * every language not measured -- keeps its name-only binds. */
+typedef enum { GATE_OFF, GATE_SUFFIX_ONLY, GATE_FULL } gate_scope_t;
+
+static gate_scope_t gate_scope(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_GO:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_LUA:
+    case CBM_LANG_TCL:
+    case CBM_LANG_GROOVY:
+    case CBM_LANG_ELIXIR:
+        return GATE_FULL;
+    case CBM_LANG_SCALA:
+    case CBM_LANG_RUST:
+    case CBM_LANG_PHP:
+        return GATE_SUFFIX_ONLY;
+    default:
+        return GATE_OFF;
+    }
+}
+
+/* #1897's type check for the one name-only exit it did not cover: the
+ * fallback of resolve_multi_with_imports that ranks every candidate when the
+ * file's imports reach none (Scala `Future.exception` bound a Variable in a
+ * test, then MultiplexedFinagleService.exception). Refused when the chosen
+ * candidate's ancestry is not in the chain and no candidate's is by the same
+ * words (Elixir's `Scheduler` names the scheduler module) -- when one is, the
+ * pick is left for the parallel resolver's field-type hint. */
+static bool type_receiver_blind(const qn_array_t *arr, const char *callee_name, const char *chosen,
+                                CBMLanguage lang) {
+    if (receiver_chain_admits(callee_name, chosen, lang)) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (gate_chain_any(callee_name, seg_names_ancestry_exactly, arr->items[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* The same-name candidates without the members -- Field and Method nodes --
  * in `view` (backed by the caller's buffers, at most REG_MAX_CANDIDATES
- * entries). The side arrays are carried over only when the bucket has them
- * for every entry. */
+ * entries). Every entry of a non-empty bucket has its stored verdict and
+ * language (index_under_name), and the view carries them over. */
 static void candidates_without_members(const cbm_registry_t *r, const qn_array_t *arr,
                                        qn_array_t *view, char **items, uint8_t *is_test,
                                        uint8_t *lang) {
     const uint8_t *flags = qn_test_flags(arr);
     const uint8_t *langs = qn_lang_flags(arr);
-    bool side = flags && langs;
     int n = 0;
     for (int i = 0; i < arr->count; i++) {
         const char *label = cbm_registry_label_of(r, arr->items[i]);
@@ -2492,24 +3004,23 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
             continue;
         }
         items[n] = arr->items[i];
-        if (side) {
-            is_test[n] = flags[i];
-            lang[n] = langs[i];
-        }
+        is_test[n] = flags[i];
+        lang[n] = langs[i];
         n++;
     }
-    *view = (qn_array_t){.items = items,
-                         .count = n,
-                         .cap = n,
-                         .is_test = side ? is_test : NULL,
-                         .is_test_cap = side ? n : 0,
-                         .lang = side ? lang : NULL};
+    *view = (qn_array_t){
+        .items = items, .count = n, .cap = n, .is_test = is_test, .is_test_cap = n, .lang = lang};
 }
 
-/* Strategies 3.5, 3 and 4 over one same-name candidate set. */
+/* Strategies 3.5, 3 and 4 over one same-name candidate set. `lang` reaches
+ * receiver_chain_admits and value_receiver_blind only (see there): it is the
+ * calling file's language on the CALLS path and CBM_LANG_COUNT on every other
+ * resolve. `caller_test` reaches best_by_import_distance only. */
 static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
                                                 const char *callee_name, const char *module_qn,
-                                                const char **import_vals, int import_count) {
+                                                const char **import_vals, int import_count,
+                                                CBMLanguage lang, bool caller_test) {
+    gate_scope_t gate = gate_scope(lang);
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -2520,9 +3031,13 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
         }
     }
 
-    /* Strategy 3: unique name */
+    /* Strategy 3: unique name, judged by the receiver gate only where it is
+     * whole (gate_scope). */
     if (arr->count == SKIP_ONE) {
-        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+        if (!receiver_chain_admits(callee_name, arr->items[0], lang) ||
+            (gate == GATE_FULL &&
+             value_receiver_blind(r, arr, callee_name, arr->items[0], module_qn, import_vals,
+                                  import_count, lang))) {
             return empty_result();
         }
         double conf = CONF_UNIQUE_NAME;
@@ -2535,12 +3050,27 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
+        cbm_resolution_t res =
+            resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count, caller_test);
+        /* An answer the file's imports do not reach came from the fallback
+         * that ranks every candidate: a name-only guess like the exits here,
+         * so on the CALLS path it passes the same receiver gates. */
+        if (gate != GATE_OFF && res.qualified_name && res.qualified_name[0] &&
+            !is_import_reachable(res.qualified_name, import_vals, import_count) &&
+            (type_receiver_blind(arr, callee_name, res.qualified_name, lang) ||
+             value_receiver_blind(r, arr, callee_name, res.qualified_name, module_qn, import_vals,
+                                  import_count, lang))) {
+            return empty_result();
+        }
+        return res;
     }
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best =
+        best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                qn_lang_flags(arr), arr->count, module_qn, caller_test);
     if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
+        if (!receiver_chain_admits(callee_name, best, lang) ||
+            (gate != GATE_OFF &&
+             value_receiver_blind(r, arr, callee_name, best, module_qn, NULL, 0, lang))) {
             return empty_result();
         }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
@@ -2558,7 +3088,8 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
  * libc `read()` the unique name of a C++ adapter's Method instead. */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
-                                            int import_count, bool skip_members) {
+                                            int import_count, bool skip_members, CBMLanguage lang,
+                                            bool caller_test) {
     const char *lookup = simple_name(callee_name);
     const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -2576,17 +3107,21 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         if (view.count == 0) {
             return empty_result();
         }
-        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count);
+        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count,
+                                       lang, caller_test);
     }
-    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count);
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count, lang,
+                                   caller_test);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
- * cbm_registry_resolve owns the per-file cache). */
+ * cbm_registry_resolve owns the per-file cache). `lang`: see
+ * receiver_chain_admits; `caller_test`: see best_by_import_distance. */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
-                                               size_t scope_len, bool skip_members) {
+                                               size_t scope_len, bool skip_members,
+                                               CBMLanguage lang, bool caller_test) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -2624,7 +3159,7 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
-                                  skip_members);
+                                  skip_members, lang, caller_test);
     }
     return res;
 }
@@ -2634,7 +3169,7 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
  * at most REG_MAX_CANDIDATES long whenever a name strategy produced `qn`. */
 static CBMLanguage registry_entry_language(const cbm_registry_t *r, const char *qn) {
     const qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(qn));
-    if (!arr || !arr->lang || arr->is_test_cap < arr->count) {
+    if (!arr) {
         return CBM_LANG_COUNT;
     }
     for (int i = 0; i < arr->count; i++) {
@@ -2672,25 +3207,38 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
                                            registry_entry_language(r, res->qualified_name));
 }
 
+/* call_lang: the calling file's language for a CALLS resolve, CBM_LANG_COUNT
+ * for every other one (see receiver_chain_admits). caller_test: the reference
+ * comes from test or test-double code (see best_by_import_distance). */
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
-                                                size_t scope_len, bool skip_members) {
+                                                size_t scope_len, bool skip_members,
+                                                CBMLanguage call_lang, bool caller_test) {
     if (!r || !callee_name) {
         return empty_result();
     }
 
     /* Per-file cache: same callee_name in N call sites → 1 chain walk
      * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
+     * cache key only needs callee_name. Within one file call_lang is
+     * either the file's own language (a CALLS resolve, which the receiver
+     * gate and the C# keyword rule read) or CBM_LANG_COUNT, so "is it a
+     * CALLS resolve" pins it and is all the entry has to record of it
+     * beside the C# bit; the caller's test verdict can differ between two
+     * functions of one file. */
+    bool calls_path = call_lang < CBM_LANG_COUNT;
+    bool cs_keywords = call_lang == CBM_LANG_CSHARP;
     resolve_cache_entry_t *cached =
         _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
-    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members)
+    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members &&
+        cached->calls_path == calls_path && cached->cs_keywords == cs_keywords &&
+        cached->caller_test == caller_test)
         return cached->res;
 
     cbm_resolution_t res =
         registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                               import_map_count, scope_len, skip_members);
+                               import_map_count, scope_len, skip_members, call_lang, caller_test);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2711,12 +3259,18 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
         cached->res = res;
         cached->scope_len = scope_len;
         cached->skip_members = skip_members;
+        cached->calls_path = calls_path;
+        cached->cs_keywords = cs_keywords;
+        cached->caller_test = caller_test;
     } else if (_resolve_cache) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
             e->res = res;
             e->scope_len = scope_len;
             e->skip_members = skip_members;
+            e->calls_path = calls_path;
+            e->cs_keywords = cs_keywords;
+            e->caller_test = caller_test;
             char *kdup = strdup(callee_name);
             if (kdup) {
                 cbm_ht_set(_resolve_cache, kdup, e);
@@ -3028,22 +3582,28 @@ static bool swift_signature_matches(const swift_signature_t *meta, const CBMCall
 }
 
 /* Keep receiver choice ahead of general import/name choice. Without a module,
- * this path still uses the deterministic distance tie-break, as before. */
-static const char *swift_choose_receiver(const cbm_registry_t *r, const char **matches, int matched,
-                                         const char *name, const CBMCall *call,
-                                         const char *module_qn, const char **import_vals,
-                                         int import_count, const char **scratch) {
+ * this path still uses the deterministic distance tie-break, as before.
+ * `match_test` holds the stored test verdict of each of `matches`, and
+ * `scratch_test` is the matching scratch, so every filtered list the scorer
+ * sees carries its own verdicts. */
+static const char *swift_choose_receiver(const cbm_registry_t *r, const char **matches,
+                                         const uint8_t *match_test, int matched, const char *name,
+                                         const CBMCall *call, const char *module_qn,
+                                         const char **import_vals, int import_count,
+                                         const char **scratch, uint8_t *scratch_test) {
     if (!strchr(call->callee_name, '.')) {
         return NULL;
     }
     size_t callee_len = strlen(call->callee_name);
     const char **receiver_matches = scratch;
+    uint8_t *receiver_test = scratch_test;
     int receiver_count = 0;
     for (int i = 0; i < matched; i++) {
         size_t base = cbm_qn_callable_base_len_named(matches[i], name);
         if (base >= callee_len &&
             memcmp(matches[i] + base - callee_len, call->callee_name, callee_len) == 0 &&
             (base == callee_len || matches[i][base - callee_len - SKIP_ONE] == '.')) {
+            receiver_test[receiver_count] = match_test[i];
             receiver_matches[receiver_count++] = matches[i];
         }
     }
@@ -3051,44 +3611,53 @@ static const char *swift_choose_receiver(const cbm_registry_t *r, const char **m
         return NULL;
     }
     const char **reachable = scratch + matched;
+    uint8_t *reachable_test = scratch_test + matched;
     int reachable_count = 0;
     if (import_vals) {
         for (int i = 0; i < receiver_count; i++) {
             if (is_import_reachable(receiver_matches[i], import_vals, import_count)) {
+                reachable_test[reachable_count] = receiver_test[i];
                 reachable[reachable_count++] = receiver_matches[i];
             }
         }
     }
     const char **preferred = reachable_count > 0 ? reachable : receiver_matches;
+    const uint8_t *preferred_test = reachable_count > 0 ? reachable_test : receiver_test;
     int preferred_count = reachable_count > 0 ? reachable_count : receiver_count;
-    return best_by_import_distance(r, preferred, NULL, NULL, preferred_count, module_qn);
+    return best_by_import_distance(r, preferred, preferred_test, NULL, preferred_count, module_qn,
+                                   false);
 }
 
 static const char *swift_choose_candidate(const cbm_registry_t *r, const char **matches,
-                                          int matched, const char *name, const CBMCall *call,
-                                          const char *module_qn, const char **import_vals,
-                                          int import_count, const char **scratch) {
-    const char *chosen = swift_choose_receiver(r, matches, matched, name, call, module_qn,
-                                               import_vals, import_count, scratch);
+                                          const uint8_t *match_test, int matched, const char *name,
+                                          const CBMCall *call, const char *module_qn,
+                                          const char **import_vals, int import_count,
+                                          const char **scratch, uint8_t *scratch_test) {
+    const char *chosen =
+        swift_choose_receiver(r, matches, match_test, matched, name, call, module_qn, import_vals,
+                              import_count, scratch, scratch_test);
     if (chosen) {
         return chosen;
     }
     const char **reachable = scratch;
+    uint8_t *reachable_test = scratch_test;
     int reachable_count = 0;
     if (import_vals) {
         for (int i = 0; i < matched; i++) {
             if (is_import_reachable(matches[i], import_vals, import_count)) {
+                reachable_test[reachable_count] = match_test[i];
                 reachable[reachable_count++] = matches[i];
             }
         }
     }
     if (reachable_count > 0) {
-        chosen = module_qn
-                     ? best_by_import_distance(r, reachable, NULL, NULL, reachable_count, module_qn)
-                     : reachable[0];
+        chosen = module_qn ? best_by_import_distance(r, reachable, reachable_test, NULL,
+                                                     reachable_count, module_qn, false)
+                           : reachable[0];
     }
     if (!chosen) {
-        chosen = module_qn ? best_by_import_distance(r, matches, NULL, NULL, matched, module_qn)
+        chosen = module_qn ? best_by_import_distance(r, matches, match_test, NULL, matched,
+                                                     module_qn, false)
                            : matches[0];
     }
     return chosen;
@@ -3719,23 +4288,29 @@ int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
     if (!bucket) {
         return 0;
     }
+    /* Three QN lists (the matches and the choosers' two scratch lists), each
+     * with a parallel byte per entry for its stored test verdict, in one block. */
     enum { SWIFT_MATCH_BUFFERS = 3 };
-    if ((size_t)bucket->count > SIZE_MAX / sizeof(const char *) / SWIFT_MATCH_BUFFERS) {
+    const size_t slot = sizeof(const char *) + sizeof(uint8_t);
+    if ((size_t)bucket->count > SIZE_MAX / slot / SWIFT_MATCH_BUFFERS) {
         return SWIFT_INCOMPATIBLE;
     }
-    const char **matches = cbm_alloc(
-        CBM_MEM_CLASS_OTHER, (size_t)bucket->count * SWIFT_MATCH_BUFFERS * sizeof(*matches));
+    size_t slots = (size_t)bucket->count * SWIFT_MATCH_BUFFERS;
+    const char **matches = cbm_alloc(CBM_MEM_CLASS_OTHER, slots * slot);
     if (!matches) {
         return SWIFT_INCOMPATIBLE;
     }
+    uint8_t *match_test = (uint8_t *)(matches + slots);
+    const uint8_t *bucket_test = qn_test_flags(bucket);
     int matched = 0;
     bool has_swift = false;
     for (int i = 0; i < bucket->count; i++) {
         const char *qn = bucket->items[i];
         swift_signature_t *meta = cbm_ht_get(r->swift_signatures, qn);
         has_swift = has_swift || meta != NULL;
-        if (meta && receiver_chain_admits(call->callee_name, qn) &&
+        if (meta && receiver_chain_admits(call->callee_name, qn, CBM_LANG_SWIFT) &&
             swift_signature_matches(meta, call)) {
+            match_test[matched] = bucket_test[i];
             matches[matched++] = qn;
         }
     }
@@ -3743,8 +4318,9 @@ int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
         cbm_free(CBM_MEM_CLASS_OTHER, matches);
         return has_swift ? SWIFT_INCOMPATIBLE : 0;
     }
-    const char *chosen = swift_choose_candidate(r, matches, matched, name, call, module_qn,
-                                                import_vals, import_count, matches + bucket->count);
+    const char *chosen =
+        swift_choose_candidate(r, matches, match_test, matched, name, call, module_qn, import_vals,
+                               import_count, matches + bucket->count, match_test + bucket->count);
     if (!chosen) {
         cbm_free(CBM_MEM_CLASS_OTHER, matches);
         return 0;
@@ -4445,7 +5021,8 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
+                                   import_map_count, module_qn ? strlen(module_qn) : 0, false,
+                                   CBM_LANG_COUNT, false);
 }
 
 static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
@@ -4458,13 +5035,23 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false);
+                                   import_map_count, lang_scope_len(module_qn, lang), false,
+                                   CBM_LANG_COUNT, false);
 }
 
-cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
-                                                const char *module_qn, const char **import_map_keys,
-                                                const char **import_map_vals, int import_map_count,
-                                                CBMLanguage lang) {
+cbm_resolution_t cbm_registry_resolve_ref(const cbm_registry_t *r, const char *ref_name,
+                                          const char *module_qn, const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          CBMLanguage lang, bool caller_test) {
+    return registry_resolve_scoped(r, ref_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, lang_scope_len(module_qn, lang), false,
+                                   CBM_LANG_COUNT, caller_test);
+}
+
+static cbm_resolution_t resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                          const char *module_qn, const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          CBMLanguage lang, bool caller_test) {
     /* A bare C call never names a member: a struct member is reached through
      * its object (cbm_call_onto_field_policy refuses every Field it lands on)
      * and C has no methods. So its Field and Method namesakes do not compete
@@ -4472,7 +5059,16 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
+                                   import_map_count, lang_scope_len(module_qn, lang), skip_members,
+                                   lang, caller_test);
+}
+
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang) {
+    return resolve_call_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                             import_map_count, lang, false);
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
@@ -4640,7 +5236,8 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false,
+                                  CBM_LANG_COUNT, false);
 }
 
 /* Python looks a bare name up in the calling def's own scope, then in each
@@ -4698,7 +5295,7 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
                                                   const char **import_map_keys,
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
-                                                  const char *scope_qn) {
+                                                  const char *scope_qn, bool caller_test) {
     if (lang == CBM_LANG_PYTHON) {
         cbm_resolution_t lexical =
             cbm_registry_resolve_lexical(r, callee_name, scope_qn, module_qn);
@@ -4706,18 +5303,25 @@ cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const
             return lexical;
         }
     }
-    return cbm_registry_resolve_call_lang(r, callee_name, module_qn, import_map_keys,
-                                          import_map_vals, import_map_count, lang);
+    return resolve_call_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                             import_map_count, lang, caller_test);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
 
 /* Filter candidates by import reachability. Returns count of reachable. */
-static int filter_import_reachable(const char **candidates, int count, const char **import_vals,
-                                   int import_count, const char **out, int max_out) {
+/* Keeps `out_flags` and `out_langs` in step with `out`: the verdicts are
+ * stored per entry and cannot be recomputed from the QN, so a filtered view has
+ * to carry its own, and the languages travel with them. */
+static int filter_import_reachable(const char **candidates, const uint8_t *flags,
+                                   const uint8_t *langs, int count, const char **import_vals,
+                                   int import_count, const char **out, uint8_t *out_flags,
+                                   uint8_t *out_langs, int max_out) {
     int n = 0;
     for (int i = 0; i < count && n < max_out; i++) {
         if (is_import_reachable(candidates[i], import_vals, import_count)) {
+            out_flags[n] = flags[i];
+            out_langs[n] = langs[i];
             out[n++] = candidates[i];
         }
     }
@@ -4757,19 +5361,28 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     /* Multiple candidates: filter by import reachability */
     const char *filtered[CBM_SZ_256];
+    uint8_t filtered_flags[CBM_SZ_256];
+    uint8_t filtered_langs[CBM_SZ_256];
     int fcount = arr->count;
     const char **fptr = (const char **)arr->items;
+    const uint8_t *fflags = qn_test_flags(arr);
+    const uint8_t *flangs = qn_lang_flags(arr);
 
     if (have_imports) {
-        fcount = filter_import_reachable((const char **)arr->items, arr->count, import_map_vals,
-                                         import_map_count, filtered, CBM_SZ_256);
+        fcount = filter_import_reachable((const char **)arr->items, qn_test_flags(arr),
+                                         qn_lang_flags(arr), arr->count, import_map_vals,
+                                         import_map_count, filtered, filtered_flags, filtered_langs,
+                                         CBM_SZ_256);
         fptr = filtered;
+        fflags = filtered_flags;
+        flangs = filtered_langs;
     }
 
     if (fcount == 0) {
         /* No import-reachable — use originals with penalty */
-        const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                                   qn_lang_flags(arr), arr->count, module_qn);
+        const char *best =
+            best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                    qn_lang_flags(arr), arr->count, module_qn, false);
         if (!best) {
             return no_match;
         }
@@ -4783,9 +5396,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
             true};
     }
-    const bool all = fptr == (const char **)arr->items;
-    const char *best = best_by_import_distance(r, fptr, all ? qn_test_flags(arr) : NULL,
-                                               all ? qn_lang_flags(arr) : NULL, fcount, module_qn);
+    const char *best = best_by_import_distance(r, fptr, fflags, flangs, fcount, module_qn, false);
     if (!best) {
         return no_match;
     }

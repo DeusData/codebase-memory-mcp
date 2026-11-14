@@ -32,6 +32,7 @@
  */
 
 #include "java_lsp.h"
+#include "lsp_work.h"
 #include "../helpers.h"
 
 #include <ctype.h>
@@ -318,6 +319,18 @@ void java_lsp_add_import(JavaLSPContext *ctx, const char *local_name, const char
     ctx->import_count++;
 }
 
+/* The imports with this local name, in table order (lsp_name_rows.h): a scan per
+ * use made a file of thousands of imports quadratic. */
+static int java_import_first(JavaLSPContext *ctx, const char *name) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                               ctx->import_count, name);
+}
+
+static int java_import_next(const JavaLSPContext *ctx, const char *name, int row) {
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names, ctx->import_count, name,
+                              row);
+}
+
 static void push_enclosing_class(JavaLSPContext *ctx, const char *class_qn) {
     if (ctx->enclosing_class_depth >= ctx->enclosing_class_cap) {
         int new_cap = ctx->enclosing_class_cap == 0 ? 8 : ctx->enclosing_class_cap * 2;
@@ -502,7 +515,7 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     }
 
     /* 2. Single-type imports. */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE)
             continue;
         if (strcmp(ctx->import_local_names[i], name) == 0) {
@@ -563,7 +576,12 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     if (ctx->registry && ctx->registry->types) {
         const char *only_qn = NULL;
         int matches = 0;
-        for (int i = 0; i < ctx->registry->type_count && matches < 2; i++) {
+        /* The registry's own types of this short name: by name once it is indexed
+         * (cbm_registry_index_types_into), else every type, as before. */
+        CBMTypeShortIter named;
+        cbm_registry_types_by_short_name(ctx->registry, name, &named);
+        for (int i = -1; matches < 2 && (i = cbm_type_short_iter_next(&named)) >= 0;) {
+            CBM_LSP_WORK(1);
             const CBMRegisteredType *t = &ctx->registry->types[i];
             if (!t->qualified_name || !t->short_name || t->alias_of) {
                 continue;
@@ -818,7 +836,7 @@ static const CBMType *resolve_identifier_type(JavaLSPContext *ctx, const char *n
     }
 
     /* Static imports — could be a static field. */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_STATIC)
             continue;
         if (strcmp(ctx->import_local_names[i], name) == 0) {
@@ -1121,7 +1139,7 @@ static const CBMType *eval_method_invocation(JavaLSPContext *ctx, TSNode node) {
             if (f)
                 return java_return_type_of(f);
         }
-        for (int i = 0; i < ctx->import_count; i++) {
+        for (int i = java_import_first(ctx, mname); i >= 0; i = java_import_next(ctx, mname, i)) {
             if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_STATIC)
                 continue;
             if (strcmp(ctx->import_local_names[i], mname) != 0)
@@ -2148,7 +2166,7 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             }
         }
         /* Static import. */
-        for (int i = 0; i < ctx->import_count; i++) {
+        for (int i = java_import_first(ctx, mname); i >= 0; i = java_import_next(ctx, mname, i)) {
             if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_STATIC)
                 continue;
             if (strcmp(ctx->import_local_names[i], mname) != 0)
@@ -3359,6 +3377,10 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                                                                         : d->qualified_name;
         cbm_registry_add_type(reg, stub);
     }
+    /* Every local type is in: from here on a type is found by name, not by a scan of
+     * every registered type per definition (first registrations, as the scan). */
+    if (reg->tail_arena)
+        cbm_registry_index_types_into(reg, reg->tail_arena);
 
     /* Pass 1b: now that every local type is in the registry, walk again and
      * fill in embedded_types using the parent_class chain. We mutate the
@@ -3383,15 +3405,7 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                                              do the in-place update directly. */
         (void)rt;
         /* Locate the actual entry in reg->types[] and write into it. */
-        CBMRegisteredType *slot = NULL;
-        for (int ti = 0; ti < reg->type_count; ti++) {
-            if (reg->types[ti].qualified_name == d->qualified_name ||
-                (reg->types[ti].qualified_name &&
-                 strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0)) {
-                slot = &reg->types[ti];
-                break;
-            }
-        }
+        CBMRegisteredType *slot = cbm_registry_first_own_type(reg, d->qualified_name);
         if (!slot)
             continue;
         if (d->base_classes) {
@@ -3563,6 +3577,25 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
 static void patch_method_signatures_from_ast(JavaLSPContext *ctx, CBMTypeRegistry *reg,
                                              TSNode class_node, const char *enclosing_class_qn);
 
+/* The next registered function of this QN after `row` (-1: the first), in
+ * registration order. By name when the caller listed the functions in
+ * ctx->func_names and none was added since; otherwise by a scan. */
+static int java_func_row_next(JavaLSPContext *ctx, const CBMTypeRegistry *reg, const char *qn,
+                              int row) {
+    if (ctx->func_names && ctx->func_name_count == reg->func_count) {
+        return row < 0 ? cbm_name_rows_first(&ctx->func_rows, ctx->func_rows_arena, ctx->func_names,
+                                             ctx->func_name_count, qn)
+                       : cbm_name_rows_next(&ctx->func_rows, ctx->func_names, ctx->func_name_count,
+                                            qn, row);
+    }
+    for (int fi = row + 1; fi < reg->func_count; fi++) {
+        CBM_LSP_WORK(1);
+        if (reg->funcs[fi].qualified_name && strcmp(reg->funcs[fi].qualified_name, qn) == 0)
+            return fi;
+    }
+    return -1;
+}
+
 static void patch_one_method(JavaLSPContext *ctx, CBMTypeRegistry *reg, TSNode method_node,
                              const char *class_qn, bool is_constructor) {
     TSNode name_node = ts_node_child_by_field_name(method_node, "name", 4);
@@ -3608,7 +3641,8 @@ static void patch_one_method(JavaLSPContext *ctx, CBMTypeRegistry *reg, TSNode m
      * first QN match keeps the legacy no-signature path best-effort. */
     CBMRegisteredFunc *slot = NULL;
     CBMRegisteredFunc *first_qn_match = NULL;
-    for (int fi = 0; fi < reg->func_count; fi++) {
+    for (int fi = java_func_row_next(ctx, reg, method_qn, -1); fi >= 0;
+         fi = java_func_row_next(ctx, reg, method_qn, fi)) {
         CBMRegisteredFunc *candidate = &reg->funcs[fi];
         if (!candidate->qualified_name || strcmp(candidate->qualified_name, method_qn) != 0)
             continue;
@@ -3709,13 +3743,7 @@ static void patch_method_signatures_from_ast(JavaLSPContext *ctx, CBMTypeRegistr
  * `obj.field.method()` for arbitrary receivers, not just `this`. */
 static void append_field_to_class(CBMTypeRegistry *reg, CBMArena *a, const char *class_qn,
                                   const char *field_name, const CBMType *ftype) {
-    CBMRegisteredType *slot = NULL;
-    for (int ti = 0; ti < reg->type_count; ti++) {
-        if (reg->types[ti].qualified_name && strcmp(reg->types[ti].qualified_name, class_qn) == 0) {
-            slot = &reg->types[ti];
-            break;
-        }
-    }
+    CBMRegisteredType *slot = cbm_registry_first_own_type(reg, class_qn);
     if (!slot)
         return;
 
@@ -3813,6 +3841,8 @@ static void populate_class_fields_from_ast(JavaLSPContext *ctx, CBMTypeRegistry 
 
 extern const TSLanguage *tree_sitter_java(void);
 
+enum { JAVA_SCRATCH_ARENA_BLOCK = 4096 };
+
 void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root) {
     if (!arena || !result || !source)
@@ -3846,8 +3876,22 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
         java_lsp_add_import(&ctx, imp->local_name, imp->module_path, CBM_JAVA_IMPORT_TYPE);
     }
 
-    /* Register file-local defs into the registry. */
+    /* Register file-local defs into the registry. Its lookups run while it
+     * fills, so it indexes its types as they come, in a scratch arena. */
+    CBMArena scratch;
+    cbm_arena_init_lazy(&scratch, JAVA_SCRATCH_ARENA_BLOCK);
+    reg.tail_arena = &scratch;
     register_local_func_or_type_from_file(&ctx, &reg, result);
+
+    /* Overloads share a QN, so patching a method asks for all of its registrations. */
+    ctx.func_rows_arena = &scratch;
+    ctx.func_names =
+        reg.func_count > 0
+            ? (const char **)cbm_arena_alloc(&scratch, (size_t)reg.func_count * sizeof(char *))
+            : NULL;
+    ctx.func_name_count = ctx.func_names ? reg.func_count : 0;
+    for (int fi = 0; fi < ctx.func_name_count; fi++)
+        ctx.func_names[fi] = reg.funcs[fi].qualified_name;
 
     /* Populate field metadata from the AST so eval_field_access works on
      * receivers other than `this`. Also patch method signatures with
@@ -3863,9 +3907,12 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
             patch_method_signatures_from_ast(&ctx, &reg, c, NULL);
         }
     }
+    ctx.func_names = NULL;
+    ctx.func_name_count = 0;
 
     /* Walk the file. */
     java_lsp_process_file(&ctx, root);
+    cbm_arena_destroy(&scratch);
 }
 
 /* ── Cross-file LSP ───────────────────────────────────────────────── */
@@ -4065,14 +4112,14 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &overlay, NULL, module_qn, out);
 
-    register_local_func_or_type_from_file(&ctx, &overlay, result);
-    cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
-
     /* Index the overlay only — the base is already finalized. Scratch arena so
      * per-file bucket allocations do not accumulate in the pipeline-lifetime
-     * arena across a large repo. */
+     * arena across a large repo. Registration already finds its own types there. */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
+    overlay.tail_arena = &idx_arena;
+    register_local_func_or_type_from_file(&ctx, &overlay, result);
+    cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
     cbm_registry_finalize_into(&overlay, &idx_arena);
 
     TSTree *tree = cached_tree;
