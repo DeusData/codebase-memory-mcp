@@ -2344,6 +2344,103 @@ TEST(sqlite_alter_table_drop_index_still_flagged_issue2246) {
     PASS();
 }
 
+/* ── jsonnet: the external scanner's state belongs to one parser ─────────────
+ * Upstream's jsonnet scanner kept its state (inside a string? which quote?) in
+ * process globals, so every worker's parser shared it: on go/grafana__loki a
+ * different set of jsonnet files came back parse_partial on every index, with
+ * their definitions and edges, and none does when parsed one at a time. The
+ * local patch moves the state into the per-parser payload and resets it on
+ * every deserialize (grammars/MANIFEST.md, "Local source patches").
+ *
+ * No threads here: the input callback hands parser A one byte per call, and
+ * when A first reads the byte after its opening quote -- A's scanner is then
+ * inside scan_string_start -- the callback runs a complete parse of `)'` on
+ * parser B. That parse ends on a string end, which clears B's state; with
+ * shared globals it cleared A's too, mid-scan, and A's string broke. The
+ * second test pins the other half: a parse that ends inside a string must not
+ * leave that state to the next parse. */
+extern const TSLanguage *tree_sitter_jsonnet(void);
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint32_t trigger; /* byte at which parser B runs */
+    bool fired;
+    TSParser *other;
+} jsonnet_interleave_t;
+
+static const char *jsonnet_read_one_byte(void *payload, uint32_t byte_index, TSPoint position,
+                                         uint32_t *bytes_read) {
+    (void)position;
+    jsonnet_interleave_t *x = (jsonnet_interleave_t *)payload;
+    if (byte_index >= x->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    if (!x->fired && byte_index == x->trigger) {
+        static const char resets_on_string_end[] = ")'\n";
+        x->fired = true;
+        TSTree *other = ts_parser_parse_string(x->other, NULL, resets_on_string_end,
+                                               (uint32_t)strlen(resets_on_string_end));
+        ts_tree_delete(other);
+    }
+    *bytes_read = 1;
+    return x->src + byte_index;
+}
+
+TEST(jsonnet_scanner_state_is_per_parser) {
+    static const char src[] = "{\n  name: 'query-scheduler-discovery',\n  port: 9095,\n}\n";
+    TSParser *a = ts_parser_new();
+    TSParser *b = ts_parser_new();
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_TRUE(ts_parser_set_language(a, tree_sitter_jsonnet()));
+    ASSERT_TRUE(ts_parser_set_language(b, tree_sitter_jsonnet()));
+
+    /* Control: on its own the source parses clean. */
+    TSTree *alone = ts_parser_parse_string(a, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(alone);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(alone)));
+    ts_tree_delete(alone);
+
+    jsonnet_interleave_t x = {src, (uint32_t)strlen(src), 0, false, b};
+    x.trigger = (uint32_t)(strchr(src, '\'') - src) + 1;
+    TSInput input = {&x, jsonnet_read_one_byte, TSInputEncodingUTF8, NULL};
+    TSTree *tree = ts_parser_parse(a, NULL, input);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(x.fired); /* B really ran inside A's string */
+    /* has_error covers ERROR and MISSING nodes alike. */
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(b);
+    ts_parser_delete(a);
+    PASS();
+}
+
+TEST(jsonnet_scanner_state_not_carried_between_parses) {
+    static const char unterminated[] = "local s = 'unterminated\n";
+    static const char text_block[] = "local doc = |||\n  a text block\n|||;\ndoc\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_jsonnet()));
+
+    /* A parse that ends inside a string... */
+    TSTree *first =
+        ts_parser_parse_string(parser, NULL, unterminated, (uint32_t)strlen(unterminated));
+    ASSERT_NOT_NULL(first);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(first)));
+    ts_tree_delete(first);
+
+    /* ...must not decide how the next file lexes: ||| blocks are lexed only by
+     * the external scanner, which a carried-over "inside a string" disabled. */
+    TSTree *next = ts_parser_parse_string(parser, NULL, text_block, (uint32_t)strlen(text_block));
+    ASSERT_NOT_NULL(next);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(next)));
+    ts_tree_delete(next);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
@@ -2418,4 +2515,8 @@ SUITE(parse_coverage) {
     RUN_TEST(sqlite_trigger_when_body_and_fts5_not_flagged_issue2246);
     RUN_TEST(sqlite_pragma_forms_not_flagged_issue2246);
     RUN_TEST(sqlite_alter_table_drop_index_still_flagged_issue2246);
+    /* Per-parser first: on the unpatched scanner, the carried-over state the
+     * second test leaves behind would hide the first one's defect. */
+    RUN_TEST(jsonnet_scanner_state_is_per_parser);
+    RUN_TEST(jsonnet_scanner_state_not_carried_between_parses);
 }

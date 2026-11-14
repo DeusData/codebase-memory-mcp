@@ -51,6 +51,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #define YYJSON_HAS_STDBOOL_H 1
 #endif
 #include "yyjson/yyjson.h"
+#include "foundation/json_writer.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1366,7 +1367,7 @@ void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_pat
     }
     ok = ok && unresolved_build_carriers(&capture) && unresolved_collect_sites(&capture);
     if (ok && yyjson_mut_arr_size(capture.sites) > 0) {
-        char *detail = yyjson_mut_write_opts(capture.doc, 0, &allocator, NULL, NULL);
+        char *detail = cbm_json_write_text(capture.doc, &allocator, NULL);
         char *path = cbm_mem_strdup(CBM_MEM_CLASS_RESOLVE, rel_path);
         /* The estimate reserves overhead and escaping. Enforce the serialized
          * limit as well, before any detail is transferred to persistence. */
