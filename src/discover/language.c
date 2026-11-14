@@ -64,6 +64,9 @@ static const ext_entry_t EXT_TABLE[] = {
      * markup lands in ERROR regions and is reported via parse_partial. */
     {".cshtml", CBM_LANG_CSHARP},
 
+    /* VB.NET */
+    {".vb", CBM_LANG_VISUALBASIC},
+
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},
     {".cljc", CBM_LANG_CLOJURE},
@@ -948,6 +951,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
     [CBM_LANG_ARKTS] = "ArkTS",
     [CBM_LANG_PLSQL] = "PL/SQL",
+    [CBM_LANG_VISUALBASIC] = "VB.NET",
 
 };
 

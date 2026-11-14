@@ -743,6 +743,157 @@ TEST(contract_chialisp_constant_resolves_across_files) {
     PASS();
 }
 
+/* Edges of `type` from any node named `src_name` to a node named `dst_name`. */
+static int edges_between_names(cbm_store_t *store, const char *project, const char *src_name,
+                               const char *type, const char *dst_name) {
+    cbm_node_t *srcs = NULL;
+    int nsrc = 0;
+    if (cbm_store_find_nodes_by_name(store, project, src_name, &srcs, &nsrc) != CBM_STORE_OK) {
+        return -1;
+    }
+    int found = 0;
+    for (int i = 0; i < nsrc; i++) {
+        cbm_edge_t *edges = NULL;
+        int nedges = 0;
+        if (cbm_store_find_edges_by_source_type(store, srcs[i].id, type, &edges, &nedges) !=
+            CBM_STORE_OK) {
+            continue;
+        }
+        for (int j = 0; j < nedges; j++) {
+            cbm_node_t dst;
+            if (cbm_store_find_node_by_id(store, edges[j].target_id, &dst) != CBM_STORE_OK) {
+                continue;
+            }
+            if (dst.name && strcmp(dst.name, dst_name) == 0) {
+                found++;
+            }
+            cbm_node_free_fields(&dst);
+        }
+        cbm_store_free_edges(edges, nedges);
+    }
+    cbm_store_free_nodes(srcs, nsrc);
+    return found;
+}
+
+/* VB.NET, WinForms-shaped: a partial Form split across Form1.vb and its
+ * Form1.Designer.vb, a service behind an interface, a derived service.
+ * Graph level: IMPLEMENTS vs INHERITS by the base's label, the Handles
+ * clause reaching the WithEvents control declared in the other half of the
+ * partial class, a call across files, and a call written in another case
+ * (VB.NET names are case-insensitive). */
+TEST(contract_visualbasic_winforms_graph) {
+    static const LangFile f[] = {
+        {"Form1.Designer.vb", "Partial Class Form1\n"
+                              "    Inherits System.Windows.Forms.Form\n"
+                              "    Friend WithEvents SaveButton As System.Windows.Forms.Button\n"
+                              "    Private Sub InitializeComponent()\n"
+                              "        Me.SaveButton = New System.Windows.Forms.Button()\n"
+                              "    End Sub\n"
+                              "End Class\n"},
+        {"Form1.vb", "Public Class Form1\n"
+                     "    Private ReadOnly service As New CustomerService()\n"
+                     "    Private Sub SaveButton_Click(sender As Object, e As EventArgs) "
+                     "Handles SaveButton.Click\n"
+                     "        service.Save(\"x\")\n"
+                     "        UPDATETITLE()\n"
+                     "    End Sub\n"
+                     "    Private Sub UpdateTitle()\n"
+                     "    End Sub\n"
+                     "End Class\n"},
+        {"CustomerService.vb", "Public Interface ICustomerStore\n"
+                               "    Sub Save(name As String)\n"
+                               "End Interface\n"
+                               "Public Class CustomerService\n"
+                               "    Implements ICustomerStore\n"
+                               "    Public Sub Save(name As String) Implements ICustomerStore.Save\n"
+                               "    End Sub\n"
+                               "End Class\n"
+                               "Public Class PremiumService\n"
+                               "    Inherits CustomerService\n"
+                               "End Class\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 3);
+    ASSERT_TRUE(store != NULL);
+    int implements =
+        edges_between_names(store, lp.project, "CustomerService", "IMPLEMENTS", "ICustomerStore");
+    int inherits =
+        edges_between_names(store, lp.project, "PremiumService", "INHERITS", "CustomerService");
+    int handles = edges_between_names(store, lp.project, "SaveButton_Click", "USAGE", "SaveButton");
+    int cross_call = edges_between_names(store, lp.project, "SaveButton_Click", "CALLS", "Save");
+    int folded_call =
+        edges_between_names(store, lp.project, "SaveButton_Click", "CALLS", "UpdateTitle");
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(implements >= 1);
+    ASSERT_TRUE(inherits >= 1);
+    ASSERT_TRUE(handles >= 1);
+    ASSERT_TRUE(cross_call >= 1);
+    ASSERT_TRUE(folded_call >= 1);
+    PASS();
+}
+
+/* VB.NET writes indexing like a call. `items(0)` and `Me.cache("k")` index a
+ * Field: the method references it (a USAGE, as C#'s `items[0]` does) and
+ * calls nothing, while `Compute(1)` stays a call. */
+TEST(contract_visualbasic_indexing_is_a_field_usage) {
+    static const LangFile f[] = {{"Worker.vb", "Public Class Worker\n"
+                                               "    Private items As New List(Of String)()\n"
+                                               "    Private cache As Dictionary(Of String, Integer)\n"
+                                               "    Public Sub Indexed()\n"
+                                               "        Dim x = items(0)\n"
+                                               "        Dim y = Me.cache(\"k\")\n"
+                                               "        Compute(1)\n"
+                                               "    End Sub\n"
+                                               "    Private Function Compute(v As Integer) As Integer\n"
+                                               "        Return v\n"
+                                               "    End Function\n"
+                                               "End Class\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_TRUE(store != NULL);
+    int items_usage = edges_between_names(store, lp.project, "Indexed", "USAGE", "items");
+    int cache_usage = edges_between_names(store, lp.project, "Indexed", "USAGE", "cache");
+    int items_call = edges_between_names(store, lp.project, "Indexed", "CALLS", "items");
+    int cache_call = edges_between_names(store, lp.project, "Indexed", "CALLS", "cache");
+    int compute_call = edges_between_names(store, lp.project, "Indexed", "CALLS", "Compute");
+    int compute_usage = edges_between_names(store, lp.project, "Indexed", "USAGE", "Compute");
+    lang_cleanup(&lp, store);
+    ASSERT_EQ(items_usage, 1);
+    ASSERT_EQ(cache_usage, 1);
+    ASSERT_EQ(items_call, 0);
+    ASSERT_EQ(cache_call, 0);
+    ASSERT_EQ(compute_call, 1);
+    ASSERT_EQ(compute_usage, 0);
+    PASS();
+}
+
+/* An enum member is never called. `Refresh()` in a Form calls the framework's
+ * Form.Refresh; the only `Refresh` the project defines is an enum member,
+ * which the short-name registry would hand back. No CALLS edge may land on
+ * it, while `Draw()` stays a call. */
+TEST(contract_visualbasic_call_never_lands_on_enum_member) {
+    static const LangFile f[] = {{"Symbols.vb", "Public Enum Symbol\n"
+                                                "    Refresh\n"
+                                                "    Save\n"
+                                                "End Enum\n"},
+                                 {"MainForm.vb", "Public Class MainForm\n"
+                                                 "    Public Sub Reload()\n"
+                                                 "        Refresh()\n"
+                                                 "        Draw()\n"
+                                                 "    End Sub\n"
+                                                 "    Private Sub Draw()\n"
+                                                 "    End Sub\n"
+                                                 "End Class\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    int enum_call = edges_between_names(store, lp.project, "Reload", "CALLS", "Refresh");
+    int method_call = edges_between_names(store, lp.project, "Reload", "CALLS", "Draw");
+    lang_cleanup(&lp, store);
+    ASSERT_EQ(enum_call, 0);
+    ASSERT_EQ(method_call, 1);
+    PASS();
+}
+
 TEST(contract_all_grammars_in_graph) {
     int n = (int)CBM_GRAMMAR_CASES_COUNT;
     if (n > GRAMMAR_BREADTH_MAX) {
@@ -1947,6 +2098,9 @@ SUITE(lang_contract) {
 
     /* Graph-level breadth across all grammars (P4). */
     RUN_TEST(contract_chialisp_constant_resolves_across_files);
+    RUN_TEST(contract_visualbasic_winforms_graph);
+    RUN_TEST(contract_visualbasic_indexing_is_a_field_usage);
+    RUN_TEST(contract_visualbasic_call_never_lands_on_enum_member);
     RUN_TEST(contract_all_grammars_in_graph);
 
     /* CALLS-edge breadth across non-LSP languages (P5). */

@@ -15647,6 +15647,420 @@ TEST(extraction_marker_round_trips_non_ascii_environment_path) {
 }
 #endif
 
+/* ===================================================================
+ * Group I: VB.NET structural extraction
+ * =================================================================== */
+
+TEST(vb_basic_declarations) {
+    CBMFileResult *r = extract("Namespace DemoApp\n"
+                               "    Module MathHelpers\n"
+                               "        Function AddOne(x As Integer) As Integer\n"
+                               "            Return x + 1\n"
+                               "        End Function\n"
+                               "    End Module\n"
+                               "\n"
+                               "    Class Customer\n"
+                               "        Public Property Name As String\n"
+                               "        Public Sub Save()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "\n"
+                               "    Interface IRunnable\n"
+                               "        Sub Run()\n"
+                               "    End Interface\n"
+                               "\n"
+                               "    Enum Status\n"
+                               "        Active\n"
+                               "        Disabled\n"
+                               "    End Enum\n"
+                               "End Namespace\n",
+                               CBM_LANG_VISUALBASIC, "t", "Demo.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "MathHelpers"));
+    ASSERT(has_def(r, "Method", "AddOne"));
+    ASSERT(has_def(r, "Class", "Customer"));
+    ASSERT(has_def(r, "Field", "Name"));
+    ASSERT(has_def(r, "Method", "Save"));
+    ASSERT(has_def(r, "Interface", "IRunnable"));
+    ASSERT(has_def(r, "Method", "Run"));
+    ASSERT(has_def(r, "Enum", "Status"));
+    ASSERT(has_def(r, "Variable", "Active"));
+    ASSERT(has_def(r, "Variable", "Disabled"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_method_qn_scoped_to_class) {
+    CBMFileResult *r = extract("Class Customer\n"
+                               "    Public Sub Save()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Customer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Save") == 0) {
+            found = 1;
+            ASSERT_STR_EQ(r->defs.items[i].label, "Method");
+            ASSERT_STR_EQ(r->defs.items[i].qualified_name, "t.Customer.Customer.Save");
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_inherits_implements_next_line) {
+    /* The standard VB.NET form: clauses on their own lines after the header. */
+    CBMFileResult *r = extract("Class Manager\n"
+                               "    Inherits Employee\n"
+                               "    Implements IRunnable, IDisposable\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Manager.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Manager") == 0) {
+            found = 1;
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes);
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[0]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[0], "Employee");
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[1]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[1], "IRunnable");
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[2]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[2], "IDisposable");
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_qualified_base_dotted_name) {
+    CBMFileResult *r = extract("Partial Class Form1\n"
+                               "    Inherits System.Windows.Forms.Form\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Form1") == 0) {
+            found = 1;
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes);
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[0]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[0], "System.Windows.Forms.Form");
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_constructor_extracted_as_new) {
+    CBMFileResult *r = extract("Class Customer\n"
+                               "    Public Sub New(name As String)\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Customer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "New"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_calls_bare_member_and_new) {
+    CBMFileResult *r = extract("Class Svc\n"
+                               "    Public Sub Run()\n"
+                               "        Validate()\n"
+                               "        Dim c As New Customer()\n"
+                               "        c.Save(1)\n"
+                               "        Me.Helper()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Svc.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "Validate"));
+    ASSERT(has_call(r, "Customer")); /* As New Customer() constructor call */
+    ASSERT(has_call(r, "c.Save"));
+    ASSERT(has_call(r, "Helper")); /* Me.Helper() self-call, receiver stripped */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_region_does_not_break_extraction) {
+    CBMFileResult *r = extract("Module Helpers\n"
+                               "#Region \"Utils\"\n"
+                               "    Sub DoWork()\n"
+                               "    End Sub\n"
+                               "#End Region\n"
+                               "    Sub After()\n"
+                               "    End Sub\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "Helpers.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Helpers"));
+    ASSERT(has_def(r, "Method", "DoWork"));
+    ASSERT(has_def(r, "Method", "After"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_winforms_designer_shapes) {
+    /* Designer-generated file shapes: attribute with `_` continuation before
+     * the class, Partial modifier, WithEvents fields, As New initializers. */
+    CBMFileResult *r = extract("<Global.Microsoft.VisualBasic.CompilerServices.DesignerGenerated()> _\n"
+                               "Partial Class Form1\n"
+                               "    Inherits System.Windows.Forms.Form\n"
+                               "    Private components As System.ComponentModel.IContainer\n"
+                               "    Friend WithEvents Button1 As System.Windows.Forms.Button\n"
+                               "    Private Sub InitializeComponent()\n"
+                               "        Me.Button1 = New System.Windows.Forms.Button()\n"
+                               "        Me.SuspendLayout()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Form1"));
+    ASSERT(has_def(r, "Method", "InitializeComponent"));
+    ASSERT(has_def(r, "Field", "components"));
+    ASSERT(has_def(r, "Field", "Button1"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_handles_and_addhandler_parse) {
+    /* Handles clause + AddHandler/AddressOf statement must not break parsing;
+     * the method defs and the AddressOf handler reference must survive. */
+    CBMFileResult *r = extract("Class Form1\n"
+                               "    Private Sub OnClick(sender As Object, e As EventArgs) Handles Button1.Click\n"
+                               "    End Sub\n"
+                               "    Private Sub Wire()\n"
+                               "        AddHandler Button1.Click, AddressOf OnClick\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "OnClick"));
+    ASSERT(has_def(r, "Method", "Wire"));
+    int handler_usage = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (strcmp(r->usages.items[i].ref_name, "OnClick") == 0) {
+            handler_usage = 1;
+        }
+    }
+    ASSERT_TRUE(handler_usage);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_imports_extracted) {
+    CBMFileResult *r = extract("Imports System.Text\n"
+                               "Imports System.Collections.Generic\n"
+                               "Module M\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "M.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(r->imports.count >= 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_nested_class_extracted) {
+    CBMFileResult *r = extract("Class Outer\n"
+                               "    Class Inner\n"
+                               "        Public Sub Go()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Outer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Outer"));
+    ASSERT(has_def(r, "Class", "Inner"));
+    ASSERT(has_def(r, "Method", "Go"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Number of calls whose callee is exactly `callee` (has_call matches a
+ * substring, which cannot tell "System" from "System.Windows.Forms.Button"). */
+static int vb_call_count_exact(CBMFileResult *r, const char *callee) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The grammar reads `New A.B.C()` as `New A` plus member accesses; the call
+ * names the whole type, and the `New A` prefix is no call of its own. Without
+ * an argument list no call encloses the chain, so the prefix names it. */
+TEST(vb_new_dotted_type_is_one_constructor_call) {
+    CBMFileResult *r = extract("Class Form1\n"
+                               "    Private Sub InitializeComponent()\n"
+                               "        Me.Button1 = New System.Windows.Forms.Button()\n"
+                               "        Me.ClientSize = New System.Drawing.Size(284, 261)\n"
+                               "        components = New System.ComponentModel.Container\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(vb_call_count_exact(r, "System.Windows.Forms.Button"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System.Drawing.Size"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System.ComponentModel.Container"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A call with arguments parses as array_access_expression (VB writes calls
+ * and indexing alike; coverage from #2885), and the Me/MyClass receiver is
+ * matched by node kind, so its spelling does not matter. */
+TEST(vb_calls_with_arguments_and_any_case_receiver) {
+    CBMFileResult *r = extract("Class Svc\n"
+                               "    Public Sub Run()\n"
+                               "        Dim x = Compute(1, 2)\n"
+                               "        me.Helper()\n"
+                               "        MYCLASS.Other(x)\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Svc.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(vb_call_count_exact(r, "Compute"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "Helper"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "Other"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `Dim a, b As Integer`: every name before an As clause takes its type, and
+ * `As New List(Of String)()` names the constructed type. */
+TEST(vb_field_types_from_as_clauses) {
+    CBMFileResult *r = extract("Class Holder\n"
+                               "    Dim a, b As Integer\n"
+                               "    Private items As New List(Of String)()\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Holder.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int typed = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Field") != 0 || !d->return_type) {
+            continue;
+        }
+        if ((strcmp(d->name, "a") == 0 || strcmp(d->name, "b") == 0) &&
+            strcmp(d->return_type, "Integer") == 0) {
+            typed++;
+        }
+        if (strcmp(d->name, "items") == 0 && strcmp(d->return_type, "List") == 0) {
+            typed++;
+        }
+    }
+    ASSERT_EQ(typed, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Imports with and without an alias (coverage from #2885). */
+TEST(vb_imports_alias_and_path) {
+    CBMFileResult *r = extract("Imports System.Text\n"
+                               "Imports Col = System.Collections.Generic\n"
+                               "Module M\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "M.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int text = 0;
+    int aliased = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (strcmp(imp->module_path, "System.Text") == 0 && strcmp(imp->local_name, "Text") == 0) {
+            text++;
+        }
+        if (strcmp(imp->module_path, "System.Collections.Generic") == 0 &&
+            strcmp(imp->local_name, "Col") == 0) {
+            aliased++;
+        }
+    }
+    ASSERT_EQ(text, 1);
+    ASSERT_EQ(aliased, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Interface members, MustOverride members and a type nested in a type. */
+TEST(vb_interface_abstract_and_nested_members) {
+    CBMFileResult *r = extract("Public Interface IShape\n"
+                               "    Function Area() As Double\n"
+                               "End Interface\n"
+                               "Public MustInherit Class Shape\n"
+                               "    Implements IShape\n"
+                               "    Public MustOverride Function Area() As Double Implements "
+                               "IShape.Area\n"
+                               "    Public Class Unit\n"
+                               "        Public Sub Scale()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Shape.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "IShape"));
+    ASSERT(has_def_qn(r, "t.Shape.IShape.Area"));
+    ASSERT(has_def_qn(r, "t.Shape.Shape.Area"));
+    ASSERT(has_def(r, "Class", "Unit"));
+    ASSERT(has_def(r, "Method", "Scale"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* is_test of the Method `Run` the source below defines, extracted as `path`;
+ * -1 when no such Method was extracted. */
+static int vb_run_method_is_test(const char *path) {
+    CBMFileResult *r = extract("Public Class OrderTests\n"
+                               "    Public Sub Run()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", path);
+    int verdict = -1;
+    for (int i = 0; r && i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "Run") == 0) {
+            verdict = d->is_test ? 1 : 0;
+        }
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+    return verdict;
+}
+
+/* *Test.vb / *Tests.vb are test files (from #2885), and that verdict reaches
+ * the methods they define: the registry ranks on it (#2427). */
+TEST(vb_test_file_names) {
+    ASSERT_TRUE(cbm_is_test_file("src/OrderTests.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_TRUE(cbm_is_test_file("src/OrderTest.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_FALSE(cbm_is_test_file("src/Order.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_EQ(vb_run_method_is_test("src/OrderTests.vb"), 1);
+    ASSERT_EQ(vb_run_method_is_test("src/Order.vb"), 0);
+    PASS();
+}
+
 SUITE(extraction) {
 #ifdef _WIN32
     RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
@@ -15728,6 +16142,25 @@ SUITE(extraction) {
     RUN_TEST(call_args_skip_comments_between_arguments);
     RUN_TEST(objectscript_data_flows_class_method_args);
     RUN_TEST(objectscript_data_flows_instance_method_args);
+
+    /* Group I: VB.NET structural extraction */
+    RUN_TEST(vb_basic_declarations);
+    RUN_TEST(vb_method_qn_scoped_to_class);
+    RUN_TEST(vb_inherits_implements_next_line);
+    RUN_TEST(vb_qualified_base_dotted_name);
+    RUN_TEST(vb_constructor_extracted_as_new);
+    RUN_TEST(vb_calls_bare_member_and_new);
+    RUN_TEST(vb_region_does_not_break_extraction);
+    RUN_TEST(vb_winforms_designer_shapes);
+    RUN_TEST(vb_handles_and_addhandler_parse);
+    RUN_TEST(vb_imports_extracted);
+    RUN_TEST(vb_nested_class_extracted);
+    RUN_TEST(vb_new_dotted_type_is_one_constructor_call);
+    RUN_TEST(vb_calls_with_arguments_and_any_case_receiver);
+    RUN_TEST(vb_field_types_from_as_clauses);
+    RUN_TEST(vb_imports_alias_and_path);
+    RUN_TEST(vb_interface_abstract_and_nested_members);
+    RUN_TEST(vb_test_file_names);
     RUN_TEST(iris_export_xml_simple_class);
     RUN_TEST(iris_export_xml_classmethod);
     RUN_TEST(iris_export_xml_property_parameter_index);

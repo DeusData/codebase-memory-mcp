@@ -1603,6 +1603,127 @@ static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
     return NULL;
 }
 
+/* VB.NET `New A.B.C(...)`: the grammar parses `New A` as a complete
+ * object_creation_expression (no argument list, no initializer) and `.B.C` as
+ * member accesses on it, so the enclosing invocation or indexing node is the
+ * real constructor call. True for that incomplete `New A` when a member access
+ * follows it; `New Foo().Bar()` creates a Foo and calls Bar, and `As New Foo`
+ * without parentheses constructs a Foo.
+ *
+ * The member access is recognised by the '.' after the node (blanks aside),
+ * not by ts_node_parent: that descends from the root, scanning siblings at
+ * every level, once per `New` in a WinForms InitializeComponent that holds
+ * thousands of them. Bytes are read only below the parsed tree's end minus
+ * one, which stays inside the source even when the parser was served an
+ * absent final newline (#2078). */
+static bool vb_new_is_chain_prefix(TSNode creation, const char *source) {
+    TSNode ty = ts_node_child_by_field_name(creation, TS_FIELD("type"));
+    if (ts_node_is_null(ty) || strcmp(ts_node_type(ty), "array_type") == 0 ||
+        !ts_node_is_null(ts_node_child_by_field_name(creation, TS_FIELD("arguments"))) ||
+        !ts_node_is_null(ts_node_child_by_field_name(creation, TS_FIELD("initializer")))) {
+        return false;
+    }
+    uint32_t limit = ts_node_end_byte(ts_tree_root_node(creation.tree));
+    for (uint32_t i = ts_node_end_byte(creation); i + SKIP_ONE < limit; i++) {
+        if (source[i] != ' ' && source[i] != '\t') {
+            return source[i] == '.';
+        }
+    }
+    return false;
+}
+
+/* The constructed type of a `New A.B.C` chain prefix (vb_new_is_chain_prefix)
+ * that no call encloses: `sb = New Text.StringBuilder` has no argument list,
+ * so no invocation or indexing node names the type. NULL when the dotted run
+ * is followed by '(' -- the enclosing call names it then (vb_callee). */
+static char *vb_new_chain_without_call(CBMArena *a, TSNode creation, const char *source) {
+    TSNode ty = ts_node_child_by_field_name(creation, TS_FIELD("type"));
+    uint32_t start = ts_node_start_byte(ty);
+    uint32_t limit = ts_node_end_byte(ts_tree_root_node(creation.tree));
+    uint32_t end = start;
+    while (end + SKIP_ONE < limit) {
+        unsigned char c = (unsigned char)source[end];
+        bool name_char = c == '_' || c == '.' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                         (c >= '0' && c <= '9');
+        if (!name_char) {
+            break;
+        }
+        end++;
+    }
+    if (end == start || (end + SKIP_ONE < limit && source[end] == '(')) {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, source + start, (size_t)(end - start));
+}
+
+/* Type name text with generic and array suffixes cut (`List(Of T)` -> "List"). */
+static char *vb_strip_type_suffix(char *text) {
+    if (!text) {
+        return NULL;
+    }
+    char *paren = strchr(text, '(');
+    if (paren) {
+        *paren = '\0';
+    }
+    return text[0] ? text : NULL;
+}
+
+/* VB.NET callee text for a call node (vb_call_types in lang_specs.c), NULL
+ * when the node names no callee.
+ *  - invocation_expression `F()` names it in `function`, and
+ *    array_access_expression `F(x)` in `array`: VB writes calls and indexing
+ *    alike, and the grammar reads a call with arguments as indexing.
+ *  - `Me.X()` / `MyClass.X()` are self-calls: the member name resolves like a
+ *    bare same-class call. The receiver is matched by node kind, so its
+ *    spelling (`me.`, `ME.`) does not matter in a case-insensitive language.
+ *  - object_creation_expression names the constructed type; an empty argument
+ *    list reads as an array rank (`New Customer()`), so an array_type there is
+ *    the type's element_type. See vb_new_is_chain_prefix for `New A.B.C()`. */
+static char *vb_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "object_creation_expression") == 0) {
+        if (vb_new_is_chain_prefix(node, source)) {
+            return vb_new_chain_without_call(a, node, source);
+        }
+        TSNode ty = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        if (!ts_node_is_null(ty) && strcmp(ts_node_type(ty), "array_type") == 0) {
+            ty = ts_node_child_by_field_name(ty, TS_FIELD("element_type"));
+        }
+        return ts_node_is_null(ty) ? NULL : vb_strip_type_suffix(cbm_node_text(a, ty, source));
+    }
+    TSNode callee = strcmp(nk, "invocation_expression") == 0
+                        ? ts_node_child_by_field_name(node, TS_FIELD("function"))
+                        : ts_node_child_by_field_name(node, TS_FIELD("array"));
+    if (ts_node_is_null(callee)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(callee), "member_access_expression") == 0) {
+        TSNode obj = ts_node_child_by_field_name(callee, TS_FIELD("object"));
+        const char *ok = ts_node_is_null(obj) ? "" : ts_node_type(obj);
+        if (strcmp(ok, "me_expression") == 0 || strcmp(ok, "myclass_expression") == 0) {
+            TSNode member = ts_node_child_by_field_name(callee, TS_FIELD("member"));
+            return ts_node_is_null(member) ? NULL : cbm_node_text(a, member, source);
+        }
+        /* Walk the access chain to its root; `New A` there makes this call
+         * the constructor of A.B.C, spelled from the type to the chain end. */
+        TSNode root = obj;
+        while (!ts_node_is_null(root) &&
+               strcmp(ts_node_type(root), "member_access_expression") == 0) {
+            root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+        }
+        if (!ts_node_is_null(root) &&
+            strcmp(ts_node_type(root), "object_creation_expression") == 0 &&
+            vb_new_is_chain_prefix(root, source)) {
+            TSNode ty = ts_node_child_by_field_name(root, TS_FIELD("type"));
+            uint32_t start = ts_node_start_byte(ty);
+            uint32_t end = ts_node_end_byte(callee);
+            return end > start ? vb_strip_type_suffix(
+                                     cbm_arena_strndup(a, source + start, (size_t)(end - start)))
+                               : NULL;
+        }
+    }
+    return cbm_node_text(a, callee, source);
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
@@ -2548,6 +2669,14 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
      * generic fallback would happily emit). NULL here means "not a call". */
     if (lang == CBM_LANG_PKL) {
         return extract_pkl_callee(a, node, source, ts_node_type(node));
+    }
+
+    /* VB.NET: resolve here and return unconditionally, like Pkl. The generic
+     * constructor path would name `New System.Windows.Forms.Button()` after
+     * its misparsed `New System` prefix, and the first-identifier fallback
+     * would turn indexing into calls of anything. NULL means "not a call". */
+    if (lang == CBM_LANG_VISUALBASIC) {
+        return vb_callee(a, node, source, ts_node_type(node));
     }
 
     // Helm / Go templates: resolve `include "x"` / `template "x"` to the

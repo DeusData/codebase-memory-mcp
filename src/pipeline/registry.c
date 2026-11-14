@@ -150,6 +150,11 @@ struct cbm_registry {
     CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
     CBMHashTable *swift_overloads;  /* base callable QN -> overloads */
     swift_owners_t *swift_owners;
+    /* VB.NET: ASCII-folded name -> the by_name spelling it was registered
+     * under (key and value owned). Filled only by VB.NET definitions and read
+     * only by a VB.NET lookup that found nothing under its own spelling, so
+     * no other language sees it (vb_canonical_callee). */
+    CBMHashTable *vb_folded;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -1338,6 +1343,7 @@ static int xl_family(CBMLanguage lang) {
         return XL_FAM_JVM;
     case CBM_LANG_CSHARP:
     case CBM_LANG_FSHARP:
+    case CBM_LANG_VISUALBASIC:
         return XL_FAM_DOTNET;
     case CBM_LANG_PHP:
     case CBM_LANG_BLADE:
@@ -1553,6 +1559,12 @@ cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, cons
     if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
         return CBM_FIELD_CALL_DROP;
     }
+    /* VB.NET writes indexing like a call (`items(0)`, `Me.Cache(key)`), so a
+     * parenthesised name that lands on a Field indexes it or reads a property:
+     * it calls nothing, and it references the Field as C#'s `items[0]` does. */
+    if (caller_lang == CBM_LANG_VISUALBASIC) {
+        return CBM_FIELD_CALL_AS_USAGE;
+    }
     if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
         return CBM_FIELD_CALL_KEEP;
     }
@@ -1620,6 +1632,17 @@ bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_labe
     return strcmp(target_label, "Variable") == 0 || strcmp(target_label, "Field") == 0;
 }
 
+bool cbm_call_never_names_data(CBMLanguage lang) {
+    /* VB.NET's Variables are enum members, and an enum member is never
+     * called: `Refresh()` in a Form calls Form.Refresh, not the `Refresh`
+     * member of some enum the short-name registry finds. Measured on
+     * staxrip/staxrip: 249 of 6,455 VB.NET CALLS edges landed on an enum
+     * member that way. A VB.NET call that lands on a Field never gets here:
+     * cbm_call_onto_field_policy has already made it a USAGE of the Field
+     * (indexing, or a delegate field invoked like a call). */
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_VISUALBASIC;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -1665,6 +1688,12 @@ static void free_swift_overloads(const char *key, void *value, void *ud) {
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
 }
 
+static void free_vb_folded(const char *key, void *value, void *ud) {
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
 static void swift_owners_free(swift_owners_t *index) {
     if (!index) {
         return;
@@ -1697,6 +1726,10 @@ void cbm_registry_free(cbm_registry_t *r) {
         cbm_ht_free(r->swift_overloads);
     }
     swift_owners_free(r->swift_owners);
+    if (r->vb_folded) {
+        cbm_ht_foreach(r->vb_folded, free_vb_folded, NULL);
+        cbm_ht_free(r->vb_folded);
+    }
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -1838,6 +1871,99 @@ static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_n
     return cbm_ht_get_key(r->exact, qualified_name);
 }
 
+/* ── VB.NET case-insensitive names ───────────────────────────────── */
+
+/* ASCII-fold the `len` bytes of `name` into `out` (`cap` bytes). False when
+ * they do not fit. VB.NET identifiers are case-insensitive: `Calculate`,
+ * `CALCULATE` and `calculate` name one symbol. */
+static bool vb_fold(const char *name, size_t len, char *out, size_t cap) {
+    if (!name || len + SKIP_ONE > cap) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        out[i] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    }
+    out[len] = '\0';
+    return true;
+}
+
+/* Record the by_name spelling of a VB.NET definition under its folded form.
+ * Two spellings that fold alike (`Run`, `RUN`) keep the strcmp-smaller one,
+ * so the table does not depend on registration order; folding keeps the
+ * length, so the kept spelling is overwritten in place. */
+static void vb_index_folded(cbm_registry_t *r, const char *spelling) {
+    char folded[CBM_SZ_512];
+    size_t len = strlen(spelling);
+    if (!vb_fold(spelling, len, folded, sizeof(folded))) {
+        return;
+    }
+    if (!r->vb_folded) {
+        r->vb_folded = cbm_ht_create(CBM_SZ_512);
+        if (!r->vb_folded) {
+            return;
+        }
+    }
+    char *have = cbm_ht_get(r->vb_folded, folded);
+    if (have) {
+        if (strcmp(spelling, have) < 0) {
+            memcpy(have, spelling, len);
+        }
+        return;
+    }
+    char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, folded);
+    char *value = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, spelling);
+    if (!key || !value) {
+        if (key) {
+            cbm_free(CBM_MEM_CLASS_OTHER, key);
+        }
+        if (value) {
+            cbm_free(CBM_MEM_CLASS_OTHER, value);
+        }
+        return;
+    }
+    cbm_ht_set(r->vb_folded, key, value);
+}
+
+/* Respell each dot segment of a VB.NET `callee` the way a VB.NET definition
+ * spells it (`helpers.format` -> `Helpers.Format`) into `out`; a segment no
+ * definition folds to (a local variable) stays as written. False when nothing
+ * changes or the result does not fit. */
+static bool vb_canonical_callee(const cbm_registry_t *r, const char *callee, char *out,
+                                size_t cap) {
+    if (!r->vb_folded || !callee) {
+        return false;
+    }
+    size_t o = 0;
+    bool changed = false;
+    const char *seg = callee;
+    for (;;) {
+        size_t len = strcspn(seg, ".");
+        const char *dot = seg[len] == '.' ? seg + len : NULL;
+        char folded[CBM_SZ_512];
+        const char *canon = vb_fold(seg, len, folded, sizeof(folded))
+                                ? (const char *)cbm_ht_get(r->vb_folded, folded)
+                                : NULL;
+        /* o < cap holds here, so cap - o - SKIP_ONE cannot wrap: room for the
+         * segment plus its '.' or the terminating NUL. */
+        if (len >= cap - o - SKIP_ONE) {
+            return false;
+        }
+        if (canon && strncmp(canon, seg, len) != 0) {
+            changed = true;
+        }
+        memcpy(out + o, canon ? canon : seg, len);
+        o += len;
+        if (!dot) {
+            break;
+        }
+        out[o++] = '.';
+        seg = dot + SKIP_ONE;
+    }
+    out[o] = '\0';
+    return changed;
+}
+
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label, bool is_test) {
     cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0, is_test);
@@ -1909,6 +2035,9 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     const char *primary =
         name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
     index_under_name(r, primary, owned_qn, is_test, lang);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        vb_index_folded(r, primary);
+    }
     /* '#' is a QN fence; no extractor mints one for a REGISTERED definition
      * today (Rust cfg twins are variants of one plain QN; a C macro's QN ends in
      * "#macro", but Macro is no registry label, so it never gets here). A
@@ -5030,22 +5159,58 @@ static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
                                    : (module_qn ? strlen(module_qn) : 0);
 }
 
+/* VB.NET names are case-insensitive. A lookup that found nothing under the
+ * name as written retries once with every segment respelled the way a VB.NET
+ * definition spells it (vb_canonical_callee); one that did find something
+ * keeps it, so an exact spelling always wins. `call_lang` and `caller_test`
+ * are passed through as the first lookup received them
+ * (registry_resolve_scoped). */
+static cbm_resolution_t vb_resolve_folded(const cbm_registry_t *r, cbm_resolution_t res,
+                                          const char *callee_name, const char *module_qn,
+                                          const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          size_t scope_len, bool skip_members,
+                                          CBMLanguage call_lang, bool caller_test) {
+    if (res.qualified_name && res.qualified_name[0]) {
+        return res;
+    }
+    char canon[CBM_SZ_512];
+    if (!vb_canonical_callee(r, callee_name, canon, sizeof(canon))) {
+        return res;
+    }
+    return registry_resolve_scoped(r, canon, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, scope_len, skip_members, call_lang,
+                                   caller_test);
+}
+
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
-    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false,
-                                   CBM_LANG_COUNT, false);
+    size_t scope_len = lang_scope_len(module_qn, lang);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, false);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        res = vb_resolve_folded(r, res, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, false);
+    }
+    return res;
 }
 
 cbm_resolution_t cbm_registry_resolve_ref(const cbm_registry_t *r, const char *ref_name,
                                           const char *module_qn, const char **import_map_keys,
                                           const char **import_map_vals, int import_map_count,
                                           CBMLanguage lang, bool caller_test) {
-    return registry_resolve_scoped(r, ref_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false,
-                                   CBM_LANG_COUNT, caller_test);
+    size_t scope_len = lang_scope_len(module_qn, lang);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, ref_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, caller_test);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        res = vb_resolve_folded(r, res, ref_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, caller_test);
+    }
+    return res;
 }
 
 static cbm_resolution_t resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
@@ -5058,9 +5223,15 @@ static cbm_resolution_t resolve_call_lang(const cbm_registry_t *r, const char *c
      * for the name; a C member call and every other language keep them. */
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
-    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members,
-                                   lang, caller_test);
+    size_t scope_len = lang_scope_len(module_qn, lang);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, skip_members, lang, caller_test);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        res = vb_resolve_folded(r, res, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, skip_members, lang, caller_test);
+    }
+    return res;
 }
 
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,

@@ -572,6 +572,7 @@ typedef enum {
     CBM_FIELD_CALL_KEEP = 0, /* not a Field target, or a language this rule leaves alone */
     CBM_FIELD_CALL_DROP,     /* a Field can never be this call's target */
     CBM_FIELD_CALL_BY_OWNER, /* C/C++ member call: the object's type names the Field */
+    CBM_FIELD_CALL_AS_USAGE, /* VB.NET indexing written like a call: a USAGE of the Field */
 } cbm_field_call_policy_t;
 cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
                                                    const char *target_label,
@@ -608,6 +609,12 @@ const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *me
  * pointers are callable names that are not methods. Pure; unit-tested in
  * test_registry.c. */
 bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label);
+
+/* The `is_java` gate of cbm_java_suppress_call_to_data_member for a caller
+ * language: Java, and VB.NET, whose Variables are enum members. One gate for
+ * pass_calls.c and pass_parallel.c, so the two resolvers cannot diverge.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_call_never_names_data(CBMLanguage lang);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

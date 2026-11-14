@@ -3754,6 +3754,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             if (field_policy == CBM_FIELD_CALL_DROP) {
                 continue;
             }
+            if (field_policy == CBM_FIELD_CALL_AS_USAGE) {
+                cbm_pipeline_emit_field_call_usage(ws->local_edge_buf, source_node, target_node,
+                                                   call);
+                continue;
+            }
             if (field_policy == CBM_FIELD_CALL_BY_OWNER && !arrow_bound) {
                 if (!field_index_built) {
                     field_index_ready =
@@ -3780,9 +3785,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
         if (target_node && source_node->id != target_node->id &&
-            cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+            cbm_java_suppress_call_to_data_member(cbm_call_never_names_data(lang),
+                                                  target_node->label)) {
             /* Same guard as pass_calls.c — a Java call never targets a
-             * Variable or a Field. */
+             * Variable or a Field, a VB.NET call never an enum member. */
             continue;
         }
         if (target_node && source_node->id != target_node->id &&

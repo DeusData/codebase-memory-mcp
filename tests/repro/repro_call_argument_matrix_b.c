@@ -1,5 +1,5 @@
 /*
- * Exhaustive call-argument reproduction matrix, CBMLanguage 80..164.
+ * Exhaustive call-argument reproduction matrix, CBMLanguage 80..170.
  *
  * Every language in this numeric range whose live spec has call-node metadata
  * owns one TEST row below. Semantic applications are exercised twice: once as
@@ -879,6 +879,21 @@ static const char PLSQL_BARE[] = "CREATE OR REPLACE PACKAGE BODY sample_pkg AS\n
                                  "  END;\n"
                                  "END sample_pkg;\n"
                                  "/\n";
+static const char VISUALBASIC_INSIDE[] = "Module Sample\n"
+                                         "    Function Accept(value As Object) As Object\n"
+                                         "        Return value\n"
+                                         "    End Function\n"
+                                         "\n"
+                                         "    Function Run(watched As Object) As Object\n"
+                                         "        Dim result = Accept(watched)\n"
+                                         "        Return result\n"
+                                         "    End Function\n"
+                                         "End Module\n";
+static const char VISUALBASIC_BARE[] = "Module Sample\n"
+                                       "    Function Run(watched As Object) As Object\n"
+                                       "        Return watched\n"
+                                       "    End Function\n"
+                                       "End Module\n";
 
 #define ROUTINE_ARGUMENT_CASE(tag_value, language_value, filename_value, inside_value, bare_value, \
                               kind_value, caller_value, callee_value, argument_value, defs_value,  \
@@ -1030,6 +1045,10 @@ static const RoutineArgumentCase PLSQL_CASE = ROUTINE_ARGUMENT_CASE(
 static const RoutineArgumentCase CHIALISP_CASE = ROUTINE_ARGUMENT_CASE(
     "CHIALISP", CBM_LANG_CHIALISP, "sample.clib", CHIALISP_INSIDE, CHIALISP_BARE, "list", "run",
     "accept", "watched", 1, 1, 0, "Chialisp list application and symbol-reference vocabulary");
+static const RoutineArgumentCase VISUALBASIC_CASE = ROUTINE_ARGUMENT_CASE(
+    "VISUALBASIC", CBM_LANG_VISUALBASIC, "Sample.vb", VISUALBASIC_INSIDE, VISUALBASIC_BARE,
+    "array_access_expression", "Run", "Accept", "watched", 1, 1, 0,
+    "VB.NET Module function application with a value argument");
 
 static const ModuleArgumentCase JUST_CASE = MODULE_ARGUMENT_CASE(
     "JUST", CBM_LANG_JUST, "justfile", JUST_INSIDE, JUST_BARE, "function_call", "uppercase",
@@ -1223,6 +1242,7 @@ DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_udl, OBJECTSCRIPT_UDL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_routine, OBJECTSCRIPT_ROUTINE_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(plsql, PLSQL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(chialisp, CHIALISP_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(visualbasic, VISUALBASIC_CASE)
 
 #undef DEFINE_ROUTINE_ARGUMENT_TEST
 
@@ -1292,15 +1312,15 @@ TEST(repro_call_argument_matrix_b_domain_bitbake) {
 }
 
 enum {
-    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 39,
+    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 40,
     MODULE_ARGUMENT_LANGUAGE_COUNT = 4,
     DOMAIN_CONTROL_LANGUAGE_COUNT = 6,
     MATRIX_LANGUAGE_COUNT = ROUTINE_ARGUMENT_LANGUAGE_COUNT + MODULE_ARGUMENT_LANGUAGE_COUNT +
                             DOMAIN_CONTROL_LANGUAGE_COUNT,
 };
 
-_Static_assert(MATRIX_LANGUAGE_COUNT == 49,
-               "RACKET..CHIALISP call-capable matrix must contain exactly 49 "
+_Static_assert(MATRIX_LANGUAGE_COUNT == 50,
+               "RACKET..VISUALBASIC call-capable matrix must contain exactly 50 "
                "language rows");
 
 #define MATRIX_B_LANGUAGE_ROWS(X)                                                               \
@@ -1345,6 +1365,7 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 49,
       OBJECTSCRIPT_ROUTINE_CASE.identity.language)                                              \
     X(repro_call_argument_matrix_b_routine_plsql, PLSQL_CASE.identity.language)                 \
     X(repro_call_argument_matrix_b_routine_chialisp, CHIALISP_CASE.identity.language)           \
+    X(repro_call_argument_matrix_b_routine_visualbasic, VISUALBASIC_CASE.identity.language)     \
     X(repro_call_argument_matrix_b_module_just, JUST_CASE.identity.language)                    \
     X(repro_call_argument_matrix_b_module_gotemplate, GOTEMPLATE_CASE.identity.language)        \
     X(repro_call_argument_matrix_b_module_linkerscript, LINKERSCRIPT_CASE.identity.language)    \

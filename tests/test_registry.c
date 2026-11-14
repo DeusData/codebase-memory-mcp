@@ -847,6 +847,81 @@ TEST(resolve_unresolved) {
     PASS();
 }
 
+/* VB.NET names are case-insensitive: a call spelled CALCULATE reaches the
+ * Calculate method (shape from #2885). */
+TEST(visual_basic_call_resolution_is_case_insensitive) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method",
+                          CBM_LANG_VISUALBASIC, false);
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_scoped(r, "CALCULATE", "proj.Worker", NULL, NULL, 0,
+                                         CBM_LANG_VISUALBASIC, "proj.Worker.Run", false);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Worker.Calculate");
+    /* Every segment of a qualified callee is respelled, not only the last. */
+    cbm_registry_add_lang(r, "Helpers", "proj.Helpers.Helpers", "Class", CBM_LANG_VISUALBASIC,
+                          false);
+    cbm_registry_add_lang(r, "Format", "proj.Helpers.Helpers.Format", "Method",
+                          CBM_LANG_VISUALBASIC, false);
+    res = cbm_registry_resolve_lang(r, "helpers.format", "proj.Worker", NULL, NULL, 0,
+                                    CBM_LANG_VISUALBASIC);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Helpers.Helpers.Format");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* References (USAGE, READS, WRITES) fold as calls do: they resolve through
+ * cbm_registry_resolve_ref, for production and test code alike. */
+TEST(visual_basic_reference_resolution_is_case_insensitive) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "Helpers", "proj.Helpers.Helpers", "Class", CBM_LANG_VISUALBASIC,
+                          false);
+    cbm_resolution_t res = cbm_registry_resolve_ref(r, "helpers", "proj.Worker", NULL, NULL, 0,
+                                                    CBM_LANG_VISUALBASIC, false);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Helpers.Helpers");
+    res = cbm_registry_resolve_ref(r, "HELPERS", "proj.WorkerTests", NULL, NULL, 0,
+                                   CBM_LANG_VISUALBASIC, true);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Helpers.Helpers");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The folded retry runs only when the spelling as written finds nothing, so
+ * an exact spelling keeps its own target. */
+TEST(visual_basic_exact_spelling_wins) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "run", "proj.Lower.run", "Method", CBM_LANG_VISUALBASIC, false);
+    cbm_registry_add_lang(r, "RUN", "proj.Upper.RUN", "Method", CBM_LANG_VISUALBASIC, false);
+    cbm_resolution_t res =
+        cbm_registry_resolve_lang(r, "RUN", "proj.Upper", NULL, NULL, 0, CBM_LANG_VISUALBASIC);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, "proj.Upper.RUN");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Only VB.NET folds: C# stays case-sensitive, even next to VB.NET symbols. */
+TEST(case_folding_is_visual_basic_only) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add_lang(r, "Calculate", "proj.Worker.Calculate", "Method", CBM_LANG_CSHARP,
+                          false);
+    cbm_registry_add_lang(r, "Total", "proj.Vb.Total", "Method", CBM_LANG_VISUALBASIC, false);
+    cbm_resolution_t res =
+        cbm_registry_resolve_lang(r, "CALCULATE", "proj.Worker", NULL, NULL, 0, CBM_LANG_CSHARP);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    res = cbm_registry_resolve_lang(r, "total", "proj.Worker", NULL, NULL, 0, CBM_LANG_CSHARP);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_many_nodes) {
     cbm_registry_t *r = cbm_registry_new();
     /* Add 500 functions */
@@ -1912,6 +1987,12 @@ TEST(call_onto_field_follows_language_and_shape) {
     /* The same language as the Field keeps its resolution too. */
     ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_GO, "s.fn", "Field", "pkg/s.go"),
               CBM_FIELD_CALL_KEEP);
+    /* VB.NET writes indexing like a call: `items(0)` on a Field references it
+     * (a USAGE, as C#'s `items[0]`), it calls nothing. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_VISUALBASIC, "items", "Field", "src/Form1.vb"),
+              CBM_FIELD_CALL_AS_USAGE);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_VISUALBASIC, "Run", "Method", "src/Form1.vb"),
+              CBM_FIELD_CALL_KEEP);
     /* Not a Field target: not this rule's business. */
     ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "main", "Function", "src/main.c"),
               CBM_FIELD_CALL_KEEP);
@@ -2019,6 +2100,18 @@ TEST(java_call_never_binds_data_member) {
     ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Variable"));
     /* Degenerate input → nothing to judge. */
     ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, NULL));
+    PASS();
+}
+
+/* The language gate both call resolvers share: Java, and VB.NET (whose
+ * Variables are enum members, never called). Languages with callable data
+ * keep their binds. */
+TEST(call_never_names_data_gate) {
+    ASSERT_TRUE(cbm_call_never_names_data(CBM_LANG_JAVA));
+    ASSERT_TRUE(cbm_call_never_names_data(CBM_LANG_VISUALBASIC));
+    ASSERT_FALSE(cbm_call_never_names_data(CBM_LANG_KOTLIN));
+    ASSERT_FALSE(cbm_call_never_names_data(CBM_LANG_C));
+    ASSERT_FALSE(cbm_call_never_names_data(CBM_LANG_CSHARP));
     PASS();
 }
 
@@ -3655,6 +3748,10 @@ SUITE(registry) {
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_qualified_receiver_awareness);
     RUN_TEST(resolve_unresolved);
+    RUN_TEST(visual_basic_call_resolution_is_case_insensitive);
+    RUN_TEST(visual_basic_reference_resolution_is_case_insensitive);
+    RUN_TEST(visual_basic_exact_spelling_wins);
+    RUN_TEST(case_folding_is_visual_basic_only);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */
     RUN_TEST(confidence_band_high);
@@ -3709,6 +3806,7 @@ SUITE(registry) {
     RUN_TEST(c_member_access_binds_by_owner_only);
     RUN_TEST(c_member_rule_covers_c_files_and_every_dot_h);
     RUN_TEST(java_call_never_binds_data_member);
+    RUN_TEST(call_never_names_data_gate);
     RUN_TEST(generated_member_registers_by_qn_only);
     RUN_TEST(generated_member_mark_on_defs_and_nodes);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
