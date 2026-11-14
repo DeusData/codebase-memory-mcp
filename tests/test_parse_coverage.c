@@ -2250,6 +2250,243 @@ TEST(vbnet_vendored_grammar_still_flags_broken_source) {
     PASS();
 }
 
+/* ── VB6 / VBA: the vendored grammar parses real VB6 and VBA (#2564, #721) ──
+ * tools/tree-sitter-vba (harumiWeb/tree-sitter-vba v0.14.5, vba dialect) is
+ * vendored ahead of VB6/VBA extraction: no CBMLanguage routes to it yet, so
+ * these cases parse through tree_sitter_vba() directly. The class module is
+ * dual-target VB6 the way real control libraries write it: the VB6 IDE class
+ * header and Attribute lines, a Declare kept in both #If VBA7 branches
+ * (PtrSafe, LongPtr) plus the LongPtr shim enum VB6 needs, Implements, an
+ * Event, Property Get/Let/Set, a label, and bare calls with plain and member
+ * callees. It is RED on the alternatives: upstream's vb6 dialect rejects
+ * PtrSafe, and the vba dialect at v0.13.0 (the pin PR #2564 carried) leaves
+ * an ERROR at `Case Target Is Nothing` and turns `Err.Raise a, b, c` after
+ * the label into an expression_statement, losing the callee. The form is CRLF,
+ * as the VB6 IDE writes it. */
+extern const TSLanguage *tree_sitter_vba(void);
+
+static const char VBA_CLASS_SOURCE[] =
+    "VERSION 1.0 CLASS\n"
+    "BEGIN\n"
+    "  MultiUse = -1  'True\n"
+    "  Persistable = 0  'NotPersistable\n"
+    "  DataBindingBehavior = 0  'vbNone\n"
+    "  DataSourceBehavior  = 0  'vbNone\n"
+    "  MTSTransactionMode  = 0  'NotAnMTSObject\n"
+    "END\n"
+    "Attribute VB_Name = \"Account\"\n"
+    "Attribute VB_GlobalNameSpace = False\n"
+    "Attribute VB_Creatable = True\n"
+    "Attribute VB_PredeclaredId = False\n"
+    "Attribute VB_Exposed = True\n"
+    "Option Explicit\n"
+    "Implements IComparable\n"
+    "\n"
+    "#If VBA7 Then\n"
+    "Private Declare PtrSafe Sub CopyMemory Lib \"kernel32\" Alias \"RtlMoveMemory\" "
+        "(ByRef Destination As Any, ByRef Source As Any, ByVal Length As LongPtr)\n"
+    "#Else\n"
+    "Private Declare Sub CopyMemory Lib \"kernel32\" Alias \"RtlMoveMemory\" (ByRef "
+        "Destination As Any, ByRef Source As Any, ByVal Length As Long)\n"
+    "#End If\n"
+    "\n"
+    "#If (VBA7 = 0) Then\n"
+    "Private Enum LongPtr\n"
+    "    [_]\n"
+    "End Enum\n"
+    "#End If\n"
+    "\n"
+    "Public Event Changed(ByVal OldValue As Currency)\n"
+    "\n"
+    "Private Type BalanceInfo\n"
+    "    Amount As Currency\n"
+    "    Stamp As Date\n"
+    "End Type\n"
+    "\n"
+    "Private mOwner As String\n"
+    "Private mInfo As BalanceInfo\n"
+    "Private mHistory As Collection\n"
+    "\n"
+    "Private Sub Class_Initialize()\n"
+    "    Set mHistory = New Collection\n"
+    "End Sub\n"
+    "\n"
+    "Public Property Get Owner() As String\n"
+    "    Owner = mOwner\n"
+    "End Property\n"
+    "\n"
+    "Public Property Let Owner(ByVal Value As String)\n"
+    "    mOwner = Value\n"
+    "End Property\n"
+    "\n"
+    "Public Property Set History(ByVal Value As Collection)\n"
+    "    Set mHistory = Value\n"
+    "End Property\n"
+    "\n"
+    "Public Function Deposit(ByVal Amount As Currency) As Boolean\n"
+    "    On Error GoTo Fail\n"
+    "    Dim Old As Currency\n"
+    "    Old = mInfo.Amount\n"
+    "    mInfo.Amount = mInfo.Amount + Amount\n"
+    "    mHistory.Add Amount\n"
+    "    ' audit trail\n"
+    "    LogLine Format$(Amount, \"0.00\"), True\n"
+    "    RaiseEvent Changed(Old)\n"
+    "    Deposit = True\n"
+    "    Exit Function\n"
+    "Fail:\n"
+    "    Err.Raise vbObjectError + 513, \"Account.Deposit\", \"deposit failed\"\n"
+    "End Function\n"
+    "\n"
+    "Public Sub Apply(ByVal Target As Object)\n"
+    "    Dim Entry As Variant\n"
+    "    For Each Entry In mHistory\n"
+    "        CallByName Target, \"Owner\", VbLet, mOwner\n"
+    "    Next\n"
+    "    Select Case True\n"
+    "    Case Target Is Nothing\n"
+    "        Exit Sub\n"
+    "    Case Else\n"
+    "        With Target\n"
+    "            .Refresh\n"
+    "        End With\n"
+    "    End Select\n"
+    "End Sub\n"
+    "\n"
+    "Private Function IComparable_CompareTo(ByVal Other As Object) As Long\n"
+    "    IComparable_CompareTo = StrComp(mOwner, Other.Owner, vbTextCompare)\n"
+    "End Function\n";
+
+static const char VBA_FORM_SOURCE[] =
+    "VERSION 5.00\r\n"
+    "Begin VB.Form frmMain\r\n"
+    "   Caption         =   \"Accounts\"\r\n"
+    "   ClientHeight    =   3090\r\n"
+    "   ClientLeft      =   60\r\n"
+    "   ClientTop       =   450\r\n"
+    "   ClientWidth     =   4680\r\n"
+    "   LinkTopic       =   \"Form1\"\r\n"
+    "   ScaleHeight     =   3090\r\n"
+    "   ScaleWidth      =   4680\r\n"
+    "   StartUpPosition =   3  'Windows Default\r\n"
+    "   Begin VB.CommandButton cmdDeposit\r\n"
+    "      Caption         =   \"Deposit\"\r\n"
+    "      Height          =   495\r\n"
+    "      Left            =   1680\r\n"
+    "      TabIndex        =   0\r\n"
+    "      Top             =   1200\r\n"
+    "      Width           =   1215\r\n"
+    "   End\r\n"
+    "End\r\n"
+    "Attribute VB_Name = \"frmMain\"\r\n"
+    "Attribute VB_GlobalNameSpace = False\r\n"
+    "Attribute VB_Creatable = False\r\n"
+    "Attribute VB_PredeclaredId = True\r\n"
+    "Attribute VB_Exposed = False\r\n"
+    "Option Explicit\r\n"
+    "\r\n"
+    "Private WithEvents mAccount As Account\r\n"
+    "\r\n"
+    "Private Sub cmdDeposit_Click()\r\n"
+    "    If mAccount.Deposit(100) Then MsgBox \"Done\", vbInformation, Me.Caption\r\n"
+    "End Sub\r\n"
+    "\r\n"
+    "Private Sub mAccount_Changed(ByVal OldValue As Currency)\r\n"
+    "    Debug.Print \"was \"; OldValue\r\n"
+    "End Sub\r\n";
+
+/* Counts the nodes of `type` under `node`. */
+static int vba_type_count(TSNode node, const char *type) {
+    int hits = strcmp(ts_node_type(node), type) == 0 ? 1 : 0;
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vba_type_count(ts_node_child(node, i), type);
+    }
+    return hits;
+}
+
+/* Counts the call_statement nodes under `node` whose callee text is exactly
+ * `callee`. */
+static int vba_callee_count(TSNode node, const char *src, const char *callee) {
+    int hits = 0;
+    if (strcmp(ts_node_type(node), "call_statement") == 0) {
+        TSNode target = ts_node_child_by_field_name(node, "callee", 6);
+        if (!ts_node_is_null(target)) {
+            uint32_t start = ts_node_start_byte(target);
+            uint32_t len = ts_node_end_byte(target) - start;
+            if (strlen(callee) == len && memcmp(src + start, callee, len) == 0) {
+                hits++;
+            }
+        }
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vba_callee_count(ts_node_child(node, i), src, callee);
+    }
+    return hits;
+}
+
+TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    /* The vendored runtime accepts the generated ABI (15). */
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, VBA_CLASS_SOURCE,
+                                          (uint32_t)strlen(VBA_CLASS_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_STR_EQ(ts_node_type(root), "source_file");
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* Every procedure is a declaration node an extractor can index. */
+    ASSERT_EQ(vba_type_count(root, "sub_declaration"), 2);
+    ASSERT_EQ(vba_type_count(root, "function_declaration"), 2);
+    ASSERT_EQ(vba_type_count(root, "property_get_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "property_let_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "property_set_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "declare_sub_statement"), 2);
+    /* Bare calls keep their callee; none is split into an expression. */
+    ASSERT_EQ(vba_type_count(root, "expression_statement"), 0);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "Err.Raise"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "CallByName"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "LogLine"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "mHistory.Add"), 1);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vba_vendored_grammar_parses_vb6_form_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, VBA_FORM_SOURCE,
+                                          (uint32_t)strlen(VBA_FORM_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* The designer header is structure, not code: the form and its button
+     * are two nested begin blocks ahead of the two event handlers. */
+    ASSERT_STR_EQ(ts_node_type(ts_node_named_child(root, 0)), "frm_version_statement");
+    ASSERT_EQ(vba_type_count(root, "frm_begin_block"), 2);
+    ASSERT_EQ(vba_type_count(root, "sub_declaration"), 2);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vba_vendored_grammar_still_flags_broken_source) {
+    static const char broken[] = "Public Sub Broken(\n    x = \nEnd Sub\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, broken, (uint32_t)strlen(broken));
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 /* ── SQLite migrations (#2246) ───────────────────────────────────────────────
  * The vendored SQL grammar is a self-maintained fork of DerekStride/tree-sitter-sql
  * (tools/tree-sitter-sql + patches/sqlite-dialect.patch). Upstream rejected
@@ -2580,6 +2817,9 @@ SUITE(parse_coverage) {
     RUN_TEST(pascal_broken_source_still_flagged_issue2211);
     RUN_TEST(vbnet_vendored_grammar_parses_real_vb_clean);
     RUN_TEST(vbnet_vendored_grammar_still_flags_broken_source);
+    RUN_TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean);
+    RUN_TEST(vba_vendored_grammar_parses_vb6_form_clean);
+    RUN_TEST(vba_vendored_grammar_still_flags_broken_source);
 
     RUN_TEST(sqlite_valid_migration_not_flagged);
     RUN_TEST(sqlite_malformed_still_flagged);

@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-163 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+164 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -77,8 +77,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Twelve further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `sql`, `tsx`, `vbnet`) are
+- Thirteen further grammars (`arkts`, `assembly`, `cfml`, `cfscript`, `dotenv`,
+  `javascript`, `pascal`, `pine`, `qml`, `sql`, `tsx`, `vba`, `vbnet`) are
   self-maintained forks that retain their original upstream authors' licenses —
   see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -101,8 +101,26 @@ License summary:
   MIT, (c) 2021 Derek Stride) is the upstream grammar with one (c) 2026
   DeusData patch that accepts the SQLite syntax of real migration files
   (PRAGMA, AUTOINCREMENT, WITHOUT ROWID, trigger bodies, virtual tables); its
-  grammar source lives in `tools/tree-sitter-sql/`. `vbnet` is described in its
-  own section below.
+  grammar source lives in `tools/tree-sitter-sql/`. `vba` and `vbnet` are described
+  in their own sections below.
+
+### tree-sitter-vba
+
+- **Project:** [harumiWeb/tree-sitter-vba](https://github.com/harumiWeb/tree-sitter-vba)
+- **License:** MIT
+- **Copyright:** (c) 2026 harumiWeb
+- **Vendored at:** `internal/cbm/vendored/grammars/vba/`
+- **Pinned commit:** `83c5c3c3c721` (v0.14.5)
+- **Notes:** Visual Basic for Applications and Visual Basic 6 grammar (its
+  `vba` dialect), maintained here as a self-maintained fork without local
+  changes: upstream does not track its generated parser, so its grammar source
+  (`common/define-grammar.js` and `vba/grammar.js`, byte-identical to
+  upstream) and the regeneration recipe live in `tools/tree-sitter-vba/`, and
+  the parser is generated in this repository with tree-sitter-cli 0.25.10.
+  Upstream's `THIRD_PARTY_LICENSE.md` covers only its test fixtures, none of
+  which is carried here. The grammar is vendored ahead of VB6/VBA extraction
+  (#2564); provenance hashes are in
+  `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ### tree-sitter-vbnet (with CodeGraph's real-world VB.NET patch)
 

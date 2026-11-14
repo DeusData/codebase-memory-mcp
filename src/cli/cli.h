@@ -480,6 +480,10 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
 
+/* Lower the limit a tar.gz archive may decompress to, so a test can pin the
+ * refusal with a small archive. 0 restores the 500 MiB limit. */
+void cbm_cli_set_decompress_max_for_test(size_t max_bytes);
+
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Index management ─────────────────────────────────────────── */
