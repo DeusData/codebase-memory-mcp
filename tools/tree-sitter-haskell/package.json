@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-haskell-cbm",
+  "version": "0.23.1-cbm.1",
+  "description": "cbm fork of tree-sitter-haskell @ 7fa19f1 (escaped char literal fix, #2439)",
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}
