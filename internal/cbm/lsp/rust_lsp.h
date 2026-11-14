@@ -24,6 +24,7 @@
 #ifndef CBM_LSP_RUST_LSP_H
 #define CBM_LSP_RUST_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -75,6 +76,7 @@ typedef struct {
     const char **use_local_names;
     const char **use_module_paths;
     int use_count;
+    CBMNameRows use_rows; /* use_local_names by name, rows in table order */
 
     const char **glob_module_qns;
     int glob_count;

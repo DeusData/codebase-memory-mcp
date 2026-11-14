@@ -624,6 +624,62 @@ TEST(handles_gin_group_prefix_issue686) {
     PASS();
 }
 
+/* #686: which statement binds a group receiver. `var` lists and blocks, tuples, a name
+ * declared with no value (no prefix), a shadowing inner block, rebinding, an enclosing
+ * block reached from an inner one, a chain of groups, and a function literal (a boundary:
+ * nothing outside it binds). */
+static const EtFile et_go_group_bindings[] = {{"main.go",
+                                               "package main\n\n"
+                                               "import \"github.com/gin-gonic/gin\"\n\n"
+                                               "func h(c *gin.Context) {}\n\n"
+                                               "func main() {\n"
+                                               "    r := gin.Default()\n"
+                                               "    var a, b = r.Group(\"/a\"), r.Group(\"/b\")\n"
+                                               "    a.GET(\"/x\", h)\n"
+                                               "    b.GET(\"/y\", h)\n"
+                                               "    var (\n"
+                                               "        c1 = r.Group(\"/c\")\n"
+                                               "        d1 *gin.RouterGroup\n"
+                                               "    )\n"
+                                               "    c1.GET(\"/z\", h)\n"
+                                               "    d1.GET(\"/w\", h)\n"
+                                               "    e, f := r.Group(\"/e\"), r.Group(\"/f\")\n"
+                                               "    f.GET(\"/q\", h)\n"
+                                               "    e.GET(\"/p\", h)\n"
+                                               "    g := r.Group(\"/g1\")\n"
+                                               "    {\n"
+                                               "        g := r.Group(\"/g2\")\n"
+                                               "        g.GET(\"/in\", h)\n"
+                                               "    }\n"
+                                               "    g.GET(\"/out\", h)\n"
+                                               "    g = r.Group(\"/g3\")\n"
+                                               "    if true {\n"
+                                               "        g.GET(\"/if\", h)\n"
+                                               "    }\n"
+                                               "    m := r.Group(\"/m\")\n"
+                                               "    n := m.Group(\"/n\")\n"
+                                               "    n.GET(\"/deep\", h)\n"
+                                               "    go func() {\n"
+                                               "        g.GET(\"/lit\", h)\n"
+                                               "    }()\n"
+                                               "}\n"}};
+
+static const char *et_go_group_bindings_routes[] = {"/a/x",   "/b/y",      "/c/z",   "/w",
+                                                    "/f/q",   "/e/p",      "/g2/in", "/g1/out",
+                                                    "/g3/if", "/m/n/deep", "/lit",   NULL};
+
+TEST(handles_go_group_binding_forms_sequential_issue686) {
+    ASSERT_TRUE(
+        et_routes_exact_mode(et_go_group_bindings, 1, et_go_group_bindings_routes, false, NULL));
+    PASS();
+}
+
+TEST(handles_go_group_binding_forms_parallel_issue686) {
+    ASSERT_TRUE(
+        et_routes_exact_mode(et_go_group_bindings, 1, et_go_group_bindings_routes, true, NULL));
+    PASS();
+}
+
 /* Spring (Java) — class-level @RequestMapping must prefix method mappings.
  * Reproduce-first: a HANDLES count alone can pass with partial routes
  * ("/orders"), but callers/search_graph need the actual endpoint names
@@ -3003,6 +3059,8 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
     RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
     RUN_TEST(handles_gin_group_prefix_issue686);
+    RUN_TEST(handles_go_group_binding_forms_sequential_issue686);
+    RUN_TEST(handles_go_group_binding_forms_parallel_issue686);
     RUN_TEST(handles_spring_java);
     RUN_TEST(data_flows_test_files_pair_within_their_file_sequential);
     RUN_TEST(data_flows_test_files_pair_within_their_file_parallel);

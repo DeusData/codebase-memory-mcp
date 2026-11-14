@@ -2848,6 +2848,41 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
     PASS();
 }
 
+/* C `x++` and `--x` write x. The C assignment node set held only
+ * assignment_expression, so an increment or a decrement left no WRITES edge,
+ * although the write resolver already handles update_expression and `x = 0`
+ * in the same file did write. */
+TEST(pipeline_c_increment_writes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incwrite_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "src/counter.c"),
+                  "struct counter { int n; };\n"
+                  "int hits;\n"
+                  "void hits_reset(void) { hits = 0; }\n"
+                  "void hits_bump(void) { hits++; }\n"
+                  "void hits_drop(void) { --hits; }\n"
+                  "void counter_tick(struct counter *c) { c->n++; }\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/incwrite.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    /* The plain assignment shows the fixture can produce WRITES at all. */
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_reset", "hits", "Variable"), 1);
+    /* Postfix and prefix on a file-level variable, postfix on a member. */
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_bump", "hits", "Variable"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_drop", "hits", "Variable"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "counter_tick", "n", "Field"), 1);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_cleanup(tmp);
+    PASS();
+}
+
 typedef struct {
     int run_rc;
     bool store_opened;
@@ -35032,6 +35067,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
+    RUN_TEST(pipeline_c_increment_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
