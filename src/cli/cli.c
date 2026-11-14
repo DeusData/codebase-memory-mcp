@@ -12587,7 +12587,7 @@ int cbm_cmd_install(int argc, char **argv) {
      * `install --force` from a freshly built binary silently kept the OLD file
      * — operators ran stale code believing they had upgraded (#472). Copy the
      * running binary to ~/.local/bin (unless we ARE that file), then sign it. */
-    if (!same_binary && target_exists && !force) {
+    if (!skip_binary && !same_binary && target_exists && !force) {
         printf("A different binary already exists at:\n  %s\n", bin_target);
         if (prompt_yn("Replace it with the binary you ran install from?")) {
             do_copy = true;
@@ -12601,7 +12601,7 @@ int cbm_cmd_install(int argc, char **argv) {
      * and gets Killed:9 when spawned by an MCP host. Sign the private staged
      * candidate before disrupting sessions, then publish those exact verified
      * bytes inside the activation window. */
-    bool sign_binary = do_copy || target_exists;
+    bool sign_binary = !skip_binary && (do_copy || target_exists);
     bool prepare_binary = sign_binary;
 #else
     bool prepare_binary = do_copy;

@@ -2132,6 +2132,46 @@ TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
     PASS();
 }
 
+/* An existing target must not turn config-only install into binary activation.
+ * Exercise the real scope guard with a committed client, not the activation
+ * fake (whose reserve callback deliberately quiesces whenever called). */
+TEST(cli_install_skip_binary_existing_target_in_host_namespace_quiesces_nothing) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "skip-existing");
+    char binary_dir[640];
+    char binary_path[704];
+    char activation_log[704];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/existing/bin", fixture.host_home);
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson",
+             fixture.host_cache);
+    const char *sentinel = "existing binary must survive config-only install\n";
+    bool prepared = ready && test_mkdirp(binary_dir) == 0 &&
+                    write_test_file(binary_path, sentinel) == 0;
+    int install_rc =
+        prepared ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, binary_dir,
+                                     true)
+                 : -1;
+    /* This asks the daemon for !stopping and committed_clients == 1. */
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    const char *binary = read_test_file(binary_path);
+    bool preserved = binary && strcmp(binary, sentinel) == 0;
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(prepared);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(preserved);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
 /* 2026-10-09: ASSERT(ready) failed with nothing in the log, so which setup
  * step broke was unknowable. The fixture now names the step it stopped at. A
  * tag naming a missing directory makes its own mkdtemp fail deterministically;
@@ -2343,6 +2383,179 @@ TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon) {
 }
 #endif
 
+typedef struct {
+    cbm_path_info_t path;
+    uint64_t device;
+    uint64_t file;
+    unsigned int mode;
+} cli_install_file_snapshot_t;
+
+static bool cli_install_file_snapshot(const char *path, cli_install_file_snapshot_t *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (cbm_path_info_utf8(path, &snapshot->path) != CBM_PATH_INFO_OK ||
+        !snapshot->path.is_regular) {
+        return false;
+    }
+#ifdef _WIN32
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION information;
+    bool captured = GetFileInformationByHandle((HANDLE)_get_osfhandle(_fileno(file)),
+                                               &information) != 0;
+    if (captured) {
+        snapshot->device = information.dwVolumeSerialNumber;
+        snapshot->file = ((uint64_t)information.nFileIndexHigh << 32) |
+                         (uint64_t)information.nFileIndexLow;
+        snapshot->mode = information.dwFileAttributes;
+    }
+    return fclose(file) == 0 && captured;
+#else
+    struct stat information;
+    if (stat(path, &information) != 0) {
+        return false;
+    }
+    snapshot->device = (uint64_t)information.st_dev;
+    snapshot->file = (uint64_t)information.st_ino;
+    snapshot->mode = (unsigned int)information.st_mode;
+    return true;
+#endif
+}
+
+static bool cli_install_file_unchanged(const char *path,
+                                       const cli_install_file_snapshot_t *before) {
+    cli_install_file_snapshot_t after;
+    return cli_install_file_snapshot(path, &after) && before->device == after.device &&
+           before->file == after.file && before->mode == after.mode &&
+           before->path.size == after.path.size && before->path.mtime_ns == after.path.mtime_ns;
+}
+
+/* --skip-binary is a config-only operation even with an existing target,
+ * --yes, or --force. Keep the sentinel's bytes, native file identity, full
+ * mtime precision, POSIX mode / Windows attributes and process PATH while
+ * still updating Codex hooks. POSIX shell rc contents stay unchanged too.
+ * The missing source also proves that config-only install does not require a
+ * readable copy candidate; this is not an observation of transient stages. */
+TEST(cli_install_skip_binary_preserves_target_and_path_while_updating_config) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-skip-binary-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    cbm_normalize_path_sep(tmpdir);
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "CODEX_HOME", "PATH", "SHELL"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char codex_dir[640];
+    char config_path[768];
+    char binary_dir[640];
+    char binary_path[768];
+    char missing_source[640];
+    char shell_rc[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+    snprintf(missing_source, sizeof(missing_source), "%s/missing/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+    snprintf(missing_source, sizeof(missing_source), "%s/missing/codebase-memory-mcp", tmpdir);
+#endif
+    snprintf(shell_rc, sizeof(shell_rc), "%s/.zshrc", tmpdir);
+    const char *sentinel = "installed binary must remain untouched\n";
+    const char *shell_sentinel = "# user PATH configuration\n";
+    bool setup_ok = test_mkdirp(codex_dir) == 0 && test_mkdirp(binary_dir) == 0 &&
+                    write_test_file(binary_path, sentinel) == 0 &&
+                    write_test_file(shell_rc, shell_sentinel) == 0;
+#ifndef _WIN32
+    setup_ok = setup_ok && chmod(binary_path, 0510) == 0;
+#endif
+    cli_install_file_snapshot_t binary_before;
+    cli_install_file_snapshot_t shell_before;
+    setup_ok = setup_ok && cli_install_file_snapshot(binary_path, &binary_before) &&
+               cli_install_file_snapshot(shell_rc, &shell_before);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("CODEX_HOME", codex_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    cbm_cli_set_self_path_override_for_test(missing_source);
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    char *skip_args[] = {"--skip-binary", "--clients=codex", "--hooks", "--yes"};
+    char *force_args[] = {"--skip-binary", "--force", "--clients=codex", "--no-hooks", "--yes"};
+    char *absent_args[] = {"--skip-binary", "--force", "--clients=codex", "--hooks", "--yes"};
+    char **cases[] = {skip_args, force_args, absent_args};
+    int case_argc[] = {4, 5, 5};
+    bool cases_ok[3] = {false, false, false};
+    for (size_t i = 0U; setup_ok && i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (i == 2U) {
+            if (cbm_unlink(binary_path) != 0) {
+                break;
+            }
+            /* Start the absent-target case with clean profiles; changing the
+             * executable embedded in earlier profiles tests migration policy,
+             * not whether --skip-binary leaves an absent target absent. */
+            snprintf(codex_dir, sizeof(codex_dir), "%s/.codex-absent", tmpdir);
+            if (test_mkdirp(codex_dir) != 0) {
+                break;
+            }
+            cbm_setenv("CODEX_HOME", codex_dir, 1);
+            snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+        }
+        int rc = cli_test_cmd_install(case_argc[i], cases[i]);
+        char *config = read_test_file_alloc(config_path);
+        const char *config_binary = i == 2U ? missing_source : binary_path;
+        bool config_ok = config && strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+                         strstr(config, config_binary) &&
+                         (i == 1U ? !strstr(config, "hook-augment")
+                                  : strstr(config, "hook-augment") != NULL);
+        free(config);
+        char *binary = i == 2U ? NULL : read_test_file_alloc(binary_path);
+        cbm_path_info_t absent_status;
+        bool target_absent =
+            cbm_path_info_utf8(binary_path, &absent_status) == CBM_PATH_INFO_ABSENT;
+        bool binary_ok = i == 2U ? target_absent
+                                 : binary && strcmp(binary, sentinel) == 0 &&
+                                       cli_install_file_unchanged(binary_path, &binary_before);
+        free(binary);
+        char *shell = read_test_file_alloc(shell_rc);
+        const char *current_path = getenv("PATH");
+        bool path_ok = current_path && strcmp(current_path, tmpdir) == 0 && shell &&
+                       strcmp(shell, shell_sentinel) == 0 &&
+                       cli_install_file_unchanged(shell_rc, &shell_before);
+        cases_ok[i] = rc == 0 && config_ok && binary_ok && path_ok;
+        if (!cases_ok[i]) {
+            (void)fprintf(stderr, "skip-binary case %zu: rc=%d config=%d binary=%d path=%d\n", i,
+                          rc, config_ok, binary_ok, path_ok);
+        }
+        free(shell);
+    }
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_self_path_override_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(cases_ok[0]);
+    ASSERT_TRUE(cases_ok[1]);
+    ASSERT_TRUE(cases_ok[2]);
+    PASS();
+}
+
 TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-XXXXXX");
@@ -2366,27 +2579,31 @@ TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
 #else
     snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
 #endif
-    write_test_file(bin_target, "old binary must survive");
-
-    cli_activation_fake_t fake = {
-        .participants_active = true,
-        .mutation_reserve_result = 1,
-    };
-    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
-    cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--force"};
-    int rc = cli_test_cmd_install(1, argv);
+    char *replace_args[] = {"--yes"};
+    char *force_args[] = {"--force", "--yes"};
+    char **cases[] = {replace_args, force_args};
+    int case_argc[] = {1, 2};
+    bool cases_ok[2] = {false, false};
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        write_test_file(bin_target, "old binary must survive");
+        cli_activation_fake_t fake = {
+            .participants_active = true,
+            .mutation_reserve_result = 1,
+        };
+        cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+        cbm_cli_set_activation_ops_for_test(&ops);
+        int rc = cli_test_cmd_install(case_argc[i], cases[i]);
+        const char *installed = read_test_file(bin_target);
+        cases_ok[i] = rc == 0 && installed && strcmp(installed, "old binary must survive") != 0 &&
+                      fake.mutation_reserve_count == 1 && fake.quiesce_count == 1 &&
+                      fake.mutation_lease_release_count == 1;
+    }
     cbm_cli_set_activation_ops_for_test(NULL);
-
-    const char *installed = read_test_file(bin_target);
-    bool preserved = installed && strcmp(installed, "old binary must survive") == 0;
+    cbm_set_auto_answer_for_test(0);
     cli_activation_restore_env(old_home, old_cache);
     test_rmdir_r(tmpdir);
-    ASSERT_EQ(rc, 0);
-    ASSERT_FALSE(preserved);
-    ASSERT_EQ(fake.mutation_reserve_count, 1);
-    ASSERT_EQ(fake.quiesce_count, 1);
-    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_TRUE(cases_ok[0]);
+    ASSERT_TRUE(cases_ok[1]);
     PASS();
 }
 
@@ -21334,12 +21551,14 @@ SUITE(cli) {
     RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
     RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
     RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
+    RUN_TEST(cli_install_skip_binary_existing_target_in_host_namespace_quiesces_nothing);
     RUN_TEST(cli_scope_fixture_names_its_failing_setup_step);
     RUN_TEST(cli_scope_fixture_finish_keeps_env_after_an_early_failure);
     RUN_TEST(cli_scope_retries_a_mute_endpoint_until_it_answers);
     RUN_TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon);
     RUN_TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon);
 #endif
+    RUN_TEST(cli_install_skip_binary_preserves_target_and_path_while_updating_config);
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
