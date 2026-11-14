@@ -3319,14 +3319,54 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
+/* The grammars built on tree-sitter-c: same set as cbm_conditional_block_types
+ * minus C#, which has no backslash line splices. */
+static bool c_splice_lang(CBMLanguage language) {
+    return language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA ||
+           language == CBM_LANG_OBJC || language == CBM_LANG_GLSL || language == CBM_LANG_HLSL ||
+           language == CBM_LANG_ISPC || language == CBM_LANG_SLANG;
+}
+
+/* #1546: these grammars read a backslash line splice inside a string literal
+ * as an escape_sequence, `\` plus one character. With CRLF line endings that
+ * character is the CR, the LF then ends the literal, and the rest of the
+ * function, often the rest of the file, becomes one ERROR region.
+ * Each `\` CR LF becomes space `\` LF: the same length, the line break in the
+ * same place, so offsets and line numbers still refer to the file on disk and
+ * the next line is byte-identical. Copied only when a splice is found. */
+static const char *c_mask_crlf_splices(CBMArena *a, const char *source, int source_len) {
+    char *out = NULL;
+    for (int i = 0; i + PAIR_LEN < source_len; i++) {
+        if (source[i] != '\\' || source[i + SKIP_ONE] != '\r' || source[i + PAIR_LEN] != '\n') {
+            continue;
+        }
+        if (!out) {
+            out = (char *)cbm_arena_alloc(a, (size_t)source_len + SKIP_ONE);
+            if (!out) {
+                return source;
+            }
+            memcpy(out, source, (size_t)source_len);
+            out[source_len] = '\0';
+        }
+        out[i] = ' ';
+        out[i + SKIP_ONE] = '\\';
+        i += PAIR_LEN;
+    }
+    return out ? out : source;
+}
+
 /* The bytes the grammar parses. PHP that leaves PHP mode (`?> markup <?php`)
- * is parsed with its markup blanked (#2000); the rewrite keeps the length and
- * every line break, so offsets and line numbers still refer to the file on
- * disk. Every other language parses the file as it is. */
+ * is parsed with its markup blanked (#2000), and a C-family line splice before
+ * a CRLF is rewritten (#1546); both rewrites keep the length and every line
+ * break, so offsets and line numbers still refer to the file on disk. Every
+ * other language parses the file as it is. */
 static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const char *source,
                                        int source_len) {
     if (language == CBM_LANG_PHP) {
         return cbm_php_mask_inline_html(a, source, source_len);
+    }
+    if (c_splice_lang(language)) {
+        return c_mask_crlf_splices(a, source, source_len);
     }
     return source;
 }
