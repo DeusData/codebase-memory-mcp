@@ -1138,6 +1138,14 @@ typedef struct {
      * The core never reads, interprets or frees it. It is the only place for
      * such state: a static or thread-local cache is not. */
     void *doclink_state;
+    /* C#: the first named file-scoped namespace among the children of the
+     * tree top cs_file_ns_top (extract_defs.c), found once per file. */
+    const void *cs_file_ns_top;
+    const char *cs_file_ns_name;
+    uint32_t cs_file_ns_start;
+    /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
+     * allocated in `scratch`. */
+    void *go_block_bindings;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */

@@ -1645,6 +1645,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
         /* Resolve each call */
         cbm_external_import_index_t ext_imports = {0};
+        cbm_spawn_file_begin(result->imports.items, result->imports.count);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1661,6 +1662,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 unresolved++;
             }
         }
+        cbm_spawn_file_end();
         cbm_pipeline_external_import_index_free(&ext_imports);
 
         cbm_pipeline_record_unresolved_calls(ctx->pipeline, rel, result, evidence);
