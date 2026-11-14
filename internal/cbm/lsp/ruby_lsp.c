@@ -417,14 +417,59 @@ static const char *ruby_ivar_type(RubyLSPContext *ctx, const char *class_qn,
     return NULL;
 }
 
-static RubyClassInfo *ruby_class_by_qn(RubyLSPContext *ctx, const char *qn) {
+/* ── shared (project-wide) class table ──────────────────────────── */
+
+static unsigned ruby_hash(const char *s) {
+    unsigned h = 2166136261u;
+    for (; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+/* Probe one of the shared table's hash indexes. `by_path` selects the key. */
+static const RubyClassInfo *ruby_shared_find(const CBMRubyCrossRegistry *sh, const int *slots,
+                                             const char *key, bool by_path) {
+    if (!sh || !slots || !key)
+        return NULL;
+    unsigned i = ruby_hash(key) & sh->slot_mask;
+    while (slots[i]) {
+        CBM_LSP_WORK(1);
+        const RubyClassInfo *c = &sh->classes[slots[i] - 1];
+        if (strcmp(by_path ? c->path : c->qn, key) == 0)
+            return c;
+        i = (i + 1) & sh->slot_mask;
+    }
+    return NULL;
+}
+
+/* This file's own declaration of a class wins; otherwise the project table.
+ * The own-file scan is bounded by the file, the shared probe is O(1). */
+static const RubyClassInfo *ruby_class_by_qn(RubyLSPContext *ctx, const char *qn) {
     if (!qn)
         return NULL;
     for (int i = 0; i < ctx->class_count; i++) {
         if (strcmp(ctx->classes[i].qn, qn) == 0)
             return &ctx->classes[i];
     }
-    return NULL;
+    return ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_qn : NULL, qn, false);
+}
+
+/* The merged record for a class of the project table: the group head holding
+ * every reopening's methods and the superclass. NULL when `qn` is not in it. */
+static const RubyClassInfo *ruby_shared_head(const CBMRubyCrossRegistry *sh, const char *qn) {
+    const RubyClassInfo *c = ruby_shared_find(sh, sh ? sh->by_qn : NULL, qn, false);
+    return c && c->group_head ? &sh->classes[c->group_head - 1] : NULL;
+}
+
+/* The entry whose superclass applies to `qn`. A file that reopens a class
+ * without `< Base` has an own entry with no superclass, so the merged record
+ * backs it up: inherited methods and the model checks keep working there. */
+static const RubyClassInfo *ruby_effective_class(RubyLSPContext *ctx, const char *qn) {
+    const RubyClassInfo *ci = ruby_class_by_qn(ctx, qn);
+    if (ci && ci->superclass_ref)
+        return ci;
+    const RubyClassInfo *head = ruby_shared_head(ctx->shared, qn);
+    return head ? head : ci;
 }
 
 /* Conventional Rails superclasses for stdlib-seeded types the class table
@@ -447,7 +492,7 @@ static const char *ruby_stdlib_superclass(const char *qn) {
 /* Superclass QN of a class: table entry first, then the conventional
  * stdlib chain above. */
 static const char *ruby_superclass_qn(RubyLSPContext *ctx, const char *class_qn) {
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    const RubyClassInfo *ci = ruby_effective_class(ctx, class_qn);
     if (ci)
         return ci->superclass_qn;
     return ruby_stdlib_superclass(class_qn);
@@ -455,13 +500,15 @@ static const char *ruby_superclass_qn(RubyLSPContext *ctx, const char *class_qn)
 
 /* ── constant resolution ────────────────────────────────────────── */
 
-/* Class-table probe by dotted path. */
+/* Class-table probe by dotted path: this file first, then the project. */
 static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path) {
     for (int i = 0; i < ctx->class_count; i++) {
         if (strcmp(ctx->classes[i].path, path) == 0)
             return ctx->classes[i].qn;
     }
-    return NULL;
+    const RubyClassInfo *c =
+        ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_path : NULL, path, true);
+    return c ? c->qn : NULL;
 }
 
 const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
@@ -506,17 +553,26 @@ const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
 /* Depth cap shared by the instance/singleton lookup walks. */
 #define RUBY_LOOKUP_MAX_DEPTH CBM_LSP_MAX_LOOKUP_DEPTH
 
-/* Own instance method of one exact class (no ancestry walk). */
-static const CBMRegisteredFunc *ruby_own_instance_method(RubyLSPContext *ctx, const char *class_qn,
-                                                         const char *method_name) {
-    return cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
+/* Own method of one exact class (no ancestry walk), instance or singleton
+ * ("<qn>.self" receiver key). Against the project table every reopening's
+ * methods are registered under the merged record's QN, so a class reopened in
+ * any number of files is still one probe. */
+static const CBMRegisteredFunc *ruby_own_method(RubyLSPContext *ctx, const char *class_qn,
+                                                const char *method_name, bool singleton) {
+    const RubyClassInfo *head = ruby_shared_head(ctx->shared, class_qn);
+    const char *owner = head ? head->qn : class_qn;
+    const char *key = singleton ? cbm_arena_sprintf(ctx->arena, "%s.self", owner) : owner;
+    return cbm_registry_lookup_method(ctx->registry, key, method_name);
 }
 
-/* Own singleton method of one exact class ("<qn>.self" receiver key). */
+static const CBMRegisteredFunc *ruby_own_instance_method(RubyLSPContext *ctx, const char *class_qn,
+                                                         const char *method_name) {
+    return ruby_own_method(ctx, class_qn, method_name, false);
+}
+
 static const CBMRegisteredFunc *ruby_own_singleton_method(RubyLSPContext *ctx, const char *class_qn,
                                                           const char *method_name) {
-    const char *key = cbm_arena_sprintf(ctx->arena, "%s.self", class_qn);
-    return cbm_registry_lookup_method(ctx->registry, key, method_name);
+    return ruby_own_method(ctx, class_qn, method_name, true);
 }
 
 /* Fail-closed ancestry. Every lookup below carries a `blocked` flag that is
@@ -540,6 +596,12 @@ typedef struct {
     unsigned int stamp;
 } RubyLookupWalk;
 
+typedef struct RubySharedMark {
+    int index; /* shared class index + 1; 0 = empty slot */
+    unsigned int seen_instance;
+    unsigned int seen_singleton;
+} RubySharedMark;
+
 static RubyLookupWalk ruby_walk_begin(RubyLSPContext *ctx) {
     if (++ctx->lookup_stamp == 0) {
         /* Wrapped: clear every mark so no class looks visited. */
@@ -547,22 +609,74 @@ static RubyLookupWalk ruby_walk_begin(RubyLSPContext *ctx) {
             ctx->classes[i].seen_instance = 0;
             ctx->classes[i].seen_singleton = 0;
         }
+        for (int i = 0; i < ctx->shared_mark_cap; i++) {
+            ctx->shared_marks[i].seen_instance = 0;
+            ctx->shared_marks[i].seen_singleton = 0;
+        }
         ctx->lookup_stamp = 1;
     }
     RubyLookupWalk w = {false, ctx->lookup_stamp};
     return w;
 }
 
+static unsigned ruby_mark_slot(int index, int cap) {
+    return ((unsigned)index * 2654435761u) & (unsigned)(cap - 1);
+}
+
+/* The mark pair for shared entry `index` (0-based), inserting it on first
+ * touch. NULL only when the arena is exhausted. */
+static RubySharedMark *ruby_shared_mark(RubyLSPContext *ctx, int index) {
+    if ((ctx->shared_mark_count + 1) * 2 > ctx->shared_mark_cap) {
+        int newcap = ctx->shared_mark_cap ? ctx->shared_mark_cap * 2 : 16;
+        RubySharedMark *nm =
+            (RubySharedMark *)cbm_arena_alloc(ctx->arena, (size_t)newcap * sizeof(RubySharedMark));
+        if (!nm)
+            return NULL;
+        memset(nm, 0, (size_t)newcap * sizeof(RubySharedMark));
+        for (int i = 0; i < ctx->shared_mark_cap; i++) {
+            if (!ctx->shared_marks[i].index)
+                continue;
+            unsigned j = ruby_mark_slot(ctx->shared_marks[i].index, newcap);
+            while (nm[j].index)
+                j = (j + 1) & (unsigned)(newcap - 1);
+            nm[j] = ctx->shared_marks[i];
+        }
+        ctx->shared_marks = nm;
+        ctx->shared_mark_cap = newcap;
+    }
+    unsigned j = ruby_mark_slot(index + 1, ctx->shared_mark_cap);
+    while (ctx->shared_marks[j].index) {
+        if (ctx->shared_marks[j].index == index + 1)
+            return &ctx->shared_marks[j];
+        j = (j + 1) & (unsigned)(ctx->shared_mark_cap - 1);
+    }
+    ctx->shared_marks[j].index = index + 1;
+    ctx->shared_mark_count++;
+    return &ctx->shared_marks[j];
+}
+
 /* Marks `class_qn` searched on one side (instance or singleton) in this walk;
- * true when it already was. Only the file's class table is marked: mixins
- * and superclass refs are recorded for those classes alone, so a type outside
- * the table (a stdlib type) has nothing to expand and is never a repeat. */
+ * true when it already was. This file's own entries carry their marks inline;
+ * entries of the shared table are read-only, so theirs live in the per-file
+ * hash. A type in neither (a stdlib type) has nothing to expand and is never
+ * a repeat. */
 static bool ruby_walk_seen(RubyLSPContext *ctx, RubyLookupWalk *w, const char *class_qn,
                            bool singleton) {
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
-    if (!ci)
-        return false;
-    unsigned int *mark = singleton ? &ci->seen_singleton : &ci->seen_instance;
+    unsigned int *mark = NULL;
+    for (int i = 0; i < ctx->class_count && !mark; i++) {
+        if (strcmp(ctx->classes[i].qn, class_qn) == 0)
+            mark = singleton ? &ctx->classes[i].seen_singleton : &ctx->classes[i].seen_instance;
+    }
+    if (!mark) {
+        const CBMRubyCrossRegistry *sh = ctx->shared;
+        const RubyClassInfo *c = ruby_shared_find(sh, sh ? sh->by_qn : NULL, class_qn, false);
+        if (!c)
+            return false;
+        RubySharedMark *m = ruby_shared_mark(ctx, (int)(c - sh->classes));
+        if (!m)
+            return false;
+        mark = singleton ? &m->seen_singleton : &m->seen_instance;
+    }
     if (*mark == w->stamp)
         return true;
     *mark = w->stamp;
@@ -577,7 +691,7 @@ static const CBMRegisteredFunc *ruby_lookup_instance_method_depth(RubyLSPContext
 /* True when the class declares a superclass the finalize step could not
  * resolve (stdlib-seeded conventions like ApplicationRecord DO resolve). */
 static bool ruby_superclass_unresolved(RubyLSPContext *ctx, const char *class_qn) {
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    const RubyClassInfo *ci = ruby_effective_class(ctx, class_qn);
     return ci && ci->superclass_ref && !ci->superclass_qn;
 }
 
@@ -593,6 +707,23 @@ static const CBMRegisteredFunc *ruby_lookup_in_mixins(RubyLSPContext *ctx, const
             continue;
         if (!mi->module_qn) {
             w->blocked = true; /* unseen module — it may define/shadow the method */
+            return NULL;
+        }
+        const CBMRegisteredFunc *f =
+            ruby_lookup_instance_method_depth(ctx, mi->module_qn, method_name, depth + 1, w);
+        if (f || w->blocked)
+            return f;
+    }
+    /* A class reopened in other files: those files' mixins are in the merged
+     * record, so a module one of them includes still shadows the superclass. */
+    const CBMRubyCrossRegistry *sh = ctx->shared;
+    const RubyClassInfo *head = ruby_shared_head(sh, owner_qn);
+    for (int i = head ? head->mixin_n - 1 : -1; i >= 0; i--) {
+        const RubyMixinInfo *mi = &sh->mixins[head->mixin_start + i];
+        if (mi->kind != kind)
+            continue;
+        if (!mi->module_qn) {
+            w->blocked = true;
             return NULL;
         }
         const CBMRegisteredFunc *f =
@@ -696,6 +827,32 @@ const CBMRegisteredFunc *ruby_lookup_singleton_method(RubyLSPContext *ctx, const
 
 /* ── ActiveRecord model detection (typing special case) ─────────── */
 
+/* Whether the finder rule (`User.find` -> User, relation chains keep the
+ * model) also fires for a model declared in ANOTHER file, which is the usual
+ * Rails layout. Off for now, so the rule keeps to models declared in the file
+ * being resolved and nothing else changes. Across files it mostly meets
+ * relation chains, and `Model.where(...).m` reaches the relation or the
+ * model's class methods in Ruby, never an instance method `m`; a judged sample
+ * of the cross-file edges came in below the 95% precision bar. Turn it on once
+ * relations are typed apart from records. */
+static bool ruby_ar_finder_cross_file = false;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_ruby_set_ar_finder_cross_file(bool on) {
+    bool prev = ruby_ar_finder_cross_file;
+    ruby_ar_finder_cross_file = on;
+    return prev;
+}
+#endif
+
+static bool ruby_class_declared_here(const RubyLSPContext *ctx, const char *qn) {
+    for (int i = 0; i < ctx->class_count; i++) {
+        if (strcmp(ctx->classes[i].qn, qn) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* True when class_qn's superclass chain reaches ActiveRecord::Base (or the
  * conventional ApplicationRecord intermediary, which per-file extraction
  * usually cannot see through). */
@@ -704,7 +861,9 @@ static bool ruby_is_ar_model(RubyLSPContext *ctx, const char *class_qn, int dept
         return false;
     if (strcmp(class_qn, "ActiveRecord.Base") == 0 || strcmp(class_qn, "ApplicationRecord") == 0)
         return true;
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    if (!ruby_ar_finder_cross_file && !ruby_class_declared_here(ctx, class_qn))
+        return false;
+    const RubyClassInfo *ci = ruby_effective_class(ctx, class_qn);
     if (ci && ci->superclass_ref &&
         (strcmp(ci->superclass_ref, "ApplicationRecord") == 0 ||
          strcmp(ci->superclass_ref, "ActiveRecord.Base") == 0))
@@ -1821,4 +1980,396 @@ void cbm_run_ruby_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     }
 
     cbm_arena_destroy(&idx_arena);
+}
+
+/* ── cross-file: shared registry ────────────────────────────────── */
+
+extern const TSLanguage *tree_sitter_ruby(void);
+
+/* Raw spelling of a cross-file class def below its module: the part of its QN
+ * after the module QN ("proj.app.models.user.Admin.Sub::User" with module
+ * "proj.app.models.user" → "Admin.Sub::User"), i.e. the extractor's frames
+ * joined by '.', each frame as written. NULL when the shape is odd. */
+static const char *ruby_cross_class_suffix(const CBMLSPDef *d) {
+    if (!d->qualified_name)
+        return NULL;
+    if (d->def_module_qn && d->def_module_qn[0]) {
+        size_t mlen = strlen(d->def_module_qn);
+        if (strncmp(d->qualified_name, d->def_module_qn, mlen) == 0 &&
+            d->qualified_name[mlen] == '.') {
+            return d->qualified_name + mlen + 1;
+        }
+    }
+    return d->short_name;
+}
+
+/* The superclass a class def carries (first "|"-separated base, since Ruby
+ * has single inheritance; a legacy "< Base" spelling is tolerated), in the
+ * dotted form constant lookup uses. NULL when none. */
+static const char *ruby_def_superclass_ref(CBMArena *arena, const CBMLSPDef *d) {
+    if (!d->embedded_types || !d->embedded_types[0])
+        return NULL;
+    const char *start = d->embedded_types;
+    while (*start == '<' || *start == ' ' || *start == '\t')
+        start++;
+    const char *bar = strchr(start, '|');
+    char *raw = bar ? cbm_arena_strndup(arena, start, (size_t)(bar - start))
+                    : cbm_arena_strdup(arena, start);
+    if (!raw || !raw[0])
+        return NULL;
+    return ruby_dotted(arena, raw);
+}
+
+/* Insert entry `idx` (already stored in sh->classes) into one hash index. */
+static void ruby_shared_insert(CBMRubyCrossRegistry *sh, int *slots, int idx, bool by_path) {
+    const RubyClassInfo *c = &sh->classes[idx];
+    unsigned i = ruby_hash(by_path ? c->path : c->qn) & sh->slot_mask;
+    while (slots[i])
+        i = (i + 1) & sh->slot_mask;
+    slots[i] = idx + 1;
+}
+
+typedef struct {
+    int head;            /* owning merged record (table index) */
+    int cls;             /* declaring entry (table index) */
+    const char *decl_qn; /* its QN, the canonical order key */
+    int seq;             /* position among that declaration's macros */
+    RubyMixinKind kind;
+    const char *ref; /* dotted constant */
+} RubyMixinTmp;
+
+static int ruby_mixin_tmp_cmp(const void *a, const void *b) {
+    const RubyMixinTmp *x = (const RubyMixinTmp *)a;
+    const RubyMixinTmp *y = (const RubyMixinTmp *)b;
+    if (x->head != y->head)
+        return x->head < y->head ? -1 : 1;
+    int c = strcmp(x->decl_qn, y->decl_qn);
+    return c ? c : x->seq - y->seq;
+}
+
+/* Resolve every declaration's include/prepend/extend macros once, from the
+ * scope that declared them, into the merged record of their constant, so a
+ * class's mixins are visible from every file. Order is canonical (declaring QN,
+ * then source order), so it does not depend on def order. An unresolvable
+ * module keeps module_qn NULL: lookups then fail closed. */
+static bool ruby_build_shared_mixins(CBMRubyCrossRegistry *sh, CBMArena *arena, RubyLSPContext *ctx,
+                                     const char **decl_mixins, const char **body_nesting) {
+    int total = 0;
+    for (int i = 0; i < sh->class_count; i++) {
+        if (!decl_mixins[i])
+            continue;
+        total++;
+        for (const char *p = decl_mixins[i]; *p; p++)
+            if (*p == '|')
+                total++;
+    }
+    if (!total)
+        return true;
+    RubyMixinTmp *tmp = (RubyMixinTmp *)cbm_arena_alloc(arena, (size_t)total * sizeof(*tmp));
+    if (!tmp)
+        return false;
+    int n = 0;
+    for (int i = 0; i < sh->class_count; i++) {
+        const char *p = decl_mixins[i];
+        int seq = 0;
+        while (p && *p) {
+            const char *end = strchr(p, '|');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (len > 2 && p[1] == ':' && (p[0] == 'i' || p[0] == 'p' || p[0] == 'e') &&
+                n < total) {
+                tmp[n].head = sh->classes[i].group_head - 1;
+                tmp[n].cls = i;
+                tmp[n].decl_qn = sh->classes[i].qn;
+                tmp[n].seq = seq++;
+                tmp[n].kind = p[0] == 'i'   ? RUBY_MIXIN_INCLUDE
+                              : p[0] == 'p' ? RUBY_MIXIN_PREPEND
+                                            : RUBY_MIXIN_EXTEND;
+                tmp[n].ref = ruby_dotted(arena, cbm_arena_strndup(arena, p + 2, len - 2));
+                n++;
+            }
+            p = end ? end + 1 : NULL;
+        }
+    }
+    if (!n)
+        return true;
+    qsort(tmp, (size_t)n, sizeof(*tmp), ruby_mixin_tmp_cmp);
+    sh->mixins = (RubyMixinInfo *)cbm_arena_alloc(arena, (size_t)n * sizeof(RubyMixinInfo));
+    if (!sh->mixins)
+        return false;
+    for (int i = 0; i < n; i++) {
+        RubyClassInfo *head = &sh->classes[tmp[i].head];
+        if (head->mixin_n == 0)
+            head->mixin_start = i;
+        head->mixin_n++;
+        RubyMixinInfo *mi = &sh->mixins[i];
+        memset(mi, 0, sizeof(*mi));
+        mi->owner_qn = head->qn;
+        mi->module_ref = tmp[i].ref;
+        mi->kind = tmp[i].kind;
+        ctx->nesting = body_nesting[tmp[i].cls];
+        mi->module_qn = ruby_resolve_constant(ctx, tmp[i].ref);
+    }
+    sh->mixin_count = n;
+    return true;
+}
+
+/* Slot of `path` in the by-path index, or -1 when absent. */
+static int ruby_shared_path_slot(const CBMRubyCrossRegistry *sh, const char *path) {
+    unsigned i = ruby_hash(path) & sh->slot_mask;
+    while (sh->by_path[i]) {
+        CBM_LSP_WORK(1);
+        if (strcmp(sh->classes[sh->by_path[i] - 1].path, path) == 0)
+            return (int)i;
+        i = (i + 1) & sh->slot_mask;
+    }
+    return -1;
+}
+
+/* Descending QN order: the registry answers a repeated name with the entry
+ * registered last, so registering the largest QN first makes the smallest win. */
+static int ruby_def_qn_cmp(const void *a, const void *b) {
+    const CBMLSPDef *x = *(const CBMLSPDef *const *)a;
+    const CBMLSPDef *y = *(const CBMLSPDef *const *)b;
+    return strcmp(y->qualified_name, x->qualified_name);
+}
+
+CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
+                                                    int def_count) {
+    if (!arena)
+        return NULL;
+    CBMRubyCrossRegistry *sh = (CBMRubyCrossRegistry *)cbm_arena_alloc(arena, sizeof(*sh));
+    if (!sh)
+        return NULL;
+    memset(sh, 0, sizeof(*sh));
+    cbm_registry_init(&sh->reg, arena);
+    cbm_ruby_stdlib_register(&sh->reg, arena);
+
+    int max_classes = 0;
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (d->lang == CBM_LANG_RUBY && d->label &&
+            (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Module") == 0))
+            max_classes++;
+    }
+    unsigned slots = 16;
+    while (slots < (unsigned)max_classes * 2u)
+        slots <<= 1;
+    sh->slot_mask = slots - 1;
+    sh->by_qn = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
+    sh->by_path = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
+    sh->classes = (RubyClassInfo *)cbm_arena_alloc(arena, (size_t)(max_classes ? max_classes : 1) *
+                                                              sizeof(RubyClassInfo));
+    const char **decl_nesting = (const char **)cbm_arena_alloc(
+        arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
+    /* Per entry: the raw mixin macros and the full nesting its body resolves
+     * them in. */
+    const char **decl_mixins = (const char **)cbm_arena_alloc(
+        arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
+    const char **body_nesting = (const char **)cbm_arena_alloc(
+        arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
+    if (!sh->by_qn || !sh->by_path || !sh->classes || !decl_nesting || !decl_mixins ||
+        !body_nesting)
+        return NULL;
+    memset(sh->by_qn, 0, slots * sizeof(int));
+    memset(sh->by_path, 0, slots * sizeof(int));
+
+    /* Ruby constants live in one global namespace, so every project class is
+     * a resolution candidate. Pass A: one entry per declaration, and per
+     * constant path the entry with the smallest QN becomes the group head, so
+     * the head does not depend on def order (a full build and the incremental
+     * closure route order defs differently). */
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->short_name || !d->label || d->lang != CBM_LANG_RUBY)
+            continue;
+        if (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Module") != 0)
+            continue;
+        const char *suffix = ruby_cross_class_suffix(d);
+        if (!suffix)
+            continue;
+        if (ruby_shared_find(sh, sh->by_qn, d->qualified_name, false))
+            continue; /* the same class body seen again — one entry per QN */
+        const char *path = ruby_dotted(arena, suffix);
+        int n = sh->class_count++;
+        RubyClassInfo *ci = &sh->classes[n];
+        memset(ci, 0, sizeof(*ci));
+        ci->path = path;
+        ci->qn = d->qualified_name;
+        ci->is_module = strcmp(d->label, "Module") == 0;
+        if (!ci->is_module)
+            ci->superclass_ref = ruby_def_superclass_ref(arena, d);
+        /* Declaring scope = every frame but the last; the superclass is
+         * resolved from there, as in the per-file pass. */
+        const char *last = strrchr(suffix, '.');
+        decl_nesting[n] = last ? cbm_arena_strndup(arena, suffix, (size_t)(last - suffix)) : "";
+        decl_mixins[n] = d->mixin_refs;
+        body_nesting[n] = suffix;
+        ruby_shared_insert(sh, sh->by_qn, n, false);
+        int slot = ruby_shared_path_slot(sh, path);
+        if (slot < 0)
+            ruby_shared_insert(sh, sh->by_path, n, true);
+        else if (strcmp(ci->qn, sh->classes[sh->by_path[slot] - 1].qn) < 0)
+            sh->by_path[slot] = n + 1;
+    }
+    for (int i = 0; i < sh->class_count; i++) {
+        RubyClassInfo *ci = &sh->classes[i];
+        ci->group_head = sh->by_path[ruby_shared_path_slot(sh, ci->path)];
+    }
+
+    /* Pass B: methods, in a fixed QN order so a name defined by two reopenings
+     * resolves to the smallest QN whatever the def order. Each registers under its
+     * group head's QN (the merged record), so a lookup is one probe however
+     * many files reopen the class; the def keeps its own file's QN. A method
+     * registers on exactly one key: the instance key, or "<qn>.self" for a
+     * `def self.m` / `class << self` method. Registering on both would let an
+     * instance call hit a singleton method of the same name and stop there,
+     * never reaching the inherited instance method Ruby would call. */
+    CBMLSPDef **fdefs = (CBMLSPDef **)cbm_arena_alloc(arena, (size_t)(def_count ? def_count : 1) *
+                                                                 sizeof(CBMLSPDef *));
+    if (!fdefs)
+        return NULL;
+    int fcount = 0;
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *d = &defs[i];
+        if (d->qualified_name && d->short_name && d->label && d->lang == CBM_LANG_RUBY &&
+            (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0))
+            fdefs[fcount++] = d;
+    }
+    qsort(fdefs, (size_t)fcount, sizeof(fdefs[0]), ruby_def_qn_cmp);
+    for (int i = 0; i < fcount; i++) {
+        const CBMLSPDef *d = fdefs[i];
+        const RubyClassInfo *owner = ruby_shared_head(sh, d->receiver_type);
+        const char *receiver = owner ? owner->qn : d->receiver_type;
+        CBMRegisteredFunc rf;
+        memset(&rf, 0, sizeof(rf));
+        rf.min_params = -1;
+        rf.qualified_name = d->qualified_name;
+        rf.short_name = d->short_name;
+        rf.receiver_type =
+            receiver && d->is_singleton ? cbm_arena_sprintf(arena, "%s.self", receiver) : receiver;
+        const CBMType **rets =
+            (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+        if (rets) {
+            rets[0] = cbm_type_unknown();
+            rets[1] = NULL;
+        }
+        rf.signature = cbm_type_func(arena, NULL, NULL, rets);
+        cbm_registry_add_func(&sh->reg, rf);
+    }
+
+    cbm_registry_finalize(&sh->reg);
+    sh->reg.read_only = true; /* sealed: shared across resolve workers */
+
+    /* Resolve each superclass against the complete table, once, from the
+     * scope that declared it. */
+    RubyLSPContext ctx;
+    ruby_lsp_init(&ctx, arena, "", 0, &sh->reg, NULL, NULL);
+    ctx.shared = sh;
+    for (int i = 0; i < sh->class_count; i++) {
+        RubyClassInfo *ci = &sh->classes[i];
+        if (!ci->superclass_ref)
+            continue;
+        ctx.nesting = decl_nesting[i];
+        ci->superclass_qn = ruby_resolve_constant(&ctx, ci->superclass_ref);
+    }
+    /* The merged record's superclass comes from the smallest-QN declaration
+     * that has one, when the head itself declares none. */
+    int *provider = (int *)cbm_arena_alloc(arena, (size_t)(sh->class_count ? sh->class_count : 1) *
+                                                      sizeof(int));
+    if (!provider)
+        return NULL;
+    for (int i = 0; i < sh->class_count; i++)
+        provider[i] = -1;
+    for (int i = 0; i < sh->class_count; i++) {
+        const RubyClassInfo *ci = &sh->classes[i];
+        int h = ci->group_head - 1;
+        if (!ci->superclass_ref || sh->classes[h].superclass_ref)
+            continue;
+        if (provider[h] < 0 || strcmp(ci->qn, sh->classes[provider[h]].qn) < 0)
+            provider[h] = i;
+    }
+    for (int h = 0; h < sh->class_count; h++) {
+        if (provider[h] < 0)
+            continue;
+        sh->classes[h].superclass_ref = sh->classes[provider[h]].superclass_ref;
+        sh->classes[h].superclass_qn = sh->classes[provider[h]].superclass_qn;
+    }
+    if (!ruby_build_shared_mixins(sh, arena, &ctx, decl_mixins, body_nesting))
+        return NULL;
+    return sh;
+}
+
+/* ── cross-file: per-file entry ─────────────────────────────────── */
+
+void cbm_run_ruby_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, const CBMRubyCrossRegistry *shared,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          CBMResolvedCallArray *out) {
+    if (!arena || !source || !out || !shared)
+        return;
+
+    RubyLSPContext ctx;
+    ruby_lsp_init(&ctx, arena, source, source_len, &shared->reg, module_qn, out);
+    ctx.shared = shared;
+    ctx.import_names = import_names;
+    ctx.import_qns = import_qns;
+    ctx.import_count = import_count;
+
+    /* Parse if the pipeline didn't hand us a cached tree. */
+    TSTree *tree = cached_tree;
+    bool owns_tree = false;
+    if (!tree) {
+        TSParser *parser = ts_parser_new();
+        if (!parser)
+            return;
+        const TSLanguage *lang = tree_sitter_ruby();
+        if (!ts_parser_set_language(parser, lang)) {
+            ts_parser_delete(parser);
+            return;
+        }
+        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        ts_parser_delete(parser);
+        if (!tree)
+            return;
+        owns_tree = true;
+    }
+    TSNode root = ts_tree_root_node(tree);
+
+    /* PASS 1 over this file's AST only: its own classes, mixins and
+     * nesting-packed superclass refs. build_reg stays NULL — methods and every
+     * other file's classes come from the shared registry, which is never
+     * written. */
+    ruby_pass1_scan(&ctx, root);
+    ruby_finalize_refs(&ctx);
+
+    /* PASS 1.5 + PASS 2. */
+    ctx.nesting = "";
+    ctx.enclosing_class_qn = NULL;
+    ruby_ivar_scan(&ctx, root);
+
+    ctx.nesting = "";
+    ctx.enclosing_class_qn = NULL;
+    ctx.enclosing_func_qn = NULL;
+    ctx.in_singleton_method = false;
+    ruby_resolve_calls_in_node(&ctx, root);
+
+    if (owns_tree)
+        ts_tree_delete(tree);
+}
+
+void cbm_run_ruby_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns, int import_count,
+                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+    if (!arena || !source || !out)
+        return;
+    CBMArena build;
+    cbm_arena_init(&build);
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, def_count);
+    if (sh) {
+        cbm_run_ruby_lsp_cross_with_registry(arena, source, source_len, module_qn, sh, import_names,
+                                             import_qns, import_count, cached_tree, out);
+    }
+    cbm_arena_destroy(&build);
 }

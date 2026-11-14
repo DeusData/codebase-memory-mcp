@@ -2045,7 +2045,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                  * path, filtered through module_def_index, is the SAME
                  * pre-Tier-2 resolution code the full pipeline still uses
                  * for languages without a shared registry, so convergence
-                 * is unaffected; only the amortization strategy changes. */
+                 * is unaffected; only the amortization strategy changes.
+                 * Ruby's fallback (cbm_run_ruby_lsp_cross) is exempt from the
+                 * def filter and so rebuilds the whole project table for each
+                 * changed Ruby file: at most CLOSURE_BUDGET_FLOOR_FILES
+                 * builds here, which is bounded and left as is. */
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
                     CBMArena *xa = &closure->arena;
                     cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, all_def_count);
@@ -2056,6 +2060,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                     cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
                     cross_registries.java =
                         cbm_java_build_cross_registry(xa, all_defs, all_def_count);
+                    cross_registries.ruby =
+                        cbm_ruby_build_cross_registry(xa, all_defs, all_def_count);
                     registries_arg = &cross_registries;
                 }
             } else {

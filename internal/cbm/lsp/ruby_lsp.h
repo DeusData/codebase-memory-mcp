@@ -5,6 +5,7 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
+#include "go_lsp.h" /* CBMLSPDef reused across languages */
 
 /* Ruby mixin kinds. Lookup order for an instance method on class C:
  *   prepended modules (last prepended first) → C's own methods →
@@ -33,11 +34,26 @@ typedef struct {
     const char *superclass_ref; /* raw dotted superclass spelling, or NULL */
     const char *superclass_qn;  /* resolved QN (table/stdlib), or NULL */
     bool is_module;             /* `module` (mixin source) vs `class` */
+    /* Shared (project-wide) table only. A class reopened in another file has
+     * a different QN there (the QN carries the file's module QN) but the same
+     * constant path. All declarations of one path share one merged record: the
+     * entry with the smallest QN (the group head), which holds every
+     * reopening's methods and the superclass. `group_head` is the head's table
+     * index + 1 (the entry's own index + 1 for the head itself); 0 in a
+     * per-file table. */
+    int group_head;
+    /* Head entries only: this constant's include/prepend/extend records, a
+     * range of the registry's `mixins` array (all reopenings, in declaring-QN
+     * then source order). */
+    int mixin_start;
+    int mixin_n;
     /* Method-lookup visit marks: the stamp of the last walk that searched
      * this class on the instance / singleton side (ruby_walk_seen). */
     unsigned int seen_instance;
     unsigned int seen_singleton;
 } RubyClassInfo;
+
+struct CBMRubyCrossRegistry;
 
 /* One `include`/`prepend`/`extend` record: owner class QN → module ref. */
 typedef struct {
@@ -88,7 +104,12 @@ typedef struct {
      * [A::B] only, so A's constants are NOT probed. */
     const char *nesting;
 
-    /* Class/module table (pass 1). */
+    /* Project-wide read-only class table + method registry (cross-file
+     * resolution). NULL for per-file extraction. Consulted after this file's
+     * own table, so a class declared here always wins. */
+    const struct CBMRubyCrossRegistry *shared;
+
+    /* Class/module table (pass 1) — this file's own declarations only. */
     RubyClassInfo *classes;
     int class_count;
     int class_cap;
@@ -137,6 +158,14 @@ typedef struct {
      * so marks left by earlier walks never match. */
     unsigned int lookup_stamp;
 
+    /* Visit marks for entries of the shared (read-only) class table. The table
+     * is read by every resolve worker at once, so a walk never marks it; its
+     * marks live here, in an open-addressing hash keyed by the shared index and
+     * sized by what this file touches. */
+    struct RubySharedMark *shared_marks;
+    int shared_mark_cap;
+    int shared_mark_count;
+
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 } RubyLSPContext;
@@ -172,5 +201,59 @@ void cbm_run_ruby_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 /* Register Ruby core stdlib types/methods + a curated Rails surface
  * (ActiveRecord/ActiveSupport/ActionController) into a registry. */
 void cbm_ruby_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
+
+/* --- Cross-file LSP resolution ---
+ *
+ * Ruby constants live in one global namespace and Rails/Zeitwerk autoloads
+ * them with no require, so a file may name any class in the project. The
+ * project's definitions are therefore indexed ONCE (cbm_ruby_build_cross_
+ * registry) into a sealed, read-only registry: a finalized method registry
+ * plus a hashed class table. Each file then resolves against it with O(1)
+ * lookups and builds nothing proportional to the project. */
+typedef struct CBMRubyCrossRegistry {
+    CBMTypeRegistry reg; /* stdlib + every project method; finalized, sealed */
+    RubyClassInfo *classes;
+    int class_count;
+    /* Open-addressing hash indexes over `classes` (values are index + 1, 0 =
+     * empty slot): by QN, and by dotted constant path (group head only). */
+    int *by_qn;
+    int *by_path;
+    unsigned slot_mask;
+    RubyMixinInfo *mixins; /* owner_qn = the merged record's QN; grouped by head */
+    int mixin_count;
+} CBMRubyCrossRegistry;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test seam: turn the cross-file half of the ActiveRecord finder rule on or
+ * off (see ruby_ar_finder_cross_file in ruby_lsp.c). Returns the previous
+ * setting, so a test restores what it found rather than a fixed value. */
+bool cbm_ruby_set_ar_finder_cross_file(bool on);
+#endif
+
+/* Build the shared registry from every project def. Strings are borrowed from
+ * `defs` (as the other languages' cross registries do) or copied into `arena`.
+ * Returns NULL on allocation failure; callers then fall back to the
+ * per-file path. */
+CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
+                                                    int def_count);
+
+/* Resolve one file against a prebuilt shared registry. Reads `shared` only;
+ * everything it allocates lives in `arena`. */
+void cbm_run_ruby_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, const CBMRubyCrossRegistry *shared,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count,
+                                          TSTree *cached_tree, /* NULL = parse internally */
+                                          CBMResolvedCallArray *out);
+
+/* Convenience for callers with a def list but no prebuilt registry (the
+ * per-file fallback path and tests): builds a registry in a scratch arena for
+ * this one call. Cost is proportional to the def list, so the pipeline uses
+ * the prebuilt path instead. */
+void cbm_run_ruby_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns, int import_count,
+                            TSTree *cached_tree, /* NULL = parse internally */
+                            CBMResolvedCallArray *out);
 
 #endif /* CBM_LSP_RUBY_LSP_H */
