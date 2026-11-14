@@ -2112,6 +2112,86 @@ TEST(daemon_runtime_verified_peer_copy_is_hashed_once_issue1955) {
     PASS();
 }
 
+typedef enum {
+    RUNTIME_TEST_HELLO_ADMITTED,
+    RUNTIME_TEST_HELLO_REJECTED_MISMATCH,
+    RUNTIME_TEST_HELLO_OTHER,
+} runtime_test_hello_outcome_t;
+
+/* One HELLO whose full peer-image hash yields `digest`, with the post-hash
+ * identity re-check failing when fail_recheck is set. The fingerprint cache is
+ * reset on both sides: the in-process peer is this process, so its stubbed
+ * digest would otherwise be cached as this image's own. */
+static runtime_test_hello_outcome_t runtime_test_hello_with_peer_digest(
+    const runtime_test_fixture_t *fixture, const cbm_daemon_build_identity_t *identity,
+    const char *digest, bool fail_recheck) {
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    cbm_daemon_runtime_fail_image_recheck_after_hash_for_testing(fail_recheck);
+    cbm_daemon_runtime_connect_result_t result = {0};
+    cbm_daemon_runtime_client_t *client = cbm_daemon_runtime_client_connect(
+        fixture->endpoint, identity, RUNTIME_TEST_TIMEOUT_MS, &result);
+    cbm_daemon_runtime_fail_image_recheck_after_hash_for_testing(false);
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    if (client) {
+        bool accepted = result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
+        bool closed = cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        return accepted && closed ? RUNTIME_TEST_HELLO_ADMITTED : RUNTIME_TEST_HELLO_OTHER;
+    }
+    return result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
+                   strstr(result.message, "fingerprint_mismatch") != NULL
+               ? RUNTIME_TEST_HELLO_REJECTED_MISMATCH
+               : RUNTIME_TEST_HELLO_OTHER;
+}
+
+/* runtime_peer_image_verify hashes the peer's image and then re-checks that
+ * the peer still runs that same image. A digest that was read and differs from
+ * this build is a fingerprint_mismatch rejection whatever that re-check
+ * concludes; an image that matched before its re-check failed stays
+ * admissible (#1539) exactly as before. The in-process peer is this process,
+ * so the seams stand in for it: distinct_copy forces the full hash, the hash
+ * stub decides the digest, and the re-check seam fails the post-hash re-check. */
+TEST(daemon_runtime_peer_image_mismatch_stays_rejected_when_recheck_fails) {
+    static const char other_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    char own_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    snprintf(own_build, sizeof(own_build), "%s", runtime_test_self_build());
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", own_build);
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "image-recheck", &identity);
+    /* An owner session keeps the ephemeral generation alive across the
+     * sequential HELLOs below; it connects through the active-image fast path
+     * before any seam is armed. */
+    cbm_daemon_runtime_connect_result_t owner_result = {0};
+    cbm_daemon_runtime_client_t *owner =
+        started ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                    RUNTIME_TEST_TIMEOUT_MS, &owner_result)
+                : NULL;
+    runtime_test_hello_outcome_t intact = RUNTIME_TEST_HELLO_OTHER;
+    runtime_test_hello_outcome_t mismatch_recheck_failed = RUNTIME_TEST_HELLO_OTHER;
+    runtime_test_hello_outcome_t match_recheck_failed = RUNTIME_TEST_HELLO_OTHER;
+
+    cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(true);
+    if (owner) {
+        /* Control: a differing digest with the re-check intact is rejected. */
+        intact = runtime_test_hello_with_peer_digest(&fixture, &identity, other_build, false);
+        mismatch_recheck_failed =
+            runtime_test_hello_with_peer_digest(&fixture, &identity, other_build, true);
+        match_recheck_failed =
+            runtime_test_hello_with_peer_digest(&fixture, &identity, own_build, true);
+    }
+    cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(false);
+    bool owner_closed = owner && cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(owner_closed);
+    ASSERT_EQ(intact, RUNTIME_TEST_HELLO_REJECTED_MISMATCH);
+    ASSERT_EQ(mismatch_recheck_failed, RUNTIME_TEST_HELLO_REJECTED_MISMATCH);
+    ASSERT_EQ(match_recheck_failed, RUNTIME_TEST_HELLO_ADMITTED);
+    PASS();
+}
+
 TEST(daemon_runtime_unexpected_frame_payload_is_freed_once) {
     static const uint8_t unexpected_payload[] = {0xde, 0xad, 0xbe, 0xef};
     cbm_daemon_build_identity_t identity =
@@ -5634,6 +5714,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);
     RUN_TEST(daemon_runtime_unverifiable_image_is_admitted_issue1539);
     RUN_TEST(daemon_runtime_verified_peer_copy_is_hashed_once_issue1955);
+    RUN_TEST(daemon_runtime_peer_image_mismatch_stays_rejected_when_recheck_fails);
     RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);
