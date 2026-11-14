@@ -2020,7 +2020,11 @@ static bool posix_directory_transition_secure(int parent_fd, int child_fd, const
     return true;
 }
 
-static int private_directory_tree_open(const char *directory_path) {
+/* harden=true creates missing components and leaves the final directory 0700
+ * with no extended ACL. harden=false (verify-only) changes nothing: every
+ * component must already exist, and the final directory must already be
+ * owner-only. */
+static int private_directory_tree_walk(const char *directory_path, bool harden) {
     if (!directory_path || !directory_path[0] || O_DIRECTORY == 0 || O_NOFOLLOW == 0) {
         return -1;
     }
@@ -2080,13 +2084,20 @@ static int private_directory_tree_open(const char *directory_path) {
                         directory_path, component, component);
                 }
             }
-            bool created = ok && mkdirat(current_fd, component, 0700) == 0;
-            if (!created && errno != EEXIST) {
+            /* A verify-only walk never creates: a missing component fails the
+             * openat below, which names it. */
+            bool created = ok && harden && mkdirat(current_fd, component, 0700) == 0;
+            if (harden && !created && errno != EEXIST) {
                 ok = false;
             }
             int next_fd =
                 ok ? openat(current_fd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
                    : -1;
+            if (ok && next_fd < 0 && !harden) {
+                ipc_validation_detail_set("%s: '%s' cannot be opened (errno %d), and a "
+                                          "verify-only check never creates it",
+                                          directory_path, component, errno);
+            }
             struct stat status;
             ok = next_fd >= 0 && fd_set_cloexec(next_fd) && fstat(next_fd, &status) == 0 &&
                  S_ISDIR(status.st_mode) &&
@@ -2124,15 +2135,16 @@ static int private_directory_tree_open(const char *directory_path) {
                                   (long)final_status.st_uid, (long)geteuid());
         ok = false;
     }
-    if (ok && fchmod(current_fd, 0700) != 0) {
+    if (ok && harden && fchmod(current_fd, 0700) != 0) {
         ipc_validation_detail_set("%s: chmod 0700 failed (errno %d)", directory_path, errno);
         ok = false;
     }
-    if (ok && !cbm_macos_extended_acl_fd_clear(current_fd)) {
+    if (ok && harden && !cbm_macos_extended_acl_fd_clear(current_fd)) {
         ipc_validation_detail_set("%s: extended ACL not clearable", directory_path);
         ok = false;
     }
-    if (ok && (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
+    if (ok && harden &&
+        (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
         /* #1687: DrvFs without `metadata` ignores chmod; name the remedy. */
         bool drvfs = posix_fd_on_wsl_drvfs(current_fd);
         ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700%s%s", directory_path,
@@ -2140,8 +2152,19 @@ static int private_directory_tree_open(const char *directory_path) {
                                   drvfs ? POSIX_WSL_DRVFS_REMEDY : "");
         ok = false;
     }
+    /* Verify-only accepts any owner-only mode, 0500 included: a read-only
+     * mount or snapshot cannot be made 0700, and need not be. */
+    if (ok && !harden && (final_status.st_mode & 077) != 0) {
+        ipc_validation_detail_set("%s: mode 0%o grants group or other access, and a verify-only "
+                                  "check never changes it",
+                                  directory_path, (unsigned)(final_status.st_mode & 07777));
+        ok = false;
+    }
     if (ok && !cbm_macos_extended_acl_fd_is_empty(current_fd)) {
-        ipc_validation_detail_set("%s: extended ACL still present after clear", directory_path);
+        ipc_validation_detail_set("%s: %s", directory_path,
+                                  harden ? "extended ACL still present after clear"
+                                         : "carries an extended ACL, and a verify-only check "
+                                           "never clears it");
         ok = false;
     }
     free(path);
@@ -2154,9 +2177,13 @@ static int private_directory_tree_open(const char *directory_path) {
     return current_fd;
 }
 
-bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
+static int private_directory_tree_open(const char *directory_path) {
+    return private_directory_tree_walk(directory_path, true);
+}
+
+static bool private_directory_check(const char *directory_path, bool harden) {
     ipc_validation_detail_set("%s", "");
-    int directory_fd = private_directory_tree_open(directory_path);
+    int directory_fd = private_directory_tree_walk(directory_path, harden);
     if (directory_fd < 0) {
         if (!ipc_validation_detail_buffer[0]) {
             ipc_validation_detail_set("%s: ancestry component validation failed (errno %d)",
@@ -2165,6 +2192,14 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
         return false;
     }
     return close(directory_fd) == 0;
+}
+
+bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
+    return private_directory_check(directory_path, true);
+}
+
+bool cbm_daemon_ipc_private_directory_verify(const char *directory_path) {
+    return private_directory_check(directory_path, false);
 }
 
 static int private_log_file_open(int directory_fd, const char *base_name, struct stat *status_out) {
@@ -5409,7 +5444,59 @@ static bool win_directory_component_secure(win_security_t *security, const wchar
     return valid;
 }
 
-static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
+/* The verify-only counterpart of win_runtime_directory_secure(): opened for
+ * reading only, never created, never re-owned, its DACL never rewritten. It
+ * must already be what that function leaves behind -- owned by this account
+ * with an owner-only DACL (win_file_dacl_is_owner_only). The general
+ * win_file_security_secure() test is not enough here: it only looks for
+ * untrusted MUTATION rights, so it would accept a DACL that lets other
+ * accounts read the directory, where the POSIX check refuses any group or
+ * other mode bit. */
+static bool win_private_directory_verify_final(const wchar_t *directory_path) {
+    win_security_t security;
+    if (!win_security_init(&security)) {
+        return false;
+    }
+    HANDLE directory =
+        CreateFileW(directory_path, FILE_READ_ATTRIBUTES | READ_CONTROL,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD open_error = directory == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    BY_HANDLE_FILE_INFORMATION info;
+    bool plain_directory = directory != INVALID_HANDLE_VALUE &&
+                           GetFileInformationByHandle(directory, &info) != 0 &&
+                           (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                           (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    /* win_file_owner_secure() names a wrong owner in the detail itself. */
+    bool owner_exact = plain_directory && win_file_owner_secure(&security, directory, true);
+    bool private_directory = owner_exact && win_file_dacl_is_owner_only(&security, directory);
+    if (!plain_directory) {
+        char message[128];
+        (void)snprintf(message, sizeof(message),
+                       "is not a plain directory that can be opened for reading (Windows error "
+                       "%lu)",
+                       (unsigned long)(open_error != ERROR_SUCCESS ? open_error : GetLastError()));
+        ipc_validation_detail_set_for_path(directory_path, message);
+    } else if (!owner_exact) {
+        char inner[sizeof(ipc_validation_detail_buffer) + 64];
+        (void)snprintf(inner, sizeof(inner), "%s, and a verify-only check never re-owns it",
+                       ipc_validation_detail_buffer);
+        ipc_validation_detail_set_for_path(directory_path, inner);
+    } else if (!private_directory) {
+        ipc_validation_detail_set_for_path(
+            directory_path, "has a DACL that is not owner-only (another account has access, or "
+                            "it is inherited), and a verify-only check never rewrites it");
+    }
+    if (directory != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(directory);
+    }
+    win_security_destroy(&security);
+    return private_directory;
+}
+
+/* See private_directory_tree_walk() for harden; verify-only never calls
+ * CreateDirectoryW and never repairs the final directory. */
+static bool win_private_directory_tree_walk(const wchar_t *directory_path, bool harden) {
     if (!directory_path) {
         return false;
     }
@@ -5459,7 +5546,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
                 bool absent = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
-                if (absent) {
+                if (absent && harden) {
                     ipc_win_directory_create_hook_run(path);
                     /* Several processes first-starting together all observe
                      * this component absent; one CreateDirectoryW wins and
@@ -5477,13 +5564,16 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
                         absent = error == ERROR_ALREADY_EXISTS;
                     }
                 }
-                ok = absent;
+                ok = absent && harden;
                 if (!ok) {
                     /* Never a bare "(endpoint)": name the component and the
                      * Windows error that refused it. */
-                    char message[96];
+                    char message[128];
                     (void)snprintf(message, sizeof(message),
-                                   "could not create or inspect the directory (Windows error %lu)",
+                                   harden ? "could not create or inspect the directory (Windows "
+                                            "error %lu)"
+                                          : "cannot be inspected (Windows error %lu), and a "
+                                            "verify-only check never creates it",
                                    (unsigned long)error);
                     ipc_validation_detail_set_for_path(path, message);
                 }
@@ -5507,21 +5597,33 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     }
     win_security_destroy(&security);
     if (ok) {
-        ok = win_runtime_directory_secure(path);
+        ok = harden ? win_runtime_directory_secure(path) : win_private_directory_verify_final(path);
     }
     free(path);
     return ok;
 }
 
-bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
+static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
+    return win_private_directory_tree_walk(directory_path, true);
+}
+
+static bool win_private_directory_check(const char *directory_path, bool harden) {
     ipc_validation_detail_set("%s", "");
     if (!directory_path || !directory_path[0]) {
         return false;
     }
     wchar_t *wide_directory = utf8_to_wide(directory_path);
-    bool secure = wide_directory && win_private_directory_tree_secure(wide_directory);
+    bool secure = wide_directory && win_private_directory_tree_walk(wide_directory, harden);
     free(wide_directory);
     return secure;
+}
+
+bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
+    return win_private_directory_check(directory_path, true);
+}
+
+bool cbm_daemon_ipc_private_directory_verify(const char *directory_path) {
+    return win_private_directory_check(directory_path, false);
 }
 
 static bool private_log_base_name_valid(const char *base_name) {

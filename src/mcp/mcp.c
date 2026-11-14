@@ -18675,7 +18675,9 @@ static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
     char directory[CBM_SZ_1K];
     const char *cache = cbm_resolve_cache_dir();
     int written;
-    if (cache && cache[0]) {
+    /* A read-only cache (CBM_IN_PROCESS) may be a read-only mount: staging
+     * there would fail, and would be a write into shared cache state if not. */
+    if (cache && cache[0] && !cbm_cache_dir_read_only()) {
         written = snprintf(directory, sizeof(directory), "%s/logs", cache);
         if (written <= 0 || written >= (int)sizeof(directory) ||
             !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
@@ -20109,7 +20111,13 @@ static char *detect_test_impact(const char *args, const char *root_path, const c
         }
     }
     char work[CBM_SZ_4K];
-    snprintf(work, sizeof(work), "%s/test-impact", cbm_resolve_cache_dir());
+    /* The per-request ti-XXXXXX work tree is private (mkdtemp) and removed
+     * afterwards, so a read-only cache can place it under the temp dir. */
+    if (cbm_cache_dir_read_only()) {
+        snprintf(work, sizeof(work), "%s", cbm_tmpdir());
+    } else {
+        snprintf(work, sizeof(work), "%s/test-impact", cbm_resolve_cache_dir());
+    }
     if (!cbm_mkdir_p(work, 0700)) {
         return cbm_mcp_text_result("test_impact_failed: no private work directory", true);
     }

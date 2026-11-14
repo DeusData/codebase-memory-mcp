@@ -2821,6 +2821,117 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     return ui_result;
 }
 
+/* In-process sessions are read-only. The analysis/scout tool allowlist set in
+ * main() keeps every mutating tool out: dispatch_tool() refuses it before any
+ * handler runs. That allowlist is not a read-only contract (mcp.h: internal
+ * cache maintenance may still write), so these guards are the second line —
+ * a write that gets past it fails closed at the lease instead of proceeding
+ * uncoordinated. They cannot stop work a handler does before it reaches the
+ * lease, which is why the allowlist comes first.
+ *
+ * An unset guard would be no line at all: mcp_project_mutation_begin() is
+ * `!srv->mutation_begin || srv->mutation_begin(...)`, so an unset guard fails
+ * OPEN and every mutation proceeds. The daemon (daemon/application.c), the UI
+ * (ui/http_server.c) and the local CLI above all install one; an in-process
+ * session has no daemon to acquire a cross-session lease from, so it must
+ * refuse the mutation instead of taking it unguarded.
+ *
+ * Leaving the try-guard unset is deliberate: with mutation_begin set and
+ * mutation_try_begin NULL, mcp_project_mutation_try_begin() also returns false,
+ * so opportunistic writes during a read are refused too. */
+static bool main_in_process_mutation_refused(void *context, const char *project) {
+    (void)context;
+    (void)project;
+    return false;
+}
+
+static void main_in_process_mutation_end(void *context, const char *project) {
+    (void)context;
+    (void)project;
+}
+
+/* Reject indexing with a message that says why, rather than letting the
+ * mutation guard report it as "blocked by an active index" — nothing is
+ * blocking, the mode simply cannot coordinate a write. Mirrors
+ * http_read_only_index_rejected in ui/http_server.c. */
+static char *main_in_process_index_rejected(void *context, const char *repo_path,
+                                            const char *args_json, bool async) {
+    (void)context;
+    (void)repo_path;
+    (void)args_json;
+    (void)async;
+    return cbm_mcp_text_result("indexing is unavailable in CBM_IN_PROCESS mode: it needs the "
+                               "coordination daemon's cross-session lease. Run "
+                               "`codebase-memory-mcp cli index_repository` outside the sandbox.",
+                               true);
+}
+
+/* CBM_IN_PROCESS=1|true, as for CBM_DIAGNOSTICS. It is not a saved runtime
+ * setting, so it can be read before the settings load that it changes. */
+static bool main_in_process_requested(void) {
+    char buf[MAIN_PATH_CAP];
+    const char *value = cbm_safe_getenv("CBM_IN_PROCESS", buf, sizeof(buf), NULL);
+    return value && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+}
+
+/* An in-process session only reads the cache, so the cache must already be
+ * usable as it is. Every daemon-backed role creates it and hardens it to 0700
+ * with no ACL (runtime settings, then main_build_identity()); this one never
+ * creates, chmods or strips it -- a read-only mount could not take that
+ * anyway -- and refuses instead unless it, and every directory containing it,
+ * already passes the same checks. A refusal is reported in JSON-RPC as well as
+ * on stderr (main_report_client_failure()), since a host shows only the former.
+ * The canonical path is then pinned in CBM_CACHE_DIR, as main_build_identity()
+ * does for the other roles, and scratch output is kept out of the cache
+ * (cbm_cache_dir_read_only()). */
+static bool main_in_process_cache_ready(void) {
+    char message[MAIN_CLIENT_FAILURE_DETAIL_CAP];
+    const char *cache = cbm_resolve_cache_dir();
+    char canonical[MAIN_PATH_CAP];
+    errno = 0;
+    bool resolved = cache && cache[0] && cbm_canonical_path(cache, canonical, sizeof(canonical));
+    int resolve_errno = errno;
+    /* Only absence earns the "index first" advice: a path the sandbox will
+     * not let us resolve (EACCES, EPERM) exists and needs a different fix. */
+    bool missing = !resolved && (resolve_errno == ENOENT || resolve_errno == ENOTDIR ||
+                                 (resolve_errno == 0 && cache && !cbm_file_exists(cache)));
+    if (!cache || !cache[0]) {
+        (void)snprintf(message, sizeof(message),
+                       "CBM_IN_PROCESS: no cache directory could be resolved");
+    } else if (missing) {
+        (void)snprintf(message, sizeof(message),
+                       "CBM_IN_PROCESS: cache directory %s does not exist; it is never created "
+                       "in this mode, so index a repository from outside the sandbox first",
+                       cache);
+    } else if (!resolved) {
+        (void)snprintf(message, sizeof(message),
+                       "CBM_IN_PROCESS: cache directory %s cannot be resolved (%s)", cache,
+                       cbm_errno_name(resolve_errno));
+    } else if (!cbm_is_dir(canonical)) {
+        (void)snprintf(message, sizeof(message),
+                       "CBM_IN_PROCESS: cache directory %s is not a directory", canonical);
+    } else {
+        cbm_normalize_path_sep(canonical);
+        if (!cbm_daemon_ipc_private_directory_verify(canonical)) {
+            (void)snprintf(message, sizeof(message),
+                           "CBM_IN_PROCESS: refusing the cache directory, which this mode "
+                           "checks but never changes - %s",
+                           cbm_daemon_ipc_validation_detail());
+        } else if (!cbm_runtime_settings_init_read_only(canonical)) {
+            (void)snprintf(message, sizeof(message),
+                           "CBM_IN_PROCESS: could not load saved runtime settings read-only");
+        } else if (cbm_setenv("CBM_CACHE_DIR", canonical, 1) != 0) {
+            (void)snprintf(message, sizeof(message),
+                           "CBM_IN_PROCESS: could not pin the canonical cache directory");
+        } else {
+            cbm_set_cache_dir_read_only(true);
+            return true;
+        }
+    }
+    main_report_client_failure(CBM_DAEMON_PROCESS_MCP_CLIENT, message);
+    return false;
+}
+
 int main(int argc, char **argv) {
     /* Must remain the first statement: see allocator binding contract above. */
     cbm_alloc_init();
@@ -2861,10 +2972,17 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* Decided before the settings load, which an in-process session does
+     * read-only (main_in_process_cache_ready()). */
+    bool in_process = role == CBM_DAEMON_PROCESS_MCP_CLIENT && main_in_process_requested();
     bool configure_stateless =
         role == CBM_DAEMON_PROCESS_STATELESS && argc > 1 && strcmp(argv[1], "config") == 0;
-    if ((role != CBM_DAEMON_PROCESS_STATELESS && role != CBM_DAEMON_PROCESS_HOOK_CLIENT) ||
-        configure_stateless) {
+    if (in_process) {
+        if (!main_in_process_cache_ready()) {
+            return EXIT_FAILURE;
+        }
+    } else if ((role != CBM_DAEMON_PROCESS_STATELESS && role != CBM_DAEMON_PROCESS_HOOK_CLIENT) ||
+               configure_stateless) {
         const char *settings_cache = cbm_resolve_cache_dir();
         if (settings_cache && !cbm_runtime_settings_init(settings_cache)) {
             (void)fprintf(stderr, "codebase-memory-mcp: could not load saved runtime settings\n");
@@ -3112,6 +3230,76 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
         }
         return exit_code;
+    }
+
+    /* In-process MCP: serve the stdio JSON-RPC loop directly, with no
+     * coordination daemon and therefore no AF_UNIX rendezvous at all.
+     *
+     * This exists for hosts whose sandbox denies socket syscalls outright —
+     * e.g. a macOS seatbelt profile that is `(allow default)` for the
+     * filesystem but `(deny network*)`, which covers network-bind and
+     * network-outbound and so makes both bind() and connect() EPERM. There the
+     * daemon handshake can never complete: presence is inferred from a file
+     * lock (permitted), so an EPERM connect is misread as "daemon still
+     * starting" and the whole MAIN_MCP_STARTUP_TIMEOUT_MS budget is spent
+     * retrying it before the client gives up.
+     *
+     * Opt-in via CBM_IN_PROCESS (1 or true, as for CBM_DIAGNOSTICS) so default
+     * behaviour is unchanged. The store is resolved from CBM_CACHE_DIR exactly
+     * as a daemon session does (cbm_mcp_server_new(NULL), as in
+     * daemon/application.c and ui/http_server.c), so this reads the same index
+     * the daemon builds.
+     *
+     * The session is READ-ONLY, and deliberately so. Without a daemon there is
+     * no cross-session mutation lease, no index executor and no exact-build
+     * admission, so a write here could not be coordinated against a daemon
+     * session touching the same project. It therefore serves only the
+     * analysis/scout tool allowlist, backed by the refusing guards above main()
+     * — see there for why an unset guard would have been worse than a refusing
+     * one. Indexing stays with the daemon, outside the sandbox.
+     *
+     * It runs before main_build_identity() on purpose. Executable identity is
+     * for cohort admission, which this session never joins, and building it
+     * hardens the cache root again (mkdir, chmod 0700, ACL clear): exactly
+     * what a read-only cache cannot take, and what main_in_process_cache_ready()
+     * already verified is unnecessary. */
+    if (in_process) {
+        cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+        cbm_mcp_server_t *inproc_srv = cbm_mcp_server_new(NULL);
+        if (!inproc_srv) {
+            (void)fprintf(stderr, "codebase-memory-mcp: cannot create in-process MCP server\n");
+            return EXIT_FAILURE;
+        }
+        /* Serve only the analysis allowlist (scout stays scout; anything
+         * else becomes analysis). dispatch_tool() refuses a tool outside it
+         * before its handler runs, which the guards below cannot do: they
+         * sit inside the handlers, and handler work before them still
+         * reaches shared state — index_repository loads the index policy
+         * first, and with no server config that creates or opens
+         * ${CBM_CACHE_DIR}/_config.db before the executor could refuse. */
+        cbm_mcp_server_set_tool_profile(inproc_srv, tool_profile == CBM_MCP_TOOL_PROFILE_SCOUT
+                                                        ? CBM_MCP_TOOL_PROFILE_SCOUT
+                                                        : CBM_MCP_TOOL_PROFILE_ANALYSIS);
+        /* The second line (see the guards above main()): no daemon means no
+         * cross-session lease, index executor or exact-build admission, so a
+         * write that got past the allowlist must fail closed rather than
+         * proceed uncoordinated. background_tasks off keeps
+         * maybe_auto_index() off the initialize path. */
+        cbm_mcp_server_set_background_tasks(inproc_srv, false);
+        cbm_mcp_server_set_index_executor(inproc_srv, main_in_process_index_rejected, NULL);
+        cbm_mcp_server_set_project_mutation_guard(inproc_srv, main_in_process_mutation_refused,
+                                                  main_in_process_mutation_end, NULL);
+        char inproc_root[MAIN_PATH_CAP];
+        char inproc_allowed[MAIN_PATH_CAP];
+        const char *inproc_allowed_ptr = NULL;
+        if (main_session_context(NULL, inproc_root, inproc_allowed, &inproc_allowed_ptr)) {
+            (void)cbm_mcp_server_set_session_context(inproc_srv, inproc_root, inproc_allowed_ptr);
+        }
+        setup_signal_handlers();
+        cbm_log_info("mcp.in_process", "reason", "CBM_IN_PROCESS", "daemon", "bypassed");
+        int inproc_rc = cbm_mcp_server_run(inproc_srv, stdin, stdout);
+        cbm_mcp_server_free(inproc_srv);
+        return inproc_rc < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
     char executable_path[MAIN_PATH_CAP];

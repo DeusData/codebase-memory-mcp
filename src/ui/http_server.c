@@ -463,7 +463,7 @@ static bool ui_log_import_legacy(sqlite3 *db, const char *cache);
 static sqlite3 *activity_db_locked(void) {
     char path[CBM_SZ_2K];
     const char *cache = cbm_resolve_cache_dir();
-    int n = snprintf(path, sizeof(path), "%s/activity.db", cache ? cache : "");
+    int n = snprintf(path, sizeof(path), "%s/" CBM_ACTIVITY_DB_FILENAME, cache ? cache : "");
     if (!cache || !*cache || n < 0 || (size_t)n >= sizeof(path))
         return NULL;
     if (strcmp(path, g_activity_path)) {
