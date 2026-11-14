@@ -29,7 +29,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Forks commonly do not have GitHub Pages enabled; keep push CI green there.
   deploy:
+    if: github.repository == "DeusData/codebase-memory-mcp"
     runs-on: ubuntu-latest
     environment:
       name: github-pages
