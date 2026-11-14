@@ -7,7 +7,7 @@
  * continue to use runtime_control_request_send unchanged. */
 typedef struct {
     uint64_t (*now_ms)(void);
-    cbm_daemon_ipc_connection_t *(*connect)(const cbm_daemon_ipc_endpoint_t *, uint32_t);
+    cbm_daemon_ipc_connection_t *(*ipc_connect)(const cbm_daemon_ipc_endpoint_t *, uint32_t);
     bool (*send)(cbm_daemon_ipc_connection_t *, cbm_daemon_frame_type_t, uint16_t, const void *,
                  uint32_t);
     int (*receive)(cbm_daemon_ipc_connection_t *, uint32_t, uint32_t, cbm_daemon_frame_t *,

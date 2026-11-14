@@ -5704,7 +5704,7 @@ static void runtime_test_status_close(cbm_daemon_ipc_connection_t *connection) {
 }
 static const cbm_daemon_status_details_transport_t runtime_test_status_transport = {
     .now_ms = runtime_test_status_now,
-    .connect = runtime_test_status_connect,
+    .ipc_connect = runtime_test_status_connect,
     .send = runtime_test_status_send,
     .receive = runtime_test_status_receive,
     .close = runtime_test_status_close,

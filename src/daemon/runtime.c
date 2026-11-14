@@ -3369,7 +3369,7 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
 
 static const cbm_daemon_status_details_transport_t runtime_status_details_transport = {
     .now_ms = cbm_now_ms,
-    .connect = cbm_daemon_ipc_connect,
+    .ipc_connect = cbm_daemon_ipc_connect,
     .send = cbm_daemon_ipc_send_frame,
     .receive = cbm_daemon_ipc_receive_frame_bounded,
     .close = cbm_daemon_ipc_connection_close,
@@ -3404,7 +3404,7 @@ static bool runtime_status_request_until(const cbm_daemon_ipc_endpoint_t *endpoi
     if (remaining == 0) {
         return false;
     }
-    cbm_daemon_ipc_connection_t *connection = transport->connect(endpoint, remaining);
+    cbm_daemon_ipc_connection_t *connection = transport->ipc_connect(endpoint, remaining);
     if (!connection) {
         return false;
     }
