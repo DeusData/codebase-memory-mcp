@@ -1,0 +1,10 @@
+{
+  "name": "tree-sitter-sql-cbm",
+  "version": "0.3.11-cbm.1",
+  "description": "cbm fork of tree-sitter-sql @ 851e9cb (SQLite migration syntax, #2246)",
+  "license": "MIT",
+  "type": "module",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}

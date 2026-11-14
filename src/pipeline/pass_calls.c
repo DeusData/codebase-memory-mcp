@@ -18,6 +18,8 @@ enum {
     PC_REGEX_GRP = 2,
     PC_SINGLE_CANDIDATE_COUNT = 1
 };
+static const double PC_SWIFT_SINGLE_CONF = 0.90;
+static const double PC_SWIFT_AMBIGUOUS_CONF = 0.55;
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
  * resolution is empty (external, unindexed client library) — see #523. */
 #define PC_SVC_PATTERN_CONF 0.5
@@ -687,11 +689,32 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
  * by the parallel formatter itself (emit_http_async_edge), because route/service
  * edge props feed full-only predump passes (create_route_nodes /
  * create_data_flows) and must not differ between the two passes. */
-/* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
+/* Append a ,"args":[{"i":0,"k":"<keyword>","e":"<expr>","v":"<value>"},...] field onto a CALLS
  * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
  * this, so data_flow mode had no argument expressions to surface for small
  * (< 50 file) repos that take the sequential path (#514). Mirrors the parallel
  * path's append_args_json shape so both pipelines agree. */
+static int calls_format_arg(char *one, size_t cap, const CBMCallArg *arg, const char *prefix) {
+    char expr[CBM_SZ_256];
+    cbm_json_escape(expr, sizeof(expr), arg->expr ? arg->expr : "");
+    char keyword[CBM_SZ_256] = "";
+    if (arg->keyword) {
+        char escaped[CBM_SZ_128];
+        cbm_json_escape(escaped, sizeof(escaped), arg->keyword);
+        int length = snprintf(keyword, sizeof(keyword), ",\"k\":\"%s\"", escaped);
+        if (length <= 0 || (size_t)length >= sizeof(keyword)) {
+            return 0;
+        }
+    }
+    if (arg->value) {
+        char value[CBM_SZ_256];
+        cbm_json_escape(value, sizeof(value), arg->value);
+        return snprintf(one, cap, "%s{\"i\":%d%s,\"e\":\"%s\",\"v\":\"%s\"}", prefix, arg->index,
+                        keyword, expr, value);
+    }
+    return snprintf(one, cap, "%s{\"i\":%d%s,\"e\":\"%s\"}", prefix, arg->index, keyword, expr);
+}
+
 static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
     if (!call || call->arg_count <= 0) {
         return;
@@ -708,19 +731,8 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
     }
     pos += (size_t)n;
     for (int i = 0; i < call->arg_count; i++) {
-        const CBMCallArg *a = &call->args[i];
-        char esc_e[CBM_SZ_256];
-        cbm_json_escape(esc_e, sizeof(esc_e), a->expr ? a->expr : "");
         char one[CBM_SZ_512];
-        if (a->value) {
-            char esc_v[CBM_SZ_256];
-            cbm_json_escape(esc_v, sizeof(esc_v), a->value);
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}",
-                         i > 0 ? "," : "", a->index, esc_e, esc_v);
-        } else {
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
-                         esc_e);
-        }
+        n = calls_format_arg(one, sizeof(one), &call->args[i], i > 0 ? "," : "");
         /* Add rather than subtract: pos is unsigned, so `cap - pos - PAIR_LEN`
          * wraps once pos reaches cap - PAIR_LEN and stops bounding the memcpy
          * below. The closing write at the end of this function already guards
@@ -840,7 +852,11 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls, const char *route_mount,
                                  CBMLanguage lang) {
-    cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
+    cbm_svc_kind_t svc = cbm_service_pattern_match_in_project(
+        res->qualified_name, target ? target->name : NULL,
+        target && res->qualified_name && strcmp(target->qualified_name, res->qualified_name) == 0
+            ? ctx->project_name
+            : NULL);
     if (svc == CBM_SVC_ROUTE_REG && route_reg_path(call, lang) != NULL) {
         return handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
                                          imp_count, route_mount, lang);
@@ -996,21 +1012,25 @@ static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const 
 }
 
 static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                  const CBMResolvedCall *lsp, bool allow_tail, CBMLanguage lang,
-                                  const CBMImportArray *imports, const cbm_gbuf_node_t *source_node,
-                                  const char *module_qn, const char **imp_keys,
-                                  const char **imp_vals, int imp_count, const char *route_mount,
-                                  CBMCallEvidence *evidence) {
+                                  const CBMResolvedCall *lsp, bool allow_tail, bool java_external,
+                                  CBMLanguage lang, const CBMImportArray *imports,
+                                  const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                  const char **imp_keys, const char **imp_vals, int imp_count,
+                                  const char *route_mount, CBMCallEvidence *evidence) {
     if (!lsp) {
         return false;
     }
     bool exact_external_target =
         call->requires_lsp_resolution && cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
+    /* A Java call on a JDK/library type binds its exact QN only: no tail
+     * match onto a same-named project method. MUST match pass_parallel.c. */
     const cbm_gbuf_node_t *target_node =
-        exact_external_target ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
-                                                                    lsp->callee_qn, allow_tail)
-                              : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
-                                                             lsp->callee_qn, allow_tail);
+        java_external           ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
+                                                                      lsp->callee_qn, false)
+        : exact_external_target ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
+                                                                      lsp->callee_qn, allow_tail)
+                                : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
+                                                               lsp->callee_qn, allow_tail);
     if (!target_node || source_node->id == target_node->id) {
         return false;
     }
@@ -1038,19 +1058,22 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     return true;
 }
 
-/* Vendor receivers and cross-language name guesses cannot bind project calls.
- * Keep the registry policy shared with the parallel resolver. */
+/* Vendor receivers, Java library receivers and cross-language name guesses
+ * cannot bind project calls. Keep the registry policy shared with the
+ * parallel resolver. `caller_test`: cbm_pipeline_caller_is_test of the
+ * calling definition. */
 static cbm_resolution_t calls_registry_resolution(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                                   const char *module_qn, const char **imp_keys,
                                                   const char **imp_vals, int imp_count,
                                                   CBMLanguage lang, bool rust_external,
-                                                  bool php_vendor_call) {
+                                                  bool php_vendor_call, bool java_external,
+                                                  bool caller_test) {
     cbm_resolution_t res = {0};
-    if (!rust_external && !php_vendor_call) {
+    if (!rust_external && !php_vendor_call && !java_external) {
         /* Python LEGB fallback first (MUST match pass_parallel.c). */
-        res =
-            cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn, imp_keys,
-                                             imp_vals, imp_count, lang, call->enclosing_func_qn);
+        res = cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn,
+                                               imp_keys, imp_vals, imp_count, lang,
+                                               call->enclosing_func_qn, caller_test);
         /* Cross-language veto: a name-only guess never binds another
          * language's symbol (a JS app.get must not become Python's
          * builtins.dict.get). The vetoed answer becomes EMPTY here, before
@@ -1114,8 +1137,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Service/route classification below still runs. Mirrors pass_parallel.c. */
     bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
                            cbm_pipeline_lsp_external_receiver(lsp);
-    if (calls_emit_lsp_target(ctx, call, lsp, allow_tail, lang, imports, source_node, module_qn,
-                              imp_keys, imp_vals, imp_count, route_mount, evidence)) {
+    /* A Java call on a JDK/library type is never bound to a project method
+     * found by name (no tail match, no registry guess). MUST match
+     * pass_parallel.c. */
+    bool java_external = cbm_pipeline_java_external_target(lang, lsp);
+    if (calls_emit_lsp_target(ctx, call, lsp, allow_tail, java_external, lang, imports, source_node,
+                              module_qn, imp_keys, imp_vals, imp_count, route_mount, evidence)) {
         return SKIP_ONE;
     }
 
@@ -1170,15 +1197,53 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return SKIP_ONE;
     }
 
-    /* #2053: a Rust call the LSP placed on an EXTERNAL symbol (std's
-     * Path::join, a seeded crate API) is resolved — it just has no graph node.
-     * The textual registry would bind it to a same-named project method
-     * instead, so skip it and let the empty-resolution service fallbacks below
-     * classify the call. MUST match pass_parallel.c. */
+    /* Swift label-compatible overload selection (#2061). count > 0: emit an
+     * edge to every compatible candidate and stop. count < 0: project symbols
+     * share this name but none matches the call's labels — a bare-name
+     * registry match would bind a WRONG overload, so resolution is skipped
+     * and the call falls through as unresolved; the empty-resolution service
+     * fallbacks below still run, mirroring the Swift block in pass_parallel.c
+     * (service edges survive overload suppression, per #523/#606/#856).
+     * count == 0: no overload metadata for this name — resolve normally. */
+    int swift_candidates = 0;
+    if (lang == CBM_LANG_SWIFT) {
+        const char *candidates[CBM_SZ_256];
+        swift_candidates =
+            cbm_registry_swift_candidates_in_file(ctx->registry, call, result, ctx->gbuf, module_qn,
+                                                  imp_vals, imp_count, candidates, CBM_SZ_256);
+        if (swift_candidates > 0) {
+            int emitted = 0;
+            for (int i = 0; i < swift_candidates; i++) {
+                const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, candidates[i]);
+                if (target && target->id != source_node->id) {
+                    cbm_resolution_t selected = {.qualified_name = candidates[i],
+                                                 .strategy = "swift_labels",
+                                                 .confidence = swift_candidates == SKIP_ONE
+                                                                   ? PC_SWIFT_SINGLE_CONF
+                                                                   : PC_SWIFT_AMBIGUOUS_CONF,
+                                                 .candidate_count = swift_candidates};
+                    evidence->candidate_qn =
+                        swift_candidates == SKIP_ONE ? target->qualified_name : NULL;
+                    evidence->calls_emitted |= emit_classified_edge(
+                        ctx, call, source_node, target, &selected, module_qn, imp_keys, imp_vals,
+                        imp_count, false, route_mount, lang);
+                    emitted++;
+                }
+            }
+            return emitted > 0 ? SKIP_ONE : 0;
+        }
+    }
+
+    /* A Rust call the LSP placed on an EXTERNAL symbol has no graph node. The
+     * textual registry must not bind it to a same-named project method. */
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
-    cbm_resolution_t res = calls_registry_resolution(
-        ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang, rust_external, php_vendor_call);
+    cbm_resolution_t res = {0};
+    if (swift_candidates >= 0) {
+        res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
+                                        rust_external, php_vendor_call, java_external,
+                                        cbm_pipeline_caller_is_test(source_node, rel, lang));
+    }
     /* `p->open(fd)`: the registry does not split a callee on the arrow, and a
      * member is not a name it could resolve anyway. The object's type decides,
      * exactly as for the dot call handled further down. MUST match
@@ -1274,7 +1339,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                  * to a docs bundle (2026-09-16 probe: 4,207 junk
                                  * edges on JetBrains/Exposed). */
                                 lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                /* Swift flags only initializer calls `T.init(...)`
+                                 * (#2379, extract_calls.c); every other Swift call
+                                 * keeps is_method=false and is unaffected. */
+                                lang == CBM_LANG_SWIFT;
     /* Bare-call local-binding suppression. A member call has a receiver the
      * guard above can reason about; a bare `run()` has none, so that guard
      * cannot see this class at all. Python-only today because the extraction
@@ -1314,7 +1383,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                             cbm_pipeline_get_nsmap()) ||
         /* MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry));
+         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry)) ||
+        /* Same-module bound-receiver suppression (#1128): `axios.get()` with
+         * axios imported must not bind the `get` this file happens to define.
+         * The language list is inside the helper - MUST match pass_parallel.c. */
+        cbm_suppress_same_module_bound_receiver(lang, call->is_method, call->callee_name,
+                                                res.qualified_name, res.strategy, imports,
+                                                call->receiver_is_amd_dependency);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -1324,12 +1399,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * the missing target must NOT drop the call — otherwise no HTTP_CALLS edge
      * is written and cross-repo matching finds nothing (#523). Emit directly
      * when the call carries a URL/topic first argument. */
-    if (calls_emit_service_call(ctx, call, source_node,
-                                cbm_service_pattern_match(res.qualified_name), &res, evidence)) {
+    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+    if (calls_emit_service_call(
+            ctx, call, source_node,
+            cbm_service_pattern_match_in_project(res.qualified_name, NULL,
+                                                 target_node ? ctx->project_name : NULL),
+            &res, evidence)) {
         return SKIP_ONE;
     }
 
-    const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
@@ -1552,6 +1630,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
         /* Resolve each call */
         cbm_external_import_index_t ext_imports = {0};
+        cbm_spawn_file_begin(result->imports.items, result->imports.count);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1568,6 +1647,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 unresolved++;
             }
         }
+        cbm_spawn_file_end();
         cbm_pipeline_external_import_index_free(&ext_imports);
 
         cbm_pipeline_record_unresolved_calls(ctx->pipeline, rel, result, evidence);

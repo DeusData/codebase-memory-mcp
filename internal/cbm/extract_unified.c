@@ -1,6 +1,7 @@
 #include "extract_unified.h"
 #include "arena.h" // cbm_arena_sprintf
 #include "cbm.h"   // CBMExtractCtx
+#include "callable_sig.h"
 #include "helpers.h"
 #include "extract_url_fold.h" // cbm_url_fold_record_constant (#706, #1147)
 #include "lang_specs.h"       // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
@@ -14,6 +15,7 @@ enum { MAX_INFRA_BINDINGS = 8 };
 #include <stdint.h> // uint32_t, uint8_t
 #include <string.h>
 #include <strings.h> // strcasecmp (ObjectScript type inference)
+#include "resolve_stats.h"
 
 // --- Scope stack management ---
 
@@ -306,6 +308,171 @@ static void py_bind_scope_parameters(CBMExtractCtx *ctx, TSNode node, WalkState 
     }
 }
 
+/* ── AMD dependency bindings (#1128) ──────────────────────────────────────
+ * `define(['axios', './util'], function (axios, util) {...})` and
+ * `require([...], function (...) {...})` bind each factory parameter to the
+ * module at the same position of the dependency array. That binding is local
+ * to the factory and is not an import of the file (it mints no IMPORTS edge),
+ * so it rides the walk like the Python parameters above: the loader call notes
+ * the factory it passes, and when the walk opens that factory's frame its
+ * dependency parameters are bound into the same per-frame map and unwound with
+ * the frame. A JS/TS walk binds nothing else there. O(1) per node and no
+ * ancestor walk (the CBMWalkScope note says why that would be quadratic). */
+enum { AMD_LOADER_MAX_ARGS = 3 }; /* define(id?, dependencies?, factory) */
+
+static bool amd_js_walk(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+           lang == CBM_LANG_ARKTS;
+}
+
+static bool amd_node_text_is(const CBMExtractCtx *ctx, TSNode node, const char *text) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = strlen(text);
+    return end >= start && (size_t)(end - start) == len && end <= (uint32_t)ctx->source_len &&
+           memcmp(ctx->source + start, text, len) == 0;
+}
+
+static bool amd_factory_kind(const char *kind) {
+    return strcmp(kind, "function_expression") == 0 || strcmp(kind, "function") == 0 ||
+           strcmp(kind, "arrow_function") == 0;
+}
+
+/* At a loader call `define(...)` / `require(...)` / `requirejs(...)` with a
+ * dependency array followed by an inline factory, note that factory. */
+static void amd_note_factory(const CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if (strcmp(ts_node_type(node), "call_expression") != 0) {
+        return;
+    }
+    TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0 ||
+        !(amd_node_text_is(ctx, fn, "define") || amd_node_text_is(ctx, fn, "require") ||
+          amd_node_text_is(ctx, fn, "requirejs"))) {
+        return;
+    }
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    uint32_t count = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    if (count == 0 || count > AMD_LOADER_MAX_ARGS) {
+        return; /* not the loader's signature */
+    }
+    TSNode deps = {0};
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        const char *kind = ts_node_type(arg);
+        if (strcmp(kind, "array") == 0) {
+            deps = arg;
+        } else if (amd_factory_kind(kind) && !ts_node_is_null(deps)) {
+            state->amd_factory_start_byte = ts_node_start_byte(arg);
+            state->amd_factory_end_byte = ts_node_end_byte(arg);
+            state->amd_dependencies = deps;
+            return;
+        }
+    }
+}
+
+/* `require`, `exports` and `module` are the CommonJS-wrapper pseudo
+ * dependencies: `exports` and `module` are THIS module, so their parameters
+ * stay unbound. */
+static bool amd_pseudo_dependency(const CBMExtractCtx *ctx, TSNode dep) {
+    static const char *const pseudo[] = {"'require'",   "\"require\"", "'exports'",
+                                         "\"exports\"", "'module'",    "\"module\""};
+    for (size_t i = 0; i < sizeof(pseudo) / sizeof(pseudo[0]); i++) {
+        if (amd_node_text_is(ctx, dep, pseudo[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The identifier a JS/TS factory parameter binds, or NULL for a destructuring
+ * or rest pattern (those bind no dependency module as a whole). */
+static const char *amd_parameter_name(CBMExtractCtx *ctx, TSNode param) {
+    const char *kind = ts_node_type(param);
+    TSNode ident = param;
+    if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0) {
+        ident = ts_node_child_by_field_name(param, TS_FIELD("pattern"));
+    } else if (strcmp(kind, "assignment_pattern") == 0) {
+        ident = ts_node_child_by_field_name(param, TS_FIELD("left"));
+    }
+    if (ts_node_is_null(ident) || strcmp(ts_node_type(ident), "identifier") != 0) {
+        return NULL;
+    }
+    return cbm_node_text(ctx->arena, ident, ctx->source);
+}
+
+/* Step a cursor to the next named, non-comment sibling; false at the end. The
+ * first call must pass `first` = true to enter the children. Cursor steps are
+ * O(1), so pairing a dependency list with a parameter list stays linear. */
+static bool amd_next_item(TSTreeCursor *cursor, bool first) {
+    bool moved =
+        first ? ts_tree_cursor_goto_first_child(cursor) : ts_tree_cursor_goto_next_sibling(cursor);
+    while (moved) {
+        TSNode node = ts_tree_cursor_current_node(cursor);
+        if (ts_node_is_named(node) && strcmp(ts_node_type(node), "comment") != 0) {
+            return true;
+        }
+        moved = ts_tree_cursor_goto_next_sibling(cursor);
+    }
+    return false;
+}
+
+/* When the walk opens the noted factory's frame (pushed at `depth`), bind each
+ * parameter whose dependency is a module string. */
+static void amd_bind_factory_parameters(CBMExtractCtx *ctx, TSNode node, WalkState *state,
+                                        uint32_t depth) {
+    if (state->amd_factory_end_byte == 0 ||
+        ts_node_start_byte(node) != state->amd_factory_start_byte ||
+        ts_node_end_byte(node) != state->amd_factory_end_byte ||
+        !amd_factory_kind(ts_node_type(node))) {
+        return;
+    }
+    TSNode deps = state->amd_dependencies;
+    state->amd_factory_start_byte = 0;
+    state->amd_factory_end_byte = 0;
+    state->amd_dependencies = (TSNode){0};
+    /* Bind only into the factory's own frame, or the bindings would outlive it. */
+    if (state->scope_top == 0 || state->scopes[state->scope_top - SKIP_ONE].depth != depth) {
+        return;
+    }
+    TSNode single = ts_node_child_by_field_name(node, TS_FIELD("parameter")); /* `dep => ...` */
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    if (ts_node_is_null(single) && ts_node_is_null(params)) {
+        return;
+    }
+    TSTreeCursor dep_cursor = ts_tree_cursor_new(deps);
+    TSTreeCursor param_cursor = ts_tree_cursor_new(ts_node_is_null(single) ? params : node);
+    bool have_dep = amd_next_item(&dep_cursor, true);
+    bool have_param = ts_node_is_null(single) ? amd_next_item(&param_cursor, true) : true;
+    while (have_dep && have_param) {
+        TSNode dep = ts_tree_cursor_current_node(&dep_cursor);
+        TSNode param =
+            ts_node_is_null(single) ? ts_tree_cursor_current_node(&param_cursor) : single;
+        if (strcmp(ts_node_type(dep), "string") == 0 && !amd_pseudo_dependency(ctx, dep)) {
+            py_param_bind(state, amd_parameter_name(ctx, param));
+        }
+        have_dep = amd_next_item(&dep_cursor, false);
+        have_param = ts_node_is_null(single) && amd_next_item(&param_cursor, false);
+    }
+    ts_tree_cursor_delete(&dep_cursor);
+    ts_tree_cursor_delete(&param_cursor);
+}
+
+static void amd_track_bindings(CBMExtractCtx *ctx, TSNode node, WalkState *state, uint32_t depth) {
+    if (!amd_js_walk(ctx->language)) {
+        return;
+    }
+    amd_bind_factory_parameters(ctx, node, state, depth);
+    amd_note_factory(ctx, node, state);
+}
+
+bool cbm_walk_amd_dependency_binds(CBMExtractCtx *ctx, const WalkState *state, TSNode ident) {
+    if (!ctx || !state || !amd_js_walk(state->language) || state->py_param_stack_count == 0 ||
+        ts_node_is_null(ident) || strcmp(ts_node_type(ident), "identifier") != 0) {
+        return false;
+    }
+    return cbm_walk_python_param_is_bound(state, cbm_node_text(ctx->arena, ident, ctx->source));
+}
+
 static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
     if (!ensure_scope_capacity(state)) {
         return false;
@@ -324,6 +491,7 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
      * CBMWalkScope comment for the quadratic recompute this replaces. */
     f->prev_enclosing_func_qn = state->enclosing_func_qn;
     f->prev_enclosing_class_qn = state->enclosing_class_qn;
+    f->prev_enclosing_class_node = state->enclosing_class_node;
     f->prev_invocation_kind = state->invocation_kind;
     f->prev_callee_expr = state->callee_expr;
     f->prev_callee_leaf = state->callee_leaf;
@@ -337,6 +505,8 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     case SCOPE_CLASS:
     case SCOPE_NAMESPACE:
         state->enclosing_class_qn = qn;
+        /* push_lexical_scope records the node; a node-less push has none. */
+        state->enclosing_class_node = (TSNode){0};
         break;
     case SCOPE_CALL:
         /* The invocation triple is applied by push_call_scope once the caller
@@ -363,6 +533,9 @@ static bool push_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t dep
     if (!push_scope(state, walk_kind, depth, qn)) {
         state->lexical_binding_tracking_failed = true;
         return false;
+    }
+    if (walk_kind == SCOPE_CLASS || walk_kind == SCOPE_NAMESPACE) {
+        state->enclosing_class_node = node;
     }
     state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id =
         add_lexical_scope(state, node, lexical_kind);
@@ -442,6 +615,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         const CBMWalkScope *f = &state->scopes[--state->scope_top];
         state->enclosing_func_qn = f->prev_enclosing_func_qn;
         state->enclosing_class_qn = f->prev_enclosing_class_qn;
+        state->enclosing_class_node = f->prev_enclosing_class_node;
         state->invocation_kind = f->prev_invocation_kind;
         state->callee_expr = f->prev_callee_expr;
         state->callee_leaf = f->prev_callee_leaf;
@@ -1160,6 +1334,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * an in-body call sources to a QN one or more segments short of the def, and
      * the edge is dropped at write. */
     const char *qn_name = name;
+    if (ctx->language == CBM_LANG_SWIFT) {
+        const char *sig = cbm_callable_sig(ctx->arena, node, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(ctx->arena, "%s%s", name, sig) : NULL;
+        if (qualified) {
+            qn_name = qualified;
+        }
+    }
     if (ctx->language == CBM_LANG_NIX) {
         qn_name = cbm_nix_qn_name(ctx->arena, node, ctx->source, name);
         if (!qn_name || !qn_name[0]) {
@@ -2410,18 +2591,50 @@ static TSNode nasm_wrapped_label(TSNode node, int remaining_depth) {
     return (TSNode){0};
 }
 
-static TSNode nasm_preceding_label(TSNode node) {
-    TSNode current = node;
-    for (int level = 0; level < 4 && !ts_node_is_null(current); level++) {
-        TSNode previous = ts_node_prev_named_sibling(current);
-        while (!ts_node_is_null(previous)) {
-            TSNode label = nasm_wrapped_label(previous, 2);
-            if (!ts_node_is_null(label)) {
-                return label;
-            }
-            previous = ts_node_prev_named_sibling(previous);
+/* The nearest earlier sibling a probe finds a label in. The walk reaches siblings in order, so a
+ * search under the same parent stops at the sibling the last one started from, and what that one
+ * found holds for everything before it: each sibling is probed once however many ask. The caller
+ * passes node's parent, which it needs anyway. */
+typedef TSNode (*flat_label_probe_fn)(TSNode sibling);
+
+static TSNode flat_preceding_label(CBMFlatLookback *memo, TSNode parent, TSNode node,
+                                   flat_label_probe_fn probe) {
+    bool known = memo->parent && memo->parent == parent.id;
+    if (known && memo->asked == node.id) {
+        return memo->found;
+    }
+    TSNode found = {0};
+    for (TSNode previous = ts_node_prev_named_sibling(node); !ts_node_is_null(previous);
+         previous = ts_node_prev_named_sibling(previous)) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        found = probe(previous);
+        if (!ts_node_is_null(found)) {
+            break;
         }
+        if (known && memo->asked == previous.id) {
+            found = memo->found;
+            break;
+        }
+    }
+    memo->parent = parent.id;
+    memo->asked = node.id;
+    memo->found = found;
+    return found;
+}
+
+static TSNode nasm_label_probe(TSNode sibling) {
+    return nasm_wrapped_label(sibling, 2);
+}
+
+static TSNode nasm_preceding_label(TSNode node, WalkState *state) {
+    TSNode current = node;
+    for (int level = 0; level < FLAT_LOOKBACK_LEVELS && !ts_node_is_null(current); level++) {
         TSNode parent = ts_node_parent(current);
+        TSNode label =
+            flat_preceding_label(&state->flat_lookback[level], parent, current, nasm_label_probe);
+        if (!ts_node_is_null(label)) {
+            return label;
+        }
         if (ts_node_is_null(parent) || strcmp(ts_node_type(current), "source_file") == 0) {
             break;
         }
@@ -2441,7 +2654,7 @@ static TSNode objectscript_routine_statement_tag(TSNode statement) {
                                           : cbm_find_child_by_kind(tag_statement, "tag");
 }
 
-static TSNode objectscript_routine_preceding_tag(TSNode node) {
+static TSNode objectscript_routine_preceding_tag(TSNode node, WalkState *state) {
     if (strcmp(ts_node_type(node), "statement") != 0) {
         return (TSNode){0};
     }
@@ -2451,14 +2664,8 @@ static TSNode objectscript_routine_preceding_tag(TSNode node) {
         !ts_node_is_null(cbm_find_child_by_kind(node, "procedure"))) {
         return (TSNode){0};
     }
-    for (TSNode previous = ts_node_prev_named_sibling(node); !ts_node_is_null(previous);
-         previous = ts_node_prev_named_sibling(previous)) {
-        TSNode tag = objectscript_routine_statement_tag(previous);
-        if (!ts_node_is_null(tag)) {
-            return tag;
-        }
-    }
-    return (TSNode){0};
+    return flat_preceding_label(&state->flat_lookback[0], parent, node,
+                                objectscript_routine_statement_tag);
 }
 
 static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
@@ -2471,7 +2678,7 @@ static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 
     TSNode label = {0};
     if (ctx->language == CBM_LANG_NASM && strcmp(ts_node_type(node), "actual_instruction") == 0) {
-        label = nasm_preceding_label(node);
+        label = nasm_preceding_label(node, state);
     } else if (ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
         if (strcmp(ts_node_type(node), "tag_statement") == 0) {
             /* A parameterized flat tag owns its header as well as the following
@@ -2479,7 +2686,7 @@ static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
              * parameter_list records lexical bindings under the same tag QN. */
             label = cbm_find_child_by_kind(node, "tag");
         } else {
-            label = objectscript_routine_preceding_tag(node);
+            label = objectscript_routine_preceding_tag(node, state);
         }
     }
     if (ts_node_is_null(label)) {
@@ -2776,6 +2983,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
 
     push_lexical_boundary(node, state, depth);
     py_bind_scope_parameters(ctx, node, state);
+    amd_track_bindings(ctx, node, state, depth);
     push_call_scope(state, depth, invocation);
     if (is_actual_import_boundary(ctx, node, spec) && !is_export_of_declaration(node)) {
         push_scope(state, SCOPE_IMPORT, depth, NULL);
@@ -2846,6 +3054,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
      * recompute_state call): module scope, nothing else active. */
     state.enclosing_func_qn = ctx->module_qn;
     state.enclosing_class_qn = NULL;
+    state.enclosing_class_node = (TSNode){0};
     state.invocation_kind = CBM_INVOCATION_NONE;
     state.callee_expr = (TSNode){0};
     state.callee_leaf = (TSNode){0};
@@ -2904,6 +3113,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             CBMInvocationDescriptor invocation =
                 tf_module ? (CBMInvocationDescriptor){0} : handle_calls(ctx, node, spec, &state);
             if (!tf_module) {
+                state.walk_depth = depth;
                 handle_usages(ctx, node, spec, &state);
             }
             handle_throws(ctx, node, spec, &state);

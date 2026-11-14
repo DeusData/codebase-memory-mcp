@@ -34,8 +34,9 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *      __image__<repository as written>, registry "unknown" -- no longer
  *      __image__docker.io/[library/]<repository>.
  *   4  #1913: Go method QNs are receiver-qualified (pkg.Recv.method, generic
- *      receivers unwrapped); free functions stay pkg.func. */
-#define CBM_INDEX_FORMAT_VERSION 4
+ *      receivers unwrapped); free functions stay pkg.func.
+ *   5  #2061: Swift declaration identities and uncapped call selectors. */
+#define CBM_INDEX_FORMAT_VERSION 5
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -805,6 +806,11 @@ typedef struct {
     int coverage_version;
     bool hash_records_complete;
     bool unresolved_calls_complete;
+    /* Git checkout identity frozen at the successful staged-generation
+     * boundary (BT-240), stored in the index_checkout table. NULL/"" when the
+     * run had no git context (non-git repo) or the DB predates that table.
+     * Owned by the row: meta_get allocates it, meta_clear frees it. */
+    const char *indexed_checkout_sha;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for

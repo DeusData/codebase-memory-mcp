@@ -17,11 +17,14 @@
  */
 
 #include "cli/cli.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "git/git_context.h"
 #include "mcp/mcp.h"
+#include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
 
@@ -62,8 +65,8 @@
  * Observability (#858): a fired deadline is otherwise indistinguishable from
  * "no matches", so the handler first write()s a pre-formatted breadcrumb to
  * <cache_dir>/logs/hook-augment-timeouts.log (by default
- * ~/.cache/codebase-memory-mcp/logs; fd and message prepared at arm time —
- * only async-signal-safe write/_exit in the handler). */
+ * ~/.cache/codebase-memory-mcp/logs) and to stderr (fd and message prepared at
+ * arm time — only async-signal-safe write/_exit in the handler). */
 #ifndef _WIN32
 #define HA_DEADLINE_DEFAULT_MS 2000 /* in-process budget; see ha_deadline_ms()  */
 #define HA_DEADLINE_MIN_MS 50
@@ -99,9 +102,16 @@ static size_t g_ha_crumb_len = 0;
 
 static void ha_deadline_exit(int sig) {
     (void)sig;
-    if (g_ha_crumb_fd >= 0 && g_ha_crumb_len > 0) {
-        ssize_t w = write(g_ha_crumb_fd, g_ha_crumb_msg, g_ha_crumb_len);
-        (void)w;
+    /* async-signal-safe only: write() the prepared breadcrumb to the timeouts
+     * log (when it opened) and ALWAYS to stderr, so a fired deadline is a
+     * visible event, never a silent 0-byte exit(0). */
+    if (g_ha_crumb_len > 0) {
+        if (g_ha_crumb_fd >= 0) {
+            ssize_t w = write(g_ha_crumb_fd, g_ha_crumb_msg, g_ha_crumb_len);
+            (void)w;
+        }
+        ssize_t e = write(STDERR_FILENO, g_ha_crumb_msg, g_ha_crumb_len);
+        (void)e;
     }
     _exit(0);
 }
@@ -112,6 +122,16 @@ static bool ha_fits(int written, size_t cap) {
 }
 
 static void ha_open_crumb_log(int deadline_ms) {
+    /* Pre-format the breadcrumb unconditionally: the handler may only write() a
+     * prepared buffer, and formatting it before the log path is resolved means
+     * stderr still gets the line even when the file cannot be opened (no HOME,
+     * unwritable cache dir) — the "never silent" guarantee holds regardless. */
+    int n = snprintf(g_ha_crumb_msg, sizeof(g_ha_crumb_msg),
+                     "hook-augment: deadline_exceeded ms=%d pid=%ld (raise via "
+                     "CBM_HOOK_DEADLINE_MS)\n",
+                     deadline_ms, (long)getpid());
+    g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
+
     const char *override = getenv("CBM_HOOK_TIMEOUT_LOG"); /* tests + power users */
     char path[CBM_SZ_1K];
     /* A path cut off at the buffer names some other file, and O_CREAT would
@@ -133,18 +153,10 @@ static void ha_open_crumb_log(int deadline_ms) {
         cbm_mkdir_p_ex(dir, 0755, CBM_MKDIR_FOLLOW_OWNED);
     }
     /* Startup may re-arm after resolving saved settings. Keep the original
-     * diagnostic descriptor and refresh only the deadline text below. */
+     * diagnostic descriptor; the deadline text above is refreshed on every arm. */
     if (g_ha_crumb_fd < 0) {
         g_ha_crumb_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     }
-    if (g_ha_crumb_fd < 0) {
-        return;
-    }
-    int n = snprintf(g_ha_crumb_msg, sizeof(g_ha_crumb_msg),
-                     "hook-augment: deadline_exceeded ms=%d pid=%ld (raise via "
-                     "CBM_HOOK_DEADLINE_MS)\n",
-                     deadline_ms, (long)getpid());
-    g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
 }
 
 int cbm_hook_augment_deadline_ms_for_testing(void) {
@@ -1654,7 +1666,14 @@ static const char *ha_active_tier(yyjson_val *root, const char *event) {
     return "Tier 2 verification";
 }
 
-static const char *ha_no_project_index_guidance(const char *event) {
+static const char *ha_no_project_index_guidance(const char *event, bool worktree_ignored) {
+    /* ignore_worktrees is on and this cwd is a linked worktree: indexing it is
+     * deliberately disabled, so telling the agent to run index_repository would
+     * only produce a refusal. Point at the setting instead. */
+    if (worktree_ignored) {
+        return "This is a linked git worktree and ignore_worktrees is enabled, so it is not "
+               "indexed on purpose; do not run index_repository here.";
+    }
     return event && strcmp(event, "SubagentStart") == 0
                ? "Ask the parent agent to run index_repository before structural exploration; "
                  "do not attempt graph mutation."
@@ -1669,6 +1688,41 @@ static bool ha_invocation_supported(ha_lifecycle_dialect_t dialect, const char *
         return true;
     }
     return !forced_event || ha_dialect_event_supported(dialect, forced_event);
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+static CBM_TLS int *g_ha_worktree_gate_counter = NULL;
+#endif
+
+/* Project resolution once ignore_worktrees is on; the caller runs this only
+ * after reading the key, so the default path does none of it. A symlink alias
+ * has no .git of its own, and walking its lexical parents leaves the linked
+ * worktree. index_repository canonicalizes before the same gate, so the hook
+ * must too or it tells the agent to index a path the setting will refuse. The
+ * setting refuses a linked worktree even when it sits inside an indexed
+ * checkout or inside another linked worktree, so a match is kept only when its
+ * root belongs to this cwd's own linked worktree, not a parent graph. */
+static char *ha_resolve_project_ignoring_worktrees(cbm_mcp_server_t *srv, const char *cwd,
+                                                   bool *drop_ancestor, bool *worktree_ignored) {
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_ha_worktree_gate_counter) {
+        (*g_ha_worktree_gate_counter)++;
+    }
+#endif
+    char canonical_cwd[4096];
+    if (ha_canonical_path(cwd, canonical_cwd, sizeof(canonical_cwd))) {
+        cwd = canonical_cwd;
+    }
+    char project_root[4096];
+    project_root[0] = '\0';
+    char *project =
+        ha_resolve_indexed_project_with_root(srv, cwd, project_root, sizeof(project_root));
+    bool linked = cbm_git_is_linked_worktree(cwd);
+    /* Drop a parent graph without a second free(): this file's raw free count
+     * is ratcheted, and the caller's single free(project) still releases it. */
+    *drop_ancestor = linked && project && !cbm_git_same_linked_worktree(cwd, project_root);
+    *worktree_ignored = linked && (!project || *drop_ancestor);
+    return project;
 }
 
 static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root,
@@ -1688,7 +1742,20 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
         srv = owned_server;
     }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
-    char *project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
+    /* Read ignore_worktrees first and do nothing else for it while it is off.
+     * cbm_mcp_server_new(NULL) has no store, and srv may be the daemon's
+     * session server, so the read leaves srv untouched (see
+     * cbm_mcp_ignore_worktrees_runtime_enabled). Off, this is the resolution
+     * the hook did before the key existed. */
+    bool drop_ancestor = false;
+    bool worktree_ignored = false;
+    char *project = NULL;
+    if (srv && cwd && cbm_mcp_ignore_worktrees_runtime_enabled(srv)) {
+        project =
+            ha_resolve_project_ignoring_worktrees(srv, cwd, &drop_ancestor, &worktree_ignored);
+    } else {
+        project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
+    }
     cbm_mcp_server_free(owned_server);
 
     char context[2048];
@@ -1713,7 +1780,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                                ? " The same tools are also available from the shell: "
                                  "`codebase-memory-mcp cli <tool> --help` lists each tool's flags."
                                : "";
-    if (project) {
+    if (project && !drop_ancestor) {
         char safe_project[HA_METADATA_CAP];
         ha_sanitize_metadata(project, safe_project, sizeof(safe_project));
         /* The untrusted label covers the graph-derived project name only. Wrapping
@@ -1732,7 +1799,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  "and file reads for literals, configs, non-code files, and verification.%s",
                  scope, safe_project, tier, cli_hint);
     } else {
-        const char *index_guidance = ha_no_project_index_guidance(event);
+        const char *index_guidance = ha_no_project_index_guidance(event, worktree_ignored);
         snprintf(context, sizeof(context),
                  "[codebase-memory] %s context: no indexed graph project matched this working "
                  "directory. %s Once indexed, "
@@ -1851,8 +1918,13 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
     return ha_path_contains_mode(root, candidate, case_insensitive);
 }
 
-const char *cbm_hook_no_project_index_guidance_for_testing(const char *event) {
-    return ha_no_project_index_guidance(event);
+const char *cbm_hook_no_project_index_guidance_for_testing(const char *event,
+                                                           bool worktree_ignored) {
+    return ha_no_project_index_guidance(event, worktree_ignored);
+}
+
+void cbm_hook_set_worktree_gate_counter_for_testing(int *counter) {
+    g_ha_worktree_gate_counter = counter;
 }
 
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz) {

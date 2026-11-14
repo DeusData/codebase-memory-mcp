@@ -371,6 +371,7 @@ static bool semantic_manifest_package_control(const char *name) {
            strcmp(name, "composer.json") == 0 || strcmp(name, "pubspec.yaml") == 0 ||
            strcmp(name, "pom.xml") == 0 || strcmp(name, "build.gradle") == 0 ||
            strcmp(name, "build.gradle.kts") == 0 || strcmp(name, "mix.exs") == 0 ||
+           strcmp(name, "Package.swift") == 0 ||
            (len >= 8 && strcmp(name + len - 8, ".gemspec") == 0);
 }
 
@@ -379,10 +380,37 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
                                            const char *rel_dir, int depth, char **excluded_dirs,
                                            int excluded_count);
 
+/* Control files are the only regular files the walk records. */
+static bool semantic_manifest_control_name(const char *rel_dir, const char *name) {
+    bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
+                                                      strcmp(name, ".codebase-memory.json") == 0);
+    /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
+     * shapes which files an image holds (pass_docker.c image_ignore), and
+     * discovery indexes neither. */
+    static const char DOCKERIGNORE[] = ".dockerignore";
+    size_t nl = strlen(name);
+    bool dockerignore = nl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
+                        strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
+    return strcmp(name, ".gitignore") == 0 || root_control ||
+           semantic_manifest_package_control(name) || dockerignore;
+}
+
+/* True when the directory listing alone shows that the entry is not a
+ * directory. A Windows listing always carries the attributes; on POSIX a
+ * d_type of DT_UNKNOWN (0), which readdir could not resolve, proves nothing. */
+static bool semantic_manifest_listed_non_directory(const cbm_dirent_t *entry) {
+#ifdef _WIN32
+    return !entry->is_dir;
+#else
+    return entry->d_type != 0 && !entry->is_dir;
+#endif
+}
+
 static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
                                            const char *project, const char *abs_dir,
                                            const char *rel_dir, int depth, char **excluded_dirs,
-                                           int excluded_count, const char *name) {
+                                           int excluded_count, const cbm_dirent_t *entry) {
+    const char *name = entry->name;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
         return 0;
     char abs_path[CBM_SZ_4K], rel_path[CBM_SZ_4K];
@@ -392,6 +420,15 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
     if (abs_n < 0 || (size_t)abs_n >= sizeof(abs_path) || rel_n < 0 ||
         (size_t)rel_n >= sizeof(rel_path))
         return CBM_NOT_FOUND;
+    /* Only directories and control files contribute, so an entry the listing
+     * already shows to be neither is skipped without reading its metadata.
+     * That read can fail on such an entry: on Windows the plain path of a file
+     * named nul names the NUL device (#2646), and the plain path of a name
+     * ending in a dot or a space does not reach the file. */
+    bool control = semantic_manifest_control_name(rel_dir, name);
+    if (!control && semantic_manifest_listed_non_directory(entry)) {
+        return 0;
+    }
     cbm_path_info_t info;
     if (cbm_path_info_utf8(abs_path, &info) != 0)
         return CBM_NOT_FOUND;
@@ -404,17 +441,6 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
         return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
                                                excluded_dirs, excluded_count);
     }
-    bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
-                                                      strcmp(name, ".codebase-memory.json") == 0);
-    /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
-     * shapes which files an image holds (pass_docker.c image_ignore), and
-     * discovery indexes neither. */
-    static const char DOCKERIGNORE[] = ".dockerignore";
-    size_t nl = strlen(name);
-    bool dockerignore = nl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
-                        strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
-    bool control = strcmp(name, ".gitignore") == 0 || root_control ||
-                   semantic_manifest_package_control(name) || dockerignore;
     return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
                                       : 0;
 }
@@ -439,7 +465,7 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
         rc = cbm_pipeline_frozen_checkpoint(builder->frozen);
         if (rc == 0)
             rc = semantic_manifest_control_entry(builder, project, abs_dir, rel_dir, depth,
-                                                 excluded_dirs, excluded_count, entry->name);
+                                                 excluded_dirs, excluded_count, entry);
     }
     cbm_closedir(dir);
     return rc;
@@ -1370,8 +1396,37 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     size_t prefix_len = lang == CBM_LANG_PYTHON
                             ? cbm_pipeline_fqn_symbol_prefix_len(seed->project, node->file_path)
                             : 0;
+    /* The full index's verdict (pass_definitions.c): the extractor's (stored
+     * as is_test) OR its file rule on the node's file and the language the
+     * full index extracted it with OR the test-double path rule. */
+    bool is_test = cbm_node_is_test(node) || cbm_is_test_file(node->file_path, lang) ||
+                   cbm_registry_test_double_path(node->file_path);
     cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
-                                    lang, prefix_len);
+                                    lang, prefix_len, is_test);
+    if (node->properties_json) {
+        const char *mask = strstr(node->properties_json, "\"param_default_mask\":\"");
+        const char *count = strstr(node->properties_json, "\"selector_param_count\":");
+        if (mask && count) {
+            mask += strlen("\"param_default_mask\":\"");
+            count += strlen("\"selector_param_count\":");
+            char *mask_end = NULL;
+            char *count_end = NULL;
+            unsigned long long defaults = strtoull(mask, &mask_end, CBM_HEX_BASE);
+            unsigned long params = strtoul(count, &count_end, CBM_DECIMAL_BASE);
+            if (mask_end == mask + CBM_SZ_16 && *mask_end == '"' && count_end != count &&
+                params <= UINT8_MAX) {
+                yyjson_doc *doc =
+                    yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+                if (doc) {
+                    const char *selector =
+                        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "call_selector"));
+                    cbm_registry_set_swift_signature(seed->registry, node->qualified_name,
+                                                     (uint64_t)defaults, (uint8_t)params, selector);
+                    yyjson_doc_free(doc);
+                }
+            }
+        }
+    }
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with
@@ -2903,6 +2958,67 @@ static const char *closure_python_namespace_decline(const char *stored_json,
     return change > 0 ? "python_namespace_changed" : NULL;
 }
 
+static bool closure_is_swift_manifest(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return strcmp(slash ? slash + SKIP_ONE : path, "Package.swift") == 0;
+}
+
+static const cbm_file_hash_t *closure_next_swift_manifest(const cbm_file_hash_t *rows, int count,
+                                                          int *cursor) {
+    while (*cursor < count) {
+        const cbm_file_hash_t *row = &rows[(*cursor)++];
+        if (closure_is_swift_manifest(row->rel_path)) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+static bool closure_manifest_rows_valid(const cbm_file_hash_t *rows, int count) {
+    if (count < 0 || (count > 0 && !rows)) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!rows[i].rel_path || !rows[i].sha256) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool closure_metadata_current(bool metadata_current, const cbm_file_hash_t *stored,
+                                     int stored_count, const cbm_file_hash_t *fresh,
+                                     int fresh_count) {
+    if (!metadata_current || !closure_manifest_rows_valid(stored, stored_count) ||
+        !closure_manifest_rows_valid(fresh, fresh_count)) {
+        return false;
+    }
+    CBMHashTable *by_path = cbm_ht_create(CBM_SZ_64);
+    if (!by_path) {
+        return false;
+    }
+    int new_cursor = 0;
+    int new_count = 0;
+    const cbm_file_hash_t *row = closure_next_swift_manifest(fresh, fresh_count, &new_cursor);
+    while (row) {
+        cbm_ht_set(by_path, row->rel_path, (void *)row->sha256);
+        new_count++;
+        row = closure_next_swift_manifest(fresh, fresh_count, &new_cursor);
+    }
+    bool current = cbm_ht_count(by_path) == (uint32_t)new_count;
+    int old_cursor = 0;
+    int old_count = 0;
+    row = closure_next_swift_manifest(stored, stored_count, &old_cursor);
+    while (current && row) {
+        const char *sha = cbm_ht_get(by_path, row->rel_path);
+        current = sha && strcmp(sha, row->sha256) == 0;
+        old_count++;
+        row = closure_next_swift_manifest(stored, stored_count, &old_cursor);
+    }
+    cbm_ht_free(by_path);
+    return current && old_count == new_count;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -3858,6 +3974,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                     .hash_records_complete = true,
                     .unresolved_calls_complete = incremental_capture_complete(
                         coverage_rows_available, unresolved_complete, retained_unresolved_complete),
+                    .indexed_checkout_sha = cbm_pipeline_indexed_checkout_sha(p),
                 },
             .surface_rows = NULL,
             .surface_row_count = 0,
@@ -4082,6 +4199,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * files plus the recorded consumers of any changed SURFACE; every
          * uncertain case declines inside the planner, making the pre-plan
          * behaviour (full rebuild) the unconditional fallback. */
+        /* Package.swift is also discovered source, but its target paths are
+         * global resolution inputs, not a file-local declaration surface.
+         * Compare their SwiftPM subsets before allowing any source-only
+         * closure repair, independently of database row order. */
+        metadata_current = closure_metadata_current(metadata_current, stored, stored_count,
+                                                    baseline_manifest, baseline_count);
         if (metadata_current &&
             closure_try_plan(p, store, project, files, file_count, stored, stored_count,
                              baseline_manifest, baseline_count, &closure_plan)) {
@@ -4543,6 +4666,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .hash_records_complete = true,
         .unresolved_calls_complete = incremental_capture_complete(
             coverage_rows_available, unresolved_complete, retained_unresolved_complete),
+        .indexed_checkout_sha = cbm_pipeline_indexed_checkout_sha(p),
     };
     /* Publish surfaces: the surviving previous rows plus this run's fresh
      * ones (closure route). The legacy test route publishes none — its

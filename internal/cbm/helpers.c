@@ -301,6 +301,16 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_PUPPET:
         keywords = puppet_keywords;
         break;
+    case CBM_LANG_SWIFT:
+        /* `init` and `deinit` are Swift keywords. A reference to one
+         * (`.init(...)`, `Foo.init`) names an initializer of a type the bare
+         * name does not carry, so resolving it by name can only guess among
+         * every type's initializer (#2379). Otherwise the generic set. */
+        if (strcmp(name, "init") == 0 || strcmp(name, "deinit") == 0) {
+            return true;
+        }
+        keywords = generic_keywords;
+        break;
     default:
         keywords = generic_keywords;
         break;
@@ -864,7 +874,8 @@ static const char *func_kinds_ocaml[] = {"value_definition", "let_binding", NULL
 static const char *func_kinds_zig[] = {"function_declaration", "test_declaration", NULL};
 static const char *func_kinds_bash[] = {"function_definition", NULL};
 static const char *func_kinds_erlang[] = {"function_clause", NULL};
-static const char *func_kinds_csharp[] = {"method_declaration", "constructor_declaration", NULL};
+static const char *func_kinds_csharp[] = {"method_declaration", "constructor_declaration",
+                                          "operator_declaration", NULL};
 static const char *func_kinds_matlab[] = {"function_definition", NULL};
 static const char *func_kinds_lean[] = {"def", "theorem", "instance", "abbrev", NULL};
 static const char *func_kinds_form[] = {"procedure_definition", NULL};
@@ -1187,6 +1198,16 @@ bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
 // const", and a member lookup for "operator bool" (the implicit call in
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
+    if (lang == CBM_LANG_SWIFT) {
+        const char *kind = ts_node_type(name_node);
+        if (strcmp(kind, "init_declaration") == 0) {
+            return cbm_arena_strdup(a, "init");
+        }
+        if (strcmp(kind, "deinit_declaration") == 0) {
+            return cbm_arena_strdup(a, "deinit");
+        }
+    }
+
     char *text = cbm_node_text(a, name_node, source);
     /* A C keyword is never a function name: the definition is an error-recovery
      * artifact. No name means no def and no call scope (calls inside fall back
@@ -1202,6 +1223,13 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
             }
             *paren = '\0';
         }
+    }
+    /* C# `operator +` is named by its token alone, an anonymous node; any other C# name
+     * is a named node. Spelled like C++'s `operator+` and `operator bool`, here so the
+     * def name and the call-scope QN cannot disagree. */
+    if (text && lang == CBM_LANG_CSHARP && !ts_node_is_named(name_node)) {
+        bool word = text[0] >= 'a' && text[0] <= 'z'; /* operator true, operator false */
+        return cbm_arena_sprintf(a, "operator%s%s", word ? " " : "", text);
     }
     /* Nix quoted attrpath segment: `"kebab-case" = a: a;` and `services."my.svc" = …`
      * are ordinary names that merely need quoting in source. The node text carries
@@ -1492,6 +1520,11 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     TSNode name_node = ts_node_child_by_field_name(func_node, TS_FIELD("name"));
     if (!ts_node_is_null(name_node)) {
         return cbm_node_text(a, name_node, source);
+    }
+    // C#: an overloaded operator has no name field, its token names it.
+    if (lang == CBM_LANG_CSHARP && strcmp(ts_node_type(func_node), "operator_declaration") == 0) {
+        TSNode op = ts_node_child_by_field_name(func_node, TS_FIELD("operator"));
+        return ts_node_is_null(op) ? NULL : cbm_func_name_node_text(a, op, source, lang);
     }
     // Arrow functions: check parent variable_declarator
     if (strcmp(ts_node_type(func_node), "arrow_function") == 0) {

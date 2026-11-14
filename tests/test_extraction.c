@@ -80,6 +80,28 @@ static int has_def_qn(CBMFileResult *r, const char *qn) {
     return 0;
 }
 
+/* Find a definition by its qualified name relative to the file's module QN
+ * (e.g. "Box.init" resolves to "<module_qn>.Box.init"). */
+static const CBMDefinition *find_def_in_module(CBMFileResult *r, const char *rel_qn) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", r->module_qn, rel_qn);
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+/* Find an in-body call by its raw callee text; returns the call or NULL. */
+static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            return &r->calls.items[i];
+        }
+    }
+    return NULL;
+}
+
 static int count_defs_with_label(CBMFileResult *r, const char *label) {
     int count = 0;
     for (int i = 0; i < r->defs.count; i++) {
@@ -894,6 +916,192 @@ TEST(php_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "greet"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2000: inline HTML between `?>` and `<?php` is valid PHP, but the php_only
+ * grammar has no rule for it, so everything after the first `?>` fell into an
+ * ERROR region and never reached the graph. */
+static const CBMCall *find_call_named(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0)
+            return &r->calls.items[i];
+    }
+    return NULL;
+}
+
+static int php_def_line(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0)
+            return (int)r->defs.items[i].start_line;
+    }
+    return -1;
+}
+
+TEST(php_inline_html_tail_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<?php\n"
+                               "function gamma() { return 2; }\n"
+                               "?>\n"
+                               "<div class=\"box\">\n"
+                               "  <p>plain markup after the closing tag</p>\n"
+                               "</div>\n"
+                               "<?php\n"
+                               "function delta() { return gamma(); }\n",
+                               CBM_LANG_PHP, "t", "inline_html.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "gamma"));
+    ASSERT(has_def(r, "Function", "delta"));
+    /* Lines are in original-file coordinates. */
+    ASSERT_EQ(php_def_line(r, "gamma"), 2);
+    ASSERT_EQ(php_def_line(r, "delta"), 8);
+    const CBMCall *c = find_call_named(r, "gamma");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(strstr(c->enclosing_func_qn, "delta"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* View-file shapes: echo tags keep their calls, and control structures that
+ * are opened in one PHP block and closed in a later one still parse. */
+TEST(php_inline_html_template_shapes_issue2000) {
+    CBMFileResult *r = extract("<!DOCTYPE html>\n"
+                               "<html><head><title><?= page_title($page) ?></title></head>\n"
+                               "<body>\n"
+                               "<?php if ($user): ?>\n"
+                               "  <p>Hello <?=$user->name?></p>\n"
+                               "<?php else: ?>\n"
+                               "  <a href=\"/login\">log in</a>\n"
+                               "<?php endif; ?>\n"
+                               "<?php foreach ($items as $item) { ?>\n"
+                               "  <li><?php echo render_item($item); ?></li>\n"
+                               "<?php } ?>\n"
+                               "<?php function footer_links() { return nav_links(); } ?>\n"
+                               "</body></html>\n",
+                               CBM_LANG_PHP, "t", "view.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "page_title"));
+    ASSERT(has_call(r, "render_item"));
+    ASSERT(has_def(r, "Function", "footer_links"));
+    ASSERT_EQ(php_def_line(r, "footer_links"), 12);
+    ASSERT(has_call(r, "nav_links"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `?>` only leaves PHP mode from code or a one-line comment. Inside strings,
+ * heredoc, nowdoc and block comments it is text; `#[` is an attribute, not a
+ * comment; `<?xml` in markup is not an open tag. */
+TEST(php_inline_html_close_tag_in_literals_issue2000) {
+    CBMFileResult *r = extract("<?php\n"
+                               "$a = 'single ?> quoted';\n"
+                               "$b = \"double ?> quoted \\\" still\";\n"
+                               "$c = <<<EOT\n"
+                               "  heredoc ?> body\n"
+                               "  EOT;\n"
+                               "$d = <<<'NOW'\n"
+                               "nowdoc ?> body\n"
+                               "NOW;\n"
+                               "/* block ?> comment */\n"
+                               "#[Pure]\n"
+                               "function one() { return 1; }\n"
+                               "// line comment ends here ?>\n"
+                               "<?xml version=\"1.0\"?><note/>\n"
+                               "<?php\n"
+                               "function two() { return one(); }\n",
+                               CBM_LANG_PHP, "t", "literals.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "one"));
+    ASSERT(has_def(r, "Function", "two"));
+    ASSERT_EQ(php_def_line(r, "two"), 16);
+    ASSERT(has_call(r, "one"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Markup is blanked, never parsed: code-shaped text outside the PHP tags must
+ * not produce definitions or calls, wherever it sits. */
+TEST(php_inline_html_markup_never_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<p>function before() { return leakBefore(); }</p>\n"
+                               "<?php\n"
+                               "function real() { return 1; }\n"
+                               "?>\n"
+                               "<p>function fake() { return leak(); }</p>\n"
+                               "<script>function jsFake() { leakScript(); }</script>\n"
+                               "<?xml version=\"1.0\"?><x>function xmlFake() { leakXml(); }</x>\n"
+                               "<?php\n"
+                               "function after() { return real(); }\n"
+                               "?>\n"
+                               "<p>class Tail { function tailFake() { leakTail(); } }</p>\n",
+                               CBM_LANG_PHP, "t", "markup.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "real"));
+    ASSERT(has_def(r, "Function", "after"));
+    ASSERT(has_call(r, "real"));
+    ASSERT_FALSE(has_def_any(r, "before"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    ASSERT_FALSE(has_def_any(r, "jsFake"));
+    ASSERT_FALSE(has_def_any(r, "xmlFake"));
+    ASSERT_FALSE(has_def_any(r, "Tail"));
+    ASSERT_FALSE(has_def_any(r, "tailFake"));
+    ASSERT_FALSE(has_call(r, "leak"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The mask hands back the caller's buffer, uncopied, when nothing needs
+ * rewriting, and a same-length rewrite otherwise. The pointer alone cannot
+ * tell copy-on-write from an eager copy, so the arena's allocation total is
+ * sampled around each call: no bytes for `plain` and `quoted`, a copy for
+ * `mixed`. */
+TEST(php_inline_html_mask_copies_only_on_write_issue2000) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *plain = "<?php\nfunction a() { return 1; }\n";
+    const char *quoted = "<?php\n$s = '?>';\n/* ?> */\n$h = <<<EOT\n?>\nEOT;\n";
+    const char *mixed = "<?php\nfunction a() {}\n?>\n<b>x</b>\n";
+
+    size_t before = cbm_arena_total(&arena);
+    ASSERT(cbm_php_mask_inline_html(&arena, plain, (int)strlen(plain)) == plain);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
+    ASSERT(cbm_php_mask_inline_html(&arena, quoted, (int)strlen(quoted)) == quoted);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
+    const char *masked = cbm_php_mask_inline_html(&arena, mixed, (int)strlen(mixed));
+    ASSERT(cbm_arena_total(&arena) > before);
+    ASSERT(masked != mixed);
+    ASSERT_EQ((int)strlen(masked), (int)strlen(mixed));
+    ASSERT_STR_EQ(masked, "<?php\nfunction a() {}\n; \n        \n");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* A trailing `?>` (common at the end of older class files) is not a partial
+ * parse, and CRLF line endings keep their line numbers. */
+TEST(php_inline_html_trailing_close_tag_crlf_issue2000) {
+    CBMFileResult *r = extract("<?php\r\n"
+                               "class Repo {\r\n"
+                               "    public function find($id) { return $id; }\r\n"
+                               "}\r\n"
+                               "?>\r\n",
+                               CBM_LANG_PHP, "t", "Repo.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Repo"));
+    ASSERT(has_def(r, "Method", "find"));
+    ASSERT_EQ(php_def_line(r, "find"), 3);
+    ASSERT_FALSE(r->parse_incomplete);
     cbm_free_result(r);
     PASS();
 }
@@ -3615,6 +3823,291 @@ TEST(swift_method_call) {
     PASS();
 }
 
+TEST(swift_type_imports_preserve_markers_and_complete_file_imports) {
+    CBMFileResult *r = extract("struct Service {}\n"
+                               "extension Service { func run() {} }\n"
+                               "import NIOCore\n"
+                               "@testable import NIOFS\n"
+                               "@_exported import struct Alpha.Service\n",
+                               CBM_LANG_SWIFT, "t", "Types.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, 3);
+    ASSERT_STR_EQ(r->imports.items[1].module_path, "NIOFS");
+    ASSERT_STR_EQ(r->imports.items[1].local_name, "NIOFS");
+    ASSERT_STR_EQ(r->imports.items[2].module_path, "Alpha.Service");
+    int types = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        bool marker = false;
+        const char *imports = NULL;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[1]; kv += 2) {
+            marker |=
+                strcmp(kv[0], "swift_type_path") == 0 || strcmp(kv[0], "swift_extension") == 0;
+            if (strcmp(kv[0], "swift_imports") == 0) {
+                imports = kv[1];
+            }
+        }
+        if (marker) {
+            types++;
+            ASSERT_NOT_NULL(imports);
+            ASSERT_STR_EQ(imports, "NIOCore|NIOFS|Alpha.Service");
+        } else {
+            ASSERT_NULL(imports);
+        }
+    }
+    ASSERT_EQ(types, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_conditional_type_members_keep_owners_and_source_lines) {
+    const char *source = "open class Session {\n"
+                         "#if canImport(Darwin) /* conditional\n"
+                         " * comment */\n"
+                         "open func request(_ value: Int) { called() }\n"
+                         "#if FEATURE\n"
+                         "open func nested() {}\n"
+                         "#else\n"
+                         "open func alternate() {}\n"
+                         "#endif\n"
+                         "#elseif canImport(FoundationNetworking)\n"
+                         "open func portable() {}\n"
+                         "#else\n"
+                         "open func fallback() {}\n"
+                         "#endif\n"
+                         "open func upload(_ value: Int) {}\n"
+                         "}\n"
+                         "let literal = #\"\"\"\n"
+                         "#if RAW\n"
+                         "func phantom() {}\n"
+                         "#endif\n"
+                         "\"\"\"#\n"
+                         "/* outer\n"
+                         "#if COMMENT\n"
+                         "/* nested */\n"
+                         "func fake() {}\n"
+                         "#endif\n"
+                         "*/\n"
+                         "func outside() {}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Session.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    const char *members[] = {"Session.request(_:Int)", "Session.nested()",
+                             "Session.alternate()",    "Session.portable()",
+                             "Session.fallback()",     "Session.upload(_:Int)"};
+    for (size_t i = 0; i < sizeof(members) / sizeof(members[0]); i++) {
+        const CBMDefinition *def = find_def_in_module(r, members[i]);
+        ASSERT_NOT_NULL(def);
+        ASSERT_STR_EQ(def->label, "Method");
+        ASSERT_STR_EQ(def->parent_class, "t.Session.Session");
+    }
+    ASSERT_EQ(find_def_in_module(r, "Session.request(_:Int)")->start_line, 4);
+    ASSERT_EQ(find_def_in_module(r, "Session.upload(_:Int)")->start_line, 15);
+    const CBMDefinition *outside = find_def_in_module(r, "outside()");
+    ASSERT_NOT_NULL(outside);
+    ASSERT_EQ(outside->start_line, 28);
+    ASSERT_FALSE(has_def_any(r, "phantom"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    const CBMCall *call = find_call_by_callee(r, "called");
+    ASSERT_NOT_NULL(call);
+    ASSERT_STR_EQ(call->enclosing_func_qn, "t.Session.Session.request(_:Int)");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2061: masking the directives leaves the `#error` line of the dropped
+ * branch in the class body. That re-parse reads less of the file than the
+ * first one (the type and its initializer disappear), so the first parse is
+ * kept. */
+TEST(swift_conditional_retry_keeps_the_better_parse_issue2061) {
+    const char *source = "protocol Locking {\n"
+                         "    func lock()\n"
+                         "    func unlock()\n"
+                         "}\n"
+                         "\n"
+                         "#if canImport(Darwin)\n"
+                         "final class SpinLock: Locking {\n"
+                         "    init() {}\n"
+                         "    func lock() {}\n"
+                         "    func unlock() {}\n"
+                         "}\n"
+                         "#elseif canImport(Foundation)\n"
+                         "extension NSLock: Locking {}\n"
+                         "#else\n"
+                         "#error(\"No lock is available on this platform.\")\n"
+                         "#endif\n"
+                         "\n"
+                         "final class Guarded<Value> {\n"
+                         "    #if canImport(Darwin)\n"
+                         "    private let lock = SpinLock()\n"
+                         "    #elseif canImport(Foundation)\n"
+                         "    private let lock = NSLock()\n"
+                         "    #else\n"
+                         "    #error(\"No lock is available on this platform.\")\n"
+                         "    #endif\n"
+                         "\n"
+                         "    private nonisolated(unsafe) var value: Value\n"
+                         "\n"
+                         "    init(_ value: Value) {\n"
+                         "        self.value = value\n"
+                         "    }\n"
+                         "\n"
+                         "    func read<U>(_ closure: (Value) throws -> U) rethrows -> U { "
+                         "try closure(value) }\n"
+                         "}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Guarded.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_def_in_module(r, "Guarded"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "init(_:Value)"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "SpinLock.init()"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_uncapped_selectors_keep_nested_return_types) {
+    CBMFileResult *r = extract("func generic(_ value: Int) -> Box<Result> { fatalError() }\n"
+                               "func callback() -> (Int) -> Result { fatalError() }\n",
+                               CBM_LANG_SWIFT, "t", "Returns.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *generic = find_def_in_module(r, "generic(_:Int)=>Box<Result>");
+    const CBMDefinition *callback = find_def_in_module(r, "callback()=>(Int)=>Result");
+    ASSERT_NOT_NULL(generic);
+    ASSERT_NOT_NULL(callback);
+    ASSERT_STR_EQ(generic->call_selector, "(_:Int)=>Box<Result>");
+    ASSERT_STR_EQ(callback->call_selector, "()=>(Int)=>Result");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_wrapped_trailing_closure_keeps_one_complete_call) {
+    const char *source =
+        "func invoke() async throws {\n"
+        "let request = session.request(.default).responseDecodable(of: Value.self) { value in\n"
+        "    consume(value)\n"
+        "}\n"
+        "let storedSession = stored(Session())\n"
+        "let awaitedSession = try await stored(Session())\n"
+        "factory()(flag: true)\n"
+        "}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Calls.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int responses = 0;
+    int factories = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (strcmp(call->callee_name, "session.request(.default).responseDecodable") == 0) {
+            responses++;
+            ASSERT_EQ(call->arg_count, 1);
+            ASSERT_STR_EQ(call->args[0].keyword, "of");
+            ASSERT_EQ(call->trailing_closure_count, 1);
+            ASSERT_TRUE(call->has_trailing_closure);
+            ASSERT_FALSE(call->trailing_closure_truncated);
+            ASSERT_EQ(source[call->site_end_byte - 1], '}');
+        } else if (strcmp(call->callee_name, "factory") == 0) {
+            factories++;
+            ASSERT_EQ(call->arg_count, 0);
+            ASSERT_FALSE(call->has_trailing_closure);
+        }
+    }
+    ASSERT_EQ(responses, 1);
+    ASSERT_EQ(factories, 1);
+    ASSERT_NOT_NULL(find_call_by_callee(r, "session.request"));
+    ASSERT_NOT_NULL(find_call_by_callee(r, "consume"));
+    const char *names[] = {"storedSession", "awaitedSession"};
+    const char *values[] = {"stored(Session())", "try await stored(Session())"};
+    for (int compact = 0; compact < 2; compact++) {
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const CBMTypeAssign *assignment = NULL;
+            for (int j = 0; j < r->type_assigns.count; j++) {
+                if (strcmp(r->type_assigns.items[j].var_name, names[i]) == 0) {
+                    assignment = &r->type_assigns.items[j];
+                }
+            }
+            ASSERT_NOT_NULL(assignment);
+            ASSERT_NULL(assignment->type_name);
+            size_t start = (size_t)(strstr(source, values[i]) - source);
+            ASSERT_EQ(assignment->value_start_byte, start);
+            ASSERT_EQ(assignment->value_end_byte, start + strlen(values[i]));
+        }
+        if (!compact) {
+            cbm_result_compact(r);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_selector_expands_only_lexical_function_aliases) {
+    CBMFileResult *r =
+        extract("typealias Plain = () -> Void\nstruct Payload {}\n"
+                "class Stream {\n"
+                "typealias Handler<T> = @Sendable (T) throws -> Void\n"
+                "func response(on queue: Int = 0, stream: Handler<Payload>) -> Self { self }\n}\n"
+                "class Wrong {\ntypealias Handler<T> = [T]\n"
+                "func response(stream: Handler<Payload>) {}\n}\n"
+                "class Top { func use(done: Plain) {} }\n",
+                CBM_LANG_SWIFT, "t", "Aliases.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *stream =
+        find_def_in_module(r, "Stream.response(on:Int,stream:Handler<Payload>)=>Self");
+    const CBMDefinition *wrong = find_def_in_module(r, "Wrong.response(stream:Handler<Payload>)");
+    const CBMDefinition *top = find_def_in_module(r, "Top.use(done:Plain)");
+    ASSERT_NOT_NULL(stream);
+    ASSERT_NOT_NULL(wrong);
+    ASSERT_NOT_NULL(top);
+    ASSERT_NOT_NULL(strstr(stream->call_selector, "stream:(T)throws=>Void"));
+    ASSERT_STR_EQ(wrong->call_selector, "(stream:Handler<Payload>)");
+    ASSERT_STR_EQ(top->call_selector, "(done:()=>Void)");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_multiple_trailing_closure_extraction) {
+    CBMFileResult *r =
+        extract("func outer() { service.handle { nested() } onError: { recover() } }\n"
+                "func one() { service.run { nested() } }\n"
+                "func incomplete() { service.handle { } onError: { recover( } }\n",
+                CBM_LANG_SWIFT, "t", "Calls.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    CBMCall *multi = NULL;
+    CBMCall *single = NULL;
+    CBMCall *incomplete = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "service.handle") == 0) {
+            if (call->start_line == 1) {
+                multi = call;
+            } else {
+                incomplete = call;
+            }
+        } else if (call->callee_name && strcmp(call->callee_name, "service.run") == 0) {
+            single = call;
+        }
+    }
+    ASSERT_NOT_NULL(multi);
+    ASSERT_NOT_NULL(single);
+    ASSERT_NOT_NULL(incomplete);
+    ASSERT_EQ(multi->trailing_closure_count, 2);
+    ASSERT_TRUE(multi->has_trailing_closure);
+    ASSERT_FALSE(multi->trailing_closure_truncated);
+    ASSERT_NOT_NULL(multi->trailing_closure_labels);
+    ASSERT_NULL(multi->trailing_closure_labels[0]);
+    ASSERT_STR_EQ(multi->trailing_closure_labels[1], "onError");
+    ASSERT_EQ(single->trailing_closure_count, 1);
+    ASSERT_FALSE(single->trailing_closure_truncated);
+    ASSERT_EQ(incomplete->trailing_closure_count, 2);
+    ASSERT_TRUE(incomplete->trailing_closure_truncated);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(swift_constructor_call) {
     CBMFileResult *r =
         extract("func create() { let x = MyClass() }\n", CBM_LANG_SWIFT, "t", "create.swift");
@@ -3649,6 +4142,366 @@ TEST(swift_force_unwrap_scanner_shift) {
         extract("func load() { let u = cached! }\n", CBM_LANG_SWIFT, "t", "Load.swift");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a struct's plain `init` is a callable, not a name-less hole -- a call
+ * inside it must source from the initializer, not fall back to the file's
+ * Module scope. */
+TEST(swift_init_struct_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "struct Box {\n"
+                               "    let value: Int\n"
+                               "    init() {\n"
+                               "        value = helper()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Box.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Box.init()");
+    ASSERT_NOT_NULL(init_def);
+    ASSERT_STR_EQ(init_def->label, "Method");
+    ASSERT_STR_EQ(init_def->name, "init");
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a class's designated init takes parameters -- coverage that a
+ * parameterized init is extracted the same way as a bare one. */
+TEST(swift_init_class_designated_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "final class Holder {\n"
+                               "    let value: Int\n"
+                               "    init(seed: Int) {\n"
+                               "        value = helper() + seed\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Holder.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init(seed:Int)");
+    ASSERT_NOT_NULL(init_def);
+    ASSERT_STR_EQ(init_def->label, "Method");
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a convenience init delegates via `self.init(...)`. Its call to
+ * `other()` (an argument of the delegating call) must source from the
+ * initializer, not from the file. */
+TEST(swift_init_convenience_delegates_issue2379) {
+    CBMFileResult *r = extract("func other() -> Int { 2 }\n"
+                               "final class Holder {\n"
+                               "    let value: Int\n"
+                               "    init(seed: Int) {\n"
+                               "        value = seed\n"
+                               "    }\n"
+                               "    convenience init() {\n"
+                               "        self.init(seed: other())\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Holder.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init()");
+    ASSERT_NOT_NULL(init_def);
+
+    /* Keep #2395's self.init suppression; its argument call still belongs
+     * to this initializer. */
+    ASSERT_FALSE(has_call(r, "self.init"));
+    ASSERT_FALSE(has_call(r, "Holder.init"));
+
+    const CBMCall *call = find_call_by_callee(r, "other");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Each initializer keeps its own identity and outgoing calls. */
+TEST(swift_init_overloads_keep_separate_nodes_issue2061) {
+    CBMFileResult *r = extract("func shared() -> Int { 3 }\n"
+                               "final class Holder {\n"
+                               "    let value: Int\n"
+                               "    init(seed: Int) {\n"
+                               "        value = shared()\n"
+                               "    }\n"
+                               "    convenience init() {\n"
+                               "        self.init(seed: shared())\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Holder.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *seeded = find_def_in_module(r, "Holder.init(seed:Int)");
+    const CBMDefinition *empty = find_def_in_module(r, "Holder.init()");
+    ASSERT_NOT_NULL(seeded);
+    ASSERT_NOT_NULL(empty);
+    ASSERT_STR_NEQ(seeded->qualified_name, empty->qualified_name);
+
+    int from_seeded = 0;
+    int from_empty = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || strcmp(c->callee_name, "shared") != 0 || !c->enclosing_func_qn) {
+            continue;
+        }
+        if (strcmp(c->enclosing_func_qn, seeded->qualified_name) == 0) {
+            from_seeded++;
+        } else {
+            ASSERT_STR_EQ(c->enclosing_func_qn, empty->qualified_name);
+            from_empty++;
+        }
+        ASSERT_STR_NEQ(c->enclosing_func_qn, r->module_qn);
+    }
+    ASSERT_EQ(from_seeded, 1);
+    ASSERT_EQ(from_empty, 1);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a failable `init?` in an enum is still a callable initializer. */
+TEST(swift_init_failable_enum_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "enum Mode {\n"
+                               "    case on\n"
+                               "    init?(flag: Bool) {\n"
+                               "        if helper() > 0 { self = .on } else { return nil }\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Mode.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Mode.init(flag:Bool)");
+    ASSERT_NOT_NULL(init_def);
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: `extension X { }` is modeled by the vendored grammar as a
+ * class_declaration named X, so an init declared in an extension goes through
+ * the same class-method path as one declared in the primary type. */
+TEST(swift_init_extension_issue2379) {
+    CBMFileResult *r = extract("func other() -> Int { 2 }\n"
+                               "extension Box {\n"
+                               "    init(raw: Int) {\n"
+                               "        value = other()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Box+Raw.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Box.init(raw:Int)");
+    ASSERT_NOT_NULL(init_def);
+
+    const CBMCall *call = find_call_by_callee(r, "other");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: regression guard -- an ordinary method in the same type keeps its own
+ * attribution unchanged (this already worked pre-fix; the initializer fix
+ * must not disturb it). */
+TEST(swift_method_still_attributed_issue2379) {
+    CBMFileResult *r = extract("func other() -> Int { 2 }\n"
+                               "struct Box {\n"
+                               "    init() {}\n"
+                               "    func read() -> Int {\n"
+                               "        other()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Box.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *read_def = find_def_in_module(r, "Box.read()=>Int");
+    ASSERT_NOT_NULL(read_def);
+
+    const CBMCall *call = find_call_by_callee(r, "other");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, read_def->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: a `deinit` has the same gap as `init` -- no source-level name, so a
+ * call inside its body attributed to the file's Module scope instead of the
+ * type. */
+TEST(swift_deinit_issue2379) {
+    CBMFileResult *r = extract("func helper() -> Int { 1 }\n"
+                               "final class Deinitable {\n"
+                               "    deinit {\n"
+                               "        _ = helper()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Deinitable.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *deinit_def = find_def_in_module(r, "Deinitable.deinit()");
+    ASSERT_NOT_NULL(deinit_def);
+    ASSERT_STR_EQ(deinit_def->name, "deinit");
+
+    const CBMCall *call = find_call_by_callee(r, "helper");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, deinit_def->qualified_name);
+    ASSERT_STR_NEQ(call->enclosing_func_qn, r->module_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: `super.init(...)` names no type. Left as written, the registry binds it
+ * by short name to whichever project `init` is nearest (on Alamofire: a nested
+ * `Options.init`, a sibling decoder's). It is emitted as the superclass's
+ * initializer instead -- the first inheritance entry, generic arguments
+ * dropped -- and stays attributed to the calling initializer. */
+TEST(swift_super_init_names_superclass_issue2379) {
+    CBMFileResult *r = extract("final class Sub: Base<Int>, Sendable {\n"
+                               "    override init() {\n"
+                               "        super.init()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Sub.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *init_def = find_def_in_module(r, "Sub.init()");
+    ASSERT_NOT_NULL(init_def);
+    ASSERT_FALSE(has_call(r, "super.init"));
+    const CBMCall *call = find_call_by_callee(r, "Base.init");
+    ASSERT_NOT_NULL(call);
+    ASSERT_NOT_NULL(call->enclosing_func_qn);
+    ASSERT_STR_EQ(call->enclosing_func_qn, init_def->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: without a superclass to name -- no inheritance clause, or a first entry
+ * that does not read as a type -- `super.init` forms no call at all. A
+ * lower-case root would pass the registry's receiver-chain check and bind by
+ * short name again. */
+TEST(swift_super_init_without_superclass_no_call_issue2379) {
+    CBMFileResult *r = extract("class Root {\n"
+                               "    init() {\n"
+                               "        super.init()\n"
+                               "    }\n"
+                               "}\n"
+                               "class Odd: base {\n"
+                               "    init() {\n"
+                               "        super.init()\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Root.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def_in_module(r, "Root.init()"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "Odd.init()"));
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *callee = r->calls.items[i].callee_name;
+        ASSERT(!callee || !strstr(callee, "init"));
+    }
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: an initializer call `T.init(...)` is flagged so the resolvers'
+ * weak-member guard keeps a short-name guess from placing it (nearly every
+ * type has an `init`); every other Swift call stays unflagged and resolves
+ * exactly as before. */
+TEST(swift_initializer_calls_flagged_issue2379) {
+    CBMFileResult *r = extract("func run(obj: Worker) {\n"
+                               "    _ = UIAlertAction.init(title: nil)\n"
+                               "    helper()\n"
+                               "    obj.start()\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Run.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *init_call = find_call_by_callee(r, "UIAlertAction.init");
+    const CBMCall *bare = find_call_by_callee(r, "helper");
+    const CBMCall *member = find_call_by_callee(r, "obj.start");
+    ASSERT_NOT_NULL(init_call);
+    ASSERT_NOT_NULL(bare);
+    ASSERT_NOT_NULL(member);
+    ASSERT_TRUE(init_call->is_method);
+    ASSERT_FALSE(bare->is_method);
+    ASSERT_FALSE(member->is_method);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2379: `init` is a Swift keyword. A reference to one (`.init(...)`,
+ * `Box.init`) names the initializer of a type the bare name does not carry,
+ * so it is not recorded as a usage -- by name it could only be guessed among
+ * every type's initializer (on Alamofire, 26 references landed on one nested
+ * `Output.init`). The type in `Box.init` is still a usage. */
+TEST(swift_init_reference_is_not_a_usage_issue2379) {
+    CBMFileResult *r = extract("struct Box {\n"
+                               "    init(raw: Int) {}\n"
+                               "}\n"
+                               "func make() -> Box {\n"
+                               "    .init(raw: 1)\n"
+                               "}\n"
+                               "func maker() -> (Int) -> Box {\n"
+                               "    Box.init\n"
+                               "}\n",
+                               CBM_LANG_SWIFT, "t", "Make.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int init_usages = 0;
+    int box_usages = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const char *ref = r->usages.items[i].ref_name;
+        init_usages += ref && strcmp(ref, "init") == 0;
+        box_usages += ref && strcmp(ref, "Box") == 0;
+    }
+    ASSERT_EQ(init_usages, 0);
+    ASSERT_GT(box_usages, 0);
+
     cbm_free_result(r);
     PASS();
 }
@@ -5199,15 +6052,47 @@ TEST(java_imports) {
     PASS();
 }
 
+static const CBMImport *rust_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0) {
+            return &r->imports.items[i];
+        }
+    }
+    return NULL;
+}
+
+static int assert_rust_import(const CBMFileResult *r, const char *local,
+                              const char *module_path) {
+    const CBMImport *imp = rust_find_import(r, local);
+    ASSERT_NOT_NULL(imp);
+    ASSERT_NOT_NULL(imp->module_path);
+    ASSERT_STR_EQ(imp->module_path, module_path);
+    return 0;
+}
+
 TEST(rust_imports) {
     CBMFileResult *r = extract(
-        "use std::collections::HashMap;\nuse std::io::{self, Write};\nuse serde::Serialize;\n"
+        "use std::collections::HashMap;\n"
+        "use std::io::{self, Write};\n"
+        "use serde::Serialize;\n"
+        "use crate::h::{Handler, Other as O};\n"
+        "use a::{b::{C, D}, E};\n"
+        "use crate::ops::*;\n"
         "fn main() {}\n",
         CBM_LANG_RUST, "t", "main.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT_GT(r->imports.count, 0);
-    ASSERT(has_import(r, "std::collections::HashMap"));
+    ASSERT_EQ(r->imports.count, 10);
+    ASSERT_EQ(assert_rust_import(r, "HashMap", "std::collections::HashMap"), 0);
+    ASSERT_EQ(assert_rust_import(r, "io", "std::io"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Write", "std::io::Write"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Serialize", "serde::Serialize"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Handler", "crate::h::Handler"), 0);
+    ASSERT_EQ(assert_rust_import(r, "O", "crate::h::Other"), 0);
+    ASSERT_EQ(assert_rust_import(r, "C", "a::b::C"), 0);
+    ASSERT_EQ(assert_rust_import(r, "D", "a::b::D"), 0);
+    ASSERT_EQ(assert_rust_import(r, "E", "a::E"), 0);
+    ASSERT_EQ(assert_rust_import(r, "*", "crate::ops::*"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -6770,6 +7655,177 @@ TEST(extract_ts_nestjs_controller_routes_issue1428) {
     PASS();
 }
 
+/* #759: the one definition named `name`; NULL for none or more than one. */
+static const CBMDefinition *nextjs_only_def(CBMFileResult *r, const char *name) {
+    const CBMDefinition *found = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            if (found) {
+                return NULL;
+            }
+            found = &r->defs.items[i];
+        }
+    }
+    return found;
+}
+
+/* #759: a Next.js App Router route file's exported HTTP verb handlers are the
+ * Functions extraction already makes for them, now carrying the route path of
+ * the file's directories -- `[id]` as `:id`, `[...slug]` as `*slug`, a
+ * `(group)` adding nothing -- and the verb as their method. A local
+ * declaration exported by name (`export { GET }`) is that same Function; no
+ * second definition appears. The 255-byte path is the longest that fits. */
+TEST(extract_nextjs_route_metadata_contract_issue759) {
+    char long_file[CBM_SZ_512];
+    char long_path[CBM_SZ_256];
+    char segment[CBM_SZ_256];
+    memset(segment, 'x', CBM_SZ_256 - PAIR_LEN);
+    segment[CBM_SZ_256 - PAIR_LEN] = '\0';
+    snprintf(long_file, sizeof(long_file), "app/%s/route.ts", segment);
+    snprintf(long_path, sizeof(long_path), "/%s", segment);
+    static const char verbs_src[] = "export async function GET() {}\n"
+                                    "export async function POST() {}\n"
+                                    "export function PUT() {}\n"
+                                    "export function PATCH() {}\n"
+                                    "export function DELETE() {}\n"
+                                    "export function HEAD() {}\n"
+                                    "export function OPTIONS() {}\n";
+    const struct {
+        const char *file;
+        const char *src;
+        const char *path;
+        const char *names[CBM_SZ_8];
+    } cases[] = {
+        {"src/app/api/users/[id]/route.ts",
+         "export function GET() { return 1; }\nexport const POST = async () => 2;\n",
+         "/api/users/:id",
+         {"GET", "POST"}},
+        {"app/api/verbs/route.ts",
+         verbs_src,
+         "/api/verbs",
+         {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}},
+        {"src/app/(public)/api/[org]/users/[id]/route.ts",
+         "export async function GET() { return 1; }\n",
+         "/api/:org/users/:id",
+         {"GET"}},
+        {"app/api/[...slug]/route.ts", "export function GET() {}\n", "/api/*slug", {"GET"}},
+        {"app/api/typed/route.ts",
+         "type Handler = () => Promise<number>;\nexport const GET: Handler = async () => 1;\n",
+         "/api/typed",
+         {"GET"}},
+        {"app/route.js", "export function GET() { return 1; }\n", "/", {"GET"}},
+        {"app/api/local/route.ts",
+         "function GET() { return 1; }\nconst POST = async () => 2;\nexport { GET, POST };\n",
+         "/api/local",
+         {"GET", "POST"}},
+        {long_file, "export function GET() {}\n", long_path, {"GET"}},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        CBMLanguage lang = strstr(cases[c].file, ".js") ? CBM_LANG_JAVASCRIPT : CBM_LANG_TYPESCRIPT;
+        CBMFileResult *r = extract(cases[c].src, lang, "t", cases[c].file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        int routed = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            routed += r->defs.items[i].route_path != NULL;
+        }
+        int want = 0;
+        for (; want < CBM_SZ_8 && cases[c].names[want]; want++) {
+            const CBMDefinition *d = nextjs_only_def(r, cases[c].names[want]);
+            ASSERT_NOT_NULL(d);
+            ASSERT_STR_EQ(d->label, "Function");
+            ASSERT_STR_EQ(d->file_path, cases[c].file);
+            ASSERT_NOT_NULL(d->route_path);
+            ASSERT_STR_EQ(d->route_path, cases[c].path);
+            ASSERT_STR_EQ(d->route_method, cases[c].names[want]);
+        }
+        ASSERT_EQ(routed, want);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* #759: nothing else routes. Not a route file, or a directory the route path
+ * cannot spell -- an optional catch-all, a private folder, a parallel slot,
+ * an intercepting route, a malformed bracket, a workspace package root, a path
+ * past 255 bytes. Not a runtime export of an HTTP verb Function of this file:
+ * an unexported, default, type-only or nested GET, a class method, a
+ * constant, a lower-case verb; and no handler is made up for a renamed,
+ * re-exported, wrapped or destructured export, or a `function` expression
+ * bound to a const: none of them has a Function of its own here. */
+TEST(extract_nextjs_rejects_nonroutes_issue759) {
+    char long_file[CBM_SZ_512];
+    char segment[CBM_SZ_256];
+    memset(segment, 'x', CBM_SZ_256 - SKIP_ONE);
+    segment[CBM_SZ_256 - SKIP_ONE] = '\0';
+    snprintf(long_file, sizeof(long_file), "app/%s/route.ts", segment);
+    const char *files[] = {
+        "pages/api/route.ts",
+        "app/api/page.ts",
+        "app/api/route.test.ts",
+        "app/api/view/route.tsx",
+        "app/api/view/route.jsx",
+        "app/api/module/route.mjs",
+        "app/_private/route.ts",
+        "src/app/api/_lib/route.ts",
+        "app/@modal/route.ts",
+        "app/(.)photo/route.ts",
+        "app/(..)(..)photo/route.ts",
+        "app/api/[[...opt]]/route.ts",
+        "app/api/[broken/route.ts",
+        "app/api/broken]/route.ts",
+        "app/api/[]/route.ts",
+        "app/api/[...]/route.ts",
+        "app/api/a[id]/route.ts",
+        "app/()/route.ts",
+        "apps/web/app/api/route.ts",
+        long_file,
+    };
+    const struct {
+        const char *file;
+        const char *src;
+    } sources[] = {
+        {"app/api/nonexports/route.ts", "function GET() {}\n"
+                                        "export default function POST() {}\n"
+                                        "function PUT() {}\n"
+                                        "export type { PUT };\n"
+                                        "function OPTIONS() {}\n"
+                                        "export { type OPTIONS };\n"
+                                        "export class Handlers { PATCH() {} }\n"
+                                        "export const DELETE = 42;\n"
+                                        "export function get() {}\n"
+                                        "export function helper() { function HEAD() {} }\n"},
+        {"app/api/bindings/route.ts", "const handler = async () => 1;\n"
+                                      "export { handler as GET };\n"
+                                      "export { POST } from './impl';\n"
+                                      "export const PUT = wrap(handler);\n"
+                                      "export const DELETE = function () {};\n"
+                                      "export const { PATCH } = handlers;\n"
+                                      "export const HEAD = handler as Handler;\n"
+                                      "export const OPTIONS = (async () => 1) satisfies Handler;\n"
+                                      "export * from './all';\n"},
+    };
+    const int file_count = (int)(sizeof(files) / sizeof(files[0]));
+    const int source_count = (int)(sizeof(sources) / sizeof(sources[0]));
+    for (int c = 0; c < file_count + source_count; c++) {
+        bool by_file = c < file_count;
+        const char *file = by_file ? files[c] : sources[c - file_count].file;
+        CBMFileResult *r =
+            extract(by_file ? "export function GET() {}\n" : sources[c - file_count].src,
+                    CBM_LANG_TYPESCRIPT, "t", file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        if (by_file) {
+            ASSERT_NOT_NULL(nextjs_only_def(r, "GET"));
+        }
+        for (int i = 0; i < r->defs.count; i++) {
+            ASSERT_NULL(r->defs.items[i].route_path);
+        }
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 /* Return the file's Module definition (extraction pushes it first), or NULL. */
 static const CBMDefinition *find_module_def(CBMFileResult *r) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -6906,16 +7962,6 @@ TEST(extract_ts_decorators_survive_interleaved_comment) {
     ASSERT(decorators_contain(m, "Post"));     /* above the comment — was dropped */
     cbm_free_result(r);
     PASS();
-}
-
-/* Find an in-body call by its raw callee text; returns the call or NULL. */
-static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
-    for (int i = 0; i < r->calls.count; i++) {
-        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
-            return &r->calls.items[i];
-        }
-    }
-    return NULL;
 }
 
 /* #1892: the Swift grammar declares no "arguments" field, so the generic field
@@ -9661,22 +10707,23 @@ TEST(extract_cpp_preprocessed_rescue_skips_raw_def_on_same_line) {
 TEST(extract_cpp_rescue_keeps_expanded_class_when_raw_qn_is_taken) {
     /* Minimized from holder.h (delta debugging against the rule with and
      * without this check). */
-    CBMFileResult *r = extract(
-        "class BaseWrapper : public BaseHolder<TYPE, BASE, DEFAULTVALUE, IS_NULL>\n"
-        "{\n"
-        "    class AddressInitHolder\n"
-        "    {\n"
-        "        FORCEINLINE AddressInitHolder(BaseWrapper<TYPE,BASE,DEFAULTVALUE,IS_NULL> &holder)\n"
-        "        {\n"
-        "            unknown = static_cast<IUnknown*>(m_holder.m_value);\n"
-        "        }\n"
-        "#if defined(FEATURE_COMINTEROP) && !defined(STRIKE)\n"
-        "        FORCEINLINE operator IInspectable **()\n"
-        "#endif // FEATURE_COMINTEROP\n"
-        "    {\n"
-        "    }\n"
-        "    }\n",
-        CBM_LANG_CPP, "t", "holder.h");
+    CBMFileResult *r =
+        extract("class BaseWrapper : public BaseHolder<TYPE, BASE, DEFAULTVALUE, IS_NULL>\n"
+                "{\n"
+                "    class AddressInitHolder\n"
+                "    {\n"
+                "        FORCEINLINE AddressInitHolder(BaseWrapper<TYPE,BASE,DEFAULTVALUE,IS_NULL> "
+                "&holder)\n"
+                "        {\n"
+                "            unknown = static_cast<IUnknown*>(m_holder.m_value);\n"
+                "        }\n"
+                "#if defined(FEATURE_COMINTEROP) && !defined(STRIKE)\n"
+                "        FORCEINLINE operator IInspectable **()\n"
+                "#endif // FEATURE_COMINTEROP\n"
+                "    {\n"
+                "    }\n"
+                "    }\n",
+                CBM_LANG_CPP, "t", "holder.h");
     ASSERT_NOT_NULL(r);
     bool scoped_class = false;
     for (int i = 0; i < r->defs.count; i++) {
@@ -13553,6 +14600,97 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
+TEST(swift_trailing_closure_boundaries_survive_compact_and_spill) {
+    const char *src = "func eight() { service.eight { } first: { } second: { } third: { } "
+                      "fourth: { } fifth: { } sixth: { } seventh: { } }\n"
+                      "func nine() { service.nine { } first: { } second: { } third: { } "
+                      "fourth: { } fifth: { } sixth: { } seventh: { } eighth: { } }\n";
+    const char *callees[] = {"service.eight", "service.nine"};
+    const char *labels[] = {NULL,     "first", "second", "third",
+                            "fourth", "fifth", "sixth",  "seventh"};
+    CBMFileResult *r = extract(src, CBM_LANG_SWIFT, "t", "TrailingBounds.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->cached_tree);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(r->cached_tree)));
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    cbm_result_spill_t *sp = cbm_result_spill_open(dir, 1, 1);
+    ASSERT_NOT_NULL(sp);
+    CBMFileResult *loaded[2] = {NULL, NULL};
+    const CBMCall *loaded_calls[2][2] = {{NULL, NULL}, {NULL, NULL}};
+
+    /* Check real extraction, compaction, and both independently loaded copies. */
+    for (int stage = 0; stage < 4; stage++) {
+        CBMFileResult *current = r;
+        if (stage == 1) {
+            cbm_result_compact(r);
+        } else if (stage >= 2) {
+            loaded[stage - 2] = cbm_result_spill_load(sp, 0);
+            current = loaded[stage - 2];
+        }
+        ASSERT_NOT_NULL(current);
+        ASSERT_FALSE(current->has_error);
+        if (stage > 0) {
+            ASSERT_EQ(current->arena.nblocks, 1);
+        }
+        for (int c = 0; c < 2; c++) {
+            ASSERT_EQ(count_calls_named(current, callees[c]), 1);
+            const CBMCall *call = find_call_by_callee(current, callees[c]);
+            ASSERT_NOT_NULL(call);
+            ASSERT_EQ(call->trailing_closure_count, 8);
+            ASSERT_TRUE(call->has_trailing_closure);
+            ASSERT_EQ(call->trailing_closure_truncated, c == 1);
+            ASSERT_NOT_NULL(call->trailing_closure_labels);
+            if (stage > 0) {
+                uintptr_t lo = (uintptr_t)current->arena.blocks[0];
+                uintptr_t array = (uintptr_t)call->trailing_closure_labels;
+                size_t bytes = 8 * sizeof(*call->trailing_closure_labels);
+                ASSERT(current->arena.used >= bytes);
+                ASSERT(array >= lo && array - lo <= current->arena.used - bytes);
+            }
+            ASSERT_NULL(call->trailing_closure_labels[0]);
+            for (int i = 1; i < 8; i++) {
+                ASSERT_NOT_NULL(call->trailing_closure_labels[i]);
+                size_t label_bytes = strlen(labels[i]) + 1;
+                if (stage > 0) {
+                    uintptr_t lo = (uintptr_t)current->arena.blocks[0];
+                    uintptr_t label = (uintptr_t)call->trailing_closure_labels[i];
+                    ASSERT(label >= lo && label - lo < current->arena.used);
+                    ASSERT(label_bytes <= current->arena.used - (label - lo));
+                }
+                ASSERT_MEM_EQ(call->trailing_closure_labels[i], labels[i], label_bytes);
+            }
+            if (stage >= 2) {
+                loaded_calls[stage - 2][c] = call;
+            }
+        }
+        if (stage == 1) {
+            ASSERT_TRUE(cbm_result_spill_park(sp, 0, 0, r));
+            r = NULL; /* Park owns and frees the compacted result. */
+        }
+    }
+
+    ASSERT(loaded[0] != loaded[1]);
+    ASSERT(loaded[0]->arena.blocks[0] != loaded[1]->arena.blocks[0]);
+    for (int c = 0; c < 2; c++) {
+        ASSERT(loaded_calls[0][c]->trailing_closure_labels !=
+               loaded_calls[1][c]->trailing_closure_labels);
+        for (int i = 1; i < 8; i++) {
+            ASSERT(loaded_calls[0][c]->trailing_closure_labels[i] !=
+                   loaded_calls[1][c]->trailing_closure_labels[i]);
+        }
+    }
+
+    cbm_free_result(loaded[1]);
+    cbm_free_result(loaded[0]);
+    cbm_result_spill_close(sp);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 /* The low-disk guard, pinned through the free-space seam rather than the host
  * disk: one byte under the floor refuses (spilling onto a nearly full disk is
  * a worse failure than the memory pressure it relieves), the floor itself
@@ -14863,6 +16001,12 @@ SUITE(extraction) {
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
     RUN_TEST(php_function);
+    RUN_TEST(php_inline_html_tail_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_template_shapes_issue2000);
+    RUN_TEST(php_inline_html_close_tag_in_literals_issue2000);
+    RUN_TEST(php_inline_html_markup_never_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_mask_copies_only_on_write_issue2000);
+    RUN_TEST(php_inline_html_trailing_close_tag_crlf_issue2000);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
     RUN_TEST(ruby_constructor_callee_is_constant_path);
@@ -14986,9 +16130,29 @@ SUITE(extraction) {
     RUN_TEST(swift_struct);
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
+    RUN_TEST(swift_type_imports_preserve_markers_and_complete_file_imports);
+    RUN_TEST(swift_conditional_type_members_keep_owners_and_source_lines);
+    RUN_TEST(swift_conditional_retry_keeps_the_better_parse_issue2061);
+    RUN_TEST(swift_uncapped_selectors_keep_nested_return_types);
+    RUN_TEST(swift_wrapped_trailing_closure_keeps_one_complete_call);
+    RUN_TEST(swift_selector_expands_only_lexical_function_aliases);
+    RUN_TEST(swift_multiple_trailing_closure_extraction);
+    RUN_TEST(swift_trailing_closure_boundaries_survive_compact_and_spill);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);
+    RUN_TEST(swift_init_struct_issue2379);
+    RUN_TEST(swift_init_class_designated_issue2379);
+    RUN_TEST(swift_init_convenience_delegates_issue2379);
+    RUN_TEST(swift_init_overloads_keep_separate_nodes_issue2061);
+    RUN_TEST(swift_init_failable_enum_issue2379);
+    RUN_TEST(swift_init_extension_issue2379);
+    RUN_TEST(swift_method_still_attributed_issue2379);
+    RUN_TEST(swift_deinit_issue2379);
+    RUN_TEST(swift_super_init_names_superclass_issue2379);
+    RUN_TEST(swift_super_init_without_superclass_no_call_issue2379);
+    RUN_TEST(swift_initializer_calls_flagged_issue2379);
+    RUN_TEST(swift_init_reference_is_not_a_usage_issue2379);
     RUN_TEST(swift_call_string_arg_issue1892);
     RUN_TEST(swift_nested_url_constructor_issue1892);
     RUN_TEST(swift_nested_url_no_bang_issue1892);
@@ -15166,6 +16330,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);
     RUN_TEST(extract_java_spring_relative_string_not_route_path);
     RUN_TEST(extract_ts_nestjs_controller_routes_issue1428);
+    RUN_TEST(extract_nextjs_route_metadata_contract_issue759);
+    RUN_TEST(extract_nextjs_rejects_nonroutes_issue759);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);

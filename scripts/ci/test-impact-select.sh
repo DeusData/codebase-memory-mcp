@@ -4,12 +4,23 @@
 #
 # Shadow (default): REPORT-ONLY; pr.yml's test-impact-shadow job runs it
 # continue-on-error and ci-ok does not need it.
-# --gate DIR (pr.yml's select-tests job, only when the repository variable
-# TEST_IMPACT_MODE is `gate`): also turns the answer into what the test legs
-# run (scripts/test-impact/selection.py) — DIR/test-only.txt and
-# DIR/optional-suites.txt for a narrowed selection — and writes
-# `selection=narrowed` or `selection=all` to $GITHUB_OUTPUT. Anything but a
-# well-formed narrowed answer, a lane that selects nothing included, is `all`.
+# --gate DIR (pr.yml's select-tests job, unless the repository variable
+# TEST_IMPACT_MODE says otherwise): also turns the answer into what the test
+# legs run (scripts/test-impact/selection.py) — DIR/test-only.txt and
+# DIR/optional-suites.txt for a narrowed selection, the view of the Linux
+# x86_64 leg the coverage is recorded on — and writes `selection=narrowed` or
+# `selection=all` to $GITHUB_OUTPUT. Anything but a well-formed narrowed
+# answer, a lane that selects nothing included, is `all`. A narrowed answer
+# also gets DIR/portable/ (`portable=narrowed`): the view of every other leg
+# (arm64, macOS, Windows), where each platform-specific suite (selection.py
+# platform-suites, at the base and at HEAD) runs whole, selected or not —
+# their platform code has no coverage of its own there. No classification,
+# no portable view: those legs run every test.
+#
+# --repo DIR: the repository under test (default: this script's own
+# checkout). pr.yml runs the merge base's copy of this script, engine and
+# selection.py against the PR checkout, so a change cannot narrow its own
+# tests by changing the tooling that selects them.
 #
 # The base is the base side of the PR merge commit (HEAD^1 by default). Its
 # bundle is fetched with scripts/ci/test-impact-bundle.sh, which only accepts
@@ -19,13 +30,14 @@
 # then reports run_all; the summary shows why each suite runs whole).
 #
 # Usage: scripts/ci/test-impact-select.sh --binary PATH --out DIR [--base REV]
-#          [--platform LABEL] [--gate DIR]
+#          [--platform LABEL] [--gate DIR] [--repo DIR]
 #        Writes DIR/selection-engine.json and DIR/summary-engine.md (appended
 #        to $GITHUB_STEP_SUMMARY when set).
 # Exit: 0 = selection written · 1 = the tooling broke · 2 = usage error.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)" # the tooling
+REPO=""                                       # the repository under test
 BINARY="" OUT="" BASE="HEAD^1" PLATFORM="linux-x86_64-clang21" GATE=""
 ANCESTOR_MAX=20 # first-parent commits before the merge base whose bundle may stand in
 while [ $# -gt 0 ]; do
@@ -35,10 +47,12 @@ while [ $# -gt 0 ]; do
         --base) BASE="$2"; shift 2 ;;
         --platform) PLATFORM="$2"; shift 2 ;;
         --gate) GATE="$2"; shift 2 ;;
-        *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        --repo) REPO="$2"; shift 2 ;;
+        *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 [ -n "$BINARY" ] && [ -n "$OUT" ] || exit 2
+REPO="$(cd "${REPO:-$ROOT}" && pwd)"
 
 mkdir -p "$OUT"
 WORK="$(mktemp -d)"
@@ -47,7 +61,7 @@ export CBM_RUNTIME_DIR
 trap 'rm -rf "$WORK" "$CBM_RUNTIME_DIR"' EXIT
 export CBM_CACHE_DIR="$WORK/cache"
 mkdir -p "$WORK/engine" && chmod 700 "$WORK/engine"
-base="$(git -C "$ROOT" rev-parse "$BASE")"
+base="$(git -C "$REPO" rev-parse "$BASE")"
 
 artifact=()
 bundle_rc=0
@@ -59,7 +73,7 @@ if [ "$bundle_rc" -eq 3 ]; then
     # run per concurrency group). Use the nearest first-parent ancestor A with
     # a bundle instead, and diff against A: A..HEAD carries main's own commits
     # since A as well as the PR, so A's coverage map stays exact for its base.
-    for candidate in $(git -C "$ROOT" rev-list --first-parent --max-count="$((ANCESTOR_MAX + 1))" "$base" | tail -n +2); do
+    for candidate in $(git -C "$REPO" rev-list --first-parent --max-count="$((ANCESTOR_MAX + 1))" "$base" | tail -n +2); do
         rm -rf "$WORK/bundle"
         bundle_rc=0
         "$ROOT/scripts/ci/test-impact-bundle.sh" --fetch "$candidate" "$WORK/bundle" || bundle_rc=$?
@@ -72,13 +86,13 @@ if [ "$bundle_rc" -eq 3 ]; then
         # Exact-revert guard: a file main changed after A that the PR changes
         # back drops out of A..HEAD. Then A's map cannot speak for it: no coverage.
         # A diff that fails proves nothing either: no coverage.
-        if git -C "$ROOT" diff --no-renames --name-only "$base" HEAD > "$WORK/pr-files.txt" &&
-            git -C "$ROOT" diff --no-renames --name-only "$select_base" HEAD > "$WORK/ancestor-files.txt"; then
+        if git -C "$REPO" diff --no-renames --name-only "$base" HEAD > "$WORK/pr-files.txt" &&
+            git -C "$REPO" diff --no-renames --name-only "$select_base" HEAD > "$WORK/ancestor-files.txt"; then
             missing=$(comm -23 <(sort -u "$WORK/pr-files.txt") <(sort -u "$WORK/ancestor-files.txt"))
         else
             missing="(git diff failed)"
         fi
-        distance=$(git -C "$ROOT" rev-list --first-parent --count "$select_base..$base")
+        distance=$(git -C "$REPO" rev-list --first-parent --count "$select_base..$base")
         if [ -n "$missing" ]; then
             echo "::warning::test-impact: ancestor bundle $select_base unusable (the change reverts main's own change in: $(echo "$missing" | head -3 | tr '\n' ' ')): selecting without coverage"
             ancestor_note="ancestor $select_base rejected by the revert guard"
@@ -98,7 +112,7 @@ fi
 started=$(date +%s)
 rm -f "$OUT/selection-vetoed.json"
 select_rc=0
-"$BINARY" test-impact select --repo "$ROOT" --base "$select_base" --work "$WORK/engine" \
+"$BINARY" test-impact select --repo "$REPO" --base "$select_base" --work "$WORK/engine" \
     --platform "$PLATFORM" ${artifact[@]+"${artifact[@]}"} \
     --vetoed-out "$OUT/selection-vetoed.json" > "$OUT/selection-engine.json" \
     2> "$WORK/select-stderr.txt" || select_rc=$?
@@ -156,16 +170,41 @@ if [ -n "$GATE" ]; then
     python3 "$ROOT/scripts/test-impact/selection.py" filter "$OUT/selection-engine.json" \
         --lane unit --out "$GATE/test-only.txt" --optional-out "$GATE/optional-suites.txt" ||
         filter_rc=$?
+    portable=all
     if [ "$filter_rc" -eq 0 ]; then
         selection=narrowed
         echo "- PR CI runs $(wc -l < "$GATE/test-only.txt" | tr -d ' ') selection tokens" \
-            >> "$OUT/summary-engine.md"
+            "on Linux x86_64" >> "$OUT/summary-engine.md"
+        # The other legs: platform-specific suites whole. The classification
+        # reads both sides of the change, so a PR cannot declassify a suite by
+        # removing its platform conditionals.
+        mkdir -p "$GATE/portable"
+        portable_rc=0
+        python3 "$ROOT/scripts/test-impact/selection.py" platform-suites --repo "$REPO" \
+            --rev "$base" --rev HEAD > "$WORK/platform-suites.txt" || portable_rc=$?
+        if [ "$portable_rc" -eq 0 ]; then
+            python3 "$ROOT/scripts/test-impact/selection.py" filter "$OUT/selection-engine.json" \
+                --lane unit --whole-suites "$WORK/platform-suites.txt" \
+                --out "$GATE/portable/test-only.txt" \
+                --optional-out "$GATE/portable/optional-suites.txt" || portable_rc=$?
+        fi
+        if [ "$portable_rc" -eq 0 ]; then
+            portable=narrowed
+            echo "- arm64, macOS and Windows run $(wc -l < "$GATE/portable/test-only.txt" | tr -d ' ')" \
+                "tokens: $(wc -l < "$WORK/platform-suites.txt" | tr -d ' ') platform-specific suites" \
+                "whole" >> "$OUT/summary-engine.md"
+        else
+            rm -rf "$GATE/portable"
+            echo "- arm64, macOS and Windows run every test (portable view exit $portable_rc)" \
+                >> "$OUT/summary-engine.md"
+        fi
     else
         rm -f "$GATE/test-only.txt" "$GATE/optional-suites.txt"
         echo "- PR CI runs every test (selection exit $filter_rc)" >> "$OUT/summary-engine.md"
     fi
     if [ -n "${GITHUB_OUTPUT:-}" ]; then
         echo "selection=$selection" >> "$GITHUB_OUTPUT"
+        echo "portable=$portable" >> "$GITHUB_OUTPUT"
     fi
 fi
 cat "$OUT/summary-engine.md"

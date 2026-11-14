@@ -174,6 +174,62 @@ static int mkc_edge(const MKC_File *files, int nfiles, const char *edge_type, in
     return got >= floor;
 }
 
+/* Nodes carrying `label` whose qualified name ends with `qn_suffix`. */
+static int mkc_label_nodes_by_qn_suffix(cbm_store_t *store, const char *project, const char *label,
+                                        const char *qn_suffix) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (!store || cbm_store_find_nodes_by_qn_suffix(store, project, qn_suffix, &nodes, &count) !=
+                      CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0) {
+            matches++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return matches;
+}
+
+/* Edges of `edge_type` from the one node ending in `source_suffix` to nodes named
+ * `target_name`. -1 when the suffix names no node or more than one, so a missing
+ * source node is told apart from a missing edge. A per-type total cannot see
+ * WHICH scope a call was attributed to. The target is matched by name so a
+ * constructor call counts whether it binds the type or its constructor. */
+static int mkc_edges_from_suffix_to_name(cbm_store_t *store, const char *project,
+                                         const char *edge_type, const char *source_suffix,
+                                         const char *target_name) {
+    cbm_node_t *sources = NULL;
+    int source_count = 0;
+    if (!store ||
+        cbm_store_find_nodes_by_qn_suffix(store, project, source_suffix, &sources, &source_count) !=
+            CBM_STORE_OK ||
+        source_count != 1) {
+        cbm_store_free_nodes(sources, source_count);
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int matches = -1;
+    if (cbm_store_find_edges_by_source_type(store, sources[0].id, edge_type, &edges, &edge_count) ==
+        CBM_STORE_OK) {
+        matches = 0;
+        for (int i = 0; i < edge_count; i++) {
+            cbm_node_t target = {0};
+            if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) == CBM_STORE_OK &&
+                target.name && strcmp(target.name, target_name) == 0) {
+                matches++;
+            }
+            cbm_node_free_fields(&target);
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_free_nodes(sources, source_count);
+    return matches;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * ═══ CLASS C1: CONSTRUCTOR / INSTANTIATION ═══════════════════════════════
  *
@@ -475,9 +531,13 @@ TEST(mkc_c2_kotlin_operator_plus) {
 }
 
 /* C2-G: C# — operator + overload.
- * red=bug: C# `a + b` for structs with operator+ is a binary_expression in
- * the grammar.  cs_call_types = {invocation_expression} only — no
- * binary_expression, so the operator call is never extracted. */
+ * green=guard: `operator+` is a Method of Vec2 with a node of its own, and the
+ * constructor call in its body belongs to it. operator_declaration was no
+ * function kind, so the operator had no node and `new Vec2(...)` was attributed
+ * to the file. That misattributed edge plus Run->Dot made CALLS >= 2, so the
+ * count this case asserted before passed without the operator ever existing.
+ * Still open [KNOWN class 12]: the operator site `a + b` in Run is no CALLS
+ * edge to operator+ (cs_call_types has no binary_expression). */
 TEST(mkc_c2_csharp_operator_plus) {
     static const MKC_File f[] = {{"Vec.cs",
                                   "namespace App {\n"
@@ -495,11 +555,65 @@ TEST(mkc_c2_csharp_operator_plus) {
                                   "        }\n"
                                   "    }\n"
                                   "}\n"}};
-    /* REAL BUG: `(a + b).Dot(b)` should CALLS both Vec2::op_Addition (the `+`)
-     * AND Dot (>=2).  Dot resolves (CALLS=1) but the operator `a + b` does not —
-     * C# binary_expression operator desugaring is not modeled (cs_call_types omits
-     * it), so the op_Addition call is missing → CALLS=1 < 2. [KNOWN class 12] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c2/csharp/operator_plus", 0));
+    MKC_Proj lp;
+    cbm_store_t *store = mkc_index(&lp, f, 1);
+    int op_nodes = mkc_label_nodes_by_qn_suffix(store, lp.project, "Method", "Vec2.operator+");
+    int op_ctor =
+        mkc_edges_from_suffix_to_name(store, lp.project, "CALLS", "Vec2.operator+", "Vec2");
+    int run_dot = mkc_edges_from_suffix_to_name(store, lp.project, "CALLS", "Math.Run", "Dot");
+    if (op_nodes != 1 || op_ctor != 1 || run_dot != 1) {
+        fprintf(stderr,
+                "  [MKC] c2/csharp/operator_plus FAIL operator_methods=%d operator_ctor_calls=%d "
+                "run_dot_calls=%d (GREEN regression)\n",
+                op_nodes, op_ctor, run_dot);
+        mkc_diag(store, lp.project, "c2/csharp/operator_plus");
+    }
+    mkc_cleanup(&lp, store);
+    ASSERT_EQ(op_nodes, 1);
+    ASSERT_EQ(op_ctor, 1);
+    ASSERT_EQ(run_dot, 1);
+    PASS();
+}
+
+/* C2-G2: C# — overloaded operators, and operators spelled with a space or a word.
+ * green=guard: the two `operator+` overloads merge into one Method node, as
+ * other C# overloads do; `operator -` is spelled `operator-`, and `operator true`
+ * keeps its space. Each operator owns the calls in its body. */
+TEST(mkc_c2_csharp_operator_overloads) {
+    static const MKC_File f[] = {
+        {"Vec.cs",
+         "namespace App {\n"
+         "    struct Vec2 {\n"
+         "        public float X;\n"
+         "        public Vec2(float x) { X = x; }\n"
+         "        public static Vec2 operator+(Vec2 a, Vec2 b) { return new Vec2(a.X + b.X); }\n"
+         "        public static Vec2 operator+(Vec2 a, float b) { return new Vec2(a.X + b); }\n"
+         "        public static Vec2 operator -(Vec2 a, Vec2 b) { return new Vec2(a.X - b.X); }\n"
+         "        public static bool operator true(Vec2 a) { return Check(a); }\n"
+         "        static bool Check(Vec2 a) { return true; }\n"
+         "    }\n"
+         "}\n"}};
+    MKC_Proj lp;
+    cbm_store_t *store = mkc_index(&lp, f, 1);
+    int plus_nodes = mkc_label_nodes_by_qn_suffix(store, lp.project, "Method", "Vec2.operator+");
+    int plus_ctor =
+        mkc_edges_from_suffix_to_name(store, lp.project, "CALLS", "Vec2.operator+", "Vec2");
+    int minus_ctor =
+        mkc_edges_from_suffix_to_name(store, lp.project, "CALLS", "Vec2.operator-", "Vec2");
+    int true_check =
+        mkc_edges_from_suffix_to_name(store, lp.project, "CALLS", "Vec2.operator true", "Check");
+    if (plus_nodes != 1 || plus_ctor != 1 || minus_ctor != 1 || true_check != 1) {
+        fprintf(stderr,
+                "  [MKC] c2/csharp/operator_overloads FAIL plus_methods=%d plus_ctor=%d "
+                "minus_ctor=%d true_check=%d (GREEN regression)\n",
+                plus_nodes, plus_ctor, minus_ctor, true_check);
+        mkc_diag(store, lp.project, "c2/csharp/operator_overloads");
+    }
+    mkc_cleanup(&lp, store);
+    ASSERT_EQ(plus_nodes, 1);
+    ASSERT_EQ(plus_ctor, 1);
+    ASSERT_EQ(minus_ctor, 1);
+    ASSERT_EQ(true_check, 1);
     PASS();
 }
 
@@ -1251,8 +1365,9 @@ SUITE(matrix_known_classes) {
     RUN_TEST(mkc_c2_rust_add_trait);
     /* C2-F: Kotlin operator fun plus — red=bug */
     RUN_TEST(mkc_c2_kotlin_operator_plus);
-    /* C2-G: C# operator+ — red=bug */
+    /* C2-G: C# operator+ — green=guard (the `a + b` site is still class 12) */
     RUN_TEST(mkc_c2_csharp_operator_plus);
+    RUN_TEST(mkc_c2_csharp_operator_overloads);
     /* C2-H: Scala symbolic method — uncertain/red=bug */
     RUN_TEST(mkc_c2_scala_symbolic_method);
     /* C2-I: Ruby def + — uncertain/red=bug */

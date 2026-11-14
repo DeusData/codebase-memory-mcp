@@ -262,8 +262,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 (lang == CBM_LANG_SQL)
                     ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
-                    : cbm_registry_resolve_lang(ctx->registry, usage->ref_name, module_qn, imp_keys,
-                                                imp_vals, imp_count, lang);
+                    : cbm_registry_resolve_ref(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                               imp_vals, imp_count, lang,
+                                               cbm_pipeline_caller_is_test(src, rel, lang));
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -405,8 +406,9 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, rw->var_name, module_qn,
-                                                         imp_keys, imp_vals, imp_count, lang);
+        cbm_resolution_t res =
+            cbm_registry_resolve_ref(ctx->registry, rw->var_name, module_qn, imp_keys, imp_vals,
+                                     imp_count, lang, cbm_pipeline_caller_is_test(src, rel, lang));
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }

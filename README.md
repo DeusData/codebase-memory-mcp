@@ -5,9 +5,9 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/release.yml?branch=main&label=main%20CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/release.yml)
 [![Native and frontend tests](https://img.shields.io/badge/tests-native_%2B_frontend-blue)](#tests)
 [![MCP tools](https://img.shields.io/badge/MCP_tools-17-blue)](#mcp-tools)
-[![Languages](https://img.shields.io/badge/languages-163-orange)](https://github.com/DeusData/codebase-memory-mcp)
+[![Languages](https://img.shields.io/badge/languages-165-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-type_resolution-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agent_surfaces-46-purple)](https://github.com/DeusData/codebase-memory-mcp)
 [![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/DeusData/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
@@ -20,7 +20,7 @@
 
 Give your coding agent structural context through [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), or query the graph directly from the CLI. **The MCP server is the core of the project.** Its optional visual companion, **CBM Lens, is in open beta (v0.0.1)**, with a source reader, architecture maps, the Galaxy graph, coverage diagnostics, architecture decisions, and local code chat.
 
-The native C backend exposes **17 MCP tools**, parses [languages and file formats](#language-support) with vendored grammars, and adds [Hybrid LSP](#hybrid-lsp) type resolution for supported languages. The installer supports **45 automatic or conditional client integrations**, including client configuration, skills, agent profiles, and applicable hooks. Indexing and graph queries need no hosted service or API key. Focused graph queries can reduce repeated file reads and token use; see the [measured results](#performance).
+The native C backend exposes **17 MCP tools**, parses [languages and file formats](#language-support) with vendored grammars, and adds [Hybrid LSP](#hybrid-lsp) type resolution for supported languages. The installer supports **46 automatic or conditional client integrations**, including client configuration, skills, agent profiles, and applicable hooks. Indexing and graph queries need no hosted service or API key. Focused graph queries can reduce repeated file reads and token use; see the [measured results](#performance).
 
 [Quick start](#quick-start) · [Capabilities](#features) · [Documentation](#documentation-connected-to-code) · [Infrastructure](#infrastructure-and-deployment) · [Smart CI](#smart-ci-and-test-impact) · [Explore CBM Lens](#cbm-lens-beta-code-visualization-and-source-navigation) · [Agent setup](#agent-setup-skills-profiles-and-hooks) · [MCP tools](#mcp-tools)
 
@@ -145,6 +145,8 @@ Installation also equips supported coding agents to use the graph in daily work.
 
 Hook augmentation is context-only and fail-open: it does not replace or block the requested tool call. Features vary by client and platform; some clients use durable instructions or a parent-agent handoff instead of hooks or direct subagent MCP access. Codex users review and trust installed hooks through `/hooks`. See [Multi-Agent Support](#multi-agent-support) and [Sessions, compaction, and subagents](#sessions-compaction-and-subagents) for exact support and activation requirements.
 
+Hooks are enabled by default. Run `codebase-memory-mcp install --no-hooks` to remove CBM-managed hooks while keeping MCP registration and other integration files; the choice persists for later installs and updates. Run `codebase-memory-mcp install --hooks` to re-enable them, or inspect the current preference with `codebase-memory-mcp config get install_hooks`.
+
 ### Session Coordination Daemon
 
 CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and a session-managed daemon stops after the final session. A daemon started with `daemon start` remains running until stopped. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
@@ -263,6 +265,8 @@ To turn the watcher off entirely, set `config set watcher_enabled false` (defaul
 
 The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
+Linked git worktrees are indexed as their own projects by default. Set `config set ignore_worktrees true` to skip them on the automatic paths — useful when short-lived `git worktree add` checkouts would otherwise each leave behind a permanent index of the same repository. An explicit `index_repository` call on a worktree is then refused unless you pass `index_worktree=true`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#ignore_worktrees).
+
 ### Keeping Up to Date
 
 **Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
@@ -365,7 +369,7 @@ Use the graph to explain which tests a change reaches, and use that evidence to 
 
 **Narrowing currently supports C/C++ family code with this repository's test conventions or declared equivalents.** It is not general test selection for every language CBM indexes. Missing, stale, incompatible, or incomplete evidence broadens the selection or returns `run_all`; static reachability without admitted coverage never omits a suite. Begin with report-only shadow mode and validate your harness before enabling gating.
 
-In this repository, test narrowing is wired to the Linux x86_64 test leg when `TEST_IMPACT_MODE=gate`; release and dry-run workflows retain full execution. See the [Smart CI guide](docs/SMART_CI.md) for supported conventions, coverage admission, setup, version requirements, and fallback behavior.
+In this repository, test narrowing is on for every PR unless `TEST_IMPACT_MODE` says otherwise: the Linux x86_64 test leg runs the selection, and the arm64, macOS and Windows legs run it with every platform-specific suite whole; release and dry-run workflows retain full execution. See the [Smart CI guide](docs/SMART_CI.md) for supported conventions, coverage admission, setup, version requirements, and fallback behavior.
 
 ### Edge types (selected)
 - `CALLS`: a callable is invoked at the source site
@@ -394,7 +398,7 @@ In this repository, test narrowing is wired to the Linux x86_64 test leg when `T
 - `SEMANTICALLY_RELATED` (vocabulary-mismatch, same-language, score ≥ 0.80)
 
 ### Indexing pipeline
-- **163 vendored tree-sitter grammars** compiled into the binary
+- **165 vendored tree-sitter grammars** compiled into the binary
 - **Generic package / module resolution**: bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
 - **Infrastructure-as-code indexing**: Dockerfiles (`Dockerfile.*`, `*.Dockerfile`, `Containerfile`: bases, what the container runs, `ENV`), container images (`Image`: the normalised repository, tag and digest on the edges; a repository built from several Dockerfiles, one per component tag, gets an `Image` per component), docker compose services (`Resource`), Kubernetes manifests (`Resource`, with `group`, `version`, `kind`, `namespace`, `labels` as `k=v,k2=v2`), Kustomize overlays (`IMPORTS` to their entries and patch files, `OVERRIDE` from their patches), Helm charts (`Chart`, `DEPENDS_ON`), Terraform / OpenTofu (`.tf`, `.tofu`, `.tfvars`) as graph nodes. A Service walks to the code it runs: Service → workload → `Image` → Dockerfile → `main`
 - **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl; a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer (parameter binding, return-type inference, generic substitution, JSX component dispatch, JSDoc inference for plain JS files, namespace + trait + late-static-binding resolution for PHP, file-scoped namespaces + records + LINQ method syntax for C#, class-hierarchy + overload + lambda resolution for Java, extension-function + scope-function resolution for Kotlin, trait-method + UFCS resolution for Rust)
@@ -617,6 +621,8 @@ running an installer.
 
 </details>
 
+> **Contributor checks need a few extra tools.** `scripts/test.sh` requires `zip`, `python3`, and `curl`. `scripts/lint.sh` requires `cppcheck`, `clang-format`, and `clang-tidy`; `scripts/lint.sh --ci`, which is what CI runs, skips `clang-tidy`.
+
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
@@ -695,7 +701,7 @@ Restart your agent. Verify with `/mcp`; you should see `codebase-memory-mcp` wit
 
 ## Multi-Agent Support
 
-`install` configures **45 supported automatic/conditional client surfaces**: 39 detected automatically and 6
+`install` configures **46 supported automatic/conditional client surfaces**: 40 detected automatically and 6
 conditional or explicit. “Conditional” means the installer writes only when the
 documented platform or an explicit, already-existing config path proves the
 target is active. It never flips experimental feature flags, enables plugins,
@@ -762,6 +768,7 @@ overwrite user-modified agents.
 | Pi | Detected | none | `~/.pi/agent/AGENTS.md` + skill; MCP/subagents require an explicit reviewed extension |
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Oh My Pi (omp) | Detected | Effective agent directory (`OMP_PROFILE` / `PI_CODING_AGENT_DIR`; default `~/.omp/agent/mcp.json`) | Skill and three direct-MCP graph-tool subagents (Scout/Verify/Auditor); preserves user `AGENTS.md` |
+| agentty | Detected | `~/.agentty/mcp.json` (overridden by `$AGENTTY_MCP_CONFIG`) | Skill in `~/.agentty/skills` (Claude-compatible SKILL.md) |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
 
 For Codex, install keeps only a tiny managed activation pointer in global
@@ -1014,15 +1021,18 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # remove/disable all background watches (default: true)
+codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree charged-memory limit
+codebase-memory-mcp config set index_max_duration_seconds 3600 # optional per-request duration
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+The four `index_max_*` settings default to `off`. Exceeding one fails the complete
 index attempt rather than publishing a partial graph; an existing serving index
 is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
@@ -1114,14 +1124,14 @@ codebase-memory-mcp ships a **lightweight C implementation of language type-reso
 
 **Two-layer architecture:**
 
-1. **Tree-sitter pass**: fast, syntactic, runs for every one of the 163 languages. Extracts definitions, calls, imports.
+1. **Tree-sitter pass**: fast, syntactic, runs for every one of the 165 languages. Extracts definitions, calls, imports.
 2. **Hybrid LSP pass**: type-aware, runs above the tree-sitter pass per-language. Refines call edges using the import graph plus a per-file or pre-built cross-file definition registry. Languages without a Hybrid LSP pass yet fall back to textual resolution, with coverage varying by language and construct.
 
 The result is a knowledge graph accurate enough to drive `trace_path` across packages, inheritance hierarchies, and stdlib calls; without paying for a language server process per project.
 
 ## Language Support
 
-163 languages, counted by the vendored grammar directories in [the parser manifest](internal/cbm/vendored/grammars/MANIFEST.md). Benchmarked against 64 real open-source repositories (78 to 49K nodes):
+165 languages, counted by the vendored grammar directories in [the parser manifest](internal/cbm/vendored/grammars/MANIFEST.md). Benchmarked against 64 real open-source repositories (78 to 49K nodes):
 
 | Tier | Score | Languages |
 |------|-------|-----------|
@@ -1138,7 +1148,7 @@ src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   daemon/             Per-account session coordination, IPC, lifecycle, shared jobs/watchers
   mcp/                MCP server (17 tools, JSON-RPC 2.0, session detection, auto-index)
-  cli/                Install/uninstall/update/config (45 client surfaces, hooks, instructions)
+  cli/                Install/uninstall/update/config (46 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor
@@ -1148,7 +1158,7 @@ src/
   ui/                 Local HTTP server + embedded CBM Lens frontend
   foundation/         Platform abstractions (threads, filesystem, logging, memory)
 graph-ui/             CodeAtlasWeb: React, Monaco, and Three.js browser frontend
-internal/cbm/         Vendored tree-sitter grammars (163 languages) + AST extraction engine
+internal/cbm/         Vendored tree-sitter grammars (165 languages) + AST extraction engine
 ```
 
 ## Security

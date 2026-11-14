@@ -49,6 +49,8 @@ enum {
      * promise. The actual cross-platform contract is this deterministic UTF-8
      * byte ceiling, applied only at whole semantic-unit boundaries. */
     MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE = 4,
+    MCP_STATUS_SAMPLE_MAX = 16, /* per-class path samples in verbose freshness */
+    MCP_REASONS_MAX = 8,        /* freshness reasons array ceiling (see below) */
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
@@ -75,6 +77,7 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
 #include "foundation/hash_table.h"
+#include "foundation/dyn_array.h"
 #include "foundation/json_writer.h"
 #include "foundation/arena.h"
 #include "foundation/diagnostics.h"
@@ -551,6 +554,9 @@ static const tool_def_t TOOLS[] = {
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"index_worktree\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Index repo_path even when it is a linked git worktree and the "
+     "ignore_worktrees config key is enabled. No effect otherwise.\"},"
      "\"doc_candidates\":{\"type\":\"boolean\",\"description\":"
      "\"Doc-code candidates; default: the doc_candidates setting, else on for full, off for "
      "moderate/fast.\"},"
@@ -635,6 +641,9 @@ static const tool_def_t TOOLS[] = {
      "topology: infra objects, routes, controllers (from a Resource/Route); deploy: what CI "
      "jobs and scripts run and deploy; run: what a Service runs (image, Dockerfile, program, "
      "env).\"},"
+     "\"include_overrides\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"For outbound calls, list OVERRIDE implementations separately as possible "
+     "callees. Declared CALLS edges remain unchanged.\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"
      "\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
@@ -7789,13 +7798,169 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
     yyjson_mut_obj_add_val(doc, root, "watch", watch);
 }
 
+/* Emit the bounded worktree-status snapshot inside the freshness block.
+ * Fail-closed: status_available is false whenever git status could not run
+ * clean, in which case the API guarantees zero counts and no samples — a
+ * non-git root or missing git is NEVER presented as a clean worktree. Ignored
+ * paths are deliberately absent (no --ignored in the underlying query) and
+ * must not be confused with tracked/untracked sources. */
+static void add_worktree_status_json(yyjson_mut_doc *doc, yyjson_mut_val *freshness,
+                                     const cbm_worktree_status_t *st) {
+    yyjson_mut_obj_add_bool(doc, freshness, "status_available", st->available);
+
+    yyjson_mut_val *tracked = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, tracked, "count", st->tracked_count);
+    yyjson_mut_val *tpaths = yyjson_mut_arr(doc);
+    for (int i = 0; i < st->tracked_sample_count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, tpaths, st->tracked_paths[i]);
+    }
+    yyjson_mut_obj_add_val(doc, tracked, "paths", tpaths);
+    yyjson_mut_obj_add_bool(doc, tracked, "truncated", st->tracked_truncated);
+    yyjson_mut_obj_add_val(doc, freshness, "tracked_changes", tracked);
+
+    yyjson_mut_val *untracked = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, untracked, "count", st->untracked_count);
+    yyjson_mut_val *upaths = yyjson_mut_arr(doc);
+    for (int i = 0; i < st->untracked_sample_count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, upaths, st->untracked_paths[i]);
+    }
+    yyjson_mut_obj_add_val(doc, untracked, "paths", upaths);
+    yyjson_mut_obj_add_bool(doc, untracked, "truncated", st->untracked_truncated);
+    yyjson_mut_obj_add_val(doc, freshness, "untracked_source", untracked);
+}
+
+/* BT-240: fail-closed freshness verdict against the indexed-checkout identity
+ * recorded with the DB at the successful staged-generation boundary. A live
+ * checkout SHA is not proof of the generation that produced graph content, so
+ * the verdict comes from that recorded identity, the live git HEAD and the
+ * bounded worktree status (tracked/untracked deltas):
+ *   - no indexed SHA                                  → unknown / unavailable
+ *   - indexed SHA differs from the live git HEAD      → stale / mismatch
+ *   - tracked changes present                         → stale / tracked
+ *   - untracked sources present                       → prevents current
+ *   - equal SHA + status available + no changes       → current
+ * Report-only: it never triggers indexing. Verbose-only and read-only; the
+ * live checkout is resolved fresh from the project root (never mutated). */
+static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                     const char *project, const char *root_path,
+                                     const char *indexed_generation) {
+    yyjson_mut_val *freshness = yyjson_mut_obj(doc);
+    if (indexed_generation && indexed_generation[0]) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_generation", indexed_generation);
+    } else {
+        yyjson_mut_obj_add_str(doc, freshness, "indexed_generation", "");
+    }
+
+    cbm_coverage_meta_t meta = {0};
+    bool have_meta = store && cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
+    const char *indexed_sha = NULL;
+    if (have_meta && meta.indexed_checkout_sha && meta.indexed_checkout_sha[0]) {
+        indexed_sha = meta.indexed_checkout_sha;
+    }
+
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(root_path, &ctx);
+    const char *checkout_sha = ctx.head_sha && ctx.head_sha[0] ? ctx.head_sha : NULL;
+
+    cbm_worktree_status_t st = {0};
+    int status_rc = cbm_git_worktree_status(root_path, MCP_STATUS_SAMPLE_MAX, &st);
+    bool status_available = status_rc == 0 && st.available;
+    add_worktree_status_json(doc, freshness, &st);
+
+    if (indexed_sha) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_checkout_sha", indexed_sha);
+    } else {
+        yyjson_mut_obj_add_null(doc, freshness, "indexed_checkout_sha");
+    }
+    if (checkout_sha) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "checkout_sha", checkout_sha);
+    } else {
+        yyjson_mut_obj_add_null(doc, freshness, "checkout_sha");
+    }
+
+    /* Verdict/reasons composition. Stale reasons (identity mismatch, tracked
+     * changes) win over everything; a missing indexed identity is unknown
+     * regardless of live state; status unavailability and untracked sources
+     * both prevent "current" but only yield stale when a stale reason is
+     * already present. The reasons array keeps every applicable code in a
+     * stable order; the singular reason stays as the first (dominant) one for
+     * compatibility with consumers that read it directly. */
+    bool sha_present = indexed_sha != NULL;
+    bool live_present = checkout_sha != NULL;
+    bool sha_mismatch = sha_present && live_present && strcmp(indexed_sha, checkout_sha) != 0;
+    bool has_tracked = st.tracked_count > 0;
+    bool has_untracked = st.untracked_count > 0;
+    bool has_stale = sha_mismatch || has_tracked;
+
+    const char *verdict;
+    if (!sha_present) {
+        verdict = "unknown";
+    } else if (has_stale) {
+        verdict = "stale";
+    } else if (!live_present) {
+        verdict = "unknown";
+    } else if (!status_available) {
+        verdict = "unknown";
+    } else if (has_untracked) {
+        verdict = "unknown";
+    } else {
+        verdict = "current";
+    }
+
+    const char *reasons[MCP_REASONS_MAX];
+    int n_reasons = 0;
+    if (!sha_present) {
+        reasons[n_reasons++] = "indexed_checkout_unavailable";
+    }
+    if (sha_mismatch) {
+        reasons[n_reasons++] = "indexed_checkout_mismatch";
+    }
+    if (has_tracked) {
+        reasons[n_reasons++] = "tracked_changes_present";
+    }
+    if (!status_available) {
+        reasons[n_reasons++] = "status_unavailable";
+    }
+    if (has_untracked) {
+        reasons[n_reasons++] = "untracked_not_indexed";
+    }
+    if (n_reasons == 0) {
+        reasons[n_reasons++] = "indexed_checkout_current";
+    }
+    const char *reason = reasons[0];
+
+    const char *recommended_action;
+    if (strcmp(verdict, "current") == 0) {
+        recommended_action = "use_graph";
+    } else if (strcmp(verdict, "stale") == 0) {
+        recommended_action = "reindex_to_match_checkout";
+    } else {
+        recommended_action = "reindex_to_record_indexed_checkout";
+    }
+    yyjson_mut_obj_add_str(doc, freshness, "verdict", verdict);
+    yyjson_mut_obj_add_str(doc, freshness, "reason", reason);
+    yyjson_mut_val *reasons_val = yyjson_mut_arr(doc);
+    for (int i = 0; i < n_reasons; i++) {
+        yyjson_mut_arr_add_str(doc, reasons_val, reasons[i]);
+    }
+    yyjson_mut_obj_add_val(doc, freshness, "reasons", reasons_val);
+    yyjson_mut_obj_add_str(doc, freshness, "recommended_action", recommended_action);
+    yyjson_mut_obj_add_val(doc, root, "freshness", freshness);
+
+    if (have_meta) {
+        cbm_store_coverage_meta_clear(&meta);
+    }
+    cbm_git_worktree_status_free(&st);
+    cbm_git_context_free(&ctx);
+}
+
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
-    /* The git context block (worktree/shadow path variants) only matters when
-     * debugging index-location issues — gate it so the common status call
-     * stays lean. */
+    /* The git context block (worktree/shadow path variants) and the freshness
+     * verdict only matter when debugging index-location issues — gate them so
+     * the common status call stays lean. */
     bool verbose = cbm_mcp_get_bool_arg(args, "verbose");
     char *diagnostics = cbm_mcp_get_string_arg(args, "diagnostics");
     int coverage_samples = 0;
@@ -7840,6 +8005,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                                       proj_info.indexed_at ? proj_info.indexed_at : "");
             if (verbose) {
                 add_git_context_json(doc, root, proj_info.root_path);
+                add_index_freshness_json(doc, root, store, project, proj_info.root_path,
+                                         proj_info.indexed_at);
             }
         }
         add_coverage_report(doc, root, store, project, have_proj_info ? proj_info.indexed_at : NULL,
@@ -9724,6 +9891,284 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
     return CBM_STORE_OK;
 }
 
+/* include_overrides (#1271): the possible runtime callees of the outbound rows
+ * a page emits. A callee row is a contract when an implementation overrides
+ * it. The indexer links each override to its nearest declaring ancestor only
+ * (pass_semantic), so the walk follows inbound OVERRIDE edges transitively --
+ * one store query per node reached, with a visited set -- and lists C.m for a
+ * call to A.m when C : B : A. Only callables are contracts or implementations:
+ * an OVERRIDE edge between infra objects (tfvars values, kustomize overlays)
+ * is not a call. Nothing is written; the declared CALLS rows stay what they
+ * are. TRACE_OVERRIDE_WALK_CAP bounds the nodes one response may reach, and
+ * hitting it is reported, never silent. */
+enum { TRACE_OVERRIDE_WALK_CAP = MCP_BFS_LIMIT_MAX };
+
+typedef struct {
+    int contract;    /* index of the contract row in the outbound traversal */
+    cbm_node_t impl; /* owned strings, released by trace_possibles_free */
+} trace_possible_t;
+
+typedef CBM_DYN_ARRAY(int64_t) trace_id_array_t;
+
+typedef struct {
+    CBM_DYN_ARRAY(trace_possible_t) items;
+    bool truncated; /* TRACE_OVERRIDE_WALK_CAP stopped the walk */
+    bool failed;    /* a store lookup failed; the list may be incomplete */
+} trace_possibles_t;
+
+static bool trace_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
+}
+
+static bool trace_id_seen(const trace_id_array_t *ids, int64_t id) {
+    for (int i = 0; i < ids->count; i++) {
+        if (ids->items[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *trace_node_qn(const cbm_node_t *n) {
+    return n->qualified_name ? n->qualified_name : (n->name ? n->name : "");
+}
+
+/* Contract row order (the page's own order), then implementation QN. */
+static int trace_possible_cmp(const void *pa, const void *pb) {
+    const trace_possible_t *a = pa;
+    const trace_possible_t *b = pb;
+    if (a->contract != b->contract) {
+        return a->contract < b->contract ? -1 : 1;
+    }
+    int c = strcmp(trace_node_qn(&a->impl), trace_node_qn(&b->impl));
+    if (c != 0) {
+        return c;
+    }
+    return (a->impl.id > b->impl.id) - (a->impl.id < b->impl.id);
+}
+
+static void trace_possibles_free(trace_possibles_t *p) {
+    for (int i = 0; i < p->items.count; i++) {
+        free_node_contents(&p->items.items[i].impl);
+    }
+    cbm_da_free(&p->items);
+}
+
+/* One reached node: recorded in `seen`; a callable is walked further and,
+ * unless it lives in a test file the trace hides, listed. */
+static void trace_possibles_visit(cbm_store_t *store, int contract, int64_t id, bool include_tests,
+                                  trace_id_array_t *seen, trace_id_array_t *frontier,
+                                  trace_possibles_t *out) {
+    cbm_da_push(seen, id);
+    cbm_node_t impl = {0};
+    if (cbm_store_find_node_by_id(store, id, &impl) != CBM_STORE_OK) {
+        free_node_contents(&impl);
+        out->failed = true;
+        return;
+    }
+    if (!trace_label_is_callable(impl.label)) {
+        free_node_contents(&impl);
+        return;
+    }
+    cbm_da_push(frontier, id);
+    if (include_tests || !is_test_file(impl.file_path)) {
+        trace_possible_t item = {.contract = contract, .impl = impl};
+        int before = out->items.count;
+        cbm_da_push(&out->items, item);
+        if (out->items.count == before) { /* allocation failed: not listed */
+            free_node_contents(&impl);
+            out->failed = true;
+        }
+    } else {
+        free_node_contents(&impl);
+    }
+}
+
+/* Whether a traced call can run an override of its declared target: it
+ * goes through an instance receiver (`self.m`, `obj.m`, `$this->m`). A bare
+ * call (a function, or a constructor that runs its own class), a `::` path, a
+ * type or constructed-object root (`Cls.m`, `Factory().m`, `new X().m`), and a
+ * super/base call (bound to the parent) run the declared target itself.
+ * Callee text the edge does not carry counts as dispatching: the list says
+ * "possible". */
+static bool trace_call_dispatches(const char *props_json) {
+    yyjson_doc *doc = props_json ? yyjson_read(props_json, strlen(props_json), 0) : NULL;
+    const char *callee =
+        doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "callee")) : NULL;
+    bool dispatches = true;
+    if (callee && callee[0]) {
+        const char *dot = NULL;
+        int depth = 0;
+        for (const char *c = callee; *c && !dot; c++) {
+            if (*c == '(' || *c == '[' || *c == '<') {
+                depth++;
+            } else if ((*c == ')' || *c == ']' || *c == '>') && depth > 0) {
+                depth--;
+            } else if (*c == '.' && depth == 0) {
+                dot = c;
+            }
+        }
+        const char *colons = strstr(callee, "::");
+        const char *root = callee;
+        while (*root == '$') {
+            root++;
+        }
+        size_t root_len = 0;
+        while (root[root_len] && root[root_len] != '.' && root[root_len] != '(' &&
+               root[root_len] != '[' && root[root_len] != '<') {
+            root_len++;
+        }
+        bool super_root = (root_len == strlen("super") && strncmp(root, "super", root_len) == 0) ||
+                          (root_len == strlen("base") && strncmp(root, "base", root_len) == 0);
+        dispatches = dot && !(colons && colons < dot) &&
+                     strncmp(root, "new ", strlen("new ")) != 0 && !super_root &&
+                     !(root[0] >= 'A' && root[0] <= 'Z');
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return dispatches;
+}
+
+static int trace_id_cmp(const void *pa, const void *pb) {
+    int64_t a = *(const int64_t *)pa;
+    int64_t b = *(const int64_t *)pb;
+    return (a > b) - (a < b);
+}
+
+static bool trace_ids_contain(const trace_id_array_t *sorted, int64_t id) {
+    return sorted->count > 0 && bsearch(&id, sorted->items, (size_t)sorted->count,
+                                        sizeof(sorted->items[0]), trace_id_cmp) != NULL;
+}
+
+/* A contract's implementations are listed only when some call that reaches it
+ * from the traced graph (`traced`: the roots and the outbound rows, sorted)
+ * dispatches. */
+static bool trace_contract_dispatched(cbm_store_t *store, int64_t contract_id,
+                                      const trace_id_array_t *traced, trace_possibles_t *out) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_target_type(store, contract_id, "CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        cbm_store_free_edges(edges, edge_count);
+        out->failed = true;
+        return false;
+    }
+    bool dispatched = false;
+    for (int i = 0; i < edge_count && !dispatched; i++) {
+        dispatched = trace_ids_contain(traced, edges[i].source_id) &&
+                     trace_call_dispatches(edges[i].properties_json);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    return dispatched;
+}
+
+/* Every implementation below one contract, through inbound OVERRIDE edges. */
+static void trace_possibles_walk(cbm_store_t *store, int contract, int64_t contract_id,
+                                 const trace_id_array_t *traced, bool include_tests,
+                                 int *walk_budget, trace_possibles_t *out) {
+    trace_id_array_t seen = {0};
+    trace_id_array_t frontier = {0};
+    cbm_da_push(&seen, contract_id);
+    cbm_da_push(&frontier, contract_id);
+    for (int head = 0; head < frontier.count && !out->truncated; head++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_target_type(store, frontier.items[head], "OVERRIDE", &edges,
+                                                &edge_count) != CBM_STORE_OK) {
+            cbm_store_free_edges(edges, edge_count);
+            out->failed = true;
+            break;
+        }
+        if (head == 0 && edge_count > 0 &&
+            !trace_contract_dispatched(store, contract_id, traced, out)) {
+            cbm_store_free_edges(edges, edge_count);
+            break;
+        }
+        for (int e = 0; e < edge_count; e++) {
+            if (trace_id_seen(&seen, edges[e].source_id)) {
+                continue;
+            }
+            if (*walk_budget <= 0) {
+                out->truncated = true;
+                break;
+            }
+            (*walk_budget)--;
+            trace_possibles_visit(store, contract, edges[e].source_id, include_tests, &seen,
+                                  &frontier, out);
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_da_free(&seen);
+    cbm_da_free(&frontier);
+}
+
+/* The possible callees of rows [start, start + len) of the outbound leg. */
+static void trace_possibles_for_page(cbm_store_t *store, const cbm_node_t *roots, int root_count,
+                                     const cbm_traverse_result_t *tr, int start, int len,
+                                     bool include_tests, trace_possibles_t *out) {
+    int walk_budget = TRACE_OVERRIDE_WALK_CAP;
+    trace_id_array_t traced = {0};
+    for (int i = 0; i < root_count; i++) {
+        cbm_da_push(&traced, roots[i].id);
+    }
+    for (int i = 0; i < tr->visited_count; i++) {
+        cbm_da_push(&traced, tr->visited[i].node.id);
+    }
+    if (traced.count > 1) {
+        qsort(traced.items, (size_t)traced.count, sizeof(traced.items[0]), trace_id_cmp);
+    }
+    for (int i = start; i < start + len && i < tr->visited_count && !out->truncated; i++) {
+        const cbm_node_t *contract = &tr->visited[i].node;
+        if (trace_label_is_callable(contract->label)) {
+            trace_possibles_walk(store, i, contract->id, &traced, include_tests, &walk_budget, out);
+        }
+    }
+    cbm_da_free(&traced);
+    if (out->items.count > 1) {
+        qsort(out->items.items, (size_t)out->items.count, sizeof(out->items.items[0]),
+              trace_possible_cmp);
+    }
+}
+
+/* JSON: [{contract, implementations: [qn, ...]}], one entry per contract. The
+ * strings are borrowed: the traversal and the list outlive serialization. */
+static yyjson_mut_val *trace_possibles_json(yyjson_mut_doc *doc, const cbm_traverse_result_t *tr,
+                                            const trace_possibles_t *p) {
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_val *implementations = NULL;
+    int current = CBM_NOT_FOUND;
+    for (int i = 0; i < p->items.count; i++) {
+        const trace_possible_t *item = &p->items.items[i];
+        if (item->contract != current) {
+            current = item->contract;
+            yyjson_mut_val *entry = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, entry, "contract",
+                                   trace_node_qn(&tr->visited[current].node));
+            implementations = yyjson_mut_arr(doc);
+            yyjson_mut_obj_add_val(doc, entry, "implementations", implementations);
+            yyjson_mut_arr_add_val(arr, entry);
+        }
+        yyjson_mut_arr_add_str(doc, implementations, trace_node_qn(&item->impl));
+    }
+    return arr;
+}
+
+/* Tree: one table row per (contract, implementation), like every section. */
+static void trace_possibles_tree(cbm_sb_t *sb, const cbm_traverse_result_t *tr,
+                                 const trace_possibles_t *p) {
+    static const char *const cols[] = {"contract", "implementation"};
+    cbm_tree_table_header(sb, "possible_callees", p->items.count, cols,
+                          (int)(sizeof(cols) / sizeof(cols[0])));
+    for (int i = 0; i < p->items.count; i++) {
+        const trace_possible_t *item = &p->items.items[i];
+        cbm_tree_row_begin(sb);
+        cbm_tree_cell_str(sb, trace_node_qn(&tr->visited[item->contract].node), true);
+        cbm_tree_cell_str(sb, trace_node_qn(&item->impl), false);
+        cbm_tree_row_end(sb);
+    }
+}
+
 /* ── Pagination cursors (stateless, exactly-once) ────────────────────
  * Token: "c1.<leg>.<generation>.<qhash>.<hop>.<id>" — version, trace leg
  * (o=callees, i=callers), the store generation (per-DB uid + mutation
@@ -9756,7 +10201,7 @@ typedef struct {
 static uint64_t trace_params_hash(const char *project, const char *func_name, const char *direction,
                                   const char *mode, const char *param_name, int depth,
                                   bool include_tests, bool risk_labels, bool include_evidence,
-                                  int limit, const char *args) {
+                                  bool include_overrides, int limit, const char *args) {
     uint64_t h = 0xcbf29ce484222325ULL;
     h = cursor_fnv1a64(project ? project : "", h);
     h = cursor_fnv1a64("|", h);
@@ -9775,6 +10220,12 @@ static uint64_t trace_params_hash(const char *project, const char *func_name, co
     snprintf(nums, sizeof(nums), "|%d|%d|%d|%d|%d", depth, include_tests ? 1 : 0,
              risk_labels ? 1 : 0, include_evidence ? 1 : 0, limit);
     h = cursor_fnv1a64(nums, h);
+    /* include_overrides adds an optional section and never changes the rows.
+     * It joins the identity only when set, so a cursor minted without it is
+     * the token minted before the flag existed. */
+    if (include_overrides) {
+        h = cursor_fnv1a64("|include_overrides", h);
+    }
 
     /* Explicit edge types define the traversed graph. Omitting them from the
      * cursor identity allowed a token minted for CALLS to resume an IMPORTS
@@ -10465,6 +10916,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         (size_t)max_output_tokens * (size_t)MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
+    bool include_overrides = cbm_mcp_get_bool_arg(args, "include_overrides");
     /* Off by default: two extra columns on every row is exactly the kind of
      * inflation the tree format exists to avoid. Opt in when you need to judge
      * whether an edge is trustworthy. */
@@ -10528,7 +10980,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (cursor_arg && cursor_arg[0]) {
         uint64_t qh = trace_params_hash(project, func_name, direction ? direction : "both", mode,
                                         param_name, depth, include_tests, risk_labels,
-                                        include_evidence, trace_limit, args);
+                                        include_evidence, include_overrides, trace_limit, args);
         const char *cerr = trace_cursor_decode(cursor_arg, generation, qh, &cur);
         if (cerr) {
             free(cursor_arg);
@@ -10777,6 +11229,16 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             break;
         }
     }
+    /* include_overrides: the possible callees of the outbound rows this page
+     * requests, computed once. They are optional output: under the byte
+     * ceiling they yield before every other field and every graph row. */
+    trace_possibles_t possibles = {0};
+    bool emit_possibles = include_overrides && do_outbound && trace_includes_calls;
+    bool possibles_omitted = false;
+    if (emit_possibles) {
+        trace_possibles_for_page(store, nodes, node_count, &tr_out, out_start, requested_out_len,
+                                 include_tests, &possibles);
+    }
     bool unresolved_out = false;
     bool unresolved_in = false;
     trace_coverage_scope_t coverage_scope = {.roots = nodes,
@@ -10812,7 +11274,7 @@ render_trace_output:;
         snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
         nc.qhash =
             trace_params_hash(project, func_name, direction, mode, param_name, depth, include_tests,
-                              risk_labels, include_evidence, trace_limit, args);
+                              risk_labels, include_evidence, include_overrides, trace_limit, args);
         /* The watermark is the last row ACTUALLY emitted, not the leg that
          * happens to have additional rows. At an exact outbound page boundary
          * inbound may be pending with zero emitted rows. */
@@ -10890,6 +11352,15 @@ render_trace_output:;
                                            render_evidence, &out_edge_ctx);
             }
         }
+        if (emit_possibles) {
+            trace_possibles_tree(&sb, &tr_out, &possibles);
+            if (possibles.truncated) {
+                cbm_tree_scalar_bool(&sb, "possible_callees_truncated", true);
+            }
+            if (possibles.failed) {
+                cbm_tree_scalar_bool(&sb, "possible_callees_incomplete", true);
+            }
+        }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
             cbm_tree_scalar_str(&sb, "callers_total_relation", in_relation);
@@ -10917,6 +11388,9 @@ render_trace_output:;
                 cbm_tree_scalar_bool(&sb, "optional_fields_omitted", true);
                 trace_emit_omitted_optional_fields_tree(&sb, risk_labels, data_flow,
                                                         include_evidence);
+            }
+            if (possibles_omitted) {
+                cbm_tree_scalar_bool(&sb, "possible_callees_omitted", true);
             }
             if (engine_saturated) {
                 cbm_tree_scalar_bool(&sb, "engine_saturated", true);
@@ -10966,6 +11440,16 @@ render_trace_output:;
                                  data_flow && emit_optional_fields,
                                  include_evidence && emit_optional_fields, &out_edge_ctx));
         }
+        if (emit_possibles) {
+            yyjson_mut_obj_add_val(doc, root, "possible_callees",
+                                   trace_possibles_json(doc, &tr_out, &possibles));
+            if (possibles.truncated) {
+                yyjson_mut_obj_add_bool(doc, root, "possible_callees_truncated", true);
+            }
+            if (possibles.failed) {
+                yyjson_mut_obj_add_bool(doc, root, "possible_callees_incomplete", true);
+            }
+        }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
             yyjson_mut_obj_add_str(doc, root, "callers_total_relation", in_relation);
@@ -10992,6 +11476,9 @@ render_trace_output:;
                 trace_emit_omitted_optional_fields_json(doc, root, risk_labels, data_flow,
                                                         include_evidence);
             }
+            if (possibles_omitted) {
+                yyjson_mut_obj_add_bool(doc, root, "possible_callees_omitted", true);
+            }
             if (engine_saturated) {
                 yyjson_mut_obj_add_bool(doc, root, "engine_saturated", true);
             }
@@ -11013,6 +11500,11 @@ render_trace_output:;
      * render, so `next` always follows the last row actually emitted. */
     if (json && strlen(json) > output_budget_bytes) {
         output_budget_hit = true;
+        if (emit_possibles && possibles.items.count > 0) {
+            emit_possibles = false;
+            possibles_omitted = true;
+            goto render_trace_output;
+        }
         if (emit_optional_fields) {
             emit_optional_fields = false;
             optional_fields_omitted = true;
@@ -11046,6 +11538,9 @@ render_trace_output:;
                     trace_emit_omitted_optional_fields_tree(&floor, risk_labels, data_flow,
                                                             include_evidence);
                 }
+                if (possibles_omitted) {
+                    cbm_tree_scalar_bool(&floor, "possible_callees_omitted", true);
+                }
                 cbm_tree_scalar_str(&floor, "hint",
                                     "raise max_output_tokens; no identifier was sliced");
                 json = cbm_sb_finish(&floor);
@@ -11076,6 +11571,9 @@ render_trace_output:;
                     yyjson_mut_obj_add_bool(floor_doc, floor, "optional_fields_omitted", true);
                     trace_emit_omitted_optional_fields_json(floor_doc, floor, risk_labels,
                                                             data_flow, include_evidence);
+                }
+                if (possibles_omitted) {
+                    yyjson_mut_obj_add_bool(floor_doc, floor, "possible_callees_omitted", true);
                 }
                 yyjson_mut_obj_add_str(floor_doc, floor, "hint",
                                        "raise max_output_tokens; no identifier was sliced");
@@ -11128,6 +11626,7 @@ trace_output_ready:
     free(direction);
     free(mode);
     free(param_name);
+    trace_possibles_free(&possibles);
     if (et_doc_keep) {
         yyjson_doc_free(et_doc_keep);
     }
@@ -11950,6 +12449,30 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     return degraded;
 }
 
+static bool project_db_is_servable(const char *project, const char *db_path);
+
+/* The heap strings that name the project of an internal worker request
+ * (repo_path and name from cbm_mcp_get_string_arg, the project name derived from
+ * them). One release point for every helper that reads them; free(NULL) is a
+ * no-op, so any of them may be NULL. */
+static void index_request_names_free(char *repo_path, char *name_override, char *project_name) {
+    free(repo_path);
+    free(name_override);
+    free(project_name);
+}
+
+/* Serialize a worker JSON document and release the heap strings it borrowed.
+ * Extra arguments may be NULL. */
+static char *index_worker_json_result(yyjson_mut_doc *doc, char *repo_path, char *name_override,
+                                      char *project_name) {
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    index_request_names_free(repo_path, name_override, project_name);
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
 /* Build the response for a worker that crashed/hung/failed without producing a
  * result. The crash is already contained (this process survived); we report it
  * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
@@ -11982,12 +12505,7 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    free(repo_path);
-    char *result = cbm_mcp_text_result(json, true);
-    free(json);
-    return result;
+    return index_worker_json_result(doc, repo_path, NULL, NULL);
 }
 
 static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_outcome_t outcome,
@@ -12008,12 +12526,81 @@ static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_ou
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    free(repo_path);
-    char *response = cbm_mcp_text_result(json, true);
-    free(json);
-    return response;
+    return index_worker_json_result(doc, repo_path, NULL, NULL);
+}
+
+/* Whether the project named by internal worker args has a servable index now. */
+static bool index_args_serving_index_servable(const char *args) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *name_override = cbm_mcp_get_string_arg(args, "name");
+    char *project_name =
+        cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
+    bool servable = false;
+    if (project_name) {
+        char db_path[CBM_SZ_1K] = {0};
+        project_db_path(project_name, db_path, sizeof(db_path));
+        servable = project_db_is_servable(project_name, db_path);
+    }
+    index_request_names_free(repo_path, name_override, project_name);
+    return servable;
+}
+
+void cbm_mcp_index_request_facts_begin(const char *args, cbm_mcp_index_request_facts_t *facts) {
+    if (!facts) {
+        return;
+    }
+    facts->serving_index_existed = index_args_serving_index_servable(args);
+    facts->publication_committed = false;
+}
+
+void cbm_mcp_index_request_facts_record(cbm_mcp_index_request_facts_t *facts,
+                                        const cbm_index_worker_result_t *worker_result) {
+    if (facts && worker_result && worker_result->publication_committed) {
+        facts->publication_committed = true;
+    }
+}
+
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result,
+                                             const cbm_mcp_index_request_facts_t *facts) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    /* The publication fence makes a limit-stopped attempt and a publication by
+     * that attempt mutually exclusive; an EARLIER attempt of the request may
+     * still have published (it crashed after committing), and an index that
+     * appeared during the request (artifact bootstrap) was not preserved. */
+    bool serving_index_preserved =
+        facts && facts->serving_index_existed && !facts->publication_committed &&
+        !worker_result->publication_committed && index_args_serving_index_servable(args);
+
+    const cbm_index_resource_violation_t *violation = &worker_result->resource_violation;
+    const char *config_key = cbm_index_resource_config_key(violation->resource);
+    char message[CBM_SZ_256];
+    (void)snprintf(message, sizeof(message),
+                   worker_result->resource_probe_failed
+                       ? "Worker resource measurement failed for %s"
+                       : "Index worker exceeded %s",
+                   config_key);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code",
+                           worker_result->resource_probe_failed ? "resource_probe_failed"
+                                                                : "resource_limit_exceeded");
+    yyjson_mut_obj_add_str(doc, root, "stage", "worker");
+    yyjson_mut_obj_add_str(doc, root, "resource", cbm_index_resource_name(violation->resource));
+    if (!worker_result->resource_probe_failed) {
+        yyjson_mut_obj_add_uint(doc, root, "observed", violation->observed);
+        yyjson_mut_obj_add_uint(doc, root, "limit", violation->limit);
+        yyjson_mut_obj_add_str(doc, root, "unit", cbm_index_resource_unit(violation->resource));
+    }
+    yyjson_mut_obj_add_bool(doc, root, "retryable", true);
+    yyjson_mut_obj_add_bool(doc, root, "serving_index_preserved", serving_index_preserved);
+    yyjson_mut_obj_add_strcpy(doc, root, "message", message);
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    return index_worker_json_result(doc, repo_path, NULL, NULL);
 }
 
 /* Drop the cached store so the next query reopens whatever the worker wrote (each
@@ -12159,6 +12746,9 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
         worker_result->supervision_failed) {
         return CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL;
     }
+    if (worker_result->resource_violation.resource != CBM_INDEX_RESOURCE_NONE) {
+        return CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE;
+    }
     if (worker_result->outcome == CBM_PROC_CLEAN) {
         return worker_result->response ? CBM_MCP_SUPERVISED_RESULT_SUCCESS
                                        : CBM_MCP_SUPERVISED_RESULT_FALLBACK;
@@ -12166,8 +12756,8 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
     return CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE;
 }
 
-static bool index_policy_from_worker_args(const char *args, cbm_index_resource_policy_t *policy,
-                                          char *error, size_t error_size) {
+bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
+                                             char *error, size_t error_size) {
     yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     yyjson_val *encoded =
@@ -12197,7 +12787,7 @@ static bool index_policy_from_worker_args(const char *args, cbm_index_resource_p
 static bool load_index_policy(cbm_mcp_server_t *srv, const char *args,
                               cbm_index_resource_policy_t *policy, char *error, size_t error_size) {
     if (cbm_index_worker_active()) {
-        return index_policy_from_worker_args(args, policy, error, error_size);
+        return cbm_mcp_index_policy_from_internal_args(args, policy, error, error_size);
     }
     cbm_config_t *owned_config = NULL;
     cbm_config_t *config = srv ? srv->config : NULL;
@@ -12307,16 +12897,26 @@ char *cbm_mcp_index_worker_no_response_failure(const char *args,
     return cbm_mcp_text_result(written ? json : hint, true);
 }
 
-static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
+                                  const cbm_index_resource_policy_t *resource_policy) {
     invalidate_cached_store(srv);
+    uint64_t request_started_ms = cbm_index_worker_now_ms();
+    /* Only an enabled worker limit can produce a worker resource failure, the
+     * one response these facts are reported in. */
+    cbm_mcp_index_request_facts_t facts = {0};
+    if (cbm_index_policy_worker_enabled(resource_policy)) {
+        cbm_mcp_index_request_facts_begin(args, &facts);
+    }
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
-    int rc = cbm_index_spawn_worker_with_log_cancel(
-        args, false, NULL, NULL, srv ? srv->index_log_callback : NULL,
-        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL, &wr);
+    int rc = cbm_index_spawn_worker_with_policy_log_cancel(
+        args, resource_policy, false, NULL, NULL, srv ? srv->index_log_callback : NULL,
+        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL,
+        request_started_ms, &wr);
     cbm_mcp_supervised_result_disposition_t disposition =
         cbm_mcp_supervised_result_disposition(rc, &wr);
+    cbm_mcp_index_request_facts_record(&facts, &wr);
 
     if (wr.response_missing) {
         /* #1300: a clean exit without a response is a named failure. */
@@ -12334,6 +12934,12 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
         char *failure =
             build_worker_unsafe_terminal_response(args, wr.outcome, wr.cancellation_requested);
+        cbm_index_worker_result_free(&wr);
+        invalidate_cached_store(srv);
+        return failure;
+    }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        char *failure = cbm_mcp_index_worker_resource_response(args, &wr, &facts);
         cbm_index_worker_result_free(&wr);
         invalidate_cached_store(srv);
         return failure;
@@ -12387,12 +12993,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     bool terminal_cancelled = false;
     for (int i = 0; i < cap; i++) {
         cbm_index_worker_result_t wr2;
-        int rc2 = cbm_index_spawn_worker_with_log_cancel(
-            args, /*single_thread=*/false, marker_path, quarantine_path,
+        int rc2 = cbm_index_spawn_worker_with_policy_log_cancel(
+            args, resource_policy, /*single_thread=*/false, marker_path, quarantine_path,
             srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
-            srv ? &srv->pipeline_cancel_requested : NULL, &wr2);
+            srv ? &srv->pipeline_cancel_requested : NULL, request_started_ms, &wr2);
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
+        cbm_mcp_index_request_facts_record(&facts, &wr2);
         if (wr2.response_missing) {
             /* #1300: a recovery run that exits cleanly without a response is
              * reported as such, not as a failed recovery start. */
@@ -12412,6 +13019,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             last_outcome = wr2.outcome;
             unsafe_terminal = true;
             terminal_cancelled = wr2.cancellation_requested;
+            cbm_index_worker_result_free(&wr2);
+            break;
+        }
+        if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+            resp = cbm_mcp_index_worker_resource_response(args, &wr2, &facts);
             cbm_index_worker_result_free(&wr2);
             break;
         }
@@ -12509,12 +13121,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
      * so it cannot itself hang. Rare given monotonic progress. */
     if (!resp && !unsafe_terminal && quarantined > 0) {
         cbm_index_worker_result_t wrp;
-        int rcp = cbm_index_spawn_worker_with_log_cancel(
-            args, /*single_thread=*/false, NULL, quarantine_path,
+        int rcp = cbm_index_spawn_worker_with_policy_log_cancel(
+            args, resource_policy, /*single_thread=*/false, NULL, quarantine_path,
             srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
-            srv ? &srv->pipeline_cancel_requested : NULL, &wrp);
+            srv ? &srv->pipeline_cancel_requested : NULL, request_started_ms, &wrp);
         cbm_mcp_supervised_result_disposition_t partial_disposition =
             cbm_mcp_supervised_result_disposition(rcp, &wrp);
+        cbm_mcp_index_request_facts_record(&facts, &wrp);
         if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
             resp = wrp.response; /* transfer ownership to caller */
             wrp.response = NULL;
@@ -12526,6 +13139,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             last_outcome = wrp.outcome;
             unsafe_terminal = true;
             terminal_cancelled = wrp.cancellation_requested;
+        } else if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+            resp = cbm_mcp_index_worker_resource_response(args, &wrp, &facts);
         }
         cbm_index_worker_result_free(&wrp);
     }
@@ -12573,7 +13188,7 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     if (!args) {
         return NULL;
     }
-    char *resp = index_run_supervised(srv, args);
+    char *resp = index_run_supervised(srv, args, &policy);
     free(args);
     return resp;
 }
@@ -12987,6 +13602,11 @@ static char *handle_index_repository_status(cbm_mcp_server_t *srv, const char *a
     return result ? result : cbm_mcp_text_result("index job status is unavailable", true);
 }
 
+static bool index_worker_publish_gate(void *context) {
+    (void)context;
+    return cbm_index_worker_claim_publication();
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     bool async_mode = false;
     bool status_mode = false;
@@ -13048,6 +13668,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                                     allowed_root, boundary_err, sizeof(boundary_err))) {
         index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(boundary_err, true);
+    }
+
+    /* ignore_worktrees: an EXPLICIT index_repository call on a linked worktree
+     * is refused with the two ways forward (per-call override, or turn the
+     * setting off) rather than silently skipped — a silent success would be
+     * indistinguishable from a real index to the caller. */
+    if (cbm_mcp_ignore_worktrees_enabled(srv) && !cbm_mcp_get_bool_arg(args, "index_worktree") &&
+        cbm_git_is_linked_worktree(repo_path)) {
+        index_args_free(repo_path, mode_str, name_override);
+        return cbm_mcp_text_result(
+            "repo_path is a linked git worktree and ignore_worktrees is enabled. Pass "
+            "index_worktree=true to index it anyway, or run: codebase-memory-mcp config set "
+            "ignore_worktrees false",
+            true);
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
@@ -13129,7 +13763,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             index_args_free(repo_path, mode_str, name_override);
             return cbm_mcp_text_result("failed to prepare supervised index request", true);
         }
-        char *supervised = index_run_supervised(srv, worker_args);
+        char *supervised = index_run_supervised(srv, worker_args, &resource_policy);
         free(worker_args);
         if (supervised) {
             free(mutation_project);
@@ -13191,6 +13825,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                                        project_has_committed_index(cbm_pipeline_project_name(p)));
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
+    if (cbm_index_worker_publish_fence()) {
+        /* Supervised worker with a worker limit: claim publication from the
+         * supervisor before the serving database is replaced. */
+        cbm_pipeline_set_publish_gate(p, index_worker_publish_gate, NULL);
+    }
     index_doc_candidates_apply(p, doc_candidates);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
@@ -17314,6 +17953,28 @@ static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
     uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
     bool git_child, cbm_proc_result_t *result_out);
 
+#ifndef _WIN32
+/* POSIX-only: supervised run of one argv stage (no shell). Same latch and
+ * containment contract as the shell runner; the measured file's size plus
+ * output_base counts toward output_limit so chained stages share one budget.
+ * tolerate_exit_one maps a plain exit-1 (grep's no-match) to SUCCESS. */
+static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
+    cbm_mcp_server_t *srv, const char *bin, const char *const *argv,
+    const char *const *env_overrides, const char *stdout_capture, uint64_t output_base,
+    size_t output_limit, uint64_t deadline_ms, bool deadline_enabled, bool tolerate_exit_one,
+    bool *cancellation_latched, bool *deadline_latched, bool *output_limit_latched,
+    cbm_proc_result_t *result_out);
+
+/* POSIX-only: the unscoped search_code scan as find/sort argv stages feeding the
+ * in-process scanner. */
+static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
+                                                 const char *file_pattern, const char *pattern,
+                                                 const char *filelist, const char *root_path,
+                                                 char output_path[CBM_SZ_2K], size_t output_limit,
+                                                 uint64_t deadline_ms, bool deadline_latched,
+                                                 cbm_proc_result_t *result_out);
+#endif
+
 static char *search_code_timeout_result(void) {
     static const char message[] = "search_code scan exceeded its execution deadline";
     static const char fallback[] =
@@ -17713,10 +18374,22 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                 scan_cause = MCP_SCAN_COMMAND_FAILURE;
             }
         } else {
-            scan_cause = mcp_run_shell_command_cancellable_bounded(
-                srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
-                scan_deadline_latched, /*exit_one_is_no_match=*/false, /*git_child=*/false,
-                &scan_result);
+#ifndef _WIN32
+            if (!srv->search_scan_command_override) {
+                /* POSIX unscoped scans run as find/sort/grep argv stages: no
+                 * shell parses search scopes or file patterns anymore (#2634).
+                 * The command override keeps the shell runner for tests. */
+                scan_cause = mcp_run_search_scan_argv(
+                    srv, use_regex, file_pattern, pattern, filelist, root_path, output_path,
+                    scan_output_limit, scan_deadline_ms, scan_deadline_latched, &scan_result);
+            } else
+#endif
+            {
+                scan_cause = mcp_run_shell_command_cancellable_bounded(
+                    srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
+                    scan_deadline_latched, /*exit_one_is_no_match=*/false, /*git_child=*/false,
+                    &scan_result);
+            }
         }
         /* Both POSIX commands wrap grep and map its no-match status to 0, so any
          * non-zero exit (a failed find/sort, an unreadable operand, a broken
@@ -18235,6 +18908,165 @@ static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *
      * success; only spawn/rejection or failed supervision is a wrapper error. */
     return cause == MCP_SCAN_COMMAND_FAILURE || cause == MCP_SCAN_SUPERVISION_FAILURE ? -1 : 0;
 }
+
+#ifndef _WIN32
+/* Latch poll shared by argv stages: request-cancellation, wall-clock deadline,
+ * and the cumulative measured-file output budget. Mirrors the latch updates of
+ * the shell runner so both paths fail the same way. */
+static void mcp_argv_stage_poll_latches(cbm_mcp_server_t *srv, const char *measured_path,
+                                        uint64_t output_base, size_t output_limit,
+                                        uint64_t deadline_ms, bool deadline_enabled,
+                                        bool *cancellation_latched, bool *deadline_latched,
+                                        bool *output_limit_latched) {
+    *cancellation_latched = *cancellation_latched || mcp_request_cancelled(srv);
+    *deadline_latched = *deadline_latched || (deadline_enabled && cbm_now_ms() >= deadline_ms);
+    if (!*output_limit_latched && output_limit > 0 && measured_path && measured_path[0]) {
+        int64_t measured_size = cbm_file_size(measured_path);
+        *output_limit_latched =
+            measured_size > 0 && output_base + (uint64_t)measured_size > output_limit;
+    }
+}
+
+static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
+    cbm_mcp_server_t *srv, const char *bin, const char *const *argv,
+    const char *const *env_overrides, const char *stdout_capture, uint64_t output_base,
+    size_t output_limit, uint64_t deadline_ms, bool deadline_enabled, bool tolerate_exit_one,
+    bool *cancellation_latched, bool *deadline_latched, bool *output_limit_latched,
+    cbm_proc_result_t *result_out) {
+    memset(result_out, 0, sizeof(*result_out));
+    mcp_argv_stage_poll_latches(srv, stdout_capture, output_base, output_limit, deadline_ms,
+                                deadline_enabled, cancellation_latched, deadline_latched,
+                                output_limit_latched);
+    if (*cancellation_latched || *deadline_latched || *output_limit_latched) {
+        result_out->tree_quiesced = true; /* no child was spawned */
+        if (*cancellation_latched) {
+            return MCP_SCAN_CANCELLED;
+        }
+        return *deadline_latched ? MCP_SCAN_DEADLINE : MCP_SCAN_OUTPUT_LIMIT;
+    }
+    cbm_proc_opts_t options = {
+        .bin = bin,
+        .argv = argv,
+        .env_overrides = env_overrides,
+        .log_file = NULL,
+        .quiet_timeout_ms = 0,
+        .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
+        .delete_log_on_exit = false,
+        .strip_git_repo_env = false,
+        .stdout_file = stdout_capture,
+    };
+    cbm_subprocess_t *process = NULL;
+    if (cbm_subprocess_spawn(&options, &process) != 0) {
+        result_out->tree_quiesced = true;
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    cbm_proc_poll_t state;
+    for (;;) {
+        mcp_argv_stage_poll_latches(srv, stdout_capture, output_base, output_limit, deadline_ms,
+                                    deadline_enabled, cancellation_latched, deadline_latched,
+                                    output_limit_latched);
+        if (*cancellation_latched || *deadline_latched || *output_limit_latched) {
+            (void)cbm_subprocess_request_cancel(process);
+        }
+        state = cbm_subprocess_poll(process, result_out);
+        if (state != CBM_PROC_POLL_RUNNING) {
+            break;
+        }
+        cbm_usleep(10000);
+    }
+    bool contained = state == CBM_PROC_POLL_TERMINAL && result_out->tree_quiesced &&
+                     !result_out->supervision_failed;
+    cbm_subprocess_destroy(process);
+    mcp_argv_stage_poll_latches(srv, stdout_capture, output_base, output_limit, deadline_ms,
+                                deadline_enabled, cancellation_latched, deadline_latched,
+                                output_limit_latched);
+    if (!contained) {
+        return MCP_SCAN_SUPERVISION_FAILURE;
+    }
+    if (*cancellation_latched) {
+        return MCP_SCAN_CANCELLED;
+    }
+    if (*deadline_latched) {
+        return MCP_SCAN_DEADLINE;
+    }
+    if (*output_limit_latched) {
+        return MCP_SCAN_OUTPUT_LIMIT;
+    }
+    if (tolerate_exit_one && result_out->outcome == CBM_PROC_EXIT_NONZERO &&
+        result_out->exit_code == 1) {
+        return MCP_SCAN_SUCCESS; /* ordinary grep no-match */
+    }
+    return result_out->outcome == CBM_PROC_CLEAN ? MCP_SCAN_SUCCESS
+                                                 : MCP_SCAN_CONTAINED_COMMAND_FAILURE;
+}
+
+/* The unscoped (unindexed or not-fully-indexed root) search_code scan with no
+ * shell anywhere: find writes the NUL-delimited candidate list and LC_ALL=C
+ * sort orders it in place, both as argv stages, then the list feeds the
+ * in-process scanner (search_scan_in_process). Search scopes and file patterns
+ * reach find as plain arguments instead of shell-string interpolations (#2634).
+ * find/sort failures fail closed, and an empty list is a successful empty
+ * scan. */
+static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
+                                                 const char *file_pattern, const char *pattern,
+                                                 const char *filelist, const char *root_path,
+                                                 char output_path[CBM_SZ_2K], size_t output_limit,
+                                                 uint64_t deadline_ms, bool deadline_latched,
+                                                 cbm_proc_result_t *result_out) {
+    bool cancellation_latched = false;
+    bool output_limit_latched = false;
+
+    const char *find_argv[9];
+    int fa = 0;
+    find_argv[fa++] = "find";
+    find_argv[fa++] = root_path;
+    find_argv[fa++] = "-type";
+    find_argv[fa++] = "f";
+    if (file_pattern) {
+        find_argv[fa++] = "-name";
+        find_argv[fa++] = file_pattern;
+    }
+    find_argv[fa++] = "-print0";
+    find_argv[fa] = NULL;
+    mcp_scan_cause_t cause = mcp_run_argv_stage_cancellable_bounded(
+        srv, "find", find_argv, NULL, filelist, 0, 0, deadline_ms, true, false,
+        &cancellation_latched, &deadline_latched, &output_limit_latched, result_out);
+    if (cause != MCP_SCAN_SUCCESS) {
+        return cause;
+    }
+
+    const char *sort_argv[] = {"sort", "-z", "-o", filelist, filelist, NULL};
+    const char *sort_env[] = {"LC_ALL=C", NULL};
+    cause = mcp_run_argv_stage_cancellable_bounded(
+        srv, "sort", sort_argv, sort_env, NULL, 0, 0, deadline_ms, true, false,
+        &cancellation_latched, &deadline_latched, &output_limit_latched, result_out);
+    if (cause != MCP_SCAN_SUCCESS) {
+        return cause;
+    }
+
+    if (!mcp_command_output_path(output_path)) {
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    FILE *out = cbm_fopen(output_path, "wb");
+    if (!out) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    /* The sorted, NUL-separated file list feeds the same in-process scanner an
+     * indexed project uses, so matching has one implementation. */
+    mcp_scan_cause_t scan_cause =
+        search_scan_in_process(srv, filelist, pattern, use_regex, out, output_limit, deadline_ms);
+    if (fclose(out) != 0 && scan_cause == MCP_SCAN_SUCCESS) {
+        scan_cause = MCP_SCAN_COMMAND_FAILURE;
+    }
+    if (scan_cause != MCP_SCAN_SUCCESS) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+    }
+    return scan_cause;
+}
+#endif
 
 /* Does `node`'s line range overlap any recorded hunk for `file`? Used to scope
  * seed detection to the actually-changed lines rather than the whole file.
@@ -21551,6 +22383,44 @@ static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
     return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, true);
 }
 
+/* ignore_worktrees config: gates automatic indexing of LINKED git worktrees
+ * (default off, so existing setups keep indexing them). Users who create many
+ * short-lived worktrees can stop each throwaway checkout from registering a
+ * new permanent project with `config set ignore_worktrees true`. */
+bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv) {
+    if (!srv || !srv->config) {
+        return false; /* default off */
+    }
+    return cbm_config_get_bool(srv->config, CBM_CONFIG_IGNORE_WORKTREES, false);
+}
+
+/* The same key for a caller whose server may have no store: the stand-alone
+ * lifecycle hook builds one with cbm_mcp_server_new(NULL), and the daemon lends
+ * its session server, which this must not modify. A server with a store answers
+ * from it. Otherwise the runtime store is opened only to read this key, and only
+ * when it exists: a missing store leaves every key at its default, so this read
+ * never creates one. */
+bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv) {
+    if (srv && srv->config) {
+        return cbm_mcp_ignore_worktrees_enabled(srv);
+    }
+    const char *store_dir = cbm_resolve_cache_dir();
+    if (!store_dir) {
+        return false;
+    }
+    char store_path[CBM_SZ_4K];
+    int written = snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, store_dir);
+    cbm_path_info_t info;
+    if (written < 0 || (size_t)written >= sizeof(store_path) ||
+        cbm_path_info_utf8(store_path, &info) != CBM_PATH_INFO_OK || !info.is_regular) {
+        return false;
+    }
+    cbm_config_t *config = cbm_config_open(store_dir);
+    bool enabled = config && cbm_config_get_bool(config, CBM_CONFIG_IGNORE_WORKTREES, false);
+    cbm_config_close(config);
+    return enabled;
+}
+
 /* Register the session project with the background watcher for ongoing
  * change detection — unless auto_watch is disabled. */
 static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
@@ -21702,6 +22572,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
                      "run: codebase-memory-mcp config set auto_index true");
+        return;
+    }
+
+    if (cbm_mcp_ignore_worktrees_enabled(srv) && cbm_git_is_linked_worktree(srv->session_root)) {
+        cbm_log_info("autoindex.skip", "reason", "linked_worktree", "project",
+                     srv->session_project);
         return;
     }
 

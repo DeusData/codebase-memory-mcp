@@ -18,6 +18,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <git/git_context.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <mcp/mcp_internal.h>
@@ -1211,6 +1212,57 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
     free(json);
     cbm_cli_set_version("dev");
+    PASS();
+}
+
+/* The lifecycle hook reads ignore_worktrees through this reader. It must never
+ * attach a store to the server (the daemon lends its session server) and never
+ * create the runtime store; a server with its own store answers from it. */
+TEST(mcp_ignore_worktrees_runtime_read_leaves_server_and_store_alone) {
+    char *raw = th_mktempdir("cbm_mcp_runtime_config");
+    ASSERT_NOT_NULL(raw);
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", raw);
+    char own_dir[320];
+    snprintf(own_dir, sizeof(own_dir), "%s/own", cache);
+    char store_path[400];
+    snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    struct stat st;
+    bool absent_off = server && !cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    bool still_absent = stat(store_path, &st) != 0;
+
+    cbm_config_t *runtime = cbm_config_open(cache);
+    bool stored = runtime && cbm_config_set(runtime, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(runtime);
+    bool runtime_on = server && cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    bool server_untouched = server && !cbm_mcp_ignore_worktrees_enabled(server);
+
+    cbm_config_t *own = cbm_config_open(own_dir);
+    if (server && own) {
+        cbm_mcp_server_set_config(server, own);
+    }
+    bool own_store_wins = server && own && !cbm_mcp_ignore_worktrees_runtime_enabled(server);
+    if (server) {
+        cbm_mcp_server_set_config(server, NULL);
+    }
+    cbm_mcp_server_free(server);
+    cbm_config_close(own);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    int removed = th_rmtree(cache);
+
+    ASSERT(absent_off);
+    ASSERT(still_absent);
+    ASSERT(stored);
+    ASSERT(runtime_on);
+    ASSERT(server_untouched);
+    ASSERT(own_store_wins);
+    ASSERT_EQ(removed, 0);
     PASS();
 }
 
@@ -3220,6 +3272,75 @@ static yyjson_val *trace_grouped_row_named(yyjson_val *leg, const char *name,
         }
     }
     return NULL;
+}
+
+TEST(tool_swift_overload_presentation_issue2061) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "swift-overloads";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/swift-overloads"), CBM_STORE_OK);
+    const char *names[] = {"work", "work", "target", "onlyCallsOverloadB"};
+    const char *qns[] = {
+        "swift-overloads.Service.work(flag:Bool)", "swift-overloads.Service.work(name:String)",
+        "swift-overloads.Sink.target()", "swift-overloads.Caller.onlyCallsOverloadB()"};
+    int64_t ids[4];
+    for (int i = 0; i < 4; i++) {
+        cbm_node_t node = {.project = project,
+                           .label = "Method",
+                           .name = names[i],
+                           .qualified_name = qns[i],
+                           .file_path = "Sources/Service.swift",
+                           .start_line = i == 0 ? 5 : 10,
+                           .end_line = i == 0 ? 7 : 12};
+        ids[i] = cbm_store_upsert_node(store, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    cbm_edge_t flag = {
+        .project = project, .source_id = ids[0], .target_id = ids[2], .type = "CALLS"};
+    cbm_edge_t name = {
+        .project = project, .source_id = ids[3], .target_id = ids[1], .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &flag), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &name), 0);
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"swift-overloads\",\"name_pattern\":\"^work$\","
+                            "\"format\":\"json\"}");
+    char *text = extract_text_content(response);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 2);
+    const char *prefix = NULL;
+    yyjson_val *row = trace_grouped_row_named(root, "work(flag:Bool)", &prefix);
+    ASSERT_NOT_NULL(row);
+    ASSERT_STR_EQ(prefix, "swift-overloads.Service");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 2)), "5-7");
+    row = trace_grouped_row_named(root, "work(name:String)", NULL);
+    ASSERT_NOT_NULL(row);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 2)), "10-12");
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    response = cbm_mcp_handle_tool(srv, "trace_path",
+                                   "{\"project\":\"swift-overloads\",\"function_name\":\"target\","
+                                   "\"direction\":\"inbound\",\"depth\":3,\"format\":\"json\"}");
+    text = extract_text_content(response);
+    ASSERT_NOT_NULL(text);
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callers_total")), 1);
+    row = trace_grouped_row_named(yyjson_obj_get(root, "callers"), "work(flag:Bool)", NULL);
+    ASSERT_NOT_NULL(row);
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(row, 1)), 1);
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
 }
 
 /* callers_total/callees_total must count what the caller can enumerate: with
@@ -7839,9 +7960,465 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════
- *  TOOL HANDLERS WITH DATA
- * ══════════════════════════════════════════════════════════════════ */
+/* BT-240 RED: a live checkout SHA is not proof of the generation that produced
+ * graph content. Older databases lack an indexed-checkout identity, so verbose
+ * status must fail closed as unknown while exposing graph generation
+ * separately. */
+TEST(tool_index_status_fails_closed_without_indexed_checkout_identity) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"test-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_generation\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":null"));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_unavailable"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* BT-240 lean-default guard: the freshness verdict is diagnostics — a
+ * report-only signal that never auto-indexes — so it must stay out of the
+ * common (non-verbose) status call. */
+TEST(tool_index_status_omits_freshness_by_default) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"test-project\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
+    ASSERT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_sha"));
+    /* BT-240 increment 3: the worktree-status snapshot is part of the
+     * verbose-only freshness block and must not leak into the default call. */
+    ASSERT_NULL(strstr(inner, "status_available"));
+    ASSERT_NULL(strstr(inner, "tracked_changes"));
+    ASSERT_NULL(strstr(inner, "untracked_source"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── BT-240: freshness verdict against the recorded indexed checkout ──
+ * These shell out to git via cbm_popen (the same isolated spawn production
+ * git_context uses) rather than system(), so they run on every platform that
+ * has git on PATH — Windows CI included. A genuinely missing git is the only
+ * skip. */
+
+static int mcp_git_run(const char *dir, const char *args) {
+    char cmd[1024];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", dir, args, null_dev);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return -1;
+    }
+    char drain[256];
+    while (fgets(drain, sizeof(drain), fp)) {
+    }
+    return cbm_pclose(fp);
+}
+
+static int mcp_make_git_repo(const char *dir) {
+    if (th_mkdir_p(dir) != 0) return -1;
+    if (mcp_git_run(dir, "init -q") != 0) return -1;
+    if (mcp_git_run(dir, "config user.email test@example.com") != 0) return -1;
+    if (mcp_git_run(dir, "config user.name Test") != 0) return -1;
+    if (th_write_file(TH_PATH(dir, ".keep"), "") != 0) return -1;
+    if (mcp_git_run(dir, "add -A") != 0) return -1;
+    if (mcp_git_run(dir, "commit -qm init") != 0) return -1;
+    return 0;
+}
+
+/* Helper: build a server whose project root is the given git repo and whose
+ * coverage metadata records indexed_checkout_sha = sha (may be NULL). */
+static cbm_mcp_server_t *mcp_freshness_server(const char *repo, const char *sha) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) return NULL;
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_mcp_server_set_project(srv, "fresh-project");
+    cbm_store_upsert_project(st, "fresh-project", repo);
+    cbm_coverage_meta_t meta = {
+        .generation = "fresh-generation",
+        .index_mode = "fast",
+        .recorded_at = "2026-08-11T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+        .indexed_checkout_sha = sha,
+    };
+    if (cbm_store_coverage_replace_ex(st, "fresh-project", NULL, 0, &meta) != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"current\""));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_current"));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"use_graph\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status_available\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    /* A stale recorded identity that does not equal the live HEAD. */
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, "0000000000000000000000000000000000000000");
+    if (!srv) {
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_mismatch"));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\"0000000000000000000000000000000000000000\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"reindex_to_match_checkout\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: a modified tracked file makes the verdict stale even
+ * when the indexed SHA matches the live HEAD, with the sample surfaced. */
+TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
+        mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
+        mcp_git_run(repo, "commit -q -m add-tracked") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to commit tracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v2") != 0) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("failed to modify tracked file");
+    }
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "tracked_changes_present"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"paths\":[\"tracked.txt\"]"));
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":false"));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: untracked sources prevent "current" — verdict is
+ * unknown (no stale reason), with the untracked_not_indexed reason. */
+TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "newfile.txt"), "n") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to create untracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "untracked_not_indexed"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":1"));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: tracked changes win over untracked — both reasons are
+ * present but the verdict is stale, never unknown. */
+TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
+        mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
+        mcp_git_run(repo, "commit -q -m add-tracked") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to commit tracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v2") != 0 ||
+        th_write_file(TH_PATH(repo, "untracked.txt"), "n") != 0) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("failed to prepare mixed worktree");
+    }
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "tracked_changes_present"));
+    ASSERT_NOT_NULL(strstr(inner, "untracked_not_indexed"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: a non-git root with a recorded identity cannot prove
+ * current — status availability must be false and the verdict unknown. */
+TEST(tool_index_status_freshness_status_unavailable_non_git) {
+    char *repo = th_mktempdir("cbm_fresh_non_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+
+    /* Record an identity even though the root is not a git repository. */
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, "0123456789012345678901234567890123456789");
+    if (!srv) {
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status_available\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "status_unavailable"));
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: sample cap at the MCP layer — many untracked sources
+ * surface the true count, a bounded paths array and truncated=true. */
+TEST(tool_index_status_freshness_sample_cap_truncates) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    enum { N_FILES = 17, MCP_SAMPLE_MAX = 16 };
+    for (int i = 0; i < N_FILES; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/u%02d.txt", repo, i);
+        if (th_write_file(path, "u") != 0) {
+            th_rmtree(repo);
+            FAIL("failed to create untracked file");
+        }
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"fresh-project\",\"verbose\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":17"));
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
+    static const char EXPECTED_PATHS[] =
+        "\"paths\":[\"u00.txt\",\"u01.txt\",\"u02.txt\",\"u03.txt\",\"u04.txt\",\"u05.txt\","
+        "\"u06.txt\",\"u07.txt\",\"u08.txt\",\"u09.txt\",\"u10.txt\",\"u11.txt\",\"u12.txt\","
+        "\"u13.txt\",\"u14.txt\",\"u15.txt\"]";
+    ASSERT_NOT_NULL(strstr(inner, EXPECTED_PATHS));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
 
 /* #2816: stored recursion must remain visible even when the CALLS graph has
  * no self-edges. Removing metadata emission must fail these assertions. */
@@ -8274,6 +8851,418 @@ TEST(tool_trace_union_records_min_hop_across_seeds) {
     ASSERT_NULL(strstr(inner, "dualproj.c.tgt 2"));
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* include_overrides fixture (#1271): run_local calls two contracts.
+ * LocalProcessor.process is overridden by Alpha and Beta, and Alpha's by
+ * Gamma -- two levels, since an OVERRIDE edge points at the nearest declaring
+ * ancestor only. A test-file Mock overrides the contract too, and so does an
+ * infra Variable (a tfvars/kustomize-style OVERRIDE). Sink.write has one
+ * implementation. Other.process is never called, so its implementation never
+ * appears. */
+static int64_t ov_node(cbm_store_t *store, const char *project, const char *label, const char *name,
+                       const char *qn, const char *file) {
+    cbm_node_t n = {.project = project,
+                    .label = label,
+                    .name = name,
+                    .qualified_name = qn,
+                    .file_path = file,
+                    .start_line = 1,
+                    .end_line = 3};
+    return cbm_store_upsert_node(store, &n);
+}
+
+static bool ov_edge(cbm_store_t *store, const char *project, int64_t src, int64_t dst,
+                    const char *type) {
+    cbm_edge_t e = {.project = project, .source_id = src, .target_id = dst, .type = type};
+    return src > 0 && dst > 0 && cbm_store_insert_edge(store, &e) > 0;
+}
+
+static cbm_mcp_server_t *ov_fixture(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *p = "dispatch-fixture";
+    cbm_mcp_server_set_project(srv, p);
+    if (cbm_store_upsert_project(st, p, "/tmp/dispatch-fixture") != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    const char *src = "src/fixture.py";
+    int64_t caller = ov_node(st, p, "Function", "run_local", "dispatch_fixture.run_local", src);
+    int64_t contract =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalProcessor.process", src);
+    int64_t sink = ov_node(st, p, "Method", "write", "dispatch_fixture.Sink.write", src);
+    int64_t alpha =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalAlphaProcessor.process", src);
+    int64_t beta =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalBetaProcessor.process", src);
+    int64_t gamma =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalGammaProcessor.process", src);
+    int64_t mock = ov_node(st, p, "Method", "process",
+                           "dispatch_fixture.tests.MockProcessor.process", "tests/test_fixture.py");
+    int64_t var =
+        ov_node(st, p, "Variable", "process", "dispatch_fixture.env.process", "env/prod.tfvars");
+    int64_t file_sink = ov_node(st, p, "Method", "write", "dispatch_fixture.FileSink.write", src);
+    int64_t other = ov_node(st, p, "Method", "process", "dispatch_fixture.Other.process", src);
+    int64_t other_impl =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.OtherImpl.process", src);
+    bool ok =
+        ov_edge(st, p, caller, contract, "CALLS") && ov_edge(st, p, caller, sink, "CALLS") &&
+        ov_edge(st, p, alpha, contract, "OVERRIDE") && ov_edge(st, p, beta, contract, "OVERRIDE") &&
+        ov_edge(st, p, gamma, alpha, "OVERRIDE") && ov_edge(st, p, mock, contract, "OVERRIDE") &&
+        ov_edge(st, p, var, contract, "OVERRIDE") && ov_edge(st, p, file_sink, sink, "OVERRIDE") &&
+        ov_edge(st, p, other_impl, other, "OVERRIDE");
+    if (!ok) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+/* One trace_path call on the fixture's run_local; `extra` is appended to the
+ * arguments object. Returns the tool's text content. */
+static char *ov_trace(cbm_mcp_server_t *srv, const char *extra) {
+    char args[640];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"dispatch-fixture\",\"function_name\":\"run_local\","
+             "\"direction\":\"outbound\",\"depth\":1%s}",
+             extra);
+    char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+    char *inner = extract_text_content(response);
+    free(response);
+    return inner;
+}
+
+/* The implementations listed for one contract in a JSON possible_callees. */
+static yyjson_val *ov_implementations(yyjson_val *possible, const char *contract) {
+    size_t i;
+    size_t max;
+    yyjson_val *entry;
+    yyjson_arr_foreach(possible, i, max, entry) {
+        const char *name = yyjson_get_str(yyjson_obj_get(entry, "contract"));
+        if (name && strcmp(name, contract) == 0) {
+            return yyjson_obj_get(entry, "implementations");
+        }
+    }
+    return NULL;
+}
+
+static bool ov_lists(yyjson_val *implementations, const char *qn) {
+    size_t i;
+    size_t max;
+    yyjson_val *impl;
+    yyjson_arr_foreach(implementations, i, max, impl) {
+        if (yyjson_is_str(impl) && strcmp(yyjson_get_str(impl), qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* include_overrides lists possible runtime implementations apart from the
+ * declared CALLS targets, which stay what they are; nothing is written to the
+ * index, and without the flag the response is the one before it existed. */
+TEST(tool_trace_path_possible_callees_stay_apart_from_calls) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    char *inner = ov_trace(srv, ",\"include_overrides\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 2);
+    yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+    ASSERT_TRUE(yyjson_is_arr(possible));
+    ASSERT_EQ(yyjson_arr_size(possible), 2);
+    yyjson_val *processors =
+        ov_implementations(possible, "dispatch_fixture.LocalProcessor.process");
+    ASSERT_NOT_NULL(processors);
+    ASSERT_TRUE(ov_lists(processors, "dispatch_fixture.LocalAlphaProcessor.process"));
+    ASSERT_TRUE(ov_lists(processors, "dispatch_fixture.LocalBetaProcessor.process"));
+    yyjson_val *sinks = ov_implementations(possible, "dispatch_fixture.Sink.write");
+    ASSERT_NOT_NULL(sinks);
+    ASSERT_EQ(yyjson_arr_size(sinks), 1);
+    ASSERT_TRUE(ov_lists(sinks, "dispatch_fixture.FileSink.write"));
+    ASSERT_NULL(strstr(inner, "dispatch_fixture.OtherImpl.process"));
+    ASSERT_EQ(cbm_store_count_edges_by_type(st, "dispatch-fixture", "CALLS"), 2);
+    ASSERT_EQ(cbm_store_count_edges_by_type(st, "dispatch-fixture", "OVERRIDE"), 7);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    char *by_default = ov_trace(srv, ",\"format\":\"json\"");
+    char *off = ov_trace(srv, ",\"include_overrides\":false,\"format\":\"json\"");
+    ASSERT_NOT_NULL(by_default);
+    ASSERT_NOT_NULL(off);
+    ASSERT_NULL(strstr(by_default, "possible_callees"));
+    ASSERT_STR_EQ(by_default, off);
+    free(by_default);
+    free(off);
+    char *tree_default = ov_trace(srv, "");
+    ASSERT_NOT_NULL(tree_default);
+    ASSERT_NULL(strstr(tree_default, "possible_callees"));
+    free(tree_default);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An OVERRIDE edge names the nearest declaring ancestor only, so the walk is
+ * transitive: Gamma overrides Alpha, which overrides the contract, and Gamma
+ * is a possible callee of the contract too. */
+TEST(tool_trace_path_possible_callees_follow_the_hierarchy) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    char *inner = ov_trace(srv, ",\"include_overrides\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *possible = yyjson_obj_get(yyjson_doc_get_root(doc), "possible_callees");
+    yyjson_val *processors =
+        ov_implementations(possible, "dispatch_fixture.LocalProcessor.process");
+    ASSERT_NOT_NULL(processors);
+    ASSERT_TRUE(ov_lists(processors, "dispatch_fixture.LocalGammaProcessor.process"));
+    ASSERT_EQ(yyjson_arr_size(processors), 3);
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Test-file implementations follow include_tests like every trace row; an
+ * OVERRIDE edge from something that is not callable (a tfvars variable) is
+ * never a possible callee. */
+TEST(tool_trace_path_possible_callees_filter_tests_and_non_callables) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    const char *mock = "dispatch_fixture.tests.MockProcessor.process";
+    const char *var = "dispatch_fixture.env.process";
+    char *inner = ov_trace(srv, ",\"include_overrides\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, mock));
+    ASSERT_NULL(strstr(inner, var));
+    free(inner);
+    inner = ov_trace(srv, ",\"include_overrides\":true,\"include_tests\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *possible = yyjson_obj_get(yyjson_doc_get_root(doc), "possible_callees");
+    yyjson_val *processors =
+        ov_implementations(possible, "dispatch_fixture.LocalProcessor.process");
+    ASSERT_NOT_NULL(processors);
+    ASSERT_TRUE(ov_lists(processors, mock));
+    ASSERT_FALSE(ov_lists(processors, var));
+    ASSERT_EQ(yyjson_arr_size(processors), 4);
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The tree format lists possible callees as a tree table, one row per
+ * (contract, implementation), like every other section. */
+TEST(tool_trace_path_possible_callees_render_as_tree_table) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    char *tree = ov_trace(srv, ",\"include_overrides\":true");
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "possible_callees: 4  (cols: contract implementation)\n"));
+    ASSERT_NULL(strstr(tree, "possible_callees: ["));
+    ASSERT_NOT_NULL(strstr(tree, "dispatch_fixture.LocalGammaProcessor.process"));
+    ASSERT_NOT_NULL(strstr(tree, "dispatch_fixture.FileSink.write"));
+    free(tree);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Possible callees belong to the rows a page emits: with limit 1 each page
+ * lists the implementations of its own callee only, so every implementation
+ * is reported exactly once across the pages. */
+TEST(tool_trace_path_possible_callees_follow_the_page) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    char *first = ov_trace(srv, ",\"include_overrides\":true,\"limit\":1,\"format\":\"json\"");
+    ASSERT_NOT_NULL(first);
+    yyjson_doc *doc = yyjson_read(first, strlen(first), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+    ASSERT_TRUE(yyjson_is_arr(possible));
+    ASSERT_EQ(yyjson_arr_size(possible), 1);
+    ASSERT_NOT_NULL(ov_implementations(possible, "dispatch_fixture.LocalProcessor.process"));
+    const char *cursor = yyjson_get_str(yyjson_obj_get(root, "next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+    char extra[320];
+    snprintf(extra, sizeof(extra),
+             ",\"include_overrides\":true,\"limit\":1,\"format\":\"json\",\"cursor\":\"%s\"",
+             cursor);
+    yyjson_doc_free(doc);
+    ASSERT_NULL(strstr(first, "dispatch_fixture.FileSink.write"));
+    free(first);
+
+    char *second = ov_trace(srv, extra);
+    ASSERT_NOT_NULL(second);
+    doc = yyjson_read(second, strlen(second), 0);
+    ASSERT_NOT_NULL(doc);
+    possible = yyjson_obj_get(yyjson_doc_get_root(doc), "possible_callees");
+    ASSERT_TRUE(yyjson_is_arr(possible));
+    ASSERT_EQ(yyjson_arr_size(possible), 1);
+    yyjson_val *sinks = ov_implementations(possible, "dispatch_fixture.Sink.write");
+    ASSERT_NOT_NULL(sinks);
+    ASSERT_TRUE(ov_lists(sinks, "dispatch_fixture.FileSink.write"));
+    ASSERT_NULL(strstr(second, "dispatch_fixture.LocalAlphaProcessor.process"));
+    yyjson_doc_free(doc);
+    free(second);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Only a call through an instance receiver can run an override. A super()
+ * call is bound to the parent, and a call on a freshly constructed object
+ * runs that class's own method, so neither lists implementations; a self
+ * call does. */
+TEST(tool_trace_path_possible_callees_only_for_dispatching_calls) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *p = "dispatch-fixture";
+    const char *src = "src/fixture.py";
+    cbm_node_t contract = {0};
+    ASSERT_EQ(
+        cbm_store_find_node_by_qn(st, p, "dispatch_fixture.LocalProcessor.process", &contract),
+        CBM_STORE_OK);
+    static const struct {
+        const char *caller;
+        const char *callee;
+        bool lists;
+    } cases[] = {
+        {"reset_local", "super().process", false},
+        {"build_local", "ProcessorFactory().process", false},
+        {"step_local", "self.process", true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char qn[96];
+        snprintf(qn, sizeof(qn), "dispatch_fixture.%s", cases[i].caller);
+        int64_t caller = ov_node(st, p, "Function", cases[i].caller, qn, src);
+        ASSERT_GT(caller, 0);
+        char props[128];
+        snprintf(props, sizeof(props), "{\"callee\":\"%s\"}", cases[i].callee);
+        cbm_edge_t call = {.project = p,
+                           .source_id = caller,
+                           .target_id = contract.id,
+                           .type = "CALLS",
+                           .properties_json = props};
+        ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+        char args[320];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"dispatch-fixture\",\"function_name\":\"%s\","
+                 "\"direction\":\"outbound\",\"depth\":1,\"include_overrides\":true,"
+                 "\"format\":\"json\"}",
+                 cases[i].caller);
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 1);
+        yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+        ASSERT_TRUE(yyjson_is_arr(possible));
+        ASSERT_EQ(yyjson_arr_size(possible), cases[i].lists ? 1U : 0U);
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    cbm_node_free_fields(&contract);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* include_overrides joins the cursor identity only when it is set. Without
+ * it the token is the one main minted before the flag existed (the qhash
+ * below is main's formula for this request), so default output and cursors
+ * already handed out survive the upgrade; with it, the token differs. */
+TEST(tool_trace_path_include_overrides_keeps_cursor_identity) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    static const char *const variants[] = {
+        ",\"limit\":1,\"format\":\"json\"",
+        ",\"limit\":1,\"include_overrides\":false,\"format\":\"json\"",
+        ",\"limit\":1,\"include_overrides\":true,\"format\":\"json\"",
+    };
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+        char *inner = ov_trace(srv, variants[i]);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        const char *cursor =
+            yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "next_cursor"));
+        ASSERT_NOT_NULL(cursor);
+        bool mains_token = strstr(cursor, ".6965863f18fa7040.") != NULL;
+        ASSERT_TRUE(mains_token == (i < 2));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* possible_callees is optional output: under max_output_tokens it yields
+ * before any graph row and says so, in both formats. */
+TEST(tool_trace_path_possible_callees_yield_first_under_budget) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *p = "override-budget";
+    cbm_mcp_server_set_project(srv, p);
+    ASSERT_EQ(cbm_store_upsert_project(st, p, "/tmp/override-budget"), CBM_STORE_OK);
+    int64_t hub = ov_node(st, p, "Function", "hub", "override_budget.hub", "src/hub.py");
+    int64_t base = ov_node(st, p, "Method", "run", "override_budget.Base.run", "src/hub.py");
+    ASSERT_TRUE(ov_edge(st, p, hub, base, "CALLS"));
+    enum { IMPLEMENTATIONS = 60 };
+    for (int i = 0; i < IMPLEMENTATIONS; i++) {
+        char qn[160];
+        snprintf(qn, sizeof(qn),
+                 "override_budget.implementations.with.a.rather.long.package.path.Impl%02d.run", i);
+        int64_t impl = ov_node(st, p, "Method", "run", qn, "src/impls.py");
+        ASSERT_TRUE(ov_edge(st, p, impl, base, "OVERRIDE"));
+    }
+    const char *formats[] = {"json", "tree"};
+    for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+        char args[320];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"override-budget\",\"function_name\":\"hub\","
+                 "\"direction\":\"outbound\",\"depth\":1,\"include_overrides\":true,"
+                 "\"max_output_tokens\":300,\"format\":\"%s\"}",
+                 formats[f]);
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NULL(strstr(inner, "Impl00.run"));
+        ASSERT_NULL(strstr(inner, "output_budget_floor_exceeded"));
+        if (strcmp(formats[f], "json") == 0) {
+            yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+            ASSERT_NOT_NULL(doc);
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            ASSERT_NULL(yyjson_obj_get(root, "possible_callees"));
+            ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "possible_callees_omitted")));
+            ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "truncation_reason")),
+                          "output_budget");
+            ASSERT_NOT_NULL(trace_grouped_row_named(yyjson_obj_get(root, "callees"), "run", NULL));
+            yyjson_doc_free(doc);
+        } else {
+            ASSERT_NOT_NULL(strstr(inner, "possible_callees_omitted: true"));
+            ASSERT_NOT_NULL(strstr(inner, "has_more: false"));
+            ASSERT_NOT_NULL(strstr(inner, "override_budget.Base"));
+        }
+        free(inner);
+    }
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -13972,6 +14961,141 @@ TEST(search_code_output_limit_fails_closed_and_cleans_scan) {
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
     PASS();
+}
+
+/* #2634: the POSIX unscoped scan runs find/sort/grep as argv stages with no
+ * shell, so file names carrying shell metacharacters are plain operands, not
+ * command text. Pin that such files are discovered and scanned. */
+TEST(search_code_unscoped_argv_scans_metachar_filenames_issue2634) {
+#ifdef _WIN32
+    SKIP_PLATFORM("argv scan stages are POSIX-only");
+#else
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-argv-meta-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char hostile[CBM_SZ_1K];
+    snprintf(hostile, sizeof(hostile), "%s/we'ird ;na`me$.go", tmp);
+    ASSERT_EQ(th_write_file(hostile,
+                          "package main\n\nfunc HandleHostile2634() error {\n\treturn nil\n}\n"),
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-argv-metachar";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"HandleHostile2634\","
+                                     "\"project\":\"search-argv-metachar\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "we'ird ;na`me$.go"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(tmp), 0);
+    PASS();
+#endif
+}
+
+/* #2634: grep's exit 1 (no match in a chunk) is an ordinary empty result, not
+ * a scan failure — the same contract the retired xargs wrapper encoded. */
+TEST(search_code_unscoped_argv_no_match_is_success_issue2634) {
+#ifdef _WIN32
+    SKIP_PLATFORM("argv scan stages are POSIX-only");
+#else
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-argv-nomatch-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char src_path[CBM_SZ_1K];
+    snprintf(src_path, sizeof(src_path), "%s/handler.go", tmp);
+    ASSERT_EQ(th_write_file(src_path,
+                          "package main\n\nfunc HandlePresent2634() error {\n\treturn nil\n}\n"),
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-argv-nomatch";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"NoSuchSymbol2634\","
+                                     "\"project\":\"search-argv-nomatch\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(tmp), 0);
+    PASS();
+#endif
+}
+
+/* #2634: the unscoped file_pattern reaches find as a -name operand, so a
+ * non-matching extension is excluded from the scan without any shell glob. */
+TEST(search_code_unscoped_argv_honours_file_pattern_issue2634) {
+#ifdef _WIN32
+    SKIP_PLATFORM("argv scan stages are POSIX-only");
+#else
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-argv-glob-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char py[CBM_SZ_1K];
+    snprintf(py, sizeof(py), "%s/handler.py", tmp);
+    ASSERT_EQ(th_write_file(py, "def handle_python2634():\n    return 1\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-argv-glob";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"handle_python2634\","
+                                     "\"project\":\"search-argv-glob\","
+                                     "\"file_pattern\":\"*.go\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(strstr(inner, "handler.py") == NULL);
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_code",
+                               "{\"pattern\":\"handle_python2634\","
+                               "\"project\":\"search-argv-glob\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "handler.py"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(tmp), 0);
+    PASS();
+#endif
 }
 
 TEST(search_code_scan_deadline_fails_closed_and_resets) {
@@ -23269,6 +24393,386 @@ TEST(index_supervisor_clean_exit_without_response_response_issue1300) {
     PASS();
 }
 
+#ifndef _WIN32
+typedef struct {
+    int calls;
+} index_worker_resource_clock_t;
+
+static uint64_t index_worker_resource_clock(void *context) {
+    index_worker_resource_clock_t *clock = context;
+    clock->calls++;
+    return clock->calls == 1 ? 100 : 1101;
+}
+
+enum {
+    IDXRESOURCE_OK = 0,
+    IDXRESOURCE_SETUP = 71,
+    IDXRESOURCE_NO_RESPONSE = 72,
+    IDXRESOURCE_BAD_CONTRACT = 73,
+    IDXRESOURCE_RETRIED = 74,
+};
+
+static int index_worker_resource_response_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server ||
+        cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXRESOURCE_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_worker_resource_clock_t clock = {0};
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_worker_resource_clock, NULL, &clock);
+    int before = cbm_index_supervisor_spawn_count();
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                   "\"_cbm_index_policy\":{\"index_max_files\":\"off\","
+                   "\"index_max_source_mb\":\"off\",\"index_max_rss_mb\":\"off\","
+                   "\"index_max_duration_seconds\":\"off\"}}",
+                   repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    int after = cbm_index_supervisor_spawn_count();
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    int result = IDXRESOURCE_OK;
+    if (!response) {
+        result = IDXRESOURCE_NO_RESPONSE;
+    } else if (!strstr(response, "resource_limit_exceeded") ||
+               !strstr(response, "\\\"stage\\\":\\\"worker\\\"") ||
+               !strstr(response, "\\\"resource\\\":\\\"duration_ms\\\"") ||
+               !strstr(response, "\\\"observed\\\":1001") ||
+               !strstr(response, "\\\"limit\\\":1000") ||
+               !strstr(response, "\\\"unit\\\":\\\"milliseconds\\\"")) {
+        result = IDXRESOURCE_BAD_CONTRACT;
+    } else if (after - before != 1) {
+        result = IDXRESOURCE_RETRIED;
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork-isolated MCP host harness; supervisor state machine is cross-platform");
+#else
+    char *repo = th_mktempdir("cbm_worker_resource_repo");
+    char *cache = th_mktempdir("cbm_worker_resource_cache");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(index_worker_resource_response_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    if (exit_code != IDXRESOURCE_OK) {
+        printf("    worker resource child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXRESOURCE_OK);
+    PASS();
+#endif
+}
+
+#ifndef _WIN32
+#include <fcntl.h>
+
+/* A worker limit must never be reported after the same attempt published.
+ * The real worker replaces the serving database and only then exports the
+ * persistence artifact. A FIFO planted at the artifact's temp path holds it
+ * inside that export, after the rename, for as long as nobody reads the FIFO,
+ * and the duration clock crosses its limit only once the serving database has
+ * been replaced. The limit is therefore observed in the post-publication
+ * window by construction, never by timing:
+ *   - uncoordinated, the supervisor stops the worker there and answers
+ *     resource_limit_exceeded with serving_index_preserved=true although the
+ *     previous generation is already gone;
+ *   - with the publication fence the worker claimed publication before the
+ *     rename, so the supervisor leaves the limit unenforced and logs that.
+ *     Only that log line releases the FIFO; the worker then finishes and
+ *     reports the published index. The artifact path is a directory, so the
+ *     export itself fails afterwards, which the #1665 response names. */
+typedef struct {
+    char live_db[CBM_SZ_1K];
+    ino_t previous_inode;
+    int over_limit_calls;
+} index_publication_race_clock_t;
+
+static char g_publication_race_fifo[CBM_SZ_1K];
+static bool g_publication_race_released;
+
+static uint64_t index_publication_race_clock(void *context) {
+    index_publication_race_clock_t *clock = context;
+    struct stat status;
+    if (stat(clock->live_db, &status) != 0 || status.st_ino == clock->previous_inode) {
+        return 100;
+    }
+    clock->over_limit_calls++;
+    return 1101;
+}
+
+static void index_publication_race_sink(const char *line) {
+    if (g_publication_race_released || !line ||
+        !strstr(line, "index.supervisor.resource_limit_after_publication")) {
+        return;
+    }
+    g_publication_race_released = true;
+    /* Blocks only until the held worker opens its end, then reads to EOF. */
+    int fifo = open(g_publication_race_fifo, O_RDONLY);
+    if (fifo >= 0) {
+        char buffer[CBM_SZ_4K];
+        ssize_t got = 0;
+        do {
+            got = read(fifo, buffer, sizeof(buffer));
+        } while (got > 0);
+        (void)close(fifo);
+    }
+}
+
+enum {
+    IDXPUB_OK = 0,
+    IDXPUB_SETUP = 81,
+    IDXPUB_FIRST_INDEX = 82,
+    IDXPUB_HOLD_SETUP = 83,
+    IDXPUB_NO_RESPONSE = 84,
+    IDXPUB_NOT_REPLACED = 85,
+    IDXPUB_NOT_CROSSED = 86,
+    IDXPUB_LIMIT_AFTER_PUBLICATION = 87,
+    IDXPUB_NOT_RELEASED = 88,
+    IDXPUB_NOT_REPORTED_PUBLISHED = 89,
+};
+
+static int index_publication_race_first_generation(cbm_mcp_server_t *server, const char *repo,
+                                                   const char *cache,
+                                                   index_publication_race_clock_t *clock) {
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    char *text = extract_text_content(response);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *status = yyjson_get_str(yyjson_obj_get(root, "status"));
+    const char *project = yyjson_get_str(yyjson_obj_get(root, "project"));
+    struct stat live;
+    bool indexed = status && strcmp(status, "indexed") == 0 && project &&
+                   snprintf(clock->live_db, sizeof(clock->live_db), "%s/%s.db", cache, project) <
+                       (int)sizeof(clock->live_db) &&
+                   stat(clock->live_db, &live) == 0;
+    if (indexed) {
+        clock->previous_inode = live.st_ino;
+    }
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    return indexed ? IDXPUB_OK : IDXPUB_FIRST_INDEX;
+}
+
+static int index_publication_race_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXPUB_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_publication_race_clock_t clock = {0};
+    int result = index_publication_race_first_generation(server, repo, cache, &clock);
+
+    /* A second generation to publish, the hold, and a 1 s duration limit. */
+    char art_dir[CBM_SZ_1K];
+    char art_path[CBM_SZ_1K];
+    (void)snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", repo);
+    (void)snprintf(art_path, sizeof(art_path), "%s/graph.db.zst", art_dir);
+    (void)snprintf(g_publication_race_fifo, sizeof(g_publication_race_fifo), "%s.tmp", art_path);
+    if (result == IDXPUB_OK &&
+        (th_write_file(TH_PATH(repo, "extra.c"), "int extra(void) { return 1; }\n") != 0 ||
+         mkdir(art_dir, 0700) != 0 || mkdir(art_path, 0700) != 0 ||
+         mkfifo(g_publication_race_fifo, 0600) != 0 ||
+         cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0)) {
+        result = IDXPUB_HOLD_SETUP;
+    }
+    char *response = NULL;
+    if (result == IDXPUB_OK) {
+        char args[CBM_SZ_2K];
+        (void)snprintf(args, sizeof(args),
+                       "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"persistence\":true}", repo);
+        cbm_log_set_level(CBM_LOG_WARN);
+        cbm_log_set_sink_ex(index_publication_race_sink, CBM_LOG_SINK_TEE);
+        cbm_index_supervisor_set_resource_hooks_for_testing(index_publication_race_clock, NULL,
+                                                            &clock);
+        response = cbm_mcp_handle_tool(server, "index_repository", args);
+        cbm_index_supervisor_reset_resource_hooks_for_testing();
+        cbm_log_set_sink(NULL);
+    }
+    struct stat live;
+    bool replaced = stat(clock.live_db, &live) == 0 && live.st_ino != clock.previous_inode;
+    if (result != IDXPUB_OK) {
+        /* setup failure already recorded */
+    } else if (!response) {
+        result = IDXPUB_NO_RESPONSE;
+    } else if (!replaced) {
+        result = IDXPUB_NOT_REPLACED;
+    } else if (clock.over_limit_calls == 0) {
+        result = IDXPUB_NOT_CROSSED;
+    } else if (strstr(response, "resource_limit_exceeded")) {
+        result = IDXPUB_LIMIT_AFTER_PUBLICATION;
+    } else if (!g_publication_race_released) {
+        result = IDXPUB_NOT_RELEASED;
+    } else if (!strstr(response, "Index database was published")) {
+        result = IDXPUB_NOT_REPORTED_PUBLISHED;
+    }
+    if (result != IDXPUB_OK && response) {
+        printf("    second response: %.600s\n", response);
+        fflush(stdout);
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_limit_never_reported_after_its_own_publication) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork + FIFO hold harness; the fence state machine is cross-platform and "
+                  "covered by the index_supervisor suite");
+#else
+    /* th_mktempdir returns one static buffer: keep each path in its own copy. */
+    const char *made = th_mktempdir("cbm_publication_race_repo");
+    char *repo = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_publication_race_cache");
+    char *cache = made ? strdup(made) : NULL;
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Hang guard only: two supervised runs that each start an ASan worker. */
+        alarm(180);
+        _exit(index_publication_race_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    free(repo);
+    free(cache);
+    if (exit_code != IDXPUB_OK) {
+        printf("    publication race child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXPUB_OK);
+    PASS();
+#endif
+}
+
+/* serving_index_preserved describes the request, not only its last attempt:
+ * an earlier attempt may have published before it crashed (recovery then runs
+ * another attempt), and an index that appeared during the request (artifact
+ * bootstrap) was not preserved. */
+TEST(index_worker_resource_response_reports_preservation_for_the_request) {
+    const char *made = th_mktempdir("cbm_request_facts_repo");
+    char *repo = made ? strdup(made) : NULL;
+    made = th_mktempdir("cbm_request_facts_cache");
+    char *cache = made ? strdup(made) : NULL;
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"RequestFactsFixture\"}",
+                   repo);
+
+    cbm_mcp_index_request_facts_t before_index = {0};
+    cbm_mcp_index_request_facts_begin(args, &before_index);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    char *indexed = server ? cbm_mcp_handle_tool(server, "index_repository", args) : NULL;
+    cbm_mcp_server_free(server);
+    cbm_mcp_index_request_facts_t facts = {0};
+    cbm_mcp_index_request_facts_begin(args, &facts);
+
+    cbm_index_worker_result_t limited;
+    memset(&limited, 0, sizeof(limited));
+    limited.outcome = CBM_PROC_KILLED;
+    limited.tree_quiesced = true;
+    limited.resource_violation = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_DURATION_MS, .observed = 1001, .limit = 1000};
+    cbm_index_worker_result_t published_then_crashed;
+    memset(&published_then_crashed, 0, sizeof(published_then_crashed));
+    published_then_crashed.outcome = CBM_PROC_CRASH;
+    published_then_crashed.publication_committed = true;
+    cbm_mcp_index_request_facts_t after_recovery = facts;
+    cbm_mcp_index_request_facts_record(&after_recovery, &limited);
+    bool limited_attempt_commits_nothing = !after_recovery.publication_committed;
+    cbm_mcp_index_request_facts_record(&after_recovery, &published_then_crashed);
+
+    char *preserved = cbm_mcp_index_worker_resource_response(args, &limited, &facts);
+    char *earlier_published =
+        cbm_mcp_index_worker_resource_response(args, &limited, &after_recovery);
+    char *appeared = cbm_mcp_index_worker_resource_response(args, &limited, &before_index);
+    char *no_facts = cbm_mcp_index_worker_resource_response(args, &limited, NULL);
+    const char *kept = "\\\"serving_index_preserved\\\":true";
+    const char *not_kept = "\\\"serving_index_preserved\\\":false";
+    bool indexed_ok = indexed && strstr(indexed, "\\\"status\\\":\\\"indexed\\\"");
+    bool preserved_ok = preserved && strstr(preserved, kept);
+    bool earlier_ok = earlier_published && strstr(earlier_published, not_kept);
+    bool appeared_ok = appeared && strstr(appeared, not_kept);
+    bool no_facts_ok = no_facts && strstr(no_facts, not_kept);
+
+    free(indexed);
+    free(preserved);
+    free(earlier_published);
+    free(appeared);
+    free(no_facts);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+    th_cleanup(repo);
+    th_cleanup(cache);
+    free(repo);
+    free(cache);
+
+    ASSERT_FALSE(before_index.serving_index_existed);
+    ASSERT_TRUE(indexed_ok);
+    ASSERT_TRUE(facts.serving_index_existed);
+    ASSERT_FALSE(facts.publication_committed);
+    ASSERT_TRUE(limited_attempt_commits_nothing);
+    ASSERT_TRUE(after_recovery.publication_committed);
+    ASSERT_TRUE(preserved_ok);
+    ASSERT_TRUE(earlier_ok);
+    ASSERT_TRUE(appeared_ok);
+    ASSERT_TRUE(no_facts_ok);
+    PASS();
+}
+
 /* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
  * Distinct exit codes so the parent can report the exact failure mode. */
 enum {
@@ -24437,6 +25941,291 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
     ASSERT_EQ(count, 0);
     PASS();
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ *  ignore_worktrees — explicit index_repository on a linked worktree
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* An EXPLICIT index_repository call is refused only when ignore_worktrees is on
+ * AND repo_path is a linked worktree AND no per-call override was passed. The
+ * refusal must never fire for the MAIN checkout — that would break ordinary
+ * indexing for anyone enabling the key — and index_worktree=true must escape it.
+ *
+ * Default-off is the regression class the project guards hardest: with the key
+ * unset, a linked worktree still indexes exactly as today.
+ *
+ * Probe returns a bit set, or a negative fixture-setup code. */
+enum {
+    IGNORE_WT_REFUSED_WORKTREE = 1, /* expected when the key is on */
+    IGNORE_WT_REFUSED_MAIN = 2,     /* BUG if set */
+    IGNORE_WT_REFUSED_OVERRIDE = 4, /* BUG if set */
+};
+
+#ifndef _WIN32
+typedef struct {
+    char cache[256];
+    char main_repo[512];
+    char wt_repo[512];
+} ignore_wt_fixture_t;
+
+static void ignore_wt_fixture_cleanup(ignore_wt_fixture_t *fx) {
+    if (!fx) {
+        return;
+    }
+    if (fx->main_repo[0]) {
+        char prune[1024];
+        snprintf(prune, sizeof(prune), "git -C \"%s\" worktree prune >/dev/null 2>&1", fx->main_repo);
+        (void)system(prune);
+    }
+    if (fx->cache[0]) {
+        th_rmtree(fx->cache);
+    }
+}
+
+/* 0 = ready. -1 tmpdir, -2 mkdir, -3 git worktree fixture unavailable. */
+static int ignore_wt_fixture_setup(ignore_wt_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    char *raw = th_mktempdir("cbm_ignorewt");
+    if (!raw) {
+        return -1;
+    }
+    snprintf(fx->cache, sizeof(fx->cache), "%s", raw);
+    snprintf(fx->main_repo, sizeof(fx->main_repo), "%s/main", fx->cache);
+    snprintf(fx->wt_repo, sizeof(fx->wt_repo), "%s/wt", fx->cache);
+    if (th_mkdir_p(fx->main_repo) != 0) {
+        ignore_wt_fixture_cleanup(fx);
+        return -2;
+    }
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" init -q >/dev/null 2>&1 && "
+             "git -C \"%s\" config user.email t@example.com && "
+             "git -C \"%s\" config user.name T && touch \"%s/.keep\" && "
+             "git -C \"%s\" add .keep && git -C \"%s\" commit -q -m init && "
+             "git -C \"%s\" worktree add -q \"%s\" -b wtb",
+             fx->main_repo, fx->main_repo, fx->main_repo, fx->main_repo, fx->main_repo,
+             fx->main_repo, fx->main_repo, fx->wt_repo);
+    if (system(cmd) != 0) {
+        ignore_wt_fixture_cleanup(fx);
+        return -3;
+    }
+    return 0;
+}
+
+static bool ignore_wt_refused(cbm_mcp_server_t *srv, const char *repo_path, bool override) {
+    char args[2048];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo_path,
+             override ? ",\"index_worktree\":true" : "");
+    char *result = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool refused = result && strstr(result, "ignore_worktrees is enabled") != NULL;
+    free(result);
+    return refused;
+}
+
+static int ignore_worktrees_index_probe(const char *ignore_value) {
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup < 0) {
+        return setup;
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", fx.cache, 1);
+
+    int bits = -4;
+    cbm_config_t *cfg = cbm_config_open(fx.cache);
+    if (cfg) {
+        if (ignore_value) {
+            cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, ignore_value);
+        }
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_config(srv, cfg);
+            bits = 0;
+            if (ignore_wt_refused(srv, fx.wt_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_WORKTREE;
+            }
+            if (ignore_wt_refused(srv, fx.main_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_MAIN;
+            }
+            if (ignore_wt_refused(srv, fx.wt_repo, true)) {
+                bits |= IGNORE_WT_REFUSED_OVERRIDE;
+            }
+            cbm_mcp_server_free(srv);
+        }
+        cbm_config_close(cfg);
+    }
+
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    ignore_wt_fixture_cleanup(&fx);
+    return bits;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void ignore_wt_count_started(void *context) {
+    int *calls = context;
+    (*calls)++;
+}
+
+/* Drive initialize → maybe_auto_index on a linked worktree. ignore_value NULL
+ * leaves the key unset (default-off). The count hook fires only if auto-index
+ * reaches discovery, so a skip for linked_worktree must leave it at 0. */
+static int ignore_wt_autoindex_count_calls(const char *session_root, const char *ignore_value) {
+    char *raw = th_mktempdir("cbm_ignorewt_auto");
+    if (!raw) {
+        return -1;
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", raw);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(session_root) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_cleanup(cache);
+        return -2;
+    }
+
+    int calls = -3;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
+    if (srv) {
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        /* Fail-closed on the actual count so this never launches an index thread. */
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "-1");
+        if (ignore_value) {
+            cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, ignore_value);
+        }
+        cbm_mcp_server_set_config(srv, cfg);
+        calls = 0;
+        cbm_mcp_server_set_auto_index_count_test_hook(srv, ignore_wt_count_started, &calls);
+        char *response = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1430,\"method\":\"initialize\",\"params\":{}}");
+        free(response);
+        cbm_mcp_server_free(srv);
+    }
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    return calls;
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+#endif /* !_WIN32 */
+
+TEST(mcp_ignore_worktrees_gates_explicit_index_repository) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe("true");
+    if (bits == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (bits == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (bits < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    /* RED before the gate existed: nothing is ever refused. */
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) != 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+/* Default-off pin: key unset, linked worktree still indexes. The gate is
+ * opt-in; an unset key must be bit-for-bit today's behaviour. */
+TEST(mcp_ignore_worktrees_default_off_still_indexes_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe(NULL);
+    if (bits == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (bits == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (bits < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+TEST(mcp_ignore_worktrees_skips_auto_index_on_linked_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (setup == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (setup < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    int calls = ignore_wt_autoindex_count_calls(fx.wt_repo, "true");
+    ignore_wt_fixture_cleanup(&fx);
+    if (calls == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (calls < 0) {
+        FAIL("ignore_worktrees auto-index fixture failed");
+    }
+    ASSERT_EQ(calls, 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (setup == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (setup < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    int calls = ignore_wt_autoindex_count_calls(fx.wt_repo, NULL);
+    ignore_wt_fixture_cleanup(&fx);
+    if (calls == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (calls < 0) {
+        FAIL("ignore_worktrees auto-index fixture failed");
+    }
+    ASSERT_EQ(calls, 1);
+    PASS();
+#endif /* _WIN32 */
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
 
 /* ══════════════════════════════════════════════════════════════════
  *  #1466 / #713 — the auto_index_limit guard
@@ -26751,6 +28540,7 @@ SUITE(mcp) {
 
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
+    RUN_TEST(mcp_ignore_worktrees_runtime_read_leaves_server_and_store_alone);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_help_list_matches_registry);
     RUN_TEST(mcp_tools_list_latest_metadata);
@@ -26841,6 +28631,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
+    RUN_TEST(tool_swift_overload_presentation_issue2061);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
@@ -26899,6 +28690,15 @@ SUITE(mcp) {
     RUN_TEST(tool_responses_carry_store_generation_issue2585);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_fails_closed_without_indexed_checkout_identity);
+    RUN_TEST(tool_index_status_omits_freshness_by_default);
+    RUN_TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes);
+    RUN_TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked);
+    RUN_TEST(tool_index_status_freshness_status_unavailable_non_git);
+    RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
@@ -26910,6 +28710,14 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
+    RUN_TEST(tool_trace_path_possible_callees_stay_apart_from_calls);
+    RUN_TEST(tool_trace_path_possible_callees_follow_the_hierarchy);
+    RUN_TEST(tool_trace_path_possible_callees_filter_tests_and_non_callables);
+    RUN_TEST(tool_trace_path_possible_callees_render_as_tree_table);
+    RUN_TEST(tool_trace_path_possible_callees_follow_the_page);
+    RUN_TEST(tool_trace_path_possible_callees_yield_first_under_budget);
+    RUN_TEST(tool_trace_path_possible_callees_only_for_dispatching_calls);
+    RUN_TEST(tool_trace_path_include_overrides_keeps_cursor_identity);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
     RUN_TEST(tool_trace_budget_never_slices_identifiers);
@@ -26992,6 +28800,9 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(search_code_unscoped_argv_scans_metachar_filenames_issue2634);
+    RUN_TEST(search_code_unscoped_argv_no_match_is_success_issue2634);
+    RUN_TEST(search_code_unscoped_argv_honours_file_pattern_issue2634);
     RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
@@ -27046,6 +28857,9 @@ SUITE(mcp) {
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
     RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
+    RUN_TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried);
+    RUN_TEST(index_worker_limit_never_reported_after_its_own_publication);
+    RUN_TEST(index_worker_resource_response_reports_preservation_for_the_request);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
@@ -27149,6 +28963,13 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    /* ignore_worktrees gate */
+    RUN_TEST(mcp_ignore_worktrees_gates_explicit_index_repository);
+    RUN_TEST(mcp_ignore_worktrees_default_off_still_indexes_worktree);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(mcp_ignore_worktrees_skips_auto_index_on_linked_worktree);
+    RUN_TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count);
+#endif
     RUN_TEST(mcp_auto_index_in_process_fresh_project_uses_full_width);
     RUN_TEST(mcp_auto_index_in_process_existing_index_keeps_headroom);
     RUN_TEST(mcp_background_flag_fresh_project_uses_full_width);

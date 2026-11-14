@@ -122,7 +122,8 @@ EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
 	-DCBM_CONFIG_EDIT_PATH_ENABLE_TEST_API=1 \
-	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1 \
+	-DCBM_SVN_STATE_ENABLE_TEST_API=1
 # The build system is the single source of truth for "is this binary
 # instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
 # clang's feature-check spelling and every non-ASan sanitizer, so the
@@ -137,9 +138,10 @@ KOTLIN_DEDUP_TEST_DEFINE = -DCBM_KOTLIN_DEDUP_TEST_API=1
 CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
 INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
 COVERAGE_MARKER_TEST_DEFINE = -DCBM_COVERAGE_MARKER_TEST_API=1
+MEM_CORE_TEST_DEFINE = -DCBM_MEM_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
+	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
 	-g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS)
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS) \
 	$(CXX_STDLIB_FLAGS)
@@ -159,7 +161,7 @@ TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
 # macro of ours.
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
 	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
-	$(COVERAGE_MARKER_TEST_DEFINE) \
+	$(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) \
 	-DCBM_SANITIZED_BUILD=1 -g -O1 $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -DCBM_SANITIZED_BUILD=1 -g -O1 \
                 $(TSAN_SANITIZE)
@@ -415,7 +417,9 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/diagram.c \
     $(CBM_DIR)/route_path.c \
     $(CBM_DIR)/openapi.c \
+    $(CBM_DIR)/extract_nextjs.c \
     $(CBM_DIR)/sql_values.c \
+    $(CBM_DIR)/php_inline_html.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/cpp_branch_views.c \
     $(CBM_DIR)/result_compact.c \
@@ -424,7 +428,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c \
-    $(CBM_DIR)/spawn_patterns.c
+    $(CBM_DIR)/spawn_patterns.c \
+    $(CBM_DIR)/resolve_stats.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
@@ -585,7 +590,7 @@ UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 TRACES_SRCS = src/traces/traces.c
 
 # Watcher module (new)
-WATCHER_SRCS = src/watcher/watcher.c
+WATCHER_SRCS = src/watcher/watcher.c src/watcher/svn_state.c
 
 # Git context module (new)
 GIT_SRCS = src/git/git_context.c
@@ -867,7 +872,7 @@ TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
 TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
-TEST_WATCHER_SRCS = tests/test_watcher.c
+TEST_WATCHER_SRCS = tests/test_watcher.c tests/test_svn_state.c
 
 TEST_LZ4_SRCS = tests/test_lz4.c
 TEST_ZSTD_SRCS = tests/test_zstd.c
@@ -886,6 +891,7 @@ TEST_CS_LSP_SRCS = tests/test_cs_lsp.c
 TEST_CS_LSP_BENCH_SRCS = tests/test_cs_lsp_bench.c
 
 TEST_PERL_LSP_SRCS = tests/test_perl_lsp.c
+TEST_RUBY_LSP_SRCS = tests/test_ruby_lsp.c
 
 TEST_SCOPE_SRCS = tests/test_scope.c
 
@@ -900,7 +906,8 @@ TEST_PY_LSP_STRESS_SRCS = tests/test_py_lsp_stress.c
 TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
-TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
+TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c \
+	tests/test_java_typed_calls.c
 TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
@@ -1009,7 +1016,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_RUBY_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -1527,8 +1534,17 @@ lint-memory-core:
 	@echo "=== memory-core linter ==="
 	@python3 scripts/lint-memory-core.py
 
+# Vendored tree-sitter scanners keep their state in the payload their create()
+# returns, one per parser. A file-scope variable is one object shared by every
+# parser in the process, and the indexer runs one per worker thread: properties
+# and jsonnet both made the graph differ run to run that way. Exceptions, each
+# argued, are in scripts/lint-vendored-scanners-whitelist.txt.
+lint-vendored-scanners:
+	@echo "=== vendored scanner state ==="
+	@python3 scripts/lint-vendored-scanners.py
+
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
-lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core
+lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core lint-vendored-scanners
 	@echo "=== CI linters passed ==="
 
 # ── Local memory-diagnostic lanes (not PR-CI gates by decision: the diag

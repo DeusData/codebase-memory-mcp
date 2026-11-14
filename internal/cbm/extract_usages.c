@@ -295,6 +295,21 @@ static TSTreeCursor *reset_occurrence_cursor(WalkState *state, TSNode node) {
     return state->occurrence_cursor;
 }
 
+/* Grammars with few fields let a classifier climb to the root from every identifier,
+ * so nesting d levels deep costs d per identifier. A climb that reaches the root
+ * undecided settles every node on its way for all nodes below them: a level's answer
+ * depends only on the path through it, and a node with any extent lies in one child of
+ * its parent. The next climb stops where it meets that path: a node no deeper than the
+ * settled one and covering it is the settled one or above it. */
+static bool occurrence_climb_settled(const CBMOccurrenceClimb *climb, TSNode current,
+                                     uint32_t depth) {
+    return climb && depth <= climb->depth && node_contains(current, climb->node);
+}
+
+static CBMOccurrenceClimb *occurrence_climb_for(TSNode node, CBMOccurrenceClimb *climb) {
+    return ts_node_end_byte(node) > ts_node_start_byte(node) ? climb : NULL;
+}
+
 static bool occurrence_parent(TSTreeCursor *cursor, TSNode current, TSNode *parent,
                               const char **field) {
     if (cursor) {
@@ -1182,11 +1197,21 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
 
     TSNode current = node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    CBMOccurrenceClimb *climb = cursor ? occurrence_climb_for(node, &state->binding_climb) : NULL;
+    uint32_t depth = cursor ? state->walk_depth : 0;
+    TSNode first_parent = {0};
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
+        if (occurrence_climb_settled(climb, current, depth)) {
+            break;
+        }
         if (!occurrence_parent(cursor, current, &parent, &field)) {
             break;
+        }
+        depth--;
+        if (ts_node_is_null(first_parent)) {
+            first_parent = parent;
         }
         if (is_value_field(field)) {
             return false;
@@ -1229,6 +1254,9 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
             }
         }
         current = parent;
+    }
+    if (climb && !ts_node_is_null(first_parent)) {
+        *climb = (CBMOccurrenceClimb){first_parent, state->walk_depth - 1};
     }
     return false;
 }
@@ -1276,11 +1304,21 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     TSNode current = node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    CBMOccurrenceClimb *climb = cursor ? occurrence_climb_for(node, &state->write_climb) : NULL;
+    uint32_t depth = cursor ? state->walk_depth : 0;
+    TSNode first_parent = {0};
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
+        if (occurrence_climb_settled(climb, current, depth)) {
+            break;
+        }
         if (!occurrence_parent(cursor, current, &parent, &field)) {
             break;
+        }
+        depth--;
+        if (ts_node_is_null(first_parent)) {
+            first_parent = parent;
         }
         if (is_value_field(field)) {
             return false;
@@ -1312,6 +1350,9 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
             return occurrence->first_named_child_is_write && named_child_contains(parent, 0, node);
         }
         current = parent;
+    }
+    if (climb && !ts_node_is_null(first_parent)) {
+        *climb = (CBMOccurrenceClimb){first_parent, state->walk_depth - 1};
     }
     return false;
 }
@@ -1354,12 +1395,19 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     if (!cursor)
         return is_call_argument_label(node);
+    CBMOccurrenceClimb *climb = occurrence_climb_for(node, &state->label_climb);
+    uint32_t depth = state->walk_depth;
+    TSNode first_parent = {0};
     TSNode current = node;
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
-        if (!occurrence_parent(cursor, current, &parent, &field))
-            return false;
+        if (occurrence_climb_settled(climb, current, depth) ||
+            !occurrence_parent(cursor, current, &parent, &field))
+            break;
+        depth--;
+        if (ts_node_is_null(first_parent))
+            first_parent = parent;
         const char *parent_kind = ts_node_type(parent);
         if (is_labeled_argument_kind(parent_kind)) {
             return field && (strcmp(field, "name") == 0 || strcmp(field, "label") == 0 ||
@@ -1369,6 +1417,8 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
             return false;
         current = parent;
     }
+    if (climb && !ts_node_is_null(first_parent))
+        *climb = (CBMOccurrenceClimb){first_parent, state->walk_depth - 1};
     return false;
 }
 

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "resolve_stats.h"
 #if defined(CBM_KOTLIN_DEDUP_TEST_API) && CBM_KOTLIN_DEDUP_TEST_API
 #include <stdatomic.h>
 #endif
@@ -427,10 +428,42 @@ static char *extract_wolfram_callee(CBMArena *a, TSNode node, const char *source
 
 // Language-specific callee extraction for FP and niche languages.
 // Swift callee extraction from call/constructor expressions.
+static TSNode swift_trailing_closure_inner(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "call_expression") != 0) {
+        return (TSNode){0};
+    }
+    TSNode inner = ts_node_named_child(node, 0);
+    if (ts_node_is_null(inner) || strcmp(ts_node_type(inner), "call_expression") != 0) {
+        return (TSNode){0};
+    }
+    TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+    if (ts_node_is_null(suffix) ||
+        !ts_node_is_null(cbm_find_child_by_kind(suffix, "value_arguments")) ||
+        (ts_node_is_null(cbm_find_child_by_kind(suffix, "lambda_literal")) &&
+         ts_node_is_null(cbm_find_child_by_kind(node, "lambda_literal")))) {
+        return (TSNode){0};
+    }
+    return inner;
+}
+
+static TSNode swift_call_base(TSNode node) {
+    TSNode inner = swift_trailing_closure_inner(node);
+    while (!ts_node_is_null(inner)) {
+        node = inner;
+        inner = swift_trailing_closure_inner(node);
+    }
+    return node;
+}
+
 static char *extract_swift_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "constructor_expression") != 0) {
         return NULL;
     }
+    TSNode wrapped = swift_trailing_closure_inner(ts_node_parent(node));
+    if (!ts_node_is_null(wrapped) && ts_node_eq(wrapped, node)) {
+        return NULL;
+    }
+    node = swift_call_base(node);
     if (ts_node_named_child_count(node) > 0) {
         TSNode callee = ts_node_named_child(node, 0);
         const char *ck = ts_node_type(callee);
@@ -2116,30 +2149,238 @@ static bool go_is_function_boundary(const char *k) {
            strcmp(k, "func_literal") == 0 || strcmp(k, "source_file") == 0;
 }
 
-/* Latest binding of `name` among the statements preceding `use` in its
- * enclosing blocks, innermost block first; a null node when none. */
-static TSNode go_find_binding(CBMArena *a, TSNode use, const char *name, const char *source) {
+/* A function of route registrations asks what each receiver is bound to, so one block's bindings
+ * are read once: every name each statement binds, by name and then in source order. A statement
+ * that names a variable but gives it no value has no row, as go_stmt_binding has no answer. */
+typedef struct {
+    const char *name;
+    uint32_t statement_start;
+    uint32_t order;
+    TSNode value;
+} go_binding_t;
+
+typedef struct {
+    const void *block;
+    go_binding_t *rows;
+    size_t count, capacity;
+} go_block_bindings_t;
+
+typedef struct {
+    go_block_bindings_t **slots;
+    size_t capacity, used;
+} go_bindings_table_t;
+
+static bool go_binding_add(CBMArena *a, go_block_bindings_t *block, TSNode statement,
+                           const char *name, const char *source) {
+    TSNode value = go_stmt_binding(a, statement, name, source);
+    if (ts_node_is_null(value)) {
+        return true;
+    }
+    if (block->count == block->capacity) {
+        size_t capacity = block->capacity ? block->capacity * 2 : 16;
+        go_binding_t *rows = cbm_arena_alloc(a, capacity * sizeof(*rows));
+        if (!rows) {
+            return false;
+        }
+        if (block->count) {
+            memcpy(rows, block->rows, block->count * sizeof(*rows));
+        }
+        block->rows = rows;
+        block->capacity = capacity;
+    }
+    block->rows[block->count] = (go_binding_t){.name = name,
+                                               .statement_start = ts_node_start_byte(statement),
+                                               .order = (uint32_t)block->count,
+                                               .value = value};
+    block->count++;
+    return true;
+}
+
+/* Every name a `var` statement declares, through its specs and their lists. */
+static bool go_var_names_add(CBMArena *a, go_block_bindings_t *block, TSNode statement, TSNode list,
+                             const char *source) {
+    uint32_t count = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(list, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "var_spec") == 0) {
+            uint32_t parts = ts_node_named_child_count(child);
+            for (uint32_t p = 0; p < parts; p++) {
+                TSNode part = ts_node_named_child(child, p);
+                const char *name = strcmp(ts_node_type(part), "identifier") == 0
+                                       ? cbm_node_text(a, part, source)
+                                       : NULL;
+                if (name && !go_binding_add(a, block, statement, name, source)) {
+                    return false;
+                }
+            }
+        } else if (strcmp(kind, "var_spec_list") == 0 &&
+                   !go_var_names_add(a, block, statement, child, source)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool go_statement_names_add(CBMArena *a, go_block_bindings_t *block, TSNode statement,
+                                   const char *source) {
+    const char *kind = ts_node_type(statement);
+    if (strcmp(kind, "var_declaration") == 0 || strcmp(kind, "var_spec_list") == 0) {
+        return go_var_names_add(a, block, statement, statement, source);
+    }
+    if (strcmp(kind, "short_var_declaration") != 0 && strcmp(kind, "assignment_statement") != 0) {
+        return true;
+    }
+    TSNode left = ts_node_child_by_field_name(statement, TS_FIELD("left"));
+    uint32_t count = ts_node_is_null(left) ? 0 : ts_node_named_child_count(left);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = cbm_node_text(a, ts_node_named_child(left, i), source);
+        if (name && !go_binding_add(a, block, statement, name, source)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int go_binding_order(const void *left, const void *right) {
+    const go_binding_t *a = left, *b = right;
+    int order = strcmp(a->name, b->name);
+    if (order) {
+        return order;
+    }
+    return a->order < b->order ? -1 : a->order > b->order;
+}
+
+static go_block_bindings_t *go_block_bindings_build(CBMArena *a, TSNode node, const char *source) {
+    go_block_bindings_t *block = cbm_arena_alloc(a, sizeof(*block));
+    if (!block) {
+        return NULL;
+    }
+    *block = (go_block_bindings_t){.block = node.id};
+    bool ok = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode statement = ts_tree_cursor_current_node(&cursor);
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            ok =
+                !ts_node_is_named(statement) || go_statement_names_add(a, block, statement, source);
+        } while (ok && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (!ok) {
+        return NULL;
+    }
+    if (block->count > 1) {
+        qsort(block->rows, block->count, sizeof(*block->rows), go_binding_order);
+    }
+    return block;
+}
+
+static size_t go_block_hash(const void *id, size_t capacity) {
+    uint64_t value = (uint64_t)(uintptr_t)id >> 3;
+    value *= UINT64_C(0x9E3779B97F4A7C15);
+    return (size_t)(value ^ (value >> 29)) & (capacity - 1);
+}
+
+/* This block's bindings, read the first time anything in it asks. */
+static go_block_bindings_t *go_block_bindings_of(CBMExtractCtx *ctx, TSNode node) {
+    enum { GO_BLOCKS_FIRST = 16 };
+    CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
+    go_bindings_table_t *table = ctx->go_block_bindings;
+    if (!table) {
+        table = cbm_arena_calloc(a, sizeof(*table));
+        go_block_bindings_t **slots =
+            table ? cbm_arena_calloc(a, GO_BLOCKS_FIRST * sizeof(*slots)) : NULL;
+        if (!slots) {
+            return NULL;
+        }
+        table->slots = slots;
+        table->capacity = GO_BLOCKS_FIRST;
+        ctx->go_block_bindings = table;
+    }
+    size_t at = go_block_hash(node.id, table->capacity);
+    while (table->slots[at]) {
+        if (table->slots[at]->block == node.id) {
+            return table->slots[at];
+        }
+        at = (at + 1) & (table->capacity - 1);
+    }
+    go_block_bindings_t *block = go_block_bindings_build(a, node, ctx->source);
+    if (!block) {
+        return NULL;
+    }
+    table->slots[at] = block;
+    table->used++;
+    if (table->used * 2 > table->capacity) {
+        size_t capacity = table->capacity * 2;
+        go_block_bindings_t **slots = cbm_arena_calloc(a, capacity * sizeof(*slots));
+        if (!slots) {
+            return NULL;
+        }
+        for (size_t i = 0; i < table->capacity; i++) {
+            if (table->slots[i]) {
+                size_t place = go_block_hash(table->slots[i]->block, capacity);
+                while (slots[place]) {
+                    place = (place + 1) & (capacity - 1);
+                }
+                slots[place] = table->slots[i];
+            }
+        }
+        table->slots = slots;
+        table->capacity = capacity;
+    }
+    return block;
+}
+
+/* The binding of `name` by the last statement in this block that starts before `before`. */
+static TSNode go_block_binding(const go_block_bindings_t *block, const char *name,
+                               uint32_t before) {
+    size_t low = 0, high = block->count;
+    while (low < high) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        size_t middle = low + (high - low) / 2;
+        const go_binding_t *row = &block->rows[middle];
+        int order = strcmp(row->name, name);
+        if (order < 0 || (order == 0 && row->statement_start < before)) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low == 0 || strcmp(block->rows[low - 1].name, name) != 0) {
+        return (TSNode){0};
+    }
+    return block->rows[low - 1].value;
+}
+
+/* Latest binding of `name` among the statements preceding `use` in its enclosing blocks, innermost
+ * block first; a null node when none. False when memory ran out and the answer is unknown. */
+static bool go_find_binding(CBMExtractCtx *ctx, TSNode use, const char *name, TSNode *binding) {
+    *binding = (TSNode){0};
     TSNode child = use;
     TSNode cur = ts_node_parent(use);
     while (!ts_node_is_null(cur) && !go_is_function_boundary(ts_node_type(cur))) {
         const char *k = ts_node_type(cur);
         if (strcmp(k, "block") == 0 || strcmp(k, "statement_list") == 0) {
-            for (TSNode s = ts_node_prev_named_sibling(child); !ts_node_is_null(s);
-                 s = ts_node_prev_named_sibling(s)) {
-                TSNode v = go_stmt_binding(a, s, name, source);
-                if (!ts_node_is_null(v)) {
-                    return v;
-                }
+            const go_block_bindings_t *block = go_block_bindings_of(ctx, cur);
+            if (!block) {
+                return false;
+            }
+            *binding = go_block_binding(block, name, ts_node_start_byte(child));
+            if (!ts_node_is_null(*binding)) {
+                return true;
             }
         }
         child = cur;
         cur = ts_node_parent(cur);
     }
-    TSNode none = {0};
-    return none;
+    return true;
 }
 
-static const char *go_group_prefix_for_call(CBMArena *a, TSNode call, const char *source) {
+static const char *go_group_prefix_for_call(CBMExtractCtx *ctx, TSNode call) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
     TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
     if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
         return NULL;
@@ -2158,7 +2399,11 @@ static const char *go_group_prefix_for_call(CBMArena *a, TSNode call, const char
         }
         if (strcmp(k, "identifier") == 0) {
             const char *name = cbm_node_text(a, recv, source);
-            recv = name ? go_find_binding(a, recv, name, source) : (TSNode){0};
+            TSNode bound = {0};
+            if (name && !go_find_binding(ctx, recv, name, &bound)) {
+                return NULL; /* never a partial prefix */
+            }
+            recv = bound;
             continue; /* unbound (parameter, package var): root reached */
         }
         TSNode inner = {0};
@@ -2191,7 +2436,7 @@ static const char *route_path_with_group_prefix(CBMExtractCtx *ctx, TSNode node,
     if (ctx->language == CBM_LANG_PHP) {
         gp = php_group_prefix_for_call(ctx->arena, node, ctx->source);
     } else if (ctx->language == CBM_LANG_GO) {
-        gp = go_group_prefix_for_call(ctx->arena, node, ctx->source);
+        gp = go_group_prefix_for_call(ctx, node);
     }
     return (gp && gp[0]) ? route_path_with_prefix(ctx->arena, gp, path) : path;
 }
@@ -2566,6 +2811,7 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
     }
 }
 
+static TSNode swift_argument_value(TSNode arg);
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node, bool url_context);
 
 /* Whether a call's callee is an HTTP client or a global fetch, which selects
@@ -2664,6 +2910,26 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
         }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
+
+        if (ctx->language == CBM_LANG_SWIFT && strcmp(ak, "value_argument") == 0) {
+            TSNode first = ts_node_named_child(arg_node, 0);
+            if (!ts_node_is_null(first) &&
+                strcmp(ts_node_type(first), "value_argument_label") == 0) {
+                TSNode label = ts_node_named_child(first, 0);
+                if (ts_node_is_null(label)) {
+                    label = first;
+                }
+                ca->keyword = cbm_node_text(ctx->arena, label, ctx->source);
+                if (ca->keyword) {
+                    size_t n = strlen(ca->keyword);
+                    if (n > 0 && ca->keyword[n - SKIP_ONE] == ':') {
+                        ca->keyword = cbm_arena_strndup(ctx->arena, ca->keyword, n - SKIP_ONE);
+                    }
+                }
+            }
+            arg_node = swift_argument_value(arg_node);
+            ak = ts_node_type(arg_node);
+        }
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
             process_keyword_arg(ctx, arg_node, ca);
@@ -3970,11 +4236,85 @@ static TSNode objectscript_call_args(TSNode node) {
  * instead. A trailing closure has a call_suffix with no value_arguments, which
  * returns a null node and leaves the call without a string argument, as before. */
 static TSNode swift_call_args(TSNode node) {
+    node = swift_call_base(node);
     TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
     if (ts_node_is_null(suffix)) {
         return (TSNode){0};
     }
     return cbm_find_child_by_kind(suffix, "value_arguments");
+}
+
+/* Store one bounded trailing-closure label; closure zero is unlabelled. */
+static void swift_store_trailing_label(CBMExtractCtx *ctx, CBMCall *call, uint32_t index,
+                                       const char *label, bool has_label) {
+    if (index == 0) {
+        call->has_trailing_closure = true;
+        return;
+    }
+    if (index >= CBM_MAX_TRAILING_CLOSURES) {
+        call->trailing_closure_truncated = true;
+        return;
+    }
+    if (!call->trailing_closure_labels) {
+        size_t bytes = CBM_MAX_TRAILING_CLOSURES * sizeof(char *);
+        call->trailing_closure_labels = cbm_arena_calloc(ctx->arena, bytes);
+    }
+    if (!call->trailing_closure_labels) {
+        call->trailing_closure_truncated = true;
+        return;
+    }
+    call->trailing_closure_labels[index] = label;
+    if (has_label && !label) {
+        call->trailing_closure_truncated = true;
+    }
+}
+
+/* Swift records trailing closures on the call_suffix: the hidden
+ * _fn_call_lambda_arguments rule inlines to
+ * `lambda_literal (simple_identifier ':')*`, so every closure literal, and the
+ * label that precedes all but the first, sit flat among the suffix's children
+ * (after an optional value_arguments). Each lambda_literal is a trailing
+ * closure; a simple_identifier directly before a closure is that closure's
+ * label. Closure 0 is always unlabelled. More closures than the bounded
+ * storage marks the call truncated so the overload matcher fails closed. */
+static void swift_capture_trailing_closures(CBMExtractCtx *ctx, TSNode call_node, TSNode suffix,
+                                            CBMCall *call) {
+    if (ts_node_has_error(call_node)) {
+        call->trailing_closure_truncated = true;
+    }
+    uint32_t children = ts_node_child_count(suffix) + ts_node_child_count(call_node);
+    uint32_t closures = 0;
+    const char *pending_label = NULL;
+    bool has_pending_label = false;
+    for (uint32_t i = 0; i < children; i++) {
+        uint32_t suffix_children = ts_node_child_count(suffix);
+        TSNode child = i < suffix_children ? ts_node_child(suffix, i)
+                                           : ts_node_child(call_node, i - suffix_children);
+        if (i >= suffix_children && ts_node_start_byte(child) < ts_node_end_byte(suffix)) {
+            continue;
+        }
+        const char *kind = ts_node_type(child);
+        if (ts_node_is_missing(child) || ts_node_has_error(child)) {
+            call->trailing_closure_truncated = true;
+        }
+        if (strcmp(kind, "lambda_literal") == 0) {
+            swift_store_trailing_label(ctx, call, closures, pending_label, has_pending_label);
+            closures++;
+            pending_label = NULL;
+            has_pending_label = false;
+        } else if (strcmp(kind, "simple_identifier") == 0) {
+            if (has_pending_label) {
+                call->trailing_closure_truncated = true;
+            }
+            pending_label = cbm_node_text(ctx->arena, child, ctx->source);
+            has_pending_label = true;
+        }
+    }
+    if (has_pending_label) {
+        call->trailing_closure_truncated = true;
+    }
+    call->trailing_closure_count =
+        (uint8_t)(closures > CBM_MAX_TRAILING_CLOSURES ? CBM_MAX_TRAILING_CLOSURES : closures);
 }
 
 static bool node_has_token(TSNode node, const char *token) {
@@ -4358,6 +4698,70 @@ static TSNode language_specific_callee_leaf(CBMLanguage language, TSNode expr,
     return terminal_callee_leaf(ctx, expr);
 }
 
+/* `Base.init` for a `super.init(...)` call: Base is the first entry of the
+ * enclosing class's inheritance clause, where Swift requires the superclass to
+ * stand. The class node is carried by the walk, so no ancestor climb. NULL (no
+ * call) outside a class, without a clause, or when the entry does not read as
+ * a plain type name -- a lower-case or attributed root would pass the
+ * registry's receiver-chain check and bind by short name, which is the false
+ * edge this exists to prevent. */
+static const char *swift_superclass_init_callee(CBMExtractCtx *ctx, const WalkState *state) {
+    TSNode cls = state ? state->enclosing_class_node : (TSNode){0};
+    if (ts_node_is_null(cls) || strcmp(ts_node_type(cls), "class_declaration") != 0) {
+        return NULL;
+    }
+    TSNode spec = cbm_find_child_by_kind(cls, "inheritance_specifier");
+    char *base = ts_node_is_null(spec) ? NULL : cbm_node_text(ctx->arena, spec, ctx->source);
+    if (!base || base[0] < 'A' || base[0] > 'Z') {
+        return NULL;
+    }
+    size_t len = strcspn(base, "<"); /* Base<T> names Base */
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)base[i]) && base[i] != '_' && base[i] != '.') {
+            return NULL;
+        }
+    }
+    base[len] = '\0';
+    return cbm_arena_sprintf(ctx->arena, "%s.init", base);
+}
+
+/* True for a Swift initializer callee `T.init` (T non-empty). */
+static bool swift_callee_is_initializer(const char *callee) {
+    static const char suffix[] = ".init";
+    size_t n = callee ? strlen(callee) : 0;
+    return n > sizeof(suffix) - SKIP_ONE &&
+           strcmp(callee + n - (sizeof(suffix) - SKIP_ONE), suffix) == 0;
+}
+
+/* Swift initializer delegation (#2379). `super.init(...)` and `self.init(...)`
+ * name no type, and a lower-case receiver passes the registry's receiver-chain
+ * check, so a short-name match binds them to whichever project `init` is
+ * nearest: a nested type's, a sibling type's, or the caller's own. On
+ * Alamofire all 8 such edges were false.
+ *
+ * `super.init` is rewritten to name the superclass (`Base.init`), so the
+ * qualified strategies place it on the project's Base.init. When Base is not
+ * in the project (UIViewController, NSObject) nothing places it, and the
+ * initializer guard in handle_calls keeps a short-name guess from doing so.
+ *
+ * `self.init` delegates to another initializer of the caller's own type.
+ * Keep #2395's no-edge policy until overload-aware delegation is addressed
+ * separately; the delegated initializer can live outside the project
+ * (`extension Notification { init(...) { self.init(...) } }` calls Foundation's). */
+static const char *resolve_swift_delegating_init(CBMExtractCtx *ctx, const WalkState *state,
+                                                 const char *callee) {
+    if (ctx->language != CBM_LANG_SWIFT || !callee) {
+        return callee;
+    }
+    if (strcmp(callee, "self.init") == 0) {
+        return NULL;
+    }
+    if (strcmp(callee, "super.init") == 0) {
+        return swift_superclass_init_callee(ctx, state);
+    }
+    return callee;
+}
+
 // Produce the textual callee and the AST occurrence from one operation. The
 // generic fallback retains the former field/terminal behavior, while grammars
 // whose extractor uses a sibling, a special field, or a synthetic literal are
@@ -4368,6 +4772,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     CBMPrimaryCalleeSelection selection = {0};
     selection.name = extract_callee_name(ctx->arena, node, ctx->source, ctx->language);
     selection.name = resolve_objectscript_callee(ctx, node, state, selection.name);
+    selection.name = resolve_swift_delegating_init(ctx, state, selection.name);
     if (!selection.name || !selection.name[0]) {
         return selection;
     }
@@ -4379,7 +4784,8 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
         return selection;
     }
 
-    selection.expr = language_specific_callee_expr(ctx->language, node);
+    TSNode callee_node = ctx->language == CBM_LANG_SWIFT ? swift_call_base(node) : node;
+    selection.expr = language_specific_callee_expr(ctx->language, callee_node);
     selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};
@@ -4498,6 +4904,16 @@ static CBMInvocationDescriptor describe_emitted_primary_call(
     return descriptor;
 }
 
+/* #1128: the node that roots a JS/TS member receiver (`a` in `a.b.c()`). The
+ * walk is over this one callee's own member chain, so it stays linear in the
+ * file; a chain rooted in a call result stops at that call. */
+static TSNode js_receiver_root(TSNode obj) {
+    while (!ts_node_is_null(obj) && strcmp(ts_node_type(obj), "member_expression") == 0) {
+        obj = ts_node_child_by_field_name(obj, TS_FIELD("object"));
+    }
+    return obj;
+}
+
 CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                      WalkState *state) {
     CBMInvocationDescriptor invocation = {0};
@@ -4569,6 +4985,8 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         const char *ok = ts_node_type(obj);
                         if (strcmp(ok, "this") != 0 && strcmp(ok, "super") != 0) {
                             call.is_method = true;
+                            call.receiver_is_amd_dependency =
+                                cbm_walk_amd_dependency_binds(ctx, state, js_receiver_root(obj));
                         }
                     }
                 }
@@ -4590,6 +5008,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     strcmp(ts_node_type(gofn), "selector_expression") == 0) {
                     call.is_method = true;
                 }
+            }
+            // Swift initializer guard (#2379; same direction). Flag `T.init(...)`,
+            // as written or as a rewritten super.init. Nearly every type has an
+            // `init`, so a short-name match onto one is a guess: with a project
+            // module imported, `UIViewController.init` bound an unrelated
+            // project initializer. The registry's qualified / same-module /
+            // import strategies still place T.init when T is a project type.
+            // No other Swift call carries the flag.
+            if (ctx->language == CBM_LANG_SWIFT && swift_callee_is_initializer(call.callee_name)) {
+                call.is_method = true;
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
@@ -4616,6 +5044,23 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // Swift has no "arguments" field either; its args hang off call_suffix.
             if (ts_node_is_null(args) && ctx->language == CBM_LANG_SWIFT) {
                 args = swift_call_args(node);
+            }
+            if (ctx->language == CBM_LANG_SWIFT) {
+                TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+                if (!ts_node_is_null(suffix)) {
+                    swift_capture_trailing_closures(ctx, node, suffix, &call);
+                }
+                uint32_t value_arg_count = 0;
+                if (!ts_node_is_null(args)) {
+                    uint32_t named_count = ts_node_named_child_count(args);
+                    for (uint32_t ai = 0; ai < named_count; ai++) {
+                        TSNode arg = ts_node_named_child(args, ai);
+                        value_arg_count += strcmp(ts_node_type(arg), "value_argument") == 0;
+                    }
+                }
+                if (value_arg_count > CBM_MAX_CALL_ARGS) {
+                    call.args_truncated = true;
+                }
             }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);

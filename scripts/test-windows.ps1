@@ -18,6 +18,7 @@
                       * test_hook_augment.py      guards #618      (fixed by #619)
                       * test_ui_drive_listing.py  guards #548      (roots field)
                       * test_cli_non_ascii_arg.py guards #423/#20  (wide-argv main())
+                      * test_mcp_stdio.py         guards #654      (clean stdio stderr)
                       * test_daemon_stability.py guards the daemon parameter
                         surface, crash recovery, busy-stop refusal, and churn
                       * test_windows_update_handoff.py guards that `update`
@@ -166,6 +167,7 @@ $guards = @(
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py",
+    "tests\windows\test_mcp_stdio.py",
     "tests\windows\test_windows_update_handoff.py"
 )
 
