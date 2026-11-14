@@ -1110,6 +1110,26 @@ static const char *py_nearest_scope_qn(const WalkState *state) {
     return NULL;
 }
 
+/* C# 14 extension block members parse as local functions in the body of a
+ * constructor named `extension`, which the def extractor lifts onto the
+ * enclosing type as methods (#2071). Climbs the same conditional blocks the
+ * def side's member iterator flattens, so #if branches count as members. */
+static bool csharp_is_extension_member(const CBMExtractCtx *ctx, TSNode node,
+                                       const WalkState *state) {
+    const char **conditional = cbm_conditional_block_types(ctx->language);
+    TSNode up = ts_node_parent(node);
+    while (conditional && !ts_node_is_null(up) && cbm_kind_in_set(up, conditional)) {
+        up = ts_node_parent(up);
+    }
+    if (ts_node_is_null(up) || strcmp(ts_node_type(up), "block") != 0 ||
+        ts_node_is_null(state->enclosing_class_node)) {
+        return false;
+    }
+    TSNode owner = ts_node_parent(up);
+    return !ts_node_is_null(owner) &&
+           cbm_csharp_is_extension_block(owner, state->enclosing_class_node, ctx->source);
+}
+
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
@@ -1118,6 +1138,20 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     const char *configured_qn = cbm_test_definition_qn(ctx, node);
     if (configured_qn) {
         return configured_qn;
+    }
+
+    /* C# local functions nested in a member have no graph node. Attribute calls
+     * in them to the enclosing function, whose definition span contains the
+     * call site, rather than to the file node (#2964); the C# LSP names the
+     * same caller, so its resolutions still join. Two local_function_statement
+     * shapes ARE nodes and fall through to keep the QN that node carries: a
+     * top-level local function (top-level statements, module-qualified) and a
+     * C# 14 extension block member (lifted onto the type, class-qualified). */
+    if (ctx->language == CBM_LANG_CSHARP &&
+        strcmp(ts_node_type(node), "local_function_statement") == 0 && state->enclosing_func_qn &&
+        state->enclosing_func_qn != ctx->module_qn &&
+        !csharp_is_extension_member(ctx, node, state)) {
+        return state->enclosing_func_qn;
     }
 
     (void)spec;

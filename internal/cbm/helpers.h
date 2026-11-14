@@ -199,6 +199,13 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
  * (extract_unified.c) so the receiver-qualified method QN has ONE formula. */
 char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source);
 
+/* C#: true for a C# 14 extension block, which the grammar parses as a
+ * constructor_declaration named `extension` inside `class_node` (#2071).
+ * Defined in extract_defs.c, which lifts the block's members onto the type;
+ * shared so call-scope attribution (extract_unified.c) names those members
+ * the same way. */
+bool cbm_csharp_is_extension_block(TSNode node, TSNode class_node, const char *source);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 

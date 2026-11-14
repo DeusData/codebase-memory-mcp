@@ -26561,6 +26561,165 @@ TEST(pipeline_csharp_modern) {
     PASS();
 }
 
+/* C# local functions do not have graph nodes yet. Their calls must stay
+ * attributed to the enclosing method, whose definition span contains the call
+ * site, instead of falling back to the file node (#2964). */
+TEST(pipeline_csharp_local_function_calls_keep_enclosing_method_issue2964) {
+    const char *files[] = {"Repro.cs"};
+    const char *contents[] = {"using System;\n"
+                              "using System.Threading.Tasks;\n"
+                              "namespace Repro;\n"
+                              "public sealed class Queue {\n"
+                              "    public Task<int> RunAsync(int n) => Task.FromResult(n);\n"
+                              "}\n"
+                              "public sealed class Caller {\n"
+                              "    private readonly Queue _queue = new Queue();\n"
+                              "    public async Task<int> FromMethod() {\n"
+                              "        return await _queue.RunAsync(1);\n"
+                              "    }\n"
+                              "    public async Task<int> WithLocalFunction() {\n"
+                              "        async Task<int> Inner(int n) {\n"
+                              "            return await _queue.RunAsync(n);\n"
+                              "        }\n"
+                              "        return await Inner(2);\n"
+                              "    }\n"
+                              "    public async Task<int> WithLambda() {\n"
+                              "        Func<int, Task<int>> f = async n => await _queue.RunAsync(n);\n"
+                              "        return await f(3);\n"
+                              "    }\n"
+                              "    public async Task<int> WithNestedLocalFunction() {\n"
+                              "        async Task<int> Outer(int n) {\n"
+                              "            async Task<int> Deep(int m) {\n"
+                              "                return await _queue.RunAsync(m);\n"
+                              "            }\n"
+                              "            return await Deep(n);\n"
+                              "        }\n"
+                              "        return await Outer(4);\n"
+                              "    }\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "FromMethod", "RunAsync"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "WithLocalFunction", "RunAsync"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "WithLambda", "RunAsync"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "WithNestedLocalFunction", "RunAsync"),
+              1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* A top-level local function (C# top-level statements) is a Function node of
+ * its own, so calls in it stay attributed to it, and a local function nested
+ * in it attributes to that Function. Neither may fall back to the Module or
+ * File node, both named after the file (#2964). */
+TEST(pipeline_csharp_top_level_local_function_calls_keep_function_issue2964) {
+    const char *files[] = {"Program.cs"};
+    const char *contents[] = {"using System;\n"
+                              "var q = new Queue();\n"
+                              "Console.WriteLine(Helper(1));\n"
+                              "Console.WriteLine(Twice(2));\n"
+                              "int Helper(int n) {\n"
+                              "    return q.Run(n);\n"
+                              "}\n"
+                              "static int Twice(int n) {\n"
+                              "    int Inner(int m) => Calc.Square(m);\n"
+                              "    return Inner(n) * 2;\n"
+                              "}\n"
+                              "class Queue {\n"
+                              "    public int Run(int n) => n;\n"
+                              "}\n"
+                              "static class Calc {\n"
+                              "    public static int Square(int x) => x * x;\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Helper", "Run"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Twice", "Square"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Program.cs", "Run"), 0);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Program.cs", "Square"), 0);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* C# 14 extension block members parse as local functions, but the def side
+ * lifts them onto the type as methods (#2071): calls in them stay attributed
+ * to those methods, under #if too, and a local function nested in a member
+ * attributes to that member (#2964). */
+TEST(pipeline_csharp_extension_member_calls_keep_method_issue2964) {
+    const char *files[] = {"NumberExtensions.cs"};
+    const char *contents[] = {"using System.Collections.Generic;\n"
+                              "namespace App;\n"
+                              "public static class Calc {\n"
+                              "    public static int Total(IEnumerable<int> xs) => 0;\n"
+                              "    public static int Nothing() => 0;\n"
+                              "    public static int One() => 1;\n"
+                              "}\n"
+                              "public static class NumberExtensions {\n"
+                              "    extension(IEnumerable<int> numbers) {\n"
+                              "        public int SumPositive() => Calc.Total(numbers);\n"
+                              "#if FEATURE\n"
+                              "        public static int Zero() => Calc.Nothing();\n"
+                              "#endif\n"
+                              "        public int Nest() { int Inner() => Calc.One(); return Inner(); }\n"
+                              "    }\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "SumPositive", "Total"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Zero", "Nothing"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Nest", "One"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "NumberExtensions.cs", "Total"), 0);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "NumberExtensions.cs", "Nothing"), 0);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "NumberExtensions.cs", "One"), 0);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_bom_stripping) {
     /* Port of TestBOMStripping — UTF-8 BOM prefix should be handled */
     snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "/tmp/cbm_bom_XXXXXX");
@@ -35280,6 +35439,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_kotlin_project);
     RUN_TEST(pipeline_lua_anonymous_functions);
     RUN_TEST(pipeline_csharp_modern);
+    RUN_TEST(pipeline_csharp_local_function_calls_keep_enclosing_method_issue2964);
+    RUN_TEST(pipeline_csharp_top_level_local_function_calls_keep_function_issue2964);
+    RUN_TEST(pipeline_csharp_extension_member_calls_keep_method_issue2964);
     RUN_TEST(pipeline_bom_stripping);
     RUN_TEST(pipeline_form_call_resolution);
     RUN_TEST(pipeline_python_type_inference);

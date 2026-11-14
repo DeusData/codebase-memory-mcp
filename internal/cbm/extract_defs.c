@@ -9636,7 +9636,7 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
  * constructor_declaration named `extension` and nothing flags it: has_error
  * stays 0. A constructor carries its own type's name, so this shape can only be
  * a genuine constructor inside a type literally called `extension` (#2071). */
-static bool csharp_is_extension_block(TSNode node, TSNode class_node, const char *source) {
+bool cbm_csharp_is_extension_block(TSNode node, TSNode class_node, const char *source) {
     if (strcmp(ts_node_type(node), "constructor_declaration") != 0) {
         return false;
     }
@@ -9710,7 +9710,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
          * enclosing type, rather than the block itself as a constructor named
          * `extension` with its members buried in the body (#2071). */
         if (ctx->language == CBM_LANG_CSHARP &&
-            csharp_is_extension_block(child, class_node, ctx->source)) {
+            cbm_csharp_is_extension_block(child, class_node, ctx->source)) {
             extract_csharp_extension_members(ctx, child, class_node, class_qn, spec);
             continue;
         }
