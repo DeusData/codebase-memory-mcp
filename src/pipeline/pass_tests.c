@@ -30,6 +30,7 @@ enum {
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
+#include "helpers.h" /* cbm_is_test_file */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,11 +46,16 @@ static const char *itoa_log(int val) {
 }
 
 /* Check if a node has is_test:true in its properties JSON. */
-static bool node_is_test(const cbm_gbuf_node_t *n) {
+bool cbm_node_is_test(const cbm_gbuf_node_t *n) {
     if (!n || !n->properties_json) {
         return false;
     }
     return strstr(n->properties_json, "\"is_test\":true") != NULL;
+}
+
+bool cbm_pipeline_caller_is_test(const cbm_gbuf_node_t *source, const char *rel, CBMLanguage lang) {
+    return cbm_node_is_test(source) || cbm_is_test_file(rel, lang) ||
+           cbm_registry_test_double_path(rel);
 }
 
 /* Helper to check suffix. */
@@ -270,13 +276,13 @@ static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
         }
 
         bool src_is_test =
-            node_is_test(src) || (src->file_path && cbm_is_test_path(src->file_path));
+            cbm_node_is_test(src) || (src->file_path && cbm_is_test_path(src->file_path));
         if (!src_is_test) {
             continue;
         }
 
         bool tgt_is_test =
-            node_is_test(tgt) || (tgt->file_path && cbm_is_test_path(tgt->file_path));
+            cbm_node_is_test(tgt) || (tgt->file_path && cbm_is_test_path(tgt->file_path));
         if (tgt_is_test) {
             continue;
         }

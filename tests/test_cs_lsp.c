@@ -1394,6 +1394,33 @@ TEST(cslsp_global_namespace_types_are_not_partial_twins) {
     PASS();
 }
 
+/* The using-directive walk kept its pending nodes in a fixed 256-entry stack
+ * and skipped every child it had no room for. A file of 300 namespace blocks
+ * left the last block, and the `using static` inside it, unwalked, so the
+ * unqualified `Sqrt` that directive imports bound to nothing. The walk's
+ * pending set grows with the file now. */
+TEST(cslsp_using_after_many_namespace_blocks) {
+    enum { PAD_BLOCKS = 300 };
+    static char src[16384];
+    size_t len = 0;
+    for (int i = 0; i < PAD_BLOCKS; i++) {
+        int w = snprintf(src + len, sizeof(src) - len, "namespace Pad%d { }\n", i);
+        ASSERT(w > 0 && (size_t)w < sizeof(src) - len);
+        len += (size_t)w;
+    }
+    int w = snprintf(src + len, sizeof(src) - len,
+                     "namespace App {\n"
+                     "    using static System.Math;\n"
+                     "    class C { public double X() { return Sqrt(2.0); } }\n"
+                     "}\n");
+    ASSERT(w > 0 && (size_t)w < sizeof(src) - len);
+    CBMFileResult *r = extract_cs(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "C.X", "Math.Sqrt") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────── */
 
 SUITE(cs_lsp) {
@@ -1461,4 +1488,5 @@ SUITE(cs_lsp) {
     RUN_TEST(cslsp_cyclic_alias_qualifier_terminates);
     RUN_TEST(cslsp_global_namespace_types_are_not_partial_twins);
     RUN_TEST(cslsp_decl_namespace_global_needs_clean_parse);
+    RUN_TEST(cslsp_using_after_many_namespace_blocks);
 }
