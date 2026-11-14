@@ -1569,6 +1569,73 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
     return NULL;
 }
 
+/* Map an alias-resolved file path to its module QN. Explicit JS/TS and
+ * JSON extensions name a module even when a dotted-name module also exists.
+ * For another indexed extension a QN alone proves nothing: filename dots and
+ * path separators both become dots. So the file path decides, in this order:
+ * a module at exactly that path (styles.css, also beside styles.css.ts), then
+ * a dotted-name module at that path plus a module extension (theme.css.ts
+ * imported as ~/theme.css), then the extension drops. A bundler ?query or a
+ * #fragment on the basename is not part of the extension; a `?` in a folder
+ * name is part of the path. Unknown suffixes such as cat.service stay intact. The shared alias
+ * resolver is unchanged, so doc links keep the file identity they had. */
+static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_path,
+                             char *aliased) {
+    static const char *const module_exts[] = {".ts",  ".tsx", ".js",  ".jsx", ".mjs",
+                                              ".cjs", ".mts", ".cts", ".json"};
+    /* The import spelled a module extension and the alias resolver removed
+     * it: what is left is the whole file stem, dots included
+     * (~/tokens.css.ts names tokens.css.ts, never tokens.css). */
+    size_t mlen = strlen(module_path);
+    size_t alen = strlen(aliased);
+    for (size_t i = 0; i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+        size_t elen = strlen(module_exts[i]);
+        bool spelled = mlen > elen && strcmp(module_path + mlen - elen, module_exts[i]) == 0;
+        bool still_there = alen > elen && strcmp(aliased + alen - elen, module_exts[i]) == 0;
+        if (spelled && !still_there) {
+            return cbm_pipeline_fqn_folder(ctx->project_name, aliased);
+        }
+    }
+    char *slash = strrchr(aliased, '/');
+    char *base = slash ? slash + SKIP_ONE : aliased;
+    char *query = strchr(base, '?');
+    if (query) {
+        *query = '\0';
+    }
+    char *ext = strrchr(base, '.');
+    char *fragment = ext ? strchr(ext, '#') : NULL;
+    if (fragment) {
+        *fragment = '\0';
+    }
+    for (size_t i = 0; ext && i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+        if (strcmp(ext, module_exts[i]) == 0) {
+            return cbm_pipeline_fqn_module(ctx->project_name, aliased);
+        }
+    }
+    char *kept = cbm_pipeline_fqn_folder(ctx->project_name, aliased);
+    if (!kept || !ext || ext == base || cbm_language_for_extension(ext) == CBM_LANG_COUNT) {
+        return kept;
+    }
+    char *stripped = cbm_pipeline_fqn_module(ctx->project_name, aliased);
+    const cbm_gbuf_node_t *node =
+        ctx->gbuf && stripped ? cbm_gbuf_find_by_qn(ctx->gbuf, stripped) : NULL;
+    bool exact = node && node->label && strcmp(node->label, "Module") == 0 && node->file_path &&
+                 strcmp(node->file_path, aliased) == 0;
+    node = ctx->gbuf && !exact ? cbm_gbuf_find_by_qn(ctx->gbuf, kept) : NULL;
+    size_t len = strlen(aliased);
+    if (node && node->label && strcmp(node->label, "Module") == 0 && node->file_path &&
+        strncmp(node->file_path, aliased, len) == 0) {
+        for (size_t i = 0; i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+            if (strcmp(node->file_path + len, module_exts[i]) == 0) {
+                safe_free(stripped);
+                return kept;
+            }
+        }
+    }
+    safe_free(kept);
+    return stripped;
+}
+
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
@@ -1595,7 +1662,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         if (amap) {
             char *aliased = cbm_path_alias_resolve(amap, module_path);
             if (aliased) {
-                char *qn = cbm_pipeline_fqn_module(ctx->project_name, aliased);
+                char *qn = alias_module_qn(ctx, module_path, aliased);
                 free(aliased);
                 return qn;
             }

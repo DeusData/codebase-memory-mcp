@@ -273,7 +273,7 @@ typedef struct {
 } EIFileEdgeExpect;
 
 static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFileEdgeExpect *want,
-                               int nwant, int expected_count) {
+                               int nwant, int expected_count, const char *target_label) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
     int ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == expected_count;
@@ -293,7 +293,14 @@ static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFile
                 cbm_node_t target;
                 memset(&target, 0, sizeof(target));
                 if (cbm_store_find_node_by_id(store, edges[j].target_id, &target) == CBM_STORE_OK) {
-                    found = target.file_path && strcmp(target.file_path, want[i].target) == 0;
+                    found = target.file_path && strcmp(target.file_path, want[i].target) == 0 &&
+                            (!target_label ||
+                             (target.label && strcmp(target.label, target_label) == 0));
+                    if (!found && target_label && edge_count == 1) {
+                        fprintf(stderr, "  [IMPORTS] %s -> %s (%s), expected %s (%s)\n",
+                                want[i].importer, target.file_path ? target.file_path : "",
+                                target.label ? target.label : "", want[i].target, target_label);
+                    }
                     cbm_node_free_fields(&target);
                 }
                 if (found) {
@@ -359,7 +366,7 @@ TEST(ei_relative_astro_css_imports_issue2558) {
     };
 
     ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
-                                    (int)(sizeof(want) / sizeof(want[0])), 12));
+                                    (int)(sizeof(want) / sizeof(want[0])), 12, NULL));
     PASS();
 }
 
@@ -386,7 +393,7 @@ TEST(ei_nix_parent_relative_import_issue2797) {
     };
 
     ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
-                                    (int)(sizeof(want) / sizeof(want[0])), 3));
+                                    (int)(sizeof(want) / sizeof(want[0])), 3, NULL));
     PASS();
 }
 
@@ -404,7 +411,7 @@ TEST(ei_thrift_parent_relative_import_issue2797) {
     };
 
     ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
-                                    (int)(sizeof(want) / sizeof(want[0])), 1));
+                                    (int)(sizeof(want) / sizeof(want[0])), 1, NULL));
     PASS();
 }
 
@@ -594,6 +601,192 @@ TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682) {
     ASSERT_TRUE(saw_type);
     ASSERT_TRUE(helper_target_ok);
     ASSERT_TRUE(type_target_ok);
+    PASS();
+}
+
+/* #514 follow-up: the tsconfig `paths` branch must preserve dotted basenames
+ * like the relative branch (#1682). It stripped `.service` from
+ * `@app/cats/cat.service`, missed the module, and bound the import by last
+ * segment to an unrelated node. */
+TEST(ei_typescript_dotted_alias_import_targets_source_module) {
+    static const char *service_path = "apps/api/src/cats/cat.service.ts";
+    static const char *controller_path = "apps/api/src/cats/cat.controller.ts";
+    static const EILangFile f[] = {
+        {"apps/api/tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{\"@app/*\":[\"src/*\"]}}}\n"},
+        {"apps/api/src/cats/cat.service.ts", "export class CatService {\n"
+                                             "  findAll(): string[] {\n"
+                                             "    return [\"a\"];\n"
+                                             "  }\n"
+                                             "}\n"},
+        {"apps/api/src/cats/cat.controller.ts",
+         "import { CatService } from \"@app/cats/cat.service\";\n"
+         "export class CatController {\n"
+         "  constructor(private readonly catService: CatService) {}\n"
+         "}\n"},
+        {"apps/api/src/other/service.ts", "export function service(): number {\n"
+                                          "  return 1;\n"
+                                          "}\n"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t controller_id = ei_node_id_for_file_label(store, lp.project, controller_path, "File");
+    ASSERT_GT(controller_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, controller_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+
+    bool saw_import = false;
+    bool target_ok = false;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        if (!strstr(props, "\"local_name\":\"CatService\"")) {
+            continue;
+        }
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        saw_import = true;
+        target_ok = target->file_path && strcmp(target->file_path, service_path) == 0 &&
+                    target->label && strcmp(target->label, "Module") == 0;
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+
+    ASSERT_TRUE(saw_import);
+    ASSERT_TRUE(target_ok);
+    PASS();
+}
+
+/* An import that spells the module extension of a dotted name gets that
+ * file, not the shorter file beside it: ~/tokens.css.ts is tokens.css.ts
+ * (never tokens.css), and ~/worker.task.mjs.ts is worker.task.mjs.ts (never
+ * worker.task.mjs). */
+TEST(ei_typescript_alias_import_spelled_ext_on_dotted_name) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/tokens.css", ":root { --gap: 4px; }\n"},
+        {"src/tokens.css.ts", "export const tokens = { gap: 4 };\n"},
+        {"src/worker.task.mjs", "export function run() {}\n"},
+        {"src/worker.task.mjs.ts", "export function typedRun(): void {}\n"},
+        {"src/a.ts", "import { tokens } from '~/tokens.css.ts';\nexport const a = tokens;\n"},
+        {"src/b.ts", "import { typedRun } from '~/worker.task.mjs.ts';\nexport const b = typedRun;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/a.ts", "src/tokens.css.ts"},
+        {"src/b.ts", "src/worker.task.mjs.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 2, "Module"));
+    PASS();
+}
+
+#ifndef _WIN32
+/* A `?` in a folder name is part of the path, not a bundler query: the alias
+ * import ~/dir?name/file names src/dir?name/file.ts, never src/dir.ts.
+ * Windows file names cannot hold `?`. */
+TEST(ei_typescript_alias_import_keeps_question_mark_folder) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/dir?name/file.ts", "export const wanted = 1;\n"},
+        {"src/dir.ts", "export const decoy = 2;\n"},
+        {"src/user.ts", "import { wanted } from '~/dir?name/file';\n"
+                        "export const u = wanted;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/user.ts", "src/dir?name/file.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 1, "Module"));
+    PASS();
+}
+#endif
+
+/* The alias branch keeps a dotted basename, but an alias import of a non-JS
+ * file still names that file: `~/styles/globals.css` and the bundler query
+ * form `~/styles.css?url` reach the CSS modules, not src/styles/css.ts or the
+ * unrelated `css` function a last-segment guess finds. A dotted name that is
+ * itself a module stays whole: theme.css.ts imported as `~/theme.css` or
+ * `~/theme.css.ts`, and `~/cats/cat.service`. Explicit .mjs/.cjs/.mts/.cts/.json imports
+ * drop their module extension even beside a dotted TypeScript module. The
+ * reverse import ~/styles/css still names src/styles/css.ts, and ~/cat.service
+ * must keep its basename even with src/cat/service.ts alongside it. A file
+ * that exists under the imported name wins over a dotted module beside it
+ * (tokens.css over tokens.css.ts), and a #fragment does not hide the
+ * extension (~/tokens.css#frag from another folder, with unrelated functions
+ * named like its segments). */
+TEST(ei_typescript_alias_import_non_js_file_targets_its_module) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/styles/globals.css", "body { margin: 0; }\n"},
+        {"src/styles.css", "html { color: black; }\n"},
+        {"src/styles/css.ts", "export const decoy = 1;\n"},
+        {"src/cat.service.ts", "export const cat = 1;\n"},
+        {"src/cat/service.ts", "export const decoy = 2;\n"},
+        {"src/theme.css.ts", "export const vars = { gap: 4 };\n"},
+        {"src/worker.task.mjs", "export function run() {}\n"},
+        {"src/worker.task.mjs.ts", "export function other() {}\n"},
+        {"src/helper.task.cjs", "exports.helper = function() {};\n"},
+        {"src/typed.task.mts", "export function typed() {}\n"},
+        {"src/compat.task.cts", "export function compat() {}\n"},
+        {"src/config.task.json", "{\"gap\":4}\n"},
+        {"src/cats/cat.service.ts", "export class CatService {\n"
+                                    "  findAll(): string[] { return []; }\n"
+                                    "}\n"},
+        {"src/lib/highlighter.ts", "export function css(): number { return 1; }\n"
+                                   "export function service(): number { return 2; }\n"},
+        {"src/app.ts", "import '~/styles/globals.css';\n"
+                       "import appCss from '~/styles.css?url';\n"
+                       "import { run } from '~/worker.task.mjs';\n"
+                       "import { helper } from '~/helper.task.cjs';\n"
+                       "import { typed } from '~/typed.task.mts';\n"
+                       "import { compat } from '~/compat.task.cts';\n"
+                       "import config from '~/config.task.json';\n"
+                       "import { CatService } from '~/cats/cat.service';\n"
+                       "export function app(): unknown[] { return [appCss, CatService]; }\n"},
+        {"src/panel.ts", "import { vars } from '~/theme.css';\n"
+                         "export function panel(): number { return vars.gap; }\n"},
+        {"src/card.ts", "import { vars } from '~/theme.css.ts';\n"
+                        "export function card(): number { return vars.gap; }\n"},
+        {"src/plain.ts", "import appCss from '~/styles.css';\n"},
+        {"src/nested.ts", "import { decoy } from '~/styles/css';\n"},
+        {"src/cat-user.ts", "import { cat } from '~/cat.service';\n"},
+        {"src/tokens.css", "a { gap: 4px; }\n"},
+        {"src/tokens.css.ts", "export const tokens = 4;\n"},
+        {"src/tokens-plain.ts", "import tokensCss from '~/tokens.css';\n"},
+        {"src/tokens-url.ts", "import tokensUrl from '~/tokens.css?url';\n"},
+        {"aaa/decoy.ts", "export function tokens(): number { return 1; }\n"
+                         "export function frag(): number { return 2; }\n"},
+        {"apps/frag.ts", "import tokensFrag from '~/tokens.css#frag';\n"},
+        {"src/lib/worker.ts", "export const w = 1;\n"},
+        {"src/worker-user.ts", "import W from '~/lib/worker.ts?worker';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/app.ts", "src/styles/globals.css"},    {"src/app.ts", "src/styles.css"},
+        {"src/app.ts", "src/cats/cat.service.ts"},   {"src/app.ts", "src/worker.task.mjs"},
+        {"src/app.ts", "src/helper.task.cjs"},       {"src/app.ts", "src/typed.task.mts"},
+        {"src/app.ts", "src/compat.task.cts"},       {"src/app.ts", "src/config.task.json"},
+        {"src/panel.ts", "src/theme.css.ts"},        {"src/card.ts", "src/theme.css.ts"},
+        {"src/plain.ts", "src/styles.css"},          {"src/nested.ts", "src/styles/css.ts"},
+        {"src/cat-user.ts", "src/cat.service.ts"},   {"src/tokens-plain.ts", "src/tokens.css"},
+        {"src/tokens-url.ts", "src/tokens.css"},     {"apps/frag.ts", "src/tokens.css"},
+        {"src/worker-user.ts", "src/lib/worker.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 17, "Module"));
     PASS();
 }
 
@@ -2551,6 +2744,12 @@ SUITE(edge_imports) {
     /* ── GREEN GUARDS — TypeScript (must stay passing) ── */
     RUN_TEST(ei_typescript_named_relative_import);
     RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
+    RUN_TEST(ei_typescript_dotted_alias_import_targets_source_module);
+    RUN_TEST(ei_typescript_alias_import_non_js_file_targets_its_module);
+    RUN_TEST(ei_typescript_alias_import_spelled_ext_on_dotted_name);
+#ifndef _WIN32
+    RUN_TEST(ei_typescript_alias_import_keeps_question_mark_folder);
+#endif
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);
