@@ -78,11 +78,18 @@ static const uint32_t K[64] = {
  * fully instrumented. Equality with the hardware backends is proven by
  * cli_sha256_hardware_matches_portable_issue2441 and the NIST vectors.
  * Release (unsanitized) builds are unaffected: the attribute only withholds
- * instrumentation that -fsanitize would add. */
+ * instrumentation that -fsanitize would add. Spelled through a macro so the
+ * attribute sits on the signature line: an attribute on its own line between
+ * preprocessor guards is laid out differently by clang-format 20 (CI) and
+ * Homebrew's newer release (same reason as NO_BUILTIN_MEM in
+ * mem_override_libc.c). */
 #if defined(__clang__) || defined(__GNUC__)
-__attribute__((no_sanitize("address", "undefined")))
+#define SHA256_NO_SANITIZE __attribute__((no_sanitize("address", "undefined")))
+#else
+#define SHA256_NO_SANITIZE
 #endif
-static void sha256_transform(cbm_sha256_ctx *c, const uint8_t *data) {
+
+SHA256_NO_SANITIZE static void sha256_transform(cbm_sha256_ctx *c, const uint8_t *data) {
     /* Scratch comes from the context, not this frame: a 256-byte local here
      * is fake-stacked by ASan's use-after-return mode on every 64-byte block
      * (see the note on cbm_sha256_ctx::sched). Identical values, allocated
