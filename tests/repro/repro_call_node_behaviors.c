@@ -712,7 +712,7 @@ TEST(repro_call_node_behavior_objectscript_udl_method_call) {
         CBM_LANG_OBJECTSCRIPT_UDL,
         "Behavior.cls",
         OBJECTSCRIPT_METHOD_SOURCE,
-        "method_call",
+        "do_parameter",
         "a typed ObjectScript receiver resolves one exact instance-method call without "
         "consuming its argument usage"};
     return run_objectscript_call_behavior(&test_case, "repro.Behavior.Sample.Behavior.run",
