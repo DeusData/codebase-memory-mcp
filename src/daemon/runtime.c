@@ -53,6 +53,13 @@ uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void) {
 static void runtime_note_peer_image_hash(void) {
     (void)atomic_fetch_add(&runtime_peer_image_hash_count_seam, 1);
 }
+/* The in-process harness peer is this very process, so its post-hash identity
+ * re-check always holds. While armed, every fingerprinting image acquisition
+ * fails that re-check after its digest was computed. */
+static atomic_bool runtime_fail_image_recheck_after_hash_seam;
+void cbm_daemon_runtime_fail_image_recheck_after_hash_for_testing(bool fail) {
+    atomic_store(&runtime_fail_image_recheck_after_hash_seam, fail);
+}
 /* The abandoned-request containment path ends in process termination, which an
  * in-process harness cannot observe. The timeout override makes the ceiling
  * reachable in test time; the hook replaces termination with a recordable
@@ -1097,10 +1104,18 @@ bool cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(
 /* Acquire one process instance's mapped image as a native object. Supplying a
  * fingerprint hashes that same held object; NULL performs metadata-only
  * acquisition for the HELLO fast path. Every platform brackets the process
- * identity/image lookup before returning the retained reference. */
-static bool runtime_process_image_reference_acquire(
+ * identity/image lookup before returning the retained reference.
+ * `fingerprint` keeps the digest only when the whole bracket held. `observed`,
+ * when supplied, receives the digest that was computed even if the post-hash
+ * re-check then failed ("" when none was computed), so a caller can tell an
+ * image that was read and differed from one that could not be read. */
+static bool runtime_process_image_reference_acquire_observed(
     uint64_t process_id, runtime_process_image_reference_t *reference,
-    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE],
+    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (observed) {
+        observed[0] = '\0';
+    }
     if (!reference || process_id == 0) {
         return false;
     }
@@ -1282,10 +1297,26 @@ static bool runtime_process_image_reference_acquire(
     (void)process_id;
     bool ok = false;
 #endif
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (ok && fingerprint && atomic_load(&runtime_fail_image_recheck_after_hash_seam)) {
+        (void)runtime_process_image_reference_release(reference);
+        ok = false;
+    }
+#endif
+    if (observed && fingerprint) {
+        (void)snprintf(observed, CBM_DAEMON_BUILD_FINGERPRINT_SIZE, "%s", fingerprint);
+    }
     if (!ok && fingerprint) {
         fingerprint[0] = '\0';
     }
     return ok;
+}
+
+static bool runtime_process_image_reference_acquire(
+    uint64_t process_id, runtime_process_image_reference_t *reference,
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    return runtime_process_image_reference_acquire_observed(process_id, reference, fingerprint,
+                                                            NULL);
 }
 
 /* True when a retained reference is still the unchanged image it captured AND
@@ -1401,10 +1432,12 @@ static runtime_peer_image_verdict_t runtime_peer_image_verify(cbm_daemon_runtime
     }
 
     char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     runtime_process_image_reference_t hashed;
     runtime_process_image_reference_init(&hashed);
     runtime_note_peer_image_hash();
-    bool fingerprinted = runtime_process_image_reference_acquire(process_id, &hashed, fingerprint);
+    bool fingerprinted = runtime_process_image_reference_acquire_observed(process_id, &hashed,
+                                                                          fingerprint, observed);
     bool verified = fingerprinted && strcmp(fingerprint, requested_build) == 0 &&
                     strcmp(fingerprint, service->identity.build_fingerprint) == 0;
     if (verified) {
@@ -1420,7 +1453,15 @@ static runtime_peer_image_verdict_t runtime_peer_image_verify(cbm_daemon_runtime
     if (verified) {
         return RUNTIME_PEER_IMAGE_VERIFIED;
     }
-    return fingerprinted ? RUNTIME_PEER_IMAGE_MISMATCH : RUNTIME_PEER_IMAGE_UNVERIFIABLE;
+    /* A digest that was computed and differs from this build is a mismatch
+     * whatever the post-hash re-check concluded. Only an image that could not
+     * be hashed at all, or whose digest matched before its re-check failed,
+     * stays unverifiable. */
+    bool observed_differs = strcmp(observed, requested_build) != 0 ||
+                            strcmp(observed, service->identity.build_fingerprint) != 0;
+    bool observed_mismatch = observed[0] != '\0' && observed_differs;
+    return fingerprinted || observed_mismatch ? RUNTIME_PEER_IMAGE_MISMATCH
+                                              : RUNTIME_PEER_IMAGE_UNVERIFIABLE;
 }
 
 static void runtime_verified_peer_images_release(cbm_daemon_runtime_service_t *service) {
@@ -2442,7 +2483,8 @@ static void *runtime_connection_worker(void *opaque) {
      *
      *   fingerprint_mismatch — the peer's image WAS read and hashes differently
      *     than the running daemon. That is the tamper/skew case the gate exists
-     *     for. Still rejected, hard.
+     *     for. Still rejected, hard, whatever the post-hash re-check concluded
+     *     (the digest was read).
      *   image_unverifiable — the peer's image could not be examined at all
      *     (ephemeral npx cache paths, ptrace_scope restrictions, sandboxed
      *     hosts). Nothing was contradicted; we simply could not look. The peer
