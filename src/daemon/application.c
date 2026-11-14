@@ -261,7 +261,7 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
 static bool application_update_reap(cbm_daemon_application_t *application, bool wait,
                                     uint32_t timeout_ms);
 static void *application_job_thread(void *opaque);
-static char *application_auto_index_args(cbm_daemon_application_t *application,
+static char *application_auto_index_args(cbm_daemon_application_t *application, bool mutex_held,
                                          const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
@@ -388,9 +388,12 @@ static int application_worker_start_default(void *context, const char *args_json
     (void)context;
     cbm_index_resource_policy_t resource_policy;
     char error[CBM_SZ_256] = {0};
+    char task_db_path[CBM_SZ_1K];
     if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
-                                                 sizeof(error))) {
-        cbm_log_error("daemon.index.policy", "error", error);
+                                                 sizeof(error)) ||
+        !cbm_mcp_index_task_db_path(args_json, task_db_path, sizeof(task_db_path))) {
+        cbm_log_error("daemon.index.worker_policy", "error",
+                      error[0] ? error : "could not resolve worker index path");
         *worker_out = NULL;
         return -1;
     }
@@ -403,9 +406,10 @@ static int application_worker_start_default(void *context, const char *args_json
     const char *root = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
     worker->project = application_index_project_key(root, args_json);
     yyjson_doc_free(args_doc);
-    int result = cbm_index_worker_start_with_policy_log(
-        args_json, memory_budget_bytes, &resource_policy, false, marker_file, quarantine_file,
-        application_worker_diagnostic, worker, duration_origin_ms, &worker->handle);
+    int result = cbm_index_worker_start_with_storage_policy(
+        args_json, memory_budget_bytes, &resource_policy, task_db_path, false, marker_file,
+        quarantine_file, application_worker_diagnostic, worker, duration_origin_ms,
+        &worker->handle);
     if (result != 0) {
         application_worker_destroy_default(NULL, worker);
         *worker_out = NULL;
@@ -1559,7 +1563,7 @@ static void application_job_request_facts_begin(cbm_daemon_application_job_t *jo
     cbm_index_resource_policy_t policy;
     char error[CBM_SZ_256] = {0};
     if (cbm_mcp_index_policy_from_internal_args(job->args_json, &policy, error, sizeof(error)) &&
-        cbm_index_policy_worker_enabled(&policy)) {
+        (cbm_index_policy_worker_enabled(&policy) || policy.max_task_temp_bytes.enabled)) {
         cbm_mcp_index_request_facts_begin(job->args_json, &job->request_facts);
     }
 }
@@ -1993,7 +1997,7 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             application_refresh_watch_locked(session);
             continue;
         }
-        char *args = application_auto_index_args(application, root_path);
+        char *args = application_auto_index_args(application, true, root_path);
         if (!args) {
             continue;
         }
@@ -2583,7 +2587,8 @@ static bool application_update_reap(cbm_daemon_application_t *application, bool 
 }
 
 static bool application_index_args_add_policy(cbm_daemon_application_t *application,
-                                              yyjson_mut_doc *document, yyjson_mut_val *root) {
+                                              bool mutex_held, yyjson_mut_doc *document,
+                                              yyjson_mut_val *root) {
     cbm_config_t *owned_config = NULL;
     cbm_config_t *config = application ? application->config : NULL;
     if (!config) {
@@ -2602,10 +2607,41 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
+    cbm_system_info_t system = cbm_system_info();
+    /* Strict measures itself against the per-worker slice, which is what the
+     * daemon budgets for one index today. */
+    uint64_t soft_budget = 0;
+    if (application) {
+        soft_budget =
+            (uint64_t)(mutex_held ? application_worker_memory_slice_locked(application, NULL)
+                                  : cbm_daemon_application_worker_memory_budget_bytes(application));
+    }
+    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram, soft_budget);
     return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
 }
 
-static char *application_auto_index_args(cbm_daemon_application_t *application,
+static char *application_index_args_replace_policy(cbm_daemon_application_t *application,
+                                                   const char *args_json) {
+    yyjson_doc *source = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_mut_doc *document = source ? yyjson_doc_mut_copy(source, NULL) : NULL;
+    yyjson_doc_free(source);
+    yyjson_mut_val *root = document ? yyjson_mut_doc_get_root(document) : NULL;
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(document);
+        return NULL;
+    }
+    while (yyjson_mut_obj_get(root, "_cbm_index_policy")) {
+        (void)yyjson_mut_obj_remove_key(root, "_cbm_index_policy");
+    }
+    char *rewritten =
+        application_index_args_add_policy(application, false, document, root)
+            ? yyjson_mut_write_opts(document, 0, cbm_json_writer_allocator(), NULL, NULL)
+            : NULL;
+    yyjson_mut_doc_free(document);
+    return rewritten;
+}
+
+static char *application_auto_index_args(cbm_daemon_application_t *application, bool mutex_held,
                                          const char *root_path) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = document ? yyjson_mut_obj(document) : NULL;
@@ -2615,7 +2651,7 @@ static char *application_auto_index_args(cbm_daemon_application_t *application,
     }
     yyjson_mut_doc_set_root(document, root);
     bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path) &&
-                   application_index_args_add_policy(application, document, root) &&
+                   application_index_args_add_policy(application, mutex_held, document, root) &&
                    yyjson_mut_obj_add_bool(document, root, "_cbm_background", true);
     char *args = encoded ? yyjson_mut_write(document, 0, NULL) : NULL;
     yyjson_mut_doc_free(document);
@@ -2669,7 +2705,7 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                      files, "limit", limit);
     }
     bool args_required = auto_index_candidate && within_auto_index_limit;
-    char *args = args_required ? application_auto_index_args(application, root_path) : NULL;
+    char *args = args_required ? application_auto_index_args(application, false, root_path) : NULL;
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     if (application->stopping || application_request_cancelled_locked(session)) {
@@ -3117,8 +3153,14 @@ static char *application_index_execute(void *context, const char *root_path, con
     if (!session || !root_path || !args_json) {
         return NULL;
     }
-    return async ? application_index_start_async(session, root_path, args_json)
-                 : application_index_run_sync(session, root_path, args_json);
+    char *trusted_args = application_index_args_replace_policy(session->application, args_json);
+    if (!trusted_args) {
+        return cbm_mcp_text_result("failed to resolve daemon index resource policy", true);
+    }
+    char *result = async ? application_index_start_async(session, root_path, trusted_args)
+                         : application_index_run_sync(session, root_path, trusted_args);
+    cbm_free(CBM_MEM_CLASS_OTHER, trusted_args);
+    return result;
 }
 
 static void application_status_add_record(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -4486,7 +4528,7 @@ static int application_background_index(cbm_daemon_application_t *application,
     }
     yyjson_mut_doc_set_root(document, root);
     bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root) &&
-                   application_index_args_add_policy(application, document, root) &&
+                   application_index_args_add_policy(application, false, document, root) &&
                    yyjson_mut_obj_add_bool(document, root, "_cbm_background", true);
     char *default_project = cbm_project_name_from_path(canonical_root);
     bool custom_project =
