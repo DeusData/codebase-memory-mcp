@@ -2431,6 +2431,23 @@ static bool cli_install_file_unchanged(const char *path,
            before->path.size == after.path.size && before->path.mtime_ns == after.path.mtime_ns;
 }
 
+/* Count all entries, including hidden stages, except the directory links. */
+static int cli_install_dir_entry_count(const char *path) {
+    cbm_dir_t *directory = cbm_opendir(path);
+    if (!directory) {
+        return -1;
+    }
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(directory)) != NULL) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            count++;
+        }
+    }
+    cbm_closedir(directory);
+    return count;
+}
+
 /* --skip-binary is a config-only operation even with an existing target,
  * --yes, or --force. Keep the sentinel's bytes, native file identity, full
  * mtime precision, POSIX mode / Windows attributes and process PATH while
@@ -2534,10 +2551,13 @@ TEST(cli_install_skip_binary_preserves_target_and_path_while_updating_config) {
         bool path_ok = current_path && strcmp(current_path, tmpdir) == 0 && shell &&
                        strcmp(shell, shell_sentinel) == 0 &&
                        cli_install_file_unchanged(shell_rc, &shell_before);
-        cases_ok[i] = rc == 0 && config_ok && binary_ok && path_ok;
+        int entries = cli_install_dir_entry_count(binary_dir);
+        bool entries_ok = entries == (i == 2U ? 0 : 1);
+        cases_ok[i] = rc == 0 && config_ok && binary_ok && path_ok && entries_ok;
         if (!cases_ok[i]) {
-            (void)fprintf(stderr, "skip-binary case %zu: rc=%d config=%d binary=%d path=%d\n", i,
-                          rc, config_ok, binary_ok, path_ok);
+            (void)fprintf(stderr,
+                          "skip-binary case %zu: rc=%d config=%d binary=%d path=%d entries=%d\n",
+                          i, rc, config_ok, binary_ok, path_ok, entries);
         }
         free(shell);
     }
@@ -20812,6 +20832,100 @@ TEST(cli_install_managed_binary_config_path_issue2722) {
     PASS();
 }
 
+/* #2722: the mise path infers skip-binary without an explicit flag. A
+ * different existing target must remain the same file, with no stage left
+ * beside it. The manager's binary and the user's PATH must stay untouched. */
+TEST(cli_install_managed_binary_keeps_a_different_existing_binary_issue2722) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-managed-kept-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    cbm_normalize_path_sep(tmpdir);
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "PATH", "SHELL"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char binary_dir[640];
+    char binary_path[768];
+    char managed_dir[640];
+    char managed_path[768];
+    char shell_rc[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    snprintf(managed_dir, sizeof(managed_dir), "%s/.local/share/mise/installs/cbm/9.9.9/bin",
+             tmpdir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+    snprintf(managed_path, sizeof(managed_path), "%s/codebase-memory-mcp.exe", managed_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+    snprintf(managed_path, sizeof(managed_path), "%s/codebase-memory-mcp", managed_dir);
+#endif
+    snprintf(shell_rc, sizeof(shell_rc), "%s/.zshrc", tmpdir);
+    const char *target_sentinel = "keep this different installed binary\n";
+    const char *managed_sentinel = "keep the mise-managed source binary\n";
+    const char *shell_sentinel = "# user PATH configuration\n";
+    bool setup_ok = test_mkdirp(binary_dir) == 0 && test_mkdirp(managed_dir) == 0 &&
+                    write_test_file(binary_path, target_sentinel) == 0 &&
+                    write_test_file(managed_path, managed_sentinel) == 0 &&
+                    write_test_file(shell_rc, shell_sentinel) == 0;
+#ifndef _WIN32
+    setup_ok = setup_ok && chmod(binary_path, 0510) == 0 && chmod(managed_path, 0500) == 0;
+#endif
+    cli_install_file_snapshot_t target_before;
+    cli_install_file_snapshot_t managed_before;
+    cli_install_file_snapshot_t shell_before;
+    setup_ok = setup_ok && cli_install_file_snapshot(binary_path, &target_before) &&
+               cli_install_file_snapshot(managed_path, &managed_before) &&
+               cli_install_file_snapshot(shell_rc, &shell_before);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    cbm_cli_set_self_path_override_for_test(managed_path);
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    char *argv[] = {"--skip-config", "--yes"};
+    int rc = setup_ok ? cli_test_cmd_install(2, argv) : -1;
+    char *target = read_test_file_alloc(binary_path);
+    bool target_kept = setup_ok && target && strcmp(target, target_sentinel) == 0 &&
+                       cli_install_file_unchanged(binary_path, &target_before);
+    free(target);
+    char *managed = read_test_file_alloc(managed_path);
+    bool managed_kept = setup_ok && managed && strcmp(managed, managed_sentinel) == 0 &&
+                        cli_install_file_unchanged(managed_path, &managed_before);
+    free(managed);
+    char *shell = read_test_file_alloc(shell_rc);
+    const char *current_path = getenv("PATH");
+    bool path_kept = setup_ok && current_path && strcmp(current_path, tmpdir) == 0 && shell &&
+                     strcmp(shell, shell_sentinel) == 0 &&
+                     cli_install_file_unchanged(shell_rc, &shell_before);
+    free(shell);
+    int entries = cli_install_dir_entry_count(binary_dir);
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_self_path_override_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(target_kept);
+    ASSERT_TRUE(managed_kept);
+    ASSERT_TRUE(path_kept);
+    ASSERT_EQ(entries, 1);
+    PASS();
+}
+
 /* #1558: `install` configured EVERY detected client, so a user who wanted
  * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
  * install silently recreated them. The selector restricts it.
@@ -21579,6 +21693,7 @@ SUITE(cli) {
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_install_managed_binary_config_path_issue2722);
+    RUN_TEST(cli_install_managed_binary_keeps_a_different_existing_binary_issue2722);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
     RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
