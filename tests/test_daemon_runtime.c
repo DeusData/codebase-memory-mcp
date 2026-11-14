@@ -14,6 +14,7 @@
 #include "daemon/host_internal.h"
 #include "daemon/ipc.h"
 #include "daemon/runtime.h"
+#include "daemon/runtime_status_details_internal.h"
 #include "daemon/service.h"
 #include "daemon/version_cohort.h"
 #include "foundation/compat.h"
@@ -1272,6 +1273,7 @@ static bool runtime_test_fixture_start_failed(const char *tag, const char *stage
 }
 
 static bool runtime_test_fixture_permanent = false;
+static const char *runtime_test_fixture_cache_directory;
 
 typedef struct {
     cbm_version_cohort_manager_t *manager;
@@ -1329,6 +1331,7 @@ static bool runtime_test_fixture_start_configured(
     cbm_daemon_runtime_service_config_t config = {
         .endpoint = fixture->endpoint,
         .identity = *identity,
+        .cache_directory = runtime_test_fixture_cache_directory,
         .conflict_log_path = fixture->log_path,
         .conflict_log_cap_bytes = 64U * 1024U,
         .max_clients = max_clients,
@@ -5512,6 +5515,307 @@ TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
     PASS();
 }
 
+TEST(daemon_runtime_status_details_preserves_long_paths_and_owns_copy) {
+    const size_t lengths[] = {259, 260, 261, 4095};
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        char cache[4096] = {0};
+        const char prefix[] = "C:/cache-中文 space/line\nbreak\t\"\\";
+        memcpy(cache, prefix, sizeof(prefix) - 1);
+        memset(cache + sizeof(prefix) - 1, 'x', lengths[i] - sizeof(prefix) + 1);
+        cache[lengths[i]] = '\0';
+        char expected[4096];
+        memcpy(expected, cache, sizeof(cache));
+        runtime_test_fixture_t fixture;
+        runtime_test_fixture_permanent = true;
+        runtime_test_fixture_cache_directory = cache;
+        bool started = runtime_test_fixture_start(&fixture, "status-path", &identity);
+        runtime_test_fixture_cache_directory = NULL;
+        runtime_test_fixture_permanent = false;
+        memset(cache, 'z', lengths[i]); /* must not change the service's path */
+        cbm_daemon_runtime_status_details_t details = {0};
+        cbm_daemon_runtime_status_t legacy = {0};
+        bool queried =
+            started && cbm_daemon_runtime_request_status_details(fixture.endpoint, &identity,
+                                                                 RUNTIME_TEST_TIMEOUT_MS, &details);
+        bool legacy_ok =
+            started && cbm_daemon_runtime_request_status(fixture.endpoint, &identity,
+                                                         RUNTIME_TEST_TIMEOUT_MS, &legacy);
+        size_t admitted = started ? cbm_daemon_runtime_service_active_clients(fixture.service) : 1;
+        runtime_test_fixture_finish(&fixture);
+        ASSERT_TRUE(started);
+        ASSERT_TRUE(queried);
+        ASSERT_STR_EQ(details.cache_directory, expected);
+        ASSERT_TRUE(legacy_ok);
+        ASSERT_EQ(details.status.daemon_pid, legacy.daemon_pid);
+        ASSERT_EQ(admitted, 0);
+    }
+    PASS();
+}
+
+TEST(daemon_runtime_status_details_does_not_disclose_paths_to_forged_peers) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    runtime_test_fixture_permanent = true;
+    runtime_test_fixture_cache_directory = "C:/private cache";
+    bool started = runtime_test_fixture_start(&fixture, "status-auth", &identity);
+    runtime_test_fixture_cache_directory = NULL;
+    runtime_test_fixture_permanent = false;
+    bool rejected = started;
+    for (uint32_t length = 64; started && length <= 65; length++) {
+        cbm_daemon_ipc_connection_t *connection =
+            cbm_daemon_ipc_connect(fixture.endpoint, RUNTIME_TEST_TIMEOUT_MS);
+        bool sent = connection && cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
+                                                            CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS,
+                                                            RUNTIME_BUILD_B, length);
+        cbm_daemon_frame_t frame = {0};
+        uint8_t *payload = NULL;
+        int received = sent ? cbm_daemon_ipc_receive_frame(connection, RUNTIME_TEST_TIMEOUT_MS,
+                                                           &frame, &payload)
+                            : 0;
+        rejected = rejected && received == 1 && frame.length == 4217 && payload;
+        for (uint32_t byte = 0; payload && byte < frame.length; byte++) {
+            rejected = rejected && payload[byte] == 0;
+        }
+        free(payload);
+        cbm_daemon_ipc_connection_close(connection);
+    }
+    runtime_test_fixture_finish(&fixture);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(rejected);
+    PASS();
+}
+
+typedef struct {
+    cbm_daemon_ipc_listener_t *listener;
+    bool malformed_details;
+    bool served;
+} runtime_legacy_status_t;
+
+static void *runtime_test_legacy_status_thread(void *opaque) {
+    runtime_legacy_status_t *server = opaque;
+    for (size_t attempt = 0; attempt < 2; attempt++) {
+        cbm_daemon_ipc_connection_t *connection = NULL;
+        if (cbm_daemon_ipc_accept(server->listener, RUNTIME_TEST_TIMEOUT_MS, &connection) != 1) {
+            return NULL;
+        }
+        cbm_daemon_frame_t frame = {0};
+        uint8_t *payload = NULL;
+        int received =
+            cbm_daemon_ipc_receive_frame(connection, RUNTIME_TEST_TIMEOUT_MS, &frame, &payload);
+        if (received == 1 && frame.length == 65) {
+            if (attempt == 0 && server->malformed_details) {
+                uint8_t malformed[4217];
+                memset(malformed, 'x', sizeof(malformed)); /* no path terminator */
+                malformed[0] = 1;
+                (void)cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_RESPONSE, 12,
+                                                malformed, sizeof(malformed));
+            } else if (attempt == 1 && frame.flags == 10) {
+                uint8_t legacy[121] = {1}; /* frozen legacy STATUS envelope */
+                runtime_test_put_u32(legacy + 4, 77);
+                server->served = cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_RESPONSE,
+                                                           10, legacy, sizeof(legacy));
+            }
+        }
+        free(payload);
+        cbm_daemon_ipc_connection_close(connection);
+    }
+    return NULL;
+}
+
+/* An opaque token replaces IPC; only the scripted clock advances. Scheduler
+ * delays cannot consume the test budget or decide its result. */
+typedef struct {
+    uint64_t now;
+    uint32_t connect_cost[2], send_cost[2], receive_cost[2];
+    uint32_t connect_budget[2], receive_budget[2];
+    unsigned connects, sends, receives, closes;
+    int first_reply; /* 0 = unsupported, 1 = malformed, 2 = supported */
+    bool valid;
+} runtime_status_transport_stub_t;
+static runtime_status_transport_stub_t runtime_status_stub;
+
+static uint64_t runtime_test_status_now(void) {
+    return runtime_status_stub.now;
+}
+static cbm_daemon_ipc_connection_t *runtime_test_status_connect(
+    const cbm_daemon_ipc_endpoint_t *endpoint, uint32_t timeout) {
+    runtime_status_transport_stub_t *stub = &runtime_status_stub;
+    if (stub->connects >= 2) {
+        stub->valid = false;
+        return NULL;
+    }
+    unsigned attempt = stub->connects++;
+    stub->valid &= endpoint == (const void *)stub;
+    stub->connect_budget[attempt] = timeout;
+    stub->now += stub->connect_cost[attempt];
+    return (void *)stub;
+}
+static bool runtime_test_status_send(cbm_daemon_ipc_connection_t *connection,
+                                     cbm_daemon_frame_type_t type, uint16_t flags,
+                                     const void *payload, uint32_t length) {
+    runtime_status_transport_stub_t *stub = &runtime_status_stub;
+    unsigned attempt = stub->connects - 1;
+    stub->valid &= connection == (void *)stub && type == CBM_DAEMON_FRAME_REQUEST &&
+                   flags == (attempt == 0 ? CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS
+                                          : CBM_DAEMON_RUNTIME_OP_STATUS) &&
+                   payload && length == CBM_DAEMON_CONTROL_REQUEST_SIZE;
+    stub->sends++;
+    stub->now += stub->send_cost[attempt];
+    return true;
+}
+static int runtime_test_status_receive(cbm_daemon_ipc_connection_t *connection, uint32_t timeout,
+                                       uint32_t cap, cbm_daemon_frame_t *frame, uint8_t **payload) {
+    runtime_status_transport_stub_t *stub = &runtime_status_stub;
+    unsigned attempt = stub->connects - 1;
+    stub->valid &=
+        connection == (void *)stub && cap == (attempt == 0 ? CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE
+                                                           : CBM_DAEMON_STATUS_RESPONSE_SIZE);
+    stub->receives++;
+    stub->receive_budget[attempt] = timeout;
+    *payload = NULL;
+    if (stub->receive_cost[attempt] >= timeout) {
+        stub->now += timeout;
+        return 0;
+    }
+    stub->now += stub->receive_cost[attempt];
+    if (attempt == 0 && stub->first_reply == 0)
+        return 0;
+    *payload = calloc(cap, 1);
+    if (!*payload)
+        return -1;
+    (*payload)[0] = 1;
+    runtime_test_put_u32(*payload + 4, 77);
+    if (attempt == 0) {
+        memset(*payload + CBM_DAEMON_STATUS_RESPONSE_SIZE, stub->first_reply == 1 ? 'x' : 0,
+               CBM_DAEMON_STATUS_CACHE_PATH_SIZE);
+    }
+    frame->type = CBM_DAEMON_FRAME_RESPONSE;
+    frame->flags =
+        attempt == 0 ? CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS : CBM_DAEMON_RUNTIME_OP_STATUS;
+    frame->length = cap;
+    return 1;
+}
+static void runtime_test_status_close(cbm_daemon_ipc_connection_t *connection) {
+    runtime_status_stub.valid &= connection == (void *)&runtime_status_stub;
+    runtime_status_stub.closes++;
+}
+static const cbm_daemon_status_details_transport_t runtime_test_status_transport = {
+    .now_ms = runtime_test_status_now,
+    .ipc_connect = runtime_test_status_connect,
+    .send = runtime_test_status_send,
+    .receive = runtime_test_status_receive,
+    .close = runtime_test_status_close,
+};
+
+TEST(daemon_runtime_status_details_uses_one_budget_across_legacy_fallback) {
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", RUNTIME_BUILD_B);
+    for (int reply = 0; reply < 3; reply++) {
+        runtime_status_stub = (runtime_status_transport_stub_t){
+            .now = 10000,
+            .connect_cost = {100, 200},
+            .send_cost = {20, 30},
+            .receive_cost = {200, 300},
+            .first_reply = reply,
+            .valid = true,
+        };
+        cbm_daemon_runtime_status_details_t details = {0};
+        cbm_daemon_runtime_set_status_details_transport_for_testing(&runtime_test_status_transport);
+        bool queried = cbm_daemon_runtime_request_status_details((const void *)&runtime_status_stub,
+                                                                 &identity, 1000, &details);
+        cbm_daemon_runtime_set_status_details_transport_for_testing(NULL);
+        ASSERT_TRUE(queried && runtime_status_stub.valid);
+        ASSERT_EQ(details.status.daemon_pid, 77);
+        ASSERT_EQ(runtime_status_stub.connect_budget[0], 1000);
+        ASSERT_EQ(runtime_status_stub.receive_budget[0], 880);
+        ASSERT_EQ(runtime_status_stub.connects, reply == 2 ? 1 : 2);
+        ASSERT_EQ(runtime_status_stub.closes, runtime_status_stub.connects);
+        if (reply != 2) {
+            ASSERT_EQ(runtime_status_stub.connect_budget[1], 680);
+            ASSERT_EQ(runtime_status_stub.receive_budget[1], 450);
+            ASSERT_EQ(details.cache_directory[0], '\0');
+        }
+    }
+    PASS();
+}
+
+TEST(daemon_runtime_status_details_stops_when_budget_expires) {
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", RUNTIME_BUILD_B);
+    for (int stage = 0; stage < 4; stage++) {
+        runtime_status_stub = (runtime_status_transport_stub_t){.now = 10000, .valid = true};
+        if (stage == 0)
+            runtime_status_stub.connect_cost[0] = 1000;
+        else if (stage == 1)
+            runtime_status_stub.send_cost[0] = 1000;
+        else if (stage == 2)
+            runtime_status_stub.receive_cost[0] = 1000;
+        else {
+            runtime_status_stub.receive_cost[0] = 400;
+            runtime_status_stub.connect_cost[1] = 600;
+        }
+        cbm_daemon_runtime_status_details_t details = {0};
+        cbm_daemon_runtime_set_status_details_transport_for_testing(&runtime_test_status_transport);
+        bool queried = cbm_daemon_runtime_request_status_details((const void *)&runtime_status_stub,
+                                                                 &identity, 1000, &details);
+        cbm_daemon_runtime_set_status_details_transport_for_testing(NULL);
+        ASSERT_FALSE(queried);
+        ASSERT_TRUE(runtime_status_stub.valid);
+        ASSERT_EQ(runtime_status_stub.now, 11000);
+        ASSERT_EQ(runtime_status_stub.connects, stage == 3 ? 2 : 1);
+        ASSERT_EQ(runtime_status_stub.closes, runtime_status_stub.connects);
+        ASSERT_EQ(runtime_status_stub.sends, stage == 0 ? 0 : 1);
+        ASSERT_EQ(runtime_status_stub.receives, stage < 2 ? 0 : 1);
+        if (stage == 3)
+            ASSERT_EQ(runtime_status_stub.connect_budget[1], 600);
+    }
+    PASS();
+}
+
+TEST(daemon_runtime_status_details_falls_back_to_legacy_on_unsupported_or_malformed_reply) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    for (int malformed = 0; malformed < 2; malformed++) {
+        char parent[RUNTIME_TEST_PATH_CAP] = {0};
+        char key[CBM_DAEMON_KEY_SIZE] = {0};
+        char runtime_dir[RUNTIME_TEST_PATH_CAP] = {0};
+        bool prepared = th_secure_runtime_parent_new(parent, sizeof(parent), "status-legacy") &&
+                        cbm_daemon_rendezvous_key(key);
+        cbm_daemon_ipc_endpoint_t *endpoint =
+            prepared ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
+        bool copied = endpoint && runtime_test_copy_path(
+                                      runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        runtime_legacy_status_t server = {
+            .listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL,
+            .malformed_details = malformed != 0,
+        };
+        cbm_thread_t thread;
+        bool started =
+            server.listener &&
+            cbm_thread_create(&thread, 0, runtime_test_legacy_status_thread, &server) == 0;
+        cbm_daemon_runtime_status_details_t details = {0};
+        bool queried = started && cbm_daemon_runtime_request_status_details(
+                                      endpoint, &identity, RUNTIME_TEST_TIMEOUT_MS, &details);
+        if (started) {
+            (void)cbm_thread_join(&thread);
+        }
+        cbm_daemon_ipc_listener_close(server.listener);
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        (void)cbm_rmdir(runtime_dir);
+        (void)cbm_rmdir(parent);
+        ASSERT_TRUE(prepared);
+        ASSERT_TRUE(copied);
+        ASSERT_TRUE(started);
+        ASSERT_TRUE(queried);
+        ASSERT_TRUE(server.served);
+        ASSERT_EQ(details.status.daemon_pid, 77);
+        ASSERT_EQ(details.cache_directory[0], '\0');
+        ASSERT_EQ(details.status.muted_endpoint_holder_pid, 0);
+    }
+    PASS();
+}
+
 TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
@@ -5598,6 +5902,11 @@ TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
 }
 
 SUITE(daemon_runtime) {
+    RUN_TEST(daemon_runtime_status_details_uses_one_budget_across_legacy_fallback);
+    RUN_TEST(daemon_runtime_status_details_stops_when_budget_expires);
+    RUN_TEST(daemon_runtime_status_details_preserves_long_paths_and_owns_copy);
+    RUN_TEST(daemon_runtime_status_details_does_not_disclose_paths_to_forged_peers);
+    RUN_TEST(daemon_runtime_status_details_falls_back_to_legacy_on_unsupported_or_malformed_reply);
     RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);

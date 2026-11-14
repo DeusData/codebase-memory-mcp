@@ -9,6 +9,7 @@ Guards the PR #1139 daemon-control surface at the product level:
 * A cold one-shot ``cli`` command is quiet by default; ``cli --verbose`` opts
   into the startup-tax hint.
 * ``daemon stop`` on an idle daemon stops it; a second ``stop`` is idempotent.
+* Cache mismatches name both canonical paths, including long Windows paths.
 
 Every path carries a kill-by-pid backstop so a stuck daemon can never hang the
 suite (the Windows leg's test-infra hang sensitivity is on record).
@@ -18,6 +19,7 @@ Exit code: 0 == lifecycle behaves (green), 1 == regression, 2 == setup error.
 Usage:
     python test_daemon_lifecycle.py <path-to-codebase-memory-mcp[.exe]>
 """
+import json
 import os
 import re
 import subprocess
@@ -40,9 +42,10 @@ def run_cli(binary, cache, args, timeout=60, extra_env=None):
     # Daemon coordination is account-wide and CBM_CACHE_DIR does not move the
     # rendezvous; a private CBM_RUNTIME_DIR per cache is what isolates a call
     # from every other daemon on the account (and makes a cold call cold).
-    env["CBM_RUNTIME_DIR"] = runtime_for(cache)
     if extra_env:
         env.update(extra_env)
+    if not extra_env or "CBM_RUNTIME_DIR" not in extra_env:
+        env["CBM_RUNTIME_DIR"] = runtime_for(cache)
     return subprocess.run([binary] + args, capture_output=True, timeout=timeout, env=env)
 
 
@@ -57,6 +60,63 @@ def force_kill(pid):
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=30)
     else:
         subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=30)
+
+
+def check_cache_conflict_paths(binary, cache, work):
+    def filesystem_path(path):
+        # Exercise CBM's own long-path support regardless of the runner's
+        # LongPathsEnabled policy; Python setup/inspection uses explicit Win32 paths.
+        if os.name == "nt":
+            absolute = os.path.abspath(path)
+            return "\\\\?\\UNC\\" + absolute[2:] if absolute.startswith("\\\\") else "\\\\?\\" + absolute
+        return path
+
+    # Cache roots must share a rendezvous, or the mismatch would never occur.
+    shared_runtime = {"CBM_RUNTIME_DIR": runtime_for(cache), "CBM_STARTUP_TIMEOUT_MS": "1000"}
+    paths = [os.path.join(work, "cache-中文 space")]
+    for length in (259, 260, 261, 1024):
+        path = os.path.join(work, "cache-length-%d" % length)
+        while len(path) < length:
+            remaining = length - len(path)
+            if remaining == 1:
+                path += "x"
+            else:
+                path = os.path.join(path, "x" * min(32, remaining - 1))
+        paths.append(path)
+
+    for requested in paths:
+        os.makedirs(filesystem_path(requested), exist_ok=True)
+        for args in (["cli", "list_projects"], []):  # [] enters the MCP frontend
+            result = run_cli(binary, requested, args, extra_env=shared_runtime)
+            text = output_text(result)
+            if result.returncode == 0:
+                raise AssertionError("different cache root unexpectedly admitted")
+            for label, path in (("requested cache", requested), ("daemon cache", cache)):
+                canonical = os.path.realpath(filesystem_path(path)).replace("\\", "/")
+                if canonical.startswith("//?/UNC/"):
+                    canonical = "//" + canonical[8:]
+                elif canonical.startswith("//?/"):
+                    canonical = canonical[4:]
+                expected = label + ": " + json.dumps(canonical, ensure_ascii=False)
+                if expected not in text:
+                    raise AssertionError("missing complete escaped cache path %r in %r"
+                                         % (expected, text))
+            if "different cache directory" not in text or "CBM_CACHE_DIR" not in text:
+                raise AssertionError("cache mismatch lost its explanation or remedy")
+            if "Cache paths unavailable or unverified." in text:
+                raise AssertionError("resolved paths were incorrectly marked unavailable")
+        log = os.path.join(requested, "logs", "daemon-conflicts.ndjson")
+        with open(filesystem_path(log), encoding="utf-8") as stream:
+            events = [json.loads(line) for line in stream if line.strip()]
+        if not any(event.get("reason") == "cache_root" for event in events):
+            raise AssertionError("cache mismatch was not recorded")
+        for event in events:
+            for key in ("active_cache", "requested_cache"):
+                if not re.fullmatch(r"[0-9a-f]{64}", event.get(key, "")):
+                    raise AssertionError("conflict log must retain cache fingerprints")
+    healthy = run_cli(binary, cache, ["cli", "list_projects"])
+    if healthy.returncode != 0:
+        raise AssertionError("cache rejection disturbed the active daemon")
 
 
 def main():
@@ -125,6 +185,9 @@ def main():
                   % status_text[:400])
             return 1
         print("PASS: warm cli recycled the daemon; daemon survived its client")
+
+        check_cache_conflict_paths(binary, cache, work)
+        print("PASS: cache mismatch paths survive Unicode, escaping and long paths")
 
         stop = run_cli(binary, cache, ["daemon", "stop"])
         if stop.returncode != 0:

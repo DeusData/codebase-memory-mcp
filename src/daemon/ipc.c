@@ -9,10 +9,14 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/macos_acl.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 #include <errno.h>
 #include <limits.h>
@@ -5425,10 +5429,19 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
          * absolute drive path. */
         return false;
     }
-    wchar_t *path = wide_copy(directory_path);
+    /* Prefix the already validated drive-absolute spelling without resolving
+     * dot components: the component walk must still reject those itself. */
+    bool extended = length >= 240U;
+    size_t prefix_length = extended ? 4U : 0U;
+    wchar_t *path = cbm_calloc(CBM_MEM_CLASS_OTHER, (length + prefix_length + 1U) * sizeof(*path));
     if (!path) {
         return false;
     }
+    if (extended) {
+        wmemcpy(path, L"\\\\?\\", prefix_length);
+    }
+    wmemcpy(path + prefix_length, directory_path, length + 1U);
+    length = wcslen(path);
     for (size_t i = 0; i < length; i++) {
         if (path[i] == L'/') {
             path[i] = L'\\';
@@ -5436,11 +5449,11 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     }
     win_security_t security;
     if (!win_security_init(&security)) {
-        free(path);
+        cbm_free(CBM_MEM_CLASS_OTHER, path);
         return false;
     }
     bool ok = true;
-    size_t component_start = 3;
+    size_t component_start = 3U + prefix_length;
     for (size_t i = component_start; ok && i <= length; i++) {
         if (i < length && path[i] != L'\\') {
             continue;
@@ -5509,7 +5522,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     if (ok) {
         ok = win_runtime_directory_secure(path);
     }
-    free(path);
+    cbm_free(CBM_MEM_CLASS_OTHER, path);
     return ok;
 }
 
@@ -5577,8 +5590,8 @@ FILE *cbm_daemon_ipc_private_log_open(const char *directory_path, const char *ba
     wchar_t *wide_directory = utf8_to_wide(directory_path);
     char *path = string_format("%s/%s", directory_path, base_name);
     char *rotated_path = path ? string_format("%s.1", path) : NULL;
-    wchar_t *wide_path = path ? utf8_to_wide(path) : NULL;
-    wchar_t *wide_rotated = rotated_path ? utf8_to_wide(rotated_path) : NULL;
+    wchar_t *wide_path = path ? cbm_path_to_wide(path) : NULL;
+    wchar_t *wide_rotated = rotated_path ? cbm_path_to_wide(rotated_path) : NULL;
     if (!wide_directory || !path || !rotated_path || !wide_path || !wide_rotated ||
         !win_private_directory_tree_secure(wide_directory)) {
         free(wide_directory);

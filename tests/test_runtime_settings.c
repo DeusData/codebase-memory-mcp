@@ -626,7 +626,64 @@ TEST(runtime_settings_ui_load_recovers_a_hot_journal) {
     PASS();
 }
 
+#ifdef _WIN32
+TEST(runtime_settings_windows_long_cache_reads_and_writes_config) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fixture_open(&fixture));
+    const size_t lengths[] = {259, 260, 261, 1024};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]) && ok; i++) {
+        char cache[1100];
+        size_t base = strlen(fixture.path);
+        memcpy(cache, fixture.path, base + 1);
+        size_t used = base;
+        while (used < lengths[i]) {
+            size_t remaining = lengths[i] - used;
+            if (remaining == 1) {
+                cache[used++] = 'x';
+            } else {
+                cache[used++] = '/';
+                size_t part = remaining - 1 < 32 ? remaining - 1 : 32;
+                memset(cache + used, 'x', part);
+                used += part;
+            }
+            cache[used] = '\0';
+        }
+        ok = cbm_mkdir_p(cache, 0700);
+        cbm_config_t *config = ok ? cbm_config_open(cache) : NULL;
+        ok = config && cbm_config_set(config, "auto_index", "true") == 0;
+        if (config)
+            cbm_config_close(config);
+        ok = ok && cbm_runtime_settings_init(cache);
+        yyjson_doc *document = ok ? read_snapshot(cache) : NULL;
+        yyjson_val *setting = document ? item(document, "auto_index") : NULL;
+        const char *value = setting ? yyjson_get_str(yyjson_obj_get(setting, "value")) : NULL;
+        ok = ok && value && strcmp(value, "true") == 0;
+        if (document)
+            yyjson_doc_free(document);
+        cbm_runtime_settings_reset_for_tests();
+        char db[1120];
+        snprintf(db, sizeof(db), "%s/_config.db", cache);
+        (void)cbm_remove_db_sidecars(db);
+        (void)cbm_unlink(db);
+        while (strlen(cache) > base) {
+            (void)cbm_rmdir(cache);
+            char *slash = strrchr(cache, '/');
+            if (!slash || (size_t)(slash - cache) < base)
+                break;
+            *slash = '\0';
+        }
+    }
+    fixture_close(&fixture);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+#endif
+
 SUITE(runtime_settings) {
+#ifdef _WIN32
+    RUN_TEST(runtime_settings_windows_long_cache_reads_and_writes_config);
+#endif
     RUN_TEST(runtime_settings_startup_recovers_a_hot_journal);
     RUN_TEST(runtime_settings_ui_load_recovers_a_hot_journal);
     RUN_TEST(runtime_settings_startup_waits_out_a_committing_writer);
