@@ -3333,8 +3333,12 @@ static bool c_splice_lang(CBMLanguage language) {
  * function, often the rest of the file, becomes one ERROR region.
  * Each `\` CR LF becomes space `\` LF: the same length, the line break in the
  * same place, so offsets and line numbers still refer to the file on disk and
- * the next line is byte-identical. Copied only when a splice is found. */
-static const char *c_mask_crlf_splices(CBMArena *a, const char *source, int source_len) {
+ * the next line is byte-identical. Copied only when a splice is found. The
+ * cross-file C/C++ LSP pass reads the file again and applies it too. */
+const char *cbm_c_mask_crlf_splices(CBMArena *a, const char *source, int source_len) {
+    if (!a || !source) {
+        return source;
+    }
     char *out = NULL;
     for (int i = 0; i + PAIR_LEN < source_len; i++) {
         if (source[i] != '\\' || source[i + SKIP_ONE] != '\r' || source[i + PAIR_LEN] != '\n') {
@@ -3366,7 +3370,7 @@ static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const 
         return cbm_php_mask_inline_html(a, source, source_len);
     }
     if (c_splice_lang(language)) {
-        return c_mask_crlf_splices(a, source, source_len);
+        return cbm_c_mask_crlf_splices(a, source, source_len);
     }
     return source;
 }
