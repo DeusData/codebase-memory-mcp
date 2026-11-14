@@ -26,21 +26,13 @@ permissions:
   attestations: write
 
 jobs:
+  # The standard (dynamic) Linux binaries build in build-linux below, inside
+  # the pinned Ubuntu 22.04 container; this job builds the two macOS binaries.
   build-unix:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            cc: gcc
-            cxx: g++
           # The macOS minimum (14.0) is pinned in Makefile.cbm, not inherited
           # from this runner's SDK, so both darwin binaries still start on macOS 14.
           - os: macos-15
@@ -64,11 +56,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install deps (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        timeout-minutes: 10
-        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
-
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -84,10 +71,6 @@ jobs:
           else
             scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
           fi
-
-      - name: Frontend integrity scan
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: scripts/security-ui.sh
 
       - name: Derive immutable stripped and unstripped release candidates
         run: |
@@ -112,6 +95,91 @@ jobs:
         with:
           name: release-candidates-${{ matrix.goos }}-${{ matrix.goarch }}
           path: release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  # The standard (dynamic) Linux binaries build INSIDE a pinned Ubuntu 22.04
+  # container; the hosted runner only hosts it. A dynamic binary requires the
+  # glibc and libstdc++ symbol versions of the userland it was built on: built
+  # on the runners' own Ubuntu 24.04 it required GLIBC_2.38 / GLIBCXX_3.4.32
+  # and refused to start on Ubuntu 22.04 (#2486). The distro toolchain (GCC 11
+  # against glibc 2.35 headers) IS the floor, so it is used as shipped, and the
+  # image is pinned by the digest of its multi-arch index -- one pin for both
+  # arches, so the floor cannot drift with the tag, and no hosted runner
+  # image's retirement date moves it. Resolved 2026-11-02 from Docker Hub
+  # (library/ubuntu, tag 22.04): registry Docker-Content-Digest == sha256 of
+  # the index body; bump deliberately, never to a tag. CBM_GLIBC_FLOOR /
+  # CBM_GLIBCXX_FLOOR make the composition gate (A6) assert the floor on every
+  # candidate: nothing newer than this image's glibc 2.35 / GLIBCXX_3.4.30.
+  # pr.yml's glibc-floor leg builds in the same image with the same floor.
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+    timeout-minutes: 240
+    steps:
+      # The container starts bare: install what the runner image preinstalls
+      # for a host build (gcc/g++/make, git for the checkout, python3 for the
+      # candidate derivation) plus zlib1g-dev, as the host legs did.
+      - name: Install deps (Ubuntu 22.04 container)
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ca-certificates git gcc g++ make python3 zlib1g-dev
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Build release binary with UI
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++
+          else
+            scripts/build.sh --with-ui CC=gcc CXX=g++
+          fi
+
+      - name: Frontend integrity scan
+        if: matrix.arch == 'amd64'
+        run: scripts/security-ui.sh
+
+      - name: Derive immutable stripped and unstripped release candidates
+        env:
+          CBM_GLIBC_FLOOR: "2.35"
+          CBM_GLIBCXX_FLOOR: "3.4.30"
+        run: |
+          scripts/ci/prepare-release-candidates.sh \
+            linux "${{ matrix.arch }}" \
+            --binary build/c/codebase-memory-mcp \
+            --out-dir release-candidates
+          scripts/gen-third-party-notices.sh \
+            "release-candidates/linux-${{ matrix.arch }}/THIRD_PARTY_NOTICES.md"
+
+      - name: Attest release candidate provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-candidates/linux-${{ matrix.arch }}/candidate-provenance.tsv
+            release-candidates/linux-${{ matrix.arch }}/stripped/*
+            release-candidates/linux-${{ matrix.arch }}/unstripped/*
+            release-candidates/linux-${{ matrix.arch }}/THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidates-linux-${{ matrix.arch }}
+          path: release-candidates/linux-${{ matrix.arch }}
           if-no-files-found: error
 
   build-windows:
@@ -304,7 +372,7 @@ jobs:
   # only choose within that tuple. A hard result on ANY sibling blocks
   # the all-target release rather than selecting around a real detection.
   select-package:
-    needs: [build-unix, build-windows, build-windows-arm64, build-linux-portable]
+    needs: [build-unix, build-linux, build-windows, build-windows-arm64, build-linux-portable]
     runs-on: ubuntu-latest
     timeout-minutes: 330
     permissions:

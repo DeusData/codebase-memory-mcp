@@ -14615,9 +14615,9 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
         base_url = "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download";
     }
     /* Linux ships a fully-static "-portable" build; the standard linux binary
-     * dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
-     * have no such variant. Keep in sync with install.sh / install.js / pypi
-     * _cli.py. */
+     * is built on Ubuntu 22.04, dynamically links glibc 2.35+ and fails on
+     * older distros. macOS/Windows have no such variant. Keep in sync with
+     * install.sh / install.js / pypi _cli.py. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
     snprintf(url, url_sz, "%s/codebase-memory-mcp-%s-%s%s.%s", base_url, os, arch, portable, ext);
 }

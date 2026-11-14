@@ -70,6 +70,7 @@ if 'LANES' in os.environ:
         'test / test-diag': 'diag', 'test / test-msan': 'msan',
         'test / test-lsan-macos': 'lsan-macos', 'test / test-windows-guards': 'windows-guards',
         'test / shard-completeness': 'shard-completeness', 'contracts': 'contracts',
+        'glibc-floor': 'glibc-floor',
     }
     matrix = ('test / test-unix (', 'test / test-windows (', 'test / test-tsan (', 'pr-smoke (',
               'codeql / analyze (')

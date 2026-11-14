@@ -1256,8 +1256,9 @@ fi
 echo "OK: update hands off to $UPDATE_SCRIPT without downloading"
 
 # The glibc constraint did NOT disappear with in-process update -- it moved. The
-# standard linux asset dynamically links glibc 2.38+ and breaks on Debian 11,
-# RHEL 8 and Ubuntu 20.04, so the installer must fetch the static "-portable"
+# standard linux asset is built on Ubuntu 22.04, dynamically links glibc 2.35+
+# and breaks on Debian 11, RHEL 8 and Ubuntu 20.04, so the installer must fetch
+# the static "-portable"
 # build. Guard it where the behaviour now lives instead of retiring the
 # protection along with the code that used to implement it.
 if [ -f "$REPO_ROOT/install.sh" ]; then

@@ -305,6 +305,41 @@ jobs:
     with:
       mode: pr
 
+  # ── glibc floor (lane glibc-floor, GATING): builds the production binary in
+  #    the SAME pinned ubuntu:22.04 container the standard Linux release
+  #    binaries build in (_build.yml build-linux) and runs the composition gate
+  #    with the same declared floor, so a change that needs a newer glibc or
+  #    libstdc++ symbol version -- or stops compiling with that GCC 11
+  #    toolchain -- fails the PR instead of a release run. Light on purpose: a
+  #    headless build (the shipped composition only swaps
+  #    src/ui/embedded_stub.c for the generated asset data) and no smoke. The
+  #    selector picks the lane whenever it picks smoke-ubuntu, i.e. whenever
+  #    the production binary can change; ci-ok needs it, and a selected
+  #    glibc-floor that fails, skips or never runs fails ci-ok. ──
+  glibc-floor:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'glibc-floor') }}
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+    timeout-minutes: 45
+    steps:
+      - name: Install deps (Ubuntu 22.04 container)
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ca-certificates git gcc g++ make python3 zlib1g-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the production binary in the release container
+        run: scripts/build.sh CC=gcc CXX=g++
+      - name: Composition gate with the release glibc floor
+        env:
+          CBM_GLIBC_FLOOR: "2.35"
+          CBM_GLIBCXX_FLOOR: "3.4.30"
+        run: scripts/ci/check-binary-composition.sh build/c/codebase-memory-mcp
+
   # ── Test-impact SHADOW, REPORT-ONLY: predicts from the code graph which C
   #    suites this change can affect (the latest released binary indexes the
   #    PR checkout; detect_changes at depth 15 against the base, mapped to
@@ -410,7 +445,7 @@ jobs:
     # every lane the selector chose ran green: `skipped` is OK only for a lane
     # nobody selected (a selected lane that skipped is a silent gate loss).
     # memwaste and the test-impact shadow are report-only and not needed here.
-    needs: [changes, security, lint, test, pr-smoke, contracts, codeql]
+    needs: [changes, security, lint, test, pr-smoke, contracts, codeql, glibc-floor]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
