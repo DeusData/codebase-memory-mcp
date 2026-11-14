@@ -20389,6 +20389,330 @@ static int dc_walk_total(yyjson_doc *doc) {
  * new is reached, and spelling the new parameters out as false changes not one
  * byte of the default answer. */
 /* Seed rows describe the actual walk inputs and page independently. */
+#define DC_DOC_BEFORE                                                        \
+    "Preamble uses `./mod.py::top`.\n\n# Service A\n\n## Implementation\n\n" \
+    "One uses `./mod.py::leaf`.\n\n# Service B\n\n## Implementation\n\n"     \
+    "Two uses `./mod.py::mid1` and `./mod.py::nope`.\n"
+#define DC_DOC_A                                                                \
+    "Preamble uses `./mod.py::top`.\n\n# Service A\n\n## Implementation\n\n"    \
+    "One always uses `./mod.py::leaf`.\n\n# Service B\n\n## Implementation\n\n" \
+    "Two uses `./mod.py::mid1` and `./mod.py::nope`.\n"
+#define DC_DOC_B                                                             \
+    "Preamble uses `./mod.py::top`.\n\n# Service A\n\n## Implementation\n\n" \
+    "One uses `./mod.py::leaf`.\n\n# Service B\n\n## Implementation\n\n"     \
+    "Two always uses `./mod.py::mid1` and `./mod.py::nope`.\n"
+
+static bool dc_doc_index(dc_walk_fixture_t *fx) {
+    char args[900];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"full\",\"doc_candidates\":false}", fx->repo);
+    char *response = cbm_mcp_handle_tool(fx->srv, "index_repository", args);
+    bool ok = response && !response_contains_json_fragment(response, "\"isError\":true");
+    free(response);
+    return ok;
+}
+
+/* Real Markdown extraction, MENTIONS resolution and Git prose hunks: a changed
+ * paragraph must select its own repeated heading, without behavioral seeds. */
+TEST(detect_changes_doc_references_prose_preamble_and_paging_issue2614) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char source[600], notes[600];
+    snprintf(source, sizeof(source), "%s/mod.py", fx.repo);
+    snprintf(notes, sizeof(notes), "%s/notes.md", fx.repo);
+    ASSERT_EQ(th_write_file(source, DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL), 0);
+    ASSERT_EQ(th_write_file(notes, DC_DOC_BEFORE), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "add -A"), 0);
+    ASSERT_EQ(
+        mcp_git_run(fx.repo,
+                    "-c user.name=t -c user.email=t@t.io -c commit.gpgsign=false commit -qm docs"),
+        0);
+    ASSERT_EQ(th_write_file(notes, DC_DOC_A), 0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    char *normal = dc_walk_call(&fx, ",\"format\":\"json\"");
+    yyjson_doc *normal_doc = yyjson_read(normal, strlen(normal), 0);
+    ASSERT_NOT_NULL(normal_doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(normal_doc), "seed_symbols")), 0);
+    ASSERT_NULL(yyjson_obj_get(yyjson_doc_get_root(normal_doc), "references"));
+    yyjson_doc_free(normal_doc);
+    free(normal);
+    char *text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantics")),
+                  "referenced_targets_for_review");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 1);
+    yyjson_val *row = yyjson_arr_get_first(yyjson_obj_get(root, "references"));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "target")), ".leaf"));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(row, "section")), "Service-A.Implementation"));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "change_mapping")), "hunk");
+    ASSERT_NULL(yyjson_obj_get(root, "impacted"));
+    yyjson_doc_free(doc);
+    free(text);
+
+    ASSERT_EQ(th_write_file(notes, DC_DOC_B), 0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\",\"limit\":1");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 2);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    row = yyjson_arr_get_first(yyjson_obj_get(root, "references"));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "status")), "missing");
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "reference")), "nope"));
+    const char *cursor = yyjson_get_str(yyjson_obj_get(root, "next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+    char extra[500];
+    snprintf(
+        extra, sizeof(extra),
+        ",\"format\":\"json\",\"scope\":\"doc_references\",\"limit\":1,\"reference_cursor\":\"%s\"",
+        cursor);
+    char *second = dc_walk_call(&fx, extra);
+    yyjson_doc *sdoc = yyjson_read(second, strlen(second), 0);
+    ASSERT_NOT_NULL(sdoc);
+    row = yyjson_arr_get_first(yyjson_obj_get(yyjson_doc_get_root(sdoc), "references"));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "target")), ".mid1"));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(sdoc), "has_more")));
+    yyjson_doc_free(sdoc);
+    free(second);
+
+    /* A cursor can only continue inside the materialized rows. An impossible
+     * offset must be an error, not an exact-looking successful empty page. */
+    const char *offset_start = strrchr(cursor, '.');
+    ASSERT_NOT_NULL(offset_start);
+    int total = (int)yyjson_get_int(yyjson_obj_get(root, "total"));
+    for (int offset = total; offset <= total + 1; offset++) {
+        char forged[128], invalid_extra[500];
+        snprintf(forged, sizeof(forged), "%.*s.%d", (int)(offset_start - cursor), cursor, offset);
+        snprintf(invalid_extra, sizeof(invalid_extra),
+                 ",\"format\":\"json\",\"scope\":\"doc_references\",\"reference_cursor\":\"%s\"",
+                 forged);
+        char *invalid = dc_walk_call(&fx, invalid_extra);
+        ASSERT_NOT_NULL(invalid);
+        ASSERT_NOT_NULL(strstr(invalid, "invalid_cursor"));
+        free(invalid);
+    }
+
+    char *budget =
+        dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\",\"limit\":5000,"
+                          "\"max_output_tokens\":128");
+    yyjson_doc *bdoc = yyjson_read(budget, strlen(budget), 0);
+    ASSERT_NOT_NULL(bdoc);
+    yyjson_val *broot = yyjson_doc_get_root(bdoc);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(broot, "truncated")));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(broot, "has_more")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(broot, "truncation_reason")), "output_budget");
+    ASSERT_LT(yyjson_get_int(yyjson_obj_get(broot, "returned")), 2);
+    yyjson_doc_free(bdoc);
+    free(budget);
+
+    /* The old page may not resume against another publication/document. */
+    ASSERT_EQ(th_write_file(notes, "Changed " DC_DOC_BEFORE), 0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    char *stale = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(strstr(stale, "snapshot_changed"));
+    free(stale);
+    yyjson_doc_free(doc);
+    free(text);
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 1);
+    row = yyjson_arr_get_first(yyjson_obj_get(root, "references"));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "target")), ".top"));
+    yyjson_doc_free(doc);
+    free(text);
+    /* Drift is unavailable, never an empty exact-looking reference set. */
+    ASSERT_EQ(th_write_file(notes, DC_DOC_A), 0);
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    row = yyjson_arr_get_first(yyjson_obj_get(yyjson_doc_get_root(doc), "references"));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "status")), "unavailable");
+    yyjson_doc_free(doc);
+    free(text);
+
+    /* A +0,0 deletion must still select the preamble when another section
+     * also has a hunk. The shared parser alone drops the zero coordinate. */
+    ASSERT_EQ(th_write_file(notes, "Discarded paragraph.\n" DC_DOC_BEFORE), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "add -A"), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "-c user.name=t -c user.email=t@t.io -c commit.gpgsign=false "
+                                   "commit -qm deletion-base"),
+              0);
+    ASSERT_EQ(th_write_file(notes, DC_DOC_B), 0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 3);
+    bool saw_preamble = false;
+    size_t i, count;
+    yyjson_arr_foreach(yyjson_obj_get(root, "references"), i, count, row) {
+        const char *target = yyjson_get_str(yyjson_obj_get(row, "target"));
+        if (target && strstr(target, ".top")) {
+            saw_preamble = true;
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "change_mapping")), "hunk");
+        }
+    }
+    ASSERT_TRUE(saw_preamble);
+    yyjson_doc_free(doc);
+    free(text);
+
+    /* A deleted file sorted after the changed document must not contribute
+     * its +0,0 hunk to that document's otherwise unchanged preamble. */
+    char deleted[600];
+    snprintf(deleted, sizeof(deleted), "%s/z-deleted.py", fx.repo);
+    ASSERT_EQ(th_write_file(notes, DC_DOC_BEFORE), 0);
+    ASSERT_EQ(th_write_file(deleted, "def gone():\n    return 1\n"), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "add -A"), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "-c user.name=t -c user.email=t@t.io -c commit.gpgsign=false "
+                                   "commit -qm deleted-file-base"),
+              0);
+    ASSERT_EQ(th_write_file(notes, DC_DOC_B), 0);
+    ASSERT_EQ(remove(deleted), 0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 2);
+    yyjson_arr_foreach(yyjson_obj_get(root, "references"), i, count, row) {
+        const char *target = yyjson_get_str(yyjson_obj_get(row, "target"));
+        ASSERT_FALSE(target && strstr(target, ".top"));
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "change_mapping")), "hunk");
+    }
+    yyjson_doc_free(doc);
+    free(text);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+#undef DC_DOC_BEFORE
+#undef DC_DOC_A
+#undef DC_DOC_B
+
+TEST(detect_changes_doc_references_quoted_paths_do_not_leak_hunks_issue2614) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char source[600], plain[600], quoted[600];
+    snprintf(source, sizeof(source), "%s/mod.py", fx.repo);
+    snprintf(plain, sizeof(plain), "%s/a.md", fx.repo);
+    snprintf(quoted, sizeof(quoted), "%s/z\xc3\xa9.md", fx.repo);
+    const char *plain_base = "# Early\n\n-- marker\nUses `./mod.py::leaf`.\n\n# Later\n\n"
+                             "Uses `./mod.py::mid1`.\n";
+    const char *plain_changed = "# Early\n\n-- marker\nUses `./mod.py::leaf`.\n\n# Later\n\n"
+                                "Still uses `./mod.py::mid1`.\n";
+    const char *quoted_base = "# Early\n\nUses `./mod.py::top`.\n\n# Later\n\n"
+                              "Uses `./mod.py::mid2`.\n";
+    const char *quoted_changed = "# Early\n\nStill uses `./mod.py::top`.\n\n# Later\n\n"
+                                 "Uses `./mod.py::mid2`.\n";
+    ASSERT_EQ(th_write_file(source, DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL), 0);
+    ASSERT_EQ(th_write_file(plain, plain_base), 0);
+    ASSERT_EQ(th_write_file(quoted, quoted_base), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "config core.quotePath true"), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "add -A"), 0);
+    ASSERT_EQ(mcp_git_run(fx.repo, "-c user.name=t -c user.email=t@t.io -c commit.gpgsign=false "
+                                   "commit -qm quoted-doc-base"),
+              0);
+    ASSERT_EQ(th_write_file(plain, plain_changed), 0);
+    ASSERT_EQ(th_write_file(quoted, quoted_changed), 0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    char *text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 3);
+    int plain_count = 0, quoted_count = 0;
+    size_t i, count;
+    yyjson_val *row;
+    yyjson_arr_foreach(yyjson_obj_get(root, "references"), i, count, row) {
+        const char *document = yyjson_get_str(yyjson_obj_get(row, "document"));
+        const char *mapping = yyjson_get_str(yyjson_obj_get(row, "change_mapping"));
+        if (strcmp(document, "a.md") == 0) {
+            plain_count++;
+            ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "target")), ".mid1"));
+            ASSERT_STR_EQ(mapping, "hunk");
+        } else {
+            quoted_count++;
+            ASSERT_STR_EQ(document, "z\xc3\xa9.md");
+            ASSERT_STR_EQ(mapping, "whole_file_without_hunks");
+        }
+    }
+    ASSERT_EQ(plain_count, 1);
+    ASSERT_EQ(quoted_count, 2);
+    yyjson_doc_free(doc);
+    free(text);
+
+    /* The query fixes its diff prefixes and raw output. Configuration must
+     * not alter file attribution, including a custom prefix starting in b/. */
+    const struct {
+        const char *key;
+        const char *value;
+    } prefix_settings[] = {{"diff.noprefix", "true"},
+                           {"diff.mnemonicPrefix", "true"},
+                           {"diff.dstPrefix", "b/custom/"},
+                           {"color.diff", "always"}};
+    for (size_t setting = 0; setting < sizeof(prefix_settings) / sizeof(prefix_settings[0]);
+         setting++) {
+        char config[128];
+        snprintf(config, sizeof(config), "config %s %s", prefix_settings[setting].key,
+                 prefix_settings[setting].value);
+        ASSERT_EQ(mcp_git_run(fx.repo, config), 0);
+        text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+        doc = yyjson_read(text, strlen(text), 0);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 3);
+        yyjson_arr_foreach(yyjson_obj_get(root, "references"), i, count, row) {
+            if (strcmp(yyjson_get_str(yyjson_obj_get(row, "document")), "a.md") == 0) {
+                ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "target")), ".mid1"));
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "change_mapping")), "hunk");
+            } else {
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "change_mapping")),
+                              "whole_file_without_hunks");
+            }
+        }
+        yyjson_doc_free(doc);
+        free(text);
+        snprintf(config, sizeof(config), "config --unset %s", prefix_settings[setting].key);
+        ASSERT_EQ(mcp_git_run(fx.repo, config), 0);
+    }
+
+    /* Removed -- and added ++ prose produce --- and +++ body lines. Neither
+     * may reset file identity or redirect a later hunk in the same document. */
+    ASSERT_EQ(th_write_file(plain, "# Early\n\n++ b/!\nUses `./mod.py::leaf`.\n\n# Later\n\n"
+                                   "Still uses `./mod.py::mid1`.\n"),
+              0);
+    ASSERT_TRUE(dc_doc_index(&fx));
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"doc_references\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    plain_count = 0;
+    bool saw_leaf = false, saw_mid1 = false;
+    yyjson_arr_foreach(yyjson_obj_get(root, "references"), i, count, row) {
+        if (strcmp(yyjson_get_str(yyjson_obj_get(row, "document")), "a.md") == 0 &&
+            strcmp(yyjson_get_str(yyjson_obj_get(row, "status")), "resolved") == 0) {
+            plain_count++;
+            const char *target = yyjson_get_str(yyjson_obj_get(row, "target"));
+            saw_leaf |= target && strstr(target, ".leaf");
+            saw_mid1 |= target && strstr(target, ".mid1");
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "change_mapping")), "hunk");
+        }
+    }
+    ASSERT_EQ(plain_count, 2);
+    ASSERT_TRUE(saw_leaf);
+    ASSERT_TRUE(saw_mid1);
+    yyjson_doc_free(doc);
+    free(text);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
 TEST(detect_changes_seed_list_reports_hunk_without_walk) {
     dc_walk_fixture_t fx;
     ASSERT_TRUE(dc_walk_fixture_open(&fx));
@@ -28887,6 +29211,8 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
     RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
     RUN_TEST(detect_changes_seed_list_reports_hunk_without_walk);
+    RUN_TEST(detect_changes_doc_references_prose_preamble_and_paging_issue2614);
+    RUN_TEST(detect_changes_doc_references_quoted_paths_do_not_leak_hunks_issue2614);
     RUN_TEST(detect_changes_seed_pages_bind_semantics_and_snapshot);
     RUN_TEST(detect_changes_product_filter_does_not_inflate_fallback);
     RUN_TEST(detect_changes_seed_params_reject_misuse);
