@@ -34918,6 +34918,240 @@ TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
     PASS();
 }
 
+/* Duplicate receiver selection must preserve valid calls in both extraction
+ * paths. Names and fixtures here are synthetic and independent of any corpus. */
+static int check_cpp_receiver_candidates(bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_receiver_rank_XXXXXX");
+    if (!cbm_mkdtemp(tmp))
+        return -1;
+    write_temp_file(tmp, "primary.h", "#pragma once\nclass Beacon { public: void Fire() {} };\n");
+    write_temp_file(tmp, "mirror.h", "#pragma once\nclass Beacon { public: void Fire() {} };\n");
+    write_temp_file(tmp, "caller.cpp",
+                    "#include \"primary.h\"\n"
+                    "void UseRef(Beacon& b) { b.Fire(); }\n"
+                    "void UsePtr(Beacon* b) { b->Fire(); }\n");
+    write_temp_file(tmp, "mirror_caller.cpp",
+                    "#include \"mirror.h\"\n"
+                    "void UseMirror(Beacon& b) { b.Fire(); }\n");
+    write_temp_file(tmp, "ambiguous.cpp",
+                    "#include \"primary.h\"\n#include \"mirror.h\"\n"
+                    "void UseBoth(Beacon& b) { b.Fire(); }\n");
+    write_temp_file(tmp, "sensor.h", "#pragma once\nclass Sensor { public: void Read() {} };\n");
+    write_temp_file(tmp, "sensor_forward.h", "class Sensor;\n");
+    write_temp_file(tmp, "sensor_idle.h", "class Sensor { public: void Idle() {} };\n");
+    write_temp_file(tmp, "unique.cpp",
+                    "#include \"sensor.h\"\n#include \"sensor_forward.h\"\n"
+                    "void UseUnique(Sensor& s) { s.Read(); }\n");
+    /* Without include evidence a sole method-bearing owner still wins.
+     * Forward declarations and an owner of a different member cannot tie it. */
+    write_temp_file(tmp, "unique_no_include.cpp",
+                    "void UseUniqueNoInclude(Sensor& s) { s.Read(); }\n");
+    write_temp_file(tmp, "trace.h",
+                    "class Trace { public: bool Empty() { return true; } };\n"
+                    "class Context { public: Trace GetTrace() { return Trace(); } };\n");
+    write_temp_file(tmp, "trace_forward.h", "class Trace; class Context;\n");
+    write_temp_file(tmp, "trace_caller.cpp",
+                    "#include \"trace.h\"\n#include \"trace_forward.h\"\n"
+                    "bool UseTrace(Context& c) { return c.GetTrace().Empty(); }\n");
+    write_temp_file(tmp, "callback.h", "struct Ops { void (*Invoke)(void); };\n");
+    write_temp_file(tmp, "callback_mirror.h", "struct Ops { void (*Invoke)(void); };\n");
+    write_temp_file(tmp, "callback_other.h", "struct Ops { void (*Invoke)(void); };\n");
+    write_temp_file(tmp, "callback.c",
+                    "#include \"callback.h\"\n"
+                    "struct Ops;\n"
+                    "void UseCallback(struct Ops* p) { p->Invoke(); }\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char path[64];
+        char source[80];
+        snprintf(path, sizeof(path), "padding_%02d.c", i);
+        snprintf(source, sizeof(source), "int padding_%02d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, path, source);
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/receiver.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    struct {
+        const char *caller;
+        const char *target;
+        int count;
+    } expected[] = {
+        {"caller.UseRef", "primary.Beacon.Fire", 1},
+        {"caller.UseRef", "mirror.Beacon.Fire", 0},
+        {"caller.UsePtr", "primary.Beacon.Fire", 1},
+        {"caller.UsePtr", "mirror.Beacon.Fire", 0},
+        {"mirror_caller.UseMirror", "mirror.Beacon.Fire", 1},
+        {"mirror_caller.UseMirror", "primary.Beacon.Fire", 0},
+        {"ambiguous.UseBoth", "primary.Beacon.Fire", 0},
+        {"ambiguous.UseBoth", "mirror.Beacon.Fire", 0},
+        {"unique.UseUnique", "sensor.Sensor.Read", 1},
+        {"unique_no_include.UseUniqueNoInclude", "sensor.Sensor.Read", 1},
+        {"trace_caller.UseTrace", "trace.Context.GetTrace", 1},
+        {"trace_caller.UseTrace", "trace.Trace.Empty", 1},
+        {"callback.UseCallback", "callback.Ops.Invoke", 1},
+    };
+    if (!s || !project)
+        rc = -1;
+    for (size_t i = 0; s && project && i < sizeof(expected) / sizeof(expected[0]); i++) {
+        /* Check nodes first: zero edges must not pass on an unindexed fixture. */
+        const char *names[] = {expected[i].caller, expected[i].target};
+        int64_t ids[2] = {0};
+        for (int j = 0; j < 2; j++) {
+            char qn[512];
+            snprintf(qn, sizeof(qn), "%s.%s", project, names[j]);
+            cbm_node_t node = {0};
+            if (cbm_store_find_node_by_qn(s, project, qn, &node) != CBM_STORE_OK) {
+                printf("  receiver fixture missing %s\n", names[j]);
+                rc = -1;
+            } else {
+                ids[j] = node.id;
+            }
+            cbm_node_free_fields(&node);
+        }
+        int count = 0;
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(s, ids[0], "CALLS", &edges, &edge_count) !=
+            CBM_STORE_OK)
+            rc = -1;
+        for (int edge = 0; edge < edge_count; edge++) {
+            if (edges[edge].target_id == ids[1])
+                count++;
+        }
+        cbm_store_free_edges(edges, edge_count);
+        if (count != expected[i].count) {
+            printf("  %s: %s -> %s: expected %d, got %d\n", parallel ? "parallel" : "sequential",
+                   expected[i].caller, expected[i].target, expected[i].count, count);
+            rc = -1;
+        }
+    }
+    if (s)
+        cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    return rc;
+}
+
+TEST(pipeline_cpp_receiver_member_candidates_sequential) {
+    ASSERT_EQ(check_cpp_receiver_candidates(false), 0);
+    PASS();
+}
+
+TEST(pipeline_cpp_receiver_member_candidates_parallel) {
+    ASSERT_EQ(check_cpp_receiver_candidates(true), 0);
+    PASS();
+}
+
+/* The C LSP's include list is converted to module form, but the shared import
+ * map keeps its values: in the parallel path that map also resolves base
+ * classes, and a module-form value let the out-of-line constructor Base::Base
+ * shadow its class (no INHERITS, no OVERRIDE). 52 padding files select the
+ * parallel path. */
+TEST(pipeline_cpp_constructor_namesake_base_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ctor_base_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "base.h",
+                    "#pragma once\n"
+                    "class Base {\npublic:\n    Base();\n    virtual ~Base();\n"
+                    "    virtual int run(int x);\n};\n");
+    write_temp_file(tmp, "base.cpp",
+                    "#include \"base.h\"\nBase::Base() {}\nBase::~Base() {}\n"
+                    "int Base::run(int x) { return x; }\n");
+    write_temp_file(tmp, "derived.h",
+                    "#pragma once\n#include \"base.h\"\n"
+                    "class Derived : public Base {\npublic:\n    Derived();\n"
+                    "    int run(int x) override;\n};\n");
+    write_temp_file(tmp, "derived.cpp",
+                    "#include \"derived.h\"\nDerived::Derived() : Base() {}\n"
+                    "int Derived::run(int x) { return Base::run(x) + 1; }\n");
+    for (int i = 0; i < 52; i++) {
+        char path[64];
+        char source[80];
+        snprintf(path, sizeof(path), "padding_%02d.cpp", i);
+        snprintf(source, sizeof(source), "int padding_%02d(int v) { return v + %d; }\n", i, i);
+        write_temp_file(tmp, path, source);
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/ctor.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db) : NULL;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    struct {
+        const char *source;
+        const char *target;
+        const char *type;
+    } expected[] = {
+        {"derived.Derived", "base.Base", "INHERITS"},
+        {"derived.Derived.run", "base.Base.run", "OVERRIDE"},
+    };
+    int found[2] = {0};
+    for (size_t i = 0; s && project && i < sizeof(expected) / sizeof(expected[0]); i++) {
+        const char *names[] = {expected[i].source, expected[i].target};
+        int64_t ids[2] = {0};
+        for (int j = 0; j < 2; j++) {
+            char qn[512];
+            snprintf(qn, sizeof(qn), "%s.%s", project, names[j]);
+            cbm_node_t node = {0};
+            if (cbm_store_find_node_by_qn(s, project, qn, &node) == CBM_STORE_OK) {
+                ids[j] = node.id;
+            } else {
+                printf("  constructor fixture missing %s\n", names[j]);
+            }
+            cbm_node_free_fields(&node);
+        }
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (ids[0] && ids[1] &&
+            cbm_store_find_edges_by_source_type(s, ids[0], expected[i].type, &edges,
+                                                &edge_count) == CBM_STORE_OK) {
+            for (int e = 0; e < edge_count; e++) {
+                if (edges[e].target_id == ids[1]) {
+                    found[i]++;
+                }
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+        if (found[i] != 1) {
+            printf("  %s -> %s: expected one %s edge, got %d\n", expected[i].source,
+                   expected[i].target, expected[i].type, found[i]);
+        }
+    }
+    if (s) {
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(found[0], 1);
+    ASSERT_EQ(found[1], 1);
+    PASS();
+}
+
 /* Discovery must choose the C++ grammar before the pipeline extracts .inc
  * symbols; a direct extractor-only test would miss that routing failure. */
 TEST(pipeline_inc_c_family_fragments) {
@@ -34951,6 +35185,9 @@ TEST(pipeline_inc_c_family_fragments) {
     PASS();
 }
 SUITE(pipeline) {
+    RUN_TEST(pipeline_cpp_receiver_member_candidates_sequential);
+    RUN_TEST(pipeline_cpp_receiver_member_candidates_parallel);
+    RUN_TEST(pipeline_cpp_constructor_namesake_base_parallel);
     RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);

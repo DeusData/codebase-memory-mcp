@@ -3085,8 +3085,37 @@ static void c_neg_memo_free(CLSPContext *ctx) {
     c_u64_set_free(&ctx->field_ref_seen, &ctx->field_ref_seen_cap, &ctx->field_ref_seen_count);
 }
 
+enum {
+    C_RECEIVER_GLOBAL = 0,
+    C_RECEIVER_INCLUDED = 2,
+    C_RECEIVER_INCLUDED_EXACT = 3,
+    C_RECEIVER_MODULE = 4,
+    C_RECEIVER_NO_MATCH = -1,
+    C_MEMBER_DEPTH_STEP = 1,
+    C_QN_SEPARATOR_WIDTH = 1,
+};
+
+// Shared receiver evidence for method and field-owner short-name lookups.
+static bool c_qn_in_module(const char *qn, const char *prefix) {
+    size_t plen = prefix ? strlen(prefix) : 0;
+    return plen > 0 && strncmp(qn, prefix, plen) == 0 && qn[plen] == '.';
+}
+
+static int c_receiver_rank(const CLSPContext *ctx, const char *qn) {
+    if (c_qn_in_module(qn, ctx->module_qn)) {
+        return C_RECEIVER_MODULE;
+    }
+    for (int i = 0; i < ctx->include_count; i++) {
+        if (c_qn_in_module(qn, ctx->include_ns_qns[i])) {
+            return C_RECEIVER_INCLUDED;
+        }
+    }
+    return C_RECEIVER_GLOBAL;
+}
+
 static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const char *type_qn,
-                                                      const char *member_name, int depth) {
+                                                      const char *member_name, int depth,
+                                                      bool *ambiguous_out) {
     if (!type_qn || !member_name)
         return NULL;
     if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
@@ -3135,7 +3164,8 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
             if (underlying && !cbm_type_is_unknown(underlying)) {
                 const char *alias_target_qn = type_to_qn(underlying);
                 if (alias_target_qn) {
-                    f = c_lookup_member_depth(ctx, alias_target_qn, member_name, depth + 1);
+                    f = c_lookup_member_depth(ctx, alias_target_qn, member_name,
+                                              depth + C_MEMBER_DEPTH_STEP, NULL);
                     if (f)
                         return f;
                 }
@@ -3162,7 +3192,8 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
     if (rt) {
         // Alias chain
         if (rt->alias_of) {
-            f = c_lookup_member_depth(ctx, rt->alias_of, member_name, depth + 1);
+            f = c_lookup_member_depth(ctx, rt->alias_of, member_name, depth + C_MEMBER_DEPTH_STEP,
+                                      NULL);
             if (f)
                 return f;
         }
@@ -3170,7 +3201,8 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         // Base classes (embedded_types stores base class QNs)
         if (rt->embedded_types) {
             for (int i = 0; rt->embedded_types[i]; i++) {
-                f = c_lookup_member_depth(ctx, rt->embedded_types[i], member_name, depth + 1);
+                f = c_lookup_member_depth(ctx, rt->embedded_types[i], member_name,
+                                          depth + C_MEMBER_DEPTH_STEP, NULL);
                 if (f)
                     return f;
             }
@@ -3190,6 +3222,14 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         const char *shortn = dot ? dot + 1 : type_qn;
         size_t slen = strlen(shortn);
         const char *best_qn = NULL;
+        const CBMRegisteredFunc *best_method = NULL;
+        int best_rank = C_RECEIVER_NO_MATCH;
+        bool ambiguous = false;
+        const char *suffix = type_qn;
+        if (c_qn_in_module(type_qn, ctx->module_qn)) {
+            suffix += strlen(ctx->module_qn) + C_QN_SEPARATOR_WIDTH;
+        }
+        size_t suffix_len = strlen(suffix);
         CBMTypeShortIter it;
         cbm_registry_types_by_short_name_chain(ctx->registry, shortn, &it);
         int i;
@@ -3206,16 +3246,50 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
             if (strcmp(q, type_qn) == 0) {
                 continue; // already tried as-is above
             }
-            best_qn = q;
-            if (ctx->module_qn && strncmp(q, ctx->module_qn, strlen(ctx->module_qn)) == 0) {
-                break; // prefer a match in the current module
+            // A forward declaration or unrelated memberless homonym cannot
+            // compete for this call. Depth > 0 keeps this probe on this owner,
+            // including its aliases/bases, without another short-name search.
+            f = c_lookup_member_depth(ctx, q, member_name, depth + C_MEMBER_DEPTH_STEP, NULL);
+            if (!f) {
+                continue;
+            }
+            if (ctx->include_count > 0 && suffix_len > slen &&
+                (qlen <= suffix_len || q[qlen - suffix_len - C_QN_SEPARATOR_WIDTH] != '.' ||
+                 strcmp(q + qlen - suffix_len, suffix) != 0)) {
+                continue;
+            }
+            int rank = c_receiver_rank(ctx, q);
+            // Within an included module, preserve explicit namespace spelling;
+            // its top-level type outranks namespaced short-name homonyms.
+            if (rank == C_RECEIVER_INCLUDED) {
+                for (int inc = 0; inc < ctx->include_count; inc++) {
+                    const char *module = ctx->include_ns_qns[inc];
+                    if (c_qn_in_module(q, module) &&
+                        strcmp(q + strlen(module) + C_QN_SEPARATOR_WIDTH, suffix) == 0) {
+                        rank = C_RECEIVER_INCLUDED_EXACT;
+                        break;
+                    }
+                }
+            }
+            if (rank > best_rank) {
+                best_qn = q;
+                best_method = f;
+                best_rank = rank;
+                ambiguous = false;
+            } else if (rank == best_rank && strcmp(best_qn, q) != 0) {
+                ambiguous = true;
             }
         }
-        if (best_qn) {
-            f = c_lookup_member_depth(ctx, best_qn, member_name, depth + 1);
-            if (f) {
-                return f;
+        if (ambiguous) {
+            // An already identified receiver's ordinary miss must retain its
+            // existing fallback. Only unknown C++ receiver identities block it.
+            if (ambiguous_out && ctx->cpp_mode && !rt) {
+                *ambiguous_out = true;
             }
+            return NULL; // Do not memoize away an ambiguity diagnostic.
+        }
+        if (best_method) {
+            return best_method;
         }
     }
 
@@ -3228,7 +3302,7 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
 
 const CBMRegisteredFunc *c_lookup_member(CLSPContext *ctx, const char *type_qn,
                                          const char *member_name) {
-    return c_lookup_member_depth(ctx, type_qn, member_name, 0);
+    return c_lookup_member_depth(ctx, type_qn, member_name, 0, NULL);
 }
 
 /* A member of a class c_resolve_scope_class_qn already pinned down: direct,
@@ -3237,7 +3311,7 @@ const CBMRegisteredFunc *c_lookup_member(CLSPContext *ctx, const char *type_qn,
  * class elsewhere -- the scope names exactly this class. */
 static const CBMRegisteredFunc *c_lookup_scope_member(CLSPContext *ctx, const char *class_qn,
                                                       const char *member_name) {
-    return c_lookup_member_depth(ctx, class_qn, member_name, 1);
+    return c_lookup_member_depth(ctx, class_qn, member_name, C_MEMBER_DEPTH_STEP, NULL);
 }
 
 // True if any BASE class of type_qn (not type_qn itself) declares member_name —
@@ -3314,12 +3388,6 @@ static const CBMType *c_lookup_field_type(CLSPContext *ctx, const char *type_qn,
     return NULL;
 }
 
-// True when qn is `prefix` followed by a '.' segment boundary.
-static bool c_qn_in_module(const char *qn, const char *prefix) {
-    size_t plen = prefix ? strlen(prefix) : 0;
-    return plen > 0 && strncmp(qn, prefix, plen) == 0 && qn[plen] == '.';
-}
-
 // The registered type a member access is made on: as written, then
 // module-qualified, then by short name -- a C use site names `struct Alpha`
 // while the struct is registered under the header that declares it.
@@ -3361,18 +3429,17 @@ static const CBMRegisteredType *c_field_owner_by_short_name(CLSPContext *ctx, co
         if (members_only && !c_type_has_members(cand))
             continue;
         *found = true;
-        if (c_qn_in_module(q, ctx->module_qn))
+        int rank = c_receiver_rank(ctx, q);
+        if (rank == C_RECEIVER_MODULE) {
             return cand;
+        }
         if (only && strcmp(only->qualified_name, q) != 0)
             only_ambiguous = true;
         only = cand;
-        for (int inc = 0; inc < ctx->include_count; inc++) {
-            if (!c_qn_in_module(q, ctx->include_ns_qns[inc]))
-                continue;
+        if (rank == C_RECEIVER_INCLUDED) {
             if (included && strcmp(included->qualified_name, q) != 0)
                 included_ambiguous = true;
             included = cand;
-            break;
         }
     }
     if (included)
@@ -4770,9 +4837,17 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             // Use type-aware overload scoring
                             const CBMRegisteredFunc *method = cbm_registry_lookup_method_by_types(
                                 ctx->registry, type_qn, field_name, arg_types, arg_count);
-                            // Fall back to c_lookup_member for base class traversal
-                            if (!method)
-                                method = c_lookup_member(ctx, type_qn, field_name);
+                            bool ambiguous_receiver = false;
+                            if (!method) {
+                                method = c_lookup_member_depth(ctx, type_qn, field_name, 0,
+                                                               &ambiguous_receiver);
+                            }
+                            if (!method && ambiguous_receiver) {
+                                c_emit_resolved_call_orig_at(ctx, field_name, NULL,
+                                                             "lsp_ambiguous_receiver", 0.0F, node);
+                            }
+                            // Keep the ordinary diagnostic and pending-template
+                            // handling below even for an ambiguous receiver.
                             if (ctx->debug)
                                 fprintf(stderr, "  [clsp] member call result: %s\n",
                                         method ? method->qualified_name : "NULL");
