@@ -25,9 +25,13 @@ on:
         type: string
         default: all
       test_selection:
-        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the Linux x86_64 test-unix leg runs only its tests, the arm64, macOS and Windows legs run every test. Empty = every test (dry run, release, and any PR the selection does not narrow)'
+        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the Linux x86_64 test-unix leg runs only its tests. Empty = every test (dry run, release, and any PR the selection does not narrow)'
         type: string
         default: ''
+      test_selection_portable:
+        description: 'The test_selection artifact also holds portable/: the view of the legs the coverage is not recorded on (arm64, macOS, Windows), where every platform-specific suite runs whole; those legs run it. false = they run every test'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -226,11 +230,14 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
 
       - name: Fetch the test selection
-        # Only the Linux x86_64 leg narrows (user decision 2026-10-16): the
-        # coverage that justifies an omission comes from the Linux x86_64
-        # producer, so arm64, macOS and Windows code under #ifdef has static
-        # evidence only and those legs run every test.
-        if: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' }}
+        # The coverage that justifies an omission is recorded on Linux x86_64:
+        # that leg runs the selection as the engine answered it. arm64 and
+        # macOS run its portable view, where every platform-specific suite
+        # (scripts/test-impact/selection.py platform-suites) runs whole, since
+        # their #ifdef code has static evidence only (user decision 2026-11-11,
+        # R151; until then these legs ran every test). No portable view: every
+        # test.
+        if: ${{ inputs.test_selection != '' && ((runner.os == 'Linux' && runner.arch == 'X64') || inputs.test_selection_portable) }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.test_selection }}
@@ -242,7 +249,7 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.cc }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' && format('{0}/test-selection', runner.temp) || '' }}
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' && format('{0}/test-selection', runner.temp) || inputs.test_selection != '' && inputs.test_selection_portable && format('{0}/test-selection/portable', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -314,7 +321,7 @@ jobs:
           go-version-file: pkg/go/go.mod
           cache: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -341,7 +348,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -460,7 +467,14 @@ jobs:
         run: scripts/ci/msan-lane.sh build
 
       - name: MSan suite (exclusions per scripts/msan.sh)
-        run: scripts/ci/msan-lane.sh run
+        # Reduce mmap ASLR entropy on the host first, as the TSan leg does: with
+        # the runner kernel's higher default the MSan runtime tries to re-exec
+        # itself with ADDR_NO_RANDOMIZE, which the container's seccomp profile
+        # refuses, and it aborts ("CHECK failed: msan_linux.cpp:193 ...
+        # personality") before any test runs. The container shares this kernel.
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+          scripts/ci/msan-lane.sh run
 
   # macOS leak coverage. LeakSanitizer runs by default under ASan on Linux, so
   # test-unix's ubuntu legs have always had it; on macOS it is off by default
@@ -628,6 +642,15 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-
 
+      # The portable view of the test selection (see test-unix): every
+      # platform-specific suite runs whole here.
+      - name: Fetch the test selection
+        if: ${{ inputs.test_selection != '' && inputs.test_selection_portable }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.test_selection }}
+          path: ${{ runner.temp }}/test-selection
+
       - name: Test
         shell: msys2 {0}
         # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
@@ -655,8 +678,8 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-          # Windows legs run every test: see the Linux x86_64-only fetch in test-unix.
-          CBM_TEST_SELECTION_DIR: ''
+          # The portable view, as on test-unix's arm64 and macOS legs.
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && inputs.test_selection_portable && format('{0}/test-selection/portable', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -757,7 +780,7 @@ jobs:
             make
             git
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 

@@ -121,9 +121,11 @@ static atomic_uint_fast64_t frontend_test_worker_observation_count = ATOMIC_VAR_
 static atomic_uint_fast64_t frontend_test_worker_idle_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_routed_cancellation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t frontend_test_replay_budget_ms = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast32_t frontend_test_monitor_idle_sleep = ATOMIC_VAR_INIT(0);
 
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor) {
     atomic_store_explicit(&frontend_test_monitor_observation_count, 0, memory_order_release);
+    atomic_store_explicit(&frontend_test_monitor_idle_sleep, 0, memory_order_release);
     atomic_store_explicit(&frontend_test_worker_observation_count, 0, memory_order_release);
     atomic_store_explicit(&frontend_test_worker_idle_count, 0, memory_order_release);
     atomic_store_explicit(&frontend_test_monitor_is_waiting, false, memory_order_release);
@@ -157,6 +159,10 @@ uint64_t cbm_daemon_frontend_test_routed_cancellations(void) {
 uint32_t cbm_daemon_frontend_test_replay_timeout_ms(void) {
     return (uint32_t)atomic_load_explicit(&frontend_test_replay_budget_ms, memory_order_acquire);
 }
+
+uint32_t cbm_daemon_frontend_test_monitor_idle_sleep_ms(void) {
+    return (uint32_t)atomic_load_explicit(&frontend_test_monitor_idle_sleep, memory_order_acquire);
+}
 #endif
 
 static cbm_version_cohort_maintenance_presence_t frontend_observe_maintenance(
@@ -187,7 +193,11 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
         cbm_version_cohort_maintenance_presence_t presence =
             frontend_observe_maintenance(monitor->manager, true);
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
-            cbm_usleep(FRONTEND_MAINTENANCE_IDLE_POLL_MS * 1000U);
+            uint32_t idle_ms = FRONTEND_MAINTENANCE_IDLE_POLL_MS;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+            atomic_store_explicit(&frontend_test_monitor_idle_sleep, idle_ms, memory_order_release);
+#endif
+            cbm_usleep(idle_ms * 1000U);
             continue;
         }
 

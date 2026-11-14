@@ -900,12 +900,16 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
     yyjson_mut_obj_add_val(doc, root, "edges", ea);
     yyjson_mut_obj_add_int(doc, root, "total_nodes", r->total_nodes);
 
-    /* The output string is an OTHER-class memory-core block, released by
-     * cbm_layout_free_json; the document keeps its own allocator. */
+    /* ALLOW_INVALID_UNICODE alone copies malformed UTF-8 through, which
+     * handle_layout's strict yyjson_read rejects. ESCAPE_UNICODE makes those
+     * bytes U+FFFD and escapes valid non-ASCII. The output string is an
+     * OTHER-class memory-core block, released by cbm_layout_free_json; the
+     * document keeps its own allocator. */
     size_t len = 0;
     yyjson_write_err write_err = {0};
-    char *json = yyjson_mut_write_opts(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE,
-                                       cbm_json_writer_allocator(), &len, &write_err);
+    char *json =
+        yyjson_mut_write_opts(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE | YYJSON_WRITE_ESCAPE_UNICODE,
+                              cbm_json_writer_allocator(), &len, &write_err);
     yyjson_mut_doc_free(doc);
     if (!json) {
         char code[CBM_SZ_32];

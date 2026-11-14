@@ -296,6 +296,9 @@ bool cbm_cli_clients_apply_selection_for_testing(const char *spec, cbm_detected_
 size_t cbm_cli_clients_count_for_testing(void);
 const char *cbm_cli_clients_token_for_testing(size_t index);
 void cbm_cli_set_client_selection_for_testing(const char *spec);
+/* True when the current --clients selection includes the registry client id
+ * (registry-backed path of the same selector). */
+bool cbm_cli_selects_registry_client_for_testing(const char *stable_id);
 #endif
 
 #ifdef CBM_CLI_ENABLE_TEST_API
@@ -477,6 +480,10 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
 
+/* Lower the limit a tar.gz archive may decompress to, so a test can pin the
+ * refusal with a small archive. 0 restores the 500 MiB limit. */
+void cbm_cli_set_decompress_max_for_test(size_t max_bytes);
+
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Index management ─────────────────────────────────────────── */
@@ -532,6 +539,7 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_DOC_CANDIDATES "doc_candidates"
+#define CBM_CONFIG_INSTALL_HOOKS "install_hooks"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
 #define CBM_CONFIG_WATCH_NON_GIT "watch_non_git"

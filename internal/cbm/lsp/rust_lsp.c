@@ -26,6 +26,7 @@
  */
 
 #include "rust_lsp.h"
+#include "lsp_work.h"
 #include "rust_cargo.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -328,12 +329,11 @@ static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name)
     if (!ctx || !local_name) {
         return NULL;
     }
-    for (int i = 0; i < ctx->use_count; i++) {
-        if (strcmp(ctx->use_local_names[i], local_name) == 0) {
-            return ctx->use_module_paths[i];
-        }
-    }
-    return NULL;
+    /* The first use of this local name (lsp_name_rows.h): a scan per use made a
+     * file of thousands of `use` items quadratic. */
+    int i = cbm_name_rows_first(&ctx->use_rows, ctx->arena, ctx->use_local_names, ctx->use_count,
+                                local_name);
+    return i >= 0 ? ctx->use_module_paths[i] : NULL;
 }
 
 /* The Rust prelude is auto-imported into every module. We map each name
@@ -2648,6 +2648,7 @@ static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
     if (reg->fallback) {
         RustLSPContext fallback_ctx = *ctx;
         fallback_ctx.registry = reg->fallback;
+        fallback_ctx.use_rows = (CBMNameRows){0}; /* the copy must not grow ctx's chains */
         return rust_lookup_method_in_trait(&fallback_ctx, trait_qn, method_name, allow_abstract);
     }
     return NULL;
@@ -5554,6 +5555,51 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
     }
 }
 
+/* The first function row of each key, for a pass that patches registered
+ * functions while the function list does not change: the pass starts its old
+ * loop at that row instead of the top. A row the memo cannot take (no memory)
+ * sets `failed`, and every loop starts at the top again. Scratch memory. */
+enum { RUST_FIRST_ROWS_BLOCK = 4096 };
+
+typedef struct {
+    CBMIdxMemo first;
+    CBMArena arena;
+    bool failed;
+} RustFirstRows;
+
+static void rust_first_rows_init(RustFirstRows *rows) {
+    memset(rows, 0, sizeof(*rows));
+    cbm_arena_init_lazy(&rows->arena, RUST_FIRST_ROWS_BLOCK);
+}
+
+static void rust_first_rows_destroy(RustFirstRows *rows) {
+    cbm_arena_destroy(&rows->arena);
+}
+
+static void rust_first_rows_put(RustFirstRows *rows, const char *key, int row) {
+    if (rows->failed)
+        return;
+    CBM_LSP_WORK(1);
+    if (key)
+        cbm_idxmemo_put_if_absent(&rows->first, &rows->arena, key, row);
+    if (!key || cbm_idxmemo_get(&rows->first, key) < 0)
+        rows->failed = true;
+}
+
+/* Where a patch loop over `count` functions starts for this key. */
+static int rust_first_rows_start(const RustFirstRows *rows, const char *key, int count) {
+    CBM_LSP_WORK(1);
+    if (rows->failed || !key)
+        return 0;
+    int row = cbm_idxmemo_get(&rows->first, key);
+    return row >= 0 ? row : count;
+}
+
+/* A method's key: receiver and name, joined by a byte no name holds. */
+static const char *rust_method_key(RustFirstRows *rows, const char *receiver, const char *name) {
+    return cbm_arena_sprintf(&rows->arena, "%s\x1f%s", receiver, name);
+}
+
 /* Build the registry from the per-file `result->defs`, `result->impl_traits`,
  * and a Rust prelude seed. */
 void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
@@ -5719,7 +5765,11 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                         fld_count++;
                     }
                     if (fld_count > 0) {
-                        for (int ti = 0; ti < reg->type_count; ti++) {
+                        /* The type's first registration (type_idx); the loop starts there. */
+                        CBM_LSP_WORK(1);
+                        int first = cbm_idxmemo_get(&type_idx, type_qn);
+                        for (int ti = first >= 0 ? first : reg->type_count; ti < reg->type_count;
+                             ti++) {
                             if (reg->types[ti].qualified_name &&
                                 strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
                                 const char **names = (const char **)cbm_arena_alloc(
@@ -5751,8 +5801,11 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     continue;
                 const char *trait_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
 
-                /* Mark as interface and collect method names. */
-                for (int ti = 0; ti < reg->type_count; ti++) {
+                /* Mark as interface and collect method names: the trait's first
+                 * registration (type_idx); the loop starts there. */
+                CBM_LSP_WORK(1);
+                int first = cbm_idxmemo_get(&type_idx, trait_qn);
+                for (int ti = first >= 0 ? first : reg->type_count; ti < reg->type_count; ti++) {
                     if (!reg->types[ti].qualified_name)
                         continue;
                     if (strcmp(reg->types[ti].qualified_name, trait_qn) == 0) {
@@ -5804,6 +5857,13 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         tmp.registry = reg;
         tmp.module_qn = module_qn;
 
+        /* The first free function of each QN; the patch loop starts there. */
+        RustFirstRows free_rows;
+        rust_first_rows_init(&free_rows);
+        for (int k = 0; k < reg->func_count; k++) {
+            if (reg->funcs[k].qualified_name && !reg->funcs[k].receiver_type)
+                rust_first_rows_put(&free_rows, reg->funcs[k].qualified_name, k);
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -5818,7 +5878,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 continue;
             const CBMType *ret = rust_parse_type_node(&tmp, rtn);
             const char *fn_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, fname);
-            for (int k = 0; k < reg->func_count; k++) {
+            for (int k = rust_first_rows_start(&free_rows, fn_qn, reg->func_count);
+                 k < reg->func_count; k++) {
                 CBMRegisteredFunc *rf = &reg->funcs[k];
                 if (!rf->qualified_name)
                     continue;
@@ -5834,6 +5895,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 break;
             }
         }
+        rust_first_rows_destroy(&free_rows);
     }
 
     /* Phase A2: derive-macro synthesis.
@@ -5963,7 +6025,10 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                          * trait QN as an embedded_type on the receiver
                          * AND synthesize the method entries. */
                         CBMRegisteredType *rt = NULL;
-                        for (int ti = 0; ti < reg->type_count; ti++) {
+                        CBM_LSP_WORK(1);
+                        int first = cbm_idxmemo_get(&type_idx, d->qualified_name);
+                        for (int ti = first >= 0 ? first : reg->type_count; ti < reg->type_count;
+                             ti++) {
                             if (reg->types[ti].qualified_name &&
                                 strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0) {
                                 rt = &reg->types[ti];
@@ -6035,6 +6100,16 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
      * registered functions have no return-type signature and chained
      * method calls (`File::open().read()`) break. */
     if (!ts_node_is_null(root)) {
+        /* The first function of each receiver and name; the patch loop starts there. */
+        RustFirstRows method_rows;
+        rust_first_rows_init(&method_rows);
+        for (int k = 0; k < reg->func_count; k++) {
+            const CBMRegisteredFunc *rf = &reg->funcs[k];
+            if (rf->receiver_type && rf->short_name)
+                rust_first_rows_put(
+                    &method_rows, rust_method_key(&method_rows, rf->receiver_type, rf->short_name),
+                    k);
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -6080,7 +6155,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     ret = cbm_type_named(arena, type_qn);
                 }
                 /* Patch the registered function's signature. */
-                for (int k = 0; k < reg->func_count; k++) {
+                const char *key = type_qn ? rust_method_key(&method_rows, type_qn, mname) : NULL;
+                for (int k = rust_first_rows_start(&method_rows, key, reg->func_count);
+                     k < reg->func_count; k++) {
                     CBMRegisteredFunc *rf = &reg->funcs[k];
                     if (!rf->receiver_type || !rf->short_name)
                         continue;
@@ -6097,6 +6174,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 }
             }
         }
+        rust_first_rows_destroy(&method_rows);
     }
 
     /* Phase C: encode `impl Trait for Type` as `embedded_types` on the

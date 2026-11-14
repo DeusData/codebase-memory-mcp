@@ -623,6 +623,28 @@ static char *delta_generated_props(const char *props, const char *generated) {
     return out;
 }
 
+/* `props` (a JSON object) with the extractor's test verdict added as
+ * `"is_test":true` (CBM_MEM_CLASS_OTHER; the caller frees), NULL on allocation
+ * failure. The incremental registry seed reads the verdict back
+ * (cbm_node_is_test) so a re-resolved caller ranks a test definition below
+ * real code exactly as the full build does; an absent key reads as false. */
+static char *delta_test_props(const char *props) {
+    static const char member[] = "\"is_test\":true";
+    size_t pl = props ? strlen(props) : 0;
+    bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
+    size_t cap = pl + sizeof(member) + CBM_SZ_4;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    if (has_members) {
+        snprintf(out, cap, "%.*s,%s}", (int)(pl - SKIP_ONE), props, member);
+    } else {
+        snprintf(out, cap, "{%s}", member);
+    }
+    return out;
+}
+
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
@@ -656,12 +678,13 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * UNIQUE violation the pre-remap patch would have raised. A resolver that
      * only LOOKS UP still needs its target resident, which is why the list
      * mirrors the registry's own membership rule instead of guessing. */
-    /* The one property a resolver READS off a proxy: an axios instance
-     * binding's client + baseURL (#1916). A caller re-resolved alone must
+    /* Preserve the resolver-visible HTTP and Swift signature properties on
+     * proxies: an axios instance binding's client + baseURL (#1916).
+     * A caller re-resolved alone must
      * compose `api.get('/p')` against its unchanged wrapper exactly as a full
      * build does. Only the two keys, only on the rare Module/Variable rows
-     * that carry them; every other proxy stays "{}". Proxies are never
-     * written back (cbm_delta_patch skips id <= max_db_id).
+     * that carry them; Swift callables retain defaults and parameter counts.
+     * Proxies are never written back (cbm_delta_patch skips id <= max_db_id).
      *
      * The other: a node's parent_class where it changes the name the node
      * goes by -- a Go method's QN has no receiver, a class-body variable's QN
@@ -672,7 +695,13 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * And a generated member's mark (a Java record's implicit accessor, a
      * Method node): the registry seed reads it to register the member by
      * qualified name only, as the full build does (cbm_node_props_generated);
-     * without it the proxy came back into the short-name index. */
+     * without it the proxy came back into the short-name index.
+     *
+     * And the extractor's test verdict: the registry seed reads it back
+     * (cbm_node_is_test) to rank a test definition below real code, as the
+     * full build does with CBMDefinition.is_test; without it every proxy
+     * scored as production and a re-resolved caller could bind a test helper
+     * the full build ranks last. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -680,14 +709,29 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Module','Variable')"
             " AND instr(properties, '\"http_client\"') > 0"
             " THEN json_object('http_client', json_extract(properties, '$.http_client'),"
-            " 'http_base_url', json_extract(properties, '$.http_base_url')) END,"
+            " 'http_base_url', json_extract(properties, '$.http_base_url'))"
+            " WHEN instr(properties, '\"param_default_mask\"') > 0"
+            " THEN json_object('param_default_mask', json_extract(properties, "
+            "'$.param_default_mask'),"
+            " 'selector_param_count', json_extract(properties, '$.selector_param_count'),"
+            " 'call_selector', json_extract(properties, '$.call_selector'),"
+            " 'return_type', json_extract(properties, '$.return_type'))"
+            " WHEN instr(properties, '\"swift_type_path\"') > 0"
+            " OR instr(properties, '\"swift_extension\"') > 0"
+            " THEN json_object('base_classes', json_extract(properties, '$.base_classes'),"
+            " 'swift_type_path', json_extract(properties, '$.swift_type_path'),"
+            " 'swift_extension', json_extract(properties, '$.swift_extension'),"
+            " 'swift_imports', json_extract(properties, '$.swift_imports'))"
+            " WHEN instr(properties, '\"base_classes\"') > 0"
+            " THEN json_object('base_classes', json_extract(properties, '$.base_classes')) END,"
             " start_line, end_line,"
             " CASE WHEN label IN ('Method','Variable')"
             " AND instr(properties, '\"parent_class\"') > 0"
             " THEN json_extract(properties, '$.parent_class') END,"
             " CASE WHEN label = 'Method'"
             " AND instr(properties, '\"" CBM_PROP_GENERATED "\"') > 0"
-            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END"
+            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END,"
+            " instr(properties, '\"is_test\":true') > 0"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -712,14 +756,27 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         int end_line = sqlite3_column_int(stmt, 7);
         const char *parent = (const char *)sqlite3_column_text(stmt, 8);
         const char *generated = (const char *)sqlite3_column_text(stmt, 9);
+        bool is_test = sqlite3_column_int(stmt, 10) != 0;
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
         char *generated_props = delta_generated_props(props, generated);
+        const char *seed_props = generated_props ? generated_props : props;
+        char *test_props = is_test ? delta_test_props(seed_props) : NULL;
+        if (is_test && !test_props) {
+            /* A proxy without its verdict would rank as production code;
+             * the run cannot be trusted, as with an id mismatch below. */
+            cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
+            cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
+            sqlite3_finalize(stmt);
+            cbm_log_error("delta.preseed_verdict_alloc_failed", "qn", qn ? qn : "");
+            return -1;
+        }
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
         int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
-                                           end_line, generated_props ? generated_props : props);
+                                           end_line, test_props ? test_props : seed_props);
+        cbm_free(CBM_MEM_CLASS_OTHER, test_props);
         cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
         if (got != id) {

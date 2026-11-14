@@ -130,23 +130,46 @@ require('--lanes "$LANES"' in test_wf.get("shard-completeness", ""),
 m = re.search(r"(?ms)^      test_selection:\n(.*?)(?=^      \S|^\S|\Z)", text("_test.yml"))
 require(m is not None and re.search(r"(?m)^        default: ''$", m.group(1)) is not None,
         "_test.yml must declare a test_selection input defaulting to '' (every test)")
+m = re.search(r"(?ms)^      test_selection_portable:\n(.*?)(?=^      \S|^\S|\Z)", text("_test.yml"))
+require(m is not None and re.search(r"(?m)^        type: boolean$", m.group(1)) is not None
+        and re.search(r"(?m)^        default: false$", m.group(1)) is not None,
+        "_test.yml must declare a boolean test_selection_portable input defaulting to false")
 readers = sorted(job for job, body in test_wf.items() if "inputs.test_selection" in body)
-# Only the Linux x86_64 leg narrows (user decision 2026-10-16): the coverage comes from
-# the Linux x86_64 producer, so arm64, macOS and Windows legs run every test.
-require(readers == ["test-unix"], f"only test-unix may read test_selection, found {readers}")
+# The Linux x86_64 leg, where the coverage is recorded, runs the answer as given; arm64,
+# macOS and Windows run its portable view, every platform-specific suite whole (user
+# decision 2026-11-11, R151, reversing the x86-only decision of 2026-10-16). Sanitizer
+# and TSan lanes keep running every test.
+require(readers == ["test-unix", "test-windows"],
+        f"only test-unix and test-windows may read test_selection, found {readers}")
 unix = test_wf.get("test-unix", "")
 linux_x64 = "inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64'"
-require(f"if: ${{{{ {linux_x64} }}}}" in unix and
-        f"CBM_TEST_SELECTION_DIR: ${{{{ {linux_x64} && " in unix,
-        "_test.yml test-unix must fetch the selection and hand it to scripts/test.sh as "
-        "CBM_TEST_SELECTION_DIR only on Linux x86_64 and only when one was passed")
-require("CBM_TEST_SELECTION_DIR: ''" in test_wf.get("test-windows", ""),
-        "_test.yml test-windows must run every test (CBM_TEST_SELECTION_DIR: '')")
+portable = "inputs.test_selection != '' && inputs.test_selection_portable"
+portable_dir = "format('{0}/test-selection/portable', runner.temp)"
+require(f"if: ${{{{ inputs.test_selection != '' && ((runner.os == 'Linux' && runner.arch == "
+        f"'X64') || inputs.test_selection_portable) }}}}" in unix and
+        f"CBM_TEST_SELECTION_DIR: ${{{{ {linux_x64} && format('{{0}}/test-selection', "
+        f"runner.temp) || {portable} && {portable_dir} || '' }}}}" in unix,
+        "_test.yml test-unix must hand scripts/test.sh the selection as answered on Linux "
+        "x86_64 and its portable/ view on every other leg, only when one was passed")
+require(f"if: ${{{{ {portable} }}}}" in test_wf.get("test-windows", "") and
+        f"CBM_TEST_SELECTION_DIR: ${{{{ {portable} && {portable_dir} || '' }}}}"
+        in test_wf.get("test-windows", ""),
+        "_test.yml test-windows must run the portable view only when one was passed")
 select = pr.get("select-tests", "")
-require(re.search(r"(?m)^    if: \$\{\{ vars\.TEST_IMPACT_MODE == 'gate' \}\}$", select) is not None,
-        "pr.yml select-tests must run only when vars.TEST_IMPACT_MODE == 'gate'")
-require("scripts/ci/test-impact-select.sh" in select and "--gate" in select,
-        "pr.yml select-tests must run scripts/ci/test-impact-select.sh --gate")
+require(re.search(r"(?m)^    if: \$\{\{ \(vars\.TEST_IMPACT_MODE \|\| 'gate'\) == 'gate' \}\}$",
+                  select) is not None,
+        "pr.yml select-tests must default to gate (fork PRs get no vars) and stop only when "
+        "vars.TEST_IMPACT_MODE says otherwise")
+require("pull_request_target" not in text("pr.yml"),
+        "pr.yml must never run on pull_request_target (fork code with a write token)")
+require('git worktree add --detach "$RUNNER_TEMP/base-tooling" HEAD^1' in select and
+        '"$RUNNER_TEMP/base-tooling/scripts/ci/test-impact-select.sh" --repo "$GITHUB_WORKSPACE"'
+        in select and "--gate" in select and
+        '--binary "$RUNNER_TEMP/base-tooling/build/c/codebase-memory-mcp"' in select,
+        "pr.yml select-tests must build and run the merge base's engine and "
+        "scripts/ci/test-impact-select.sh --gate against the PR checkout, never the PR's own")
+require("portable: ${{ steps.select.outputs.portable }}" in select,
+        "pr.yml select-tests must export the portable view's state")
 require("select-tests" not in needs,
         "ci-ok must not need select-tests: a broken selection runs every test, never blocks")
 test_job = pr.get("test", "")
@@ -156,6 +179,11 @@ require(re.search(r"(?m)^    needs: \[changes, lint, select-tests\]$", test_job)
 require("test_selection: ${{ needs.select-tests.result == 'success' && "
         "needs.select-tests.outputs.selection == 'narrowed' && 'test-selection' || '' }}" in test_job,
         "pr.yml test must pass a selection only from a successful, narrowed select-tests run")
+require("test_selection_portable: ${{ needs.select-tests.result == 'success' && "
+        "needs.select-tests.outputs.selection == 'narrowed' && "
+        "needs.select-tests.outputs.portable == 'narrowed' }}" in test_job,
+        "pr.yml test must pass the portable view only from a successful select-tests run "
+        "that narrowed both views")
 
 # 3. every lane is served by a job.
 MATRIX = {"unix-x86": "_test.yml", "unix-arm64": "_test.yml", "unix-macos14": "_test.yml",

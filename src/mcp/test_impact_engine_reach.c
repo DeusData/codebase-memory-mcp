@@ -208,23 +208,48 @@ static bool te_line_names(const char *text, size_t len, const char *needle, size
  * the tests that use it are unknown, and everything runs. */
 #define TE_DEFINE_DEPTH_MAX 4
 
+/* The definition around `line` of `path`, when it is one of `exclude` (a
+ * handler naming a role's literal: it starts that role's child), into
+ * `starters` once. No `starters`: nothing to record. */
+static bool te_record_starter(te_ctx_t *c, const char *path, int line, const te_ids_t *exclude,
+                              te_ids_t *starters) {
+    if (!starters) {
+        return true;
+    }
+    bool ok = true;
+    const cbm_ti_node_t *d = cbm_ti_graph_enclosing(c->graph, path, line, &ok);
+    if (!ok) {
+        return te_fallback(c, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE, "graph read failed") &&
+               false;
+    }
+    if (!d || !te_ids_has(exclude, d->id) || te_ids_has(starters, d->id)) {
+        return true;
+    }
+    return te_ids_push(c, starters, d->id);
+}
+
 /* Every line of a test file that contains `needle`: its enclosing
  * definition is a fixture case or a seed — unless it is one of `exclude`
- * (a role handler naming its own literal is not a test that spawns it).
+ * (a role handler naming its own literal is not a test that spawns it; one
+ * naming another role's literal starts that role's child, and is recorded in
+ * `excluded_hits` when given, once per definition).
  * A `#define NAME "literal"` line names nobody: the code that uses NAME does,
  * so the scan follows NAME (a whole word) instead, through macros that name
  * macros. A define it cannot follow runs everything. In a role's scan
  * (`runner_cases`: the walk's sinks) a runner file's helper — the runner's own
  * use of a role's marker — still seeds the walk but names no spawner: there,
- * only a test case does (a sink, found by its start line like every case). */
+ * only a test case does (a sink, found by its start line like every case).
+ * A runner file that defines no suite holds no test: there, only the handlers
+ * that name the literal are recorded. */
 static bool te_scan_text(te_ctx_t *c, const char *needle, bool ident, int depth, te_ids_t *seeds,
                          bool *cases, bool *hit, const te_ids_t *exclude,
-                         const te_ids_t *runner_cases) {
+                         const te_ids_t *runner_cases, te_ids_t *excluded_hits) {
     int files = cbm_ti_source_file_count(c->source);
     size_t nlen = strlen(needle);
     for (int f = 0; f < files; f++) {
         const char *path = cbm_ti_source_path(c->source, f);
-        if (!te_test_file(c, path)) {
+        bool test_file = te_test_file(c, path);
+        if (!test_file && !(excluded_hits && te_runner_file(c, path))) {
             continue;
         }
         int lines = cbm_ti_source_line_count(c->source, f);
@@ -232,6 +257,12 @@ static bool te_scan_text(te_ctx_t *c, const char *needle, bool ident, int depth,
             size_t len = 0;
             const char *text = cbm_ti_source_line(c->source, f, line, &len);
             if (!text || !te_line_names(text, len, needle, nlen, ident)) {
+                continue;
+            }
+            if (!test_file) {
+                if (!te_record_starter(c, path, line, exclude, excluded_hits)) {
+                    return false;
+                }
                 continue;
             }
             char name[256];
@@ -248,10 +279,13 @@ static bool te_scan_text(te_ctx_t *c, const char *needle, bool ident, int depth,
             }
             if (define > 0) {
                 if (!te_scan_text(c, name, true, depth + 1, seeds, cases, hit, exclude,
-                                  runner_cases)) {
+                                  runner_cases, excluded_hits)) {
                     return false;
                 }
                 continue;
+            }
+            if (!te_record_starter(c, path, line, exclude, excluded_hits)) {
+                return false;
             }
             bool ok = true;
             const cbm_ti_node_t *d = cbm_ti_graph_enclosing(c->graph, path, line, &ok);
@@ -279,14 +313,16 @@ static bool te_scan_text(te_ctx_t *c, const char *needle, bool ident, int depth,
 
 static bool te_scan_literal(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
                             bool *hit) {
-    return te_scan_text(c, needle, false, 0, seeds, cases, hit, NULL, NULL);
+    return te_scan_text(c, needle, false, 0, seeds, cases, hit, NULL, NULL, NULL);
 }
 
 /* The scan for a role's literal: `exclude` holds the handlers and main,
- * `sinks` the walk's sinks (every test case among them). */
+ * `sinks` the walk's sinks (every test case among them); `starters` receives
+ * the excluded definitions that name the literal. */
 static bool te_scan_literal_ex(te_ctx_t *c, const char *needle, te_ids_t *seeds, bool *cases,
-                               bool *hit, const te_ids_t *exclude, const te_ids_t *sinks) {
-    return te_scan_text(c, needle, false, 0, seeds, cases, hit, exclude, sinks);
+                               bool *hit, const te_ids_t *exclude, const te_ids_t *sinks,
+                               te_ids_t *starters) {
+    return te_scan_text(c, needle, false, 0, seeds, cases, hit, exclude, sinks, starters);
 }
 
 /* One fixture path: the path itself, then each parent down to the rule's
@@ -370,7 +406,10 @@ typedef struct {
     int64_t id;          /* the handler's function node; one handler may have several */
     bool reached;
     bool scanned;
-    bool named; /* some test or helper names the literal */
+    bool named;        /* some test or helper names the literal */
+    bool covered;      /* named, or started by a role whose spawners are known */
+    int started_by;    /* the role whose child starts this one, when that reached it; -1 */
+    te_ids_t starters; /* other roles' handlers that name the literal: they start it */
 } te_role_t;
 
 typedef struct {
@@ -507,7 +546,7 @@ static bool te_runner_roles(te_ctx_t *c, const char *file, te_sinks_t *s) {
         if (!owned) {
             return te_oom(c);
         }
-        s->roles[s->role_count++] = (te_role_t){.literal = owned, .id = id};
+        s->roles[s->role_count++] = (te_role_t){.literal = owned, .id = id, .started_by = -1};
         if (!te_ids_push(c, &s->sinks, id)) {
             return false;
         }
@@ -604,10 +643,32 @@ static bool te_walk(te_ctx_t *c, const te_sinks_t *sinks, const int64_t *extra, 
 /* ── Parse gaps (user decision 2026-10-04: handled per file) ────────
  * A partial parse leaves a few lines (index_coverage `parse_partial`, detail
  * "a-b,c-d") the graph has no edges from. A gap can only hide references
- * written in its own lines, so when a gap's text names a definition the walk
- * reached, the definition around the gap is reached too (its whole file when
- * the gap lies outside every definition) and the walk goes on, to a
- * fixpoint. Only C-family sources are read; tests are C. More, never fewer. */
+ * written in its own lines, so when a gap's text names a reached function,
+ * variable or macro, the definition around the gap is reached too, and the
+ * walk goes on, to a fixpoint. A gap outside every definition reaches the
+ * definitions that start on its lines, never its whole file. Only C-family
+ * sources are read; tests are C. More, never fewer.
+ *
+ * User decision R155 (2026-11-11): matching every reached name (fields,
+ * types, two-letter names) and seeding whole files fired hundreds of gaps
+ * per change in this repository. A file-scope `__attribute__((used))` line
+ * in compat_thread.c fired on any reached field named `used`, its whole file
+ * included cbm_mutex_init, which the memory core calls, and so every change
+ * reached the test runner's main. */
+
+/* A hidden call or read names a function, a variable (an enum constant
+ * included) or a macro, by a name of at least this many characters. */
+#define TE_GAP_NAME_MIN 3
+
+static bool te_gap_name_kind(const char *label) {
+    static const char *const kinds[] = {"Function", "Method", "Variable", "Macro"};
+    for (size_t i = 0; label && i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (strcmp(label, kinds[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 typedef struct {
     const char *file;
@@ -674,7 +735,8 @@ static bool te_load_gaps(te_ctx_t *c, te_gaps_t *gaps) {
     return ok;
 }
 
-/* The short names of everything the walk reached (last QN segment). */
+/* The short names (last QN segment) of the reached functions, variables and
+ * macros a gap's text can name. */
 static bool te_reached_names(te_ctx_t *c, cbm_impact_walk_t *walk, CBMHashTable *names) {
     const cbm_impact_hit_t *hits = cbm_impact_walk_hits(walk);
     int n = cbm_impact_walk_count(walk);
@@ -682,7 +744,8 @@ static bool te_reached_names(te_ctx_t *c, cbm_impact_walk_t *walk, CBMHashTable 
         const char *qn = hits[i].qualified_name;
         const char *dot = qn ? strrchr(qn, '.') : NULL;
         const char *name = dot ? dot + 1 : qn;
-        if (!name || !*name || cbm_ht_get(names, name)) {
+        if (!name || strlen(name) < TE_GAP_NAME_MIN || !te_gap_name_kind(hits[i].label) ||
+            cbm_ht_get(names, name)) {
             continue;
         }
         const char *owned = cbm_arena_strdup(&c->arena, name);
@@ -726,7 +789,8 @@ static bool te_gap_names_reached(te_ctx_t *c, const te_gap_t *g, CBMHashTable *n
     return false;
 }
 
-/* Seeds for a gap that fired: the definition around it, else its file. */
+/* Seeds for a gap that fired: the definition around it, else the definitions
+ * that start on its lines (none: nothing more is reached). */
 static bool te_gap_seeds(te_ctx_t *c, const te_gap_t *g, te_ids_t *out) {
     bool ok = true;
     const cbm_ti_node_t *d = cbm_ti_graph_enclosing(c->graph, g->file, g->start, &ok);
@@ -736,7 +800,8 @@ static bool te_gap_seeds(te_ctx_t *c, const te_gap_t *g, te_ids_t *out) {
     int n = 0;
     const cbm_ti_node_t *nodes = ok ? cbm_ti_graph_file(c->graph, g->file, &n, &ok) : NULL;
     for (int i = 0; ok && i < n; i++) {
-        ok = nodes[i].variant_span || te_ids_push(c, out, nodes[i].id);
+        bool on_gap = nodes[i].start_line >= g->start && nodes[i].start_line <= g->end;
+        ok = nodes[i].variant_span || !on_gap || te_ids_push(c, out, nodes[i].id);
     }
     return ok || te_fallback(c, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE, "graph read failed");
 }
@@ -1058,22 +1123,73 @@ static bool te_role_mark(te_ctx_t *c, cbm_impact_walk_t *walk, te_sinks_t *s, bo
     return true;
 }
 
-/* A reached handler none of whose literals any test names: its spawners are
- * unknown, so everything runs. One named literal names the handler's spawners
- * (the index worker: "--index-worker" or the CBM_INDEX_SUPERVISOR switch). */
-static bool te_roles_named(te_ctx_t *c, const te_sinks_t *s) {
+static void te_call_chain(const cbm_impact_walk_t *walk, int64_t id, const char *prefix, char *out,
+                          size_t cap);
+
+/* Whether role `k` starts role `i`: k's handler (not i's own) names i's literal. */
+static bool te_role_starts(const te_sinks_t *s, int k, int i) {
+    return s->roles[k].id != s->roles[i].id && te_ids_has(&s->roles[i].starters, s->roles[k].id);
+}
+
+/* A reached role starts in the child of every role whose handler names its
+ * literal (the runner's __cbm_rss_tree_root starts __cbm_rss_tree_hold): those
+ * roles' spawners start it too, so they are reached with it. */
+static void te_role_reach_starters(te_sinks_t *s, int i, bool *grew) {
+    for (int k = 0; k < s->role_count; k++) {
+        if (!s->roles[k].reached && te_role_starts(s, k, i)) {
+            s->roles[k].reached = *grew = true;
+            s->roles[k].started_by = i;
+        }
+    }
+}
+
+/* A reached handler none of whose literals any test names, and that no role
+ * with known spawners starts: its spawners are unknown, so everything runs.
+ * One named literal names the handler's spawners (the index worker:
+ * "--index-worker" or the CBM_INDEX_SUPERVISOR switch); a role started only by
+ * another role has that role's spawners. The note names the role and the
+ * call chain from its handler to the changed code. */
+static bool te_roles_named(te_ctx_t *c, const cbm_impact_walk_t *walk, te_sinks_t *s) {
+    for (int i = 0; i < s->role_count; i++) {
+        s->roles[i].covered = false;
+        for (int k = 0; !s->roles[i].covered && k < s->role_count; k++) {
+            s->roles[i].covered = s->roles[k].id == s->roles[i].id && s->roles[k].named;
+        }
+    }
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (int i = 0; i < s->role_count; i++) {
+            for (int k = 0; !s->roles[i].covered && k < s->role_count; k++) {
+                if (s->roles[k].covered && te_role_starts(s, k, i)) {
+                    s->roles[i].covered = grew = true;
+                }
+            }
+        }
+    }
     for (int i = 0; i < s->role_count; i++) {
         const te_role_t *r = &s->roles[i];
-        bool named = !r->reached;
-        for (int k = 0; !named && k < s->role_count; k++) {
-            named = s->roles[k].id == r->id && s->roles[k].named;
+        if (!r->reached || r->covered) {
+            continue;
         }
-        if (!named) {
-            char note[320];
+        /* The chain starts at the first handler the walk itself reached. */
+        int from = i;
+        for (int hops = 0; s->roles[from].started_by >= 0 && hops < s->role_count; hops++) {
+            from = s->roles[from].started_by;
+        }
+        char note[700];
+        int used =
             snprintf(note, sizeof(note),
                      "the change reaches the test-runner role %s, which no test names", r->literal);
-            return te_fallback(c, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED, note);
+        if (used > 0 && from != i && (size_t)used < sizeof(note)) {
+            int n = snprintf(note + used, sizeof(note) - (size_t)used, " (it starts %s)",
+                             s->roles[from].literal);
+            used = n > 0 ? used + n : used;
         }
+        if (used > 0 && (size_t)used + 2 < sizeof(note) &&
+            cbm_impact_walk_hit(walk, s->roles[from].id)) {
+            te_call_chain(walk, s->roles[from].id, ": ", note + used, sizeof(note) - (size_t)used);
+        }
+        return te_fallback(c, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED, note);
     }
     return true;
 }
@@ -1097,7 +1213,11 @@ static bool te_role_lift(te_ctx_t *c, cbm_impact_walk_t *walk, te_sinks_t *s, bo
             }
             r->scanned = true;
             te_ids_t seeds = {0};
-            ok = te_scan_literal_ex(c, r->literal, &seeds, cases, &r->named, &handlers, &s->sinks);
+            ok = te_scan_literal_ex(c, r->literal, &seeds, cases, &r->named, &handlers, &s->sinks,
+                                    &r->starters);
+            if (ok) {
+                te_role_reach_starters(s, i, &grew);
+            }
             if (ok && seeds.count) {
                 ok = cbm_impact_walk_run(walk, seeds.items, seeds.count) == CBM_STORE_OK ||
                      (te_fallback(c, CBM_TEST_RESULT_FALLBACK_ENGINE_SATURATED,
@@ -1109,7 +1229,7 @@ static bool te_role_lift(te_ctx_t *c, cbm_impact_walk_t *walk, te_sinks_t *s, bo
         }
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, handlers.items);
-    return ok && te_roles_named(c, s);
+    return ok && te_roles_named(c, walk, s);
 }
 
 /* The last two segments of a qualified name (`test_main.main`), or all of it. */
@@ -1256,6 +1376,9 @@ bool te_reach(te_ctx_t *c) {
     cbm_free(CBM_MEM_CLASS_EXTRACT, extra);
     cbm_free(CBM_MEM_CLASS_EXTRACT, sinks.sinks.items);
     cbm_free(CBM_MEM_CLASS_EXTRACT, sinks.runner_main.items);
+    for (int i = 0; i < sinks.role_count; i++) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, sinks.roles[i].starters.items);
+    }
     cbm_free(CBM_MEM_CLASS_EXTRACT, sinks.roles);
     return ok;
 }

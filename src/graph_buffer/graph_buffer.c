@@ -1234,6 +1234,56 @@ static int gb_qn_claim_rank(const char *label) {
     return (label && strcmp(label, "Macro") == 0) ? 0 : 1;
 }
 
+/* A Swift declaration and its same-file extensions share one QN. Keep the
+ * declaration's metadata even when a later extension wins the source span. */
+static char *gb_swift_type_props(const char *preferred, const char *other) {
+    if (!preferred || !other || !strstr(preferred, "\"swift_") || !strstr(other, "\"swift_")) {
+        return NULL;
+    }
+    yyjson_doc *first = yyjson_read_opts((char *)preferred, strlen(preferred),
+                                         YYJSON_READ_NUMBER_AS_RAW, &gb_yy_alc, NULL);
+    yyjson_doc *second =
+        yyjson_read_opts((char *)other, strlen(other), YYJSON_READ_NUMBER_AS_RAW, &gb_yy_alc, NULL);
+    yyjson_val *left = yyjson_doc_get_root(first);
+    yyjson_val *right = yyjson_doc_get_root(second);
+    yyjson_val *declaration = yyjson_is_str(yyjson_obj_get(left, "swift_type_path")) ? left : right;
+    const char *target = yyjson_get_str(yyjson_obj_get(left, "swift_extension"));
+    if (!target) {
+        target = yyjson_get_str(yyjson_obj_get(right, "swift_extension"));
+    }
+    const char *path = yyjson_get_str(yyjson_obj_get(declaration, "swift_type_path"));
+    char *merged = NULL;
+    if (path && target && strcmp(path, target) == 0) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(&gb_yy_alc);
+        if (doc) {
+            yyjson_mut_val *root = yyjson_val_mut_copy(doc, declaration);
+            if (root) {
+                yyjson_mut_obj_remove_key(root, "swift_extension");
+                if (yyjson_mut_obj_add_strcpy(doc, root, "swift_extension", target)) {
+                    yyjson_mut_doc_set_root(doc, root);
+                    merged = yyjson_mut_write_opts(doc, 0, &gb_yy_alc, NULL, NULL);
+                }
+            }
+            yyjson_mut_doc_free(doc);
+        }
+    }
+    yyjson_doc_free(second);
+    yyjson_doc_free(first);
+    return merged;
+}
+
+static const char *gb_swift_merge_node_props(cbm_gbuf_node_t *existing, const char *arrival,
+                                             bool arrival_wins) {
+    char *merged = arrival_wins ? gb_swift_type_props(arrival, existing->properties_json)
+                                : gb_swift_type_props(existing->properties_json, arrival);
+    if (!merged) {
+        return arrival;
+    }
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
+    existing->properties_json = merged;
+    return merged;
+}
+
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json) {
@@ -1295,6 +1345,7 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
         }
         gb_def_t arrival = {label, properties_json, file_path, start_line, end_line};
         gb_note_collision(gb, existing, &arrival, NULL);
+        properties_json = gb_swift_merge_node_props(existing, properties_json, c <= 0);
         if (c > 0) {
             return existing->id; /* existing entity is the canonical winner */
         }
@@ -1854,8 +1905,14 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->type = (char *)gb_intern(gb, type);
     edge->properties_json = (char *)gb_intern(gb, properties_json);
 
-    /* Store pointer in array */
+    /* Publication reads this primary array. Do not register a missing edge
+     * in secondary indexes or report success when array growth fails. */
+    int before = gb->edges.count;
     cbm_da_push(&gb->edges, edge);
+    if (gb->edges.count != before + 1) {
+        cbm_free(CBM_MEM_CLASS_GBUF_EDGE, edge);
+        return 0;
+    }
 
     /* Dedup index */
     (void)edge_key_map_set(&gb->edge_by_key, h0, h1, edge);
@@ -2077,6 +2134,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         gb_def_t src_def = {sn->label, sn->properties_json, sn->file_path, sn->start_line,
                             sn->end_line};
         gb_note_collision(dst, existing, &src_def, sn_spans);
+        const char *properties = gb_swift_merge_node_props(existing, sn->properties_json, sn_wins);
         if (sn_wins) {
             /* src's properties; the variant spans both carry are written on
              * export (cbm_gbuf_settle_variants). */
@@ -2105,8 +2163,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             existing->start_line = sn->start_line;
             existing->end_line = sn->end_line;
             if (sn->properties_json) {
-                cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
+                (void)cbm_gbuf_node_set_properties_json(existing, properties);
             }
             if (label_changed) {
                 node_ptr_array_t *by_label = get_or_create_node_array(

@@ -397,8 +397,36 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* A client interface method's declared request (Retrofit): an HTTP_CALLS edge
+ * to the Route, with the url_path/method properties a call site's edge carries,
+ * so the endpoint is matched to its server like any other outbound call. */
+static void emit_client_route_call(cbm_gbuf_t *gb, int64_t func_id, const char *path,
+                                   const char *method) {
+    const char *rm = method ? method : "ANY";
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    char cpath[CBM_SZ_256];
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm,
+             cbm_route_canon_path(path, cpath, sizeof(cpath)));
+    char esc_m[CBM_SZ_128];
+    cbm_json_escape(esc_m, sizeof(esc_m), rm);
+    char rprops[CBM_SZ_256];
+    (void)snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\"}", esc_m);
+    int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", path, route_qn, "", 0, 0, rprops);
+    char esc_p[CBM_SZ_512];
+    cbm_json_escape(esc_p, sizeof(esc_p), path);
+    char eprops[CBM_SZ_1K];
+    (void)snprintf(eprops, sizeof(eprops),
+                   "{\"callee\":\"%s\",\"url_path\":\"%s\",\"method\":\"%s\"}", esc_m, esc_p,
+                   esc_m);
+    cbm_gbuf_insert_edge(gb, func_id, route_id, "HTTP_CALLS", eprops);
+}
+
 void cbm_pipeline_emit_def_route(cbm_gbuf_t *gb, int64_t func_id, const CBMDefinition *def,
                                  const char *rel) {
+    if (def->client_route_path && def->client_route_path[0]) {
+        emit_client_route_call(gb, func_id, def->client_route_path, def->route_method);
+        return;
+    }
     if (!def->route_path || def->route_path[0] == '\0') {
         return;
     }

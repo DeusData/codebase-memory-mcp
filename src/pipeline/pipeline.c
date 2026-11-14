@@ -51,6 +51,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #define YYJSON_HAS_STDBOOL_H 1
 #endif
 #include "yyjson/yyjson.h"
+#include "foundation/json_writer.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1366,7 +1367,7 @@ void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_pat
     }
     ok = ok && unresolved_build_carriers(&capture) && unresolved_collect_sites(&capture);
     if (ok && yyjson_mut_arr_size(capture.sites) > 0) {
-        char *detail = yyjson_mut_write_opts(capture.doc, 0, &allocator, NULL, NULL);
+        char *detail = cbm_json_write_text(capture.doc, &allocator, NULL);
         char *path = cbm_mem_strdup(CBM_MEM_CLASS_RESOLVE, rel_path);
         /* The estimate reserves overhead and escaping. Enforce the serialized
          * limit as well, before any detail is transferred to persistence. */
@@ -2592,7 +2593,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                              census_len(def->label) + census_len(def->file_path) +
                              census_len(def->parent_class);
             str_def_sig += census_len(def->signature) + census_len(def->return_type) +
-                           census_len(def->receiver);
+                           census_len(def->receiver) + census_len(def->call_selector);
             str_def_doc += census_len(def->docstring);
             str_def_tokens += census_len(def->body_tokens);
             str_def_profile += census_len(def->structural_profile);
@@ -2604,9 +2605,10 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             }
             str_def_fp += def->fingerprint ? (size_t)def->fingerprint_k * sizeof(uint32_t) : 0;
             str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
-                            census_len(def->impl_trait) + census_len(def->http_base_url) +
-                            census_list(def->extra_props) + census_len(def->decl_namespace) +
-                            census_len(def->variant_key) + census_len(def->alias_target);
+                            census_len(def->client_route_path) + census_len(def->impl_trait) +
+                            census_len(def->http_base_url) + census_list(def->extra_props) +
+                            census_len(def->decl_namespace) + census_len(def->variant_key) +
+                            census_len(def->alias_target);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];
