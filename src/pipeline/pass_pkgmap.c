@@ -120,6 +120,8 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
     e->items[e->count].manifest_rel = NULL;
+    e->items[e->count].source_rel = NULL;
+    e->items[e->count].source_seq = 0;
     e->count++;
 }
 
@@ -128,6 +130,7 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
         free(e->items[i].pkg_name);
         free(e->items[i].entry_rel);
         cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].source_rel);
     }
     free(e->items);
     e->items = NULL;
@@ -1014,8 +1017,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
-bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
-                          int source_len, cbm_pkg_entries_t *entries) {
+static bool pkgmap_parse_by_basename(const char *basename, const char *rel_path, const char *source,
+                                     int source_len, cbm_pkg_entries_t *entries) {
     if (!basename || !source || source_len <= 0) {
         return false;
     }
@@ -1067,6 +1070,22 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     return false;
 }
 
+/* Parse one manifest and stamp what it yielded with where it came from. The
+ * merge orders manifests by that, and keeps one manifest's entries in the order
+ * its parser pushed them (a pyproject.toml pushes src/<name> before <name>). */
+bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
+                          int source_len, cbm_pkg_entries_t *entries) {
+    int before = entries ? entries->count : 0;
+    if (!pkgmap_parse_by_basename(basename, rel_path, source, source_len, entries)) {
+        return false;
+    }
+    for (int i = before; rel_path && i < entries->count; i++) {
+        entries->items[i].source_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        entries->items[i].source_seq = i - before;
+    }
+    return true;
+}
+
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
 /* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
@@ -1089,11 +1108,14 @@ static int pkgmap_entry_depth(const char *entry_rel) {
     return depth;
 }
 
-/* Merge order: by package name, then the entry nearest the repository root,
- * then by path. Two manifests can declare one package name (a repository's
+/* Merge order: by package name, then the manifest nearest the repository root,
+ * then by manifest path, then the order in which that manifest's parser pushed
+ * its entries. Two manifests can declare one package name (a repository's
  * go.mod and a test fixture's copy of it), and which worker parsed which is
- * thread scheduling. Ordering the candidates here makes the winner a property
- * of the repository, not of the run. */
+ * thread scheduling. Ordering the manifests here makes the winner a property of
+ * the repository, not of the run. One manifest's own entries keep their order:
+ * its parser puts the preferred candidate first. An entry no manifest stamped
+ * is ordered by its own path. */
 static int pkgmap_candidate_cmp(const void *lhs, const void *rhs) {
     const cbm_pkg_entry_t *a = *(const cbm_pkg_entry_t *const *)lhs;
     const cbm_pkg_entry_t *b = *(const cbm_pkg_entry_t *const *)rhs;
@@ -1101,10 +1123,19 @@ static int pkgmap_candidate_cmp(const void *lhs, const void *rhs) {
     if (by_name != 0) {
         return by_name;
     }
-    int depth_a = pkgmap_entry_depth(a->entry_rel);
-    int depth_b = pkgmap_entry_depth(b->entry_rel);
+    const char *from_a = a->source_rel ? a->source_rel : a->entry_rel;
+    const char *from_b = b->source_rel ? b->source_rel : b->entry_rel;
+    int depth_a = pkgmap_entry_depth(from_a);
+    int depth_b = pkgmap_entry_depth(from_b);
     if (depth_a != depth_b) {
         return depth_a < depth_b ? -SKIP_ONE : SKIP_ONE;
+    }
+    int by_source = strcmp(from_a, from_b);
+    if (by_source != 0) {
+        return by_source;
+    }
+    if (a->source_seq != b->source_seq) {
+        return a->source_seq < b->source_seq ? -SKIP_ONE : SKIP_ONE;
     }
     return strcmp(a->entry_rel, b->entry_rel);
 }
