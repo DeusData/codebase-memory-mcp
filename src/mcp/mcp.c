@@ -77,6 +77,7 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
 #include "foundation/hash_table.h"
+#include "foundation/dyn_array.h"
 #include "foundation/json_writer.h"
 #include "foundation/arena.h"
 #include "foundation/diagnostics.h"
@@ -640,6 +641,9 @@ static const tool_def_t TOOLS[] = {
      "topology: infra objects, routes, controllers (from a Resource/Route); deploy: what CI "
      "jobs and scripts run and deploy; run: what a Service runs (image, Dockerfile, program, "
      "env).\"},"
+     "\"include_overrides\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"For outbound calls, list OVERRIDE implementations separately as possible "
+     "callees. Declared CALLS edges remain unchanged.\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"
      "\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
@@ -9887,6 +9891,284 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
     return CBM_STORE_OK;
 }
 
+/* include_overrides (#1271): the possible runtime callees of the outbound rows
+ * a page emits. A callee row is a contract when an implementation overrides
+ * it. The indexer links each override to its nearest declaring ancestor only
+ * (pass_semantic), so the walk follows inbound OVERRIDE edges transitively --
+ * one store query per node reached, with a visited set -- and lists C.m for a
+ * call to A.m when C : B : A. Only callables are contracts or implementations:
+ * an OVERRIDE edge between infra objects (tfvars values, kustomize overlays)
+ * is not a call. Nothing is written; the declared CALLS rows stay what they
+ * are. TRACE_OVERRIDE_WALK_CAP bounds the nodes one response may reach, and
+ * hitting it is reported, never silent. */
+enum { TRACE_OVERRIDE_WALK_CAP = MCP_BFS_LIMIT_MAX };
+
+typedef struct {
+    int contract;    /* index of the contract row in the outbound traversal */
+    cbm_node_t impl; /* owned strings, released by trace_possibles_free */
+} trace_possible_t;
+
+typedef CBM_DYN_ARRAY(int64_t) trace_id_array_t;
+
+typedef struct {
+    CBM_DYN_ARRAY(trace_possible_t) items;
+    bool truncated; /* TRACE_OVERRIDE_WALK_CAP stopped the walk */
+    bool failed;    /* a store lookup failed; the list may be incomplete */
+} trace_possibles_t;
+
+static bool trace_label_is_callable(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
+}
+
+static bool trace_id_seen(const trace_id_array_t *ids, int64_t id) {
+    for (int i = 0; i < ids->count; i++) {
+        if (ids->items[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *trace_node_qn(const cbm_node_t *n) {
+    return n->qualified_name ? n->qualified_name : (n->name ? n->name : "");
+}
+
+/* Contract row order (the page's own order), then implementation QN. */
+static int trace_possible_cmp(const void *pa, const void *pb) {
+    const trace_possible_t *a = pa;
+    const trace_possible_t *b = pb;
+    if (a->contract != b->contract) {
+        return a->contract < b->contract ? -1 : 1;
+    }
+    int c = strcmp(trace_node_qn(&a->impl), trace_node_qn(&b->impl));
+    if (c != 0) {
+        return c;
+    }
+    return (a->impl.id > b->impl.id) - (a->impl.id < b->impl.id);
+}
+
+static void trace_possibles_free(trace_possibles_t *p) {
+    for (int i = 0; i < p->items.count; i++) {
+        free_node_contents(&p->items.items[i].impl);
+    }
+    cbm_da_free(&p->items);
+}
+
+/* One reached node: recorded in `seen`; a callable is walked further and,
+ * unless it lives in a test file the trace hides, listed. */
+static void trace_possibles_visit(cbm_store_t *store, int contract, int64_t id, bool include_tests,
+                                  trace_id_array_t *seen, trace_id_array_t *frontier,
+                                  trace_possibles_t *out) {
+    cbm_da_push(seen, id);
+    cbm_node_t impl = {0};
+    if (cbm_store_find_node_by_id(store, id, &impl) != CBM_STORE_OK) {
+        free_node_contents(&impl);
+        out->failed = true;
+        return;
+    }
+    if (!trace_label_is_callable(impl.label)) {
+        free_node_contents(&impl);
+        return;
+    }
+    cbm_da_push(frontier, id);
+    if (include_tests || !is_test_file(impl.file_path)) {
+        trace_possible_t item = {.contract = contract, .impl = impl};
+        int before = out->items.count;
+        cbm_da_push(&out->items, item);
+        if (out->items.count == before) { /* allocation failed: not listed */
+            free_node_contents(&impl);
+            out->failed = true;
+        }
+    } else {
+        free_node_contents(&impl);
+    }
+}
+
+/* Whether a traced call can run an override of its declared target: it
+ * goes through an instance receiver (`self.m`, `obj.m`, `$this->m`). A bare
+ * call (a function, or a constructor that runs its own class), a `::` path, a
+ * type or constructed-object root (`Cls.m`, `Factory().m`, `new X().m`), and a
+ * super/base call (bound to the parent) run the declared target itself.
+ * Callee text the edge does not carry counts as dispatching: the list says
+ * "possible". */
+static bool trace_call_dispatches(const char *props_json) {
+    yyjson_doc *doc = props_json ? yyjson_read(props_json, strlen(props_json), 0) : NULL;
+    const char *callee =
+        doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "callee")) : NULL;
+    bool dispatches = true;
+    if (callee && callee[0]) {
+        const char *dot = NULL;
+        int depth = 0;
+        for (const char *c = callee; *c && !dot; c++) {
+            if (*c == '(' || *c == '[' || *c == '<') {
+                depth++;
+            } else if ((*c == ')' || *c == ']' || *c == '>') && depth > 0) {
+                depth--;
+            } else if (*c == '.' && depth == 0) {
+                dot = c;
+            }
+        }
+        const char *colons = strstr(callee, "::");
+        const char *root = callee;
+        while (*root == '$') {
+            root++;
+        }
+        size_t root_len = 0;
+        while (root[root_len] && root[root_len] != '.' && root[root_len] != '(' &&
+               root[root_len] != '[' && root[root_len] != '<') {
+            root_len++;
+        }
+        bool super_root = (root_len == strlen("super") && strncmp(root, "super", root_len) == 0) ||
+                          (root_len == strlen("base") && strncmp(root, "base", root_len) == 0);
+        dispatches = dot && !(colons && colons < dot) &&
+                     strncmp(root, "new ", strlen("new ")) != 0 && !super_root &&
+                     !(root[0] >= 'A' && root[0] <= 'Z');
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return dispatches;
+}
+
+static int trace_id_cmp(const void *pa, const void *pb) {
+    int64_t a = *(const int64_t *)pa;
+    int64_t b = *(const int64_t *)pb;
+    return (a > b) - (a < b);
+}
+
+static bool trace_ids_contain(const trace_id_array_t *sorted, int64_t id) {
+    return sorted->count > 0 && bsearch(&id, sorted->items, (size_t)sorted->count,
+                                        sizeof(sorted->items[0]), trace_id_cmp) != NULL;
+}
+
+/* A contract's implementations are listed only when some call that reaches it
+ * from the traced graph (`traced`: the roots and the outbound rows, sorted)
+ * dispatches. */
+static bool trace_contract_dispatched(cbm_store_t *store, int64_t contract_id,
+                                      const trace_id_array_t *traced, trace_possibles_t *out) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_target_type(store, contract_id, "CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        cbm_store_free_edges(edges, edge_count);
+        out->failed = true;
+        return false;
+    }
+    bool dispatched = false;
+    for (int i = 0; i < edge_count && !dispatched; i++) {
+        dispatched = trace_ids_contain(traced, edges[i].source_id) &&
+                     trace_call_dispatches(edges[i].properties_json);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    return dispatched;
+}
+
+/* Every implementation below one contract, through inbound OVERRIDE edges. */
+static void trace_possibles_walk(cbm_store_t *store, int contract, int64_t contract_id,
+                                 const trace_id_array_t *traced, bool include_tests,
+                                 int *walk_budget, trace_possibles_t *out) {
+    trace_id_array_t seen = {0};
+    trace_id_array_t frontier = {0};
+    cbm_da_push(&seen, contract_id);
+    cbm_da_push(&frontier, contract_id);
+    for (int head = 0; head < frontier.count && !out->truncated; head++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_target_type(store, frontier.items[head], "OVERRIDE", &edges,
+                                                &edge_count) != CBM_STORE_OK) {
+            cbm_store_free_edges(edges, edge_count);
+            out->failed = true;
+            break;
+        }
+        if (head == 0 && edge_count > 0 &&
+            !trace_contract_dispatched(store, contract_id, traced, out)) {
+            cbm_store_free_edges(edges, edge_count);
+            break;
+        }
+        for (int e = 0; e < edge_count; e++) {
+            if (trace_id_seen(&seen, edges[e].source_id)) {
+                continue;
+            }
+            if (*walk_budget <= 0) {
+                out->truncated = true;
+                break;
+            }
+            (*walk_budget)--;
+            trace_possibles_visit(store, contract, edges[e].source_id, include_tests, &seen,
+                                  &frontier, out);
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_da_free(&seen);
+    cbm_da_free(&frontier);
+}
+
+/* The possible callees of rows [start, start + len) of the outbound leg. */
+static void trace_possibles_for_page(cbm_store_t *store, const cbm_node_t *roots, int root_count,
+                                     const cbm_traverse_result_t *tr, int start, int len,
+                                     bool include_tests, trace_possibles_t *out) {
+    int walk_budget = TRACE_OVERRIDE_WALK_CAP;
+    trace_id_array_t traced = {0};
+    for (int i = 0; i < root_count; i++) {
+        cbm_da_push(&traced, roots[i].id);
+    }
+    for (int i = 0; i < tr->visited_count; i++) {
+        cbm_da_push(&traced, tr->visited[i].node.id);
+    }
+    if (traced.count > 1) {
+        qsort(traced.items, (size_t)traced.count, sizeof(traced.items[0]), trace_id_cmp);
+    }
+    for (int i = start; i < start + len && i < tr->visited_count && !out->truncated; i++) {
+        const cbm_node_t *contract = &tr->visited[i].node;
+        if (trace_label_is_callable(contract->label)) {
+            trace_possibles_walk(store, i, contract->id, &traced, include_tests, &walk_budget, out);
+        }
+    }
+    cbm_da_free(&traced);
+    if (out->items.count > 1) {
+        qsort(out->items.items, (size_t)out->items.count, sizeof(out->items.items[0]),
+              trace_possible_cmp);
+    }
+}
+
+/* JSON: [{contract, implementations: [qn, ...]}], one entry per contract. The
+ * strings are borrowed: the traversal and the list outlive serialization. */
+static yyjson_mut_val *trace_possibles_json(yyjson_mut_doc *doc, const cbm_traverse_result_t *tr,
+                                            const trace_possibles_t *p) {
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    yyjson_mut_val *implementations = NULL;
+    int current = CBM_NOT_FOUND;
+    for (int i = 0; i < p->items.count; i++) {
+        const trace_possible_t *item = &p->items.items[i];
+        if (item->contract != current) {
+            current = item->contract;
+            yyjson_mut_val *entry = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, entry, "contract",
+                                   trace_node_qn(&tr->visited[current].node));
+            implementations = yyjson_mut_arr(doc);
+            yyjson_mut_obj_add_val(doc, entry, "implementations", implementations);
+            yyjson_mut_arr_add_val(arr, entry);
+        }
+        yyjson_mut_arr_add_str(doc, implementations, trace_node_qn(&item->impl));
+    }
+    return arr;
+}
+
+/* Tree: one table row per (contract, implementation), like every section. */
+static void trace_possibles_tree(cbm_sb_t *sb, const cbm_traverse_result_t *tr,
+                                 const trace_possibles_t *p) {
+    static const char *const cols[] = {"contract", "implementation"};
+    cbm_tree_table_header(sb, "possible_callees", p->items.count, cols,
+                          (int)(sizeof(cols) / sizeof(cols[0])));
+    for (int i = 0; i < p->items.count; i++) {
+        const trace_possible_t *item = &p->items.items[i];
+        cbm_tree_row_begin(sb);
+        cbm_tree_cell_str(sb, trace_node_qn(&tr->visited[item->contract].node), true);
+        cbm_tree_cell_str(sb, trace_node_qn(&item->impl), false);
+        cbm_tree_row_end(sb);
+    }
+}
+
 /* ── Pagination cursors (stateless, exactly-once) ────────────────────
  * Token: "c1.<leg>.<generation>.<qhash>.<hop>.<id>" — version, trace leg
  * (o=callees, i=callers), the store generation (per-DB uid + mutation
@@ -9919,7 +10201,7 @@ typedef struct {
 static uint64_t trace_params_hash(const char *project, const char *func_name, const char *direction,
                                   const char *mode, const char *param_name, int depth,
                                   bool include_tests, bool risk_labels, bool include_evidence,
-                                  int limit, const char *args) {
+                                  bool include_overrides, int limit, const char *args) {
     uint64_t h = 0xcbf29ce484222325ULL;
     h = cursor_fnv1a64(project ? project : "", h);
     h = cursor_fnv1a64("|", h);
@@ -9938,6 +10220,12 @@ static uint64_t trace_params_hash(const char *project, const char *func_name, co
     snprintf(nums, sizeof(nums), "|%d|%d|%d|%d|%d", depth, include_tests ? 1 : 0,
              risk_labels ? 1 : 0, include_evidence ? 1 : 0, limit);
     h = cursor_fnv1a64(nums, h);
+    /* include_overrides adds an optional section and never changes the rows.
+     * It joins the identity only when set, so a cursor minted without it is
+     * the token minted before the flag existed. */
+    if (include_overrides) {
+        h = cursor_fnv1a64("|include_overrides", h);
+    }
 
     /* Explicit edge types define the traversed graph. Omitting them from the
      * cursor identity allowed a token minted for CALLS to resume an IMPORTS
@@ -10628,6 +10916,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         (size_t)max_output_tokens * (size_t)MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
+    bool include_overrides = cbm_mcp_get_bool_arg(args, "include_overrides");
     /* Off by default: two extra columns on every row is exactly the kind of
      * inflation the tree format exists to avoid. Opt in when you need to judge
      * whether an edge is trustworthy. */
@@ -10691,7 +10980,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (cursor_arg && cursor_arg[0]) {
         uint64_t qh = trace_params_hash(project, func_name, direction ? direction : "both", mode,
                                         param_name, depth, include_tests, risk_labels,
-                                        include_evidence, trace_limit, args);
+                                        include_evidence, include_overrides, trace_limit, args);
         const char *cerr = trace_cursor_decode(cursor_arg, generation, qh, &cur);
         if (cerr) {
             free(cursor_arg);
@@ -10940,6 +11229,16 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             break;
         }
     }
+    /* include_overrides: the possible callees of the outbound rows this page
+     * requests, computed once. They are optional output: under the byte
+     * ceiling they yield before every other field and every graph row. */
+    trace_possibles_t possibles = {0};
+    bool emit_possibles = include_overrides && do_outbound && trace_includes_calls;
+    bool possibles_omitted = false;
+    if (emit_possibles) {
+        trace_possibles_for_page(store, nodes, node_count, &tr_out, out_start, requested_out_len,
+                                 include_tests, &possibles);
+    }
     bool unresolved_out = false;
     bool unresolved_in = false;
     trace_coverage_scope_t coverage_scope = {.roots = nodes,
@@ -10975,7 +11274,7 @@ render_trace_output:;
         snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
         nc.qhash =
             trace_params_hash(project, func_name, direction, mode, param_name, depth, include_tests,
-                              risk_labels, include_evidence, trace_limit, args);
+                              risk_labels, include_evidence, include_overrides, trace_limit, args);
         /* The watermark is the last row ACTUALLY emitted, not the leg that
          * happens to have additional rows. At an exact outbound page boundary
          * inbound may be pending with zero emitted rows. */
@@ -11053,6 +11352,15 @@ render_trace_output:;
                                            render_evidence, &out_edge_ctx);
             }
         }
+        if (emit_possibles) {
+            trace_possibles_tree(&sb, &tr_out, &possibles);
+            if (possibles.truncated) {
+                cbm_tree_scalar_bool(&sb, "possible_callees_truncated", true);
+            }
+            if (possibles.failed) {
+                cbm_tree_scalar_bool(&sb, "possible_callees_incomplete", true);
+            }
+        }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
             cbm_tree_scalar_str(&sb, "callers_total_relation", in_relation);
@@ -11080,6 +11388,9 @@ render_trace_output:;
                 cbm_tree_scalar_bool(&sb, "optional_fields_omitted", true);
                 trace_emit_omitted_optional_fields_tree(&sb, risk_labels, data_flow,
                                                         include_evidence);
+            }
+            if (possibles_omitted) {
+                cbm_tree_scalar_bool(&sb, "possible_callees_omitted", true);
             }
             if (engine_saturated) {
                 cbm_tree_scalar_bool(&sb, "engine_saturated", true);
@@ -11129,6 +11440,16 @@ render_trace_output:;
                                  data_flow && emit_optional_fields,
                                  include_evidence && emit_optional_fields, &out_edge_ctx));
         }
+        if (emit_possibles) {
+            yyjson_mut_obj_add_val(doc, root, "possible_callees",
+                                   trace_possibles_json(doc, &tr_out, &possibles));
+            if (possibles.truncated) {
+                yyjson_mut_obj_add_bool(doc, root, "possible_callees_truncated", true);
+            }
+            if (possibles.failed) {
+                yyjson_mut_obj_add_bool(doc, root, "possible_callees_incomplete", true);
+            }
+        }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
             yyjson_mut_obj_add_str(doc, root, "callers_total_relation", in_relation);
@@ -11155,6 +11476,9 @@ render_trace_output:;
                 trace_emit_omitted_optional_fields_json(doc, root, risk_labels, data_flow,
                                                         include_evidence);
             }
+            if (possibles_omitted) {
+                yyjson_mut_obj_add_bool(doc, root, "possible_callees_omitted", true);
+            }
             if (engine_saturated) {
                 yyjson_mut_obj_add_bool(doc, root, "engine_saturated", true);
             }
@@ -11176,6 +11500,11 @@ render_trace_output:;
      * render, so `next` always follows the last row actually emitted. */
     if (json && strlen(json) > output_budget_bytes) {
         output_budget_hit = true;
+        if (emit_possibles && possibles.items.count > 0) {
+            emit_possibles = false;
+            possibles_omitted = true;
+            goto render_trace_output;
+        }
         if (emit_optional_fields) {
             emit_optional_fields = false;
             optional_fields_omitted = true;
@@ -11209,6 +11538,9 @@ render_trace_output:;
                     trace_emit_omitted_optional_fields_tree(&floor, risk_labels, data_flow,
                                                             include_evidence);
                 }
+                if (possibles_omitted) {
+                    cbm_tree_scalar_bool(&floor, "possible_callees_omitted", true);
+                }
                 cbm_tree_scalar_str(&floor, "hint",
                                     "raise max_output_tokens; no identifier was sliced");
                 json = cbm_sb_finish(&floor);
@@ -11239,6 +11571,9 @@ render_trace_output:;
                     yyjson_mut_obj_add_bool(floor_doc, floor, "optional_fields_omitted", true);
                     trace_emit_omitted_optional_fields_json(floor_doc, floor, risk_labels,
                                                             data_flow, include_evidence);
+                }
+                if (possibles_omitted) {
+                    yyjson_mut_obj_add_bool(floor_doc, floor, "possible_callees_omitted", true);
                 }
                 yyjson_mut_obj_add_str(floor_doc, floor, "hint",
                                        "raise max_output_tokens; no identifier was sliced");
@@ -11291,6 +11626,7 @@ trace_output_ready:
     free(direction);
     free(mode);
     free(param_name);
+    trace_possibles_free(&possibles);
     if (et_doc_keep) {
         yyjson_doc_free(et_doc_keep);
     }

@@ -35,6 +35,7 @@
  */
 
 #include "kotlin_lsp.h"
+#include "lsp_work.h"
 #include "../helpers.h"
 /* CBMHashTable — cross-registry field bucketing. Relative path: the LSP
  * amalgamation compiles with -Iinternal/cbm only, not -Isrc. */
@@ -63,6 +64,7 @@ typedef struct {
 
 #define KT_EVAL_MAX_DEPTH 32
 #define KT_IMPORT_INITIAL_CAP 16
+#define KT_INDEX_ARENA_BLOCK 4096
 
 #define KT_CONF_CONSTRUCTOR 0.95f
 #define KT_CONF_METHOD 0.90f
@@ -1011,6 +1013,17 @@ void kotlin_lsp_add_import(KotlinLSPContext *ctx, const char *local_name, const 
     ctx->import_count++;
 }
 
+/* The imports with this local name, in table order (lsp_name_rows.h): a scan per
+ * use made a file of thousands of imports quadratic. */
+static int kt_import_first(KotlinLSPContext *ctx, const char *name) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_locals, ctx->import_count,
+                               name);
+}
+
+static int kt_import_next(const KotlinLSPContext *ctx, const char *name, int row) {
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_locals, ctx->import_count, name, row);
+}
+
 const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
     if (!ctx || !name || !*name) {
         return NULL;
@@ -1041,7 +1054,7 @@ const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
     }
 
     /* Explicit imports */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = kt_import_first(ctx, name); i >= 0; i = kt_import_next(ctx, name, i)) {
         const char *local = ctx->import_locals[i];
         if (local && strcmp(local, name) == 0 &&
             (ctx->import_kinds[i] == CBM_KT_USE_TYPE ||
@@ -1103,7 +1116,7 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
      * symbol itself. Prove that the candidate is a registered top-level
      * function before accepting it; otherwise `import values.handler` where
      * handler is a property would fabricate a callable target. */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = kt_import_first(ctx, name); i >= 0; i = kt_import_next(ctx, name, i)) {
         const char *local = ctx->import_locals[i];
         if (local && strcmp(local, name) == 0 &&
             (ctx->import_kinds[i] == CBM_KT_USE_FUNCTION ||
@@ -5189,9 +5202,12 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
         }
     }
 
-    /* Build per-file registry. */
+    /* Build per-file registry. Indexed once the file's declarations are in, as the
+     * cross-file pass does: a scan finds the first registration, so the index
+     * answers with that one too. */
     CBMTypeRegistry registry;
     cbm_registry_init(&registry, arena);
+    registry.index_first_registered = true;
 
     /* Curated stdlib */
     cbm_kotlin_stdlib_register(&registry, arena);
@@ -5229,8 +5245,15 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
     kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, module_qn, module_qn,
                     project_name, /*rel_path=*/NULL, &result->resolved_calls);
     ctx.synthetic_calls = &result->calls;
+    /* The registry's lookups run while it fills and after: its types are found by
+     * name as they come (tail_arena), and all of it once it is indexed. */
+    CBMArena index_arena;
+    cbm_arena_init_lazy(&index_arena, KT_INDEX_ARENA_BLOCK);
+    ctx.overlay_index_arena = &index_arena;
+    registry.tail_arena = &index_arena;
 
     kotlin_lsp_process_file(&ctx, use_root);
+    cbm_arena_destroy(&index_arena);
 
     /* Inject kotlin.Any universal-method nodes (toString/equals/hashCode) so the
      * lsp_kt_any fallback emitted above has a target node to form a CALLS edge. */
@@ -5584,6 +5607,7 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     kotlin_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn ? module_qn : "",
                     module_qn ? module_qn : "", project_name, /*rel_path=*/NULL, out);
     ctx.overlay_index_arena = &idx_arena;
+    overlay.tail_arena = &idx_arena;
 
     /* Unique short type name -> registered QN, for receiver annotations that
      * name a type defined in another file without an import. Two types
