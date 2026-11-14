@@ -401,6 +401,140 @@ TEST(extract_cpp_real_in_body_error_still_flagged_issue1071) {
     PASS();
 }
 
+/* #1546: the grammars built on tree-sitter-c read a backslash line splice
+ * inside a string literal as `\` plus one character. With CRLF line endings
+ * that character was the CR, the LF then ended the literal, and every
+ * function after it was lost to one ERROR region. */
+static const CBMDefinition *splice_def(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* The reporter's file, byte for byte. */
+TEST(extract_cpp_crlf_string_splice_keeps_later_functions_issue1546) {
+    CBMFileResult *r = extract("void Head()\r\n"
+                               "{\r\n"
+                               "    int h = 0;\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "void Middle()\r\n"
+                               "{\r\n"
+                               "    const wchar_t* s = L\"line 0\\r\\n\\\r\n"
+                               "line 1\\r\\n\";\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "void TrailerOne()\r\n"
+                               "{\r\n"
+                               "    int a = 1;\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "void TrailerTwo()\r\n"
+                               "{\r\n"
+                               "    int b = 2;\r\n"
+                               "}\r\n",
+                               CBM_LANG_CPP, "t", "repro.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    const CBMDefinition *middle = splice_def(r, "Middle");
+    const CBMDefinition *one = splice_def(r, "TrailerOne");
+    const CBMDefinition *two = splice_def(r, "TrailerTwo");
+    ASSERT_NOT_NULL(middle);
+    ASSERT_NOT_NULL(one);
+    ASSERT_NOT_NULL(two);
+    ASSERT_EQ((int)middle->start_line, 6);
+    ASSERT_EQ((int)middle->end_line, 10);
+    ASSERT_EQ((int)one->start_line, 12);
+    ASSERT_EQ((int)two->start_line, 17);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Every grammar built on tree-sitter-c has the same escape rule. */
+TEST(extract_c_family_crlf_string_splice_parses_clean_issue1546) {
+    static const CBMLanguage langs[] = {CBM_LANG_C,    CBM_LANG_CPP,  CBM_LANG_CUDA,
+                                        CBM_LANG_OBJC, CBM_LANG_GLSL, CBM_LANG_HLSL,
+                                        CBM_LANG_ISPC, CBM_LANG_SLANG};
+    const char *src = "void Head()\r\n"
+                      "{\r\n"
+                      "    int h = 0;\r\n"
+                      "}\r\n"
+                      "\r\n"
+                      "void Middle()\r\n"
+                      "{\r\n"
+                      "    const char *s = \"line 0\\\r\n"
+                      "line 1\";\r\n"
+                      "}\r\n"
+                      "\r\n"
+                      "void TrailerOne()\r\n"
+                      "{\r\n"
+                      "    int a = 1;\r\n"
+                      "}\r\n";
+    for (size_t i = 0; i < sizeof(langs) / sizeof(langs[0]); i++) {
+        CBMFileResult *r = extract(src, langs[i], "t", "splice.c");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        const CBMDefinition *middle = splice_def(r, "Middle");
+        const CBMDefinition *tail = splice_def(r, "TrailerOne");
+        ASSERT_NOT_NULL(middle);
+        ASSERT_NOT_NULL(tail);
+        ASSERT_EQ((int)middle->end_line, 10);
+        ASSERT_EQ((int)tail->start_line, 12);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Splices in a macro and a line comment, which the grammar already read with
+ * CRLF, still do; the preprocessed second pass sees the rewritten bytes too. */
+TEST(extract_c_crlf_splices_in_macro_comment_and_string_issue1546) {
+    CBMFileResult *r = extract("#define LOG2(a, b) \\\r\n"
+                               "    do { log_it(a); \\\r\n"
+                               "         log_it(b); } while (0)\r\n"
+                               "\r\n"
+                               "// a comment that ends with a splice \\\r\n"
+                               "   and goes on here\r\n"
+                               "\r\n"
+                               "static const char *usage = \"usage: tool\\n\\\r\n"
+                               "  -h  help\\n\";\r\n"
+                               "\r\n"
+                               "int helper(int x)\r\n"
+                               "{\r\n"
+                               "    return x + 1;\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "int main(void)\r\n"
+                               "{\r\n"
+                               "    LOG2(\"a\", \"b\");\r\n"
+                               "    return helper(2);\r\n"
+                               "}\r\n",
+                               CBM_LANG_C, "t", "mix.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT(has_def(r, "Macro", "LOG2"));
+    const CBMDefinition *usage = splice_def(r, "usage");
+    const CBMDefinition *helper = splice_def(r, "helper");
+    ASSERT_NOT_NULL(usage);
+    ASSERT_NOT_NULL(helper);
+    ASSERT_EQ((int)usage->end_line, 9);
+    ASSERT_EQ((int)helper->start_line, 11);
+    ASSERT_EQ((int)helper->end_line, 14);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            ASSERT_NOT_NULL(c->enclosing_func_qn);
+            ASSERT_NOT_NULL(strstr(c->enclosing_func_qn, "main"));
+        }
+    }
+    ASSERT(has_call(r, "log_it"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1735: the #1071 check's cost. cbm_subtract_macro_invocation_regions asked
  * "is this region a macro call?" before "is it inside a function?", and the
  * first question walked the source from byte 0 for every region: regions x
@@ -15745,6 +15879,9 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
     RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
+    RUN_TEST(extract_cpp_crlf_string_splice_keeps_later_functions_issue1546);
+    RUN_TEST(extract_c_family_crlf_string_splice_parses_clean_issue1546);
+    RUN_TEST(extract_c_crlf_splices_in_macro_comment_and_string_issue1546);
     RUN_TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735);
     RUN_TEST(macro_check_locates_lines_with_one_table_issue1735);
     RUN_TEST(extract_gdscript_issue186);
