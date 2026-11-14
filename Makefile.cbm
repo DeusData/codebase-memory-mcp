@@ -428,7 +428,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c \
-    $(CBM_DIR)/spawn_patterns.c
+    $(CBM_DIR)/spawn_patterns.c \
+    $(CBM_DIR)/resolve_stats.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
