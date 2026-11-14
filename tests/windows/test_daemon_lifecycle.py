@@ -25,7 +25,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 
 
 def runtime_for(cache):
