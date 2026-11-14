@@ -3250,6 +3250,87 @@ static char *k8s_skeleton(const char *src, int len, int *out_len) {
     return out;
 }
 
+/* ── Dependency-manifest text encoding (#2941) ────────────────────── */
+
+enum { DEP_UTF8_BOM_LEN = 3, DEP_UTF16_UNIT = 2, DEP_UTF8_MAX_PER_UNIT = 3 };
+
+/* One UTF-16 code unit at `u`, little- or big-endian. */
+static uint32_t dep_utf16_unit(const unsigned char *u, bool le) {
+    return le ? (uint32_t)u[0] | ((uint32_t)u[1] << 8U) : ((uint32_t)u[0] << 8U) | (uint32_t)u[1];
+}
+
+/* Append code point `c` to `out` as UTF-8; returns the bytes written. */
+static size_t dep_put_utf8(char *out, uint32_t c) {
+    unsigned char *o = (unsigned char *)out;
+    if (c < 0x80U) {
+        o[0] = (unsigned char)c;
+        return 1;
+    }
+    if (c < 0x800U) {
+        o[0] = (unsigned char)(0xC0U | (c >> 6U));
+        o[1] = (unsigned char)(0x80U | (c & 0x3FU));
+        return 2;
+    }
+    if (c < 0x10000U) {
+        o[0] = (unsigned char)(0xE0U | (c >> 12U));
+        o[1] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
+        o[2] = (unsigned char)(0x80U | (c & 0x3FU));
+        return 3;
+    }
+    o[0] = (unsigned char)(0xF0U | (c >> 18U));
+    o[1] = (unsigned char)(0x80U | ((c >> 12U) & 0x3FU));
+    o[2] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
+    o[3] = (unsigned char)(0x80U | (c & 0x3FU));
+    return 4;
+}
+
+/* requirements.txt / go.mod as UTF-8 text. pip decodes a requirements file by
+ * its BOM, and Windows tools write BOMs: Windows PowerShell 5.1 saves
+ * `pip freeze > requirements.txt` as UTF-16 LE with a BOM, and many editors
+ * put a UTF-8 BOM in front. Read as raw bytes, UTF-16 stops at the NUL after
+ * the first letter, and a UTF-8 BOM sticks to the first package name.
+ * Drops a UTF-8 BOM in place, or returns a new UTF-8 buffer for UTF-16 (BOM
+ * dropped, `src` freed). Keeps the K8S_TS_PAD zero tail k8s_read_file adds. */
+static char *dep_manifest_utf8(char *src, int *len) {
+    const unsigned char *b = (const unsigned char *)src;
+    size_t n = (size_t)*len;
+    if (n >= DEP_UTF8_BOM_LEN && b[0] == 0xEFU && b[1] == 0xBBU && b[2] == 0xBFU) {
+        memmove(src, src + DEP_UTF8_BOM_LEN, n - DEP_UTF8_BOM_LEN + K8S_TS_PAD);
+        *len = (int)(n - DEP_UTF8_BOM_LEN);
+        return src;
+    }
+    bool le = n >= DEP_UTF16_UNIT && b[0] == 0xFFU && b[1] == 0xFEU;
+    bool be = n >= DEP_UTF16_UNIT && b[0] == 0xFEU && b[1] == 0xFFU;
+    if (!le && !be) {
+        return src;
+    }
+    size_t units = (n - DEP_UTF16_UNIT) / DEP_UTF16_UNIT;
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, (units * DEP_UTF8_MAX_PER_UNIT) + K8S_TS_PAD);
+    if (!out) {
+        return src;
+    }
+    const unsigned char *u = b + DEP_UTF16_UNIT;
+    size_t w = 0;
+    for (size_t i = 0; i < units; i++) {
+        uint32_t c = dep_utf16_unit(u + (i * DEP_UTF16_UNIT), le);
+        if (c >= 0xD800U && c <= 0xDBFFU && i + SKIP_ONE < units) {
+            uint32_t lo = dep_utf16_unit(u + ((i + SKIP_ONE) * DEP_UTF16_UNIT), le);
+            if (lo >= 0xDC00U && lo <= 0xDFFFU) {
+                c = 0x10000U + ((c - 0xD800U) << 10U) + (lo - 0xDC00U);
+                i++;
+            }
+        }
+        if (c >= 0xD800U && c <= 0xDFFFU) {
+            c = 0xFFFDU; /* unpaired surrogate */
+        }
+        w += dep_put_utf8(out + w, c);
+    }
+    memset(out + w, 0, K8S_TS_PAD);
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    *len = (int)w;
+    return out;
+}
+
 static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
     cbm_pipeline_ctx_t *ctx = job->ctx;
     const char *path = job->files[i].path;
@@ -3259,6 +3340,9 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
 
     if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
         out->source = k8s_read_file(path, &out->src_len);
+        if (out->source) {
+            out->source = dep_manifest_utf8(out->source, &out->src_len);
+        }
         out->kind = out->source ? K8S_DEP : K8S_SKIP;
     } else if (lang == CBM_LANG_KUSTOMIZE) {
         /* Its `namespace:` is the namespace of the objects it builds; its
