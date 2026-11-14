@@ -9018,6 +9018,418 @@ TEST(tool_trace_union_records_min_hop_across_seeds) {
     PASS();
 }
 
+/* include_overrides fixture (#1271): run_local calls two contracts.
+ * LocalProcessor.process is overridden by Alpha and Beta, and Alpha's by
+ * Gamma -- two levels, since an OVERRIDE edge points at the nearest declaring
+ * ancestor only. A test-file Mock overrides the contract too, and so does an
+ * infra Variable (a tfvars/kustomize-style OVERRIDE). Sink.write has one
+ * implementation. Other.process is never called, so its implementation never
+ * appears. */
+static int64_t ov_node(cbm_store_t *store, const char *project, const char *label, const char *name,
+                       const char *qn, const char *file) {
+    cbm_node_t n = {.project = project,
+                    .label = label,
+                    .name = name,
+                    .qualified_name = qn,
+                    .file_path = file,
+                    .start_line = 1,
+                    .end_line = 3};
+    return cbm_store_upsert_node(store, &n);
+}
+
+static bool ov_edge(cbm_store_t *store, const char *project, int64_t src, int64_t dst,
+                    const char *type) {
+    cbm_edge_t e = {.project = project, .source_id = src, .target_id = dst, .type = type};
+    return src > 0 && dst > 0 && cbm_store_insert_edge(store, &e) > 0;
+}
+
+static cbm_mcp_server_t *ov_fixture(void) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *p = "dispatch-fixture";
+    cbm_mcp_server_set_project(srv, p);
+    if (cbm_store_upsert_project(st, p, "/tmp/dispatch-fixture") != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    const char *src = "src/fixture.py";
+    int64_t caller = ov_node(st, p, "Function", "run_local", "dispatch_fixture.run_local", src);
+    int64_t contract =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalProcessor.process", src);
+    int64_t sink = ov_node(st, p, "Method", "write", "dispatch_fixture.Sink.write", src);
+    int64_t alpha =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalAlphaProcessor.process", src);
+    int64_t beta =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalBetaProcessor.process", src);
+    int64_t gamma =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.LocalGammaProcessor.process", src);
+    int64_t mock = ov_node(st, p, "Method", "process",
+                           "dispatch_fixture.tests.MockProcessor.process", "tests/test_fixture.py");
+    int64_t var =
+        ov_node(st, p, "Variable", "process", "dispatch_fixture.env.process", "env/prod.tfvars");
+    int64_t file_sink = ov_node(st, p, "Method", "write", "dispatch_fixture.FileSink.write", src);
+    int64_t other = ov_node(st, p, "Method", "process", "dispatch_fixture.Other.process", src);
+    int64_t other_impl =
+        ov_node(st, p, "Method", "process", "dispatch_fixture.OtherImpl.process", src);
+    bool ok =
+        ov_edge(st, p, caller, contract, "CALLS") && ov_edge(st, p, caller, sink, "CALLS") &&
+        ov_edge(st, p, alpha, contract, "OVERRIDE") && ov_edge(st, p, beta, contract, "OVERRIDE") &&
+        ov_edge(st, p, gamma, alpha, "OVERRIDE") && ov_edge(st, p, mock, contract, "OVERRIDE") &&
+        ov_edge(st, p, var, contract, "OVERRIDE") && ov_edge(st, p, file_sink, sink, "OVERRIDE") &&
+        ov_edge(st, p, other_impl, other, "OVERRIDE");
+    if (!ok) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+/* One trace_path call on the fixture's run_local; `extra` is appended to the
+ * arguments object. Returns the tool's text content. */
+static char *ov_trace(cbm_mcp_server_t *srv, const char *extra) {
+    char args[640];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"dispatch-fixture\",\"function_name\":\"run_local\","
+             "\"direction\":\"outbound\",\"depth\":1%s}",
+             extra);
+    char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+    char *inner = extract_text_content(response);
+    free(response);
+    return inner;
+}
+
+/* The implementations listed for one contract in a JSON possible_callees. */
+static yyjson_val *ov_implementations(yyjson_val *possible, const char *contract) {
+    size_t i;
+    size_t max;
+    yyjson_val *entry;
+    yyjson_arr_foreach(possible, i, max, entry) {
+        const char *name = yyjson_get_str(yyjson_obj_get(entry, "contract"));
+        if (name && strcmp(name, contract) == 0) {
+            return yyjson_obj_get(entry, "implementations");
+        }
+    }
+    return NULL;
+}
+
+static bool ov_lists(yyjson_val *implementations, const char *qn) {
+    size_t i;
+    size_t max;
+    yyjson_val *impl;
+    yyjson_arr_foreach(implementations, i, max, impl) {
+        if (yyjson_is_str(impl) && strcmp(yyjson_get_str(impl), qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* include_overrides lists possible runtime implementations apart from the
+ * declared CALLS targets, which stay what they are; nothing is written to the
+ * index, and without the flag the response is the one before it existed. */
+TEST(tool_trace_path_possible_callees_stay_apart_from_calls) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    char *inner = ov_trace(srv, ",\"include_overrides\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 2);
+    yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+    ASSERT_TRUE(yyjson_is_arr(possible));
+    ASSERT_EQ(yyjson_arr_size(possible), 2);
+    yyjson_val *processors =
+        ov_implementations(possible, "dispatch_fixture.LocalProcessor.process");
+    ASSERT_NOT_NULL(processors);
+    ASSERT_TRUE(ov_lists(processors, "dispatch_fixture.LocalAlphaProcessor.process"));
+    ASSERT_TRUE(ov_lists(processors, "dispatch_fixture.LocalBetaProcessor.process"));
+    yyjson_val *sinks = ov_implementations(possible, "dispatch_fixture.Sink.write");
+    ASSERT_NOT_NULL(sinks);
+    ASSERT_EQ(yyjson_arr_size(sinks), 1);
+    ASSERT_TRUE(ov_lists(sinks, "dispatch_fixture.FileSink.write"));
+    ASSERT_NULL(strstr(inner, "dispatch_fixture.OtherImpl.process"));
+    ASSERT_EQ(cbm_store_count_edges_by_type(st, "dispatch-fixture", "CALLS"), 2);
+    ASSERT_EQ(cbm_store_count_edges_by_type(st, "dispatch-fixture", "OVERRIDE"), 7);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    char *by_default = ov_trace(srv, ",\"format\":\"json\"");
+    char *off = ov_trace(srv, ",\"include_overrides\":false,\"format\":\"json\"");
+    ASSERT_NOT_NULL(by_default);
+    ASSERT_NOT_NULL(off);
+    ASSERT_NULL(strstr(by_default, "possible_callees"));
+    ASSERT_STR_EQ(by_default, off);
+    free(by_default);
+    free(off);
+    char *tree_default = ov_trace(srv, "");
+    ASSERT_NOT_NULL(tree_default);
+    ASSERT_NULL(strstr(tree_default, "possible_callees"));
+    free(tree_default);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An OVERRIDE edge names the nearest declaring ancestor only, so the walk is
+ * transitive: Gamma overrides Alpha, which overrides the contract, and Gamma
+ * is a possible callee of the contract too. */
+TEST(tool_trace_path_possible_callees_follow_the_hierarchy) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    char *inner = ov_trace(srv, ",\"include_overrides\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *possible = yyjson_obj_get(yyjson_doc_get_root(doc), "possible_callees");
+    yyjson_val *processors =
+        ov_implementations(possible, "dispatch_fixture.LocalProcessor.process");
+    ASSERT_NOT_NULL(processors);
+    ASSERT_TRUE(ov_lists(processors, "dispatch_fixture.LocalGammaProcessor.process"));
+    ASSERT_EQ(yyjson_arr_size(processors), 3);
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Test-file implementations follow include_tests like every trace row; an
+ * OVERRIDE edge from something that is not callable (a tfvars variable) is
+ * never a possible callee. */
+TEST(tool_trace_path_possible_callees_filter_tests_and_non_callables) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    const char *mock = "dispatch_fixture.tests.MockProcessor.process";
+    const char *var = "dispatch_fixture.env.process";
+    char *inner = ov_trace(srv, ",\"include_overrides\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, mock));
+    ASSERT_NULL(strstr(inner, var));
+    free(inner);
+    inner = ov_trace(srv, ",\"include_overrides\":true,\"include_tests\":true,\"format\":\"json\"");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *possible = yyjson_obj_get(yyjson_doc_get_root(doc), "possible_callees");
+    yyjson_val *processors =
+        ov_implementations(possible, "dispatch_fixture.LocalProcessor.process");
+    ASSERT_NOT_NULL(processors);
+    ASSERT_TRUE(ov_lists(processors, mock));
+    ASSERT_FALSE(ov_lists(processors, var));
+    ASSERT_EQ(yyjson_arr_size(processors), 4);
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The tree format lists possible callees as a tree table, one row per
+ * (contract, implementation), like every other section. */
+TEST(tool_trace_path_possible_callees_render_as_tree_table) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    char *tree = ov_trace(srv, ",\"include_overrides\":true");
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "possible_callees: 4  (cols: contract implementation)\n"));
+    ASSERT_NULL(strstr(tree, "possible_callees: ["));
+    ASSERT_NOT_NULL(strstr(tree, "dispatch_fixture.LocalGammaProcessor.process"));
+    ASSERT_NOT_NULL(strstr(tree, "dispatch_fixture.FileSink.write"));
+    free(tree);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Possible callees belong to the rows a page emits: with limit 1 each page
+ * lists the implementations of its own callee only, so every implementation
+ * is reported exactly once across the pages. */
+TEST(tool_trace_path_possible_callees_follow_the_page) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    char *first = ov_trace(srv, ",\"include_overrides\":true,\"limit\":1,\"format\":\"json\"");
+    ASSERT_NOT_NULL(first);
+    yyjson_doc *doc = yyjson_read(first, strlen(first), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+    ASSERT_TRUE(yyjson_is_arr(possible));
+    ASSERT_EQ(yyjson_arr_size(possible), 1);
+    ASSERT_NOT_NULL(ov_implementations(possible, "dispatch_fixture.LocalProcessor.process"));
+    const char *cursor = yyjson_get_str(yyjson_obj_get(root, "next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+    char extra[320];
+    snprintf(extra, sizeof(extra),
+             ",\"include_overrides\":true,\"limit\":1,\"format\":\"json\",\"cursor\":\"%s\"",
+             cursor);
+    yyjson_doc_free(doc);
+    ASSERT_NULL(strstr(first, "dispatch_fixture.FileSink.write"));
+    free(first);
+
+    char *second = ov_trace(srv, extra);
+    ASSERT_NOT_NULL(second);
+    doc = yyjson_read(second, strlen(second), 0);
+    ASSERT_NOT_NULL(doc);
+    possible = yyjson_obj_get(yyjson_doc_get_root(doc), "possible_callees");
+    ASSERT_TRUE(yyjson_is_arr(possible));
+    ASSERT_EQ(yyjson_arr_size(possible), 1);
+    yyjson_val *sinks = ov_implementations(possible, "dispatch_fixture.Sink.write");
+    ASSERT_NOT_NULL(sinks);
+    ASSERT_TRUE(ov_lists(sinks, "dispatch_fixture.FileSink.write"));
+    ASSERT_NULL(strstr(second, "dispatch_fixture.LocalAlphaProcessor.process"));
+    yyjson_doc_free(doc);
+    free(second);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Only a call through an instance receiver can run an override. A super()
+ * call is bound to the parent, and a call on a freshly constructed object
+ * runs that class's own method, so neither lists implementations; a self
+ * call does. */
+TEST(tool_trace_path_possible_callees_only_for_dispatching_calls) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *p = "dispatch-fixture";
+    const char *src = "src/fixture.py";
+    cbm_node_t contract = {0};
+    ASSERT_EQ(
+        cbm_store_find_node_by_qn(st, p, "dispatch_fixture.LocalProcessor.process", &contract),
+        CBM_STORE_OK);
+    static const struct {
+        const char *caller;
+        const char *callee;
+        bool lists;
+    } cases[] = {
+        {"reset_local", "super().process", false},
+        {"build_local", "ProcessorFactory().process", false},
+        {"step_local", "self.process", true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char qn[96];
+        snprintf(qn, sizeof(qn), "dispatch_fixture.%s", cases[i].caller);
+        int64_t caller = ov_node(st, p, "Function", cases[i].caller, qn, src);
+        ASSERT_GT(caller, 0);
+        char props[128];
+        snprintf(props, sizeof(props), "{\"callee\":\"%s\"}", cases[i].callee);
+        cbm_edge_t call = {.project = p,
+                           .source_id = caller,
+                           .target_id = contract.id,
+                           .type = "CALLS",
+                           .properties_json = props};
+        ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+        char args[320];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"dispatch-fixture\",\"function_name\":\"%s\","
+                 "\"direction\":\"outbound\",\"depth\":1,\"include_overrides\":true,"
+                 "\"format\":\"json\"}",
+                 cases[i].caller);
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 1);
+        yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+        ASSERT_TRUE(yyjson_is_arr(possible));
+        ASSERT_EQ(yyjson_arr_size(possible), cases[i].lists ? 1U : 0U);
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    cbm_node_free_fields(&contract);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* include_overrides joins the cursor identity only when it is set. Without
+ * it the token is the one main minted before the flag existed (the qhash
+ * below is main's formula for this request), so default output and cursors
+ * already handed out survive the upgrade; with it, the token differs. */
+TEST(tool_trace_path_include_overrides_keeps_cursor_identity) {
+    cbm_mcp_server_t *srv = ov_fixture();
+    ASSERT_NOT_NULL(srv);
+    static const char *const variants[] = {
+        ",\"limit\":1,\"format\":\"json\"",
+        ",\"limit\":1,\"include_overrides\":false,\"format\":\"json\"",
+        ",\"limit\":1,\"include_overrides\":true,\"format\":\"json\"",
+    };
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+        char *inner = ov_trace(srv, variants[i]);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        const char *cursor =
+            yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "next_cursor"));
+        ASSERT_NOT_NULL(cursor);
+        bool mains_token = strstr(cursor, ".6965863f18fa7040.") != NULL;
+        ASSERT_TRUE(mains_token == (i < 2));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* possible_callees is optional output: under max_output_tokens it yields
+ * before any graph row and says so, in both formats. */
+TEST(tool_trace_path_possible_callees_yield_first_under_budget) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *p = "override-budget";
+    cbm_mcp_server_set_project(srv, p);
+    ASSERT_EQ(cbm_store_upsert_project(st, p, "/tmp/override-budget"), CBM_STORE_OK);
+    int64_t hub = ov_node(st, p, "Function", "hub", "override_budget.hub", "src/hub.py");
+    int64_t base = ov_node(st, p, "Method", "run", "override_budget.Base.run", "src/hub.py");
+    ASSERT_TRUE(ov_edge(st, p, hub, base, "CALLS"));
+    enum { IMPLEMENTATIONS = 60 };
+    for (int i = 0; i < IMPLEMENTATIONS; i++) {
+        char qn[160];
+        snprintf(qn, sizeof(qn),
+                 "override_budget.implementations.with.a.rather.long.package.path.Impl%02d.run", i);
+        int64_t impl = ov_node(st, p, "Method", "run", qn, "src/impls.py");
+        ASSERT_TRUE(ov_edge(st, p, impl, base, "OVERRIDE"));
+    }
+    const char *formats[] = {"json", "tree"};
+    for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+        char args[320];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"override-budget\",\"function_name\":\"hub\","
+                 "\"direction\":\"outbound\",\"depth\":1,\"include_overrides\":true,"
+                 "\"max_output_tokens\":300,\"format\":\"%s\"}",
+                 formats[f]);
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NULL(strstr(inner, "Impl00.run"));
+        ASSERT_NULL(strstr(inner, "output_budget_floor_exceeded"));
+        if (strcmp(formats[f], "json") == 0) {
+            yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+            ASSERT_NOT_NULL(doc);
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            ASSERT_NULL(yyjson_obj_get(root, "possible_callees"));
+            ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "possible_callees_omitted")));
+            ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "truncation_reason")),
+                          "output_budget");
+            ASSERT_NOT_NULL(trace_grouped_row_named(yyjson_obj_get(root, "callees"), "run", NULL));
+            yyjson_doc_free(doc);
+        } else {
+            ASSERT_NOT_NULL(strstr(inner, "possible_callees_omitted: true"));
+            ASSERT_NOT_NULL(strstr(inner, "has_more: false"));
+            ASSERT_NOT_NULL(strstr(inner, "override_budget.Base"));
+        }
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Exactly-once trace pagination: 12 callees paged at limit=5 must yield
  * 5+5+2 rows with every callee appearing on exactly one page, exact totals
  * on every page, and a final page without a cursor. Stale and mismatched
@@ -28463,6 +28875,14 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
+    RUN_TEST(tool_trace_path_possible_callees_stay_apart_from_calls);
+    RUN_TEST(tool_trace_path_possible_callees_follow_the_hierarchy);
+    RUN_TEST(tool_trace_path_possible_callees_filter_tests_and_non_callables);
+    RUN_TEST(tool_trace_path_possible_callees_render_as_tree_table);
+    RUN_TEST(tool_trace_path_possible_callees_follow_the_page);
+    RUN_TEST(tool_trace_path_possible_callees_yield_first_under_budget);
+    RUN_TEST(tool_trace_path_possible_callees_only_for_dispatching_calls);
+    RUN_TEST(tool_trace_path_include_overrides_keeps_cursor_identity);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
     RUN_TEST(tool_trace_budget_never_slices_identifiers);

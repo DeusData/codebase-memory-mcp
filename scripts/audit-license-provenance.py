@@ -47,6 +47,10 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
     "sql": "DerekStride/tree-sitter-sql",
     "tsx": "tree-sitter/tree-sitter-typescript",
+    # vba: tree-sitter-vba's vba dialect, generated here because upstream tracks
+    # no parser.c; no local patch. Same routing rule as arkts -- upstream's MIT
+    # verbatim, byte-verified.
+    "vba": "harumiWeb/tree-sitter-vba",
     # vbnet: tree-sitter-vbnet + CodeGraph's real-world VB.NET patch; same
     # routing rule as arkts -- `LICENSE` is upstream's MIT verbatim and is the
     # file byte-verified here (local_license() takes it before the sibling
