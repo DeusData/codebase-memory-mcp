@@ -155,6 +155,9 @@ void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
                                                   cbm_mcp_snippet_capture_test_hook_fn hook,
                                                   void *context);
 
+/* Lower the per-request search capture budget; zero restores the production limit. */
+void cbm_mcp_server_set_search_capture_budget_for_test(cbm_mcp_server_t *srv, size_t bytes);
+
 /* Filesystem PATH_MAX prevents a portable end-to-end fixture for multi-KiB
  * stored paths. This seam drives the normal search result ownership,
  * directory aggregation, and renderer pipeline with synthetic identities. */

@@ -572,7 +572,8 @@ static const tool_def_t TOOLS[] = {
     {"search_graph",
      "Find symbols via BM25 query, regex name/qn filters, or semantic_query. Rows keep "
      "qn/file/lines and in/out over CALLS/USAGE/CALL_REFERENCE/INHERITS/IMPLEMENTS.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "{\"type\":\"object\",\"properties\":{\"snapshot\":{\"type\":\"boolean\"},\"project\":{"
+     "\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
@@ -597,12 +598,11 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"project\"]}"},
 
     {"query_graph",
-     "Read-only Cypher for multi-hop, aggregation, complexity, or cross-service analysis. "
-     "Default: 200 visible rows with "
-     "exact/lower-bound totals and truncation; continue safely with next_cursor. "
-     "graph=missed is a file tree of flagged coverage gaps; absence is not proof of completeness. "
-     "Use get_graph_schema(diagnostics=full) for properties.",
-     "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
+     "Read-only Cypher. Default 200 rows, exact/lower-bound totals, truncation and "
+     "next_cursor. graph=missed lists coverage gaps; absence is not proof of completeness. "
+     "Properties: get_graph_schema(diagnostics=full).",
+     "{\"type\":\"object\",\"properties\":{\"snapshot\":{\"type\":\"boolean\"},\"query\":{\"type\":"
+     "\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},"
      "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\"],\"default\":\"code\","
      "\"description\":\"code graph (default) or missed coverage-gap file tree.\"},"
@@ -623,7 +623,8 @@ static const tool_def_t TOOLS[] = {
     {"trace_path",
      "Trace callers/callees, data flow, or cross-service paths. Defaults exclude tests and "
      "resolver evidence. Rows keep qn/hop with explicit totals, relations, and continuations.",
-     "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
+     "{\"type\":\"object\",\"properties\":{\"snapshot\":{\"type\":\"boolean\"},\"function_name\":{"
+     "\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3,"
      "\"minimum\":1,\"maximum\":15},"
@@ -659,7 +660,8 @@ static const tool_def_t TOOLS[] = {
     {"get_code_snippet",
      "Read a search_graph symbol. auto bounds source and outlines large containers; full "
      "restores up to 500 lines. Source/outline pages continue; coverage_note marks gaps.",
-     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
+     "{\"type\":\"object\",\"properties\":{\"snapshot\":{\"type\":\"boolean\"},\"qualified_name\":{"
+     "\"type\":\"string\",\"description\":"
      "\"search_graph qn, or short name.\"},\"project\":{"
      "\"type\":\"string\"},\"include_neighbors\":{"
      "\"type\":\"boolean\",\"default\":false},"
@@ -737,7 +739,8 @@ static const tool_def_t TOOLS[] = {
 
     {"search_code",
      "Graph-ranked text search: compact symbols, full bounded source, or file paths.",
-     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
+     "{\"type\":\"object\",\"properties\":{\"snapshot\":{\"type\":\"boolean\"},\"pattern\":{"
+     "\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob on file name; "
      "with '/', on repo-relative path (** = any dirs).\"},"
      "\"path_filter\":{\"type\":\"string\",\"description\":\"Regex on repo-relative path.\"},"
@@ -799,7 +802,7 @@ static const tool_def_t TOOLS[] = {
     {"check_index_coverage",
      "Best-effort exact-path/scope coverage and freshness, paged separately. full diagnostics "
      "adds raw detail. Clean is not proof of completeness.",
-     "{\"type\":\"object\",\"properties\":{"
+     "{\"type\":\"object\",\"properties\":{\"snapshot\":{\"type\":\"boolean\"},"
      "\"project\":{\"type\":\"string\"},"
      "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128},"
      "\"path_limit\":{\"type\":\"integer\",\"default\":20,\"minimum\":1,\"maximum\":128},"
@@ -1915,6 +1918,7 @@ struct cbm_mcp_server {
     void *snapshot_read_test_context;
     cbm_mcp_snippet_capture_test_hook_fn snippet_capture_test_hook;
     void *snippet_capture_test_context;
+    size_t search_capture_test_budget;
 #endif
     bool read_batch_tool; /* this request's store reads run in a read batch */
     size_t search_output_limit_override;
@@ -2294,6 +2298,11 @@ void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
     }
     srv->snippet_capture_test_hook = hook;
     srv->snippet_capture_test_context = context;
+}
+
+void cbm_mcp_server_set_search_capture_budget_for_test(cbm_mcp_server_t *srv, size_t bytes) {
+    if (srv)
+        srv->search_capture_test_budget = bytes;
 }
 #endif
 
@@ -7165,18 +7174,33 @@ static bool mcp_recorded_sha256(const char *sha) {
 
 /* #2585: read a whole file into *bytes (released with cbm_sb_free), so that
  * the bytes a response serves are the bytes whose hash was checked. */
-static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes) {
+static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes, size_t max_bytes,
+                                bool *limited) {
     cbm_sb_init(bytes);
+    if (limited) {
+        *limited = false;
+    }
     FILE *file = cbm_fopen(abs_path, "rb");
     if (!file) {
         return false;
     }
     char buf[CBM_SZ_4K];
     size_t len;
+    bool hit_limit = false;
     while ((len = fread(buf, 1, sizeof(buf), file)) > 0) {
+        if (len > max_bytes - bytes->len) {
+            hit_limit = true;
+            if (limited) {
+                *limited = true;
+            }
+            break;
+        }
         cbm_sb_append_n(bytes, buf, len);
+        if (bytes->oom) {
+            break;
+        }
     }
-    bool valid = !ferror(file) && !bytes->oom;
+    bool valid = !ferror(file) && !bytes->oom && !hit_limit;
     if (fclose(file) != 0) {
         valid = false;
     }
@@ -7188,7 +7212,7 @@ static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes) {
 
 /* Lines [start, end] of an in-memory file, with read_file_lines' semantics
  * (text-mode line endings, NULL when the range is empty). */
-static char *mcp_slice_lines(cbm_sb_t *bytes, int start, int end) {
+static char *mcp_slice_lines(const cbm_sb_t *bytes, int start, int end) {
     size_t begin = bytes->len;
     size_t stop = bytes->len;
     int lineno = 1;
@@ -7245,12 +7269,24 @@ static bool coverage_freshness_current(const char *freshness, bool content_verif
  * serving them cannot race a concurrent write. *captured_ok stays false when
  * the path never reached the file (missing, outside, not tracked,
  * unreadable). */
-static const char *coverage_path_freshness_capture(cbm_store_t *store, const char *project,
-                                                   const char *root_path, const char *rel_path,
-                                                   bool *outside, bool *content_verified,
-                                                   cbm_sb_t *captured, bool *captured_ok) {
+static bool mcp_capture_file_sha256(const char *path, cbm_sb_t *captured, size_t max_bytes,
+                                    bool *limited, char current[CBM_SHA256_HEX_LEN + SKIP_ONE]) {
+    if (!mcp_read_file_bytes(path, captured, max_bytes, limited)) {
+        return false;
+    }
+    cbm_sha256_hex(captured->buf ? captured->buf : "", captured->len, current);
+    return true;
+}
+
+static const char *coverage_path_freshness_capture_bounded(
+    cbm_store_t *store, const char *project, const char *root_path, const char *rel_path,
+    bool *outside, bool *content_verified, cbm_sb_t *captured, bool *captured_ok,
+    size_t max_capture_bytes, bool *limited) {
     *outside = false;
     *content_verified = false;
+    if (limited) {
+        *limited = false;
+    }
     if (captured) {
         cbm_sb_init(captured);
         *captured_ok = false;
@@ -7290,11 +7326,9 @@ static const char *coverage_path_freshness_capture(cbm_store_t *store, const cha
     char current[CBM_SHA256_HEX_LEN + 1] = "";
     bool hashed = false;
     if (captured) {
-        *captured_ok = mcp_read_file_bytes(abs_path, captured);
-        if (*captured_ok) {
-            cbm_sha256_hex(captured->buf ? captured->buf : "", captured->len, current);
-            hashed = true;
-        }
+        *captured_ok =
+            mcp_capture_file_sha256(abs_path, captured, max_capture_bytes, limited, current);
+        hashed = *captured_ok;
     } else {
         hashed = mcp_recorded_sha256(hash.sha256) && mcp_file_sha256_hex(abs_path, current);
     }
@@ -7309,6 +7343,15 @@ static const char *coverage_path_freshness_capture(cbm_store_t *store, const cha
         return same_bytes ? "metadata_match" : "content_changed";
     }
     return same_bytes ? "content_match" : "metadata_changed";
+}
+
+static const char *coverage_path_freshness_capture(cbm_store_t *store, const char *project,
+                                                   const char *root_path, const char *rel_path,
+                                                   bool *outside, bool *content_verified,
+                                                   cbm_sb_t *captured, bool *captured_ok) {
+    return coverage_path_freshness_capture_bounded(store, project, root_path, rel_path, outside,
+                                                   content_verified, captured, captured_ok,
+                                                   SIZE_MAX, NULL);
 }
 
 static const char *coverage_path_freshness(cbm_store_t *store, const char *project,
@@ -15507,6 +15550,13 @@ typedef struct {
     int match_count;        /* exact total across the complete grep stream */
     int match_stored_count; /* bounded evidence retained for rendering */
     int match_capacity;
+    cbm_sb_t captured_source;
+    const char *source_freshness;
+    bool captured_source_ok;
+    bool source_content_verified;
+    bool source_drift;
+    bool captured_source_owner;
+    bool source_capture_limited;
 } search_result_t;
 
 typedef struct {
@@ -15549,6 +15599,9 @@ static void free_search_results(search_result_t *results, int count) {
         free(results[i].qualified_name);
         free(results[i].file);
         free(results[i].match_lines);
+        if (results[i].captured_source_owner) {
+            cbm_sb_free(&results[i].captured_source);
+        }
     }
     free(results);
 }
@@ -15857,26 +15910,163 @@ static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_resul
     return files_arr;
 }
 
+/* Capture once before rendering: budget retries must not reread a changing file.
+ * Match locations came from the live scan; only source attribution is verified. */
+static void capture_search_source(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
+                                  const char *root_path, search_result_t *results, int start,
+                                  int count) {
+    (void)srv; /* Production builds omit the test-only hooks. */
+    enum { CAPTURE_BUDGET = 64 * 1024 * 1024 };
+    size_t remaining = CAPTURE_BUDGET;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (srv->search_capture_test_budget)
+        remaining = srv->search_capture_test_budget;
+#endif
+    for (int i = start; i < start + count; i++) {
+        search_result_t *r = &results[i];
+        bool cached = false;
+        for (int j = start; j < i; j++) {
+            const search_result_t *prior = &results[j];
+            if (strcmp(r->file, prior->file) != 0) {
+                continue;
+            }
+            r->captured_source = prior->captured_source;
+            r->captured_source_ok = prior->captured_source_ok;
+            r->source_freshness = prior->source_freshness;
+            r->source_content_verified = prior->source_content_verified;
+            r->source_drift = prior->source_drift;
+            r->source_capture_limited = prior->source_capture_limited;
+            cached = true;
+            break;
+        }
+        if (cached) {
+            continue;
+        }
+        bool outside = false;
+        r->captured_source_owner = true;
+        r->source_freshness = coverage_path_freshness_capture_bounded(
+            store, project, root_path, r->file, &outside, &r->source_content_verified,
+            &r->captured_source, &r->captured_source_ok, remaining, &r->source_capture_limited);
+        r->source_drift =
+            r->source_content_verified &&
+            !coverage_freshness_current(r->source_freshness, r->source_content_verified);
+        if (r->captured_source_ok && r->captured_source.cap > remaining) {
+            r->source_capture_limited = true;
+        }
+        if (r->source_capture_limited || r->source_drift) {
+            cbm_sb_free(&r->captured_source);
+            r->captured_source_ok = false;
+        } else if (r->captured_source_ok) {
+            remaining -= r->captured_source.cap;
+        }
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (srv->snippet_capture_test_hook)
+            srv->snippet_capture_test_hook(srv->snippet_capture_test_context, r->file);
+#endif
+    }
+}
+
 /* Attach source or context lines to a search result JSON item. */
-static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
-                                 int mode, int context_lines, int source_max_lines,
-                                 const char *root_path, root_containment_t *containment) {
+static void attach_full_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                      const search_result_t *r, int source_max_lines,
+                                      const char *abs_path) {
+    /* Cap each hit's source at a match-anchored window: uncapped
+     * whole-symbol dumps ran to 5.7KB × N hits (142KB responses). The
+     * complete symbol stays one get_code_snippet call away;
+     * source_start/source_truncated make the cut explicit. */
+    enum { SC_FULL_LEAD = 5 };
+    if (source_max_lines <= 0) {
+        yyjson_mut_obj_add_bool(doc, item, "source_omitted", true);
+        return;
+    }
+    int s = r->start_line;
+    int e = r->end_line;
+    bool truncated = false;
+    if (e - s + SKIP_ONE > source_max_lines) {
+        if (r->match_count > 0 && r->match_lines[0] - SC_FULL_LEAD > s) {
+            s = r->match_lines[0] - SC_FULL_LEAD;
+        }
+        e = s + source_max_lines - SKIP_ONE;
+        if (e > r->end_line) {
+            e = r->end_line;
+        }
+        truncated = true;
+    }
+    char *source = r->captured_source_ok ? mcp_slice_lines(&r->captured_source, s, e)
+                                         : read_file_lines(abs_path, s, e);
+    if (source) {
+        char *safe_source = sanitize_utf8_lossy(source);
+        if (safe_source) {
+            yyjson_mut_obj_add_strcpy(doc, item, "source", safe_source);
+            free(safe_source);
+        }
+        free(source);
+        if (truncated) {
+            yyjson_mut_obj_add_int(doc, item, "source_start", s);
+            yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
+        }
+    }
+}
+
+static void attach_context_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                         const search_result_t *r, int context_lines,
+                                         const char *abs_path) {
+    /* Bounded here as well as at the handler: the window must stay
+     * match ± MCP_SEARCH_CONTEXT_MAX_LINES for any caller, and the
+     * arithmetic must not overflow for any value. */
+    int ctx_lines =
+        context_lines > MCP_SEARCH_CONTEXT_MAX_LINES ? MCP_SEARCH_CONTEXT_MAX_LINES : context_lines;
+    int first_match = r->match_lines[0];
+    int last_match = r->match_lines[r->match_count - SKIP_ONE];
+    int ctx_start = first_match > ctx_lines ? first_match - ctx_lines : SKIP_ONE;
+    int ctx_end = last_match > INT_MAX - ctx_lines ? INT_MAX : last_match + ctx_lines;
+    char *ctx = r->captured_source_ok ? mcp_slice_lines(&r->captured_source, ctx_start, ctx_end)
+                                      : read_file_lines(abs_path, ctx_start, ctx_end);
+    if (ctx) {
+        char *safe_context = sanitize_utf8_lossy(ctx);
+        if (safe_context) {
+            yyjson_mut_obj_add_strcpy(doc, item, "context", safe_context);
+            free(safe_context);
+        }
+        yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
+        free(ctx);
+    }
+}
+
+static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                 const search_result_t *r, int mode, int context_lines,
+                                 int source_max_lines, const char *root_path,
+                                 root_containment_t *containment) {
     enum { MODE_FULL = 1 };
+    yyjson_mut_obj_add_bool(doc, item, "content_verified", r->source_content_verified);
+    if (r->source_freshness) {
+        yyjson_mut_obj_add_str(doc, item, "freshness", r->source_freshness);
+    }
+    if (r->source_drift) {
+        yyjson_mut_obj_add_bool(doc, item, "source_drift", true);
+        yyjson_mut_obj_add_str(doc, item, "recommended_action", "reindex_then_retry");
+        return;
+    }
+    if (r->source_capture_limited) {
+        yyjson_mut_obj_add_str(doc, item, "source_unavailable", "capture_budget");
+        yyjson_mut_obj_add_str(doc, item, "recommended_action", "use_get_code_snippet");
+        return;
+    }
     if (r->start_line <= 0 || r->end_line <= 0) {
         return;
     }
     size_t root_length = strlen(root_path);
     size_t file_length = strlen(r->file);
-    if (root_length > SIZE_MAX - file_length - 2U) {
+    if (root_length > SIZE_MAX - file_length - PAIR_LEN) {
         return;
     }
-    char *abs_path = malloc(root_length + file_length + 2U);
+    char *abs_path = malloc(root_length + file_length + PAIR_LEN);
     if (!abs_path) {
         return;
     }
     memcpy(abs_path, root_path, root_length);
     abs_path[root_length] = '/';
-    memcpy(abs_path + root_length + 1U, r->file, file_length + 1U);
+    memcpy(abs_path + root_length + SKIP_ONE, r->file, file_length + SKIP_ONE);
 
     /* Containment: a search result whose indexed path resolves outside the
      * project root (a `..` segment, or a symlink/junction that discovery
@@ -15888,62 +16078,9 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
     }
 
     if (mode == MODE_FULL) {
-        /* Cap each hit's source at a match-anchored window: uncapped
-         * whole-symbol dumps ran to 5.7KB × N hits (142KB responses). The
-         * complete symbol stays one get_code_snippet call away;
-         * source_start/source_truncated make the cut explicit. */
-        enum { SC_FULL_LEAD = 5 };
-        if (source_max_lines <= 0) {
-            yyjson_mut_obj_add_bool(doc, item, "source_omitted", true);
-            free(abs_path);
-            return;
-        }
-        int s = r->start_line;
-        int e = r->end_line;
-        bool truncated = false;
-        if (e - s + 1 > source_max_lines) {
-            if (r->match_count > 0 && r->match_lines[0] - SC_FULL_LEAD > s) {
-                s = r->match_lines[0] - SC_FULL_LEAD;
-            }
-            e = s + source_max_lines - 1;
-            if (e > r->end_line) {
-                e = r->end_line;
-            }
-            truncated = true;
-        }
-        char *source = read_file_lines(abs_path, s, e);
-        if (source) {
-            char *safe_source = sanitize_utf8_lossy(source);
-            if (safe_source) {
-                yyjson_mut_obj_add_strcpy(doc, item, "source", safe_source);
-                free(safe_source);
-            }
-            free(source);
-            if (truncated) {
-                yyjson_mut_obj_add_int(doc, item, "source_start", s);
-                yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
-            }
-        }
+        attach_full_result_source(doc, item, r, source_max_lines, abs_path);
     } else if (context_lines > 0 && r->match_count > 0) {
-        /* Bounded here as well as at the handler: the window must stay
-         * match ± MCP_SEARCH_CONTEXT_MAX_LINES for any caller, and the
-         * arithmetic must not overflow for any value. */
-        int ctx_lines = context_lines > MCP_SEARCH_CONTEXT_MAX_LINES ? MCP_SEARCH_CONTEXT_MAX_LINES
-                                                                     : context_lines;
-        int first_match = r->match_lines[0];
-        int last_match = r->match_lines[r->match_count - SKIP_ONE];
-        int ctx_start = first_match > ctx_lines ? first_match - ctx_lines : SKIP_ONE;
-        int ctx_end = last_match > INT_MAX - ctx_lines ? INT_MAX : last_match + ctx_lines;
-        char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
-        if (ctx) {
-            char *safe_context = sanitize_utf8_lossy(ctx);
-            if (safe_context) {
-                yyjson_mut_obj_add_strcpy(doc, item, "context", safe_context);
-                free(safe_context);
-            }
-            yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
-            free(ctx);
-        }
+        attach_context_result_source(doc, item, r, context_lines, abs_path);
     }
     free(abs_path);
 }
@@ -16207,6 +16344,7 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
     }
     free_search_dirs(directories, dir_n);
 
+    cbm_tree_scalar_str(&sb, "match_source", "live_filesystem");
     cbm_tree_scalar_int(&sb, "total_grep_matches", gm_count);
     cbm_tree_scalar_int(&sb, "total_results", sr_count);
     cbm_tree_scalar_int(&sb, "raw_match_count", raw_count);
@@ -16297,6 +16435,7 @@ static char *assemble_search_output(
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
+    yyjson_mut_obj_add_str(doc, root_obj, "match_source", "live_filesystem");
 
     if (mode == MODE_FILES) {
         yyjson_mut_val *files = build_dedup_files_array(doc, sr, result_start, output_count, raw,
@@ -18543,6 +18682,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * containment for the request keeps that to one resolution per file. */
     root_containment_t request_containment;
     root_containment_init(&request_containment, root_path);
+    enum { SOURCE_MODE_COMPACT = 0, SOURCE_MODE_FULL = 1 };
+    if (mode == SOURCE_MODE_FULL || (mode == SOURCE_MODE_COMPACT && context_lines > 0)) {
+        capture_search_source(srv, store, project, root_path, sr, result_start, output_count);
+    }
     char *payload = render_search_payload(
         sr, sr_count, raw, raw_count, raw_content_truncated, gm_count, result_start, result_limit,
         output_count, raw_start, raw_output, directory_start, directory_output, raw_limit,
@@ -22301,6 +22444,132 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     cbm_mem_collect();
 }
 
+/* #2585: a snapshot is opt-in so ordinary query latency and output stay
+ * compatible. It pins the database, not the live filesystem. */
+static bool mcp_snapshot_tool(const char *name) {
+    return name && (!strcmp(name, "search_graph") || !strcmp(name, "query_graph") ||
+                    !strcmp(name, "trace_path") || !strcmp(name, "get_code_snippet") ||
+                    !strcmp(name, "search_code") || !strcmp(name, "check_index_coverage"));
+}
+
+static bool mcp_snapshot_cancelled(void *context) {
+    return mcp_request_cancelled((const cbm_mcp_server_t *)context);
+}
+
+/* Keep the tool's original format inside data. A JSON envelope makes the same
+ * publication identity observable through MCP structuredContent and the CLI. */
+static char *mcp_snapshot_result(char *result, const char *generation) {
+    yyjson_doc *wire = result ? yyjson_read(result, strlen(result), 0) : NULL;
+    yyjson_val *root = wire ? yyjson_doc_get_root(wire) : NULL;
+    if (root && yyjson_get_bool(yyjson_obj_get(root, "isError"))) {
+        yyjson_doc_free(wire);
+        return result;
+    }
+    yyjson_val *text = yyjson_obj_get(yyjson_arr_get(yyjson_obj_get(root, "content"), 0), "text");
+    yyjson_val *data = yyjson_obj_get(root, "structuredContent");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *envelope = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *value = NULL;
+    if (doc) {
+        if (data) {
+            value = yyjson_val_mut_copy(doc, data);
+        } else {
+            value = yyjson_mut_strcpy(doc, yyjson_get_str(text));
+        }
+    }
+    bool ok = envelope && value &&
+              yyjson_mut_obj_add_strcpy(doc, envelope, "store_generation", generation) &&
+              yyjson_mut_obj_add_bool(doc, envelope, "snapshot_consistent", true) &&
+              yyjson_mut_obj_add_val(doc, envelope, "data", value);
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, envelope);
+    }
+    char *payload = ok ? yy_doc_to_str(doc) : NULL;
+    char *wrapped = payload ? cbm_mcp_text_result(payload, false) : NULL;
+    free(payload);
+    yyjson_mut_doc_free(doc);
+    yyjson_doc_free(wire);
+    free(result);
+    return wrapped ? wrapped
+                   : cbm_mcp_text_result("snapshot_unavailable: cannot encode evidence", true);
+}
+
+typedef struct {
+    bool enabled;
+    bool discard_store;
+    const char *error;
+    cbm_store_read_scope_t *scope;
+    char generation[QUERY_GRAPH_GENERATION_CAP];
+} mcp_snapshot_request_t;
+
+static void mcp_snapshot_open(cbm_mcp_server_t *srv, const char *args,
+                              mcp_snapshot_request_t *snapshot) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = project ? resolve_store(srv, project) : NULL;
+    int opened =
+        store ? cbm_store_read_scope_open(store, mcp_snapshot_cancelled, srv, &snapshot->scope)
+              : CBM_STORE_ERR;
+    snapshot->discard_store = opened == CBM_STORE_SCOPE_DISCARD;
+    if (opened != CBM_STORE_OK) {
+        snapshot->error = "snapshot_unavailable: cannot pin the requested project";
+    } else if (cbm_store_generation(store, snapshot->generation, sizeof(snapshot->generation)) !=
+                   CBM_STORE_OK ||
+               !snapshot->generation[0] || strcmp(snapshot->generation, "legacy") == 0) {
+        snapshot->error = "snapshot_unavailable: reindex to establish publication identity";
+    }
+    free(project);
+}
+
+static void mcp_snapshot_prepare(cbm_mcp_server_t *srv, const char *tool_name, const char *args,
+                                 mcp_snapshot_request_t *snapshot) {
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *input = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *value = yyjson_obj_get(input, "snapshot");
+    snapshot->enabled = value && yyjson_is_true(value);
+    if (value && !yyjson_is_bool(value)) {
+        snapshot->error = "snapshot must be true or false";
+    } else if (snapshot->enabled && (!srv || !mcp_snapshot_tool(tool_name))) {
+        snapshot->error = "snapshot is supported by the graph, snippet, coverage and search tools";
+    } else if (snapshot->enabled && strcmp(tool_name, "trace_path") == 0) {
+        const char *mode = yyjson_get_str(yyjson_obj_get(input, "mode"));
+        if (mode && strcmp(mode, "cross_service") == 0) {
+            snapshot->error = "snapshot_unavailable: cross_service reads multiple project stores";
+        }
+    }
+    yyjson_doc_free(doc);
+    if (srv) {
+        srv->read_batch_tool = !snapshot->enabled && mcp_tool_reads_in_batch(tool_name);
+    }
+    if (snapshot->enabled && !snapshot->error) {
+        mcp_snapshot_open(srv, args, snapshot);
+    }
+}
+
+static char *mcp_snapshot_finish(cbm_mcp_server_t *srv, mcp_snapshot_request_t *snapshot,
+                                 char *result) {
+    if (snapshot->scope) {
+        int checked = cbm_store_read_scope_check(snapshot->scope);
+        int closed = cbm_store_read_scope_close(snapshot->scope);
+        snapshot->discard_store = closed == CBM_STORE_SCOPE_DISCARD;
+        if (checked != CBM_STORE_OK || closed != CBM_STORE_OK) {
+            free(result);
+            result =
+                cbm_mcp_text_result("snapshot_unavailable: read scope lost or cancelled", true);
+        } else if (!snapshot->error) {
+            result = mcp_snapshot_result(result, snapshot->generation);
+        }
+    }
+    if (snapshot->discard_store && srv) {
+        if (srv->owns_store) {
+            cbm_store_close(srv->store);
+        }
+        srv->store = NULL;
+        free(srv->current_project);
+        srv->current_project = NULL;
+    }
+    return result;
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     /* Phase marks bracket the WHOLE request with no unlabelled gap, so growth
      * cannot hide between them (CBM_MEM_PHASES=1; see foundation/mem.h). The
@@ -22314,10 +22583,11 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return cbm_mcp_text_result("request cancellation scope unavailable", true);
     }
     cbm_mem_phase_mark("request.dispatch_tool");
-    if (srv) {
-        srv->read_batch_tool = mcp_tool_reads_in_batch(tool_name);
-    }
-    char *result = dispatch_tool(srv, tool_name, args_json);
+    mcp_snapshot_request_t snapshot = {0};
+    mcp_snapshot_prepare(srv, tool_name, args_json, &snapshot);
+    char *result = snapshot.error ? cbm_mcp_text_result(snapshot.error, true)
+                                  : dispatch_tool(srv, tool_name, args_json);
+    result = mcp_snapshot_finish(srv, &snapshot, result);
     if (srv) {
         /* An embedded store outlives the request: end its batch here. */
         srv->read_batch_tool = false;
