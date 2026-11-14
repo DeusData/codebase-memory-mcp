@@ -2730,9 +2730,15 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 /* Forward decl — definition lives below in handle_trace_call_path's helpers. */
 static void free_node_contents(cbm_node_t *n);
 
+/* Forward decl: defined below with the other cache-directory scans. */
+static bool project_scan_should_stop(cbm_mcp_server_t *srv, const char *db_file);
+
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
- * Returns the number of projects found. */
-static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
+ * Returns the number of projects found. It opens every project database, so
+ * it stops like the other cache scans once the request is cancelled and sets
+ * *cancelled (#2796). srv may be NULL (no request scope). */
+static int collect_db_project_names(cbm_mcp_server_t *srv, const char *dir_path, char *out,
+                                    size_t out_sz, bool *cancelled) {
     int count = 0;
     int offset = 0;
     cbm_dir_t *d = cbm_opendir(dir_path);
@@ -2744,6 +2750,10 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         const char *n = entry->name;
         if (!cbm_is_project_index_db(n)) {
             continue;
+        }
+        if (project_scan_should_stop(srv, n)) {
+            *cancelled = true;
+            break;
         }
         /* #704: advertise the db's INTERNAL project name, not its filename, and
          * skip ghost/empty/corrupt dbs — so the hint lists names the user can
@@ -2808,17 +2818,22 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     cbm_git_context_free(&ctx);
 }
 
-/* Build a helpful error listing available projects. Caller must free() result. */
-static char *build_project_list_error(const char *reason) {
+/* Build a helpful error listing available projects. Caller must free() result.
+ * srv may be NULL (no request scope). A cancelled request gets the bare reason:
+ * a partial list would mislead, and nobody is waiting for it (#2796). */
+static char *build_project_list_error(cbm_mcp_server_t *srv, const char *reason) {
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
 
     char projects[CBM_SZ_4K] = "";
-    int count = collect_db_project_names(dir_path, projects, sizeof(projects));
+    bool cancelled = false;
+    int count = collect_db_project_names(srv, dir_path, projects, sizeof(projects), &cancelled);
 
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
-    if (count > 0) {
+    if (cancelled) {
+        snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", reason);
+    } else if (count > 0) {
         /* #1690: say how to pick the project, so an agent that guessed a repo
          * or folder name can recover instead of dropping the graph. */
         snprintf(buf, sizeof(buf),
@@ -2849,8 +2864,8 @@ static char *build_missing_project_error(void) {
 /* Pick the right no-store error: a NULL project means the argument was missing
  * (clearer message); a non-NULL project that didn't resolve means it's
  * unknown/unindexed (list the available ones). */
-static char *build_no_store_error(const char *project) {
-    return project ? build_project_list_error("project not found or not indexed")
+static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
+    return project ? build_project_list_error(srv, "project not found or not indexed")
                    : build_missing_project_error();
 }
 
@@ -2861,9 +2876,9 @@ static char *build_no_store_error_checked(cbm_mcp_server_t *srv, const char *pro
     if (srv->readonly_resolve_hit_corrupt && project &&
         strcmp(project, srv->readonly_corrupt_project) == 0) {
         return build_project_list_error(
-            "project store is corrupt (left untouched); run index_repository to rebuild it");
+            srv, "project store is corrupt (left untouched); run index_repository to rebuild it");
     }
-    return build_no_store_error(project);
+    return build_no_store_error(srv, project);
 }
 
 /* Bail with the right error when no store is available. */
@@ -3403,7 +3418,8 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
 static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     cbm_project_t proj_check = {0};
     if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
-        char *err = build_project_list_error("project not indexed — run index_repository first");
+        char *err =
+            build_project_list_error(NULL, "project not indexed — run index_repository first");
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         return res;
@@ -6322,7 +6338,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("project is required when graph=\"missed\"", true);
     }
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_project_list_error(srv, "project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(cursor_arg);
@@ -10689,7 +10705,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("function_name is required", true);
     }
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_project_list_error(srv, "project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(func_name);
@@ -14937,7 +14953,7 @@ static char *handle_get_file_outline(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
-        char *error = build_project_list_error("project not found or not indexed");
+        char *error = build_project_list_error(srv, "project not found or not indexed");
         char *result = cbm_mcp_text_result(error, true);
         free(error);
         free(project);
@@ -15101,7 +15117,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_project_list_error(srv, "project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(qn);
@@ -17858,7 +17874,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
         free(pattern);
         free(file_pattern);
-        char *_err = build_project_list_error("project is required");
+        char *_err = build_project_list_error(srv, "project is required");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         return _res;
@@ -17872,7 +17888,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_project_list_error(srv, "project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         return _res;

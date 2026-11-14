@@ -6632,8 +6632,9 @@ TEST(tool_list_projects_scan_stops_at_request_cancellation_issue2796) {
 }
 
 /* The same scan runs for every project name with no <name>.db: the internal-
- * name fallback. A hook from a directory with no index hits it once per
- * ancestor it probes, so it must honor cancellation too. */
+ * name fallback, then the not-found error's project listing, which opens every
+ * database again. A hook from a directory with no index hits both once per
+ * ancestor it probes, so both must honor cancellation too. */
 TEST(tool_project_name_miss_scan_stops_at_request_cancellation_issue2796) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-scan-cancel-miss-XXXXXX", cbm_tmpdir());
@@ -6654,6 +6655,13 @@ TEST(tool_project_name_miss_scan_stops_at_request_cancellation_issue2796) {
         srv ? mcp_scan_cancel_run(srv, "index_status", args, MCP_SCAN_CANCEL_VISIT, &cut) : NULL;
 
     bool responded = whole_response && cut_response;
+    /* The uncancelled miss lists every project; the cancelled one names only
+     * the reason, because its listing stopped at the first database. */
+    bool whole_listed = whole_response && strstr(whole_response, "available_projects") &&
+                        strstr(whole_response, "scan-cancel-11");
+    bool cut_unlisted = cut_response && strstr(cut_response, "\"isError\":true") &&
+                        strstr(cut_response, "project not found or not indexed") &&
+                        !strstr(cut_response, "available_projects");
     free(whole_response);
     free(cut_response);
     cbm_mcp_server_free(srv);
@@ -6663,9 +6671,13 @@ TEST(tool_project_name_miss_scan_stops_at_request_cancellation_issue2796) {
 
     ASSERT_TRUE(seeded);
     ASSERT_TRUE(responded);
-    ASSERT_EQ(whole.visits, MCP_SCAN_CANCEL_PROJECTS);
+    ASSERT_TRUE(whole_listed);
+    /* The fallback scan and the listing each reach every database. */
+    ASSERT_EQ(whole.visits, 2 * MCP_SCAN_CANCEL_PROJECTS);
     ASSERT_TRUE(cut.cancel_accepted);
-    ASSERT_EQ(cut.visits, MCP_SCAN_CANCEL_VISIT);
+    ASSERT_TRUE(cut_unlisted);
+    /* The fallback stops at the cancelling database; the listing at its first. */
+    ASSERT_EQ(cut.visits, MCP_SCAN_CANCEL_VISIT + 1);
     PASS();
 }
 
