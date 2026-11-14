@@ -711,7 +711,11 @@ static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
         !client || cbm_daemon_runtime_client_close(client, TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (!accepted) {
-        return 26;
+        /* 26 only when the daemon ANSWERED and refused. No answer inside the
+         * exchange budget (the daemon still hashing this copy, or I/O) is 30:
+         * a slow peer-image hash must fail loudly as itself, never satisfy a
+         * rejection assertion by timing out. */
+        return result.status == CBM_DAEMON_RUNTIME_CONNECT_ERROR ? 30 : 26;
     }
     return closed ? 0 : 27;
 }
@@ -741,7 +745,10 @@ static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
                         endpoint, &identity, (cbm_daemon_runtime_activation_action_t)action_value,
                         TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result);
     cbm_daemon_ipc_endpoint_free(endpoint);
-    return exchanged && result.accepted ? 0 : 29;
+    if (!exchanged) {
+        return 31; /* no answer inside the exchange budget; see the HELLO probe */
+    }
+    return result.accepted ? 0 : 29;
 }
 
 /* macOS adversarial HELLO probe: execute this mode from a foreign process

@@ -66,7 +66,30 @@ static const uint32_t K[64] = {
 #define SIG0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ ((x) >> 3))
 #define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
 
-static void sha256_transform(cbm_sha256_ctx *c, const uint8_t *data) {
+/* WHY no_sanitize: sanitized test runners fingerprint their own ~800 MB image
+ * (and copies of it) through this transform whenever the CPU has no SHA
+ * instructions. ASan + UBSan checks on these fixed-size rounds made one such
+ * hash 5.3x slower with GCC 13 on x86-64 (15.6 s vs 3.0 s measured; ~72-92 s
+ * on hosted runners without SHA-NI, past the 60 s copied-image exchange
+ * budget) and 2.4x slower on arm64, so a test verdict depended on which CPU
+ * the runner drew. Every access here is a compile-time-bounded index into the
+ * context or into one 64-byte block whose bounds the callers establish;
+ * cbm_sha256_update/final, the block loop and the hardware backends stay
+ * fully instrumented. Equality with the hardware backends is proven by
+ * cli_sha256_hardware_matches_portable_issue2441 and the NIST vectors.
+ * Release (unsanitized) builds are unaffected: the attribute only withholds
+ * instrumentation that -fsanitize would add. Spelled through a macro so the
+ * attribute sits on the signature line: an attribute on its own line between
+ * preprocessor guards is laid out differently by clang-format 20 (CI) and
+ * Homebrew's newer release (same reason as NO_BUILTIN_MEM in
+ * mem_override_libc.c). */
+#if defined(__clang__) || defined(__GNUC__)
+#define SHA256_NO_SANITIZE __attribute__((no_sanitize("address", "undefined")))
+#else
+#define SHA256_NO_SANITIZE
+#endif
+
+SHA256_NO_SANITIZE static void sha256_transform(cbm_sha256_ctx *c, const uint8_t *data) {
     /* Scratch comes from the context, not this frame: a 256-byte local here
      * is fake-stacked by ASan's use-after-return mode on every 64-byte block
      * (see the note on cbm_sha256_ctx::sched). Identical values, allocated
