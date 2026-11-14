@@ -2376,8 +2376,9 @@ TEST(external_import_shadow_keeps_everything_else) {
         {.local_name = "eq", .module_path = "drizzle-orm"},
         {.local_name = "normalize", .module_path = "./text-utils"},
         {.local_name = "getRootContainer", .module_path = "@repo/shared"},
+        {.local_name = "fail", .module_path = "pkg.outcomes.fail", .function_scope = true},
     };
-    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+    CBMImportArray arr = {.items = imports, .count = 4, .cap = 4};
     /* The relative import and the workspace package both materialized. */
     const char *keys[] = {"normalize", "getRootContainer"};
     const int nkeys = 2;
@@ -2406,6 +2407,10 @@ TEST(external_import_shadow_keeps_everything_else) {
     /* A package the import map DOES bind resolved in-graph (workspace package). */
     ASSERT_FALSE(cbm_suppress_external_import_shadow("getRootContainer", "unique_name", &arr, keys,
                                                      nkeys, NULL, NULL));
+    /* A Python def's own import (#2285) never enters the file-wide import map:
+     * its missing key is no evidence of an external binding. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("fail", "unique_name", &arr, keys, nkeys, NULL, NULL));
     /* A name the file never imports (called with no import at all). */
     ASSERT_FALSE(cbm_suppress_external_import_shadow("helper", "unique_name", &arr, keys, nkeys,
                                                      NULL, NULL));

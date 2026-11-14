@@ -410,23 +410,28 @@ void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *mo
                                                                             sizeof(const char *));
         const char **qns = (const char **)cbm_arena_alloc(ctx->arena, (size_t)(capacity + 1) *
                                                                           sizeof(const char *));
+        const char **sources =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(const char *));
         unsigned char *kinds =
             (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(unsigned char));
-        if (!names || !qns || !kinds)
+        if (!names || !qns || !sources || !kinds)
             return;
         for (int i = 0; i < ctx->import_count; i++) {
             CBM_LSP_WORK(1);
             names[i] = ctx->import_local_names[i];
             qns[i] = ctx->import_module_qns[i];
+            sources[i] = ctx->import_source_qns[i];
             kinds[i] = ctx->import_kinds ? ctx->import_kinds[i] : 0;
         }
         ctx->import_local_names = names;
         ctx->import_module_qns = qns;
+        ctx->import_source_qns = sources;
         ctx->import_kinds = kinds;
         ctx->import_capacity = capacity;
     }
     ctx->import_local_names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
     ctx->import_module_qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->import_source_qns[ctx->import_count] = ctx->import_module_qns[ctx->import_count];
     ctx->import_kinds[ctx->import_count] = 0;
     ctx->import_local_names[new_count] = NULL;
     ctx->import_module_qns[new_count] = NULL;
@@ -3002,12 +3007,14 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
      * map only. Several defs may import one name: each statement matches the
      * entries afresh instead of consuming one. Unmatched, it binds UNKNOWN. */
     if (strcmp(k, "import_statement") == 0 || strcmp(k, "import_from_statement") == 0) {
-        unsigned char *fresh = NULL;
-        if (ctx->import_count > 0) {
-            fresh = (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)ctx->import_count);
-            if (fresh)
-                memset(fresh, 0, (size_t)ctx->import_count);
+        if (ctx->import_count > ctx->def_import_consumed_cap) {
+            ctx->def_import_consumed =
+                (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)ctx->import_count);
+            ctx->def_import_consumed_cap = ctx->def_import_consumed ? ctx->import_count : 0;
         }
+        unsigned char *fresh = ctx->import_count > 0 ? ctx->def_import_consumed : NULL;
+        if (fresh)
+            memset(fresh, 0, (size_t)ctx->import_count);
         py_replay_import_statement(ctx, node, fresh);
         return;
     }
@@ -5871,7 +5878,10 @@ static void py_replay_import_local(PyLSPContext *ctx, TSNode stmt, const char *l
             !ctx->import_module_qns[i] || strcmp(ctx->import_local_names[i], local) != 0) {
             continue;
         }
-        const char *candidate_qn = ctx->import_module_qns[i];
+        /* Match the path the row was added with: an earlier replay may have
+         * canonicalized import_module_qns[i] to a re-export target, which the
+         * same statement in another def no longer spells (#2285). */
+        const char *candidate_qn = ctx->import_source_qns[i];
         PyDirectImportKind kind = py_import_kind_from_statement(ctx, stmt, local, &candidate_qn);
         if (!py_replayable_import_kind(kind))
             continue;

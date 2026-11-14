@@ -70,7 +70,15 @@ typedef struct {
     // Built from CBMFileResult.imports.
     const char **import_local_names;
     const char **import_module_qns;
+    // The module_qn each row was added with, never rewritten: an import
+    // statement is matched against it, while import_module_qns carries the
+    // canonical QN a replay bound (a re-export target, #2285).
+    const char **import_source_qns;
     unsigned char *import_kinds; // internal PyDirectImportKind, classified once from the AST
+    // A def's import statement matches the rows afresh: their consumed flags,
+    // cleared per statement (py_process_statement), grown with import_count.
+    unsigned char *def_import_consumed;
+    int def_import_consumed_cap;
     int import_count;
     int import_capacity;     // rows the three arrays hold (py_lsp_add_import)
     CBMNameRows import_rows; // import_local_names by name, rows in table order
