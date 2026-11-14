@@ -520,6 +520,29 @@ def section_churn_stability(binary, work):
         kill_pid(daemon_pid)
 
 
+def read_cleanup_trace(err_path, cache, traces):
+    # The supervisor removes successful worker logs while this guard polls them.
+    paths = [err_path]
+    log_dir = os.path.join(cache, "logs")
+    if os.path.isdir(log_dir):
+        paths.extend(os.path.join(log_dir, name) for name in os.listdir(log_dir)
+                     if name.startswith(".worker-log-"))
+    unavailable = []
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                traces[path] = handle.read()
+        except FileNotFoundError:
+            pass
+        except PermissionError as error:
+            # Windows also refuses opens during deletion/sharing contention.
+            # Keep the last trace and retry on the next poll; retain diagnostics.
+            if path == err_path or getattr(error, "winerror", None) not in (5, 32):
+                raise
+            unavailable.append(("worker trace temporarily unreadable: " + str(error)).encode())
+    return b"\n".join(list(traces.values()) + unavailable)
+
+
 def section_local_cleanup_waits_for_startup_gate(binary, work):
     """A live startup owner must not turn completed local work into failure."""
     if os.name != "nt":
@@ -553,22 +576,6 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
     locked = False
     traces = {}
 
-    def read_trace():
-        # The daemon supervises indexing in a worker. Worker progress goes to
-        # its own durable log; the outer CLI only reports the final response.
-        paths = [err_path]
-        log_dir = os.path.join(cache, "logs")
-        if os.path.isdir(log_dir):
-            paths.extend(os.path.join(log_dir, name) for name in os.listdir(log_dir)
-                         if name.startswith(".worker-log-"))
-        for path in paths:
-            try:
-                with open(path, "rb") as handle:
-                    traces[path] = handle.read()
-            except FileNotFoundError:
-                pass  # The supervisor removes a successful worker's log.
-        return b"\n".join(traces.values())
-
     with open(gates[0], "r+b") as gate, open(err_path, "wb") as errors:
         try:
             process = subprocess.Popen(
@@ -581,7 +588,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
             # Extraction is after begin_work released startup-v2. Observe that
             # event before acquiring the real one-byte native startup lock.
             while time.monotonic() < deadline:
-                trace = read_trace()
+                trace = read_cleanup_trace(err_path, cache, traces)
                 if b"msg=parallel.extract" in trace or b"msg=pass.definitions" in trace:
                     gate.seek(0)
                     try:
@@ -598,7 +605,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
             if not locked:
                 raise SetupFailure("index never entered local work:\n" + excerpt(trace))
             while time.monotonic() < deadline:
-                trace = read_trace()
+                trace = read_cleanup_trace(err_path, cache, traces)
                 if b"Completed index_repository (" in trace:
                     break
                 if process.poll() is not None:
@@ -619,7 +626,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
             msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
             locked = False
             stdout, _ = process.communicate(timeout=30)
-            trace = read_trace()
+            trace = read_cleanup_trace(err_path, cache, traces)
             if not stayed_alive or process.returncode != 0 or b"cleanup_timeout" in trace:
                 print("RED: completed work must wait out startup contention and exit 0 "
                       "after release (rc=%s):\n%s" %

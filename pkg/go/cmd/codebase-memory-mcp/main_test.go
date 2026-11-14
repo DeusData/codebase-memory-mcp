@@ -5,10 +5,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1386,5 +1388,103 @@ func TestReleaseVersionFromModuleVersion(t *testing.T) {
 		if got := releaseVersionFrom(c.module, "fallback"); got != c.want {
 			t.Errorf("releaseVersionFrom(%q) = %q, want %q", c.module, got, c.want)
 		}
+	}
+}
+
+// Re-executed as a candidate binary; the connection holds it until released.
+func TestVerifyCandidateProcess(t *testing.T) {
+	address := os.Getenv("CBM_TEST_VERIFY_ADDRESS")
+	if address == "" {
+		return
+	}
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		os.Exit(2)
+	}
+	defer connection.Close()
+	if _, err := connection.Write([]byte("ready")); err != nil {
+		os.Exit(3)
+	}
+	var release [1]byte
+	if _, err := io.ReadFull(connection, release[:]); err != nil {
+		os.Exit(4)
+	}
+	os.Exit(int(release[0]))
+}
+
+func TestVerifyCandidateWaitsForResult(t *testing.T) {
+	for _, exitCode := range []byte{0, 7} {
+		t.Run(fmt.Sprintf("exit_%d", exitCode), func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			// This bound only aborts a hung test, never decides a successful result.
+			guard, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			accepted := make(chan net.Conn, 1)
+			go func() {
+				connection, err := listener.Accept()
+				if err == nil {
+					accepted <- connection
+				}
+			}()
+			done := make(chan error, 1)
+			go func() {
+				done <- verifyCandidateWithCommand("candidate", func(ctx context.Context, path string, args ...string) *exec.Cmd {
+					if _, deadline := ctx.Deadline(); deadline {
+						t.Error("candidate verification must wait for its result, without a deadline")
+					}
+					if path != "candidate" || !reflect.DeepEqual(args, []string{"--version"}) {
+						t.Errorf("candidate command = %q %q", path, args)
+					}
+					command := exec.CommandContext(guard, os.Args[0], "-test.run=^TestVerifyCandidateProcess$")
+					command.Env = append(os.Environ(), "CBM_TEST_VERIFY_ADDRESS="+listener.Addr().String())
+					return command
+				})
+			}()
+			var connection net.Conn
+			select {
+			case connection = <-accepted:
+			case err := <-done:
+				t.Fatalf("verification returned before handshake: %v", err)
+			case <-guard.Done():
+				t.Fatal("candidate handshake hung")
+			}
+			defer connection.Close()
+			if err := connection.SetDeadline(time.Now().Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			ready := make([]byte, len("ready"))
+			if _, err := io.ReadFull(connection, ready); err != nil || string(ready) != "ready" {
+				t.Fatalf("candidate handshake = %q, %v", ready, err)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("verification returned while candidate held: %v", err)
+			default:
+			}
+			if _, err := connection.Write([]byte{exitCode}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if exitCode == 0 && err != nil {
+					t.Fatal(err)
+				}
+				if exitCode != 0 {
+					var exitError *exec.ExitError
+					if !errors.As(err, &exitError) || exitError.ExitCode() != int(exitCode) {
+						t.Fatalf("verification error = %v, want exit %d", err, exitCode)
+					}
+				}
+			case <-guard.Done():
+				t.Fatal("verification hung after candidate release")
+			}
+		})
+	}
+	if err := verifyCandidate(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("verification accepted a missing executable")
 	}
 }

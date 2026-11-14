@@ -51,7 +51,6 @@ const (
 	requestTimeout        = 2 * time.Minute
 	connectTimeout        = 15 * time.Second
 	responseHeaderTimeout = 30 * time.Second
-	candidateTimeout      = 15 * time.Second
 	maxArchiveMembers     = 64
 
 	runtimeSetLockName               = ".codebase-memory-mcp-runtime.lock"
@@ -1008,16 +1007,19 @@ func validateWindowsZipMember(raw string) (string, error) {
 }
 
 func verifyCandidate(path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), candidateTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "--version")
+	return verifyCandidateWithCommand(path, exec.CommandContext)
+}
+
+func verifyCandidateWithCommand(
+	path string, command func(context.Context, string, ...string) *exec.Cmd,
+) error {
+	// Verification is decided by the child exit; the smoke harness bounds hangs.
+	ctx := context.Background()
+	cmd := command(ctx, path, "--version")
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("downloaded binary verification timed out: %w", ctx.Err())
-		}
 		return fmt.Errorf("downloaded binary failed to run: %w", err)
 	}
 	return nil

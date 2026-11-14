@@ -140,8 +140,18 @@ smoke_go() {
         ran go "$dir/install.log" "$rc"
         return
     fi
-    # The first run downloads the binary into the wrapper's cache.
-    isolated "$dir" "$dir/codebase-memory-mcp$EXE" --version >"$dir/run.log" 2>&1 || rc=$?
+    local py=""
+    if command -v python3 >/dev/null 2>&1; then
+        py=python3
+    elif command -v python >/dev/null 2>&1; then
+        py=python
+    else
+        missing go "Python 3 (outer hang guard)"
+        return
+    fi
+    # The first run downloads the binary. The outer guard diagnoses hangs;
+    # the verifier itself waits for the binary's exit, regardless of runner speed.
+    isolated "$dir" "$py" "$ROOT/scripts/smoke-wrapper-run.py" "$dir/codebase-memory-mcp$EXE" --version >"$dir/run.log" 2>&1 || rc=$?
     ran go "$dir/run.log" "$rc"
 }
 
