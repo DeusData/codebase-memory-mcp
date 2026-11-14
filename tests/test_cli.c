@@ -20595,6 +20595,130 @@ TEST(cli_install_managed_binary_config_path_issue2722) {
     PASS();
 }
 
+/* Entries of dir other than "." and "..", or -1 when it cannot be read. */
+static int cli_count_dir_entries(const char *dir) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return -1;
+    }
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            count++;
+        }
+    }
+    cbm_closedir(d);
+    return count;
+}
+
+#define CLI_KEPT_BINARY_BYTES "a different binary that must stay byte-identical"
+
+typedef struct {
+    int rc;
+    bool target_byte_identical;
+    /* A republish (stage + rename) gives the target a new inode even when the
+     * bytes it publishes are the same, e.g. a re-signed copy of itself. */
+    bool target_same_file;
+    int bin_dir_entries;
+} cli_kept_binary_outcome_t;
+
+/* HOME=<tmp> whose ~/.local/bin/codebase-memory-mcp already holds a DIFFERENT
+ * binary. With managed_self, the running binary reports a mise-owned path, so
+ * install infers "externally managed" (#1566/#2722) instead of being told. */
+static cli_kept_binary_outcome_t cli_install_over_different_binary(bool managed_self, int argc,
+                                                                   char **argv) {
+    cli_kept_binary_outcome_t outcome = {.rc = -1, .bin_dir_entries = -1};
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-kept-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return outcome;
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    struct stat target_before;
+    memset(&target_before, 0, sizeof(target_before));
+    bool prepared = write_test_file(bin_target, CLI_KEPT_BINARY_BYTES) == 0 &&
+                    stat(bin_target, &target_before) == 0;
+
+    char managed_dir[512];
+    char managed_path[640];
+    snprintf(managed_dir, sizeof(managed_dir), "%s/.local/share/mise/installs/cbm/9.9.9/bin",
+             tmpdir);
+    snprintf(managed_path, sizeof(managed_path), "%s/codebase-memory-mcp", managed_dir);
+    if (managed_self) {
+        test_mkdirp(managed_dir);
+        prepared = prepared && write_test_file(managed_path, "the mise-managed binary") == 0;
+        cbm_cli_set_self_path_override_for_test(managed_path);
+    }
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    if (prepared) {
+        outcome.rc = cli_test_cmd_install(argc, argv);
+    }
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_self_path_override_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    char *kept = read_test_file_alloc(bin_target);
+    outcome.target_byte_identical = kept && strcmp(kept, CLI_KEPT_BINARY_BYTES) == 0;
+    free(kept);
+    struct stat target_after;
+    outcome.target_same_file = prepared && stat(bin_target, &target_after) == 0 &&
+                               target_after.st_dev == target_before.st_dev &&
+                               target_after.st_ino == target_before.st_ino;
+    outcome.bin_dir_entries = cli_count_dir_entries(bin_dir);
+
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+    return outcome;
+}
+
+/* `install --skip-binary --yes` printed "Skipping binary placement" and then
+ * answered the "A different binary already exists ... Replace it?" prompt
+ * with the auto-yes, replacing the very binary the flag promised to leave
+ * alone. The target must stay byte-identical, with nothing staged beside it. */
+TEST(cli_install_skip_binary_keeps_a_different_existing_binary) {
+    char *argv[] = {"--skip-binary", "--skip-config", "--yes"};
+    cli_kept_binary_outcome_t outcome = cli_install_over_different_binary(false, 3, argv);
+    ASSERT_EQ(outcome.rc, 0);
+    ASSERT_TRUE(outcome.target_byte_identical);
+    ASSERT_TRUE(outcome.target_same_file);
+    ASSERT_EQ(outcome.bin_dir_entries, 1);
+    PASS();
+}
+
+/* #2722: an externally managed binary (here: mise) leaves ~/.local/bin alone.
+ * The same prompt used to replace a different binary already there. */
+TEST(cli_install_managed_binary_keeps_a_different_existing_binary_issue2722) {
+    char *argv[] = {"--skip-config", "--yes"};
+    cli_kept_binary_outcome_t outcome = cli_install_over_different_binary(true, 2, argv);
+    ASSERT_EQ(outcome.rc, 0);
+    ASSERT_TRUE(outcome.target_byte_identical);
+    ASSERT_TRUE(outcome.target_same_file);
+    ASSERT_EQ(outcome.bin_dir_entries, 1);
+    PASS();
+}
+
 /* #1558: `install` configured EVERY detected client, so a user who wanted
  * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
  * install silently recreated them. The selector restricts it.
@@ -21360,6 +21484,8 @@ SUITE(cli) {
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_install_managed_binary_config_path_issue2722);
+    RUN_TEST(cli_install_skip_binary_keeps_a_different_existing_binary);
+    RUN_TEST(cli_install_managed_binary_keeps_a_different_existing_binary_issue2722);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
     RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
