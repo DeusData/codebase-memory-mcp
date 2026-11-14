@@ -31731,6 +31731,147 @@ static unsigned char *read_file_bytes(const char *path, size_t *len_out) {
     return buf;
 }
 
+/* An archive's unrelated definitions must not size C#/JVM scratch copies.
+ * Keep the same matching defs and compare the real arena capacity, rather
+ * than relying on RSS or a machine being short of memory. */
+TEST(pipeline_cross_registry_ignores_unrelated_allocation_size) {
+    enum { NOISE = 50000, MATCHES = 3 };
+    CBMLSPDef *defs = calloc(NOISE + MATCHES, sizeof(*defs));
+    ASSERT_NOT_NULL(defs);
+    for (int i = 0; i < NOISE; i++) {
+        defs[i] = (CBMLSPDef){.lang = CBM_LANG_JSON,
+                              .qualified_name = "archive.entry",
+                              .short_name = "entry",
+                              .label = "Variable"};
+    }
+    const CBMLanguage langs[] = {CBM_LANG_CSHARP, CBM_LANG_JAVA};
+    size_t small[2] = {0}, mixed[2] = {0};
+    bool valid = true;
+    for (int li = 0; li < 2; li++) {
+        /* A method before its type also exercises the stable type-first split. */
+        defs[NOISE] = (CBMLSPDef){.lang = langs[li],
+                                  .label = "Method",
+                                  .qualified_name = "example.Widget.run",
+                                  .short_name = "run",
+                                  .receiver_type = "example.Widget"};
+        defs[NOISE + 1] = (CBMLSPDef){.lang = langs[li],
+                                      .label = "Class",
+                                      .qualified_name = "example.Widget",
+                                      .short_name = "Widget"};
+        defs[NOISE + 2] = (CBMLSPDef){.lang = CBM_LANG_KOTLIN,
+                                      .label = "Class",
+                                      .qualified_name = "example.KWidget",
+                                      .short_name = "KWidget"};
+        for (int big = 0; big < 2; big++) {
+            CBMArena arena;
+            cbm_arena_init(&arena);
+            CBMLSPDef *slice = big ? defs : defs + NOISE;
+            int count = big ? NOISE + MATCHES : MATCHES;
+            CBMTypeRegistry *reg = li == 0 ? cbm_cs_build_cross_registry(&arena, slice, count)
+                                           : cbm_java_build_cross_registry(&arena, slice, count);
+            valid = valid && reg && cbm_registry_lookup_type(reg, "example.Widget");
+            if (li == 1) {
+                valid = valid && reg && cbm_registry_lookup_type(reg, "example.KWidget");
+            }
+            if (big) {
+                mixed[li] = cbm_arena_capacity(&arena);
+            } else {
+                small[li] = cbm_arena_capacity(&arena);
+            }
+            cbm_arena_destroy(&arena);
+        }
+    }
+    free(defs);
+    ASSERT_TRUE(valid);
+    ASSERT_EQ(mixed[0], small[0]);
+    ASSERT_EQ(mixed[1], small[1]);
+    PASS();
+}
+
+TEST(pipeline_cross_collect_refuses_oversized_array_before_reading_defs) {
+    /* No backing definition array: an attempted copy would crash under ASan.
+     * Metadata alone proves the proposed array cannot fit the remaining budget. */
+    CBMFileResult result = {0};
+    result.defs.count = 1000000;
+    CBMFileResult *cache[] = {&result};
+    cbm_file_info_t files[] = {{.rel_path = "archive.json", .language = CBM_LANG_JSON}};
+    char *modules[] = {NULL};
+    int starts[] = {7, 9};
+    int count = 0;
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    size_t saved = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests(1024 * 1024);
+    cbm_mem_set_charged_for_tests(512 * 1024);
+    CBMLSPDef *defs =
+        cbm_pxc_collect_all_defs(NULL, &arena, cache, files, 1, "budget", modules, &count, starts);
+    cbm_mem_set_charged_for_tests(0);
+    cbm_mem_set_budget_for_tests(saved);
+    free(defs);
+    cbm_arena_destroy(&arena);
+    free(modules[0]);
+    ASSERT_NULL(defs);
+    ASSERT_EQ(count, CBM_PXC_DEFS_OVER_BUDGET);
+    ASSERT_EQ(starts[0], 0);
+    ASSERT_EQ(starts[1], 0);
+    PASS();
+}
+
+TEST(pipeline_cross_prepare_budget_preserves_serving_generation) {
+    if (!write_backpressure_fixture()) {
+        FAIL("failed to create fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cross-budget.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    int first = p ? cbm_pipeline_run(p) : -1;
+    cbm_pipeline_free(p);
+    size_t before_len = 0;
+    unsigned char *before = read_file_bytes(db_path, &before_len);
+    bool written = true;
+    for (int i = 0; i < 64; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/f%02d.go", g_tmpdir, i);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            written = false;
+            break;
+        }
+        fprintf(f, "package main\n");
+        for (int j = 0; j < 256; j++) {
+            fprintf(f, "func F%02d_%03d() int { return %d }\n", i, j, j);
+        }
+        fclose(f);
+    }
+    /* Extraction sees charge below budget, so its backpressure gate cannot
+     * cause this refusal. The cross-def array exceeds the remaining 1 MiB. */
+    size_t saved = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests(16 * 1024 * 1024);
+    cbm_mem_set_charged_for_tests(15 * 1024 * 1024);
+    cbm_pp_bp_nap_cycles_reset();
+    p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    int second = p ? cbm_pipeline_run(p) : -1;
+    long cycles = cbm_pp_bp_nap_cycles();
+    cbm_mem_set_charged_for_tests(0);
+    cbm_mem_set_budget_for_tests(saved);
+    cbm_pipeline_free(p);
+    size_t after_len = 0;
+    unsigned char *after = read_file_bytes(db_path, &after_len);
+    bool same =
+        before && after && before_len == after_len && memcmp(before, after, before_len) == 0;
+    int stages = count_generation_stage_artifacts(g_tmpdir, "cross-budget.db");
+    free(before);
+    free(after);
+    teardown_test_repo();
+    ASSERT_EQ(first, 0);
+    ASSERT_TRUE(written);
+    ASSERT_EQ(second, CBM_PIPELINE_ABORT_OVER_BUDGET);
+    ASSERT_EQ(cycles, 0);
+    ASSERT_TRUE(same);
+    ASSERT_EQ(stages, 0);
+    PASS();
+}
+
 TEST(pipeline_backpressure_futile_nap_disengages) {
     /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
      * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
@@ -34985,6 +35126,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing);
     RUN_TEST(pipeline_late_source_limit_preserves_previous_generation);
     /* Extraction back-pressure */
+    RUN_TEST(pipeline_cross_registry_ignores_unrelated_allocation_size);
+    RUN_TEST(pipeline_cross_collect_refuses_oversized_array_before_reading_defs);
+    RUN_TEST(pipeline_cross_prepare_budget_preserves_serving_generation);
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     RUN_TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
