@@ -2529,6 +2529,75 @@ TEST(ei_pkgmap_duplicate_package_name_at_equal_depth_is_settled_by_path) {
     PASS();
 }
 
+/* One manifest can yield two candidates for its own package name: a
+ * pyproject.toml registers src/<name> first and <name> second, and the first
+ * has always won. Ordering the manifests of a repository (above) must not
+ * reorder the candidates of one manifest. When the nearest-the-root rule was
+ * applied to every candidate of a name, the second one won for every Python
+ * package, and flask's `from flaskr import create_app` in examples/tutorial
+ * bound to the celery example's create_app. */
+static char *ei_pkgmap_pyproject_winner(bool tutorial_parsed_by_first_worker) {
+    static const char tutorial[] = "[project]\nname = \"flaskr\"\n";
+    static const char celery[] = "[project]\nname = \"flask-example-celery\"\n";
+    cbm_pkg_entries_t workers[2];
+    cbm_pkg_entries_init(&workers[0]);
+    cbm_pkg_entries_init(&workers[1]);
+    int tutorial_worker = tutorial_parsed_by_first_worker ? 0 : 1;
+    bool parsed =
+        cbm_pkgmap_try_parse("pyproject.toml", "examples/tutorial/pyproject.toml", tutorial,
+                             (int)strlen(tutorial), &workers[tutorial_worker]) &&
+        cbm_pkgmap_try_parse("pyproject.toml", "examples/celery/pyproject.toml", celery,
+                             (int)strlen(celery), &workers[1 - tutorial_worker]);
+    CBMHashTable *map = parsed ? cbm_pkgmap_build(workers, 2, "proj") : NULL;
+    const char *qn = map ? (const char *)cbm_ht_get(map, "flaskr") : NULL;
+    char *winner = qn ? strdup(qn) : NULL;
+    if (map) {
+        cbm_pkgmap_free(map);
+    }
+    cbm_pkg_entries_free(&workers[0]);
+    cbm_pkg_entries_free(&workers[1]);
+    return winner;
+}
+
+TEST(ei_pkgmap_one_manifest_keeps_its_candidate_order) {
+    char *want = cbm_pipeline_fqn_module("proj", "examples/tutorial/src/flaskr/__init__");
+    char *tutorial_first = ei_pkgmap_pyproject_winner(true);
+    char *celery_first = ei_pkgmap_pyproject_winner(false);
+    bool tutorial_first_ok = want && tutorial_first && strcmp(tutorial_first, want) == 0;
+    bool celery_first_ok = want && celery_first && strcmp(celery_first, want) == 0;
+    free(want);
+    free(tutorial_first);
+    free(celery_first);
+    ASSERT_TRUE(tutorial_first_ok);
+    ASSERT_TRUE(celery_first_ok);
+    PASS();
+}
+
+/* The same defect seen from the graph: an example project's test imports its
+ * own package by name, and a sibling example defines a function of the same
+ * name. The import must bind the importing project's own package. */
+TEST(ei_python_example_project_import_binds_its_own_package) {
+    static const EILangFile f[] = {
+        {"examples/celery/pyproject.toml", "[project]\nname = \"flask-example-celery\"\n"},
+        {"examples/celery/src/task_app/__init__.py", "def create_app():\n    return 1\n"},
+        {"examples/tutorial/pyproject.toml", "[project]\nname = \"flaskr\"\n"},
+        {"examples/tutorial/flaskr/__init__.py", "def create_app(config=None):\n    return 2\n"},
+        {"examples/tutorial/tests/conftest.py",
+         "from flaskr import create_app\n\ndef app():\n    return create_app()\n"}};
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 5);
+    char target[512] = "";
+    int edges =
+        store ? ei_import_target_path(store, lp.project, "examples/tutorial/tests/conftest.py",
+                                      "create_app", target, sizeof(target))
+              : -1;
+    bool own_package = strcmp(target, "examples/tutorial/flaskr/__init__.py") == 0;
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(edges, 1);
+    ASSERT_TRUE(own_package);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -2637,5 +2706,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_binding_snapshot_groups_kinds_and_invalidates_failed_rebuild);
     RUN_TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown);
     RUN_TEST(ei_pkgmap_duplicate_package_name_prefers_root_manifest_in_any_worker_order);
+    RUN_TEST(ei_pkgmap_one_manifest_keeps_its_candidate_order);
+    RUN_TEST(ei_python_example_project_import_binds_its_own_package);
     RUN_TEST(ei_pkgmap_duplicate_package_name_at_equal_depth_is_settled_by_path);
 }
