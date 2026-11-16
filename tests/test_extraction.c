@@ -9930,6 +9930,105 @@ TEST(extract_python_bare_call_flags_locally_bound_callee) {
     PASS();
 }
 
+/* #1355: the JS/TS twin of the Python flag above. A bare call is flagged when
+ * its nearest binding is a local that names no definition of the project: a
+ * parameter, a declarator whose initializer is not a function
+ * (`const submitForm = useCallback(...)`), an array-pattern element. Pins both
+ * directions, and the whole-scope rule: `lateBound` is declared after the
+ * handler that calls it. A shorthand object-pattern name is not a binding
+ * occurrence of the walk, so `removeItem` stays unflagged. */
+TEST(extract_tsx_bare_call_flags_locally_bound_callee) {
+    CBMFileResult *r = extract("import { useCallback, useState } from 'react';\n"
+                               "import { imported } from './lib';\n"
+                               "import { useStore } from './useStore';\n"
+                               "\n"
+                               "const moduleConst = wrap(() => 1);\n"
+                               "\n"
+                               "export function Panel(props: Props, onParam: () => void) {\n"
+                               "  const [open, setOpen] = useState(false);\n"
+                               "  const { removeItem } = useStore();\n"
+                               "  const submitForm = useCallback(async (v: string) => v, []);\n"
+                               "  const typedLocal = pick() as () => void;\n"
+                               "  const plainArrow = () => 1;\n"
+                               "  const castArrow = ((x: number) => x) as Fn;\n"
+                               "  function nestedDecl() { return 2; }\n"
+                               "  const go = () => {\n"
+                               "    submitForm('x');\n"
+                               "    lateBound();\n"
+                               "    setOpen(!open);\n"
+                               "    onParam();\n"
+                               "    typedLocal();\n"
+                               "    removeItem(1);\n"
+                               "    plainArrow();\n"
+                               "    castArrow(1);\n"
+                               "    nestedDecl();\n"
+                               "    moduleLevel();\n"
+                               "    moduleConst();\n"
+                               "    imported();\n"
+                               "  };\n"
+                               "  const lateBound = useCallback(() => 0, []);\n"
+                               "  return <button onClick={go} />;\n"
+                               "}\n"
+                               "\n"
+                               "export function sibling() {\n"
+                               "  return unboundHere();\n"
+                               "}\n",
+                               CBM_LANG_TSX, "t", "Panel.tsx");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    struct {
+        const char *callee;
+        bool expect_bound;
+        int seen;
+    } cases[] = {
+        {"submitForm", true, 0},   /* const x = useCallback(...): the reported shape    */
+        {"lateBound", true, 0},    /* same, declared after the caller (const TDZ scope) */
+        {"setOpen", true, 0},      /* array-pattern element                             */
+        {"onParam", true, 0},      /* parameter                                         */
+        {"typedLocal", true, 0},   /* call result behind a type assertion               */
+        {"removeItem", false, 0},  /* object-pattern key: names a member, keep guess    */
+        {"plainArrow", false, 0},  /* arrow-valued const: a real definition             */
+        {"castArrow", false, 0},   /* arrow behind parentheses and `as`                 */
+        {"nestedDecl", false, 0},  /* nested function declaration                       */
+        {"moduleLevel", false, 0}, /* unbound: the true cross-file edge                 */
+        {"moduleConst", false, 0}, /* module-scope binding, not a local                 */
+        {"imported", false, 0},    /* import binding                                    */
+        {"unboundHere", false, 0}, /* unbound in a sibling function                     */
+    };
+    const int case_count = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (!cn) {
+            continue;
+        }
+        for (int c = 0; c < case_count; c++) {
+            if (strcmp(cn, cases[c].callee) != 0) {
+                continue;
+            }
+            cases[c].seen++;
+            if (r->calls.items[i].callee_is_locally_bound != cases[c].expect_bound) {
+                printf("  bare-call flag mismatch for %s(): got %d, expected %d\n", cases[c].callee,
+                       r->calls.items[i].callee_is_locally_bound ? 1 : 0,
+                       cases[c].expect_bound ? 1 : 0);
+            }
+            ASSERT_EQ(r->calls.items[i].callee_is_locally_bound, cases[c].expect_bound);
+        }
+    }
+    /* Each shape must appear exactly once, so a missed extraction cannot let the
+     * loop above pass vacuously. */
+    for (int c = 0; c < case_count; c++) {
+        if (cases[c].seen != 1) {
+            printf("  bare call %s() extracted %d times, expected 1\n", cases[c].callee,
+                   cases[c].seen);
+        }
+        ASSERT_EQ(cases[c].seen, 1);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_go_selector_call_flags_is_method) {
     /* Go selector calls are flagged so the weak-match guard can fire when the
      * Go LSP cannot type the receiver; bare calls stay unflagged. */
@@ -15690,6 +15789,7 @@ SUITE(extraction) {
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
+    RUN_TEST(extract_tsx_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_go_selector_call_flags_is_method);
     RUN_TEST(extract_go_method_receiver_qualified_qn);

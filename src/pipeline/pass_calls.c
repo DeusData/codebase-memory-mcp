@@ -1346,10 +1346,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                 lang == CBM_LANG_SWIFT;
     /* Bare-call local-binding suppression. A member call has a receiver the
      * guard above can reason about; a bare `run()` has none, so that guard
-     * cannot see this class at all. Python-only today because the extraction
-     * flag is set only for Python — this gate MUST match pass_parallel.c's
-     * exactly, for the same divergence reason noted above. */
-    bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+     * cannot see this class at all. The language set is the one the extractor
+     * sets the flag for, and lives in the helper so that this gate and
+     * pass_parallel.c's cannot diverge. */
+    bool suppress_weak_local_binding = cbm_weak_local_binding_guard_lang(lang);
     /* The member guard's one exemption (Python, self/cls-rooted receiver,
      * unique_name, not a builtin type's method) — see
      * cbm_weak_member_unique_name_exempt. MUST match pass_parallel.c exactly. */

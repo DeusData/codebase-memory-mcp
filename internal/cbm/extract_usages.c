@@ -2126,6 +2126,63 @@ static bool js_var_binding(TSNode node) {
     return false;
 }
 
+static bool js_family_language(CBMLanguage language) {
+    return language == CBM_LANG_JAVASCRIPT || language == CBM_LANG_TYPESCRIPT ||
+           language == CBM_LANG_TSX || language == CBM_LANG_ARKTS;
+}
+
+/* Does a JS/TS declarator's initializer declare a function or class under the
+ * declarator's name? Those are graph definitions (`const save = () => {}`), so
+ * a call of the name has a real target. Type-only wrappers are looked through. */
+static bool js_value_declares_callable(TSNode value) {
+    for (int hops = 0; hops < CBM_SZ_8 && !ts_node_is_null(value); hops++) {
+        const char *kind = ts_node_type(value);
+        bool wrapper =
+            strcmp(kind, "parenthesized_expression") == 0 || strcmp(kind, "as_expression") == 0 ||
+            strcmp(kind, "satisfies_expression") == 0 || strcmp(kind, "non_null_expression") == 0;
+        if (!wrapper) {
+            return strcmp(kind, "arrow_function") == 0 ||
+                   strcmp(kind, "function_expression") == 0 || strcmp(kind, "function") == 0 ||
+                   strcmp(kind, "generator_function") == 0 || strcmp(kind, "class") == 0;
+        }
+        value = ts_node_named_child(value, 0);
+    }
+    return false;
+}
+
+/* True when a JS/TS binding names no definition of the project: a parameter,
+ * a declarator whose initializer is not a function or class
+ * (`const save = useCallback(...)`), or an array-pattern element
+ * (`const [open, setOpen] = useState()`). The declaration chose the name, so a
+ * project function that merely shares it is unrelated.
+ *
+ * Deliberately NOT flagged: a nested function declaration and a function-valued
+ * declarator (real definitions), a renamed object-pattern value and a
+ * declarator without initializer (assigned later, unknown). A shorthand
+ * object-pattern name (`const { removeItem } = useStore()`, a destructured
+ * prop) is no binding occurrence for this walk at all, so it is never flagged
+ * either; in a declarator that name is a member some definition does declare. */
+static bool js_binding_names_no_definition(TSNode node, bool parameter) {
+    if (parameter) {
+        return true;
+    }
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) {
+        return false;
+    }
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "array_pattern") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "variable_declarator") != 0) {
+        return false;
+    }
+    TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+    TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
+    return !ts_node_is_null(name) && ts_node_eq(name, node) && !ts_node_is_null(value) &&
+           !js_value_declares_callable(value);
+}
+
 static bool import_kind_matches(TSNode node, const CBMLangSpec *spec) {
     return (spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types)) ||
            (spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types));
@@ -2412,8 +2469,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     } else if (ctx->language == CBM_LANG_POWERSHELL) {
         scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
         whole_scope = true;
-    } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-               ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
+    } else if (js_family_language(ctx->language)) {
         bool is_var = js_var_binding(node);
         scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
         if (scope_id == 0) {
@@ -2449,6 +2505,9 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
      * signature/body languages extend the scope after parameters are seen. */
     binding->active_end = 0;
     binding->name = name;
+    binding->names_no_definition = !import_binding && ts_node_is_null(function_declaration) &&
+                                   js_family_language(ctx->language) &&
+                                   js_binding_names_no_definition(node, parameter);
 }
 
 static int compare_lexical_bindings(const void *left_ptr, const void *right_ptr) {
@@ -2531,6 +2590,84 @@ static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *s
     return NULL;
 }
 
+/* Innermost lexical scope holding `position`, 0 when none does. Scopes are
+ * appended as the walk opens them, so their start bytes never decrease: the
+ * last one starting at or before the position is the innermost candidate, and
+ * each one that already closed hands over to its parent. */
+static uint32_t lexical_scope_at(const WalkState *state, uint32_t position) {
+    int low = 0;
+    int high = state->lexical_scope_count;
+    while (low < high) {
+        int middle = low + (high - low) / PAIR_LEN;
+        if (state->lexical_scopes[middle].start_byte <= position) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    uint32_t scope_id = (uint32_t)low;
+    int remaining = state->lexical_scope_count;
+    while (scope_id != 0 && remaining-- > 0) {
+        const CBMLexicalScope *scope = usage_lexical_scope(state, scope_id);
+        if (!scope || position < scope->end_byte) {
+            break;
+        }
+        scope_id = scope->parent_id;
+    }
+    return scope_id;
+}
+
+/* JS/TS: flag every bare call `name()` whose nearest binding of `name` is a
+ * local one that names no definition (js_binding_names_no_definition). The
+ * resolver then refuses a weak short-name match for it, as it does for a
+ * Python parameter: `const submit = useCallback(...)` followed by `submit()`
+ * must not become a CALLS edge to an unrelated `submit` in a file the caller
+ * never imports.
+ *
+ * Runs after the walk because let/const/var bind their whole scope: a handler
+ * may call a local that is declared further down. A scope that binds the name
+ * more than once is flagged only when every active binding agrees, so a real
+ * nested definition always keeps its edge. On an allocation failure nothing is
+ * flagged, which costs a suppression and never a true edge. */
+static void flag_js_locally_bound_callees(CBMExtractCtx *ctx, const WalkState *state) {
+    for (int i = state->call_start_index; i < ctx->result->calls.count; i++) {
+        CBMCall *call = &ctx->result->calls.items[i];
+        const char *name = call->callee_name;
+        if (!name || !name[0] || strchr(name, '.') || call->site_end_byte == 0) {
+            continue;
+        }
+        uint32_t scope_id = lexical_scope_at(state, call->site_start_byte);
+        int remaining = state->lexical_scope_count;
+        while (scope_id != 0 && remaining-- > 0) {
+            const CBMLexicalScope *scope = usage_lexical_scope(state, scope_id);
+            if (!scope) {
+                break;
+            }
+            bool bound = false;
+            bool no_definition = true;
+            for (int b = lexical_binding_lower_bound(state, scope_id, name);
+                 b < state->lexical_binding_count; b++) {
+                const CBMLexicalBinding *binding = &state->lexical_bindings[b];
+                if (binding->scope_id != scope_id || strcmp(binding->name, name) != 0) {
+                    break;
+                }
+                uint32_t active_end = binding->active_end ? binding->active_end : scope->end_byte;
+                if (binding->active_start <= call->site_start_byte &&
+                    call->site_start_byte < active_end) {
+                    bound = true;
+                    no_definition = no_definition && binding->names_no_definition;
+                }
+            }
+            if (bound) {
+                call->callee_is_locally_bound =
+                    no_definition && scope->kind != CBM_LEXICAL_SCOPE_MODULE;
+                break;
+            }
+            scope_id = scope->lookup_parent_id;
+        }
+    }
+}
+
 void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
     if (!ctx || !state) {
         return;
@@ -2538,6 +2675,9 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
     if (state->lexical_binding_count > 1) {
         qsort(state->lexical_bindings, (size_t)state->lexical_binding_count,
               sizeof(*state->lexical_bindings), compare_lexical_bindings);
+    }
+    if (js_family_language(ctx->language) && !state->lexical_binding_tracking_failed) {
+        flag_js_locally_bound_callees(ctx, state);
     }
     for (int i = state->usage_start_index; i < ctx->result->usages.count; i++) {
         CBMUsage *usage = &ctx->result->usages.items[i];
