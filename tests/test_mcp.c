@@ -5203,8 +5203,7 @@ TEST(tool_search_graph_rejects_bm25_and_semantic_query_together) {
 
     char *tools = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(tools);
-    ASSERT_NOT_NULL(strstr(tools, "Empty array is ignored"));
-    ASSERT_NOT_NULL(strstr(tools, "omit query entirely"));
+    ASSERT_NOT_NULL(strstr(tools, "[] ignored; otherwise omit query."));
     free(tools);
 
     cbm_mcp_server_free(srv);
