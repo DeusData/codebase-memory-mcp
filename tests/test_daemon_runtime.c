@@ -5237,6 +5237,196 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
 }
 #endif
 
+/* The executable-image fingerprint cache short-circuits the full-image hash for
+ * a repeated file identity, and rolls its key when the binary changes so a
+ * rebuild or atomic replacement never returns a stale digest. Results are
+ * gathered first and asserted only after the stub is disarmed: an assertion
+ * returns early, and an armed stub would replace every later fingerprint in
+ * this process. */
+TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll) {
+    /* 64-hex placeholders, distinct enough to tell "cached" from "recomputed". */
+    static const char digest_a[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char digest_b[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t image = {1,   2,   3,  100,
+                                                                         200, 300, 400};
+    cbm_daemon_runtime_fingerprint_identity_for_testing_t rolled = image;
+    char miss[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char hit[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char mtime_rolled[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char ctime_rolled[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char inode_rolled[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    /* Miss: first sight of this identity pays the hash and stores digest_a. */
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest_a);
+    bool miss_ok = cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &image, miss);
+    int hashes_after_miss = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* Hit: the same identity returns the cached digest without calling the
+     * hash, even though the stub would now yield a different value. */
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest_b);
+    bool hit_ok = cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &image, hit);
+    int hashes_after_hit = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* Key roll: a changed mtime (a rebuilt binary) misses and recomputes. */
+    rolled = image;
+    rolled.mtime_seconds = 101;
+    bool mtime_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&rolled, &rolled, mtime_rolled);
+    int hashes_after_mtime_roll = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* A changed change time (an in-place write, a metadata edit) rolls it too. */
+    rolled = image;
+    rolled.ctime_seconds = 301;
+    bool ctime_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&rolled, &rolled, ctime_rolled);
+    int hashes_after_ctime_roll = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* A changed inode (atomic replacement) likewise rolls the key. */
+    rolled = image;
+    rolled.inode = 9;
+    bool inode_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&rolled, &rolled, inode_rolled);
+    int hashes_after_inode_roll = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+
+    ASSERT_TRUE(miss_ok);
+    ASSERT_STR_EQ(miss, digest_a);
+    ASSERT_EQ(hashes_after_miss, 1);
+    ASSERT_TRUE(hit_ok);
+    ASSERT_STR_EQ(hit, digest_a);
+    ASSERT_EQ(hashes_after_hit, 1);
+    ASSERT_TRUE(mtime_ok);
+    ASSERT_STR_EQ(mtime_rolled, digest_b);
+    ASSERT_EQ(hashes_after_mtime_roll, 2);
+    ASSERT_TRUE(ctime_ok);
+    ASSERT_STR_EQ(ctime_rolled, digest_b);
+    ASSERT_EQ(hashes_after_ctime_roll, 3);
+    ASSERT_TRUE(inode_ok);
+    ASSERT_STR_EQ(inode_rolled, digest_b);
+    ASSERT_EQ(hashes_after_inode_roll, 4);
+    PASS();
+}
+
+/* A digest is committed only when the identity observed after the hash is the
+ * one it was keyed on. An image that changed under the hash still yields the
+ * bytes read for that acquisition (the acquire chain's own post-hash stat check
+ * is what rejects it) but is never cached, so the next sight of the original
+ * identity hashes again. */
+TEST(daemon_runtime_fingerprint_cache_skips_image_changed_under_hash) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t image = {1,   2,   3,  100,
+                                                                         200, 300, 400};
+    cbm_daemon_runtime_fingerprint_identity_for_testing_t moved = image;
+    moved.ctime_seconds = 301;
+    char first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool first_ok = cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &moved, first);
+    int hashes_after_first = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool second_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &image, second);
+    int hashes_after_second = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+
+    ASSERT_TRUE(first_ok);
+    ASSERT_STR_EQ(first, digest);
+    ASSERT_EQ(hashes_after_first, 1);
+    ASSERT_TRUE(second_ok);
+    ASSERT_STR_EQ(second, digest);
+    ASSERT_EQ(hashes_after_second, 2);
+    PASS();
+}
+
+/* The real acquire path: fingerprinting this process twice pays the image hash
+ * once, and the second call is served from the cache inside the same bracketed
+ * identity checks. This drives cbm_daemon_runtime_process_build_fingerprint,
+ * not the seam, so a cache wired into the seam but not into the platform's
+ * acquire site fails here. */
+TEST(daemon_runtime_process_fingerprint_hashes_own_image_once_per_process) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    char first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool first_ok = cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), first);
+    int hashes_after_first = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool second_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), second);
+    int hashes_after_second = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+
+    ASSERT_TRUE(first_ok);
+    ASSERT_TRUE(second_ok);
+    ASSERT_STR_EQ(first, digest);
+    ASSERT_STR_EQ(second, digest);
+    ASSERT_EQ(hashes_after_first, 1);
+    ASSERT_EQ(hashes_after_second, 1);
+    PASS();
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+/* Only this process's own image is cached. The peer here is this very runner
+ * spawned in holder mode, so its image has exactly the file identity the own
+ * image is cached under: a cache keyed on that identity alone would answer for
+ * the peer. A peer must be hashed on every fingerprint, before and after the
+ * own image is cached, while the own image still costs one hash. */
+TEST(daemon_runtime_process_fingerprint_caches_only_own_image) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    char image_path[RUNTIME_TEST_PATH_CAP] = {0};
+    char peer_first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char peer_second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char own_first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char own_second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char peer_after_own[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    int release_fd = -1;
+    bool setup = runtime_test_self_image_path(image_path);
+    pid_t child = setup ? runtime_test_spawn_blocked_executable(image_path, &release_fd) : -1;
+    setup = setup && child > 0;
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool peer_first_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_first);
+    bool peer_second_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_second);
+    int hashes_after_peer = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool own_first_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), own_first);
+    bool own_second_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), own_second);
+    int hashes_after_own = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool peer_after_own_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_after_own);
+    int hashes_after_peer_again = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    runtime_test_stop_blocked_executable(child, release_fd);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(peer_first_ok);
+    ASSERT_TRUE(peer_second_ok);
+    ASSERT_TRUE(own_first_ok);
+    ASSERT_TRUE(own_second_ok);
+    ASSERT_TRUE(peer_after_own_ok);
+    ASSERT_STR_EQ(peer_first, digest);
+    ASSERT_STR_EQ(peer_second, digest);
+    ASSERT_STR_EQ(own_first, digest);
+    ASSERT_STR_EQ(own_second, digest);
+    ASSERT_STR_EQ(peer_after_own, digest);
+    /* Each peer fingerprint pays its own hash: a peer is never cached. */
+    ASSERT_EQ(hashes_after_peer, 2);
+    /* The own image is hashed once, then served from the cache. */
+    ASSERT_EQ(hashes_after_own, 3);
+    /* The cached own entry never answers for the peer's identical file. */
+    ASSERT_EQ(hashes_after_peer_again, 4);
+    PASS();
+}
+#endif
+
 TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
     static const uint8_t request[] = {'b', 'l', 'o', 'c', 'k'};
     cbm_daemon_build_identity_t identity =
@@ -5430,6 +5620,12 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed);
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     RUN_TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path);
+#endif
+    RUN_TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll);
+    RUN_TEST(daemon_runtime_fingerprint_cache_skips_image_changed_under_hash);
+    RUN_TEST(daemon_runtime_process_fingerprint_hashes_own_image_once_per_process);
+#if defined(__APPLE__) || defined(__linux__)
+    RUN_TEST(daemon_runtime_process_fingerprint_caches_only_own_image);
 #endif
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
     RUN_TEST(daemon_runtime_host_loop_stops_on_coordination_file_loss);

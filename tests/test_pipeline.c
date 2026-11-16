@@ -2848,6 +2848,41 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
     PASS();
 }
 
+/* C `x++` and `--x` write x. The C assignment node set held only
+ * assignment_expression, so an increment or a decrement left no WRITES edge,
+ * although the write resolver already handles update_expression and `x = 0`
+ * in the same file did write. */
+TEST(pipeline_c_increment_writes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incwrite_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "src/counter.c"),
+                  "struct counter { int n; };\n"
+                  "int hits;\n"
+                  "void hits_reset(void) { hits = 0; }\n"
+                  "void hits_bump(void) { hits++; }\n"
+                  "void hits_drop(void) { --hits; }\n"
+                  "void counter_tick(struct counter *c) { c->n++; }\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/incwrite.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    /* The plain assignment shows the fixture can produce WRITES at all. */
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_reset", "hits", "Variable"), 1);
+    /* Postfix and prefix on a file-level variable, postfix on a member. */
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_bump", "hits", "Variable"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_drop", "hits", "Variable"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "counter_tick", "n", "Field"), 1);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_cleanup(tmp);
+    PASS();
+}
+
 typedef struct {
     int run_rc;
     bool store_opened;
@@ -6619,6 +6654,445 @@ TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full) {
     PASS();
 }
 
+/* #2427 rank probes: one bare call, two same-named candidates, and the
+ * registry's test ranking alone decides which one the call binds. Three runs
+ * on one database: a full index, then a comment-only edit of the caller on
+ * the closure-repair route, then another on the forced legacy-partial route.
+ * Both incremental routes re-resolve the caller against a registry seeded from
+ * stored nodes rather than the extractor's definitions, which is where a
+ * seeder that loses the verdict shows. */
+typedef struct {
+    int want[3];
+    int other[3];
+    cbm_incremental_route_t route[3];
+} rank_probe_t;
+
+static int rank_probe_count(const char *db, const char *project, const char *source,
+                            const char *target, const char *file) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        return -1;
+    }
+    int n = named_edge_to_file_count(s, project, "CALLS", source, target, file);
+    cbm_store_close(s);
+    return n;
+}
+
+static void rank_probe(const char *tmp, const char *caller_path, const char *caller_src,
+                       const char *source, const char *target, const char *want_file,
+                       const char *other_file, rank_probe_t *out) {
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rank.db", tmp);
+    for (int run = 0; run < 3; run++) {
+        out->want[run] = -1;
+        out->other[run] = -1;
+        out->route[run] = CBM_INCREMENTAL_ROUTE_NONE;
+        if (run > 0) {
+            char edited[512];
+            snprintf(edited, sizeof(edited), "%s// edit %d\n", caller_src, run);
+            write_temp_file(tmp, caller_path, edited);
+        }
+        cbm_pipeline_incremental_test_reset_faults();
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        if (run == 2) {
+            cbm_pipeline_incremental_test_force_legacy_partial_once();
+        }
+#endif
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        if (!p) {
+            return;
+        }
+        int rc = cbm_pipeline_run(p);
+        out->route[run] = cbm_pipeline_incremental_test_last_route();
+        char project[256];
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+        cbm_pipeline_free(p);
+        if (rc != 0) {
+            return;
+        }
+        out->want[run] = rank_probe_count(db, project, source, target, want_file);
+        out->other[run] = rank_probe_count(db, project, source, target, other_file);
+    }
+}
+
+/* "latest" spells "test", so the QN scan the extractor's verdict replaced
+ * ranked the production Parse below a helper in a _test.go file, whose Go QN
+ * names only its package and so spells nothing. The verdict ranks them the
+ * right way round, and both incremental routes must read the same verdict
+ * back from the stored nodes: the closure-repair proxies once carried no
+ * is_test, every candidate scored as production, and the smaller QN -- the
+ * test helper -- won. */
+TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_verdict_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package app\n\nfunc Run() int { return Parse() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "latest/parse.go", "package latest\n\nfunc Parse() int { return 1 }\n");
+    write_temp_file(tmp, "harness/parse_test.go",
+                    "package harness\n\nfunc Parse() int { return 2 }\n");
+    write_temp_file(tmp, "app/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "app/run.go", caller, "Run", "Parse", "latest/parse.go",
+               "harness/parse_test.go", &r);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* A generated fake beside its callers: client/fake shares more of the caller's
+ * package path than the real store does, so on the extractor's verdict alone
+ * (a fake is not a test file) the fake wins on proximity. The test-double path
+ * rule ranks it last in the full index and, through the incremental seed's own
+ * use of the rule, on both incremental routes. */
+TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_double_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package client\n\nfunc Run() int { return Load() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "store/load.go", "package store\n\nfunc Load() int { return 1 }\n");
+    write_temp_file(tmp, "client/fake/load.go", "package fake\n\nfunc Load() int { return 2 }\n");
+    write_temp_file(tmp, "client/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "client/run.go", caller, "Run", "Load", "store/load.go", "client/fake/load.go",
+               &r);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* A fresh full index of the probe's files through the parallel driver: `pad`
+ * filler scripts take the file count past MIN_FILES_FOR_PARALLEL and
+ * CBM_WORKERS selects pass_parallel.c, whose registry seeder the small
+ * fixture's sequential full run never reaches. */
+static void rank_probe_parallel(const char *tmp, const char *source, const char *target,
+                                const char *want_file, const char *other_file, int *want,
+                                int *other) {
+    *want = -1;
+    *other = -1;
+    for (int i = 0; i < 55; i++) {
+        char path[64];
+        char body[96];
+        snprintf(path, sizeof(path), "pad/rank_pad_%02d.js", i);
+        snprintf(body, sizeof(body), "function rankPad%02d() { return %d; }\n", i, i);
+        write_temp_file(tmp, path, body);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rank_parallel.db", tmp);
+    XlangEnvSave save = xlang_env_select(true);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    char project[256];
+    snprintf(project, sizeof(project), "%s", p ? cbm_pipeline_project_name(p) : "");
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    xlang_env_restore(&save);
+    if (rc != 0) {
+        return;
+    }
+    *want = rank_probe_count(db, project, source, target, want_file);
+    *other = rank_probe_count(db, project, source, target, other_file);
+}
+
+/* Every definition in a test file ranks as test, not only its callables. The
+ * extractor gives a definition the file's test verdict only for functions,
+ * methods and the module, so a package-level variable in a _test.go file
+ * carries is_test=false. On that verdict alone the variable, one package
+ * nearer the caller, beat the production function on proximity. The registry
+ * applies the extractor's own file rule (cbm_is_test_file) as well, in the
+ * full index and on both incremental routes. */
+TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tfvar_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller[] = "package app\n\nfunc Run() int { return Parse() }\n";
+    write_temp_file(tmp, "go.mod", "module example.com/rank\n\ngo 1.22\n");
+    write_temp_file(tmp, "lib/parse.go", "package lib\n\nfunc Parse() int { return 1 }\n");
+    write_temp_file(tmp, "app/sub/parse_test.go",
+                    "package sub\n\nvar Parse = func() int { return 2 }\n");
+    write_temp_file(tmp, "app/run.go", caller);
+    rank_probe_t r;
+    rank_probe(tmp, "app/run.go", caller, "Run", "Parse", "lib/parse.go", "app/sub/parse_test.go",
+               &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "Run", "Parse", "lib/parse.go", "app/sub/parse_test.go", &par_want,
+                        &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* The same for a class, in the layout of a multi-module Java build: a class
+ * nested in a test under streams/src/test shares more of the caller's path
+ * than the production class in another module, and carries is_test=false. The
+ * QN scan #2427 replaced caught it by the "Test" in RunTest; the file rule
+ * catches it by the src/test directory, as the extractor's own verdict does. */
+TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tfcls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "streams/src/main/java/org/acme/streams/Run.java";
+    static const char caller[] = "package org.acme.streams;\n\n"
+                                 "public class Run {\n"
+                                 "    Object go() { return new Codec(); }\n"
+                                 "}\n";
+    static const char prod_path[] = "clients/src/main/java/org/acme/clients/Codec.java";
+    static const char test_path[] = "streams/src/test/java/org/acme/streams/RunTest.java";
+    write_temp_file(tmp, prod_path, "package org.acme.clients;\n\npublic class Codec {}\n");
+    write_temp_file(tmp, test_path,
+                    "package org.acme.streams;\n\npublic class RunTest {\n"
+                    "    static class Codec {}\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "go", "Codec", prod_path, test_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "go", "Codec", prod_path, test_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* Test code ranks test candidates like any other: the test penalty is for
+ * production callers. kafka's clients tests call `new MockTime()`, meaning the
+ * clients test helper next to them; with every test-file definition ranked as
+ * test, a same-named class in a test-support module under src/main (which no
+ * test rule marks) won instead. For a test caller no candidate takes the
+ * penalty, so proximity picks the helper again, in the full index and on both
+ * incremental routes. */
+TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rank_tcaller_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char caller_path[] = "clients/src/test/java/org/acme/clients/ClientTest.java";
+    static const char caller[] = "package org.acme.clients;\n\n"
+                                 "public class ClientTest {\n"
+                                 "    Object make() { return new MockTime(); }\n"
+                                 "}\n";
+    static const char helper_path[] = "clients/src/test/java/org/acme/common/utils/MockTime.java";
+    static const char support_path[] =
+        "streams/test-utils/src/main/java/org/acme/streams/TopologyTestDriver.java";
+    write_temp_file(tmp, helper_path,
+                    "package org.acme.common.utils;\n\npublic class MockTime {}\n");
+    write_temp_file(tmp, support_path,
+                    "package org.acme.streams;\n\npublic class TopologyTestDriver {\n"
+                    "    static class MockTime {\n        MockTime() {}\n    }\n}\n");
+    write_temp_file(tmp, caller_path, caller);
+    rank_probe_t r;
+    rank_probe(tmp, caller_path, caller, "make", "MockTime", helper_path, support_path, &r);
+    int par_want = -1;
+    int par_other = -1;
+    rank_probe_parallel(tmp, "make", "MockTime", helper_path, support_path, &par_want, &par_other);
+    th_rmtree(tmp);
+    ASSERT_EQ(r.want[0], 1); /* full, sequential */
+    ASSERT_EQ(r.other[0], 0);
+    ASSERT_EQ(par_want, 1); /* full, parallel */
+    ASSERT_EQ(par_other, 0);
+    ASSERT_EQ(r.route[1], CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.want[1], 1);
+    ASSERT_EQ(r.other[1], 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT_EQ(r.route[2], CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+#endif
+    ASSERT_EQ(r.want[2], 1);
+    ASSERT_EQ(r.other[2], 0);
+    PASS();
+}
+
+/* The receiver gate's fixture: member calls whose receivers are lambda
+ * parameters nothing types, so every one of them reaches the registry's
+ * name-only exits, a C call through a function-pointer member, and a Go call
+ * on a standard-library package. */
+static const char GATE_CALLER_PATH[] = "streams/src/main/java/org/acme/streams/Assign.java";
+static const char GATE_CALLER[] =
+    "package org.acme.streams;\n\nimport java.util.List;\n\npublic class Assign {\n"
+    "    long count(List<Object> tps, String t) {\n"
+    "        return tps.stream().filter(tp -> tp.topic().equals(t)).count();\n    }\n\n"
+    "    long found(List<Object> repos) {\n"
+    "        return repos.stream().filter(repo -> repo.find() > 0).count();\n    }\n\n"
+    "    long cleaned(List<Object> ms) {\n"
+    "        return ms.stream().filter(cleanerManager -> cleanerManager.cleaningState() > 0)"
+    ".count();\n    }\n\n"
+    "    Object built() {\n        return new RaftContext.Builder().withVoters();\n    }\n\n"
+    "    void named() {\n        new External().setName(\"x\");\n    }\n\n"
+    "    long parts(List<Object> ts) {\n"
+    "        return ts.stream().filter(topic -> topic.numPartitions() > 0).count();\n    }\n"
+    "}\n";
+static const char GATE_C_PATH[] = "csrc/alloc.c";
+static const char GATE_C[] = "#include <stddef.h>\n\n"
+                             "typedef struct allocFuncs {\n    void *(*mallocFn)(size_t);\n} "
+                             "allocFuncs;\n\n"
+                             "static void *plain_malloc(size_t n) { return NULL; }\n\n"
+                             "allocFuncs allocFns = {plain_malloc};\n\n"
+                             "void *my_malloc(size_t n) {\n    return allocFns.mallocFn(n);\n}\n";
+static const char GATE_GO_PATH[] = "gosrc/cmd/main.go";
+static const char GATE_GO[] = "package cmd\n\nimport \"strings\"\n\n"
+                              "func Run(parts []string) string {\n"
+                              "\treturn strings.Join(parts, \",\")\n}\n";
+static const char GATE_RECORD[] =
+    "clients/src/main/java/org/acme/clients/consumer/ConsumerRecord.java";
+static const char GATE_PRODUCER[] =
+    "clients/src/main/java/org/acme/clients/producer/ProducerRecord.java";
+static const char GATE_REPO[] = "clients/src/main/java/org/acme/clients/store/Repo.java";
+static const char GATE_INDEX[] = "core/src/main/java/org/acme/index/Index.java";
+static const char GATE_LOGGER[] = "core/src/main/java/org/acme/log/Logger.java";
+static const char GATE_GO_JOIN[] = "gosrc/util/join.go";
+static const char GATE_SCALA_PATH[] = "streams/src/main/scala/org/acme/streams/Assigner.scala";
+static const char GATE_SCALA[] =
+    "package org.acme.streams\n\nobject Assigner {\n"
+    "  def count(tps: Seq[AnyRef], t: String): Int = tps.count(tp => tp.topicName() == t)\n\n"
+    "  def named(rs: Seq[AnyRef], t: String): Int =\n"
+    "    rs.count(consumerRecordS => consumerRecordS.topicName() == t)\n}\n";
+static const char GATE_SCALA_CONSUMER[] =
+    "clients/src/main/scala/org/acme/clients/consumer/Record.scala";
+static const char GATE_SCALA_PRODUCER[] =
+    "clients/src/main/scala/org/acme/clients/producer/Record.scala";
+
+static void gate_fixture(const char *tmp) {
+    write_temp_file(tmp, GATE_RECORD,
+                    "package org.acme.clients.consumer;\n\npublic class ConsumerRecord {\n"
+                    "    public String topic() { return \"t\"; }\n}\n");
+    write_temp_file(tmp, GATE_PRODUCER,
+                    "package org.acme.clients.producer;\n\npublic class ProducerRecord {\n"
+                    "    public String topic() { return \"p\"; }\n}\n");
+    write_temp_file(tmp, GATE_REPO,
+                    "package org.acme.clients.store;\n\npublic class Repo {\n"
+                    "    public int find() { return 1; }\n}\n");
+    write_temp_file(tmp, GATE_INDEX,
+                    "package org.acme.index;\n\npublic class Index {\n"
+                    "    public int find() { return 2; }\n}\n");
+    write_temp_file(tmp, "core/src/main/java/org/acme/log/LogCleanerManager.java",
+                    "package org.acme.log;\n\npublic class LogCleanerManager {\n"
+                    "    public int cleaningState() { return 1; }\n}\n");
+    write_temp_file(tmp, GATE_LOGGER,
+                    "package org.acme.log;\n\npublic class Logger {\n"
+                    "    public void setName(String name) {}\n}\n");
+    write_temp_file(tmp, "clients/src/main/java/org/acme/clients/RaftContext.java",
+                    "package org.acme.clients;\n\npublic class RaftContext {\n"
+                    "    public static class Builder {\n"
+                    "        public Builder withVoters() { return this; }\n    }\n}\n");
+    write_temp_file(tmp, "streams/src/main/java/org/acme/streams/TopicInfo.java",
+                    "package org.acme.streams;\n\npublic class TopicInfo {\n"
+                    "    public int numPartitions() { return 1; }\n}\n");
+    write_temp_file(tmp, "go.mod", "module example.com/gate\n\ngo 1.22\n");
+    write_temp_file(tmp, GATE_GO_JOIN,
+                    "package util\n\nfunc Join(parts []string) string { return \"\" }\n");
+    write_temp_file(tmp, GATE_SCALA_CONSUMER,
+                    "package org.acme.clients.consumer\n\nclass ConsumerRecordS {\n"
+                    "  def topicName(): String = \"t\"\n}\n");
+    write_temp_file(tmp, GATE_SCALA_PRODUCER,
+                    "package org.acme.clients.producer\n\nclass ProducerRecordS {\n"
+                    "  def topicName(): String = \"p\"\n}\n");
+    write_temp_file(tmp, GATE_CALLER_PATH, GATE_CALLER);
+    write_temp_file(tmp, GATE_SCALA_PATH, GATE_SCALA);
+    write_temp_file(tmp, GATE_C_PATH, GATE_C);
+    write_temp_file(tmp, GATE_GO_PATH, GATE_GO);
+}
+
+/* A member call whose receiver type nothing resolved binds by name only on
+ * evidence that it means the candidate. Refused: Scala's proximity pick
+ * between two same-named methods for `tp.topicName()` (kafka's `tp.topic()`
+ * shape), and Go's `strings.Join` onto the project's one Join. Kept: the
+ * Scala receiver named after its owner, and a C call through a
+ * function-pointer member, which the C member resolver types (C is off the
+ * gate's allowlist). A veto, not a re-pick: a refused call stays unresolved.
+ * Full index (sequential and parallel) and both incremental routes. Java is
+ * off the allowlist too (the registry test pins every language's scope); the
+ * Java files only share the fixture. */
+TEST(pipeline_registry_receiver_gate_full_and_incremental) {
+    static const struct {
+        const char *source;
+        const char *target;
+        const char *file;
+        const char *other;
+        const char *caller_path;
+        const char *caller;
+        int expect;
+    } cases[] = {
+        {"count", "topicName", GATE_SCALA_CONSUMER, GATE_SCALA_PRODUCER, GATE_SCALA_PATH,
+         GATE_SCALA, 0},
+        {"named", "topicName", GATE_SCALA_CONSUMER, GATE_SCALA_PRODUCER, GATE_SCALA_PATH,
+         GATE_SCALA, 1},
+        {"my_malloc", "mallocFn", GATE_C_PATH, GATE_INDEX, GATE_C_PATH, GATE_C, 1},
+        {"Run", "Join", GATE_GO_JOIN, GATE_INDEX, GATE_GO_PATH, GATE_GO, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_gate_%zu_XXXXXX", i);
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        gate_fixture(tmp);
+        rank_probe_t r;
+        rank_probe(tmp, cases[i].caller_path, cases[i].caller, cases[i].source, cases[i].target,
+                   cases[i].file, cases[i].other, &r);
+        int par = -1;
+        int par_other = -1;
+        rank_probe_parallel(tmp, cases[i].source, cases[i].target, cases[i].file, cases[i].other,
+                            &par, &par_other);
+        th_rmtree(tmp);
+        int want = cases[i].expect;
+        bool routes_ok = r.route[1] == CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR;
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        routes_ok = routes_ok && r.route[2] == CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL;
+#endif
+        bool others_zero = r.other[0] == 0 && par_other == 0 && r.other[1] == 0 && r.other[2] == 0;
+        if (r.want[0] != want || par != want || !routes_ok || r.want[1] != want ||
+            r.want[2] != want || !others_zero) {
+            char why[256];
+            snprintf(why, sizeof(why),
+                     "%s -> %s: want %d, got full %d parallel %d closure %d legacy %d, other "
+                     "%d %d %d %d (routes %d %d)",
+                     cases[i].source, cases[i].target, want, r.want[0], par, r.want[1], r.want[2],
+                     r.other[0], par_other, r.other[1], r.other[2], (int)r.route[1],
+                     (int)r.route[2]);
+            FAIL(why);
+        }
+    }
+    PASS();
+}
+
 /* A semantic control file can change an unchanged source file's exact target.
  * Both target modules deliberately export the same short name: without the
  * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
@@ -8892,6 +9366,125 @@ TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds) {
     cbm_pipeline_free(unchanged);
     cbm_pipeline_incremental_test_reset_faults();
     th_rmtree(tmp);
+    PASS();
+}
+
+/* The latin-1 'é' of the fixtures below, as the strict JSON reader returns it. */
+#define NON_UTF8_REPLACED "caf\xef\xbf\xbd"
+
+/* True when some string in value, at any depth, contains needle. */
+static bool non_utf8_json_has(yyjson_val *value, const char *needle) {
+    const char *text = yyjson_get_str(value);
+    if (text) {
+        return strstr(text, needle) != NULL;
+    }
+    size_t index, count;
+    yyjson_val *key, *item;
+    if (yyjson_is_arr(value)) {
+        yyjson_arr_foreach(value, index, count, item) {
+            if (non_utf8_json_has(item, needle)) {
+                return true;
+            }
+        }
+    }
+    if (yyjson_is_obj(value)) {
+        yyjson_obj_foreach(value, index, count, key, item) {
+            if (non_utf8_json_has(item, needle)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* -1: absent or not strict JSON; 0: strict without the replaced text; 1: with it. */
+static int non_utf8_json_state(const char *json) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc) {
+        return -1;
+    }
+    int found = non_utf8_json_has(yyjson_doc_get_root(doc), NON_UTF8_REPLACED) ? 1 : 0;
+    yyjson_doc_free(doc);
+    return found;
+}
+
+typedef struct {
+    int surface_rows;
+    int surface_state[3]; /* a.ts, b.ts, c.py */
+    bool unresolved_complete;
+    int unresolved_state; /* b.ts's unresolved_calls detail */
+} non_utf8_outcome_t;
+
+static void non_utf8_read_outcome(cbm_store_t *store, const char *project,
+                                  non_utf8_outcome_t *out) {
+    static const char *paths[] = {"a.ts", "b.ts", "c.py"};
+    cbm_lsp_surface_row_t *surfaces = NULL;
+    if (cbm_store_get_lsp_surfaces(store, project, &surfaces, &out->surface_rows) != CBM_STORE_OK) {
+        out->surface_rows = -1;
+    }
+    for (int i = 0; i < out->surface_rows; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (strcmp(surfaces[i].rel_path, paths[j]) == 0) {
+                out->surface_state[j] = non_utf8_json_state(surfaces[i].defs_json);
+            }
+        }
+    }
+    cbm_store_free_lsp_surfaces(surfaces, out->surface_rows);
+    cbm_coverage_meta_t meta = {0};
+    out->unresolved_complete = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
+                               meta.unresolved_calls_complete;
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get_path(store, project, "b.ts", &rows, &row_count) == CBM_STORE_OK) {
+        for (int i = 0; i < row_count; i++) {
+            if (strcmp(rows[i].kind, "unresolved_calls") == 0) {
+                out->unresolved_state = non_utf8_json_state(rows[i].detail);
+            }
+        }
+    }
+    cbm_store_free_coverage(rows, row_count);
+}
+
+/* Source text is not always UTF-8. A latin-1 'é' that names a TS method reaches
+ * both that file's LSP surface and the caller of its unresolved call; one in a
+ * Python __all__ string reaches the namespace surface. The strict writer refused
+ * each document, which cost the repository every surface row and switched off
+ * unresolved-call capture for the run. Each is now strict JSON with U+FFFD. */
+TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture) {
+    char tmp[256] = "/tmp/cbm_non_utf8_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.ts", "export function ok(): number { return 1; }\n");
+    write_temp_file(tmp, "b.ts", "class A {\n  \"caf\xe9\"(): void { missing(); }\n}\n");
+    write_temp_file(tmp, "c.py", "__all__ = ['caf\xe9']\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/non_utf8.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    non_utf8_outcome_t outcome = {.surface_state = {-1, -1, -1}, .unresolved_state = -1};
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    if (store) {
+        non_utf8_read_outcome(store, project, &outcome);
+        cbm_store_close(store);
+    }
+    th_rmtree(tmp);
+    if (outcome.surface_rows != 3 || !outcome.unresolved_complete) {
+        fprintf(stderr, "  [non-utf8] rc=%d surfaces=%d states=%d,%d,%d complete=%d detail=%d\n",
+                rc, outcome.surface_rows, outcome.surface_state[0], outcome.surface_state[1],
+                outcome.surface_state[2], outcome.unresolved_complete, outcome.unresolved_state);
+    }
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(outcome.surface_rows, 3);
+    ASSERT_EQ(outcome.surface_state[0], 0);
+    ASSERT_EQ(outcome.surface_state[1], 1);
+    ASSERT_EQ(outcome.surface_state[2], 1);
+    ASSERT_TRUE(outcome.unresolved_complete);
+    ASSERT_EQ(outcome.unresolved_state, 1);
     PASS();
 }
 
@@ -21834,7 +22427,7 @@ static int python_typed_field_scope_case(bool external) {
     if (result && reg && gbuf && result->field_types.count == 1) {
         for (int i = 0; i < result->defs.count; i++) {
             const CBMDefinition *def = &result->defs.items[i];
-            cbm_registry_add(reg, def->name, def->qualified_name, def->label);
+            cbm_registry_add(reg, def->name, def->qualified_name, def->label, false);
         }
         const char **keys = NULL;
         const char **vals = NULL;
@@ -27801,8 +28394,8 @@ TEST(helm_parse_chart_many_dependencies) {
 
 TEST(registry_resolve_single_candidate) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
-    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
+    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function", false);
 
     /* Normal resolve unique name */
     cbm_resolution_t r = cbm_registry_resolve(reg, "CreateOrder", "svcC.caller", NULL, NULL, 0);
@@ -27820,7 +28413,7 @@ TEST(registry_resolve_single_candidate) {
 
 TEST(registry_fuzzy_nonexistent) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "NonExistent", "svcC.caller", NULL, NULL, 0);
@@ -27832,8 +28425,8 @@ TEST(registry_fuzzy_nonexistent) {
 
 TEST(registry_fuzzy_multiple_best_by_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function");
-    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function");
+    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function", false);
 
     /* Caller in svcA → prefer svcA */
     cbm_fuzzy_result_t fr =
@@ -27852,7 +28445,7 @@ TEST(registry_fuzzy_multiple_best_by_distance) {
 
 TEST(registry_fuzzy_simple_name_extraction) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function");
+    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function", false);
 
     /* Deeply qualified name → extract "DoWork" */
     cbm_fuzzy_result_t fr = cbm_registry_fuzzy_resolve(reg, "some.deep.module.DoWork",
@@ -27877,8 +28470,8 @@ TEST(registry_fuzzy_empty) {
 
 TEST(registry_exists) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method");
+    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method", false);
 
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Foo"));
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Bar"));
@@ -27891,7 +28484,7 @@ TEST(registry_exists) {
 
 TEST(registry_confidence_import_map) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -27906,7 +28499,7 @@ TEST(registry_confidence_import_map) {
 
 TEST(registry_confidence_import_map_suffix) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -27921,7 +28514,7 @@ TEST(registry_confidence_import_map_suffix) {
 
 TEST(registry_confidence_same_module) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Foo", "proj.pkg", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Foo");
@@ -27934,7 +28527,7 @@ TEST(registry_confidence_same_module) {
 
 TEST(registry_confidence_unique_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
@@ -27947,8 +28540,8 @@ TEST(registry_confidence_unique_name) {
 
 TEST(registry_confidence_suffix_match) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
@@ -27964,7 +28557,7 @@ TEST(registry_confidence_suffix_match) {
  * wrong target — and with one candidate it won the top name-only confidence. */
 TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable", false);
 
     cbm_resolution_t r =
         cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
@@ -27978,8 +28571,8 @@ TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
  * the final name and import distance picks the winner. */
 TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
-    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable", false);
+    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable", false);
 
     cbm_resolution_t r =
         cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
@@ -27993,7 +28586,7 @@ TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
  * so Calendar really is in the receiver chain. */
 TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method");
+    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Calendar.utcGregorian.startOfDayUTC",
                                               "HomeboxUI.Stats", NULL, NULL, 0);
@@ -28013,7 +28606,7 @@ TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
 TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "putList", "org.elasticsearch.common.settings.Settings.Builder.putList",
-                     "Method");
+                     "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Settings.builder().putList", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
@@ -28024,7 +28617,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
      * .toBuilder().setWarningsHandler -> RequestOptions.Builder.setWarningsHandler. */
     cbm_registry_add(reg, "setWarningsHandler",
                      "org.elasticsearch.client.RequestOptions.Builder.setWarningsHandler",
-                     "Method");
+                     "Method", false);
     r = cbm_registry_resolve(reg, "RequestOptions.DEFAULT.toBuilder().setWarningsHandler",
                              "org.elasticsearch.client.Rest", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name,
@@ -28040,7 +28633,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
 TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "getEncoder", "org.elasticsearch.index.codec.DocOffsetsCodec.getEncoder",
-                     "Method");
+                     "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Base64.getEncoder", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
@@ -28050,7 +28643,7 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
      * org.elasticsearch.common.Math.toIntExact through "Math" appearing as an
      * ancestry segment ONLY IF that segment really is the type — here it is, and
      * that is the correct outcome (the project's own Math.toIntExact). */
-    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method");
+    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method", false);
     r = cbm_registry_resolve(reg, "Math.toIntExact", "org.elasticsearch.index.IndexSettings", NULL,
                              NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.Math.toIntExact");
@@ -28063,7 +28656,7 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
  * must not look at it, or every ordinary vm.load style call would be refused. */
 TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method");
+    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "vm.load", "HomeboxUI.Views", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "HomeboxUI.EntityListViewModel.load");
@@ -28073,10 +28666,102 @@ TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
     PASS();
 }
 
+/* Issue #2121: unlike vm.load's lower-case value root above, C#'s built-in
+ * type keywords (int, string, bool, nint, ...) DO name a type and must get the
+ * same chain-consistency check an upper-case root gets. The check belongs to
+ * the CALLS entry point both resolvers share, for a C# file. */
+TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method", false);
+
+    cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "int.TryParse", "tmp.Demo", NULL, NULL,
+                                                        0, CBM_LANG_CSHARP);
+    ASSERT_NULL(r.qualified_name);
+    /* C# 9 native-sized integers are keywords in receiver position too. */
+    r = cbm_registry_resolve_call_lang(reg, "nint.TryParse", "tmp.Demo", NULL, NULL, 0,
+                                       CBM_LANG_CSHARP);
+    ASSERT_NULL(r.qualified_name);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The true positive the new keyword check must not eat: the project really
+ * does define a type literally named "int" (or similar) and the chain shows
+ * it, so the match must still go through. Resolved as a C# call, so this
+ * exercises the keyword branch's ancestry walk, not the non-C# early return
+ * (which would pass through for the wrong reason). */
+TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.int.TryParse", "Method", false);
+
+    cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "int.TryParse", "tmp.Demo", NULL, NULL,
+                                                        0, CBM_LANG_CSHARP);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.int.TryParse");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The type-keyword branch above is a C#-only rule (closed list, gated on the
+ * calling file's language) and must not trade away recall in a language where
+ * the same spellings are ordinary identifiers. `object` and `string` are
+ * ordinary lower-case variable names in Python/Go; a variable named `object`
+ * calling a method (`object.TryParse`, shaped exactly like the refusal test
+ * above) must still resolve as a value root there: the negative control
+ * pinning the other side of the gate. */
+TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method", false);
+
+    cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "object.TryParse", "tmp.Demo", NULL,
+                                                        NULL, 0, CBM_LANG_PYTHON);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.Decoys.TsidNode.TryParse");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    /* A Go call and the language-blind cbm_registry_resolve read a second
+     * keyword spelling as a value root as well. A Go value receiver binds a
+     * name-only candidate on evidence (the receiver gate): here the candidate
+     * lives in the caller's own module, which a type root would not admit. */
+    cbm_registry_t *reg2 = cbm_registry_new();
+    cbm_registry_add(reg2, "Join", "tmp.Demo.Joiner.Join", "Method", false);
+    cbm_resolution_t r2 =
+        cbm_registry_resolve_call_lang(reg2, "string.Join", "tmp.Demo", NULL, NULL, 0, CBM_LANG_GO);
+    ASSERT_STR_EQ(r2.qualified_name, "tmp.Demo.Joiner.Join");
+    ASSERT_STR_EQ(r2.strategy, "unique_name");
+    r2 = cbm_registry_resolve(reg2, "string.Join", "tmp.Demo", NULL, NULL, 0);
+    ASSERT_STR_EQ(r2.qualified_name, "tmp.Demo.Joiner.Join");
+    ASSERT_STR_EQ(r2.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    cbm_registry_free(reg2);
+    PASS();
+}
+
+/* `dynamic` is a contextual keyword in C#, not a reserved type keyword like
+ * `int`: in receiver position (`dynamic.Invoke(...)`) it is a variable that
+ * happens to be called `dynamic`, whose type the chain does not show. In a C#
+ * file it must stay an ordinary lower-case value root, like vm.load above, so
+ * the call still binds on a value receiver's evidence (here: a candidate in
+ * the caller's own module, which a type root would not admit): the control
+ * that keeps the keyword list closed to words that can only name a type. */
+TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Invoke", "tmp.Demo.Handler.Invoke", "Method", false);
+
+    cbm_resolution_t r = cbm_registry_resolve_call_lang(reg, "dynamic.Invoke", "tmp.Demo", NULL,
+                                                        NULL, 0, CBM_LANG_CSHARP);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.Demo.Handler.Invoke");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
 /* An unqualified callee has no chain at all and must pass through unchanged. */
 TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function");
+    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "helper", "proj.other", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.helper");
@@ -28088,7 +28773,7 @@ TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
 
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
@@ -28102,8 +28787,8 @@ TEST(registry_fuzzy_confidence_single) {
 
 TEST(registry_fuzzy_confidence_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
@@ -28117,8 +28802,8 @@ TEST(registry_fuzzy_confidence_distance) {
 
 TEST(registry_negative_import_rejects) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function", false);
 
     /* Import only handler's module → should prefer handler */
     const char *keys[] = {"handler"};
@@ -28132,7 +28817,7 @@ TEST(registry_negative_import_rejects) {
 
 TEST(registry_fuzzy_import_penalty) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", false);
 
     /* Has imports but billing not imported → confidence halved */
     const char *keys[] = {"other"};
@@ -28149,7 +28834,7 @@ TEST(registry_fuzzy_import_penalty) {
 
 TEST(registry_fuzzy_no_import_map_passthrough) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", false);
 
     /* NULL import map → no penalty, full fuzzy confidence */
     cbm_fuzzy_result_t fr =
@@ -28163,10 +28848,10 @@ TEST(registry_fuzzy_no_import_map_passthrough) {
 
 TEST(registry_find_by_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", false);
 
     /* FindByName returns all entries for "Foo" */
     const char **foos = NULL;
@@ -29126,10 +29811,10 @@ TEST(registry_is_import_reachable) {
 /* Port of FindEndingWith portion from Go TestFunctionRegistry in pipeline_test.go */
 TEST(registry_find_ending_with) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", false);
 
     /* FindEndingWith "DataProcessor.transform" → 1 match */
     const char **matches = NULL;
@@ -34382,6 +35067,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
+    RUN_TEST(pipeline_c_increment_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
@@ -34397,6 +35083,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
     RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
+    RUN_TEST(pipeline_registry_ranks_by_extractor_verdict_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_doubles_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_file_variable_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_ranks_test_file_class_last_full_and_incremental);
+    RUN_TEST(pipeline_registry_test_caller_ranks_test_helpers_full_and_incremental);
+    RUN_TEST(pipeline_registry_receiver_gate_full_and_incremental);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -34687,6 +35379,10 @@ SUITE(pipeline) {
     RUN_TEST(registry_receiver_chain_admits_factory_chain_into_nested_type);
     RUN_TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule);
     RUN_TEST(registry_receiver_chain_ignores_lowercase_root_issue1893);
+    RUN_TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121);
+    RUN_TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121);
+    RUN_TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121);
+    RUN_TEST(registry_receiver_chain_csharp_dynamic_variable_still_binds_issue2121);
     RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
@@ -34909,6 +35605,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_semantic_version_8_index_is_rebuilt_once);
     RUN_TEST(pipeline_semantic_version_10_index_is_rebuilt_once);
     RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
+    RUN_TEST(pipeline_non_utf8_source_keeps_surfaces_and_unresolved_capture);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
     RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);

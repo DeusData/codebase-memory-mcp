@@ -1,0 +1,23 @@
+# lint-vendored-scanners: file-scope variables that are not shared parse state
+#
+# The gate (make -f Makefile.cbm lint-vendored-scanners) rejects every
+# non-const file-scope variable in a vendored scanner, because such a variable
+# is one object shared by every parser in the process (one per indexing
+# thread). An entry here argues that one specific variable is never written
+# after its initializer, so sharing it cannot change any parse.
+#
+# Rules:
+#   * Argue from the code: say where the variable is read and that nothing
+#     assigns it. A variable a scan writes is never whitelisted; move it into
+#     the payload instead (grammars/MANIFEST.md, "Local source patches").
+#   * An entry that no longer matches a finding fails the gate, so re-check
+#     the entry when a grammar is re-vendored.
+#
+# Format, one line each:  path :: variable :: why
+# `variable` may be an fnmatch pattern for a family of generated variables;
+# the argument must then hold for every name it matches.
+
+internal/cbm/vendored/grammars/haskell/scanner.c :: debug_parse_metadata :: initialized false and never assigned; read once, to decide whether to dump debug output (`if (debug_parse_metadata) dump_parse_metadata(env)`)
+internal/cbm/vendored/grammars/haskell/unicode.h :: bitmap_*_codepoint :: 40 generated `static int32_t bitmap_<class>_<n>_{min,max}_codepoint = <constant>` range bounds; none is ever assigned, incremented or address-taken, each is only read by the bitmap lookup generated next to it
+internal/cbm/vendored/grammars/purescript/scanner.c :: res_cont :: `static Result res_cont = {.sym = FAIL, .finished = false}`, a constant missing its const: its 30-odd uses all `return res_cont` by value; nothing assigns a field or takes its address
+internal/cbm/vendored/grammars/purescript/scanner.c :: res_fail :: `static Result res_fail = {.sym = FAIL, .finished = true}`, same as res_cont: only returned by value, never assigned or address-taken

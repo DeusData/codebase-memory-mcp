@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "sql",
+      "camelcase": "SQL",
+      "scope": "source.sql",
+      "path": ".",
+      "file-types": ["sql"]
+    }
+  ],
+  "metadata": {
+    "version": "0.3.11-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-sql @ 851e9cb (SQLite migration syntax)"
+  }
+}

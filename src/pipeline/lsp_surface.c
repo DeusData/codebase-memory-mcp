@@ -28,6 +28,7 @@
 
 #include "cbm.h"     /* cbm_label_is_relation — reg-only surface membership */
 #include "doclink.h" /* cbm_doclink_portable_scope — the "dl" key */
+#include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/sha256.h"
@@ -495,7 +496,9 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_doc_free(doc);
         return NULL;
     }
-    char *json = yyjson_mut_write(doc, 0, out_len);
+    /* Names, types and strings come from source text, which need not be UTF-8:
+     * one such byte must not cost the repository every surface row. */
+    char *json = cbm_json_write_text(doc, NULL, out_len);
     yyjson_mut_doc_free(doc);
     return json;
 }

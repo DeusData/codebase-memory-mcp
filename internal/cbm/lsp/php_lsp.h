@@ -1,6 +1,7 @@
 #ifndef CBM_LSP_PHP_LSP_H
 #define CBM_LSP_PHP_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -36,6 +37,7 @@ typedef struct {
     enum { CBM_PHP_USE_CLASS = 0, CBM_PHP_USE_FUNCTION, CBM_PHP_USE_CONST } *use_kinds;
     int use_count;
     int use_cap;
+    CBMNameRows use_rows; /* use_local_names by name; zeroed whenever use_count is reset */
 
     /* Cross-file mode: dotted targets of the file's class `use` declarations
      * that the pipeline's import map left unresolved (vendor / unmapped

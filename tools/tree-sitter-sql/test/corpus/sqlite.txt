@@ -1,0 +1,507 @@
+================================================================================
+SQLite: PRAGMA statements
+================================================================================
+
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA main.cache_size = -2000;
+PRAGMA table_info(registrations);
+PRAGMA optimize;
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (pragma_statement
+      (keyword_pragma)
+      (object_reference
+        (identifier))
+      (identifier)))
+  (statement
+    (pragma_statement
+      (keyword_pragma)
+      (object_reference
+        (identifier))
+      (identifier)))
+  (statement
+    (pragma_statement
+      (keyword_pragma)
+      (object_reference
+        (identifier)
+        (identifier))
+      (literal)))
+  (statement
+    (pragma_statement
+      (keyword_pragma)
+      (object_reference
+        (identifier))
+      (identifier)))
+  (statement
+    (pragma_statement
+      (keyword_pragma)
+      (object_reference
+        (identifier)))))
+
+================================================================================
+SQLite: AUTOINCREMENT column
+================================================================================
+
+CREATE TABLE IF NOT EXISTS registrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL
+);
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_table
+      (keyword_create)
+      (keyword_table)
+      (keyword_if)
+      (keyword_not)
+      (keyword_exists)
+      (object_reference
+        (identifier))
+      (column_definitions
+        (column_definition
+          (identifier)
+          (int
+            (keyword_int))
+          (keyword_primary)
+          (keyword_key)
+          (keyword_auto_increment))
+        (column_definition
+          (identifier)
+          (keyword_text)
+          (keyword_not)
+          (keyword_null))))))
+
+================================================================================
+SQLite: a column named key after the first column
+================================================================================
+
+CREATE TABLE kv (
+  namespace TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL
+);
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_table
+      (keyword_create)
+      (keyword_table)
+      (object_reference
+        (identifier))
+      (column_definitions
+        (column_definition
+          (identifier)
+          (keyword_text)
+          (keyword_not)
+          (keyword_null))
+        (column_definition
+          (identifier)
+          (keyword_text)
+          (keyword_not)
+          (keyword_null))
+        (column_definition
+          (identifier)
+          (keyword_text)
+          (keyword_not)
+          (keyword_null))))))
+
+================================================================================
+MySQL: KEY index named after a type keyword is still an index
+================================================================================
+
+CREATE TABLE t (
+  id INT NOT NULL,
+  KEY name (id),
+  UNIQUE KEY date (id)
+);
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_table
+      (keyword_create)
+      (keyword_table)
+      (object_reference
+        (identifier))
+      (column_definitions
+        (column_definition
+          (identifier)
+          (int
+            (keyword_int))
+          (keyword_not)
+          (keyword_null))
+        (constraints
+          (constraint
+            (keyword_key)
+            (identifier)
+            (ordered_columns
+              (column
+                (identifier))))
+          (constraint
+            (keyword_unique)
+            (keyword_key)
+            (identifier)
+            (ordered_columns
+              (column
+                (identifier)))))))))
+
+================================================================================
+SQLite: WITHOUT ROWID table
+================================================================================
+
+CREATE TABLE history_uploads (
+  user_id TEXT NOT NULL,
+  history_id TEXT NOT NULL,
+  PRIMARY KEY (user_id, history_id)
+) WITHOUT ROWID;
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_table
+      (keyword_create)
+      (keyword_table)
+      (object_reference
+        (identifier))
+      (column_definitions
+        (column_definition
+          (identifier)
+          (keyword_text)
+          (keyword_not)
+          (keyword_null))
+        (column_definition
+          (identifier)
+          (keyword_text)
+          (keyword_not)
+          (keyword_null))
+        (constraints
+          (constraint
+            (keyword_primary)
+            (keyword_key)
+            (ordered_columns
+              (column
+                (identifier))
+              (column
+                (identifier))))))
+      (keyword_without)
+      (keyword_rowid))))
+
+================================================================================
+SQLite: trigger with a BEGIN END body
+================================================================================
+
+CREATE TRIGGER IF NOT EXISTS registrations_guard
+BEFORE UPDATE ON registrations
+BEGIN
+  SELECT RAISE(ABORT, 'registrations are immutable');
+END;
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_trigger
+      (keyword_create)
+      (keyword_trigger)
+      (keyword_if)
+      (keyword_not)
+      (keyword_exists)
+      (object_reference
+        (identifier))
+      (keyword_before)
+      (keyword_update)
+      (keyword_on)
+      (object_reference
+        (identifier))
+      (block
+        (keyword_begin)
+        (statement
+          (select
+            (keyword_select)
+            (select_expression
+              (term
+                (invocation
+                  (object_reference
+                    (identifier))
+                  (term
+                    (field
+                      (identifier)))
+                  (term
+                    (literal)))))))
+        (keyword_end)))))
+
+================================================================================
+SQLite: trigger with a WHEN condition and INSERT OR IGNORE
+================================================================================
+
+CREATE TRIGGER sessions_regrouped AFTER UPDATE OF root_harness ON sessions
+WHEN OLD.root_harness IS NOT NEW.root_harness
+BEGIN
+  INSERT OR IGNORE INTO regrouped (session) VALUES (NEW.id);
+END;
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_trigger
+      (keyword_create)
+      (keyword_trigger)
+      (object_reference
+        (identifier))
+      (keyword_after)
+      (keyword_update)
+      (keyword_of)
+      (identifier)
+      (keyword_on)
+      (object_reference
+        (identifier))
+      (keyword_when)
+      (binary_expression
+        (field
+          (object_reference
+            (identifier))
+          (identifier))
+        (is_not
+          (keyword_is)
+          (keyword_not))
+        (field
+          (object_reference
+            (identifier))
+          (identifier)))
+      (block
+        (keyword_begin)
+        (statement
+          (insert
+            (keyword_insert)
+            (keyword_or)
+            (keyword_ignore)
+            (keyword_into)
+            (object_reference
+              (identifier))
+            (list
+              (column
+                (identifier)))
+            (keyword_values)
+            (list
+              (field
+                (object_reference
+                  (identifier))
+                (identifier)))))
+        (keyword_end)))))
+
+================================================================================
+SQLite: trigger with a parenthesized WHEN condition
+================================================================================
+
+CREATE TRIGGER tg AFTER INSERT ON x FOR EACH ROW WHEN (NEW.a > 1)
+BEGIN
+  UPDATE y SET b = 1;
+  DELETE FROM z WHERE id = NEW.id;
+END;
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_trigger
+      (keyword_create)
+      (keyword_trigger)
+      (object_reference
+        (identifier))
+      (keyword_after)
+      (keyword_insert)
+      (keyword_on)
+      (object_reference
+        (identifier))
+      (keyword_for)
+      (keyword_each)
+      (keyword_row)
+      (keyword_when)
+      (parenthesized_expression
+        (binary_expression
+          (field
+            (object_reference
+              (identifier))
+            (identifier))
+          (literal)))
+      (block
+        (keyword_begin)
+        (statement
+          (update
+            (keyword_update)
+            (relation
+              (object_reference
+                (identifier)))
+            (keyword_set)
+            (assignment
+              (field
+                (identifier))
+              (literal))))
+        (statement
+          (delete
+            (keyword_delete))
+          (from
+            (keyword_from)
+            (object_reference
+              (identifier))
+            (where
+              (keyword_where)
+              (binary_expression
+                (field
+                  (identifier))
+                (field
+                  (object_reference
+                    (identifier))
+                  (identifier))))))
+        (keyword_end)))))
+
+================================================================================
+Postgres: trigger WHEN condition before EXECUTE FUNCTION is unchanged
+================================================================================
+
+CREATE TRIGGER tg BEFORE UPDATE ON x FOR EACH ROW
+WHEN (OLD.a IS DISTINCT FROM NEW.a) EXECUTE FUNCTION f();
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_trigger
+      (keyword_create)
+      (keyword_trigger)
+      (object_reference
+        (identifier))
+      (keyword_before)
+      (keyword_update)
+      (keyword_on)
+      (object_reference
+        (identifier))
+      (keyword_for)
+      (keyword_each)
+      (keyword_row)
+      (keyword_when)
+      (binary_expression
+        (field
+          (object_reference
+            (identifier))
+          (identifier))
+        (distinct_from
+          (keyword_is)
+          (keyword_distinct)
+          (keyword_from))
+        (field
+          (object_reference
+            (identifier))
+          (identifier)))
+      (keyword_execute)
+      (keyword_function)
+      (object_reference
+        (identifier)))))
+
+================================================================================
+SQLite: virtual tables
+================================================================================
+
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    title,
+    body UNINDEXED,
+    tokenize = 'unicode61',
+    content = '',
+    contentless_delete = 1
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS boxes USING rtree(id, minx, maxx);
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (create_table
+      (keyword_create)
+      (keyword_virtual)
+      (keyword_table)
+      (object_reference
+        (identifier))
+      (keyword_using)
+      (identifier)
+      (module_argument
+        (identifier))
+      (module_argument
+        (identifier)
+        (identifier))
+      (module_argument
+        (identifier)
+        (literal))
+      (module_argument
+        (identifier)
+        (literal))
+      (module_argument
+        (identifier)
+        (literal))))
+  (statement
+    (create_table
+      (keyword_create)
+      (keyword_virtual)
+      (keyword_table)
+      (keyword_if)
+      (keyword_not)
+      (keyword_exists)
+      (object_reference
+        (identifier))
+      (keyword_using)
+      (identifier)
+      (module_argument
+        (identifier))
+      (module_argument
+        (identifier))
+      (module_argument
+        (identifier)))))
+
+================================================================================
+SQLite: INSERT OR conflict clause
+================================================================================
+
+INSERT OR REPLACE INTO t (a) VALUES (1);
+INSERT OR ROLLBACK INTO t (a) VALUES (2);
+
+--------------------------------------------------------------------------------
+
+(program
+  (statement
+    (insert
+      (keyword_insert)
+      (keyword_or)
+      (keyword_replace)
+      (keyword_into)
+      (object_reference
+        (identifier))
+      (list
+        (column
+          (identifier)))
+      (keyword_values)
+      (list
+        (literal))))
+  (statement
+    (insert
+      (keyword_insert)
+      (keyword_or)
+      (keyword_rollback)
+      (keyword_into)
+      (object_reference
+        (identifier))
+      (list
+        (column
+          (identifier)))
+      (keyword_values)
+      (list
+        (literal)))))

@@ -434,9 +434,9 @@ TEST(callable_sig_leaf_splitters_skip_suffix) {
  * keeps its historical key (last '.' or "::" segment). */
 TEST(callable_sig_registry_by_name_uses_base_leaf) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "upload", "p.Session.upload(_:Data,to:URL)", "Method");
-    cbm_registry_add(r, "upload", "p.Session.upload(_:Data,with:URLRequest)", "Method");
-    cbm_registry_add(r, "square", "p.Math::square", "Function");
+    cbm_registry_add(r, "upload", "p.Session.upload(_:Data,to:URL)", "Method", false);
+    cbm_registry_add(r, "upload", "p.Session.upload(_:Data,with:URLRequest)", "Method", false);
+    cbm_registry_add(r, "square", "p.Math::square", "Function", false);
     const char **out = NULL;
     int count = 0;
     cbm_registry_find_by_name(r, "upload", &out, &count);

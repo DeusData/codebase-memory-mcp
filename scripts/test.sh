@@ -243,7 +243,7 @@ assert_test_runner_build_config() {
     fi
 }
 
-print_env "test.sh"
+print_env "test.sh" --cpu
 
 # ── TSan mode (--tsan): the data-race gate ──
 # One entry for every venue: CI's tsan jobs and the compose test-tsan service

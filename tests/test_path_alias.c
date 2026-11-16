@@ -69,9 +69,9 @@ static cbm_path_alias_map_t *make_map(const char *base_url, int count, ...) {
     return map;
 }
 
-/* The map produced by make_map() owns all heap memory the same way the
- * loader does, so the public free routine on the wrapping collection
- * works equivalently — but tests build naked maps, so use this helper. */
+/* make_map() allocates with the C allocator, the loader through the memory
+ * core, so a map built here is freed with this helper and never handed to
+ * cbm_path_alias_collection_free. */
 static void free_map(cbm_path_alias_map_t *map) {
     if (!map) {
         return;
@@ -212,7 +212,12 @@ TEST(path_alias_find_for_file_nearest_ancestor) {
     ASSERT_EQ(m2->count, 1);
     ASSERT_STR_EQ(m2->entries[0].alias_prefix, "@root/");
 
-    cbm_path_alias_collection_free(coll);
+    for (int i = 0; i < coll->count; i++) {
+        free(coll->scopes[i].dir_prefix);
+        free_map(coll->scopes[i].map);
+    }
+    free(coll->scopes);
+    free(coll);
     PASS();
 }
 

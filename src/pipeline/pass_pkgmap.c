@@ -120,6 +120,8 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
     e->items[e->count].manifest_rel = NULL;
+    e->items[e->count].source_rel = NULL;
+    e->items[e->count].source_seq = 0;
     e->count++;
 }
 
@@ -128,6 +130,7 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
         free(e->items[i].pkg_name);
         free(e->items[i].entry_rel);
         cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].source_rel);
     }
     free(e->items);
     e->items = NULL;
@@ -1014,8 +1017,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
-bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
-                          int source_len, cbm_pkg_entries_t *entries) {
+static bool pkgmap_parse_by_basename(const char *basename, const char *rel_path, const char *source,
+                                     int source_len, cbm_pkg_entries_t *entries) {
     if (!basename || !source || source_len <= 0) {
         return false;
     }
@@ -1067,12 +1070,74 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     return false;
 }
 
+/* Parse one manifest and stamp what it yielded with where it came from. The
+ * merge orders manifests by that, and keeps one manifest's entries in the order
+ * its parser pushed them (a pyproject.toml pushes src/<name> before <name>). */
+bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
+                          int source_len, cbm_pkg_entries_t *entries) {
+    int before = entries ? entries->count : 0;
+    if (!pkgmap_parse_by_basename(basename, rel_path, source, source_len, entries)) {
+        return false;
+    }
+    for (int i = before; rel_path && i < entries->count; i++) {
+        entries->items[i].source_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        entries->items[i].source_seq = i - before;
+    }
+    return true;
+}
+
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
 /* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
 static bool pkgmap_is_psr4_prefix(const char *pkg_name) {
     size_t n = pkg_name ? strlen(pkg_name) : 0;
     return n > 0 && pkg_name[n - SKIP_ONE] == '\\';
+}
+
+/* How far below the repository root an entry sits: 0 for the root itself. */
+static int pkgmap_entry_depth(const char *entry_rel) {
+    if (!entry_rel[0] || strcmp(entry_rel, ".") == 0) {
+        return 0;
+    }
+    int depth = SKIP_ONE;
+    for (const char *p = entry_rel; *p; p++) {
+        if (*p == '/') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Merge order: by package name, then the manifest nearest the repository root,
+ * then by manifest path, then the order in which that manifest's parser pushed
+ * its entries. Two manifests can declare one package name (a repository's
+ * go.mod and a test fixture's copy of it), and which worker parsed which is
+ * thread scheduling. Ordering the manifests here makes the winner a property of
+ * the repository, not of the run. One manifest's own entries keep their order:
+ * its parser puts the preferred candidate first. An entry no manifest stamped
+ * is ordered by its own path. */
+static int pkgmap_candidate_cmp(const void *lhs, const void *rhs) {
+    const cbm_pkg_entry_t *a = *(const cbm_pkg_entry_t *const *)lhs;
+    const cbm_pkg_entry_t *b = *(const cbm_pkg_entry_t *const *)rhs;
+    int by_name = strcmp(a->pkg_name, b->pkg_name);
+    if (by_name != 0) {
+        return by_name;
+    }
+    const char *from_a = a->source_rel ? a->source_rel : a->entry_rel;
+    const char *from_b = b->source_rel ? b->source_rel : b->entry_rel;
+    int depth_a = pkgmap_entry_depth(from_a);
+    int depth_b = pkgmap_entry_depth(from_b);
+    if (depth_a != depth_b) {
+        return depth_a < depth_b ? -SKIP_ONE : SKIP_ONE;
+    }
+    int by_source = strcmp(from_a, from_b);
+    if (by_source != 0) {
+        return by_source;
+    }
+    if (a->source_seq != b->source_seq) {
+        return a->source_seq < b->source_seq ? -SKIP_ONE : SKIP_ONE;
+    }
+    return strcmp(a->entry_rel, b->entry_rel);
 }
 
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
@@ -1086,39 +1151,50 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
         return NULL;
     }
 
-    CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
-    int merged = 0;
-
+    const cbm_pkg_entry_t **candidates =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)total * sizeof(*candidates));
+    if (!candidates) {
+        return NULL;
+    }
+    int candidate_count = 0;
     for (int w = 0; w < worker_count; w++) {
-        cbm_pkg_entries_t *we = &worker_entries[w];
+        const cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
             if (!we->items[i].pkg_name || !we->items[i].entry_rel) {
                 continue; /* package-boundary metadata has no import specifier */
             }
-            /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
-             * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
-             * instead: its readers map `Prefix\Sub\Class` onto a file path
-             * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
-            const char *entry_rel = we->items[i].entry_rel;
-            char *qn = pkgmap_is_psr4_prefix(we->items[i].pkg_name)
-                           ? cbm_strndup(entry_rel, strlen(entry_rel))
-                           : cbm_pipeline_fqn_module(project_name, entry_rel);
-            if (!qn) {
-                continue;
-            }
-
-            /* Check for duplicate — first wins */
-            if (cbm_ht_has(map, we->items[i].pkg_name)) {
-                free(qn);
-                continue;
-            }
-
-            /* Transfer ownership: key = strdup'd pkg_name, value = qn */
-            char *key = strdup(we->items[i].pkg_name);
-            cbm_ht_set(map, key, qn);
-            merged++;
+            candidates[candidate_count++] = &we->items[i];
         }
     }
+    qsort(candidates, (size_t)candidate_count, sizeof(*candidates), pkgmap_candidate_cmp);
+
+    CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
+    int merged = 0;
+
+    for (int i = 0; i < candidate_count; i++) {
+        const cbm_pkg_entry_t *entry = candidates[i];
+        /* Duplicate name: the first in merge order wins. */
+        if (cbm_ht_has(map, entry->pkg_name)) {
+            continue;
+        }
+        /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
+         * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
+         * instead: its readers map `Prefix\Sub\Class` onto a file path
+         * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
+        const char *entry_rel = entry->entry_rel;
+        char *qn = pkgmap_is_psr4_prefix(entry->pkg_name)
+                       ? cbm_strndup(entry_rel, strlen(entry_rel))
+                       : cbm_pipeline_fqn_module(project_name, entry_rel);
+        if (!qn) {
+            continue;
+        }
+
+        /* Transfer ownership: key = strdup'd pkg_name, value = qn */
+        char *key = strdup(entry->pkg_name);
+        cbm_ht_set(map, key, qn);
+        merged++;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, candidates);
 
     if (merged == 0) {
         cbm_ht_free(map);

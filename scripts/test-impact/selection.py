@@ -14,6 +14,18 @@ what a CI consumer runs.
                (scripts/run-tests-parallel.sh, CBM_TEST_SELECTION_OPTIONAL)
       exit 11  the lane selects nothing: FILE is empty
       anything else: run everything (FILE and FILE2 are removed)
+      --whole-suites FILE3: the view for a leg the coverage was not recorded
+               on: every suite FILE3 lists runs whole there, selected or not
+               (an unselected one is optional: a build without it drops it)
+
+  selection.py platform-suites --repo DIR --rev REV [--rev REV ...]
+      The platform-specific runner suites, one per line: those whose defining
+      test file, at any of the revisions, holds a SKIP_PLATFORM( call or a
+      preprocessor conditional on an OS or architecture macro — the two
+      markers scripts/check-no-test-skips.sh names for a genuinely
+      platform-specific test — and those tests/test_main.c registers under
+      such a conditional. Any git failure exits 1 (the caller then narrows no
+      leg the classification would have protected).
 
 It fails safe by construction: a run-all answer, a lane it cannot find, an
 unknown schema or filter encoding, a token that is not `suite` or
@@ -24,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 
 SCHEMAS = {"cbm.test_impact.v0", "cbm.test_impact.v1"}
@@ -94,6 +107,98 @@ def conditional_suites(answer, name):
     return []
 
 
+def whole_view(lines, optional, whole):
+    """The filter lines and optional suites for a leg where every suite in
+    `whole` runs whole: their per-test tokens collapse to the suite, and those
+    the answer did not select are added — optional, since only the answer
+    knows which suites every build registers."""
+    selected = {line.split(":", 1)[0] for line in lines}
+    out, seen = [], set()
+    for line in lines:
+        suite = line.split(":", 1)[0]
+        token = suite if suite in whole else line
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    added = sorted(set(whole) - selected)
+    return out + added, sorted(set(optional) | set(added))
+
+
+# The OS and architecture macros a test is compile-gated on.
+PLATFORM_MACROS = ("_WIN32", "_WIN64", "__APPLE__", "__MACH__", "__linux__", "__unix__",
+                   "__FreeBSD__", "__OpenBSD__", "__NetBSD__", "__CYGWIN__", "__MINGW32__",
+                   "__MINGW64__", "_MSC_VER", "__aarch64__", "__arm64__", "__x86_64__",
+                   "__i386__", "_M_ARM64", "_M_X64", "_M_IX86")
+PLATFORM_CONDITIONAL = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b.*\b(?:"
+                                  + "|".join(re.escape(m) for m in PLATFORM_MACROS) + r")\b")
+SKIP_PLATFORM = re.compile(r"\bSKIP_PLATFORM\s*\(")
+SUITE_DEFINITION = re.compile(r"^\s*(?:SUITE\s*\(\s*([A-Za-z0-9_]+)\s*\)|"
+                              r"void\s+suite_([A-Za-z0-9_]+)\s*\(\s*void\s*\)\s*\{?\s*$)")
+RUNNER_REGISTRATION = re.compile(r"^\s*RUN_SELECTED_SUITE(?:_PERF)?\s*\(\s*([a-z0-9_]+)\s*\)")
+RUNNER = "tests/test_main.c"
+
+
+def git(repo, *args, stdin=None):
+    # Pinned behaviour: no pager, no replacement objects.
+    return subprocess.run(["git", "-C", repo, "--no-pager", "-c", "core.quotePath=false",
+                           *args], check=True, capture_output=True, input=stdin,
+                          env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}).stdout
+
+
+def blobs(repo, rev, paths):
+    """{path: text} of `paths` at `rev`, read in one `git cat-file --batch`."""
+    out = git(repo, "cat-file", "--batch",
+              stdin="".join(f"{rev}:{path}\n" for path in paths).encode("utf-8"))
+    texts, at = {}, 0
+    for path in paths:
+        end = out.index(b"\n", at)
+        header = out[at:end].split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise OSError(f"{rev}:{path}: {out[at:end][:80]!r}")
+        size = int(header[2])
+        texts[path] = out[end + 1:end + 1 + size].decode("utf-8", "replace")
+        at = end + 1 + size + 1  # the blob, then its newline
+    return texts
+
+
+def runner_conditional_suites(text):
+    """Suites tests/test_main.c registers inside an OS or architecture #if."""
+    out, stack = set(), []
+    for line in text.splitlines():
+        directive = re.match(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b", line)
+        if directive:
+            kind = directive.group(1)
+            if kind in ("if", "ifdef", "ifndef"):
+                stack.append(bool(PLATFORM_CONDITIONAL.match(line)))
+            elif kind == "elif" and stack:
+                stack[-1] = stack[-1] or bool(PLATFORM_CONDITIONAL.match(line))
+            elif kind == "endif" and stack:
+                stack.pop()
+            continue
+        registered = RUNNER_REGISTRATION.match(line)
+        if registered and any(stack):
+            out.add(registered.group(1))
+    return out
+
+
+def platform_suites(repo, revs):
+    out = set()
+    for rev in revs:
+        names = git(repo, "ls-tree", "-r", "-z", "--name-only", rev, "--", "tests")
+        paths = sorted(p for p in names.decode("utf-8").split("\0") if p.endswith(".c"))
+        for path, text in blobs(repo, rev, paths).items():
+            if path == RUNNER:
+                out |= runner_conditional_suites(text)
+            lines = text.splitlines()
+            if not any(PLATFORM_CONDITIONAL.match(l) or SKIP_PLATFORM.search(l) for l in lines):
+                continue
+            for line in lines:
+                defined = SUITE_DEFINITION.match(line)
+                if defined:
+                    out.add(defined.group(1) or defined.group(2))
+    return sorted(out)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -104,13 +209,25 @@ def main():
     f.add_argument("--lane", required=True)
     f.add_argument("--out", required=True)
     f.add_argument("--optional-out")
+    f.add_argument("--whole-suites")
+    p = sub.add_parser("platform-suites")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--rev", action="append", required=True)
     args = parser.parse_args()
+    # LF on every host, like the files below: a Windows python would
+    # otherwise write CRLF.
+    sys.stdout.reconfigure(newline="\n")
     if args.command == "suites":
-        # LF on every host, like the files below: a Windows python would
-        # otherwise write CRLF.
-        sys.stdout.reconfigure(newline="\n")
         with open(args.answer, encoding="utf-8") as handle:
             print("\n".join(suites(json.load(handle))))
+        return 0
+    if args.command == "platform-suites":
+        try:
+            found = platform_suites(args.repo, args.rev)
+        except (OSError, subprocess.CalledProcessError, UnicodeDecodeError) as error:
+            print(f"selection: platform suites unknown: {error}", file=sys.stderr)
+            return 1
+        print("".join(suite + "\n" for suite in found), end="")
         return 0
     for stale in (args.out, args.optional_out):
         if stale and os.path.exists(stale):
@@ -123,11 +240,21 @@ def main():
     if not isinstance(answer, dict):
         return run_all("the answer is not an object")
     code, lines = lane_filter(answer, args.lane)
+    optional = conditional_suites(answer, args.lane) if code == NARROWED else []
+    if code == NARROWED and args.whole_suites:
+        try:
+            with open(args.whole_suites, encoding="utf-8") as handle:
+                whole = [line.strip() for line in handle if line.strip()]
+        except OSError as error:
+            return run_all(f"unreadable whole-suite list ({error})")
+        bad = [suite for suite in whole if not TOKEN.match(suite) or ":" in suite]
+        if bad:
+            return run_all(f"whole-suite list unusable ({bad[:3]})")
+        lines, optional = whole_view(lines, optional, whole)
     if code in (NARROWED, NOTHING):
         with open(args.out, "w", encoding="utf-8", newline="\n") as handle:
             handle.write("".join(line + "\n" for line in lines))
         if args.optional_out:
-            optional = conditional_suites(answer, args.lane) if code == NARROWED else []
             with open(args.optional_out, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write("".join(suite + "\n" for suite in optional))
     return code
