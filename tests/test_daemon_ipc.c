@@ -53,6 +53,15 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <sched.h> /* #1830 userns real smoke: unshare(CLONE_NEWUSER). */
+#if defined(__has_include) && __has_include(<linux/landlock.h>)
+#include <linux/landlock.h> /* #3014 Landlock real smoke. */
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#if defined(SYS_landlock_create_ruleset) && defined(SYS_landlock_add_rule) && \
+    defined(SYS_landlock_restrict_self)
+#define IPC_TEST_HAS_LANDLOCK 1
+#endif
+#endif
 #endif
 #ifdef __APPLE__
 #include <membership.h>
@@ -5394,6 +5403,93 @@ TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor) {
     PASS();
 }
 
+/* #3014: a process confined by Landlock that may not list "/", or any other
+ * ancestor of its private directory, must still be able to secure that
+ * directory. The walk used to open every ancestor O_RDONLY|O_DIRECTORY, which
+ * Landlock counts as listing, so it failed at "/" in any sandbox that handles
+ * LANDLOCK_ACCESS_FS_READ_DIR without granting it on the root; the daemon then
+ * exited with "could not load saved runtime settings".
+ *
+ * The child handles READ_DIR only and is granted it beneath this test's own
+ * parent directory, then creates and secures a private directory below it.
+ * Exit protocol, as the userns smoke: 0 secured, 1 refused, 2 Landlock is not
+ * available in this kernel, 3 the harness could not build its sandbox. */
+TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014) {
+#ifdef IPC_TEST_HAS_LANDLOCK
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    if (ipc_test_parent_new(parent, "private-cache-landlock")) {
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = cache_written > 0 && cache_written < (int)sizeof(cache);
+    }
+    if (!paths_ok) {
+        ipc_test_remove_flat_dir(parent);
+        FAIL("could not create the Landlock smoke's parent directory");
+    }
+
+    pid_t child = fork();
+    if (child == 0) {
+        struct landlock_ruleset_attr ruleset = {.handled_access_fs = LANDLOCK_ACCESS_FS_READ_DIR};
+        int ruleset_fd = (int)syscall(SYS_landlock_create_ruleset, &ruleset, sizeof(ruleset), 0U);
+        if (ruleset_fd < 0) {
+            _exit(errno == ENOSYS || errno == EOPNOTSUPP ? 2 : 3);
+        }
+        struct landlock_path_beneath_attr beneath = {
+            .allowed_access = LANDLOCK_ACCESS_FS_READ_DIR,
+            .parent_fd = open(parent, O_PATH | O_CLOEXEC),
+        };
+        if (beneath.parent_fd < 0 ||
+            syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &beneath, 0U) !=
+                0 ||
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+            syscall(SYS_landlock_restrict_self, ruleset_fd, 0U) != 0) {
+            _exit(3);
+        }
+        /* The sandbox must be real, or a pass below would prove nothing:
+         * listing "/" is refused from here on. */
+        int root_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (root_fd >= 0 || errno != EACCES) {
+            _exit(3);
+        }
+        _exit(cbm_daemon_ipc_private_directory_secure(cache) ? 0 : 1);
+    }
+    int status = 0;
+    if (child > 0) {
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }
+    struct stat secured = {0};
+    bool hardened = lstat(cache, &secured) == 0 && S_ISDIR(secured.st_mode) &&
+                    secured.st_uid == geteuid() && (secured.st_mode & 07777) == 0700;
+    (void)rmdir(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    if (child < 0) {
+        FAIL("fork failed for the Landlock smoke");
+    }
+    if (!WIFEXITED(status)) {
+        FAIL("Landlock probe did not exit normally (signalled) -- not a security verdict");
+    }
+    if (WEXITSTATUS(status) == 2) {
+        SKIP_PLATFORM("Landlock is not available in this Linux kernel");
+    }
+    if (WEXITSTATUS(status) == 3) {
+        FAIL("Landlock smoke could not build a sandbox that refuses listing /");
+    }
+    if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
+        char unexpected[128];
+        (void)snprintf(unexpected, sizeof(unexpected),
+                       "Landlock probe exited %d -- not a security verdict", WEXITSTATUS(status));
+        FAIL(unexpected);
+    }
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    ASSERT_TRUE(hardened);
+    PASS();
+#else
+    SKIP_PLATFORM("Landlock is Linux-only");
+#endif
+}
+
 TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only) {
     char parent[TEST_PATH_CAP] = {0};
     char logs[TEST_PATH_CAP] = {0};
@@ -6240,6 +6336,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_log_creates_first_ever_cache_tree_safely);
     RUN_TEST(daemon_ipc_posix_private_directory_hardens_existing_cache_root);
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
+    RUN_TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
 #ifndef _WIN32
