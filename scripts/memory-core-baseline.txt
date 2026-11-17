@@ -73,7 +73,7 @@ src/pipeline/pass_pkgmap.c	80
 src/pipeline/pass_semantic.c	3
 src/pipeline/pass_tests.c	3
 src/pipeline/pass_usages.c	4
-src/pipeline/path_alias.c	40
+src/pipeline/path_alias.c	1
 src/pipeline/pipeline.c	129
 src/pipeline/pipeline_delta.c	19
 src/pipeline/pipeline_incremental.c	130

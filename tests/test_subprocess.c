@@ -808,10 +808,16 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
 }
 
 /* ── Process-tree memory probe (every platform) ─────────────────────────────
- * The test runner's __cbm_rss_tree_root role starts one __cbm_rss_tree_hold
- * descendant that touches a controlled allocation and then publishes its pid.
- * Waits below have no deadline: they end when the descendant is ready or the
- * tree stops running, so the outcome, not a timer, decides the verdict. */
+ * One tree per sample. The test creates two pipes, "up" (tree -> test) and
+ * "down" (test -> tree); the runner's __cbm_rss_tree_root role connects both
+ * before anything else, then starts ONE __cbm_rss_tree_hold descendant that
+ * alone holds the tree's ends (protocol: tf_rss_tree_hold in test_main.c).
+ * The test takes the idle sample, lets the descendant allocate, and takes the
+ * loaded sample of the SAME processes, each step blocked in a pipe read until
+ * the other side has written. A descendant that dies closes its ends, so the
+ * read waiting on it returns end-of-file: no step has a deadline, a sleep or a
+ * poll interval. Connecting is the one wait end-of-file cannot cover; the
+ * root does it as its first action. */
 
 #ifdef _WIN32
 #define RSS_TREE_FAULT_GONE ERROR_INVALID_PARAMETER /* no process with that id any more */
@@ -826,9 +832,27 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
 
 #define RSS_TREE_MIB UINT64_C(1048576)
 
+#ifdef _WIN32
+typedef HANDLE rss_tree_pipe_t;
+#define RSS_TREE_NO_PIPE INVALID_HANDLE_VALUE
+#else
+typedef int rss_tree_pipe_t;
+#define RSS_TREE_NO_PIPE (-1)
+#endif
+
+typedef struct {
+    char up_name[300];   /* the tree writes, the test reads */
+    char down_name[300]; /* the test writes, the tree reads */
+    rss_tree_pipe_t up;
+    rss_tree_pipe_t down;
+} rss_tree_pipes_t;
+
 typedef struct {
     bool spawned;
-    bool ready;
+    bool idle_ready; /* the descendant said 'I': started, nothing allocated */
+    cbm_proc_tree_rss_status_t idle_status;
+    uint64_t idle_rss;
+    bool ready; /* the descendant said 'R': every page of the load touched */
     cbm_proc_tree_rss_status_t status;
     uint64_t rss;
     bool quiesced;
@@ -840,23 +864,136 @@ static void rss_tree_pause(void) {
     cbm_usleep(10000); /* poll interval only; nothing here is a deadline */
 }
 
-static bool rss_tree_wait_ready(const char *ready_path, cbm_subprocess_t *process) {
-    for (;;) {
-        FILE *ready = cbm_fopen(ready_path, "rb");
-        if (ready) {
-            long pid = 0;
-            int fields = fscanf(ready, "%ld", &pid);
-            (void)fclose(ready);
-            if (fields == 1 && pid > 0) {
-                return true;
-            }
-        }
-        cbm_proc_result_t ignored;
-        if (cbm_subprocess_poll(process, &ignored) != CBM_PROC_POLL_RUNNING) {
-            return false;
-        }
-        rss_tree_pause();
+#ifdef _WIN32
+static HANDLE rss_tree_pipe_serve(const char *name, DWORD direction) {
+    wchar_t *wide = cbm_utf8_to_wide(name);
+    HANDLE channel = wide ? CreateNamedPipeW(wide, direction | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+                                                 PIPE_REJECT_REMOTE_CLIENTS,
+                                             1, 64, 64, 0, NULL)
+                          : INVALID_HANDLE_VALUE;
+    free(wide);
+    return channel;
+}
+
+/* The client may connect before this call (ERROR_PIPE_CONNECTED) or connect
+ * and close again (ERROR_NO_DATA). Both are connected; the next read or write
+ * reports whether the other side is still there. */
+static bool rss_tree_pipe_accept(HANDLE channel) {
+    if (ConnectNamedPipe(channel, NULL)) {
+        return true;
     }
+    DWORD error = GetLastError();
+    return error == ERROR_PIPE_CONNECTED || error == ERROR_NO_DATA;
+}
+#else
+static int rss_tree_fifo_open(const char *name, int mode) {
+    int channel;
+    do {
+        channel = open(name, mode | O_CLOEXEC);
+    } while (channel < 0 && errno == EINTR);
+    return channel;
+}
+#endif
+
+/* Pipes named after the private temporary directory, so concurrent runners
+ * never meet: FIFOs inside it on POSIX, named pipes after its unique leaf on
+ * Windows, created before the spawn so the root's connect finds them. */
+static bool rss_tree_pipes_create(rss_tree_pipes_t *pipes, const char *dir) {
+    pipes->up = RSS_TREE_NO_PIPE;
+    pipes->down = RSS_TREE_NO_PIPE;
+#ifdef _WIN32
+    const char *leaf = dir;
+    for (const char *cursor = dir; *cursor; cursor++) {
+        if (*cursor == '\\' || *cursor == '/') {
+            leaf = cursor + 1;
+        }
+    }
+    int up_length = snprintf(pipes->up_name, sizeof(pipes->up_name), "\\\\.\\pipe\\%s-up", leaf);
+    int down_length =
+        snprintf(pipes->down_name, sizeof(pipes->down_name), "\\\\.\\pipe\\%s-down", leaf);
+#else
+    int up_length = snprintf(pipes->up_name, sizeof(pipes->up_name), "%s/up", dir);
+    int down_length = snprintf(pipes->down_name, sizeof(pipes->down_name), "%s/down", dir);
+#endif
+    if (up_length <= 0 || (size_t)up_length >= sizeof(pipes->up_name) || down_length <= 0 ||
+        (size_t)down_length >= sizeof(pipes->down_name)) {
+        return false;
+    }
+#ifdef _WIN32
+    pipes->up = rss_tree_pipe_serve(pipes->up_name, PIPE_ACCESS_INBOUND);
+    pipes->down = rss_tree_pipe_serve(pipes->down_name, PIPE_ACCESS_OUTBOUND);
+    return pipes->up != INVALID_HANDLE_VALUE && pipes->down != INVALID_HANDLE_VALUE;
+#else
+    return mkfifo(pipes->up_name, 0600) == 0 && mkfifo(pipes->down_name, 0600) == 0;
+#endif
+}
+
+/* Blocks until the root has connected both ends, in the order it connects
+ * them (up, then down). */
+static bool rss_tree_pipes_connect(rss_tree_pipes_t *pipes) {
+#ifdef _WIN32
+    return rss_tree_pipe_accept(pipes->up) && rss_tree_pipe_accept(pipes->down);
+#else
+    pipes->up = rss_tree_fifo_open(pipes->up_name, O_RDONLY);
+    pipes->down = pipes->up >= 0 ? rss_tree_fifo_open(pipes->down_name, O_WRONLY) : -1;
+    return pipes->up >= 0 && pipes->down >= 0;
+#endif
+}
+
+/* Closing the test's ends is what releases the descendant to exit. */
+static void rss_tree_pipes_close(rss_tree_pipes_t *pipes) {
+    rss_tree_pipe_t *ends[] = {&pipes->up, &pipes->down};
+    for (size_t index = 0; index < sizeof(ends) / sizeof(ends[0]); index++) {
+        if (*ends[index] == RSS_TREE_NO_PIPE) {
+            continue;
+        }
+#ifdef _WIN32
+        (void)CloseHandle(*ends[index]);
+#else
+        (void)close(*ends[index]);
+#endif
+        *ends[index] = RSS_TREE_NO_PIPE;
+    }
+}
+
+/* Blocks until the descendant writes; false on end-of-file (it is gone) or
+ * an unexpected byte. */
+static bool rss_tree_hear(rss_tree_pipe_t channel, char expected) {
+    char byte = 0;
+#ifdef _WIN32
+    DWORD got = 0;
+    bool heard = ReadFile(channel, &byte, 1, &got, NULL) && got == 1;
+#else
+    ssize_t count;
+    do {
+        count = read(channel, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    bool heard = count == 1;
+#endif
+    return heard && byte == expected;
+}
+
+static bool rss_tree_say(rss_tree_pipe_t channel, char byte) {
+#ifdef _WIN32
+    DWORD written = 0;
+    return WriteFile(channel, &byte, 1, &written, NULL) && written == 1;
+#else
+    /* A descendant that already died leaves no reader: report that instead
+     * of taking SIGPIPE. */
+    struct sigaction ignore = {.sa_handler = SIG_IGN};
+    struct sigaction previous;
+    (void)sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &previous) != 0) {
+        return false;
+    }
+    ssize_t count;
+    do {
+        count = write(channel, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    bool restored = sigaction(SIGPIPE, &previous, NULL) == 0;
+    return count == 1 && restored;
+#endif
 }
 
 static bool rss_tree_finish(cbm_subprocess_t *process, rss_tree_sample_t *sample) {
@@ -877,66 +1014,85 @@ static bool rss_tree_finish(cbm_subprocess_t *process, rss_tree_sample_t *sample
     return result.tree_quiesced;
 }
 
-/* Measure one tree whose descendant holds `mib` MiB, with every non-root
- * member's measurement failing with `member_fault` (0 = real calls). */
+/* Sample one tree idle, then again once its descendant has touched `mib` MiB.
+ * In the loaded sample every non-root member's measurement fails with
+ * `member_fault` (0 = real calls). */
 static rss_tree_sample_t rss_tree_sample(int mib, int member_fault) {
-    rss_tree_sample_t sample = {.status = CBM_PROC_TREE_RSS_ERROR,
+    rss_tree_sample_t sample = {.idle_status = CBM_PROC_TREE_RSS_ERROR,
+                                .status = CBM_PROC_TREE_RSS_ERROR,
                                 .final_status = CBM_PROC_TREE_RSS_ERROR,
                                 .final_rss = UINT64_MAX};
     const char *made = th_mktempdir("cbm_rss_tree");
     char dir[256];
-    char ready_path[300];
-    char mib_text[16];
-    if (!made || snprintf(dir, sizeof(dir), "%s", made) >= (int)sizeof(dir) ||
-        snprintf(ready_path, sizeof(ready_path), "%s/ready", dir) >= (int)sizeof(ready_path)) {
+    if (!made || snprintf(dir, sizeof(dir), "%s", made) >= (int)sizeof(dir)) {
         return sample;
     }
-    (void)snprintf(mib_text, sizeof(mib_text), "%d", mib);
-    const char *argv[] = {cbm_test_program_path, "__cbm_rss_tree_root", ready_path, mib_text,
-                          NULL};
-    cbm_proc_opts_t opts = {0};
-    opts.bin = cbm_test_program_path;
-    opts.argv = argv;
-    opts.cancel_grace_ms = 100;
-    cbm_subprocess_t *process = NULL;
-    sample.spawned = cbm_subprocess_spawn(&opts, &process) == 0;
-    if (sample.spawned) {
-        sample.ready = rss_tree_wait_ready(ready_path, process);
-        if (sample.ready) {
-            cbm_subprocess_tree_rss_fault_members_for_testing(member_fault);
-            sample.status = cbm_subprocess_tree_rss_bytes(process, &sample.rss);
-            cbm_subprocess_tree_rss_fault_members_for_testing(0);
+    rss_tree_pipes_t pipes;
+    if (rss_tree_pipes_create(&pipes, dir)) {
+        char mib_text[16];
+        (void)snprintf(mib_text, sizeof(mib_text), "%d", mib);
+        const char *argv[] = {cbm_test_program_path,
+                              "__cbm_rss_tree_root",
+                              pipes.up_name,
+                              pipes.down_name,
+                              mib_text,
+                              NULL};
+        cbm_proc_opts_t opts = {0};
+        opts.bin = cbm_test_program_path;
+        opts.argv = argv;
+        opts.cancel_grace_ms = 100;
+        cbm_subprocess_t *process = NULL;
+        sample.spawned = cbm_subprocess_spawn(&opts, &process) == 0;
+        if (sample.spawned) {
+            sample.idle_ready = rss_tree_pipes_connect(&pipes) && rss_tree_hear(pipes.up, 'I');
+            if (sample.idle_ready) {
+                sample.idle_status = cbm_subprocess_tree_rss_bytes(process, &sample.idle_rss);
+            }
+            sample.ready =
+                sample.idle_ready && rss_tree_say(pipes.down, 'L') && rss_tree_hear(pipes.up, 'R');
+            if (sample.ready) {
+                cbm_subprocess_tree_rss_fault_members_for_testing(member_fault);
+                sample.status = cbm_subprocess_tree_rss_bytes(process, &sample.rss);
+                cbm_subprocess_tree_rss_fault_members_for_testing(0);
+            }
+            rss_tree_pipes_close(&pipes);
+            sample.quiesced = rss_tree_finish(process, &sample);
         }
-        sample.quiesced = rss_tree_finish(process, &sample);
     }
+    rss_tree_pipes_close(&pipes);
     th_cleanup(dir);
     return sample;
 }
 
-/* Only the DESCENDANT allocates, so the difference between two otherwise
- * identical trees is memory the probe can only have counted by measuring past
- * the root. 128 MiB touched against a 96 MiB floor leaves room for allocator
- * and page-rounding noise and none for a root-only total. */
+/* Only the DESCENDANT allocates, and only between two samples of the SAME
+ * tree while the root sits blocked in its wait, so the growth is memory the
+ * probe can only have counted by measuring past the root. (Two separately
+ * spawned trees need not start from the same footprint, so comparing them
+ * proves nothing.) The floor is half the touched load: a root-only total,
+ * which does not grow, misses it by the full 96 MiB, and a total that counts
+ * the descendant clears it with 96 MiB to spare for page rounding, allocator
+ * bookkeeping, or a working-set trim between the two samples. */
+#define RSS_TREE_LOAD_MIB 192
+#define RSS_TREE_FLOOR_MIB 96
+
 TEST(subprocess_tree_rss_measures_contained_descendants) {
-    rss_tree_sample_t idle = rss_tree_sample(0, 0);
-    rss_tree_sample_t loaded = rss_tree_sample(128, 0);
-    if (loaded.status == CBM_PROC_TREE_RSS_OK && idle.status == CBM_PROC_TREE_RSS_OK) {
-        printf("    tree rss: idle=%llu MiB loaded=%llu MiB\n",
-               (unsigned long long)(idle.rss / RSS_TREE_MIB),
-               (unsigned long long)(loaded.rss / RSS_TREE_MIB));
+    rss_tree_sample_t tree = rss_tree_sample(RSS_TREE_LOAD_MIB, 0);
+    if (tree.idle_status == CBM_PROC_TREE_RSS_OK && tree.status == CBM_PROC_TREE_RSS_OK) {
+        printf("    tree rss: idle=%llu MiB loaded=%llu MiB (load %d MiB, floor +%d MiB)\n",
+               (unsigned long long)(tree.idle_rss / RSS_TREE_MIB),
+               (unsigned long long)(tree.rss / RSS_TREE_MIB), RSS_TREE_LOAD_MIB,
+               RSS_TREE_FLOOR_MIB);
     }
-    ASSERT_TRUE(idle.spawned);
-    ASSERT_TRUE(idle.ready);
-    ASSERT_EQ(idle.status, CBM_PROC_TREE_RSS_OK);
-    ASSERT_TRUE(idle.rss > 0);
-    ASSERT_TRUE(loaded.spawned);
-    ASSERT_TRUE(loaded.ready);
-    ASSERT_EQ(loaded.status, CBM_PROC_TREE_RSS_OK);
-    ASSERT_TRUE(loaded.rss >= idle.rss + 96 * RSS_TREE_MIB);
-    ASSERT_TRUE(idle.quiesced);
-    ASSERT_TRUE(loaded.quiesced);
-    ASSERT_EQ(loaded.final_status, CBM_PROC_TREE_RSS_EMPTY);
-    ASSERT_EQ(loaded.final_rss, 0);
+    ASSERT_TRUE(tree.spawned);
+    ASSERT_TRUE(tree.idle_ready);
+    ASSERT_EQ(tree.idle_status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(tree.idle_rss > 0);
+    ASSERT_TRUE(tree.ready);
+    ASSERT_EQ(tree.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(tree.rss >= tree.idle_rss + RSS_TREE_FLOOR_MIB * RSS_TREE_MIB);
+    ASSERT_TRUE(tree.quiesced);
+    ASSERT_EQ(tree.final_status, CBM_PROC_TREE_RSS_EMPTY);
+    ASSERT_EQ(tree.final_rss, 0);
     PASS();
 }
 
