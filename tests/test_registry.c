@@ -1706,6 +1706,187 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
     PASS();
 }
 
+static bool gate_bound(const cbm_resolution_t *res, const char *qn) {
+    return res->qualified_name && strcmp(res->qualified_name, qn) == 0;
+}
+
+static bool gate_empty(const cbm_resolution_t *res) {
+    return !res->qualified_name || res->qualified_name[0] == '\0';
+}
+
+/* The receiver gate at the name-only CALLS exits judges a member call whose
+ * receiver is a value (`tp.topic`): it binds only on evidence that the call
+ * means the candidate, and is refused otherwise -- a veto, never a re-pick.
+ * The evidence rules are shown on C#, where unique_name binds are judged too. */
+TEST(registry_receiver_gate_judges_value_receivers) {
+    cbm_registry_t *r = cbm_registry_new();
+    const char *mod = "proj.streams.src.main.java.org.acme.streams";
+    const char *topic = "proj.clients.src.main.java.org.acme.clients.consumer.ConsumerRecord.topic";
+    const char *clean = "proj.core.src.main.java.org.acme.log.LogCleanerManager.cleaningState";
+    const char *with = "proj.clients.src.main.java.org.acme.clients.RaftContext.Builder.withVoters";
+    const char *set_name = "proj.core.src.main.java.org.acme.log.Logger.setName";
+    const char *parts = "proj.streams.src.main.java.org.acme.streams.TopicInfo.numPartitions";
+    const char *guard = "proj.src.shipping.src.telemetry_conf.OtelGuard.shutdown";
+    cbm_registry_add_lang(r, "topic", topic, "Method", CBM_LANG_CSHARP, false);
+    cbm_registry_add_lang(r, "cleaningState", clean, "Method", CBM_LANG_CSHARP, false);
+    cbm_registry_add_lang(r, "withVoters", with, "Method", CBM_LANG_CSHARP, false);
+    cbm_registry_add_lang(r, "setName", set_name, "Method", CBM_LANG_CSHARP, false);
+    cbm_registry_add_lang(r, "numPartitions", parts, "Method", CBM_LANG_CSHARP, false);
+    cbm_registry_add_lang(r, "shutdown", guard, "Method", CBM_LANG_CPP, false);
+    const CBMLanguage cs = CBM_LANG_CSHARP;
+
+    /* Nothing ties `tp` to ConsumerRecord: refused on the CALLS path, while
+     * every other resolve keeps its answer. */
+    cbm_resolution_t res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_empty(&res));
+    res = cbm_registry_resolve_lang(r, "tp.topic", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_bound(&res, topic));
+    /* The file imports the candidate's class: bound. */
+    const char *vals[] = {"proj.clients.src.main.java.org.acme.clients.consumer.ConsumerRecord"};
+    const char *keys[] = {"ConsumerRecord"};
+    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, keys, vals, 1, cs);
+    ASSERT_TRUE(gate_bound(&res, topic));
+    /* Self receivers are not unknown, protobuf's `this_` included. */
+    res = cbm_registry_resolve_call_lang(r, "this.topic", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_bound(&res, topic));
+    res = cbm_registry_resolve_call_lang(r, "this_.topic", mod, NULL, NULL, 0, CBM_LANG_CPP);
+    ASSERT_TRUE(gate_bound(&res, topic));
+    res =
+        cbm_registry_resolve_call_lang(r, "self.items.topic", mod, NULL, NULL, 0, CBM_LANG_PYTHON);
+    ASSERT_TRUE(gate_bound(&res, topic));
+
+    /* A receiver named after the owner type, compared word by word: one name's
+     * words ending the other's, snake_case and a PHP sigil included. */
+    res = cbm_registry_resolve_call_lang(r, "cleanerManager.cleaningState", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_bound(&res, clean));
+    res = cbm_registry_resolve_call_lang(r, "spyLogCleanerManager2.cleaningState", mod, NULL, NULL,
+                                         0, cs);
+    ASSERT_TRUE(gate_bound(&res, clean));
+    res =
+        cbm_registry_resolve_call_lang(r, "anotherManagerX.cleaningState", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_empty(&res));
+    res = cbm_registry_resolve_call_lang(r, "verify(cleanerManager).cleaningState", mod, NULL, NULL,
+                                         0, cs);
+    ASSERT_TRUE(gate_bound(&res, clean));
+    res = cbm_registry_resolve_call_lang(r, "otel_guard.shutdown", "proj.src.shipping.src.main",
+                                         NULL, NULL, 0, CBM_LANG_CPP);
+    ASSERT_TRUE(gate_bound(&res, guard));
+    res = cbm_registry_resolve_call_lang(r, "$logger.setName", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_bound(&res, set_name));
+    /* Languages with their own member-call guard after resolution are left
+     * to it. */
+    res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, CBM_LANG_TYPESCRIPT);
+    ASSERT_TRUE(gate_bound(&res, topic));
+    /* A constructor root names its type. */
+    res = cbm_registry_resolve_call_lang(r, "new RaftContext.Builder(voters, 1).withVoters", mod,
+                                         NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_bound(&res, with));
+    res = cbm_registry_resolve_call_lang(r, "new External().setName", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_empty(&res));
+    /* A candidate in the caller's own module. */
+    res = cbm_registry_resolve_call_lang(r, "topic.numPartitions", mod, NULL, NULL, 0, cs);
+    ASSERT_TRUE(gate_bound(&res, parts));
+
+    /* C++ (and C): a member call landing on a struct member is decided by the C
+     * member resolver from the object's type. */
+    const char *c_mod = "proj.src.redis";
+    cbm_registry_add_lang(r, "mallocFn", "proj.deps.hiredis.alloc.hiredisAllocFuncs.mallocFn",
+                          "Field", CBM_LANG_CPP, false);
+    res = cbm_registry_resolve_call_lang(r, "hiredisAllocFns.mallocFn", c_mod, NULL, NULL, 0,
+                                         CBM_LANG_CPP);
+    ASSERT_TRUE(gate_bound(&res, "proj.deps.hiredis.alloc.hiredisAllocFuncs.mallocFn"));
+    /* C++: a candidate whose owner type the caller's own file declares (a class
+     * re-declared above `Widget w(n); w.get_id()`); refused from a file that
+     * declares no Widget. */
+    const char *get_id = "proj.src.widget.Widget.get_id";
+    cbm_registry_add_lang(r, "get_id", get_id, "Method", CBM_LANG_CPP, false);
+    cbm_registry_add_lang(r, "Widget", "proj.src.main.Widget", "Class", CBM_LANG_CPP, false);
+    res =
+        cbm_registry_resolve_call_lang(r, "w.get_id", "proj.src.main", NULL, NULL, 0, CBM_LANG_CPP);
+    ASSERT_TRUE(gate_bound(&res, get_id));
+    res = cbm_registry_resolve_call_lang(r, "w.get_id", "proj.src.other", NULL, NULL, 0,
+                                         CBM_LANG_CPP);
+    ASSERT_TRUE(gate_empty(&res));
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The gate runs by measured language (an allowlist). Whole for Go and Elixir:
+ * a unique_name bind is judged too. Suffix-only for Scala, Rust and PHP: they
+ * keep their unique_name binds and only a suffix_match pick is judged. Off
+ * for every other language -- measured below the bar (Java, Kotlin, Swift,
+ * Ruby, Objective-C), refusing nothing (C, Dart), or not measured (Zig). */
+TEST(registry_receiver_gate_runs_by_measured_language) {
+    cbm_registry_t *r = cbm_registry_new();
+    const char *mod = "proj.streams.src.main.scala.org.acme.streams";
+    const char *consumer =
+        "proj.clients.src.main.java.org.acme.clients.consumer.ConsumerRecord.topic";
+    const char *producer =
+        "proj.clients.src.main.java.org.acme.clients.producer.ProducerRecord.topic";
+    static const CBMLanguage full[] = {CBM_LANG_GO, CBM_LANG_ELIXIR};
+    static const CBMLanguage suffix_only[] = {CBM_LANG_SCALA, CBM_LANG_RUST, CBM_LANG_PHP};
+    static const CBMLanguage off[] = {CBM_LANG_JAVA, CBM_LANG_KOTLIN, CBM_LANG_SWIFT, CBM_LANG_RUBY,
+                                      CBM_LANG_OBJC, CBM_LANG_C,      CBM_LANG_DART,  CBM_LANG_ZIG};
+    cbm_registry_add_lang(r, "topic", consumer, "Method", CBM_LANG_JAVA, false);
+    /* One definition of the name: refused only where the gate is whole. */
+    cbm_resolution_t res;
+    for (size_t i = 0; i < sizeof(full) / sizeof(full[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, full[i]);
+        ASSERT_TRUE(gate_empty(&res));
+    }
+    for (size_t i = 0; i < sizeof(suffix_only) / sizeof(suffix_only[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, suffix_only[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, off[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    /* Two: the proximity pick between them is refused where the gate runs,
+     * unless the receiver names its owner; the other languages keep theirs. */
+    cbm_registry_add_lang(r, "topic", producer, "Method", CBM_LANG_JAVA, false);
+    for (size_t i = 0; i < sizeof(suffix_only) / sizeof(suffix_only[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, suffix_only[i]);
+        ASSERT_TRUE(gate_empty(&res));
+        res = cbm_registry_resolve_call_lang(r, "consumerRecord.topic", mod, NULL, NULL, 0,
+                                             suffix_only[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+        res = cbm_registry_resolve_call_lang(r, "tp.topic", mod, NULL, NULL, 0, off[i]);
+        ASSERT_TRUE(gate_bound(&res, consumer));
+    }
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A chain rooted in a TYPE (`Future.exception`) in a file with imports: no
+ * candidate is import-reachable, so the fallback ranks every candidate -- a
+ * name-only guess that now passes the same type check as the other exits.
+ * When some candidate's owner IS named, the pick is left alone for the
+ * parallel resolver's field-type hint. */
+TEST(registry_receiver_gate_judges_type_roots_at_import_fallback) {
+    cbm_registry_t *r = cbm_registry_new();
+    const char *mod = "proj.finagle-core.src.main.scala.com.twitter.finagle.service";
+    cbm_registry_add_lang(r, "exception",
+                          "proj.finagle-thrift.src.main.scala.com.twitter.finagle.thrift."
+                          "MultiplexedService.MultiplexedFinagleService.exception",
+                          "Method", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(
+        r, "exception", "proj.finagle-mux.src.main.scala.com.twitter.finagle.mux.Message.exception",
+        "Method", CBM_LANG_SCALA, false);
+    const char *vals[] = {"proj.finagle-core.src.main.scala.com.twitter.finagle.Stack"};
+    const char *keys[] = {"Stack"};
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_lang(r, "Future.exception", mod, keys, vals, 1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_empty(&res));
+    /* The reference resolver keeps its answer. */
+    res = cbm_registry_resolve_lang(r, "Future.exception", mod, keys, vals, 1, CBM_LANG_SCALA);
+    ASSERT_FALSE(gate_empty(&res));
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(call_onto_field_follows_language_and_shape) {
     /* A call the registry resolved onto a Field node. */
     /* Another language: only the spelling connects them. */
@@ -3518,6 +3699,9 @@ SUITE(registry) {
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(go_bare_init_never_binds_init_namesake);
     RUN_TEST(c_bare_ref_never_binds_field);
+    RUN_TEST(registry_receiver_gate_judges_value_receivers);
+    RUN_TEST(registry_receiver_gate_runs_by_measured_language);
+    RUN_TEST(registry_receiver_gate_judges_type_roots_at_import_fallback);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);

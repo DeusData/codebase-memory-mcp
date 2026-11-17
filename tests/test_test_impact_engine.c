@@ -1077,6 +1077,104 @@ TEST(test_impact_engine_parse_gaps_reach_what_they_name) {
     PASS();
 }
 
+/* A gap names only what its text can call or read: a reached function,
+ * variable or macro (user decision R155, 2026-11-11). The word of a changed
+ * struct field (`used`) or a very short name (`nn`) written in an unrelated
+ * function's gap names nothing, and a gap outside every definition reaches the
+ * definitions written on its own lines, never its whole file. Matching every
+ * reached name and seeding whole files fired hundreds of gaps per change in
+ * this repository and reached the runner's main through the memory core. */
+static const char tie_gaps_main[] = "#include \"test_framework.h\"\n"
+                                    "int main(int argc, char **argv) {\n"
+                                    "    RUN_SELECTED_SUITE(alpha);\n"
+                                    "    RUN_SELECTED_SUITE(beta);\n"
+                                    "    RUN_SELECTED_SUITE(gamma);\n"
+                                    "    RUN_SELECTED_SUITE(delta);\n"
+                                    "    RUN_SELECTED_SUITE(epsilon);\n"
+                                    "    return 0;\n"
+                                    "}\n";
+
+/* One test that calls `fn`, as the whole suite `suite`. */
+static void tie_calling_suite(char *out, size_t cap, const char *suite, const char *fn) {
+    snprintf(out, cap,
+             "int %s(void);\n"
+             "TEST(%s_calls) {\n"
+             "    return %s() == 0 ? 0 : 1;\n"
+             "}\n"
+             "SUITE(%s) {\n"
+             "    RUN_TEST(%s_calls);\n"
+             "}\n",
+             fn, suite, fn, suite, suite);
+}
+
+TEST(test_impact_engine_parse_gaps_name_only_reached_functions) {
+    static const char lib[] = "struct counts {\n    int used;\n};\n"
+                              "int nn = 1;\n"
+                              "int lib_value(void) {\n    return 1;\n}\n"
+                              "int lib_other(void) {\n    return 2;\n}\n";
+    static const char changed[] = "struct counts {\n    long used;\n};\n"
+                                  "int nn = 2;\n"
+                                  "int lib_value(void) {\n    return 1 + 0;\n}\n"
+                                  "int lib_other(void) {\n    return 2;\n}\n";
+    static const char gapped[] = "int lib_value(void);\n"
+                                 "int helper_named(void) {\n"
+                                 "    int x = 0;\n"
+                                 "    x = (lib_value() ;\n"
+                                 "    return x;\n"
+                                 "}\n"
+                                 "int helper_field(void) {\n"
+                                 "    int used = 0;\n"
+                                 "    used = (used + ;\n"
+                                 "    return used;\n"
+                                 "}\n"
+                                 "int helper_short(void) {\n"
+                                 "    int nn = 0;\n"
+                                 "    nn = (nn + ;\n"
+                                 "    return nn;\n"
+                                 "}\n";
+    /* The shape of src/foundation/mem_core.c:110: a declaration the parser
+     * cannot read, outside every definition (no node holds its line). */
+    static const char table[] = "int lib_value(void);\n"
+                                "int far_away(void) {\n"
+                                "    return 0;\n"
+                                "}\n"
+                                "static _Thread_local int tl_x[lib_value];\n";
+    char beta[512];
+    char gamma[512];
+    char delta[512];
+    char epsilon[512];
+    tie_calling_suite(beta, sizeof(beta), "beta", "helper_named");
+    tie_calling_suite(gamma, sizeof(gamma), "gamma", "far_away");
+    tie_calling_suite(delta, sizeof(delta), "delta", "helper_field");
+    tie_calling_suite(epsilon, sizeof(epsilon), "epsilon", "helper_short");
+    const char *const files[] = {
+        "tests/test_main.c",    tie_gaps_main, "tests/test_beta.c",  beta,
+        "tests/test_gamma.c",   gamma,         "tests/test_delta.c", delta,
+        "tests/test_epsilon.c", epsilon,       "src/lib.c",          lib,
+        "src/gapped.c",         gapped,        "src/table.c",        table};
+    tie_fixture_t fx;
+    ASSERT_TRUE(tie_open_files(&fx, files, 8));
+    ASSERT_TRUE(tie_write(&fx, "src/lib.c", changed));
+    ASSERT_TRUE(tie_commit(&fx, "change lib_value, the field, the short global"));
+    char *json = tie_answer(&fx);
+    ASSERT_NOT_NULL(json);
+    bool want = tie_suite_has(json, "alpha", "STATIC") && tie_suite_has(json, "beta", "STATIC") &&
+                !tie_suite_has(json, "gamma", "STATIC") &&
+                !tie_suite_has(json, "delta", "STATIC") &&
+                !tie_suite_has(json, "epsilon", "STATIC");
+    if (!want) {
+        printf("  note: %s\n  %.2400s\n", tie_last_note, json);
+    }
+    ASSERT_TRUE(tie_suite_has(json, "alpha", "STATIC"));    /* calls lib_value */
+    ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC"));     /* its helper's gap names lib_value */
+    ASSERT_FALSE(tie_suite_has(json, "gamma", "STATIC"));   /* a file-scope gap's file */
+    ASSERT_FALSE(tie_suite_has(json, "delta", "STATIC"));   /* gap word = a changed field */
+    ASSERT_FALSE(tie_suite_has(json, "epsilon", "STATIC")); /* gap word = a 2-letter global */
+    free(json);
+    tie_close(&fx);
+    PASS();
+}
+
 /* The base commit's object id, read from the branch ref (never packed here). */
 static bool tie_base_sha(tie_fixture_t *fx, char sha[65]) {
     char path[1200];
@@ -1378,6 +1476,7 @@ SUITE(test_impact_engine) {
     RUN_TEST(test_impact_engine_reached_role_handler_is_no_way_into_main);
     RUN_TEST(test_impact_engine_role_started_by_a_role_selects_its_spawners);
     RUN_TEST(test_impact_engine_parse_gaps_reach_what_they_name);
+    RUN_TEST(test_impact_engine_parse_gaps_name_only_reached_functions);
     RUN_TEST(test_impact_engine_admitted_coverage_narrows_only_when_verified);
     RUN_TEST(test_impact_engine_coverage_reaches_unmapped_code_through_mapped_callers);
 }

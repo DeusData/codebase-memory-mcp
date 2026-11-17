@@ -643,10 +643,32 @@ static bool te_walk(te_ctx_t *c, const te_sinks_t *sinks, const int64_t *extra, 
 /* ── Parse gaps (user decision 2026-10-04: handled per file) ────────
  * A partial parse leaves a few lines (index_coverage `parse_partial`, detail
  * "a-b,c-d") the graph has no edges from. A gap can only hide references
- * written in its own lines, so when a gap's text names a definition the walk
- * reached, the definition around the gap is reached too (its whole file when
- * the gap lies outside every definition) and the walk goes on, to a
- * fixpoint. Only C-family sources are read; tests are C. More, never fewer. */
+ * written in its own lines, so when a gap's text names a reached function,
+ * variable or macro, the definition around the gap is reached too, and the
+ * walk goes on, to a fixpoint. A gap outside every definition reaches the
+ * definitions that start on its lines, never its whole file. Only C-family
+ * sources are read; tests are C. More, never fewer.
+ *
+ * User decision R155 (2026-11-11): matching every reached name (fields,
+ * types, two-letter names) and seeding whole files fired hundreds of gaps
+ * per change in this repository. A file-scope `__attribute__((used))` line
+ * in compat_thread.c fired on any reached field named `used`, its whole file
+ * included cbm_mutex_init, which the memory core calls, and so every change
+ * reached the test runner's main. */
+
+/* A hidden call or read names a function, a variable (an enum constant
+ * included) or a macro, by a name of at least this many characters. */
+#define TE_GAP_NAME_MIN 3
+
+static bool te_gap_name_kind(const char *label) {
+    static const char *const kinds[] = {"Function", "Method", "Variable", "Macro"};
+    for (size_t i = 0; label && i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (strcmp(label, kinds[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 typedef struct {
     const char *file;
@@ -713,7 +735,8 @@ static bool te_load_gaps(te_ctx_t *c, te_gaps_t *gaps) {
     return ok;
 }
 
-/* The short names of everything the walk reached (last QN segment). */
+/* The short names (last QN segment) of the reached functions, variables and
+ * macros a gap's text can name. */
 static bool te_reached_names(te_ctx_t *c, cbm_impact_walk_t *walk, CBMHashTable *names) {
     const cbm_impact_hit_t *hits = cbm_impact_walk_hits(walk);
     int n = cbm_impact_walk_count(walk);
@@ -721,7 +744,8 @@ static bool te_reached_names(te_ctx_t *c, cbm_impact_walk_t *walk, CBMHashTable 
         const char *qn = hits[i].qualified_name;
         const char *dot = qn ? strrchr(qn, '.') : NULL;
         const char *name = dot ? dot + 1 : qn;
-        if (!name || !*name || cbm_ht_get(names, name)) {
+        if (!name || strlen(name) < TE_GAP_NAME_MIN || !te_gap_name_kind(hits[i].label) ||
+            cbm_ht_get(names, name)) {
             continue;
         }
         const char *owned = cbm_arena_strdup(&c->arena, name);
@@ -765,7 +789,8 @@ static bool te_gap_names_reached(te_ctx_t *c, const te_gap_t *g, CBMHashTable *n
     return false;
 }
 
-/* Seeds for a gap that fired: the definition around it, else its file. */
+/* Seeds for a gap that fired: the definition around it, else the definitions
+ * that start on its lines (none: nothing more is reached). */
 static bool te_gap_seeds(te_ctx_t *c, const te_gap_t *g, te_ids_t *out) {
     bool ok = true;
     const cbm_ti_node_t *d = cbm_ti_graph_enclosing(c->graph, g->file, g->start, &ok);
@@ -775,7 +800,8 @@ static bool te_gap_seeds(te_ctx_t *c, const te_gap_t *g, te_ids_t *out) {
     int n = 0;
     const cbm_ti_node_t *nodes = ok ? cbm_ti_graph_file(c->graph, g->file, &n, &ok) : NULL;
     for (int i = 0; ok && i < n; i++) {
-        ok = nodes[i].variant_span || te_ids_push(c, out, nodes[i].id);
+        bool on_gap = nodes[i].start_line >= g->start && nodes[i].start_line <= g->end;
+        ok = nodes[i].variant_span || !on_gap || te_ids_push(c, out, nodes[i].id);
     }
     return ok || te_fallback(c, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE, "graph read failed");
 }

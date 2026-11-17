@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-vba-cbm",
+  "version": "0.14.5-cbm.1",
+  "description": "cbm fork of tree-sitter-vba @ 83c5c3c (vba dialect, generated with tree-sitter-cli 0.25.10)",
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}

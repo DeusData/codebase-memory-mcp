@@ -2178,6 +2178,243 @@ TEST(vbnet_vendored_grammar_still_flags_broken_source) {
     PASS();
 }
 
+/* ── VB6 / VBA: the vendored grammar parses real VB6 and VBA (#2564, #721) ──
+ * tools/tree-sitter-vba (harumiWeb/tree-sitter-vba v0.14.5, vba dialect) is
+ * vendored ahead of VB6/VBA extraction: no CBMLanguage routes to it yet, so
+ * these cases parse through tree_sitter_vba() directly. The class module is
+ * dual-target VB6 the way real control libraries write it: the VB6 IDE class
+ * header and Attribute lines, a Declare kept in both #If VBA7 branches
+ * (PtrSafe, LongPtr) plus the LongPtr shim enum VB6 needs, Implements, an
+ * Event, Property Get/Let/Set, a label, and bare calls with plain and member
+ * callees. It is RED on the alternatives: upstream's vb6 dialect rejects
+ * PtrSafe, and the vba dialect at v0.13.0 (the pin PR #2564 carried) leaves
+ * an ERROR at `Case Target Is Nothing` and turns `Err.Raise a, b, c` after
+ * the label into an expression_statement, losing the callee. The form is CRLF,
+ * as the VB6 IDE writes it. */
+extern const TSLanguage *tree_sitter_vba(void);
+
+static const char VBA_CLASS_SOURCE[] =
+    "VERSION 1.0 CLASS\n"
+    "BEGIN\n"
+    "  MultiUse = -1  'True\n"
+    "  Persistable = 0  'NotPersistable\n"
+    "  DataBindingBehavior = 0  'vbNone\n"
+    "  DataSourceBehavior  = 0  'vbNone\n"
+    "  MTSTransactionMode  = 0  'NotAnMTSObject\n"
+    "END\n"
+    "Attribute VB_Name = \"Account\"\n"
+    "Attribute VB_GlobalNameSpace = False\n"
+    "Attribute VB_Creatable = True\n"
+    "Attribute VB_PredeclaredId = False\n"
+    "Attribute VB_Exposed = True\n"
+    "Option Explicit\n"
+    "Implements IComparable\n"
+    "\n"
+    "#If VBA7 Then\n"
+    "Private Declare PtrSafe Sub CopyMemory Lib \"kernel32\" Alias \"RtlMoveMemory\" "
+        "(ByRef Destination As Any, ByRef Source As Any, ByVal Length As LongPtr)\n"
+    "#Else\n"
+    "Private Declare Sub CopyMemory Lib \"kernel32\" Alias \"RtlMoveMemory\" (ByRef "
+        "Destination As Any, ByRef Source As Any, ByVal Length As Long)\n"
+    "#End If\n"
+    "\n"
+    "#If (VBA7 = 0) Then\n"
+    "Private Enum LongPtr\n"
+    "    [_]\n"
+    "End Enum\n"
+    "#End If\n"
+    "\n"
+    "Public Event Changed(ByVal OldValue As Currency)\n"
+    "\n"
+    "Private Type BalanceInfo\n"
+    "    Amount As Currency\n"
+    "    Stamp As Date\n"
+    "End Type\n"
+    "\n"
+    "Private mOwner As String\n"
+    "Private mInfo As BalanceInfo\n"
+    "Private mHistory As Collection\n"
+    "\n"
+    "Private Sub Class_Initialize()\n"
+    "    Set mHistory = New Collection\n"
+    "End Sub\n"
+    "\n"
+    "Public Property Get Owner() As String\n"
+    "    Owner = mOwner\n"
+    "End Property\n"
+    "\n"
+    "Public Property Let Owner(ByVal Value As String)\n"
+    "    mOwner = Value\n"
+    "End Property\n"
+    "\n"
+    "Public Property Set History(ByVal Value As Collection)\n"
+    "    Set mHistory = Value\n"
+    "End Property\n"
+    "\n"
+    "Public Function Deposit(ByVal Amount As Currency) As Boolean\n"
+    "    On Error GoTo Fail\n"
+    "    Dim Old As Currency\n"
+    "    Old = mInfo.Amount\n"
+    "    mInfo.Amount = mInfo.Amount + Amount\n"
+    "    mHistory.Add Amount\n"
+    "    ' audit trail\n"
+    "    LogLine Format$(Amount, \"0.00\"), True\n"
+    "    RaiseEvent Changed(Old)\n"
+    "    Deposit = True\n"
+    "    Exit Function\n"
+    "Fail:\n"
+    "    Err.Raise vbObjectError + 513, \"Account.Deposit\", \"deposit failed\"\n"
+    "End Function\n"
+    "\n"
+    "Public Sub Apply(ByVal Target As Object)\n"
+    "    Dim Entry As Variant\n"
+    "    For Each Entry In mHistory\n"
+    "        CallByName Target, \"Owner\", VbLet, mOwner\n"
+    "    Next\n"
+    "    Select Case True\n"
+    "    Case Target Is Nothing\n"
+    "        Exit Sub\n"
+    "    Case Else\n"
+    "        With Target\n"
+    "            .Refresh\n"
+    "        End With\n"
+    "    End Select\n"
+    "End Sub\n"
+    "\n"
+    "Private Function IComparable_CompareTo(ByVal Other As Object) As Long\n"
+    "    IComparable_CompareTo = StrComp(mOwner, Other.Owner, vbTextCompare)\n"
+    "End Function\n";
+
+static const char VBA_FORM_SOURCE[] =
+    "VERSION 5.00\r\n"
+    "Begin VB.Form frmMain\r\n"
+    "   Caption         =   \"Accounts\"\r\n"
+    "   ClientHeight    =   3090\r\n"
+    "   ClientLeft      =   60\r\n"
+    "   ClientTop       =   450\r\n"
+    "   ClientWidth     =   4680\r\n"
+    "   LinkTopic       =   \"Form1\"\r\n"
+    "   ScaleHeight     =   3090\r\n"
+    "   ScaleWidth      =   4680\r\n"
+    "   StartUpPosition =   3  'Windows Default\r\n"
+    "   Begin VB.CommandButton cmdDeposit\r\n"
+    "      Caption         =   \"Deposit\"\r\n"
+    "      Height          =   495\r\n"
+    "      Left            =   1680\r\n"
+    "      TabIndex        =   0\r\n"
+    "      Top             =   1200\r\n"
+    "      Width           =   1215\r\n"
+    "   End\r\n"
+    "End\r\n"
+    "Attribute VB_Name = \"frmMain\"\r\n"
+    "Attribute VB_GlobalNameSpace = False\r\n"
+    "Attribute VB_Creatable = False\r\n"
+    "Attribute VB_PredeclaredId = True\r\n"
+    "Attribute VB_Exposed = False\r\n"
+    "Option Explicit\r\n"
+    "\r\n"
+    "Private WithEvents mAccount As Account\r\n"
+    "\r\n"
+    "Private Sub cmdDeposit_Click()\r\n"
+    "    If mAccount.Deposit(100) Then MsgBox \"Done\", vbInformation, Me.Caption\r\n"
+    "End Sub\r\n"
+    "\r\n"
+    "Private Sub mAccount_Changed(ByVal OldValue As Currency)\r\n"
+    "    Debug.Print \"was \"; OldValue\r\n"
+    "End Sub\r\n";
+
+/* Counts the nodes of `type` under `node`. */
+static int vba_type_count(TSNode node, const char *type) {
+    int hits = strcmp(ts_node_type(node), type) == 0 ? 1 : 0;
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vba_type_count(ts_node_child(node, i), type);
+    }
+    return hits;
+}
+
+/* Counts the call_statement nodes under `node` whose callee text is exactly
+ * `callee`. */
+static int vba_callee_count(TSNode node, const char *src, const char *callee) {
+    int hits = 0;
+    if (strcmp(ts_node_type(node), "call_statement") == 0) {
+        TSNode target = ts_node_child_by_field_name(node, "callee", 6);
+        if (!ts_node_is_null(target)) {
+            uint32_t start = ts_node_start_byte(target);
+            uint32_t len = ts_node_end_byte(target) - start;
+            if (strlen(callee) == len && memcmp(src + start, callee, len) == 0) {
+                hits++;
+            }
+        }
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vba_callee_count(ts_node_child(node, i), src, callee);
+    }
+    return hits;
+}
+
+TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    /* The vendored runtime accepts the generated ABI (15). */
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, VBA_CLASS_SOURCE,
+                                          (uint32_t)strlen(VBA_CLASS_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_STR_EQ(ts_node_type(root), "source_file");
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* Every procedure is a declaration node an extractor can index. */
+    ASSERT_EQ(vba_type_count(root, "sub_declaration"), 2);
+    ASSERT_EQ(vba_type_count(root, "function_declaration"), 2);
+    ASSERT_EQ(vba_type_count(root, "property_get_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "property_let_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "property_set_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "declare_sub_statement"), 2);
+    /* Bare calls keep their callee; none is split into an expression. */
+    ASSERT_EQ(vba_type_count(root, "expression_statement"), 0);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "Err.Raise"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "CallByName"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "LogLine"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "mHistory.Add"), 1);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vba_vendored_grammar_parses_vb6_form_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, VBA_FORM_SOURCE,
+                                          (uint32_t)strlen(VBA_FORM_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* The designer header is structure, not code: the form and its button
+     * are two nested begin blocks ahead of the two event handlers. */
+    ASSERT_STR_EQ(ts_node_type(ts_node_named_child(root, 0)), "frm_version_statement");
+    ASSERT_EQ(vba_type_count(root, "frm_begin_block"), 2);
+    ASSERT_EQ(vba_type_count(root, "sub_declaration"), 2);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vba_vendored_grammar_still_flags_broken_source) {
+    static const char broken[] = "Public Sub Broken(\n    x = \nEnd Sub\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, broken, (uint32_t)strlen(broken));
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 /* ── SQLite migrations (#2246) ───────────────────────────────────────────────
  * The vendored SQL grammar is a self-maintained fork of DerekStride/tree-sitter-sql
  * (tools/tree-sitter-sql + patches/sqlite-dialect.patch). Upstream rejected
@@ -2344,6 +2581,103 @@ TEST(sqlite_alter_table_drop_index_still_flagged_issue2246) {
     PASS();
 }
 
+/* ── jsonnet: the external scanner's state belongs to one parser ─────────────
+ * Upstream's jsonnet scanner kept its state (inside a string? which quote?) in
+ * process globals, so every worker's parser shared it: on go/grafana__loki a
+ * different set of jsonnet files came back parse_partial on every index, with
+ * their definitions and edges, and none does when parsed one at a time. The
+ * local patch moves the state into the per-parser payload and resets it on
+ * every deserialize (grammars/MANIFEST.md, "Local source patches").
+ *
+ * No threads here: the input callback hands parser A one byte per call, and
+ * when A first reads the byte after its opening quote -- A's scanner is then
+ * inside scan_string_start -- the callback runs a complete parse of `)'` on
+ * parser B. That parse ends on a string end, which clears B's state; with
+ * shared globals it cleared A's too, mid-scan, and A's string broke. The
+ * second test pins the other half: a parse that ends inside a string must not
+ * leave that state to the next parse. */
+extern const TSLanguage *tree_sitter_jsonnet(void);
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint32_t trigger; /* byte at which parser B runs */
+    bool fired;
+    TSParser *other;
+} jsonnet_interleave_t;
+
+static const char *jsonnet_read_one_byte(void *payload, uint32_t byte_index, TSPoint position,
+                                         uint32_t *bytes_read) {
+    (void)position;
+    jsonnet_interleave_t *x = (jsonnet_interleave_t *)payload;
+    if (byte_index >= x->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    if (!x->fired && byte_index == x->trigger) {
+        static const char resets_on_string_end[] = ")'\n";
+        x->fired = true;
+        TSTree *other = ts_parser_parse_string(x->other, NULL, resets_on_string_end,
+                                               (uint32_t)strlen(resets_on_string_end));
+        ts_tree_delete(other);
+    }
+    *bytes_read = 1;
+    return x->src + byte_index;
+}
+
+TEST(jsonnet_scanner_state_is_per_parser) {
+    static const char src[] = "{\n  name: 'query-scheduler-discovery',\n  port: 9095,\n}\n";
+    TSParser *a = ts_parser_new();
+    TSParser *b = ts_parser_new();
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_TRUE(ts_parser_set_language(a, tree_sitter_jsonnet()));
+    ASSERT_TRUE(ts_parser_set_language(b, tree_sitter_jsonnet()));
+
+    /* Control: on its own the source parses clean. */
+    TSTree *alone = ts_parser_parse_string(a, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(alone);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(alone)));
+    ts_tree_delete(alone);
+
+    jsonnet_interleave_t x = {src, (uint32_t)strlen(src), 0, false, b};
+    x.trigger = (uint32_t)(strchr(src, '\'') - src) + 1;
+    TSInput input = {&x, jsonnet_read_one_byte, TSInputEncodingUTF8, NULL};
+    TSTree *tree = ts_parser_parse(a, NULL, input);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(x.fired); /* B really ran inside A's string */
+    /* has_error covers ERROR and MISSING nodes alike. */
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(b);
+    ts_parser_delete(a);
+    PASS();
+}
+
+TEST(jsonnet_scanner_state_not_carried_between_parses) {
+    static const char unterminated[] = "local s = 'unterminated\n";
+    static const char text_block[] = "local doc = |||\n  a text block\n|||;\ndoc\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_jsonnet()));
+
+    /* A parse that ends inside a string... */
+    TSTree *first =
+        ts_parser_parse_string(parser, NULL, unterminated, (uint32_t)strlen(unterminated));
+    ASSERT_NOT_NULL(first);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(first)));
+    ts_tree_delete(first);
+
+    /* ...must not decide how the next file lexes: ||| blocks are lexed only by
+     * the external scanner, which a carried-over "inside a string" disabled. */
+    TSTree *next = ts_parser_parse_string(parser, NULL, text_block, (uint32_t)strlen(text_block));
+    ASSERT_NOT_NULL(next);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(next)));
+    ts_tree_delete(next);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
@@ -2409,6 +2743,9 @@ SUITE(parse_coverage) {
     RUN_TEST(pascal_broken_source_still_flagged_issue2211);
     RUN_TEST(vbnet_vendored_grammar_parses_real_vb_clean);
     RUN_TEST(vbnet_vendored_grammar_still_flags_broken_source);
+    RUN_TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean);
+    RUN_TEST(vba_vendored_grammar_parses_vb6_form_clean);
+    RUN_TEST(vba_vendored_grammar_still_flags_broken_source);
 
     RUN_TEST(sqlite_valid_migration_not_flagged);
     RUN_TEST(sqlite_malformed_still_flagged);
@@ -2418,4 +2755,8 @@ SUITE(parse_coverage) {
     RUN_TEST(sqlite_trigger_when_body_and_fts5_not_flagged_issue2246);
     RUN_TEST(sqlite_pragma_forms_not_flagged_issue2246);
     RUN_TEST(sqlite_alter_table_drop_index_still_flagged_issue2246);
+    /* Per-parser first: on the unpatched scanner, the carried-over state the
+     * second test leaves behind would hide the first one's defect. */
+    RUN_TEST(jsonnet_scanner_state_is_per_parser);
+    RUN_TEST(jsonnet_scanner_state_not_carried_between_parses);
 }

@@ -29,6 +29,7 @@
  *      enforced by lsp_resolve.h).
  */
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -72,6 +73,14 @@ typedef struct {
     int *import_kinds;
     int import_count;
     int import_cap;
+    CBMNameRows import_rows; /* import_local_names by name, rows in table order */
+
+    /* While signatures are patched: the registered functions' QNs, by name
+     * (overloads share a QN). NULL func_names: a scan answers instead. */
+    const char **func_names;
+    int func_name_count;
+    CBMNameRows func_rows;
+    CBMArena *func_rows_arena;
 
     /* Current enclosing context. */
     const char *enclosing_method_qn;    /* QN of the nearest method/ctor */

@@ -1905,8 +1905,14 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->type = (char *)gb_intern(gb, type);
     edge->properties_json = (char *)gb_intern(gb, properties_json);
 
-    /* Store pointer in array */
+    /* Publication reads this primary array. Do not register a missing edge
+     * in secondary indexes or report success when array growth fails. */
+    int before = gb->edges.count;
     cbm_da_push(&gb->edges, edge);
+    if (gb->edges.count != before + 1) {
+        cbm_free(CBM_MEM_CLASS_GBUF_EDGE, edge);
+        return 0;
+    }
 
     /* Dedup index */
     (void)edge_key_map_set(&gb->edge_by_key, h0, h1, edge);
