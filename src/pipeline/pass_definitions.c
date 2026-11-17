@@ -1101,10 +1101,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             : lang == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
-                : cbm_extract_file_ex_with_tests(source, source_len, lang, ctx->project_name, rel,
-                                                 CBM_EXTRACT_BUDGET, NULL,
-                                                 NULL /* no extra defines or include paths */,
-                                                 ctx->macro_table, NULL, ctx->test_declarations);
+                : cbm_extract_file_ex_with_tests(
+                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
+                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL,
+                      ctx->test_declarations, ctx->repo_path);
         free(source);
 
         if (!cbm_pipeline_test_extraction_ok(ctx, lang, result)) {

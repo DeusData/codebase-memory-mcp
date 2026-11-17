@@ -34950,7 +34950,304 @@ TEST(pipeline_inc_c_family_fragments) {
     th_rmtree(tmp);
     PASS();
 }
+
+/* ── C/C++ #include lookup against the indexed repository root (#2993) ── */
+
+#ifdef _WIN32
+#include <direct.h>
+#define inc_root_chdir _chdir
+#define inc_root_getcwd _getcwd
+#else
+#define inc_root_chdir chdir
+#define inc_root_getcwd getcwd
+#endif
+
+/* Index `root` into `db` with the process working directory set to `cwd`, and
+ * restore the working directory afterwards. */
+static int inc_root_index_from(const char *root, const char *db, const char *cwd) {
+    char saved[CBM_SZ_4K];
+    if (!inc_root_getcwd(saved, sizeof(saved)) || inc_root_chdir(cwd) != 0) {
+        return -1;
+    }
+    int rc = -1;
+    cbm_pipeline_t *p = cbm_pipeline_new(root, db, CBM_MODE_FULL);
+    if (p) {
+        (void)cbm_pipeline_set_project_name(p, "incroot");
+        cbm_pipeline_set_persistence(p, false);
+        rc = cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    if (inc_root_chdir(saved) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+/* One FNV-1a digest over every node and edge row of the graph, in sorted
+ * order: two graphs with the same digest and row count are the same graph. */
+static uint64_t inc_root_graph_digest(const char *db_path, int *rows) {
+    static const char *const queries[] = {
+        "SELECT label||'|'||qualified_name||'|'||file_path||'|'||start_line||'|'||end_line||'|'||"
+        "properties FROM nodes ORDER BY 1",
+        "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||e.properties FROM edges "
+        "e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id ORDER BY 1",
+    };
+    uint64_t h = 1469598103934665603ULL;
+    *rows = 0;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        for (size_t q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
+            sqlite3_stmt *stmt = NULL;
+            if (sqlite3_prepare_v2(db, queries[q], -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const unsigned char *row = sqlite3_column_text(stmt, 0);
+                    for (const unsigned char *c = row ? row : (const unsigned char *)""; *c; c++) {
+                        h = (h ^ *c) * 1099511628211ULL;
+                    }
+                    h = (h ^ 0xffU) * 1099511628211ULL;
+                    (*rows)++;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    sqlite3_close(db);
+    return h;
+}
+
+/* CALLS edges from the function named `from` to the Function named `to`. */
+static int inc_root_calls(const char *db, const char *from, const char *to) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+             "t.id=e.target_id WHERE e.type='CALLS' AND s.name='%s' AND t.name='%s' AND "
+             "t.label='Function'",
+             from, to);
+    return k8s_inc_count(db, sql);
+}
+
+/* #2993: the graph depended on the directory the indexer was started from:
+ * a quoted #include was looked up relative to the process working directory.
+ * The lookup now resolves against the indexed repository root. The same
+ * fixture, indexed from an empty directory, from a directory holding a
+ * different lib/m.h, and from the repository root, gives one graph, in which
+ * the macro of the repository's own lib/m.h expands to a call that resolves
+ * to its in-tree target. */
+TEST(pipeline_c_include_lookup_uses_repo_root) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incroot_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    char empty[512];
+    char other[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    snprintf(empty, sizeof(empty), "%s/empty", tmp);
+    snprintf(other, sizeof(other), "%s/other", tmp);
+    write_temp_file(root, "lib/a.c",
+                    "#define A_C_LOCAL 1\n"
+                    "#include \"m.h\"\n"
+                    "\n"
+                    "void caller(int v) {\n"
+                    "    DO_WORK(v);\n"
+                    "}\n");
+    write_temp_file(root, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) real_target(x)\n#endif\n");
+    write_temp_file(root, "lib/t.c",
+                    "void real_target(int x) { (void)x; }\n"
+                    "void other_target(int x) { (void)x; }\n");
+    write_temp_file(other, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) other_target(x)\n#endif\n");
+    ASSERT(cbm_mkdir_p(empty, 0755));
+
+    const char *cwds[] = {empty, other, root};
+    enum { RUNS = sizeof(cwds) / sizeof(cwds[0]) };
+    int rc[RUNS];
+    int rows[RUNS];
+    int real[RUNS];
+    int stray[RUNS];
+    uint64_t digest[RUNS];
+    for (int i = 0; i < RUNS; i++) {
+        char db[512];
+        snprintf(db, sizeof(db), "%s/graph%d.db", tmp, i);
+        rc[i] = inc_root_index_from(root, db, cwds[i]);
+        digest[i] = inc_root_graph_digest(db, &rows[i]);
+        real[i] = inc_root_calls(db, "caller", "real_target");
+        stray[i] = inc_root_calls(db, "caller", "other_target");
+    }
+    th_rmtree(tmp);
+    for (int i = 0; i < RUNS; i++) {
+        ASSERT_EQ(rc[i], 0);
+        ASSERT_GT(rows[i], 0);
+        ASSERT_EQ(real[i], 1);
+        ASSERT_EQ(stray[i], 0);
+        ASSERT_EQ(rows[i], rows[0]);
+        ASSERT(digest[i] == digest[0]);
+    }
+    PASS();
+}
+
+/* #2993: simplecpp discards a file's whole expansion when it stops at #error.
+ * An #error reached inside an included header must not cost the file its
+ * expansion: the file keeps its expansion without includes, so the call its
+ * own macro expands to survives. Indexed from the repository root, where the
+ * header is found whichever way the lookup is made. */
+TEST(pipeline_c_include_error_keeps_expansion_without_includes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incerr_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    write_temp_file(root, "cfg.h",
+                    "#ifndef CFG_H\n"
+                    "#define CFG_H\n"
+                    "#ifndef CFG_CONFIGURED\n"
+                    "#error \"configure first\"\n"
+                    "#endif\n"
+                    "#endif\n");
+    write_temp_file(root, "z.c",
+                    "#include \"cfg.h\"\n"
+                    "#define RUN_STEP(x) step_target(x)\n"
+                    "\n"
+                    "int z_entry(int v) {\n"
+                    "    RUN_STEP(v);\n"
+                    "    return v;\n"
+                    "}\n");
+    write_temp_file(root, "steps.c", "void step_target(int x) { (void)x; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    int rc = inc_root_index_from(root, db, root);
+    int step_calls = inc_root_calls(db, "z_entry", "step_target");
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(step_calls, 1);
+    PASS();
+}
+
+/* #2993: an included header's body is the header's own -- indexed as its own
+ * file, with its own lines. The includer's expansion holds only the
+ * includer's tokens (the header's macros still shape them), so a call or a
+ * write inside a header's inline function is never one of the includer's
+ * edges, and no edge of the includer carries a line past the includer's last
+ * line. Indexed from the repository root, where the header is found whichever
+ * way the lookup is made. */
+TEST(pipeline_c_header_body_stays_with_the_header) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_inchdr_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    char header[2048];
+    int used = snprintf(header, sizeof(header), "#ifndef OPS_H\n#define OPS_H\n");
+    for (int i = 0; i < 24; i++) {
+        used += snprintf(header + used, sizeof(header) - (size_t)used, "/* line %d */\n", i);
+    }
+    snprintf(header + used, sizeof(header) - (size_t)used,
+             "extern int header_counter;\n"
+             "static inline int ops_inline(int v) {\n"
+             "    header_counter = v;\n"
+             "    return header_only_callee(v);\n"
+             "}\n"
+             "#endif\n");
+    write_temp_file(root, "ops.h", header);
+    /* user.c is 6 lines long. */
+    write_temp_file(root, "user.c",
+                    "#include \"ops.h\"\n"
+                    "#define USER_FLAG 1\n"
+                    "\n"
+                    "int user_fn(int v) {\n"
+                    "    return main_only_callee(v);\n"
+                    "}\n");
+    write_temp_file(root, "callees.c",
+                    "int header_counter;\n"
+                    "int header_only_callee(int v) { return v; }\n"
+                    "int main_only_callee(int v) { return v; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    int rc = inc_root_index_from(root, db, root);
+    int from_user = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type IN ('CALLS','USAGE','WRITES') AND "
+            "s.file_path='user.c' AND t.name IN ('header_only_callee','header_counter')");
+    int past_end = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type IN "
+            "('CALLS','USAGE') AND s.file_path='user.c' AND "
+            "CAST(json_extract(e.properties,'$.line') AS INTEGER) > 6");
+    int own_call = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type='CALLS' AND s.file_path='ops.h' AND "
+            "t.name='header_only_callee'");
+    int user_call = inc_root_calls(db, "user_fn", "main_only_callee");
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(from_user, 0);
+    ASSERT_EQ(past_end, 0);
+    ASSERT_GT(own_call, 0);
+    ASSERT_EQ(user_call, 1);
+    PASS();
+}
+
+/* #2993: only a name that denotes a file of the indexed tree resolves. Each
+ * of the three includes of lib/a.c names a header that is not part of the
+ * indexed tree (the third is reached through a symbolic link, which discovery
+ * does not index either), so none of the three macros expands, wherever the
+ * indexer runs; here it runs from the repository root. */
+TEST(pipeline_c_include_lookup_stays_in_repo_root) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incside_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    write_temp_file(tmp, "m_side.h", "#define SIDE_M(x) m_target(x)\n");
+    write_temp_file(tmp, "n_side.h", "#define SIDE_N(x) n_target(x)\n");
+    write_temp_file(tmp, "l_side.h", "#define SIDE_L(x) l_target(x)\n");
+    char source[2048];
+    snprintf(source, sizeof(source),
+             "#define A_LOCAL 1\n"
+             "#include \"../../m_side.h\"\n"
+             "#include \"%s/n_side.h\"\n"
+             "#include \"l_side.h\"\n"
+             "\n"
+             "void caller(int v) {\n"
+             "    SIDE_M(v);\n"
+             "    SIDE_N(v);\n"
+             "    SIDE_L(v);\n"
+             "}\n",
+             tmp);
+    write_temp_file(root, "lib/a.c", source);
+    write_temp_file(root, "lib/t.c",
+                    "void m_target(int x) { (void)x; }\n"
+                    "void n_target(int x) { (void)x; }\n"
+                    "void l_target(int x) { (void)x; }\n");
+#ifndef _WIN32
+    char link_target[512];
+    char link_path[512];
+    snprintf(link_target, sizeof(link_target), "%s/l_side.h", tmp);
+    snprintf(link_path, sizeof(link_path), "%s/lib/l_side.h", root);
+    ASSERT_EQ(symlink(link_target, link_path), 0);
+#endif
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    int rc = inc_root_index_from(root, db, root);
+    static const char *const targets[] = {"m_target", "n_target", "l_target"};
+    int wrong = 0;
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        int n = inc_root_calls(db, "caller", targets[i]);
+        if (n != 0) {
+            printf("  caller -> %s: %d\n", targets[i], n);
+            wrong++;
+        }
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(wrong, 0);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_c_include_lookup_uses_repo_root);
+    RUN_TEST(pipeline_c_include_error_keeps_expansion_without_includes);
+    RUN_TEST(pipeline_c_header_body_stays_with_the_header);
+    RUN_TEST(pipeline_c_include_lookup_stays_in_repo_root);
     RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);

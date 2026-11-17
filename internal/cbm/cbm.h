@@ -1282,12 +1282,16 @@ CBMFileResult *cbm_extract_file_ex(
 /* Additive immutable-snapshot entry point. NULL preserves legacy behavior.
  * Snapshot must outlive this call; returned data is independently result-owned.
  * A non-OK result status is an explicit configured-mapping failure, not a
- * successful empty inventory. error_msg may be NULL on diagnostic OOM. */
+ * successful empty inventory. error_msg may be NULL on diagnostic OOM.
+ * repo_root: the indexed repository root rel_path is relative to. The C-family
+ * preprocessed pass resolves quoted #include names against it (preprocessor.h);
+ * NULL resolves none. Never the process working directory. */
 CBMFileResult *cbm_extract_file_ex_with_tests(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
     const char **include_paths, const CBMMacroTable *macro_table,
-    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations);
+    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations,
+    const char *repo_root);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);

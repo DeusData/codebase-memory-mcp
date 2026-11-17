@@ -481,7 +481,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                          ? NULL
                          : cbm_extract_file_ex_with_tests(
                                source, source_len, files[i].language, ctx->project_name, rel,
-                               CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations);
+                               CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations,
+                               ctx->repo_path);
             free(source);
             if (!cbm_pipeline_test_extraction_ok(ctx, files[i].language, result)) {
                 cbm_free_result(result);

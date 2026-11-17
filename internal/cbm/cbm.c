@@ -28,6 +28,7 @@
 #include "cpp_branch_views.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
+#include "foundation/limits.h"     // cbm_max_file_bytes — headers read by the #include lookup
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
 #include "foundation/str_util.h"   // cbm_json_escape — variants file_path
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
@@ -3779,14 +3780,83 @@ static void cbm_swift_type_imports(CBMFileResult *result, CBMLanguage language) 
     }
 }
 
-static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
-                                           const char *project, const char *rel_path,
-                                           int64_t timeout_micros, const char **extra_defines,
-                                           const char **include_paths,
-                                           const CBMMacroTable *macro_table,
-                                           const CBMReturnTypeTable *return_type_table,
-                                           CBMArena *scratch,
-                                           const cbm_test_declarations_t *test_declarations) {
+/* ── #include lookup of the preprocessed pass (#2993) ──────────────
+ * Quoted #include names of the C-family second pass resolve against the
+ * indexed repository root: preprocessor.cpp hands over a normalised,
+ * root-relative name, and the header is read only when it is part of the tree
+ * the way discovery sees the tree -- every component below the root a
+ * directory or a regular file, none a symlink or junction (discovery skips
+ * those), within the per-file size cap. Paths are UTF-8, opened through
+ * cbm_fopen. Nothing here depends on the process working directory. */
+typedef struct {
+    const char *root;
+} cbm_include_tree_t;
+
+/* True when every component of `path` after its first `root_len` bytes is a
+ * directory, the last one a regular file; *size receives that file's size. */
+static bool include_path_in_tree(char *path, size_t root_len, int64_t *size) {
+    cbm_path_info_t info = {0};
+    char *component = path + root_len;
+    for (;;) {
+        char *slash = strchr(component, '/');
+        if (slash) {
+            *slash = '\0';
+        }
+        int rc = cbm_path_info_utf8(path, &info);
+        if (slash) {
+            *slash = '/';
+        }
+        if (rc != CBM_PATH_INFO_OK || info.is_symlink ||
+            (slash ? !info.is_directory : !info.is_regular)) {
+            return false;
+        }
+        if (!slash) {
+            *size = info.size;
+            return true;
+        }
+        component = slash + 1;
+    }
+}
+
+static char *include_tree_read(const void *userdata, const char *rel_path, size_t *out_len) {
+    const cbm_include_tree_t *tree = (const cbm_include_tree_t *)userdata;
+    size_t root_len = strlen(tree->root);
+    bool sep = root_len > 0 && tree->root[root_len - 1] != '/' && tree->root[root_len - 1] != '\\';
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s%s%s", tree->root, sep ? "/" : "", rel_path);
+    if (!rel_path[0] || written < 0 || (size_t)written >= sizeof(path)) {
+        return NULL;
+    }
+    int64_t size = 0;
+    if (!include_path_in_tree(path, root_len + (sep ? 1 : 0), &size) || size < 0 ||
+        size > (int64_t)cbm_max_file_bytes()) {
+        return NULL;
+    }
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    char *data = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)size + 1);
+    size_t got = data && size > 0 ? fread(data, 1, (size_t)size, f) : 0;
+    (void)fclose(f);
+    if (data) {
+        data[got] = '\0';
+        *out_len = got;
+    }
+    return data;
+}
+
+static void include_tree_release(const void *userdata, char *data) {
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_EXTRACT, data);
+}
+
+static CBMFileResult *extract_file_ex_body(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table, CBMArena *scratch,
+    const cbm_test_declarations_t *test_declarations, const char *repo_root) {
     // Allocate result on heap (arena inside for all string data)
     CBMFileResult *result = cbm_result_alloc();
     if (!result) {
@@ -4179,8 +4249,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         char export_cands[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
         int export_cand_count =
             cbm_export_macro_candidates(source, source_len, export_cands, CBM_EXPORT_MACRO_MAX);
+        cbm_include_tree_t include_tree = {repo_root};
+        CBMIncludeReader include_reader = {include_tree_read, include_tree_release, &include_tree};
         CBMPreprocessedSource *preprocessed = cbm_preprocess_with_map(
-            source, source_len, rel_path, extra_defines, include_paths, language != CBM_LANG_C);
+            source, source_len, rel_path, extra_defines, include_paths, language != CBM_LANG_C,
+            repo_root && repo_root[0] ? &include_reader : NULL);
         if (preprocessed && preprocessed->source) {
             char *expanded = preprocessed->source;
             int expanded_len = (int)strlen(expanded);
@@ -4849,14 +4922,15 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                                    const CBMReturnTypeTable *return_type_table) {
     return cbm_extract_file_ex_with_tests(source, source_len, language, project, rel_path,
                                           timeout_micros, extra_defines, include_paths, macro_table,
-                                          return_type_table, NULL);
+                                          return_type_table, NULL, NULL);
 }
 
 CBMFileResult *cbm_extract_file_ex_with_tests(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
     const char **include_paths, const CBMMacroTable *macro_table,
-    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations) {
+    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations,
+    const char *repo_root) {
     CBMArena scratch;
     if (tl_scratch_live && tl_scratch_slot) {
         scratch = *tl_scratch_slot;
@@ -4867,7 +4941,7 @@ CBMFileResult *cbm_extract_file_ex_with_tests(
     }
     CBMFileResult *result = extract_file_ex_body(
         source, source_len, language, project, rel_path, timeout_micros, extra_defines,
-        include_paths, macro_table, return_type_table, &scratch, test_declarations);
+        include_paths, macro_table, return_type_table, &scratch, test_declarations, repo_root);
     /* Even early parse/quarantine exits publish conservative Python metadata.
      * No tree is reparsed, and existing best-effort extraction flags stay intact. */
     if (result && language == CBM_LANG_PYTHON &&
