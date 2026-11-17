@@ -1863,6 +1863,25 @@ if ! grep -q 'hook-augment' "$GATE_SCRIPT"; then
 fi
 echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
 
+HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" APPDATA="$FAKE_HOME/AppData/Roaming" LOCALAPPDATA="$FAKE_HOME/AppData/Local" PATH="$FAKE_HOME/.local/bin:$PATH" \
+  "$BINARY" install --no-hooks --skip-binary --clients=claude -y >/dev/null
+# Claude hooks are registered shell-free (#1733): 'hook-augment' is the owned
+# marker; the shim names only cover legacy shell registrations.
+if grep -qE 'hook-augment|cbm-(code-discovery-gate|session-reminder|subagent-reminder)' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
+   [ -e "$GATE_SCRIPT" ] ||
+   ! grep -q 'codebase-memory-mcp' "$FAKE_HOME/.claude.json" 2>/dev/null; then
+  echo "FAIL 8e-i: --no-hooks did not remove owned Claude hooks while preserving MCP"
+  exit 1
+fi
+HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" APPDATA="$FAKE_HOME/AppData/Roaming" LOCALAPPDATA="$FAKE_HOME/AppData/Local" PATH="$FAKE_HOME/.local/bin:$PATH" \
+  "$BINARY" install --hooks --skip-binary --clients=claude -y >/dev/null
+if ! grep -q 'hook-augment' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
+   [ ! -e "$GATE_SCRIPT" ]; then
+  echo "FAIL 8e-i: --hooks did not restore owned Claude hooks"
+  exit 1
+fi
+echo "OK 8e-i: Claude hook opt-out and re-enable preserve MCP"
+
 # 8f-8h: Codex TOML
 if ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$FAKE_HOME/.codex/config.toml"; then
   echo "FAIL 8f: Codex TOML missing MCP section"

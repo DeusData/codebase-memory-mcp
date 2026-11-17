@@ -31,4 +31,13 @@ bool cbm_ui_config_save(const cbm_ui_config_t *cfg);
  * Exposed for testing. */
 void cbm_ui_config_path(char *buf, int bufsz);
 
+/* The cold `daemon start` UI rule (#2114). A bare start honours the saved
+ * choice, including a deliberately disabled UI; an explicit --port=N
+ * (requested_port > 0) or --open requests the UI, and the caller persists that
+ * choice. Returns whether the start configures the UI. *port_out (optional)
+ * receives the port to use, the requested port winning over the saved one, or
+ * 0 when no UI is requested. A NULL saved configuration requests nothing. */
+bool cbm_ui_config_daemon_start_ui(const cbm_ui_config_t *saved, int requested_port,
+                                   bool open_browser, int *port_out);
+
 #endif /* CBM_UI_CONFIG_H */

@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "vbnet",
+      "camelcase": "Vbnet",
+      "scope": "source.vbnet",
+      "path": ".",
+      "file-types": ["vb"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-vbnet @ 538b708 with CodeGraph's real-world VB.NET patch"
+  }
+}

@@ -26,6 +26,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 
 #include <stdbool.h>
@@ -45,7 +46,21 @@ enum {
     CBM_PATH_ALIAS_MAX_DEPTH = 32, /* directory recursion depth    */
 };
 
+/* Everything a collection owns comes from the memory core in this class and
+ * goes back through cbm_path_alias_collection_free. */
+#define ALIAS_MEM CBM_MEM_CLASS_OTHER
+
 /* ── Helpers ───────────────────────────────────────────────────── */
+
+/* Copy the first length bytes of text, which holds no NUL before them. */
+static char *alias_strndup(const char *text, size_t length) {
+    char *copy = cbm_alloc(ALIAS_MEM, length + 1);
+    if (copy) {
+        memcpy(copy, text, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
 
 /* Strip .ts/.tsx/.js/.jsx in place. Returns its argument. */
 static char *strip_resolved_ext(char *path) {
@@ -82,7 +97,7 @@ static char *resolve_target_relative(const char *dir_prefix, const char *target)
     }
     size_t dp_len = (dir_prefix && dir_prefix[0] != '\0') ? strlen(dir_prefix) : 0;
     size_t t_len = strlen(target);
-    char *buf = malloc(dp_len + t_len + 2);
+    char *buf = cbm_alloc(ALIAS_MEM, dp_len + t_len + 2);
     if (!buf) {
         return NULL;
     }
@@ -183,7 +198,7 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         fclose(f);
         return NULL;
     }
-    char *buf = malloc((size_t)len + 1);
+    char *buf = cbm_alloc(ALIAS_MEM, (size_t)len + 1);
     if (!buf) {
         fclose(f);
         return NULL;
@@ -194,7 +209,7 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
 
     yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_TRAILING_COMMAS;
     yyjson_doc *doc = yyjson_read(buf, nread, flg);
-    free(buf);
+    cbm_free(ALIAS_MEM, buf);
     if (!doc) {
         return NULL;
     }
@@ -212,7 +227,7 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         return NULL;
     }
 
-    cbm_path_alias_map_t *map = calloc(1, sizeof(*map));
+    cbm_path_alias_map_t *map = cbm_calloc(ALIAS_MEM, sizeof(*map));
     if (!map) {
         yyjson_doc_free(doc);
         return NULL;
@@ -222,7 +237,7 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         map->base_url = resolve_target_relative(dir_prefix, base_url_str);
     } else if (base_url_str && strcmp(base_url_str, ".") == 0 && dir_prefix &&
                dir_prefix[0] != '\0') {
-        map->base_url = strdup(dir_prefix);
+        map->base_url = cbm_mem_strdup(ALIAS_MEM, dir_prefix);
     }
 
     if (paths_obj && yyjson_is_obj(paths_obj)) {
@@ -230,10 +245,10 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         bool capped = obj_size > CBM_PATH_ALIAS_MAX_ENTRIES;
         int capacity = (int)(capped ? (size_t)CBM_PATH_ALIAS_MAX_ENTRIES : obj_size);
         if (capacity > 0) {
-            map->entries = calloc((size_t)capacity, sizeof(cbm_path_alias_t));
+            map->entries = cbm_calloc(ALIAS_MEM, (size_t)capacity * sizeof(cbm_path_alias_t));
             if (!map->entries) {
-                free(map->base_url);
-                free(map);
+                cbm_free(ALIAS_MEM, map->base_url);
+                cbm_free(ALIAS_MEM, map);
                 yyjson_doc_free(doc);
                 return NULL;
             }
@@ -254,22 +269,22 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
                 if (star) {
                     entry->has_wildcard = true;
                     entry->alias_prefix =
-                        cbm_strndup(alias_pattern, (size_t)(star - alias_pattern));
-                    entry->alias_suffix = strdup(star + 1);
+                        alias_strndup(alias_pattern, (size_t)(star - alias_pattern));
+                    entry->alias_suffix = cbm_mem_strdup(ALIAS_MEM, star + 1);
                 } else {
                     entry->has_wildcard = false;
-                    entry->alias_prefix = strdup(alias_pattern);
-                    entry->alias_suffix = strdup("");
+                    entry->alias_prefix = cbm_mem_strdup(ALIAS_MEM, alias_pattern);
+                    entry->alias_suffix = cbm_mem_strdup(ALIAS_MEM, "");
                 }
                 const char *tstar = strchr(target_pattern, '*');
                 if (tstar) {
-                    char *pre = cbm_strndup(target_pattern, (size_t)(tstar - target_pattern));
+                    char *pre = alias_strndup(target_pattern, (size_t)(tstar - target_pattern));
                     entry->target_prefix = resolve_target_relative(dir_prefix, pre);
-                    free(pre);
-                    entry->target_suffix = strdup(tstar + 1);
+                    cbm_free(ALIAS_MEM, pre);
+                    entry->target_suffix = cbm_mem_strdup(ALIAS_MEM, tstar + 1);
                 } else {
                     entry->target_prefix = resolve_target_relative(dir_prefix, target_pattern);
-                    entry->target_suffix = strdup("");
+                    entry->target_suffix = cbm_mem_strdup(ALIAS_MEM, "");
                 }
                 map->count++;
             }
@@ -294,14 +309,14 @@ static void free_alias_map(cbm_path_alias_map_t *map) {
         return;
     }
     for (int j = 0; j < map->count; j++) {
-        free(map->entries[j].alias_prefix);
-        free(map->entries[j].alias_suffix);
-        free(map->entries[j].target_prefix);
-        free(map->entries[j].target_suffix);
+        cbm_free(ALIAS_MEM, map->entries[j].alias_prefix);
+        cbm_free(ALIAS_MEM, map->entries[j].alias_suffix);
+        cbm_free(ALIAS_MEM, map->entries[j].target_prefix);
+        cbm_free(ALIAS_MEM, map->entries[j].target_suffix);
     }
-    free(map->entries);
-    free(map->base_url);
-    free(map);
+    cbm_free(ALIAS_MEM, map->entries);
+    cbm_free(ALIAS_MEM, map->base_url);
+    cbm_free(ALIAS_MEM, map);
 }
 
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
@@ -309,12 +324,12 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
         return;
     }
     for (int i = 0; i < coll->count; i++) {
-        free(coll->scopes[i].dir_prefix);
-        free(coll->scopes[i].source_rel_path);
+        cbm_free(ALIAS_MEM, coll->scopes[i].dir_prefix);
+        cbm_free(ALIAS_MEM, coll->scopes[i].source_rel_path);
         free_alias_map(coll->scopes[i].map);
     }
-    free(coll->scopes);
-    free(coll);
+    cbm_free(ALIAS_MEM, coll->scopes);
+    cbm_free(ALIAS_MEM, coll);
 }
 
 bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
@@ -367,6 +382,7 @@ bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *mo
     return true;
 }
 
+/* The result stays on the C allocator: its callers release it with free(). */
 char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module_path) {
     char buf[CBM_PATH_ALIAS_RESULT_MAX];
     return cbm_path_alias_resolve_into(map, module_path, buf, sizeof(buf)) ? strdup(buf) : NULL;
@@ -450,7 +466,7 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     if (!repo_path) {
         return NULL;
     }
-    alias_config_hit_t *hits = calloc(CBM_PATH_ALIAS_MAX_FILES, sizeof(*hits));
+    alias_config_hit_t *hits = cbm_calloc(ALIAS_MEM, CBM_PATH_ALIAS_MAX_FILES * sizeof(*hits));
     if (!hits) {
         return NULL;
     }
@@ -461,19 +477,19 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
     }
     if (count == 0) {
-        free(hits);
+        cbm_free(ALIAS_MEM, hits);
         return NULL;
     }
 
-    cbm_path_alias_collection_t *coll = calloc(1, sizeof(*coll));
+    cbm_path_alias_collection_t *coll = cbm_calloc(ALIAS_MEM, sizeof(*coll));
     if (!coll) {
-        free(hits);
+        cbm_free(ALIAS_MEM, hits);
         return NULL;
     }
-    coll->scopes = calloc((size_t)count, sizeof(cbm_path_alias_scope_t));
+    coll->scopes = cbm_calloc(ALIAS_MEM, (size_t)count * sizeof(cbm_path_alias_scope_t));
     if (!coll->scopes) {
-        free(coll);
-        free(hits);
+        cbm_free(ALIAS_MEM, coll);
+        cbm_free(ALIAS_MEM, hits);
         return NULL;
     }
 
@@ -490,11 +506,11 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         } else {
             snprintf(selected_rel, sizeof(selected_rel), "%s", base);
         }
-        char *dir_prefix = strdup(hits[i].rel);
-        char *source_rel_path = strdup(selected_rel);
+        char *dir_prefix = cbm_mem_strdup(ALIAS_MEM, hits[i].rel);
+        char *source_rel_path = cbm_mem_strdup(ALIAS_MEM, selected_rel);
         if (!dir_prefix || !source_rel_path) {
-            free(dir_prefix);
-            free(source_rel_path);
+            cbm_free(ALIAS_MEM, dir_prefix);
+            cbm_free(ALIAS_MEM, source_rel_path);
             free_alias_map(map);
             continue;
         }
@@ -503,11 +519,11 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         coll->scopes[coll->count].map = map;
         coll->count++;
     }
-    free(hits);
+    cbm_free(ALIAS_MEM, hits);
 
     if (coll->count == 0) {
-        free(coll->scopes);
-        free(coll);
+        cbm_free(ALIAS_MEM, coll->scopes);
+        cbm_free(ALIAS_MEM, coll);
         return NULL;
     }
 

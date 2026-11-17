@@ -18,6 +18,7 @@
 #include "pipeline/lsp_surface.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h"
+#include "resolve_stats.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
 #include "callable_sig.h"
@@ -759,23 +760,36 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
  * "Class" for a C struct or union. */
 static void pxc_fold_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
                                    int start, int end, const char *type_label) {
-    if (!arena || !result || !defs || start >= end) {
+    if (!arena || !result || !defs || start >= end || result->defs.count <= 0) {
         return;
     }
-    for (int si = start; si < end; si++) {
+    /* A generated file holds hundreds of types and thousands of fields: each type's
+     * fields are one chain, in definition order, instead of a scan of the file per type.
+     * next_field[di] is the 1-based index of the field after di of the same owner. */
+    int *next_field =
+        cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)result->defs.count * sizeof(*next_field));
+    CBMHashTable *fields_of = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 32);
+    bool joined = next_field && fields_of;
+    for (int di = result->defs.count - 1; joined && di >= 0; di--) {
+        const CBMDefinition *fd = &result->defs.items[di];
+        if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
+            !fd->return_type[0] || strcmp(fd->label, "Field") != 0) {
+            continue;
+        }
+        next_field[di] =
+            (int)(intptr_t)cbm_ht_set(fields_of, fd->parent_class, (void *)(intptr_t)(di + 1));
+    }
+    for (int si = start; joined && si < end; si++) {
         CBMLSPDef *dst = &defs[si];
         if (!dst->label || strcmp(dst->label, type_label) != 0 || !dst->qualified_name) {
             continue;
         }
         int count = 0;
         size_t total = 0; /* "name:type" bytes; separators and NUL added below */
-        for (int di = 0; di < result->defs.count; di++) {
-            const CBMDefinition *fd = &result->defs.items[di];
-            if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
-                !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
-                strcmp(fd->parent_class, dst->qualified_name) != 0) {
-                continue;
-            }
+        int first_field = (int)(intptr_t)cbm_ht_get(fields_of, dst->qualified_name);
+        for (int link = first_field; link; link = next_field[link - 1]) {
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            const CBMDefinition *fd = &result->defs.items[link - 1];
             total += strlen(fd->name) + 1 + strlen(fd->return_type);
             count++;
         }
@@ -790,13 +804,8 @@ static void pxc_fold_struct_fields(CBMArena *arena, const CBMFileResult *result,
         }
         char *p = buf;
         int written = 0;
-        for (int di = 0; di < result->defs.count; di++) {
-            const CBMDefinition *fd = &result->defs.items[di];
-            if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
-                !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
-                strcmp(fd->parent_class, dst->qualified_name) != 0) {
-                continue;
-            }
+        for (int link = first_field; link; link = next_field[link - 1]) {
+            const CBMDefinition *fd = &result->defs.items[link - 1];
             size_t n = strlen(fd->name);
             memcpy(p, fd->name, n);
             p += n;
@@ -812,6 +821,8 @@ static void pxc_fold_struct_fields(CBMArena *arena, const CBMFileResult *result,
         *p = '\0';
         dst->field_defs = buf;
     }
+    cbm_ht_free(fields_of);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, next_field);
 }
 
 /* Python annotation text -> the one type name it declares, or NULL. Strips a
@@ -2597,6 +2608,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.java = cbm_java_build_cross_registry(xa, all_defs, def_count);
     }
 
     int processed = 0;

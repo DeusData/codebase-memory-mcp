@@ -30,7 +30,7 @@ scripts/test.sh
 
 This builds with ASan + UBSan and runs the full C test suite. Key test files:
 - `tests/test_pipeline.c` — pipeline integration tests
-- `tests/test_httplink.c` — HTTP route extraction and linking
+- `tests/test_route_canon.c` — route-path canonicalization used to link HTTP clients and handlers
 - `tests/test_mcp.c` — MCP protocol and tool handler tests
 - `tests/test_store_*.c` — SQLite graph store tests
 

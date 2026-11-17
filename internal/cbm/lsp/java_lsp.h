@@ -29,11 +29,14 @@
  *      enforced by lsp_resolve.h).
  */
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
 #include "go_lsp.h" /* CBMLSPDef, CBMResolvedCallArray reused across languages */
+
+#define JAVA_EXT_MEMO 8
 
 /* Java `use`-style import kinds. Mirrors PHP's enum with Java semantics. */
 enum {
@@ -70,6 +73,14 @@ typedef struct {
     int *import_kinds;
     int import_count;
     int import_cap;
+    CBMNameRows import_rows; /* import_local_names by name, rows in table order */
+
+    /* While signatures are patched: the registered functions' QNs, by name
+     * (overloads share a QN). NULL func_names: a scan answers instead. */
+    const char **func_names;
+    int func_name_count;
+    CBMNameRows func_rows;
+    CBMArena *func_rows_arena;
 
     /* Current enclosing context. */
     const char *enclosing_method_qn;    /* QN of the nearest method/ctor */
@@ -90,6 +101,12 @@ typedef struct {
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
+
+    /* java_receiver_is_external's answers for the packages probed so far
+     * (a few per file), so each costs one registry walk. */
+    const char *ext_memo_pkg[JAVA_EXT_MEMO];
+    bool ext_memo_val[JAVA_EXT_MEMO];
+    int ext_memo_next;
 } JavaLSPContext;
 
 /* ── Initialization / configuration ───────────────────────────────── */

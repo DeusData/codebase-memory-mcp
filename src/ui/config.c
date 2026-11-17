@@ -168,6 +168,22 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     cbm_runtime_settings_load_ui(&cfg->ui_enabled, &cfg->ui_port);
 }
 
+/* ── Daemon start rule ───────────────────────────────────────── */
+
+bool cbm_ui_config_daemon_start_ui(const cbm_ui_config_t *saved, int requested_port,
+                                   bool open_browser, int *port_out) {
+    if (port_out) {
+        *port_out = 0;
+    }
+    if (!saved || !(saved->ui_enabled || requested_port > 0 || open_browser)) {
+        return false;
+    }
+    if (port_out) {
+        *port_out = requested_port > 0 ? requested_port : saved->ui_port;
+    }
+    return true;
+}
+
 /* ── Save ────────────────────────────────────────────────────── */
 
 static bool config_parent_directory(const char *path, char *directory, size_t directory_size) {

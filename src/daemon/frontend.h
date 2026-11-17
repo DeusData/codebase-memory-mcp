@@ -83,6 +83,10 @@ uint64_t cbm_daemon_frontend_test_routed_cancellations(void);
  * settings requests. Recovery tests use distinct connect and startup budgets
  * and compare. */
 uint32_t cbm_daemon_frontend_test_replay_timeout_ms(void);
+/* Milliseconds the maintenance monitor last slept in its no-maintenance
+ * (ABSENT) branch, recorded from the exact value passed to the sleep; zero
+ * until the first idle cycle after reset. Pins the idle probe cadence. */
+uint32_t cbm_daemon_frontend_test_monitor_idle_sleep_ms(void);
 #endif
 
 /* Takes ownership of client and borrows cohort_manager for the complete call.

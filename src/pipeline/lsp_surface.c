@@ -17,15 +17,18 @@
  *     bytes is the early-cutoff key: a body edit reserializes identically.
  */
 #include "pipeline/lsp_surface.h"
+#include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cbm.h"     /* cbm_label_is_relation — reg-only surface membership */
 #include "doclink.h" /* cbm_doclink_portable_scope — the "dl" key */
+#include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/sha256.h"
@@ -417,6 +420,29 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
 
+    yyjson_mut_val *swift = NULL;
+    for (int i = 0; result && i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->qn_sig_off || !d->qualified_name) {
+            continue;
+        }
+        if (!swift) {
+            swift = yyjson_mut_arr(doc);
+        }
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, o, "q", d->qualified_name);
+        char defaults[CBM_SZ_16 + SKIP_ONE];
+        (void)snprintf(defaults, sizeof(defaults), "%016llx",
+                       (unsigned long long)d->param_default_mask);
+        yyjson_mut_obj_add_strcpy(doc, o, "d", defaults);
+        yyjson_mut_obj_add_int(doc, o, "p", d->selector_param_count);
+        yyjson_mut_obj_add_str(doc, o, "s", d->call_selector ? d->call_selector : "");
+        yyjson_mut_arr_add_val(swift, o);
+    }
+    if (swift) {
+        yyjson_mut_obj_add_val(doc, root, "callables", swift);
+    }
+
     /* #1916: an axios instance binding's baseURL is consumed by the files
      * that import it (their HTTP_CALLS compose base + path), so a changed
      * base must change the surface or those importers keep stale edges.
@@ -470,7 +496,9 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_doc_free(doc);
         return NULL;
     }
-    char *json = yyjson_mut_write(doc, 0, out_len);
+    /* Names, types and strings come from source text, which need not be UTF-8:
+     * one such byte must not cost the repository every surface row. */
+    char *json = cbm_json_write_text(doc, NULL, out_len);
     yyjson_mut_doc_free(doc);
     return json;
 }

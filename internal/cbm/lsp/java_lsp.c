@@ -32,6 +32,7 @@
  */
 
 #include "java_lsp.h"
+#include "lsp_work.h"
 #include "../helpers.h"
 
 #include <ctype.h>
@@ -318,6 +319,18 @@ void java_lsp_add_import(JavaLSPContext *ctx, const char *local_name, const char
     ctx->import_count++;
 }
 
+/* The imports with this local name, in table order (lsp_name_rows.h): a scan per
+ * use made a file of thousands of imports quadratic. */
+static int java_import_first(JavaLSPContext *ctx, const char *name) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                               ctx->import_count, name);
+}
+
+static int java_import_next(const JavaLSPContext *ctx, const char *name, int row) {
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names, ctx->import_count, name,
+                              row);
+}
+
 static void push_enclosing_class(JavaLSPContext *ctx, const char *class_qn) {
     if (ctx->enclosing_class_depth >= ctx->enclosing_class_cap) {
         int new_cap = ctx->enclosing_class_cap == 0 ? 8 : ctx->enclosing_class_cap * 2;
@@ -502,7 +515,7 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     }
 
     /* 2. Single-type imports. */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE)
             continue;
         if (strcmp(ctx->import_local_names[i], name) == 0) {
@@ -510,7 +523,19 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         }
     }
 
-    /* 3. java.lang auto-import. Try registered first, then the conventional QN. */
+    /* 3. Java package prefix. A type of the own package shadows every
+     * on-demand import, java.lang's included (JLS 6.4.1). */
+    if (ctx->package_name && ctx->package_name[0]) {
+        char buf[JAVA_LSP_BUF];
+        int n = snprintf(buf, sizeof(buf), "%s.%s", ctx->package_name, name);
+        if (n > 0 && (size_t)n < sizeof(buf)) {
+            if (cbm_registry_lookup_type(ctx->registry, buf)) {
+                return cbm_arena_strdup(ctx->arena, buf);
+            }
+        }
+    }
+
+    /* 4. java.lang auto-import. Try registered first, then the conventional QN. */
     for (int i = 0; JAVA_LANG_TYPES[i]; i++) {
         if (strcmp(JAVA_LANG_TYPES[i], name) == 0) {
             char buf[JAVA_LSP_BUF];
@@ -521,23 +546,12 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         }
     }
 
-    /* 4. On-demand imports. */
+    /* 5. On-demand imports. */
     for (int i = 0; i < ctx->import_count; i++) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_ON_DEMAND)
             continue;
         char buf[JAVA_LSP_BUF];
         int n = snprintf(buf, sizeof(buf), "%s.%s", ctx->import_target_qns[i], name);
-        if (n > 0 && (size_t)n < sizeof(buf)) {
-            if (cbm_registry_lookup_type(ctx->registry, buf)) {
-                return cbm_arena_strdup(ctx->arena, buf);
-            }
-        }
-    }
-
-    /* 5. Java package prefix. */
-    if (ctx->package_name && ctx->package_name[0]) {
-        char buf[JAVA_LSP_BUF];
-        int n = snprintf(buf, sizeof(buf), "%s.%s", ctx->package_name, name);
         if (n > 0 && (size_t)n < sizeof(buf)) {
             if (cbm_registry_lookup_type(ctx->registry, buf)) {
                 return cbm_arena_strdup(ctx->arena, buf);
@@ -562,7 +576,12 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     if (ctx->registry && ctx->registry->types) {
         const char *only_qn = NULL;
         int matches = 0;
-        for (int i = 0; i < ctx->registry->type_count && matches < 2; i++) {
+        /* The registry's own types of this short name: by name once it is indexed
+         * (cbm_registry_index_types_into), else every type, as before. */
+        CBMTypeShortIter named;
+        cbm_registry_types_by_short_name(ctx->registry, name, &named);
+        for (int i = -1; matches < 2 && (i = cbm_type_short_iter_next(&named)) >= 0;) {
+            CBM_LSP_WORK(1);
             const CBMRegisteredType *t = &ctx->registry->types[i];
             if (!t->qualified_name || !t->short_name || t->alias_of) {
                 continue;
@@ -817,7 +836,7 @@ static const CBMType *resolve_identifier_type(JavaLSPContext *ctx, const char *n
     }
 
     /* Static imports — could be a static field. */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_STATIC)
             continue;
         if (strcmp(ctx->import_local_names[i], name) == 0) {
@@ -969,6 +988,12 @@ const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *cla
     return fallback;
 }
 
+/* A type declared in the project: the cross registrar and the own-file pass
+ * stamp namespace_qn on every project type; the JDK seed leaves it NULL. */
+static bool java_is_project_type(const CBMRegisteredType *rt) {
+    return rt && rt->namespace_qn && rt->namespace_qn[0];
+}
+
 /* ── Method-invocation evaluation ─────────────────────────────────── */
 
 static const CBMType *java_return_type_of(const CBMRegisteredFunc *f) {
@@ -1114,7 +1139,7 @@ static const CBMType *eval_method_invocation(JavaLSPContext *ctx, TSNode node) {
             if (f)
                 return java_return_type_of(f);
         }
-        for (int i = 0; i < ctx->import_count; i++) {
+        for (int i = java_import_first(ctx, mname); i >= 0; i = java_import_next(ctx, mname, i)) {
             if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_STATIC)
                 continue;
             if (strcmp(ctx->import_local_names[i], mname) != 0)
@@ -1797,11 +1822,135 @@ void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
 
 /* ── Call-edge resolution ─────────────────────────────────────────── */
 
+/* True when `callee_qn` names a member (or a constructor) of a registered type
+ * the project does not declare — a JDK seed type. Such a target has no graph
+ * node, and the pipeline must not hand it to a same-named project method. */
+static bool java_callee_is_external(const JavaLSPContext *ctx, const char *callee_qn) {
+    if (!ctx->registry || !callee_qn)
+        return false;
+    const CBMRegisteredType *self = cbm_registry_lookup_type(ctx->registry, callee_qn);
+    if (self)
+        return !java_is_project_type(self);
+    const char *dot = strrchr(callee_qn, '.');
+    if (!dot || dot == callee_qn)
+        return false;
+    char owner[JAVA_LSP_BUF];
+    size_t n = (size_t)(dot - callee_qn);
+    if (n >= sizeof(owner))
+        return false;
+    memcpy(owner, callee_qn, n);
+    owner[n] = '\0';
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, owner);
+    return rt && !java_is_project_type(rt);
+}
+
+/* `T`, `ID`, `SELF`: a type-variable spelling — one or two characters, or
+ * capitals, digits and '_' only — that the file imports neither by name nor
+ * through its package (`import org.jooq.impl.*;` makes `DSL` a type). A type
+ * variable the resolver failed to bind can reach a receiver qualified by some
+ * package; it is unknown, not a library type. */
+static bool java_is_type_var_spelling(const JavaLSPContext *ctx, const char *pkg, size_t pkg_len,
+                                      const char *simple) {
+    size_t n = strlen(simple);
+    bool caps = n > 0;
+    for (size_t i = 0; i < n && caps; i++) {
+        caps = isupper((unsigned char)simple[i]) || isdigit((unsigned char)simple[i]) ||
+               simple[i] == '_';
+    }
+    if (!caps && n > 2) {
+        return false;
+    }
+    for (int i = 0; i < ctx->import_count; i++) {
+        const char *target = ctx->import_target_qns[i];
+        if (ctx->import_kinds[i] == CBM_JAVA_IMPORT_TYPE && ctx->import_local_names[i] &&
+            strcmp(ctx->import_local_names[i], simple) == 0) {
+            return false;
+        }
+        if (ctx->import_kinds[i] == CBM_JAVA_IMPORT_ON_DEMAND && target &&
+            strlen(target) == pkg_len && strncmp(target, pkg, pkg_len) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Whether the shared registry holds no project type under `prefix`
+ * ("org.jooq."), memoised per package. */
+static bool java_package_is_external(JavaLSPContext *ctx, const CBMTypeRegistry *base,
+                                     const char *prefix) {
+    for (int i = 0; i < JAVA_EXT_MEMO; i++) {
+        if (ctx->ext_memo_pkg[i] && strcmp(ctx->ext_memo_pkg[i], prefix) == 0) {
+            return ctx->ext_memo_val[i];
+        }
+    }
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMQNPrefixIter it;
+    bool project = false;
+    /* The prefix search reads one layer, and the layer above the shared
+     * registry is a per-file overlay that is often empty: walk the chain. */
+    for (const CBMTypeRegistry *reg = base; reg && !project; reg = reg->fallback) {
+        if (!cbm_registry_types_with_qn_prefix(reg, prefix, true, &scratch, &it))
+            continue;
+        for (int ti = cbm_qn_prefix_iter_next(&it); ti >= 0 && !project;
+             ti = cbm_qn_prefix_iter_next(&it)) {
+            project = java_is_project_type(&reg->types[ti]);
+        }
+    }
+    cbm_arena_destroy(&scratch);
+    int slot = ctx->ext_memo_next++ % JAVA_EXT_MEMO;
+    ctx->ext_memo_pkg[slot] = prefix;
+    ctx->ext_memo_val[slot] = !project;
+    return !project;
+}
+
+/* A receiver type the registry does not know, spelled with a package the
+ * project declares no type in (`org.jooq.DSLContext` from an import): a
+ * library type. The package is the segments before the first capitalised
+ * one, so a nested type (`com.acme.Order.OrderBuilder`, registered flattened
+ * as `com.acme.OrderBuilder`) is judged by `com.acme`. Cross-file runs only —
+ * the shared registry is the one that knows every project package, and its
+ * type order makes the probe a binary search. A path-derived QN
+ * (project-prefixed) is an unresolved project spelling, never a library. */
+static bool java_receiver_is_external(JavaLSPContext *ctx, const char *recv_qn) {
+    const CBMTypeRegistry *base = ctx->registry ? ctx->registry->fallback : NULL;
+    if (!base || !recv_qn || !islower((unsigned char)recv_qn[0]))
+        return false;
+    const char *type = NULL;
+    for (const char *p = recv_qn; (p = strchr(p, '.')) != NULL; p++) {
+        if (isupper((unsigned char)p[1])) {
+            type = p + 1;
+            break;
+        }
+    }
+    if (!type)
+        return false;
+    size_t pkg_len = (size_t)(type - 1 - recv_qn);
+    const char *last = strrchr(recv_qn, '.');
+    if (java_is_type_var_spelling(ctx, recv_qn, pkg_len, last + 1))
+        return false;
+    /* The project segment; a file at the repository root has a module QN
+     * that is the project name alone. */
+    const char *mod_dot = ctx->module_qn ? strchr(ctx->module_qn, '.') : NULL;
+    size_t mod_len = mod_dot ? (size_t)(mod_dot - ctx->module_qn)
+                             : (ctx->module_qn ? strlen(ctx->module_qn) : 0);
+    if (mod_len && strncmp(recv_qn, ctx->module_qn, mod_len) == 0 && recv_qn[mod_len] == '.')
+        return false;
+    if (ctx->package_name && strlen(ctx->package_name) == pkg_len &&
+        strncmp(ctx->package_name, recv_qn, pkg_len) == 0)
+        return false;
+    /* "org.jooq." */
+    return java_package_is_external(ctx, base, cbm_arena_strndup(ctx->arena, recv_qn, pkg_len + 1));
+}
+
 static void java_emit_resolved_orig_kind(JavaLSPContext *ctx, const char *callee_qn,
                                          const char *orig, const char *strategy, float confidence,
                                          CBMResolvedKind kind) {
     if (!ctx->resolved_calls || !ctx->enclosing_method_qn || !callee_qn)
         return;
+    if (kind == CBM_RESOLVED_INVOCATION && java_callee_is_external(ctx, callee_qn)) {
+        strategy = "lsp_external";
+    }
     CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_method_qn;
     rc.callee_qn = callee_qn;
@@ -2017,7 +2166,7 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             }
         }
         /* Static import. */
-        for (int i = 0; i < ctx->import_count; i++) {
+        for (int i = java_import_first(ctx, mname); i >= 0; i = java_import_next(ctx, mname, i)) {
             if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_STATIC)
                 continue;
             if (strcmp(ctx->import_local_names[i], mname) != 0)
@@ -2143,6 +2292,15 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             }
             java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", recv_qn, mname),
                                "lsp_interface_dispatch", 0.80f);
+            return;
+        }
+        /* A library type the registry does not hold: no method of it can be
+         * looked up, but no project method is its target either. A seeded
+         * JDK type with no such method stays a diagnostic below, as Rust's
+         * gate (#2053) needs a positively resolved std method. */
+        if (!rt && java_receiver_is_external(ctx, recv_qn)) {
+            java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", recv_qn, mname),
+                               "lsp_external", 0.90f);
             return;
         }
         java_emit_unresolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", recv_qn, mname),
@@ -3214,8 +3372,15 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
         stub.qualified_name = d->qualified_name;
         stub.short_name = d->name;
         stub.is_interface = (strcmp(d->label, "Interface") == 0);
+        stub.namespace_qn = (ctx->package_name && ctx->package_name[0]) ? ctx->package_name
+                            : (module_qn && module_qn[0])               ? module_qn
+                                                                        : d->qualified_name;
         cbm_registry_add_type(reg, stub);
     }
+    /* Every local type is in: from here on a type is found by name, not by a scan of
+     * every registered type per definition (first registrations, as the scan). */
+    if (reg->tail_arena)
+        cbm_registry_index_types_into(reg, reg->tail_arena);
 
     /* Pass 1b: now that every local type is in the registry, walk again and
      * fill in embedded_types using the parent_class chain. We mutate the
@@ -3240,15 +3405,7 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                                              do the in-place update directly. */
         (void)rt;
         /* Locate the actual entry in reg->types[] and write into it. */
-        CBMRegisteredType *slot = NULL;
-        for (int ti = 0; ti < reg->type_count; ti++) {
-            if (reg->types[ti].qualified_name == d->qualified_name ||
-                (reg->types[ti].qualified_name &&
-                 strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0)) {
-                slot = &reg->types[ti];
-                break;
-            }
-        }
+        CBMRegisteredType *slot = cbm_registry_first_own_type(reg, d->qualified_name);
         if (!slot)
             continue;
         if (d->base_classes) {
@@ -3420,6 +3577,25 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
 static void patch_method_signatures_from_ast(JavaLSPContext *ctx, CBMTypeRegistry *reg,
                                              TSNode class_node, const char *enclosing_class_qn);
 
+/* The next registered function of this QN after `row` (-1: the first), in
+ * registration order. By name when the caller listed the functions in
+ * ctx->func_names and none was added since; otherwise by a scan. */
+static int java_func_row_next(JavaLSPContext *ctx, const CBMTypeRegistry *reg, const char *qn,
+                              int row) {
+    if (ctx->func_names && ctx->func_name_count == reg->func_count) {
+        return row < 0 ? cbm_name_rows_first(&ctx->func_rows, ctx->func_rows_arena, ctx->func_names,
+                                             ctx->func_name_count, qn)
+                       : cbm_name_rows_next(&ctx->func_rows, ctx->func_names, ctx->func_name_count,
+                                            qn, row);
+    }
+    for (int fi = row + 1; fi < reg->func_count; fi++) {
+        CBM_LSP_WORK(1);
+        if (reg->funcs[fi].qualified_name && strcmp(reg->funcs[fi].qualified_name, qn) == 0)
+            return fi;
+    }
+    return -1;
+}
+
 static void patch_one_method(JavaLSPContext *ctx, CBMTypeRegistry *reg, TSNode method_node,
                              const char *class_qn, bool is_constructor) {
     TSNode name_node = ts_node_child_by_field_name(method_node, "name", 4);
@@ -3465,7 +3641,8 @@ static void patch_one_method(JavaLSPContext *ctx, CBMTypeRegistry *reg, TSNode m
      * first QN match keeps the legacy no-signature path best-effort. */
     CBMRegisteredFunc *slot = NULL;
     CBMRegisteredFunc *first_qn_match = NULL;
-    for (int fi = 0; fi < reg->func_count; fi++) {
+    for (int fi = java_func_row_next(ctx, reg, method_qn, -1); fi >= 0;
+         fi = java_func_row_next(ctx, reg, method_qn, fi)) {
         CBMRegisteredFunc *candidate = &reg->funcs[fi];
         if (!candidate->qualified_name || strcmp(candidate->qualified_name, method_qn) != 0)
             continue;
@@ -3566,13 +3743,7 @@ static void patch_method_signatures_from_ast(JavaLSPContext *ctx, CBMTypeRegistr
  * `obj.field.method()` for arbitrary receivers, not just `this`. */
 static void append_field_to_class(CBMTypeRegistry *reg, CBMArena *a, const char *class_qn,
                                   const char *field_name, const CBMType *ftype) {
-    CBMRegisteredType *slot = NULL;
-    for (int ti = 0; ti < reg->type_count; ti++) {
-        if (reg->types[ti].qualified_name && strcmp(reg->types[ti].qualified_name, class_qn) == 0) {
-            slot = &reg->types[ti];
-            break;
-        }
-    }
+    CBMRegisteredType *slot = cbm_registry_first_own_type(reg, class_qn);
     if (!slot)
         return;
 
@@ -3670,6 +3841,8 @@ static void populate_class_fields_from_ast(JavaLSPContext *ctx, CBMTypeRegistry 
 
 extern const TSLanguage *tree_sitter_java(void);
 
+enum { JAVA_SCRATCH_ARENA_BLOCK = 4096 };
+
 void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root) {
     if (!arena || !result || !source)
@@ -3703,8 +3876,22 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
         java_lsp_add_import(&ctx, imp->local_name, imp->module_path, CBM_JAVA_IMPORT_TYPE);
     }
 
-    /* Register file-local defs into the registry. */
+    /* Register file-local defs into the registry. Its lookups run while it
+     * fills, so it indexes its types as they come, in a scratch arena. */
+    CBMArena scratch;
+    cbm_arena_init_lazy(&scratch, JAVA_SCRATCH_ARENA_BLOCK);
+    reg.tail_arena = &scratch;
     register_local_func_or_type_from_file(&ctx, &reg, result);
+
+    /* Overloads share a QN, so patching a method asks for all of its registrations. */
+    ctx.func_rows_arena = &scratch;
+    ctx.func_names =
+        reg.func_count > 0
+            ? (const char **)cbm_arena_alloc(&scratch, (size_t)reg.func_count * sizeof(char *))
+            : NULL;
+    ctx.func_name_count = ctx.func_names ? reg.func_count : 0;
+    for (int fi = 0; fi < ctx.func_name_count; fi++)
+        ctx.func_names[fi] = reg.funcs[fi].qualified_name;
 
     /* Populate field metadata from the AST so eval_field_access works on
      * receivers other than `this`. Also patch method signatures with
@@ -3720,9 +3907,12 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
             patch_method_signatures_from_ast(&ctx, &reg, c, NULL);
         }
     }
+    ctx.func_names = NULL;
+    ctx.func_name_count = 0;
 
     /* Walk the file. */
     java_lsp_process_file(&ctx, root);
+    cbm_arena_destroy(&scratch);
 }
 
 /* ── Cross-file LSP ───────────────────────────────────────────────── */
@@ -3740,6 +3930,11 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
+            /* Project marker (java_is_project_type) and the package that
+             * qualifies the type's own member signatures. */
+            rt.namespace_qn = (d->namespace_name && d->namespace_name[0]) ? d->namespace_name
+                              : (d->def_module_qn && d->def_module_qn[0]) ? d->def_module_qn
+                                                                          : d->qualified_name;
             /* Embedded types from "|"-separated text. */
             if (d->embedded_types && d->embedded_types[0]) {
                 int n = 1;
@@ -3883,6 +4078,9 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
         cbm_java_register_lsp_defs(arena, reg, jvm + type_count, total - type_count);
     }
     cbm_registry_finalize(reg);
+    /* java_receiver_is_external asks "does the project declare a type in
+     * this package?" per unresolved receiver: a binary search on this order. */
+    cbm_registry_build_type_qn_order(reg, arena);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -3914,14 +4112,14 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &overlay, NULL, module_qn, out);
 
-    register_local_func_or_type_from_file(&ctx, &overlay, result);
-    cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
-
     /* Index the overlay only — the base is already finalized. Scratch arena so
      * per-file bucket allocations do not accumulate in the pipeline-lifetime
-     * arena across a large repo. */
+     * arena across a large repo. Registration already finds its own types there. */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
+    overlay.tail_arena = &idx_arena;
+    register_local_func_or_type_from_file(&ctx, &overlay, result);
+    cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
     cbm_registry_finalize_into(&overlay, &idx_arena);
 
     TSTree *tree = cached_tree;
@@ -3958,6 +4156,9 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     }
 }
 
+/* The per-file fallback when no shared cross registry was built. Its
+ * registry has no fallback layer, so java_receiver_is_external never fires
+ * here: library calls keep the textual registry fallback, as before. */
 void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
