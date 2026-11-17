@@ -1,4 +1,4 @@
-/*
+﻿/*
  * test_cli.c — Tests for CLI subcommands: install, uninstall, update, version.
  *
  * Port of Go test files:
@@ -4441,6 +4441,102 @@ TEST(cli_uninstall_cleans_user_owned_symlinked_config) {
     PASS();
 }
 #endif
+
+/* `install --dir=X` writes X's binary into every agent entry; `uninstall
+ * --dir=X` must recognise exactly those entries as its own. Before the fix
+ * every uninstall path except Claude Code compared against ~/.local/bin, so
+ * the entries were reported as foreign and left behind (Cursor covers the
+ * generic editor path, Amazon Q the client registry that also serves Visual
+ * Studio). No symlinks and no fd capture: this runs on Windows as well. */
+TEST(cli_uninstall_dir_removes_agent_entries_written_for_that_dir) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-dir-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    char *old_path = save_test_env("PATH");
+    char *old_appdata = save_test_env("APPDATA");
+    char *old_xdg = save_test_env("XDG_CONFIG_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("APPDATA");
+    cbm_unsetenv("XDG_CONFIG_HOME");
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    char bin_dir[512];
+    char bin_target[640];
+    char dir_arg[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/custom/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "binary installed with --dir");
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    char amazon_dir[512];
+    char amazon_config[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    snprintf(amazon_dir, sizeof(amazon_dir), "%s/.aws/amazonq/agents", tmpdir);
+    snprintf(amazon_config, sizeof(amazon_config), "%s/default.json", amazon_dir);
+    test_mkdirp(cursor_dir);
+    test_mkdirp(amazon_dir);
+    write_test_file(cursor_config,
+                    "{\n  \"mcpServers\": {\n    \"keep\": {\"command\": \"x\"}\n  }\n}\n");
+    write_test_file(amazon_config, "{\"keep\":\"amazon\"}\n");
+
+    int install_rc = cbm_install_agent_configs(tmpdir, bin_target, false, false);
+    char *cursor_installed = read_test_file_alloc(cursor_config);
+    char *amazon_installed = read_test_file_alloc(amazon_config);
+    bool installed = cursor_installed && strstr(cursor_installed, "codebase-memory-mcp") &&
+                     amazon_installed && strstr(amazon_installed, "codebase-memory-mcp");
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--yes", dir_arg};
+    int rc = cli_test_cmd_uninstall(2, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat state;
+    bool binary_gone = stat(bin_target, &state) != 0 && errno == ENOENT;
+    char *cursor_after = read_test_file_alloc(cursor_config);
+    char *amazon_after = read_test_file_alloc(amazon_config);
+    bool cursor_removed = cursor_after && !strstr(cursor_after, "codebase-memory-mcp") &&
+                          strstr(cursor_after, "\"keep\"");
+    bool amazon_removed = amazon_after && !strstr(amazon_after, "codebase-memory-mcp") &&
+                          strstr(amazon_after, "\"keep\"");
+
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    restore_test_env("APPDATA", old_appdata);
+    restore_test_env("XDG_CONFIG_HOME", old_xdg);
+    test_rmdir_r(tmpdir);
+    free(cursor_installed);
+    free(amazon_installed);
+    free(cursor_after);
+    free(amazon_after);
+
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(installed);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(cursor_removed);
+    ASSERT_TRUE(amazon_removed);
+    PASS();
+}
 
 TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
     char tmpdir[256];
@@ -21376,6 +21472,7 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails);
     RUN_TEST(cli_uninstall_cleans_user_owned_symlinked_config);
 #endif
+    RUN_TEST(cli_uninstall_dir_removes_agent_entries_written_for_that_dir);
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
     RUN_TEST(cli_windows_update_hands_off_to_install_script);
