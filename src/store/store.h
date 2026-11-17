@@ -35,8 +35,12 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *      __image__docker.io/[library/]<repository>.
  *   4  #1913: Go method QNs are receiver-qualified (pkg.Recv.method, generic
  *      receivers unwrapped); free functions stay pkg.func.
- *   5  #2061: Swift declaration identities and uncapped call selectors. */
-#define CBM_INDEX_FORMAT_VERSION 5
+ *   5  #2061: Swift declaration identities and uncapped call selectors.
+ *   6  #2360: File nodes record their declared package clause (`package`
+ *      property); an incremental run reads it back to build the namespace
+ *      map and the Scala top-level index for the files it does not
+ *      re-extract. */
+#define CBM_INDEX_FORMAT_VERSION 6
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
