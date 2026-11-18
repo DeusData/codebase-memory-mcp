@@ -175,11 +175,17 @@ struct cbm_include_universe {
     CBMArena arena;
     CBMHashTable *listed; /* rel -> non-NULL */
     CBMHashTable *tails;  /* every path suffix on a '/' boundary -> ip_tail_t */
-    const char **paths;   /* listed paths, in listing order */
+    /* the same suffixes in lower case: a path that matches one only when case
+     * is ignored is not known absent (a case-insensitive disk opens it) */
+    CBMHashTable *ftails;
+    const char **paths; /* listed paths, in listing order */
     size_t npaths;
     size_t cap_paths;
     bool did_list;
     bool complete;
+    /* the walk met a symbolic link (not entered): a path under one is not
+     * known absent */
+    bool saw_link;
     uint64_t visited;    /* directory entries read by the listing */
     uint64_t tail_steps; /* suffix keys made and looked up */
 };
@@ -218,6 +224,9 @@ void cbm_include_universe_free(cbm_include_universe_t *u) {
     if (u->tails) {
         cbm_ht_free(u->tails);
     }
+    if (u->ftails) {
+        cbm_ht_free(u->ftails);
+    }
     cbm_free(CBM_MEM_CLASS_OTHER, u->paths);
     cbm_arena_destroy(&u->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, u);
@@ -231,8 +240,28 @@ uint64_t cbm_include_universe_tail_steps(const cbm_include_universe_t *u) {
     return u ? u->tail_steps : 0;
 }
 
-/* One listed path: into the set, the order, and the suffix index. */
+/* "a/B.proto" -> "a/b.proto" (ASCII), in the universe's arena. */
+static const char *ip_fold(cbm_include_universe_t *u, const char *p) {
+    char *f = cbm_arena_strdup(&u->arena, p);
+    for (char *c = f; c && *c; c++) {
+        if (*c >= 'A' && *c <= 'Z') {
+            *c = (char)(*c - 'A' + 'a');
+        }
+    }
+    return f;
+}
+
+/* One listed path: into the set, the order, and the suffix indexes. */
 static bool ip_list_add(cbm_include_universe_t *u, const char *rel) {
+    const char *folded = ip_fold(u, rel);
+    if (!folded) {
+        return false;
+    }
+    for (const char *p = folded; p;) {
+        cbm_ht_set(u->ftails, p, (void *)folded);
+        const char *slash = strchr(p, '/');
+        p = slash ? slash + SKIP_ONE : NULL;
+    }
     if (u->npaths >= u->cap_paths) {
         size_t ncap = u->cap_paths ? u->cap_paths * PAIR_LEN : CBM_SZ_256;
         const char **np = cbm_alloc(CBM_MEM_CLASS_OTHER, ncap * sizeof(*np));
@@ -306,7 +335,11 @@ static bool ip_list_dir(cbm_include_universe_t *u, const char *dir, char ***stac
         u->visited++;
         /* a symbolic link is not entered: it may leave the repository, and
          * what it points at inside is listed anyway */
-        if (ent->d_type == IP_DT_LNK || (!ent->is_dir && !cbm_include_path_listed_name(name))) {
+        if (ent->d_type == IP_DT_LNK) {
+            u->saw_link = true;
+            continue;
+        }
+        if (!ent->is_dir && !cbm_include_path_listed_name(name)) {
             continue;
         }
         char *rel = dir[0] ? cbm_arena_sprintf(&u->arena, "%s/%s", dir, name)
@@ -326,7 +359,9 @@ static bool ip_list_dir(cbm_include_universe_t *u, const char *dir, char ***stac
             ok = false;
             break;
         }
-        if (!info.is_symlink) { /* a junction (Windows) is not entered either */
+        if (info.is_symlink) { /* a junction (Windows) is not entered either */
+            u->saw_link = true;
+        } else {
             ok = ip_push_dir(stack, top, cap, rel);
         }
     }
@@ -339,7 +374,8 @@ static void ip_list(cbm_include_universe_t *u) {
     u->did_list = true;
     u->listed = cbm_ht_create(CBM_SZ_4K);
     u->tails = cbm_ht_create(CBM_SZ_4K);
-    if (!u->listed || !u->tails) {
+    u->ftails = cbm_ht_create(CBM_SZ_4K);
+    if (!u->listed || !u->tails || !u->ftails) {
         return;
     }
     int cap = CBM_SZ_64;
@@ -448,6 +484,21 @@ static const char *ip_unique_tail(cbm_include_universe_t *u, const cbm_include_p
     return buf;
 }
 
+/* Proven that no repository file is `key` or ends with "/" + key: the whole
+ * listing holds none, none when letter case is ignored, and the walk passed
+ * no symbolic link a path could hide under. */
+static bool ip_absent_tail(cbm_include_universe_t *u, const cbm_include_path_row_t *row,
+                           const char *key) {
+    const char *base = strrchr(key, '/');
+    base = base ? base + SKIP_ONE : key;
+    if (!base[0] || !ip_row_names(row, base) || !ip_listing(u) || u->saw_link) {
+        return false;
+    }
+    u->tail_steps++;
+    const char *folded = ip_fold(u, key);
+    return folded && !cbm_ht_get(u->tails, key) && !cbm_ht_get(u->ftails, folded);
+}
+
 cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
                                                     const cbm_gbuf_t *graph, const char *project,
                                                     const char *rel, CBMLanguage lang,
@@ -471,11 +522,10 @@ cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
     if (!u || p[0] == '/' || strpbrk(p, "$`") || !ip_dirname(dir, sizeof(dir), rel)) {
         return CBM_INCLUDE_PATH_NONE; /* a path the rule cannot read */
     }
-    if (row->whole_path_tail) {
-        char key[IP_PATH_MAX];
-        if (ip_join(key, sizeof(key), "", p) && ip_unique_tail(u, row, key, buf, buf_sz)) {
-            return CBM_INCLUDE_PATH_FILE;
-        }
+    char key[IP_PATH_MAX];
+    bool keyed = ip_join(key, sizeof(key), "", p);
+    if (row->whole_path_tail && keyed && ip_unique_tail(u, row, key, buf, buf_sz)) {
+        return CBM_INCLUDE_PATH_FILE;
     }
     char cands[2][IP_PATH_MAX];
     int n = 0;
@@ -485,9 +535,13 @@ cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
     if (row->base_root && ip_join(cands[n], sizeof(cands[n]), "", p)) {
         n++;
     }
-    return ip_pick(u, graph, project, cands, n, row->exactly_one, buf, buf_sz)
-               ? CBM_INCLUDE_PATH_FILE
-               : CBM_INCLUDE_PATH_NONE;
+    if (ip_pick(u, graph, project, cands, n, row->exactly_one, buf, buf_sz)) {
+        return CBM_INCLUDE_PATH_FILE;
+    }
+    /* Proof of "no file": no repository file is the path or ends with it, so
+     * no include root or run directory inside the repository can supply one
+     * (absence at the bases alone would not do: another directory may). */
+    return keyed && ip_absent_tail(u, row, key) ? CBM_INCLUDE_PATH_NO_FILE : CBM_INCLUDE_PATH_NONE;
 }
 
 /* The file's Module node (named by its path) when it has one: the node a
@@ -515,11 +569,16 @@ bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CB
     char buf[IP_PATH_MAX];
     cbm_include_path_verdict_t v = cbm_include_path_resolve(
         ctx->include_universe, ctx->gbuf, ctx->project_name, rel, lang, imp, buf, sizeof(buf));
-    if (v != CBM_INCLUDE_PATH_FILE) {
-        return false; /* not a path, or no file: main's strategies decide */
+    if (v == CBM_INCLUDE_PATH_FILE) {
+        /* the statement names this repository file: its node, or no edge when
+         * the graph has none (a file in a skipped directory) */
+        *out = ip_file_target(ctx, buf);
+        return true;
     }
-    *out = ip_file_target(ctx, buf);
-    return *out != NULL;
+    /* proven to name no repository file: neither a file nor a symbol of the
+     * repository can be its target. Otherwise (not a path, several files,
+     * unknown) main's strategies decide. */
+    return v == CBM_INCLUDE_PATH_NO_FILE;
 }
 
 static int ip_strcmp_ptr(const void *a, const void *b) {

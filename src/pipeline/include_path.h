@@ -68,7 +68,10 @@ uint64_t cbm_include_universe_tail_steps(const cbm_include_universe_t *u);
 typedef enum {
     CBM_INCLUDE_PATH_NOT_A_PATH = 0, /* no row, or not a path the row reads: main decides */
     CBM_INCLUDE_PATH_FILE,           /* names one repository file (path in the buffer) */
-    CBM_INCLUDE_PATH_NONE,           /* a path that names no file the rule can prove */
+    CBM_INCLUDE_PATH_NONE,           /* a path whose file the rule cannot tell (several, unknown) */
+    /* proven: no repository file is that path or ends with it (whole listing,
+     * letter case ignored, no symbolic link passed) */
+    CBM_INCLUDE_PATH_NO_FILE,
 } cbm_include_path_verdict_t;
 
 /* The file the import `imp` of the file `rel` names, written into buf.
@@ -80,7 +83,9 @@ cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
 
 /* The IMPORTS target of an import, for resolve_import_strategies: true when
  * the path rule decides it, with *out the target node (the file's Module node
- * when it has one, else its File node). False: main's strategies decide. */
+ * when it has one, else its File node) or NULL: no edge (the named file has no
+ * node, or no repository file is named; a symbol is never the target of a
+ * statement that names a file). False: main's strategies decide. */
 bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
                               const CBMImport *imp, const cbm_gbuf_node_t **out);
 

@@ -59,8 +59,11 @@ TEST(include_path_proto_tail_beside_and_ambiguity) {
     ASSERT_EQ(ip_ask(u, CBM_LANG_PROTOBUF, "x/common.proto", "shared.proto", got, sizeof(got)),
               CBM_INCLUDE_PATH_NONE);
 
-    /* no such file; a path the rule cannot read; leaving the repository */
+    /* no such file (proven); a path the rule cannot read; leaving the repository */
     ASSERT_EQ(ip_ask(u, CBM_LANG_PROTOBUF, "api/a.proto", "nope/none.proto", got, sizeof(got)),
+              CBM_INCLUDE_PATH_NO_FILE);
+    /* only a case variant exists: a case-insensitive disk opens it, so not proven */
+    ASSERT_EQ(ip_ask(u, CBM_LANG_PROTOBUF, "api/a.proto", "X/Common.proto", got, sizeof(got)),
               CBM_INCLUDE_PATH_NONE);
     ASSERT_EQ(ip_ask(u, CBM_LANG_PROTOBUF, "api/a.proto", "/abs/common.proto", got, sizeof(got)),
               CBM_INCLUDE_PATH_NONE);
@@ -88,6 +91,7 @@ TEST(include_path_make_exactly_one_base) {
     th_write_file(TH_PATH(root, "rules.mk"), "Y = 1\n");
     th_write_file(TH_PATH(root, "both.mk"), "Z = 1\n");
     th_write_file(TH_PATH(root, "sub/both.mk"), "Z = 2\n");
+    th_write_file(TH_PATH(root, "other/elsewhere.mk"), "W = 1\n");
     cbm_include_universe_t *u = cbm_include_universe_new(root);
     ASSERT_NOT_NULL(u);
     char got[1024];
@@ -101,8 +105,12 @@ TEST(include_path_make_exactly_one_base) {
     /* both: which one make reads depends on where it runs */
     ASSERT_EQ(ip_ask(u, CBM_LANG_MAKEFILE, "sub/Makefile", "both.mk", got, sizeof(got)),
               CBM_INCLUDE_PATH_NONE);
-    /* none; a name with a variable */
+    /* none (proven); a name with a variable */
     ASSERT_EQ(ip_ask(u, CBM_LANG_MAKEFILE, "Makefile", "missing.mk", got, sizeof(got)),
+              CBM_INCLUDE_PATH_NO_FILE);
+    /* not at either base, but elsewhere in the repository (make may run
+     * there): not proven absent */
+    ASSERT_EQ(ip_ask(u, CBM_LANG_MAKEFILE, "sub/Makefile", "elsewhere.mk", got, sizeof(got)),
               CBM_INCLUDE_PATH_NONE);
     ASSERT_EQ(ip_ask(u, CBM_LANG_MAKEFILE, "Makefile", "$(TOP)/rules.mk", got, sizeof(got)),
               CBM_INCLUDE_PATH_NONE);
@@ -207,7 +215,59 @@ TEST(include_path_listing_grows_linearly) {
     PASS();
 }
 
+/* The IMPORTS decision: a statement that names a file is decided by the path
+ * rule when it names one repository file (its node, or no edge without one)
+ * or provably none (no edge: a symbol of the name is never its target); with
+ * several candidate files main's strategies decide. */
+TEST(include_path_names_no_file_decides_no_target) {
+    char *root = ip_tree();
+    ASSERT_NOT_NULL(root);
+    th_write_file(TH_PATH(root, "a.proto"), "");
+    th_write_file(TH_PATH(root, "x/common.proto"), "");
+    th_write_file(TH_PATH(root, "y/dup.proto"), "");
+    th_write_file(TH_PATH(root, "z/dup.proto"), "");
+    th_write_file(TH_PATH(root, "skipped/only.proto"), "");
+    th_write_file(TH_PATH(root, "Makefile"), "");
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", root);
+    char *file_qn = cbm_pipeline_fqn_compute("p", "x/common.proto", "__file__");
+    ASSERT_GT(
+        cbm_gbuf_upsert_node(gb, "File", "common.proto", file_qn, "x/common.proto", 1, 1, "{}"), 0);
+    cbm_pipeline_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gbuf = gb;
+    ctx.project_name = "p";
+    ctx.include_universe = cbm_include_universe_new(root);
+    CBMImport imp;
+    memset(&imp, 0, sizeof(imp));
+    const cbm_gbuf_node_t *out = NULL;
+
+    imp.module_path = "google/protobuf/empty.proto"; /* no repository file ends with it */
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "a.proto", CBM_LANG_PROTOBUF, &imp, &out));
+    ASSERT_NULL(out);
+    imp.module_path = "skipped/only.proto"; /* one file, without a node */
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "a.proto", CBM_LANG_PROTOBUF, &imp, &out));
+    ASSERT_NULL(out);
+    imp.module_path = "missing.mk";
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "Makefile", CBM_LANG_MAKEFILE, &imp, &out));
+    ASSERT_NULL(out);
+
+    /* partners: the named file's node; several files: main decides */
+    imp.module_path = "x/common.proto";
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "a.proto", CBM_LANG_PROTOBUF, &imp, &out));
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out->qualified_name, file_qn);
+    imp.module_path = "dup.proto";
+    ASSERT_FALSE(cbm_include_path_decides(&ctx, "a.proto", CBM_LANG_PROTOBUF, &imp, &out));
+    cbm_include_universe_free(ctx.include_universe);
+    free(file_qn);
+    cbm_gbuf_free(gb);
+    th_rmtree(root);
+    free(root);
+    PASS();
+}
+
 SUITE(include_path) {
+    RUN_TEST(include_path_names_no_file_decides_no_target);
     RUN_TEST(include_path_proto_tail_beside_and_ambiguity);
     RUN_TEST(include_path_make_exactly_one_base);
     RUN_TEST(include_path_listing_skips_git_and_links);
