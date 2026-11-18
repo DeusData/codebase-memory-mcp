@@ -79,6 +79,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/laravel_routing.h"
+#include "pipeline/site_bind.h"
 #include "lsp/rust_cargo.h"
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
@@ -3351,6 +3352,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     bool field_index_built = false;
     bool field_index_ready = false;
     cbm_spawn_file_begin(result->imports.items, result->imports.count);
+    cbm_site_file_t site;
+    cbm_pipeline_site_bind_begin(&site, rc->pctx, rc->main_gbuf, rel, lang, result);
     for (int c = 0; c < result->calls.count; c++) {
         const CBMCall *call = &result->calls.items[c];
         CBMCallEvidence fallback = {0};
@@ -3464,12 +3467,23 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                           module_qn, imp_vals, imp_count,
                                                           candidates, CBM_SZ_256);
         }
+        /* The shared cross-file layer (site_bind.h) is asked at every call no
+         * engine row matched; a proven answer replaces the name chain. MUST
+         * match pass_calls.c. */
+        cbm_site_answer_t scoped = {.verdict = CBM_SITE_NO_ANSWER};
+        if (!lsp && !call->requires_lsp_resolution) {
+            scoped = cbm_pipeline_site_bind_call(&site, call, source_node);
+        }
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call && !java_external && count == 0) {
-            /* Python LEGB fallback first (MUST match pass_calls.c). */
-            res = cbm_registry_resolve_call_scoped(
-                rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang,
-                call->enclosing_func_qn, cbm_pipeline_caller_is_test(source_node, rel, lang));
+            if (scoped.verdict == CBM_SITE_PROVEN) {
+                res = scoped.res;
+            } else {
+                /* Python LEGB fallback first (MUST match pass_calls.c). */
+                res = cbm_registry_resolve_call_scoped(
+                    rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang,
+                    call->enclosing_func_qn, cbm_pipeline_caller_is_test(source_node, rel, lang));
+            }
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further
@@ -3822,6 +3836,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         ws->calls_resolved++;
     }
+    cbm_pipeline_site_bind_end(&site, ws->local_edge_buf);
     if (lsp_exact_idx) {
         cbm_ht_foreach(lsp_exact_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_exact_idx);
@@ -3846,6 +3861,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     cbm_pipeline_lsp_field_index_t field_index = {0};
     bool field_index_ready =
         cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
+    cbm_site_file_t site;
+    cbm_pipeline_site_bind_begin(&site, rc->pctx, rc->main_gbuf, rel, lang, result);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -3922,7 +3939,16 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
             }
         }
-        if (!tgt) {
+        /* The shared cross-file layer (site_bind.h) is asked at every usage no
+         * engine row was found for; a proven answer is the target and main's
+         * name chain does not run for this site. MUST match pass_usages.c. */
+        cbm_site_answer_t scoped = {.verdict = CBM_SITE_NO_ANSWER};
+        if (!tgt && !semantic_reference && !property_read) {
+            scoped = cbm_pipeline_site_bind_usage(&site, usage, src);
+        }
+        if (scoped.verdict == CBM_SITE_PROVEN) {
+            tgt = scoped.target;
+        } else if (!tgt) {
             /* Exact semantic ownership beats textual name fallback even when
              * the semantic target is not materialized in this graph. */
             if (semantic_reference) {
@@ -4001,6 +4027,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, uprops);
         ws->usages_resolved++;
     }
+    cbm_pipeline_site_bind_end(&site, ws->local_edge_buf);
     cbm_pipeline_lsp_reference_index_free(&reference_index);
     cbm_pipeline_lsp_field_index_free(&field_index);
 }

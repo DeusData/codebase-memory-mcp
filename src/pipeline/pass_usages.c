@@ -18,6 +18,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/site_bind.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -161,6 +162,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     /* imp_keys is the IMPORTS-edge map (cbm_pxc_build_import_map). */
     cbm_php_vendor_names_t php_vendor;
     cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
+    cbm_site_file_t site;
+    cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, lang, result);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -237,11 +240,21 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             }
         }
 
+        /* The shared cross-file layer (site_bind.h) is asked at every usage no
+         * engine row was found for; a proven answer is the target and main's
+         * name chain does not run for this site. MUST match pass_parallel.c. */
+        cbm_site_answer_t scoped = {.verdict = CBM_SITE_NO_ANSWER};
+        if (!tgt && !semantic_reference && !property_read) {
+            scoped = cbm_pipeline_site_bind_usage(&site, usage, src);
+        }
+
         /* A syntactically explicit reference remains useful when exact semantic
          * resolution is unavailable, but the textual registry fallback proves
          * only value use—not an occurrence-exact callable target. Emit USAGE in
          * that case; CALL_REFERENCE is reserved for the exact LSP join. */
-        if (!tgt) {
+        if (scoped.verdict == CBM_SITE_PROVEN) {
+            tgt = scoped.target;
+        } else if (!tgt) {
             /* An occurrence-exact semantic record owns this reference even when
              * its target is not materialized in the graph (for example, a
              * Kotlin local function). Falling back by raw name here would bind
@@ -317,6 +330,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, edge_type, uprops);
         resolved++;
     }
+    cbm_pipeline_site_bind_end(&site, ctx->gbuf);
     cbm_pipeline_lsp_reference_index_free(&reference_index);
     cbm_pipeline_lsp_field_index_free(&field_index);
     cbm_pipeline_php_vendor_names_free(&php_vendor);
