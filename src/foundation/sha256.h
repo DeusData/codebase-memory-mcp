@@ -48,6 +48,21 @@ const char *cbm_sha256_backend_name_for_testing(void);
 /* Force the portable transform (true) or return to the probed backend (false),
  * so a test can hash the same input both ways. */
 void cbm_sha256_force_portable_for_testing(bool force);
+
+/* TEMPORARY diagnostic (drop before merge): per-hash CPU facts for the hosted
+ * x86 runners whose full-image fingerprint is ~40x slower on Intel than on
+ * AMD. Enabled once per process (before any thread starts); when enabled, the
+ * x86 SHA-NI block path samples XINUSE (XGETBV ECX=1) before each call, per
+ * thread, to show whether dirty upper YMM/ZMM state precedes the legacy-SSE
+ * SHA-NI code. Reset and take refer to the calling thread's counters. */
+void cbm_sha256_diag_enable_for_testing(bool enable);
+void cbm_sha256_diag_reset_for_testing(void);
+void cbm_sha256_diag_take_for_testing(uint64_t *x86_calls, uint64_t *dirty_upper_calls,
+                                      uint64_t *xinuse_or);
+/* One "key=value ..." summary of the CPU: vendor/family/model/stepping, the
+ * CPUID SHA/AVX/AVX-512F bits, XINUSE readability and the SSE encoding the
+ * SHA-NI path was compiled with. */
+void cbm_sha256_diag_cpu_for_testing(char *out, size_t cap);
 #endif
 
 #endif /* CBM_SHA256_H */

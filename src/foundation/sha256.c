@@ -13,6 +13,9 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+#include <stdio.h> /* TEMPORARY diagnostic (drop before merge): snprintf */
+#endif
 
 /* The ARM path needs a way to ask the OS whether the CPU has SHA2; on any
  * other aarch64 OS the portable transform is used. */
@@ -233,6 +236,55 @@ static bool sha256_cpu_has_x86(void) {
 }
 #endif
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* TEMPORARY diagnostic (drop before merge); see sha256.h. */
+static _Atomic bool g_sha256_diag = false;
+static _Thread_local uint64_t g_sha256_diag_calls;
+static _Thread_local uint64_t g_sha256_diag_dirty;
+static _Thread_local uint64_t g_sha256_diag_xinuse_or;
+
+#if defined(SHA256_HW_X86)
+static _Atomic int g_sha256_diag_xinuse_readable = -1;
+
+/* XGETBV with ECX=1 (XINUSE) needs OSXSAVE and CPUID.(0DH,1):EAX[2]. */
+static bool sha256_diag_xinuse_readable(void) {
+    int readable = atomic_load_explicit(&g_sha256_diag_xinuse_readable, memory_order_relaxed);
+    if (readable < 0) {
+        unsigned int eax = 0;
+        unsigned int ebx = 0;
+        unsigned int ecx = 0;
+        unsigned int edx = 0;
+        bool osxsave = __get_cpuid(1, &eax, &ebx, &ecx, &edx) && (ecx & (1U << 27)) != 0;
+        bool ecx1 =
+            osxsave && __get_cpuid_count(0xD, 1, &eax, &ebx, &ecx, &edx) && (eax & (1U << 2)) != 0;
+        readable = ecx1 ? 1 : 0;
+        atomic_store_explicit(&g_sha256_diag_xinuse_readable, readable, memory_order_relaxed);
+    }
+    return readable == 1;
+}
+
+/* XINUSE bit 2 = AVX upper YMM, 5 = opmask, 6 = ZMM_Hi256, 7 = Hi16_ZMM: any of
+ * them in use when legacy-SSE code runs is the Intel SSE/AVX transition case. */
+static void sha256_diag_sample_x86(void) {
+    if (!atomic_load_explicit(&g_sha256_diag, memory_order_relaxed)) {
+        return;
+    }
+    g_sha256_diag_calls++;
+    if (!sha256_diag_xinuse_readable()) {
+        return;
+    }
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(1U));
+    uint64_t xinuse = ((uint64_t)hi << 32) | lo;
+    g_sha256_diag_xinuse_or |= xinuse;
+    if ((xinuse & 0xE4U) != 0) {
+        g_sha256_diag_dirty++;
+    }
+}
+#endif
+#endif
+
 typedef enum {
     SHA256_BACKEND_UNPROBED = 0,
     SHA256_BACKEND_PORTABLE,
@@ -278,6 +330,9 @@ static void sha256_blocks(cbm_sha256_ctx *c, const uint8_t *data, size_t blocks)
 #endif
 #if defined(SHA256_HW_X86)
     case SHA256_BACKEND_X86:
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        sha256_diag_sample_x86(); /* TEMPORARY diagnostic (drop before merge) */
+#endif
         sha256_blocks_x86(c, data, blocks);
         return;
 #endif
@@ -301,6 +356,88 @@ const char *cbm_sha256_backend_name_for_testing(void) {
 
 void cbm_sha256_force_portable_for_testing(bool force) {
     atomic_store_explicit(&g_sha256_force_portable, force, memory_order_relaxed);
+}
+
+/* TEMPORARY diagnostic (drop before merge); see sha256.h. */
+void cbm_sha256_diag_enable_for_testing(bool enable) {
+    atomic_store_explicit(&g_sha256_diag, enable, memory_order_relaxed);
+}
+
+void cbm_sha256_diag_reset_for_testing(void) {
+    g_sha256_diag_calls = 0;
+    g_sha256_diag_dirty = 0;
+    g_sha256_diag_xinuse_or = 0;
+}
+
+void cbm_sha256_diag_take_for_testing(uint64_t *x86_calls, uint64_t *dirty_upper_calls,
+                                      uint64_t *xinuse_or) {
+    if (x86_calls) {
+        *x86_calls = g_sha256_diag_calls;
+    }
+    if (dirty_upper_calls) {
+        *dirty_upper_calls = g_sha256_diag_dirty;
+    }
+    if (xinuse_or) {
+        *xinuse_or = g_sha256_diag_xinuse_or;
+    }
+}
+
+/* SHA256RNDS2/MSG1/MSG2 have no VEX form at all; this names the encoding of
+ * the SSE shuffles and loads around them, fixed when this file was compiled. */
+#if defined(__AVX__)
+#define SHA256_DIAG_SSE_ENCODING "vex"
+#else
+#define SHA256_DIAG_SSE_ENCODING "legacy-sse"
+#endif
+
+void cbm_sha256_diag_cpu_for_testing(char *out, size_t cap) {
+    if (!out || cap == 0) {
+        return;
+    }
+#if defined(SHA256_HW_X86)
+    unsigned int eax = 0;
+    unsigned int ebx = 0;
+    unsigned int ecx = 0;
+    unsigned int edx = 0;
+    char vendor[13] = "unknown";
+    if (__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
+        memcpy(vendor, &ebx, 4);
+        memcpy(vendor + 4, &edx, 4);
+        memcpy(vendor + 8, &ecx, 4);
+        vendor[12] = '\0';
+    }
+    unsigned int family = 0;
+    unsigned int model = 0;
+    unsigned int stepping = 0;
+    bool avx = false;
+    bool osxsave = false;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+        unsigned int base_family = (eax >> 8) & 0xFU;
+        unsigned int base_model = (eax >> 4) & 0xFU;
+        family = base_family == 0xFU ? base_family + ((eax >> 20) & 0xFFU) : base_family;
+        model = base_family == 0x6U || base_family == 0xFU
+                    ? (((eax >> 16) & 0xFU) << 4) | base_model
+                    : base_model;
+        stepping = eax & 0xFU;
+        avx = (ecx & (1U << 28)) != 0;
+        osxsave = (ecx & (1U << 27)) != 0;
+    }
+    bool sha = false;
+    bool avx512f = false;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        sha = (ebx & (1U << 29)) != 0;
+        avx512f = (ebx & (1U << 16)) != 0;
+    }
+    (void)snprintf(out, cap,
+                   "cpu_vendor=%s family=0x%x model=0x%x stepping=%u cpuid_sha=%d avx=%d "
+                   "avx512f=%d osxsave=%d xinuse_readable=%d shani_sse_encoding=%s",
+                   vendor, family, model, stepping, sha, avx, avx512f, osxsave,
+                   sha256_diag_xinuse_readable(), SHA256_DIAG_SSE_ENCODING);
+#elif defined(SHA256_HW_ARM)
+    (void)snprintf(out, cap, "cpu_arch=arm64 cpu_sha2=%d", sha256_cpu_has_arm());
+#else
+    (void)snprintf(out, cap, "cpu_arch=other");
+#endif
 }
 #endif
 

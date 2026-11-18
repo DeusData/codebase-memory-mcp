@@ -24,6 +24,7 @@ int tf_deselected_count = 0;
 #include "daemon/runtime.h"            /* bounded worker response probe */
 #include "daemon/ipc.h"                /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h"     /* Windows crash-turnover re-exec probe */
+#include "daemon/service_internal.h"   /* TEMPORARY sha256 diagnostic (drop before merge) */
 #include "mcp/index_supervisor.h"      /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"                   /* cbm_mcp_handle_tool — act as a real worker */
 #include "ui/http_server.h"            /* deleted-self executable probe */
@@ -2271,6 +2272,9 @@ static void tf_msan_mi_output(const char *msg, void *arg) {
 #endif
 
 int main(int argc, char **argv) {
+    /* TEMPORARY diagnostic (drop before merge): read CBM_SHA256_DIAG_FILE here,
+     * before any role or thread, so exec'd roles record their hashes too. */
+    cbm_daemon_fingerprint_diag_init_for_testing();
 #ifdef TF_MSAN_MIMALLOC_OUTPUT
     mi_register_output(tf_msan_mi_output, NULL);
     tf_msan_mi_output_live = true;
@@ -2397,6 +2401,15 @@ int main(int argc, char **argv) {
     }
     if (!g_list_only) {
         printf("\n  codebase-memory-mcp  C test suite\n");
+        /* TEMPORARY diagnostic (drop before merge): once, in the daemon_bootstrap
+         * suite process only, before any test runs: time the selected SHA-256
+         * backend against the portable transform on this runner's own image. */
+        for (int i = 1; i < argc; i++) {
+            if (argv[i] && strcmp(argv[i], "daemon_bootstrap") == 0) {
+                cbm_daemon_fingerprint_diag_compare_for_testing(cbm_test_program_path);
+                break;
+            }
+        }
     }
 
     /* Runner isolation first: nothing below may reach the developer's daemon. */

@@ -12,6 +12,9 @@
 
 #include <errno.h>
 #include <limits.h>
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+#include <stdatomic.h> /* TEMPORARY diagnostic (drop before merge) */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -355,6 +358,176 @@ static bool fd_regular(int fd, struct stat *status_out) {
     return true;
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* TEMPORARY diagnostic (drop before merge). When the test runner's main read
+ * CBM_SHA256_DIAG_FILE (before any thread starts), every full-file fingerprint
+ * appends one "CBM-SHA256-DIAG kind=hash ..." line there: backend, bytes, wall
+ * ms split into read (pread) and compute (SHA-256), and the CPU facts.
+ * scripts/test.sh prints the file at exit, so the hosted job log carries the
+ * lines whatever the verdict. A file, not stderr: tests compare the stderr of
+ * child processes, and a verdict must not change. Test runner only. */
+static char g_fingerprint_diag_path[1024];
+static _Atomic bool g_fingerprint_diag_on = false;
+static _Atomic bool g_fingerprint_diag_compared = false;
+
+void cbm_daemon_fingerprint_diag_init_for_testing(void) {
+    const char *path = getenv("CBM_SHA256_DIAG_FILE");
+    size_t length = path ? strlen(path) : 0;
+    if (length == 0 || length >= sizeof(g_fingerprint_diag_path)) {
+        return;
+    }
+    memcpy(g_fingerprint_diag_path, path, length + 1);
+    atomic_store_explicit(&g_fingerprint_diag_on, true, memory_order_release);
+    cbm_sha256_diag_enable_for_testing(true);
+}
+
+static bool fingerprint_diag_on(void) {
+    return atomic_load_explicit(&g_fingerprint_diag_on, memory_order_acquire);
+}
+
+static double fingerprint_diag_now_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0.0;
+    }
+    return (double)now.tv_sec * 1e3 + (double)now.tv_nsec / 1e6;
+}
+
+static void fingerprint_diag_emit(const char *line) {
+    char cpu[384];
+    cbm_sha256_diag_cpu_for_testing(cpu, sizeof(cpu));
+    char text[1024];
+    int length =
+        snprintf(text, sizeof(text), "CBM-SHA256-DIAG %s pid=%ld %s\n", line, (long)getpid(), cpu);
+    if (length <= 0) {
+        return;
+    }
+    size_t size = (size_t)length < sizeof(text) ? (size_t)length : sizeof(text) - 1;
+    int fd = open(g_fingerprint_diag_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return;
+    }
+    ssize_t written = write(fd, text, size);
+    (void)written;
+    (void)close(fd);
+}
+
+typedef struct {
+    bool on;
+    double start_ms;
+    double read_ms;
+    double compute_ms;
+} fingerprint_diag_t;
+
+static void fingerprint_diag_begin(fingerprint_diag_t *diag) {
+    diag->on = fingerprint_diag_on();
+    diag->read_ms = 0.0;
+    diag->compute_ms = 0.0;
+    diag->start_ms = diag->on ? fingerprint_diag_now_ms() : 0.0;
+    if (diag->on) {
+        cbm_sha256_diag_reset_for_testing();
+    }
+}
+
+static double fingerprint_diag_stamp(const fingerprint_diag_t *diag) {
+    return diag->on ? fingerprint_diag_now_ms() : 0.0;
+}
+
+static void fingerprint_diag_end(const fingerprint_diag_t *diag, long long bytes, bool ok) {
+    if (!diag->on) {
+        return;
+    }
+    uint64_t calls = 0;
+    uint64_t dirty = 0;
+    uint64_t xinuse_or = 0;
+    cbm_sha256_diag_take_for_testing(&calls, &dirty, &xinuse_or);
+    char line[512];
+    (void)snprintf(line, sizeof(line),
+                   "kind=hash ok=%d bytes=%lld backend=%s wall_ms=%.1f read_ms=%.1f "
+                   "compute_ms=%.1f x86_block_calls=%llu x86_dirty_upper_calls=%llu "
+                   "xinuse_or=0x%llx",
+                   ok, bytes, cbm_sha256_backend_name_for_testing(),
+                   fingerprint_diag_now_ms() - diag->start_ms, diag->read_ms, diag->compute_ms,
+                   (unsigned long long)calls, (unsigned long long)dirty,
+                   (unsigned long long)xinuse_or);
+    fingerprint_diag_emit(line);
+}
+
+/* At most once per process: hash `path` once, feeding every chunk to the
+ * selected backend and to the portable transform, so both are timed on the
+ * same bytes and the same CPU. The test runner calls it only in the
+ * daemon_bootstrap suite process, before any test runs (single-threaded), so
+ * it adds about one hash outside every deadline. */
+void cbm_daemon_fingerprint_diag_compare_for_testing(const char *path) {
+    if (!fingerprint_diag_on() || !path ||
+        atomic_exchange_explicit(&g_fingerprint_diag_compared, true, memory_order_acq_rel)) {
+        return;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat status;
+    if (fd < 0 || fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)) {
+        if (fd >= 0) {
+            (void)close(fd);
+        }
+        return;
+    }
+    const char *backend = cbm_sha256_backend_name_for_testing();
+    cbm_sha256_ctx selected;
+    cbm_sha256_ctx portable;
+    cbm_sha256_init(&selected);
+    cbm_sha256_init(&portable);
+    unsigned char buffer[DAEMON_SERVICE_IO_CAP];
+    double read_ms = 0.0;
+    double selected_ms = 0.0;
+    double portable_ms = 0.0;
+    double start_ms = fingerprint_diag_now_ms();
+    off_t offset = 0;
+    bool ok = true;
+    cbm_sha256_diag_reset_for_testing();
+    while (ok && offset < status.st_size) {
+        off_t remaining = status.st_size - offset;
+        size_t request = remaining < (off_t)sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+        double t0 = fingerprint_diag_now_ms();
+        ssize_t count = pread(fd, buffer, request, offset);
+        double t1 = fingerprint_diag_now_ms();
+        read_ms += t1 - t0;
+        if (count <= 0) {
+            ok = count < 0 && errno == EINTR;
+            continue;
+        }
+        cbm_sha256_update(&selected, buffer, (size_t)count);
+        double t2 = fingerprint_diag_now_ms();
+        cbm_sha256_force_portable_for_testing(true);
+        cbm_sha256_update(&portable, buffer, (size_t)count);
+        cbm_sha256_force_portable_for_testing(false);
+        double t3 = fingerprint_diag_now_ms();
+        selected_ms += t2 - t1;
+        portable_ms += t3 - t2;
+        offset += (off_t)count;
+    }
+    (void)close(fd);
+    uint8_t selected_digest[CBM_SHA256_DIGEST_LEN];
+    uint8_t portable_digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&selected, selected_digest);
+    cbm_sha256_final(&portable, portable_digest);
+    uint64_t calls = 0;
+    uint64_t dirty = 0;
+    uint64_t xinuse_or = 0;
+    cbm_sha256_diag_take_for_testing(&calls, &dirty, &xinuse_or);
+    char line[512];
+    (void)snprintf(line, sizeof(line),
+                   "kind=compare ok=%d bytes=%lld backend=%s wall_ms=%.1f read_ms=%.1f "
+                   "selected_compute_ms=%.1f portable_compute_ms=%.1f digests_match=%d "
+                   "x86_block_calls=%llu x86_dirty_upper_calls=%llu xinuse_or=0x%llx",
+                   ok, (long long)status.st_size, backend, fingerprint_diag_now_ms() - start_ms,
+                   read_ms, selected_ms, portable_ms,
+                   memcmp(selected_digest, portable_digest, sizeof(selected_digest)) == 0,
+                   (unsigned long long)calls, (unsigned long long)dirty,
+                   (unsigned long long)xinuse_or);
+    fingerprint_diag_emit(line);
+}
+#endif
+
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     if (!out) {
@@ -375,12 +548,26 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     unsigned char buffer[DAEMON_SERVICE_IO_CAP];
     off_t offset = 0;
     bool ok = true;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    fingerprint_diag_t diag; /* TEMPORARY diagnostic (drop before merge) */
+    fingerprint_diag_begin(&diag);
+#endif
     while (offset < before.st_size) {
         off_t remaining = before.st_size - offset;
         size_t request = remaining < (off_t)sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        double diag_read_start = fingerprint_diag_stamp(&diag);
+#endif
         ssize_t count = pread(fd, buffer, request, offset);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        double diag_read_end = fingerprint_diag_stamp(&diag);
+        diag.read_ms += diag_read_end - diag_read_start;
+#endif
         if (count > 0) {
             cbm_sha256_update(&context, buffer, (size_t)count);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+            diag.compute_ms += fingerprint_diag_stamp(&diag) - diag_read_end;
+#endif
             offset += (off_t)count;
         } else if (count == 0) {
             ok = false;
@@ -394,6 +581,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     ok = ok && fstat(fd, &after) == 0 && before.st_dev == after.st_dev &&
          before.st_ino == after.st_ino && before.st_size == after.st_size &&
          offset == after.st_size;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    fingerprint_diag_end(&diag, (long long)before.st_size, ok);
+#endif
     if (!ok) {
         return false;
     }
@@ -1005,6 +1195,15 @@ static bool windows_log_append(const char *log_path, const char *record, size_t 
     windows_log_path_close(&path);
     return ok;
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* TEMPORARY diagnostic (drop before merge): POSIX-only; no-ops on Windows. */
+void cbm_daemon_fingerprint_diag_init_for_testing(void) {}
+
+void cbm_daemon_fingerprint_diag_compare_for_testing(const char *path) {
+    (void)path;
+}
+#endif
 
 #endif /* _WIN32 */
 
