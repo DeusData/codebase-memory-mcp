@@ -3106,49 +3106,29 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
     CBM_PROF_END_N("lsp_cross_prepare", "3_module_def_index", t_module_index, def_count);
-    /* Tier 2 full: pre-build per-language cross-LSP registries.
-     * Built ONCE here; shared READ-ONLY across all files of that language
-     * during resolve. Per-file work is then: parse + AST walk + O(1) lookups
-     * — no registry build, no Phase 1b mutations. Languages added so far:
-     * Go, Python, C/C++, C#, TS/JS, Java. Others (Kotlin, PHP) fall back to per-file. */
-    CBMCrossLspRegistries cross_registries = {0};
+    /* Tier 2 full: pre-build each engine's shared cross-LSP registry (the
+     * engine table, pass_lsp_cross.c). Built ONCE here; shared READ-ONLY
+     * across all files of that engine's languages during resolve. Per-file
+     * work is then: parse + AST walk + O(1) lookups — no registry build, no
+     * Phase 1b mutations. Engines without one (Kotlin, PHP) take the per-file
+     * path. Rust's is lazy: built on the first NULL-filter rust file (the
+     * amplifier files) inside cbm_parallel_resolve — repos whose rust files
+     * all filter to subsets never pay the build/RSS. */
+    CBMCrossLspRegistries cross_registries;
+    memset(&cross_registries, 0, sizeof(cross_registries));
     if (all_defs) {
         /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
-         * ONE language instead of re-diagnosing the whole pass (the cs builder
+         * ONE engine instead of re-diagnosing the whole pass (the cs builder
          * hid ~140 s behind the pass total, #1669 follow-up). */
-        struct timespec t_b;
-        long b_ms[6];
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
-        cross_registries.go = cbm_go_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        b_ms[0] = (long)elapsed_ms(t_b);
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
-        cross_registries.python =
-            cbm_py_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        b_ms[1] = (long)elapsed_ms(t_b);
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
-        cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        b_ms[2] = (long)elapsed_ms(t_b);
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
-        cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        b_ms[3] = (long)elapsed_ms(t_b);
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
-        cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        b_ms[4] = (long)elapsed_ms(t_b);
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
-        cross_registries.java =
-            cbm_java_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
-        b_ms[5] = (long)elapsed_ms(t_b);
-        char b_buf[6][CBM_SZ_16];
-        const char *b_name[6] = {"go", "python", "c", "cs", "ts", "java"};
-        for (int bi = 0; bi < 6; bi++) {
-            snprintf(b_buf[bi], sizeof(b_buf[bi]), "%ld", b_ms[bi]);
+        for (int engine = 0; engine < cbm_pxc_engine_count(); engine++) {
+            struct timespec t_b;
+            cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
+            if (cbm_pxc_build_engine_registry(engine, &cross_lsp_arena, all_defs, def_count,
+                                              &cross_registries)) {
+                cbm_log_info("lsp_cross_prepare.builder", "engine", cbm_pxc_engine_name(engine),
+                             "elapsed_ms", itoa_buf((int)elapsed_ms(t_b)));
+            }
         }
-        cbm_log_info("lsp_cross_prepare.builders", b_name[0], b_buf[0], b_name[1], b_buf[1],
-                     b_name[2], b_buf[2], b_name[3], b_buf[3], b_name[4], b_buf[4], b_name[5],
-                     b_buf[5]);
-        /* Rust: NOT built here. The shared all_defs registry is built LAZILY on the
-         * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
-         * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));

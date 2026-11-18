@@ -2002,7 +2002,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         int all_def_count = 0;
         char **def_modules = NULL;
         CBMModuleDefIndex *module_def_index = NULL;
-        CBMCrossLspRegistries cross_registries = {0};
+        CBMCrossLspRegistries cross_registries;
+        memset(&cross_registries, 0, sizeof(cross_registries));
         CBMCrossLspRegistries *registries_arg = NULL;
         CBMArena legacy_cross_arena;
         bool legacy_cross_arena_live = false;
@@ -2074,15 +2075,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                  * for languages without a shared registry, so convergence
                  * is unaffected; only the amortization strategy changes. */
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
-                    CBMArena *xa = &closure->arena;
-                    cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.python =
-                        cbm_py_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.java =
-                        cbm_java_build_cross_registry(xa, all_defs, all_def_count);
+                    cbm_pxc_build_cross_registries(&closure->arena, all_defs, all_def_count,
+                                                   &cross_registries);
                     registries_arg = &cross_registries;
                 }
             } else {

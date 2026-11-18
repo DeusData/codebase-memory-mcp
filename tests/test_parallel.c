@@ -380,15 +380,19 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
-    /* C# has no per-file cross path (cbm_pxc_run_one has no C# case): production
-     * resolves it only through the Tier-2 registry, so a harness run that opts
-     * in builds that one registry exactly as run_parallel_pipeline does. */
-    CBMCrossLspRegistries harness_registries = {0};
+    /* C# has no per-file cross path (its engine row has no per-file walk):
+     * production resolves it only through the Tier-2 registry, so a harness run
+     * that opts in builds that one registry exactly as run_parallel_pipeline
+     * does. */
+    CBMCrossLspRegistries harness_registries;
+    memset(&harness_registries, 0, sizeof(harness_registries));
     if (g_harness_cs_registry && all_defs) {
-        harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
+        (void)cbm_pxc_build_engine_registry(cbm_pxc_engine_of_lang(CBM_LANG_CSHARP), &cross_arena,
+                                            all_defs, def_count, &harness_registries);
     }
     if (g_harness_c_registry && all_defs) {
-        harness_registries.c = cbm_c_build_cross_registry(&cross_arena, all_defs, def_count);
+        (void)cbm_pxc_build_engine_registry(cbm_pxc_engine_of_lang(CBM_LANG_C), &cross_arena,
+                                            all_defs, def_count, &harness_registries);
     }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,

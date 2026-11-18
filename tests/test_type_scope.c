@@ -392,6 +392,69 @@ TEST(type_scope_python_unlisted_bindings_get_none) {
     PASS();
 }
 
+/* ── The engine table of the cross-file pass ─────────────────────── */
+
+/* Every language that had a cross-file walk has exactly one engine row, and
+ * no other language has one; the engines that built a shared registry with
+ * the others still do, in the same order, and only they; an engine reads
+ * identities exactly where the step has a description of its language. */
+TEST(type_scope_engine_table_rows) {
+    static const CBMLanguage served[] = {
+        CBM_LANG_GO,         CBM_LANG_C,          CBM_LANG_CPP, CBM_LANG_CUDA, CBM_LANG_PYTHON,
+        CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_TSX, CBM_LANG_PHP,  CBM_LANG_CSHARP,
+        CBM_LANG_JAVA,       CBM_LANG_KOTLIN,     CBM_LANG_RUST};
+    int served_count = 0;
+    for (int lang = 0; lang < CBM_LANG_COUNT; lang++) {
+        bool expect = false;
+        for (size_t i = 0; i < sizeof(served) / sizeof(served[0]); i++) {
+            expect = expect || served[i] == (CBMLanguage)lang;
+        }
+        served_count += expect ? 1 : 0;
+        ASSERT_EQ(cbm_pxc_has_cross_lsp((CBMLanguage)lang), expect);
+        ASSERT_EQ(cbm_pxc_engine_of_lang((CBMLanguage)lang) >= 0, expect);
+        ASSERT_EQ(cbm_pxc_wants_identities((CBMLanguage)lang),
+                  cbm_type_scope_lang((CBMLanguage)lang) != NULL);
+    }
+    ASSERT_EQ(served_count, 13);
+    ASSERT(cbm_pxc_wants_identities(CBM_LANG_GO));
+    ASSERT(cbm_pxc_wants_identities(CBM_LANG_PYTHON));
+    /* One row, one registry: C, C++ and CUDA share one, as do JavaScript,
+     * TypeScript and TSX; Java and Kotlin do not. */
+    int c_row = cbm_pxc_engine_of_lang(CBM_LANG_C);
+    int js_row = cbm_pxc_engine_of_lang(CBM_LANG_JAVASCRIPT);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_CPP), c_row);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_CUDA), c_row);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_TYPESCRIPT), js_row);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_TSX), js_row);
+    ASSERT_NEQ(cbm_pxc_engine_of_lang(CBM_LANG_JAVA), cbm_pxc_engine_of_lang(CBM_LANG_KOTLIN));
+    ASSERT_LTE(cbm_pxc_engine_count(), CBM_PXC_MAX_ENGINES);
+    ASSERT_NULL(cbm_pxc_engine_name(cbm_pxc_engine_count()));
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMCrossLspRegistries regs;
+    memset(&regs, 0, sizeof(regs));
+    char built[128] = "";
+    for (int e = 0; e < cbm_pxc_engine_count(); e++) {
+        if (cbm_pxc_build_engine_registry(e, &arena, NULL, 0, &regs)) {
+            ASSERT_NOT_NULL(regs.by_engine[e]);
+            size_t at = strlen(built);
+            snprintf(built + at, sizeof(built) - at, "%s%s", at ? " " : "", cbm_pxc_engine_name(e));
+        } else {
+            ASSERT_NULL(regs.by_engine[e]);
+        }
+    }
+    ASSERT_STR_EQ(built, "go python c cs ts java");
+    ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_CUDA) == regs.by_engine[c_row]);
+    ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_TSX) == regs.by_engine[js_row]);
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUST)); /* lazy */
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_KOTLIN));
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_PHP));
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUBY));
+    ASSERT_NULL(cbm_pxc_registry_for_lang(NULL, CBM_LANG_GO));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Growth: counted work at two sizes ─────────────────────────────── */
 
 static bool ts_linear(uint64_t small, uint64_t large) {
@@ -2415,6 +2478,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_class_body_bindings);
     RUN_TEST(type_scope_python_type_parameters);
     RUN_TEST(type_scope_python_unlisted_bindings_get_none);
+    RUN_TEST(type_scope_engine_table_rows);
     RUN_TEST(type_scope_step_work_grows_linearly);
     RUN_TEST(type_scope_lookup_work_grows_linearly);
     RUN_TEST(type_scope_reach_work_grows_linearly);
