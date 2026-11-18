@@ -3791,11 +3791,12 @@ static int test_span_order(const void *left, const void *right) {
     return strcmp(a->qualified_name, b->qualified_name);
 }
 
-/* The raw view's GoogleTest definitions (recorded by the def walk), sorted, and
- * the preprocessor's line map, for the preprocessed view of the same file.
- * NULL when the raw view named no test or the map is missing. */
+/* The raw view's GoogleTest definitions (recorded by the def walk), sorted, the
+ * preprocessor's line map, and the index of the preprocessed view's top-level
+ * definitions that map onto them, for that view of the same file. NULL when
+ * the raw view named no test or the map is missing. */
 static const CBMTestSpanMap *pp_test_span_map(CBMTestSpanMap *map, CBMExtractCtx *raw,
-                                              const CBMPreprocessedSource *pp) {
+                                              const CBMPreprocessedSource *pp, TSNode pp_root) {
     if (raw->test_span_count <= 0 || !pp->original_line_by_expanded_line ||
         !pp->belongs_to_main_file) {
         return NULL;
@@ -3804,9 +3805,14 @@ static const CBMTestSpanMap *pp_test_span_map(CBMTestSpanMap *map, CBMExtractCtx
 #ifdef CBM_ENABLE_TEST_SEAMS
     cbm_test_span_test_count((uint64_t)raw->test_span_count);
 #endif
-    *map =
-        (CBMTestSpanMap){raw->test_spans, raw->test_span_count, pp->original_line_by_expanded_line,
-                         pp->belongs_to_main_file, pp->expanded_line_count};
+    *map = (CBMTestSpanMap){raw->test_spans,
+                            raw->test_span_count,
+                            pp->original_line_by_expanded_line,
+                            pp->belongs_to_main_file,
+                            pp->expanded_line_count,
+                            NULL,
+                            0};
+    cbm_test_span_index_view(map, raw->scratch ? raw->scratch : raw->arena, pp_root);
     return map;
 }
 
@@ -4244,7 +4250,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                      * view names their bodies the same way however the
                      * expanded head reads (cbm_test_span_owner_qn). */
                     CBMTestSpanMap pp_map;
-                    const CBMTestSpanMap *pp_spans = pp_test_span_map(&pp_map, &ctx, preprocessed);
+                    const CBMTestSpanMap *pp_spans =
+                        pp_test_span_map(&pp_map, &ctx, preprocessed, pp_root);
                     CBMExtractCtx pp_ctx = {
                         .arena = a,
                         .scratch = scratch,

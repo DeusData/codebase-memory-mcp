@@ -4923,8 +4923,12 @@ TEST(cpp_gtest_preprocessed_view_one_line_pair) {
 }
 
 /* The preprocessed view finds the raw test of a body by a binary search over
- * the file's test spans, sorted once per file: counted work (spans indexed
- * plus search steps) grows like n log n with the number of tests, never n^2. */
+ * the file's test spans, sorted once per file, and over the view's indexed
+ * top-level definitions: counted work (spans indexed, nodes walked, search
+ * steps) grows like n log n with the number of tests, never n^2. So it pins
+ * "not worse than main's growth": main's own calls pass on such a file grows
+ * faster than n log n (not counted here), and this change adds no growth of
+ * its own beyond n log n. */
 static uint64_t pp_test_span_work(int tests, int *at_tests) {
     size_t cap = (size_t)tests * 64 + 256;
     char *src = malloc(cap);

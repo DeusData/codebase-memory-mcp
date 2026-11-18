@@ -1070,16 +1070,30 @@ typedef struct {
     const char *qualified_name;
 } CBMTestSpan;
 
+/* A top-level function definition of the preprocessed view (directly in the
+ * translation unit or in a namespace body) by its bytes in that view, and the
+ * raw test span its first and last lines map onto; span -1 when another
+ * top-level definition of the view maps onto the same span. */
+typedef struct {
+    uint32_t start_byte;
+    uint32_t end_byte;
+    int span;
+} CBMTestViewDef;
+
 /* What the preprocessed second view of a C/C++ file needs to name a test body
  * as the raw view did: the raw test definitions sorted by (start_line,
- * end_line), and the preprocessor's 1-based map from expanded lines to raw
- * lines (0 = no raw line) with the lines that belong to the file itself. */
+ * end_line), the preprocessor's 1-based map from expanded lines to raw lines
+ * (0 = no raw line) with the lines that belong to the file itself, and the
+ * view's top-level definitions that map onto a raw test span, in document
+ * order (cbm_test_span_index_view). */
 typedef struct {
     const CBMTestSpan *spans;
     int count;
     const uint32_t *raw_line_by_line;
     const uint8_t *in_main_file;
     int line_count;
+    const CBMTestViewDef *view_defs;
+    int view_def_count;
 } CBMTestSpanMap;
 
 // Method-return-type table for ObjectScript variable type inference. Populated
@@ -1217,16 +1231,25 @@ char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNod
 bool cbm_cpp_test_macro_names_on(CBMLanguage language, const cbm_test_declarations_t *declarations);
 /* The preprocessed view reads a head after macro expansion and without its
  * comments, so it can spell a test differently from the raw view (a project
- * macro among the arguments, a project's own TEST macro). A function
+ * macro among the arguments, a project's own TEST macro). A top-level function
  * definition of that view whose first and last lines map to exactly one raw
- * test definition's span (CBMTestSpanMap) is that test: its QN, else NULL and
- * the caller names the body as usual. Two raw tests on one line span share it
- * and get NULL. Used by the call scope, the enclosing-function helper and the
- * C/C++ engine, the three places that name a caller. Constant work plus a
- * binary search over the file's tests. */
+ * test definition's span (CBMTestSpanMap), and the only top-level definition
+ * of the view that does, is that test: its QN. Otherwise NULL and the caller
+ * names the body as usual: a method of a local class, a function written on a
+ * one-line test's line, two raw tests on one line. Used by the call scope, the
+ * enclosing-function helper and the C/C++ engine, the three places that name
+ * a caller. A binary search over the view's indexed definitions. */
 const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function);
+/* Index the preprocessed view's top-level function definitions (directly in
+ * the translation unit, or in namespace, extern-block, template and
+ * conditional bodies; never inside a function or class body) that map onto a
+ * raw test span, into map->view_defs (allocated in `a`). One pass over those
+ * containers plus a binary search per definition. On allocation failure the
+ * index stays empty and no body is named from a span. */
+void cbm_test_span_index_view(CBMTestSpanMap *map, CBMArena *a, TSNode root);
 #ifdef CBM_ENABLE_TEST_SEAMS
-/* Steps of cbm_test_span_owner_qn's searches plus spans indexed, since reset. */
+/* Steps of the test-span searches and the view index walk plus spans indexed,
+ * since reset. */
 void cbm_test_span_test_reset(void);
 uint64_t cbm_test_span_test_work(void);
 void cbm_test_span_test_count(uint64_t work);

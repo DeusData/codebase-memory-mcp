@@ -6082,22 +6082,9 @@ static int test_span_cmp(const CBMTestSpan *s, uint32_t start, uint32_t end) {
     return s->end_line == end ? 0 : (s->end_line < end ? -1 : 1);
 }
 
-const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function) {
-    if (!map || map->count <= 0 || !map->raw_line_by_line || !map->in_main_file ||
-        ts_node_is_null(function)) {
-        return NULL;
-    }
-    uint32_t first = ts_node_start_point(function).row + 1;
-    uint32_t last = ts_node_end_point(function).row + 1;
-    if (last < first || last > (uint32_t)map->line_count || !map->in_main_file[first] ||
-        !map->in_main_file[last]) {
-        return NULL;
-    }
-    uint32_t start = map->raw_line_by_line[first];
-    uint32_t end = map->raw_line_by_line[last];
-    if (!start || !end) {
-        return NULL;
-    }
+/* The raw test span (start, end): its index, or -1 when none or two raw tests
+ * share it. Binary search. */
+static int test_span_at(const CBMTestSpanMap *map, uint32_t start, uint32_t end) {
     int lo = 0;
     int hi = map->count;
     while (lo < hi) { /* the first span not below (start, end) */
@@ -6111,9 +6098,131 @@ const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function) {
     }
     if (lo >= map->count || test_span_cmp(&map->spans[lo], start, end) != 0 ||
         (lo + 1 < map->count && test_span_cmp(&map->spans[lo + 1], start, end) == 0)) {
-        return NULL; /* none, or two raw tests on one span */
+        return -1; /* none, or two raw tests on one span */
     }
-    return map->spans[lo].qualified_name;
+    return lo;
+}
+
+/* The raw test span a preprocessed-view definition's first and last lines map
+ * onto, or -1. */
+static int test_span_of(const CBMTestSpanMap *map, TSNode function) {
+    uint32_t first = ts_node_start_point(function).row + 1;
+    uint32_t last = ts_node_end_point(function).row + 1;
+    if (last < first || last > (uint32_t)map->line_count || !map->in_main_file[first] ||
+        !map->in_main_file[last]) {
+        return -1;
+    }
+    uint32_t start = map->raw_line_by_line[first];
+    uint32_t end = map->raw_line_by_line[last];
+    return start && end ? test_span_at(map, start, end) : -1;
+}
+
+/* Nodes whose children are still top level: namespace, extern-block and
+ * template bodies and the branches of conditionals. */
+static bool test_view_container(const char *kind) {
+    return strcmp(kind, "namespace_definition") == 0 || strcmp(kind, "declaration_list") == 0 ||
+           strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "template_declaration") == 0 || strncmp(kind, "preproc_", 8) == 0;
+}
+
+void cbm_test_span_index_view(CBMTestSpanMap *map, CBMArena *a, TSNode root) {
+    if (!map) {
+        return;
+    }
+    map->view_defs = NULL;
+    map->view_def_count = 0;
+    if (map->count <= 0 || !map->raw_line_by_line || !map->in_main_file || !a ||
+        ts_node_is_null(root)) {
+        return;
+    }
+    CBMTestViewDef *defs = NULL;
+    int count = 0;
+    int cap = 0;
+    bool failed = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    int depth = 1;
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    while (more && !failed) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TEST_SPAN_WORK(1);
+        if (strcmp(kind, "function_definition") == 0) {
+            int span = test_span_of(map, node);
+            if (span >= 0 && count == cap) {
+                int grown_cap = cap ? cap * 2 : 16;
+                CBMTestViewDef *grown =
+                    cbm_arena_alloc(a, (size_t)grown_cap * sizeof(CBMTestViewDef));
+                if (!grown) {
+                    failed = true;
+                    break;
+                }
+                if (count) {
+                    memcpy(grown, defs, (size_t)count * sizeof(CBMTestViewDef));
+                }
+                defs = grown;
+                cap = grown_cap;
+            }
+            if (span >= 0) {
+                defs[count++] =
+                    (CBMTestViewDef){ts_node_start_byte(node), ts_node_end_byte(node), span};
+            }
+        } else if (test_view_container(kind) && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!(more = ts_tree_cursor_goto_next_sibling(&cursor)) && depth > 1) {
+            ts_tree_cursor_goto_parent(&cursor);
+            depth--;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    int *per_span =
+        failed || count == 0 ? NULL : cbm_arena_alloc(a, (size_t)map->count * sizeof(int));
+    if (!per_span) {
+        return; /* nothing maps, or out of memory: no body is named from a span */
+    }
+    memset(per_span, 0, (size_t)map->count * sizeof(int));
+    for (int i = 0; i < count; i++) {
+        per_span[defs[i].span]++;
+    }
+    for (int i = 0; i < count; i++) {
+        if (per_span[defs[i].span] != 1) {
+            defs[i].span = -1; /* two definitions of this view on one span: neither */
+        }
+    }
+    map->view_defs = defs;
+    map->view_def_count = count;
+}
+
+/* The raw test span of an indexed top-level definition of the preprocessed
+ * view, or -1: not indexed (not top level, or mapping onto no single raw
+ * test), or sharing its span with another such definition. */
+static int test_view_def_span(const CBMTestSpanMap *map, TSNode function) {
+    if (!map || map->view_def_count <= 0 || ts_node_is_null(function)) {
+        return -1;
+    }
+    uint32_t start = ts_node_start_byte(function);
+    int lo = 0;
+    int hi = map->view_def_count;
+    while (lo < hi) { /* the first indexed definition not before `function` */
+        int mid = lo + (hi - lo) / 2;
+        TEST_SPAN_WORK(1);
+        if (map->view_defs[mid].start_byte < start) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= map->view_def_count || map->view_defs[lo].start_byte != start ||
+        map->view_defs[lo].end_byte != ts_node_end_byte(function)) {
+        return -1; /* not an indexed top-level definition of the view */
+    }
+    return map->view_defs[lo].span; /* -1 on a shared span */
+}
+
+const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function) {
+    int span = test_view_def_span(map, function);
+    return span >= 0 ? map->spans[span].qualified_name : NULL;
 }
 
 /* Record a raw test definition's span for the preprocessed view (in scratch;
