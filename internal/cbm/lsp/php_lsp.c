@@ -18,6 +18,7 @@
  */
 
 #include "php_lsp.h"
+#include "member_walk.h"
 #include "lsp_node_iter.h"
 #include "lsp_work.h"
 #include "../cbm.h"
@@ -369,97 +370,451 @@ static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, con
     return best;
 }
 
-/* ── method lookup with parent walk ─────────────────────────────── */
+/* ── member lookup: the shared walk (member_walk.h) ─────────────────
+ *
+ * PHP's lookup order is the type's own members, its traits (one place: two
+ * traits providing a name is a fatal error unless `insteadof` picks one), the
+ * parent chain, and only then the interfaces' declarations:
+ * cbm_lin_own_traits_parent. This file supplies the supertypes. Registrars
+ * record them as written (state UNRESOLVED, type_qn the spelling); the first
+ * time a type's order is built, php_settle_type resolves each spelling the way
+ * a receiver's type is resolved (exact, then lookup_type_with_project). A
+ * supertype outside the project or nowhere in the registry becomes an unknown
+ * place in the order, never "no such member". */
 
-const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class_qn,
-                                           const char *method_name) {
-    if (!class_qn || !method_name)
-        return NULL;
+enum { PHP_COPY_KEY_MAX = 512 };
 
-    /* Direct lookup by the registry's receiver_qn -> method_name index. */
-    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
-    if (f)
-        return f;
+struct php_members {
+    CBMArena arena; /* orders and settled supertypes; dies with the file */
+    CBMMemberOrders orders;
+    CBMMemberWalker walker;
+    CBMHashTable *copies; /* "<class>.<name>" -> a trait member reported on <class> */
+};
 
-    /* If the QN we have isn't the registry's canonical key, resolve the
-     * type to its registered identity and retry. */
-    const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, class_qn);
-    if (!t)
-        t = lookup_type_with_project(ctx, class_qn);
-    if (!t)
-        return NULL;
-    if (strcmp(t->qualified_name, class_qn) != 0) {
-        f = cbm_registry_lookup_method(ctx->registry, t->qualified_name, method_name);
-        if (f)
-            return f;
+/* The registered type a supertype spelling names, as the receiver lookup
+ * finds it. The type itself (a trait named like its class, #951) is no
+ * supertype. */
+static const char *php_settle_spelling(PHPLSPContext *ctx, const char *self, const char *spelled,
+                                       uint8_t *state) {
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, spelled);
+    if (!rt) {
+        rt = lookup_type_with_project(ctx, spelled);
     }
+    if (rt && rt->qualified_name && (!self || strcmp(rt->qualified_name, self) != 0)) {
+        *state = CBM_SUPER_KNOWN;
+        return rt->qualified_name;
+    }
+    *state = !rt && php_external_qn(ctx, spelled) ? CBM_SUPER_EXTERNAL : CBM_SUPER_UNRESOLVED;
+    return spelled;
+}
 
-    /* Walk the full ancestor chain. PHP only allows single inheritance for
-     * `extends`, but a class may also pick up methods from `implements` /
-     * traits, both of which are recorded in embedded_types. We iterate
-     * across all entries and recurse into each branch with cycle-detection.
-     *
-     * Cap depth at 16 across all visited types to bound runtime. */
-    const char *visited[32];
-    int visited_count = 0;
-    const char *frontier[32];
-    int frontier_count = 0;
-    if (t->embedded_types) {
-        for (int i = 0; t->embedded_types[i] && frontier_count < 32; i++) {
-            frontier[frontier_count++] = t->embedded_types[i];
+/* ── trait uses: resolved where they were written ─────────────────────
+ *
+ * A trait is resolved by the name the file that writes the `use` gives it:
+ * that file's `use` map (a QN this registry holds exactly), or the name the
+ * extractor qualified there with the file's namespace and `use` statements (a
+ * leading `\`), found by the namespace and short name of the registered
+ * types. Never by short name in another file's registry, never with the
+ * caller's own prefixes: a trait that does not resolve that way is not KNOWN,
+ * so a SOFT place (fx/vtrait). Parents keep the receiver path
+ * (php_settle_spelling), as main resolves them. */
+
+/* "App\\Traits\\Greets" / "App.Traits.Greets" (a leading `\` ignored), lower
+ * case and '.'-separated; with `ns`, ns + "." + name. */
+static char *php_fqn_key(CBMArena *a, const char *ns, const char *name) {
+    size_t nl = ns ? strlen(ns) : 0;
+    size_t ml = name ? strlen(name) : 0;
+    char *k = (char *)cbm_arena_alloc(a, nl + ml + 2);
+    if (!k) {
+        return NULL;
+    }
+    size_t j = 0;
+    for (int part = 0; part < 2; part++) {
+        const char *p = part == 0 ? ns : name;
+        if (!p) {
+            continue;
+        }
+        while (*p == '\\' || *p == '.') {
+            p++;
+        }
+        if (!*p) {
+            continue;
+        }
+        if (j > 0) {
+            k[j++] = '.';
+        }
+        for (; *p; p++) {
+            k[j++] = *p == '\\' ? '.' : (char)tolower((unsigned char)*p);
         }
     }
-    while (frontier_count > 0 && visited_count < 32) {
-        const char *parent = frontier[--frontier_count];
-        bool seen = false;
-        for (int v = 0; v < visited_count; v++) {
-            if (strcmp(visited[v], parent) == 0) {
-                seen = true;
-                break;
+    k[j] = '\0';
+    return k;
+}
+
+static void php_fqn_add(PHPLSPContext *ctx, const char *ns, const char *short_name,
+                        const char *qn) {
+    if (!short_name || !short_name[0] || !qn) {
+        return;
+    }
+    if (!ctx->type_fqns) {
+        ctx->type_fqns = cbm_ht_create(0);
+        if (!ctx->type_fqns) {
+            return;
+        }
+    }
+    char *key = php_fqn_key(ctx->arena, ns, short_name);
+    if (!key || !key[0]) {
+        return;
+    }
+    const char *seen = (const char *)cbm_ht_get(ctx->type_fqns, key);
+    if (!seen) {
+        cbm_ht_set(ctx->type_fqns, key, (void *)qn);
+    } else if (seen[0] && strcmp(seen, qn) != 0) {
+        cbm_ht_set(ctx->type_fqns, key, (void *)""); /* two types, one name: neither */
+    }
+}
+
+static void php_fqn_free(PHPLSPContext *ctx) {
+    if (ctx->type_fqns) {
+        cbm_ht_free(ctx->type_fqns);
+        ctx->type_fqns = NULL;
+    }
+}
+
+/* The registered type a namespace-qualified name denotes, or NULL. */
+static const CBMRegisteredType *php_fqn_type(PHPLSPContext *ctx, const char *fq) {
+    if (!ctx->type_fqns || !fq) {
+        return NULL;
+    }
+    char *key = php_fqn_key(ctx->arena, NULL, fq);
+    const char *qn = key ? (const char *)cbm_ht_get(ctx->type_fqns, key) : NULL;
+    return qn && qn[0] ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+}
+
+static const char *php_settle_trait(PHPLSPContext *ctx, const char *self, const char *spelled,
+                                    uint8_t *state) {
+    const CBMRegisteredType *rt =
+        spelled[0] == '\\' ? NULL : cbm_registry_lookup_type(ctx->registry, spelled);
+    if (!rt) {
+        rt = php_fqn_type(ctx, spelled);
+    }
+    if (rt && rt->qualified_name && (!self || strcmp(rt->qualified_name, self) != 0)) {
+        *state = CBM_SUPER_KNOWN;
+        return rt->qualified_name;
+    }
+    const char *dotted = spelled[0] == '\\' ? php_ns_to_dot(ctx->arena, spelled + 1) : spelled;
+    *state =
+        !rt && dotted && php_external_qn(ctx, dotted) ? CBM_SUPER_EXTERNAL : CBM_SUPER_UNRESOLVED;
+    return spelled;
+}
+
+/* PHP class names compare without case. */
+static bool php_same_name(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+/* A rename's trait (`T::m insteadof U`, `T::m as n`): resolved as a trait use;
+ * else the one trait the class uses under that short name (the clause can only
+ * name a trait of the class's own `use`). */
+static const char *php_settle_rename_trait(PHPLSPContext *ctx, const CBMRegisteredType *t,
+                                           const char *spelled, bool *known) {
+    uint8_t state = 0;
+    const char *qn = php_settle_trait(ctx, t->qualified_name, spelled, &state);
+    *known = state == CBM_SUPER_KNOWN;
+    if (*known) {
+        return qn;
+    }
+    const char *tail = spelled;
+    for (const char *p = spelled; *p; p++) {
+        if (*p == '\\' || *p == '.') {
+            tail = p + 1;
+        }
+    }
+    const char *match = NULL;
+    for (int i = 0; i < t->supertype_count; i++) {
+        const CBMSupertype *s = &t->supertypes[i];
+        if (s->kind != CBM_SUPER_TRAIT || s->state != CBM_SUPER_KNOWN || !s->type_qn) {
+            continue;
+        }
+        const CBMRegisteredType *tr = cbm_registry_lookup_type(ctx->registry, s->type_qn);
+        if (tr && tr->short_name && php_same_name(tr->short_name, tail)) {
+            if (match && strcmp(match, s->type_qn) != 0) {
+                return spelled; /* two of the class's traits: neither */
+            }
+            match = s->type_qn;
+        }
+    }
+    *known = match != NULL;
+    return match ? match : spelled;
+}
+
+/* Whether `qn` is a type this file declares (its QN is the file's module's). */
+static bool php_declared_here(const PHPLSPContext *ctx, const char *qn) {
+    size_t n = ctx->module_qn ? strlen(ctx->module_qn) : 0;
+    return n > 0 && qn && strncmp(qn, ctx->module_qn, n) == 0 && qn[n] == '.';
+}
+
+/* A seeded library type lists its parents without kinds (php_stdlib_data.c):
+ * an interface among them is an implemented interface (an interface's parent
+ * when the type is one), a class the superclass. */
+static int php_settle_seeded(PHPLSPContext *ctx, CBMRegisteredType *t, CBMSupertype **out) {
+    int n = 0;
+    while (t->embedded_types[n]) {
+        n++;
+    }
+    CBMSupertype *s =
+        (CBMSupertype *)cbm_arena_alloc(&ctx->members->arena, (size_t)(n > 0 ? n : 1) * sizeof(*s));
+    if (!s) {
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        memset(&s[i], 0, sizeof(s[i]));
+        s[i].type_qn =
+            php_settle_spelling(ctx, t->qualified_name, t->embedded_types[i], &s[i].state);
+        const CBMRegisteredType *pt = s[i].state == CBM_SUPER_KNOWN
+                                          ? cbm_registry_lookup_type(ctx->registry, s[i].type_qn)
+                                          : NULL;
+        s[i].kind =
+            (pt && pt->is_interface && !t->is_interface) ? CBM_SUPER_IMPLEMENTS : CBM_SUPER_EXTENDS;
+    }
+    *out = s;
+    return n;
+}
+
+/* CBMMemberOrders.prepare: settle t's supertypes, renames and member flags
+ * before its order is built (once per type and file). */
+static void php_settle_type(void *vctx, CBMRegisteredType *t) {
+    PHPLSPContext *ctx = (PHPLSPContext *)vctx;
+    if (!ctx || !ctx->members || !t || !t->qualified_name) {
+        return;
+    }
+    CBMArena *a = &ctx->members->arena;
+    /* __call / __callStatic answer every name nobody declares. */
+    if (cbm_registry_lookup_method(ctx->registry, t->qualified_name, "__call") ||
+        cbm_registry_lookup_method(ctx->registry, t->qualified_name, "__callStatic")) {
+        t->member_flags |= CBM_MEMBERS_OPEN;
+    }
+    if (t->supertype_count == 0 && t->embedded_types && t->embedded_types[0]) {
+        CBMSupertype *seeded = NULL;
+        int n = php_settle_seeded(ctx, t, &seeded);
+        if (n < 0) {
+            t->member_flags |= CBM_MEMBERS_DECLS_DISAGREE; /* own members only */
+            return;
+        }
+        t->supertypes = seeded;
+        t->supertype_count = n;
+    } else if (t->supertype_count > 0 && t->supertypes) {
+        CBMSupertype *out =
+            (CBMSupertype *)cbm_arena_alloc(a, (size_t)t->supertype_count * sizeof(*out));
+        if (!out) {
+            t->member_flags |= CBM_MEMBERS_DECLS_DISAGREE;
+            return;
+        }
+        int n = 0;
+        for (int i = 0; i < t->supertype_count; i++) {
+            CBMSupertype s = t->supertypes[i];
+            if (s.type_qn && s.state == CBM_SUPER_UNRESOLVED) {
+                s.type_qn = s.kind == CBM_SUPER_TRAIT
+                                ? php_settle_trait(ctx, t->qualified_name, s.type_qn, &s.state)
+                                : php_settle_spelling(ctx, t->qualified_name, s.type_qn, &s.state);
+            }
+            /* One parent spelled twice (the class body and a PHPDoc tag) is one
+             * parent. Only superclasses are compared: a repeated trait or
+             * interface is harmless to the walk. */
+            bool dup = false;
+            for (int j = 0; j < n && s.kind == CBM_SUPER_EXTENDS && s.state == CBM_SUPER_KNOWN;
+                 j++) {
+                dup = out[j].kind == CBM_SUPER_EXTENDS && out[j].state == CBM_SUPER_KNOWN &&
+                      strcmp(out[j].type_qn, s.type_qn) == 0;
+                if (dup) {
+                    break;
+                }
+            }
+            if (!dup) {
+                out[n++] = s;
             }
         }
-        if (seen)
-            continue;
-        visited[visited_count++] = parent;
-
-        f = cbm_registry_lookup_method(ctx->registry, parent, method_name);
-        if (f)
-            return f;
-
-        const CBMRegisteredType *next = cbm_registry_lookup_type(ctx->registry, parent);
-        if (!next)
-            next = lookup_type_with_project(ctx, parent);
-        if (!next)
-            continue;
-
-        if (strcmp(next->qualified_name, parent) != 0) {
-            f = cbm_registry_lookup_method(ctx->registry, next->qualified_name, method_name);
-            if (f)
-                return f;
+        t->supertypes = out;
+        t->supertype_count = n;
+    }
+    if (t->rename_count > 0 && t->renames) {
+        CBMMemberRename *r =
+            (CBMMemberRename *)cbm_arena_alloc(a, (size_t)t->rename_count * sizeof(*r));
+        if (!r) {
+            t->rename_count = 0;
+            t->renames = NULL;
+            t->member_flags |= CBM_MEMBERS_DECLS_DISAGREE;
+            return;
         }
-        if (next->method_qns && next->method_names) {
-            for (int i = 0; next->method_names[i]; i++) {
-                if (strcmp(next->method_names[i], method_name) == 0) {
-                    const CBMRegisteredFunc *cand =
-                        cbm_registry_lookup_func(ctx->registry, next->method_qns[i]);
-                    if (cand)
-                        return cand;
+        for (int i = 0; i < t->rename_count; i++) {
+            r[i] = t->renames[i];
+            if (r[i].from_type) {
+                bool known = false;
+                const char *qn = php_settle_rename_trait(ctx, t, r[i].from_type, &known);
+                /* An unknown trait keeps its spelling: it matches no member,
+                 * so the walk answers its alias unknown. */
+                if (known) {
+                    r[i].from_type = qn;
                 }
             }
         }
-        if (next->embedded_types) {
-            for (int i = 0; next->embedded_types[i] && frontier_count < 32; i++) {
-                frontier[frontier_count++] = next->embedded_types[i];
+        t->renames = r;
+    }
+}
+
+void php_members_begin(PHPLSPContext *ctx, CBMTypeRegistry *reg) {
+    if (!ctx || !reg || ctx->members) {
+        return;
+    }
+    struct php_members *m =
+        (struct php_members *)cbm_calloc(CBM_MEM_CLASS_RESOLVE, sizeof(struct php_members));
+    if (!m) {
+        return;
+    }
+    cbm_arena_init(&m->arena);
+    cbm_member_orders_init(&m->orders, reg, cbm_lin_own_traits_parent, &m->arena);
+    m->orders.prepare = php_settle_type;
+    m->orders.prepare_ctx = ctx;
+    cbm_member_walker_init(&m->walker, &m->orders);
+    ctx->members = m;
+}
+
+void php_members_end(PHPLSPContext *ctx) {
+    struct php_members *m = ctx ? ctx->members : NULL;
+    if (!m) {
+        return;
+    }
+    if (m->copies) {
+        cbm_ht_free(m->copies);
+    }
+    cbm_member_walker_free(&m->walker);
+    cbm_member_orders_free(&m->orders);
+    cbm_arena_destroy(&m->arena);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, m);
+    ctx->members = NULL;
+}
+
+/* PHP copies a trait's methods into the class that uses it (Reflection names
+ * that class as the method's class, and `self` in the trait is that class).
+ * Report the trait member found through `via`'s traits the same way: as
+ * <via>.<name>, a `self` / trait return type rewritten to via. One copy per
+ * (class, name) and file. */
+static const CBMRegisteredFunc *php_mixin_member(PHPLSPContext *ctx, const CBMMemberHit *h,
+                                                 const char *name) {
+    struct php_members *m = ctx->members;
+    const char *via = h->via_qn;
+    char key[PHP_COPY_KEY_MAX];
+    int kl = snprintf(key, sizeof(key), "%s.%s", via, name);
+    bool keyed = kl > 0 && (size_t)kl < sizeof(key);
+    if (keyed && m->copies) {
+        const CBMRegisteredFunc *seen = (const CBMRegisteredFunc *)cbm_ht_get(m->copies, key);
+        if (seen) {
+            return seen;
+        }
+    }
+    CBMRegisteredFunc *rf = (CBMRegisteredFunc *)cbm_arena_alloc(ctx->arena, sizeof(*rf));
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", via, name);
+    if (!rf || !qn) {
+        return NULL;
+    }
+    memset(rf, 0, sizeof(*rf));
+    rf->qualified_name = qn;
+    rf->short_name = cbm_arena_strdup(ctx->arena, name);
+    rf->receiver_type = via;
+    rf->min_params = h->func->min_params;
+    const CBMType *sig = h->func->signature;
+    if (sig && sig->kind == CBM_TYPE_FUNC && sig->data.func.return_types) {
+        const CBMType *ret0 = sig->data.func.return_types[0];
+        if (ret0 && ret0->kind == CBM_TYPE_NAMED && ret0->data.named.qualified_name &&
+            h->owner_qn && strcmp(ret0->data.named.qualified_name, h->owner_qn) == 0) {
+            const CBMType **rets = (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
+            if (rets) {
+                rets[0] = cbm_type_named(ctx->arena, via);
+                rets[1] = NULL;
+                sig = cbm_type_func_replace_returns(ctx->arena, sig, rets);
             }
         }
     }
-    return NULL;
+    rf->signature = sig;
+    if (keyed) {
+        if (!m->copies) {
+            m->copies = cbm_ht_create(0);
+        }
+        if (m->copies) {
+            cbm_ht_set(m->copies, qn, rf);
+        }
+    }
+    return rf;
+}
+
+const CBMRegisteredFunc *php_find_method(PHPLSPContext *ctx, const char *class_qn,
+                                         const char *method_name) {
+    if (!ctx || !class_qn || !method_name) {
+        return NULL;
+    }
+    /* The receiver's own member under the spelling it was named by. */
+    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
+    if (f) {
+        return f;
+    }
+    /* The registered type that spelling names (identity, not ancestry). */
+    const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, class_qn);
+    if (!t) {
+        t = lookup_type_with_project(ctx, class_qn);
+    }
+    if (!t || !t->qualified_name || !ctx->members) {
+        return NULL;
+    }
+    CBMMemberQuery q;
+    memset(&q, 0, sizeof(q));
+    q.reg = ctx->registry;
+    q.lang = CBM_LANG_PHP;
+    q.type_qn = t->qualified_name;
+    q.name = method_name;
+    q.member_kind = CBM_MW_MEMBER_METHOD;
+    q.overloads = CBM_MW_HIDE_BY_NAME;
+    CBMMemberHit hit;
+    /* ABSENT and ABSTAIN both leave the call to the rules below the lookup
+     * (magic methods, the unindexed-receiver row): the PHP engine draws no
+     * edge and vetoes nothing on either today. */
+    if (cbm_member_lookup(&ctx->members->walker, &q, &hit) != CBM_MW_FOUND || !hit.func) {
+        return NULL;
+    }
+    /* What the PHP engine draws from a FOUND (the walk never decides; this is
+     * the one place this engine does):
+     *  - a proven hit (prefix_complete) is drawn: the member's own function,
+     *    or a trait's member as the using class's copy (php_mixin_member);
+     *  - a possible hit (the walk passed a supertype the index does not hold)
+     *    is drawn only where today's engine gave an answer at that site: a
+     *    member among the class's own members, its known parents and its
+     *    known interface declarations (place OWN, SUPER, INTERFACE_DEFAULT),
+     *    or the copy of a member of a trait a class of this file uses itself
+     *    (mixin depth 1, no alias), which today's flattening made. Where both
+     *    answer behind an unknown and differ only in order (fx/twoifc: the
+     *    walk's I1.m against the old stack's I2.m) the walk's order, php's,
+     *    stands;
+     *  - what the walk adds beyond the deleted lookup (a trait's trait, an
+     *    alias, a trait of a class declared in another file) gives nothing
+     *    when only possible: the call keeps the pipeline's other rules. */
+    if (hit.place == CBM_MW_PLACE_MIXIN && hit.via_qn) {
+        if (!hit.prefix_complete &&
+            (hit.mixin_depth != 1 || hit.renamed || !php_declared_here(ctx, hit.via_qn))) {
+            return NULL;
+        }
+        return php_mixin_member(ctx, &hit, method_name);
+    }
+    return hit.func;
 }
 
 /* Detect a __call / __callStatic on a class chain. */
 static bool class_has_magic_call(PHPLSPContext *ctx, const char *class_qn, bool is_static) {
     const char *magic = is_static ? "__callStatic" : "__call";
-    return php_lookup_method(ctx, class_qn, magic) != NULL;
+    return php_find_method(ctx, class_qn, magic) != NULL;
 }
 
 /* ── type parsing ───────────────────────────────────────────────── */
@@ -1053,7 +1408,7 @@ const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node) {
             } else if (recv && recv->kind == CBM_TYPE_NAMED) {
                 /* offsetGet on a registered ArrayAccess-like class. */
                 const CBMRegisteredFunc *og =
-                    php_lookup_method(ctx, recv->data.named.qualified_name, "offsetGet");
+                    php_find_method(ctx, recv->data.named.qualified_name, "offsetGet");
                 if (og && og->signature && og->signature->kind == CBM_TYPE_FUNC &&
                     og->signature->data.func.return_types &&
                     og->signature->data.func.return_types[0]) {
@@ -1290,7 +1645,7 @@ static const CBMType *eval_member_call_type(PHPLSPContext *ctx, TSNode call_node
         }
         if (recv_type && recv_type->kind == CBM_TYPE_TEMPLATE) {
             /* Apply generic substitution to method return type. */
-            const CBMRegisteredFunc *f = php_lookup_method(ctx, class_qn, method_name);
+            const CBMRegisteredFunc *f = php_find_method(ctx, class_qn, method_name);
             if (!f || !f->signature)
                 return cbm_type_unknown();
             const CBMType *sig = f->signature;
@@ -1312,7 +1667,7 @@ static const CBMType *eval_member_call_type(PHPLSPContext *ctx, TSNode call_node
     if (!class_qn)
         return cbm_type_unknown();
 
-    const CBMRegisteredFunc *f = php_lookup_method(ctx, class_qn, method_name);
+    const CBMRegisteredFunc *f = php_find_method(ctx, class_qn, method_name);
     if (!f || !f->signature)
         return cbm_type_unknown();
     const CBMType *sig = f->signature;
@@ -1604,7 +1959,7 @@ static void process_foreach(PHPLSPContext *ctx, TSNode node) {
             }
         } else if (it_type && it_type->kind == CBM_TYPE_NAMED) {
             const CBMRegisteredFunc *cur =
-                php_lookup_method(ctx, it_type->data.named.qualified_name, "current");
+                php_find_method(ctx, it_type->data.named.qualified_name, "current");
             if (cur && cur->signature && cur->signature->kind == CBM_TYPE_FUNC &&
                 cur->signature->data.func.return_types &&
                 cur->signature->data.func.return_types[0] &&
@@ -1688,7 +2043,7 @@ static void resolve_function_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKi
             class_qn = receiver->data.template_type.template_name;
         }
         const CBMRegisteredFunc *invoke =
-            class_qn ? php_lookup_method(ctx, class_qn, "__invoke") : NULL;
+            class_qn ? php_find_method(ctx, class_qn, "__invoke") : NULL;
         if (invoke && invoke->qualified_name) {
             emit_resolved_reason_kind(ctx, invoke->qualified_name, "php_invokable_reference", 0.95f,
                                       name, kind);
@@ -1783,7 +2138,7 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
     }
     if (!class_qn)
         return; /* unknown receiver; defer */
-    const CBMRegisteredFunc *f = php_lookup_method(ctx, class_qn, method_name);
+    const CBMRegisteredFunc *f = php_find_method(ctx, class_qn, method_name);
     if (f) {
         const char *strategy = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                    ? "php_method_typed"
@@ -1843,7 +2198,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
     if (!class_qn)
         return;
 
-    const CBMRegisteredFunc *f = php_lookup_method(ctx, class_qn, method_name);
+    const CBMRegisteredFunc *f = php_find_method(ctx, class_qn, method_name);
     if (f) {
         emit_resolved_kind(ctx, f->qualified_name, strategy, 0.95f, kind);
         return;
@@ -1852,7 +2207,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
      * only when a materialized `__callStatic` exists. Preserve the source name
      * as the occurrence-join reason, but point at the real method node. Normal
      * facade invocations retain their existing low-confidence behavior. */
-    const CBMRegisteredFunc *magic_static = php_lookup_method(ctx, class_qn, "__callStatic");
+    const CBMRegisteredFunc *magic_static = php_find_method(ctx, class_qn, "__callStatic");
     if (magic_static && kind == CBM_RESOLVED_CALL_REFERENCE) {
         emit_resolved_reason_kind(ctx, magic_static->qualified_name, "php_static_magic_reference",
                                   0.95f, method_name, kind);
@@ -3129,7 +3484,74 @@ typedef struct {
     const CBMType **field_types;
     int count;
     int cap;
+    /* The member lookup's view of a class this file declares, read from its
+     * syntax tree with the file's `use` map: its supertypes as resolved
+     * spellings (settled later, php_settle_type), the `@extends` of its
+     * PHPDoc, and the renames of its trait uses. They replace what the
+     * registrar recorded from the extracted definition. */
+    CBMSupertype *supers;
+    int super_count;
+    int super_cap;
+    const char **doc_extends;
+    int doc_count;
+    int doc_cap;
+    CBMMemberRename *renames;
+    int rename_count;
+    int rename_cap;
+    bool declared; /* the declaration was read */
 } php_class_fields_t;
+
+/* Append one element to a growable arena array. */
+static void *php_grow(CBMArena *a, void *items, int *cap, int count, size_t size) {
+    if (count < *cap) {
+        return items;
+    }
+    int ncap = *cap ? *cap * 2 : 4;
+    void *grown = cbm_arena_alloc(a, (size_t)ncap * size);
+    if (!grown) {
+        return NULL;
+    }
+    if (count > 0) {
+        memcpy(grown, items, (size_t)count * size);
+    }
+    *cap = ncap;
+    return grown;
+}
+
+static void php_super_add(CBMArena *a, php_class_fields_t *f, uint8_t kind, const char *spelled) {
+    if (!spelled || !spelled[0]) {
+        return;
+    }
+    CBMSupertype *s =
+        (CBMSupertype *)php_grow(a, f->supers, &f->super_cap, f->super_count, sizeof(*s));
+    if (!s) {
+        return;
+    }
+    f->supers = s;
+    memset(&s[f->super_count], 0, sizeof(*s));
+    s[f->super_count].type_qn = spelled;
+    s[f->super_count].kind = kind;
+    s[f->super_count].state = CBM_SUPER_UNRESOLVED; /* a spelling until settled */
+    f->super_count++;
+}
+
+static void php_rename_add(CBMArena *a, php_class_fields_t *f, uint8_t kind, const char *name,
+                           const char *from_type, const char *from_name) {
+    if (!name || !name[0]) {
+        return;
+    }
+    CBMMemberRename *r =
+        (CBMMemberRename *)php_grow(a, f->renames, &f->rename_cap, f->rename_count, sizeof(*r));
+    if (!r) {
+        return;
+    }
+    f->renames = r;
+    r[f->rename_count].name = name;
+    r[f->rename_count].from_type = from_type;
+    r[f->rename_count].from_name = from_name;
+    r[f->rename_count].kind = kind;
+    f->rename_count++;
+}
 
 typedef struct {
     php_class_fields_t *items;
@@ -3599,14 +4021,13 @@ static void apply_phpdoc_class_tags(PHPLSPContext *ctx, CBMTypeRegistry *reg, co
     /* @extends ParentClass<X>  /  @template-extends ParentClass<X>
      *  — when a class generically extends a parametric ancestor, we
      * record that the ancestor's type-params are bound to the concrete
-     * args. We model this by replacing the embedded_types entry with
-     * a synthetic key class_qn + "@@" + parent_with_args, plus storing
+     * args. A full model would key the parent by its arguments and keep
      * the type-arg mapping in a side table. For Phase 4s we keep it
      * minimal: when method lookup walks the ancestor, eval_member_call
      * on the receiver doesn't yet know about this binding. The full
      * substitution happens in Phase 4s+ via a side table; for now we
-     * record the @extends parent in embedded_types as a NAMED type so
-     * inherited methods at least resolve (untyped). */
+     * record the @extends parent as a supertype of the class so inherited
+     * methods at least resolve (untyped). */
     {
         const char *p = docstring;
         while ((p = strstr(p, "@extends")) != NULL) {
@@ -3644,37 +4065,16 @@ static void apply_phpdoc_class_tags(PHPLSPContext *ctx, CBMTypeRegistry *reg, co
             } else if (parent_type && parent_type->kind == CBM_TYPE_TEMPLATE) {
                 parent_qn = parent_type->data.template_type.template_name;
             }
-            if (!parent_qn)
+            if (!parent_qn || !out_fields)
                 continue;
-            /* Append to embedded_types if not already present. */
-            for (int t = 0; t < reg->type_count; t++) {
-                if (strcmp(reg->types[t].qualified_name, class_qn) != 0)
-                    continue;
-                int existing = 0;
-                if (reg->types[t].embedded_types) {
-                    while (reg->types[t].embedded_types[existing])
-                        existing++;
-                }
-                bool found = false;
-                for (int e = 0; e < existing; e++) {
-                    if (strcmp(reg->types[t].embedded_types[e], parent_qn) == 0) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (found)
-                    break;
-                const char **expanded = (const char **)cbm_arena_alloc(
-                    ctx->arena, (size_t)(existing + 2) * sizeof(*expanded));
-                if (!expanded)
-                    break;
-                for (int e = 0; e < existing; e++) {
-                    expanded[e] = reg->types[t].embedded_types[e];
-                }
-                expanded[existing] = parent_qn;
-                expanded[existing + 1] = NULL;
-                reg->types[t].embedded_types = expanded;
-                break;
+            /* Kept apart: the class body's own `extends` wins over it
+             * (process_class_for_fields). */
+            const char **d =
+                (const char **)php_grow(ctx->arena, out_fields->doc_extends, &out_fields->doc_cap,
+                                        out_fields->doc_count, sizeof(*d));
+            if (d) {
+                out_fields->doc_extends = d;
+                d[out_fields->doc_count++] = parent_qn;
             }
         }
     }
@@ -3759,304 +4159,76 @@ static void apply_phpdoc_class_tags(PHPLSPContext *ctx, CBMTypeRegistry *reg, co
     }
 }
 
-/* Flatten the methods of a trait into the using class's method table.
- *
- * Tree-sitter-php emits `use Trait1, Trait2;` inside a class body as a
- * `use_declaration` (distinct from the namespace-level
- * namespace_use_declaration). The optional conflict resolution block
- * uses `use_instead_of_clause` (for `Trait1::foo insteadof Trait2`) and
- * `use_as_clause` (for `Trait2::foo as fooAlt`).
- *
- * Phase 4e basic strategy:
- *   - copy each method on the trait into the class as a synthetic
- *     CBMRegisteredFunc with receiver_type = class_qn
- *   - if the same method exists from multiple traits, last write wins
- *     (suboptimal but matches PHP's "use the last `use` line" default
- *     when no insteadof clause exists)
- *   - handle `as` aliasing: register method under the alias name too
- *   - skip insteadof (rare in practice; full support deferred)
- */
-/* The registry indices of each receiver's methods, in registration order.
- * Flattening a trait used to visit EVERY registered function to find the
- * trait's own, so a file whose classes use traits paid O(uses x functions),
- * and the functions grow with every class flattened before: quadratic in the
- * trait-using classes of one file (#1265). The registry is append-only, so
- * the index catches up incrementally (indexed_upto) and never misses a
- * function registered between two flattens. */
-typedef struct {
-    int *items;
-    int count;
-    int cap;
-} php_func_ids_t;
-
-struct php_trait_index {
-    CBMHashTable *by_receiver; /* receiver_type (borrowed) -> php_func_ids_t* */
-    int indexed_upto;          /* reg->funcs[0, indexed_upto) are indexed */
-    bool failed;               /* allocation failed: callers use the full scan */
-};
-
-static bool php_func_ids_push(CBMArena *arena, php_func_ids_t *ids, int func_index) {
-    if (ids->count == ids->cap) {
-        int cap = ids->cap ? ids->cap * 2 : 4;
-        int *items = (int *)cbm_arena_alloc(arena, (size_t)cap * sizeof(*items));
-        if (!items) {
-            return false;
-        }
-        if (ids->count > 0) {
-            memcpy(items, ids->items, (size_t)ids->count * sizeof(*items));
-        }
-        ids->items = items;
-        ids->cap = cap;
-    }
-    ids->items[ids->count++] = func_index;
-    return true;
-}
-
-/* Index every function registered since the last call. Returns false (and
- * marks the index failed for good) on an allocation failure. */
-static bool php_trait_index_sync(PHPLSPContext *ctx, struct php_trait_index *ix,
-                                 const CBMTypeRegistry *reg) {
-    if (ix->failed) {
-        return false;
-    }
-    if (!ix->by_receiver) {
-        ix->by_receiver = cbm_ht_create(0);
-        if (!ix->by_receiver) {
-            ix->failed = true;
-            return false;
-        }
-    }
-    for (; ix->indexed_upto < reg->func_count; ix->indexed_upto++) {
-        CBM_LSP_WORK(1);
-        const char *receiver = reg->funcs[ix->indexed_upto].receiver_type;
-        if (!receiver) {
-            continue;
-        }
-        php_func_ids_t *ids = (php_func_ids_t *)cbm_ht_get(ix->by_receiver, receiver);
-        if (!ids) {
-            ids = (php_func_ids_t *)cbm_arena_alloc(ctx->arena, sizeof(*ids));
-            if (!ids) {
-                ix->failed = true;
-                return false;
-            }
-            memset(ids, 0, sizeof(*ids));
-            cbm_ht_set(ix->by_receiver, receiver, ids);
-        }
-        if (!php_func_ids_push(ctx->arena, ids, ix->indexed_upto)) {
-            ix->failed = true;
-            return false;
-        }
-    }
-    return true;
-}
-
-static void php_trait_index_free(struct php_trait_index *ix) {
-    if (ix->by_receiver) {
-        cbm_ht_free(ix->by_receiver);
-        ix->by_receiver = NULL;
-    }
-}
-
-/* Copy one method `src` of the trait into class_qn (see
- * flatten_trait_into_class). Reads src before registering, because
- * cbm_registry_add_func may move reg->funcs. */
-static void flatten_trait_method(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
-                                 const char *canonical_trait_qn, const CBMRegisteredFunc *src,
-                                 const char *alias_for_method, const char *only_method_name) {
-    if (only_method_name && src->short_name && strcmp(src->short_name, only_method_name) != 0) {
-        return;
-    }
-    const char *new_short = alias_for_method ? alias_for_method : src->short_name;
-    if (!new_short)
-        return;
-    CBMRegisteredFunc rf;
-    memset(&rf, 0, sizeof(rf));
-    rf.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, new_short);
-    rf.short_name = cbm_arena_strdup(ctx->arena, new_short);
-    rf.receiver_type = class_qn;
-    rf.min_params = src->min_params;
-
-    /* Self-substitute the return type: any NAMED(trait_qn) in the
-     * signature's return becomes NAMED(class_qn). */
-    const CBMType *new_sig = src->signature;
-    if (src->signature && src->signature->kind == CBM_TYPE_FUNC &&
-        src->signature->data.func.return_types) {
-        const CBMType *ret0 = src->signature->data.func.return_types[0];
-        if (ret0 && ret0->kind == CBM_TYPE_NAMED && ret0->data.named.qualified_name &&
-            strcmp(ret0->data.named.qualified_name, canonical_trait_qn) == 0) {
-            const CBMType **rets = (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
-            if (rets) {
-                rets[0] = cbm_type_named(ctx->arena, class_qn);
-                rets[1] = NULL;
-                new_sig = cbm_type_func_replace_returns(ctx->arena, src->signature, rets);
-            }
-        }
-    }
-    rf.signature = new_sig;
-    cbm_registry_add_func(reg, rf);
-}
-
-static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
-                                     const char *trait_qn, const char *alias_for_method,
-                                     const char *only_method_name) {
-    if (!class_qn || !trait_qn)
-        return;
-    /* Resolve trait through alias-style lookup if needed. */
-    const CBMRegisteredType *t = cbm_registry_lookup_type(reg, trait_qn);
-    if (!t)
-        t = lookup_type_with_project(ctx, trait_qn);
-    const char *canonical_trait_qn = t ? t->qualified_name : trait_qn;
-
-    /* A trait cannot meaningfully flatten into itself. PHP itself rejects
-     * `trait T { use T; }` ("Trait T cannot use itself"), and an aliased
-     * `use X as Y; use Y;` can resolve back onto the enclosing trait by short
-     * name. Without this guard the loop below copies the trait's own methods
-     * back onto it with receiver_type == canonical_trait_qn; because each copy
-     * then re-matches the loop's filter while cbm_registry_add_func() keeps
-     * growing reg->func_count, the iteration never terminates — it arena-
-     * allocates a fresh method every pass until the process exhausts all
-     * memory (observed: 40 GB+, freezing the host). See regression test
-     * phplsp_trait_self_use_terminates. */
-    if (strcmp(class_qn, canonical_trait_qn) == 0)
-        return;
-
-    /* Iterate registry funcs whose receiver_type is the trait.
-     *
-     * Self-substitution: when the trait's method has a return type that
-     * names the trait itself (e.g. `tap(): self` registered as
-     * NAMED(trait_qn)), rewrite it to NAMED(using_class_qn) so chains
-     * like `$c->tap()->classMethod()` resolve correctly.
-     *
-     * Snapshot the count before iterating: cbm_registry_add_func() below
-     * appends to reg->funcs, so the loop must never visit entries it adds
-     * during iteration (a mutate-while-iterating hazard). */
-    const int func_count_before = reg->func_count;
-    struct php_trait_index *ix = ctx->trait_index;
-    if (ix && php_trait_index_sync(ctx, ix, reg)) {
-        /* Only the trait's own methods, in registration order; the ids are
-         * ascending, so the snapshot bound ends the walk. No sync runs inside
-         * the loop, so the list cannot change under it. */
-        const php_func_ids_t *ids =
-            (const php_func_ids_t *)cbm_ht_get(ix->by_receiver, canonical_trait_qn);
-        for (int j = 0; ids && j < ids->count && ids->items[j] < func_count_before; j++) {
-            CBM_LSP_WORK(1);
-            if (CBM_LSP_WORK_CEILING_HIT()) {
-                break; /* test seam only (#765, #1265): see lsp_work.h */
-            }
-            flatten_trait_method(ctx, reg, class_qn, canonical_trait_qn, &reg->funcs[ids->items[j]],
-                                 alias_for_method, only_method_name);
-        }
-        return;
-    }
-    /* No index (no owning pass, or it could not allocate): the full scan,
-     * which yields the same methods in the same order. */
-    for (int i = 0; i < func_count_before; i++) {
-        CBM_LSP_WORK(1);
-        if (CBM_LSP_WORK_CEILING_HIT()) {
-            break; /* test seam only (#765, #1265): see lsp_work.h */
-        }
-        const CBMRegisteredFunc *src = &reg->funcs[i];
-        if (!src->receiver_type || strcmp(src->receiver_type, canonical_trait_qn) != 0) {
-            continue;
-        }
-        flatten_trait_method(ctx, reg, class_qn, canonical_trait_qn, src, alias_for_method,
-                             only_method_name);
-    }
-}
-
-static void process_trait_use(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
-                              TSNode use_decl) {
-    /* Collect the named traits and any `as` alias clauses. */
-    const char *trait_qns[16];
-    int trait_count = 0;
-
-    uint32_t nc = ts_node_child_count(use_decl);
-    for (uint32_t i = 0; i < nc && trait_count < 16; i++) {
-        TSNode c = ts_node_child(use_decl, i);
-        if (ts_node_is_null(c) || !ts_node_is_named(c))
-            continue;
+/* A trait use in a class body (`use A, B { A::m insteadof B; B::m as m2; }`)
+ * read as facts of the class: each trait a supertype, resolved with the file's
+ * `use` map; each `insteadof` an exclusion of the excluded trait's member; each
+ * `as` with a new name an alias (the shared walk applies them, member_walk.h).
+ * An `as` that only changes visibility renames nothing. Tree-sitter-php holds
+ * the clauses in a `use_list` child. PHP copies the trait's methods into the
+ * class; the lookup reports them that way (php_mixin_member). */
+static void php_read_trait_use(PHPLSPContext *ctx, php_class_fields_t *f, TSNode use_decl) {
+    uint32_t nc = ts_node_named_child_count(use_decl);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(use_decl, i);
         const char *k = ts_node_type(c);
         if (strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0) {
             char *tn = php_node_text(ctx, c);
-            if (tn) {
-                const char *resolved = php_resolve_class_name(ctx, tn);
-                if (resolved)
-                    trait_qns[trait_count++] = resolved;
-            }
-        }
-    }
-
-    /* First, do the default flatten for all traits. */
-    for (int i = 0; i < trait_count; i++) {
-        flatten_trait_into_class(ctx, reg, class_qn, trait_qns[i], NULL, NULL);
-    }
-
-    /* Process `use_list` block for `as` / `insteadof` clauses. The block is
-     * either named "body" or a sibling. */
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(use_decl, i);
-        if (ts_node_is_null(c) || !ts_node_is_named(c))
+            php_super_add(ctx->arena, f, CBM_SUPER_TRAIT,
+                          tn ? php_resolve_class_name(ctx, tn) : NULL);
             continue;
-        const char *k = ts_node_type(c);
-        if (strcmp(k, "use_list") != 0 && strcmp(k, "use_clause") != 0) {
-            uint32_t bnc = ts_node_child_count(c);
-            for (uint32_t j = 0; j < bnc; j++) {
-                TSNode cc = ts_node_child(c, j);
-                if (ts_node_is_null(cc) || !ts_node_is_named(cc))
-                    continue;
-                const char *kk = ts_node_type(cc);
-                if (strcmp(kk, "use_as_clause") == 0) {
-                    /* Trait::method as alias  OR  method as alias */
-                    char *trait_text = NULL;
-                    char *method_text = NULL;
-                    char *alias_text = NULL;
-                    uint32_t anc = ts_node_child_count(cc);
-                    for (uint32_t a = 0; a < anc; a++) {
-                        TSNode ch = ts_node_child(cc, a);
-                        if (ts_node_is_null(ch) || !ts_node_is_named(ch))
+        }
+        if (strcmp(k, "use_list") != 0) {
+            continue;
+        }
+        uint32_t lc = ts_node_named_child_count(c);
+        for (uint32_t j = 0; j < lc; j++) {
+            TSNode cl = ts_node_named_child(c, j);
+            const char *ck = ts_node_type(cl);
+            bool instead = strcmp(ck, "use_instead_of_clause") == 0;
+            if (!instead && strcmp(ck, "use_as_clause") != 0) {
+                continue;
+            }
+            char *trait_text = NULL;
+            char *method_text = NULL;
+            char *alias_text = NULL;
+            uint32_t cc = ts_node_named_child_count(cl);
+            for (uint32_t a = 0; a < cc; a++) {
+                TSNode p = ts_node_named_child(cl, a);
+                const char *pk = ts_node_type(p);
+                if (strcmp(pk, "class_constant_access_expression") == 0) {
+                    /* Trait::method */
+                    uint32_t sc = ts_node_named_child_count(p);
+                    for (uint32_t s = 0; s < sc; s++) {
+                        TSNode q = ts_node_named_child(p, s);
+                        const char *qk = ts_node_type(q);
+                        if (strcmp(qk, "name") != 0 && strcmp(qk, "qualified_name") != 0) {
                             continue;
-                        const char *ck = ts_node_type(ch);
-                        if (strcmp(ck, "class_constant_access_expression") == 0) {
-                            /* Trait::method */
-                            uint32_t cc2 = ts_node_child_count(ch);
-                            for (uint32_t a2 = 0; a2 < cc2; a2++) {
-                                TSNode subch = ts_node_child(ch, a2);
-                                if (ts_node_is_null(subch) || !ts_node_is_named(subch))
-                                    continue;
-                                const char *sck = ts_node_type(subch);
-                                if (strcmp(sck, "name") == 0 ||
-                                    strcmp(sck, "qualified_name") == 0) {
-                                    if (!trait_text)
-                                        trait_text = php_node_text(ctx, subch);
-                                    else
-                                        method_text = php_node_text(ctx, subch);
-                                }
-                            }
-                        } else if (strcmp(ck, "name") == 0) {
-                            char *t = php_node_text(ctx, ch);
-                            if (!method_text)
-                                method_text = t;
-                            else
-                                alias_text = t;
+                        }
+                        if (!trait_text) {
+                            trait_text = php_node_text(ctx, q);
+                        } else if (!method_text) {
+                            method_text = php_node_text(ctx, q);
                         }
                     }
-                    if (alias_text && method_text) {
-                        const char *trait_qn_resolved = NULL;
-                        if (trait_text) {
-                            trait_qn_resolved = php_resolve_class_name(ctx, trait_text);
-                        } else if (trait_count > 0) {
-                            trait_qn_resolved = trait_qns[0];
+                } else if (strcmp(pk, "name") == 0 || strcmp(pk, "qualified_name") == 0) {
+                    char *t = php_node_text(ctx, p);
+                    if (instead) {
+                        /* One excluded trait: its `method_text` gives way. */
+                        if (trait_text && method_text && t) {
+                            php_rename_add(ctx->arena, f, CBM_RENAME_EXCLUDE, method_text,
+                                           php_resolve_class_name(ctx, t), NULL);
                         }
-                        if (trait_qn_resolved) {
-                            flatten_trait_into_class(ctx, reg, class_qn, trait_qn_resolved,
-                                                     alias_text, method_text);
-                        }
+                    } else if (!method_text) {
+                        method_text = t;
+                    } else if (!alias_text) {
+                        alias_text = t;
                     }
                 }
-                /* `use_instead_of_clause` is recognised but not yet
-                 * implemented — last-flatten-wins semantics already match
-                 * the common case where the resolution clause picks a
-                 * specific implementation. */
+            }
+            if (!instead && method_text && alias_text) {
+                php_rename_add(ctx->arena, f, CBM_RENAME_ALIAS, alias_text,
+                               trait_text ? php_resolve_class_name(ctx, trait_text) : NULL,
+                               method_text);
             }
         }
     }
@@ -4093,27 +4265,26 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
         apply_phpdoc_class_tags(ctx, reg, cqn, class_doc, f);
     }
 
-    /* Belt-and-suspenders: walk the class declaration's `base_clause` and
-     * `class_interface_clause` to gather extends/implements QNs and append
-     * them to the registered type's embedded_types. The unified extractor
-     * is supposed to populate base_classes for class_declaration but
-     * may miss interface_declaration's `extends Base` chain or use a
-     * raw form (with backslashes) that doesn't round-trip cleanly.
-     * Doing this AST extraction here keeps the LSP self-sufficient. */
+    /* The class's supertypes as its declaration writes them, resolved with
+     * the file's `use` map: a class's `extends` (an interface's parents) and
+     * `implements`; the traits come from the body below. They replace what
+     * the registrar recorded from the extracted definition. */
+    f->declared = true;
+    bool is_iface = strcmp(ts_node_type(class_node), "interface_declaration") == 0;
+    bool body_extends = false;
     {
-        const char *parent_qns[16];
-        int parent_count = 0;
         uint32_t cnc = ts_node_child_count(class_node);
-        for (uint32_t i = 0; i < cnc && parent_count < 16; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(class_node, i);
             if (ts_node_is_null(c) || !ts_node_is_named(c))
                 continue;
             const char *k = ts_node_type(c);
-            if (strcmp(k, "base_clause") != 0 && strcmp(k, "class_interface_clause") != 0) {
+            bool ext = strcmp(k, "base_clause") == 0;
+            if (!ext && strcmp(k, "class_interface_clause") != 0) {
                 continue;
             }
             uint32_t bnc = ts_node_child_count(c);
-            for (uint32_t j = 0; j < bnc && parent_count < 16; j++) {
+            for (uint32_t j = 0; j < bnc; j++) {
                 TSNode bc = ts_node_child(c, j);
                 if (ts_node_is_null(bc) || !ts_node_is_named(bc))
                     continue;
@@ -4121,60 +4292,25 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                 if (strcmp(bk, "name") != 0 && strcmp(bk, "qualified_name") != 0)
                     continue;
                 char *t = php_node_text(ctx, bc);
-                if (!t)
-                    continue;
-                const char *resolved = php_resolve_class_name(ctx, t);
+                const char *resolved = t ? php_resolve_class_name(ctx, t) : NULL;
                 if (!resolved)
                     continue;
-                parent_qns[parent_count++] = resolved;
+                php_super_add(ctx->arena, f, ext ? CBM_SUPER_EXTENDS : CBM_SUPER_IMPLEMENTS,
+                              resolved);
+                body_extends = body_extends || ext;
             }
         }
-        if (parent_count > 0) {
-            for (int t = 0; t < reg->type_count; t++) {
-                if (strcmp(reg->types[t].qualified_name, cqn) != 0)
-                    continue;
-                /* Merge with existing embedded_types — dedup. */
-                int existing = 0;
-                if (reg->types[t].embedded_types) {
-                    while (reg->types[t].embedded_types[existing])
-                        existing++;
-                }
-                int total = existing;
-                for (int p = 0; p < parent_count; p++) {
-                    bool seen = false;
-                    for (int e = 0; e < existing; e++) {
-                        if (strcmp(reg->types[t].embedded_types[e], parent_qns[p]) == 0) {
-                            seen = true;
-                            break;
-                        }
-                    }
-                    if (!seen)
-                        total++;
-                }
-                if (total == existing)
-                    break;
-                const char **expanded = (const char **)cbm_arena_alloc(
-                    ctx->arena, (size_t)(total + 1) * sizeof(*expanded));
-                if (!expanded)
-                    break;
-                int wi = 0;
-                for (int e = 0; e < existing; e++)
-                    expanded[wi++] = reg->types[t].embedded_types[e];
-                for (int p = 0; p < parent_count; p++) {
-                    bool seen = false;
-                    for (int e = 0; e < existing; e++) {
-                        if (strcmp(reg->types[t].embedded_types[e], parent_qns[p]) == 0) {
-                            seen = true;
-                            break;
-                        }
-                    }
-                    if (!seen)
-                        expanded[wi++] = parent_qns[p];
-                }
-                expanded[wi] = NULL;
-                reg->types[t].embedded_types = expanded;
-                break;
-            }
+    }
+    /* `@extends Parent<T>` names the parent with its type arguments: it counts
+     * where the declaration names no parent (an interface's tag adds one). */
+    for (int d = 0; d < f->doc_count && (is_iface || !body_extends); d++) {
+        bool seen = false;
+        for (int s = 0; s < f->super_count && !seen; s++) {
+            seen = f->supers[s].kind == CBM_SUPER_EXTENDS &&
+                   strcmp(f->supers[s].type_qn, f->doc_extends[d]) == 0;
+        }
+        if (!seen) {
+            php_super_add(ctx->arena, f, CBM_SUPER_EXTENDS, f->doc_extends[d]);
         }
     }
 
@@ -4219,7 +4355,7 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
             }
         } else if (strcmp(k, "use_declaration") == 0) {
             /* Trait `use Foo;` inside a class body. */
-            process_trait_use(ctx, reg, cqn, c);
+            php_read_trait_use(ctx, f, c);
         } else if (strcmp(k, "method_declaration") == 0) {
             /* Constructor: scan params for property_promotion_parameter and
              * scan body for $this->X = $param assignments. */
@@ -4372,26 +4508,9 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
                                          php_class_field_table_t *tab) {
     if (ts_node_is_null(root))
         return;
-    /* TWO PASSES so trait/interface declared-return-types get patched
-     * BEFORE classes that use them — otherwise flatten_trait_into_class
-     * sees stale (BUILTIN/UNKNOWN) signatures and can't perform the
-     * trait `self` substitution.
-     *
-     * Pass 1: traits and interfaces (declarators that don't pull from
-     * other classes via `use`).
-     * Pass 2: classes and enums (which may `use Trait;` and need the
-     * trait's signatures already patched).
-     */
-    /* The index lives in the call's arena, not on this stack frame: ctx keeps
-     * a pointer to it for the duration of the pass. On an allocation failure
-     * it stays NULL and flatten_trait_into_class runs the full scan. */
-    struct php_trait_index *trait_index =
-        (struct php_trait_index *)cbm_arena_alloc(ctx->arena, sizeof(*trait_index));
-    if (trait_index) {
-        memset(trait_index, 0, sizeof(*trait_index));
-    }
-    struct php_trait_index *outer_index = ctx->trait_index;
-    ctx->trait_index = trait_index;
+    /* Two passes, traits and interfaces before classes and enums: the order
+     * in which declarations are read, kept from when trait methods were
+     * copied into their classes here. */
     for (int pass = 0; pass < 2; pass++) {
         TSNode stack[256];
         int top = 0;
@@ -4416,10 +4535,59 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
             }
         }
     }
-    if (trait_index) {
-        php_trait_index_free(trait_index);
+}
+
+/* The supertypes of a class this file declares. Each one takes the identity
+ * its declaration spells, read with the file's `use` map; where that names no
+ * type at all (a `use` map built from file-level import edges names the file,
+ * not the class), the same supertype as the registrar recorded it from the
+ * extracted definition: the same kind, the same position among that kind.
+ * Today's walk tried both spellings; an answer outside the project
+ * (EXTERNAL) is an answer and keeps the declaration's. A trait takes the
+ * strict path both times (php_settle_trait).
+ * Slice B4: the declared-type step's PHP row replaces this function, attached
+ * at its call in cbm_php_refine_lsp_registry. */
+static void php_settle_declared(PHPLSPContext *ctx, CBMRegisteredType *rt,
+                                const php_class_fields_t *fields) {
+    int n = fields->super_count;
+    CBMSupertype *out =
+        n > 0 ? (CBMSupertype *)cbm_arena_alloc(ctx->arena, (size_t)n * sizeof(*out)) : NULL;
+    if (n > 0 && !out) {
+        rt->supertypes = fields->supers; /* spellings; settled when first walked */
+        rt->supertype_count = n;
+        return;
     }
-    ctx->trait_index = outer_index;
+    for (int i = 0; i < n; i++) {
+        CBMSupertype s = fields->supers[i];
+        s.type_qn = s.kind == CBM_SUPER_TRAIT
+                        ? php_settle_trait(ctx, rt->qualified_name, s.type_qn, &s.state)
+                        : php_settle_spelling(ctx, rt->qualified_name, s.type_qn, &s.state);
+        if (s.state == CBM_SUPER_UNRESOLVED) {
+            int ordinal = 0;
+            for (int j = 0; j < i; j++) {
+                ordinal += fields->supers[j].kind == s.kind;
+            }
+            for (int j = 0; j < rt->supertype_count && rt->supertypes; j++) {
+                const CBMSupertype *r = &rt->supertypes[j];
+                if (r->kind != s.kind || !r->type_qn || ordinal-- != 0) {
+                    continue;
+                }
+                uint8_t state = 0;
+                const char *qn =
+                    r->kind == CBM_SUPER_TRAIT
+                        ? php_settle_trait(ctx, rt->qualified_name, r->type_qn, &state)
+                        : php_settle_spelling(ctx, rt->qualified_name, r->type_qn, &state);
+                if (state != CBM_SUPER_UNRESOLVED) {
+                    s.type_qn = qn;
+                    s.state = state;
+                }
+                break;
+            }
+        }
+        out[i] = s;
+    }
+    rt->supertypes = out;
+    rt->supertype_count = n;
 }
 
 void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root) {
@@ -4430,6 +4598,17 @@ void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNod
     php_lsp_collect_class_fields(ctx, reg, root, &tab);
     for (int i = 0; i < tab.count; i++) {
         php_class_fields_t *fields = &tab.items[i];
+        /* The member lookup reads the declaration's supertypes and trait
+         * rules from the type the lookups find. */
+        CBMRegisteredType *rt =
+            fields->declared ? (CBMRegisteredType *)cbm_registry_lookup_type(reg, fields->class_qn)
+                             : NULL;
+        if (rt) {
+            php_settle_declared(ctx, rt, fields);
+            rt->renames = fields->renames;
+            rt->rename_count = fields->rename_count;
+            rt->embedded_types = NULL; /* kindless parents are the seed's only */
+        }
         if (fields->count == 0)
             continue;
         for (int t = 0; t < reg->type_count; t++) {
@@ -4440,6 +4619,115 @@ void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNod
             }
         }
     }
+}
+
+/* ── registrars: supertypes as written ─────────────────────────────
+ *
+ * A registered type gets its supertypes from the extracted definition:
+ * `entries` (its bases, then its trait uses) with one kind letter each in
+ * `kinds` ('e' extends, 'i' implements, 't' a trait; a trailing '+' for bases
+ * the extractor left unrecorded). Each stays a spelling until
+ * php_settle_type. Without kinds that describe the entries the type keeps them
+ * kindless in embedded_types, and settling reads each kind off the type it
+ * names, as for the seeded library types. */
+static void php_spell_supertypes(CBMArena *arena, CBMRegisteredType *rt, const char *const *entries,
+                                 int count, const char *kinds) {
+    size_t nk = kinds ? strlen(kinds) : 0;
+    bool more = nk > 0 && kinds[nk - 1] == '+';
+    bool described = kinds && (int)nk - (more ? 1 : 0) == count;
+    for (int i = 0; described && i < count; i++) {
+        described = kinds[i] == 'e' || kinds[i] == 'i' || kinds[i] == 't';
+    }
+    if (!described) {
+        if (count > 0) {
+            const char **emb =
+                (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(*emb));
+            if (emb) {
+                memcpy(emb, entries, (size_t)count * sizeof(*emb));
+                emb[count] = NULL;
+                rt->embedded_types = emb;
+            }
+        }
+        return;
+    }
+    int total = count + (more ? 1 : 0);
+    if (total == 0) {
+        return;
+    }
+    CBMSupertype *s = (CBMSupertype *)cbm_arena_alloc(arena, (size_t)total * sizeof(*s));
+    if (!s) {
+        rt->member_flags |= CBM_MEMBERS_DECLS_DISAGREE; /* own members only */
+        return;
+    }
+    memset(s, 0, (size_t)total * sizeof(*s));
+    for (int i = 0; i < count; i++) {
+        s[i].type_qn = entries[i];
+        s[i].state = CBM_SUPER_UNRESOLVED;
+        s[i].kind = kinds[i] == 'e'   ? CBM_SUPER_EXTENDS
+                    : kinds[i] == 'i' ? CBM_SUPER_IMPLEMENTS
+                                      : CBM_SUPER_TRAIT;
+    }
+    if (more) {
+        /* An implemented interface nobody recorded: unknown, in its place. */
+        s[count].kind = CBM_SUPER_IMPLEMENTS;
+        s[count].state = CBM_SUPER_UNRESOLVED;
+    }
+    rt->supertypes = s;
+    rt->supertype_count = total;
+}
+
+/* The rules of the type's trait uses, as extract_defs.c encodes them:
+ * "x T m U" (T::m insteadof U) and "a T m alias" ("-" for an unnamed trait),
+ * ';'-separated. Trait spellings stay spellings until php_settle_type. */
+static void php_spell_rules(CBMArena *arena, CBMRegisteredType *rt, const char *rules) {
+    if (!rules || !rules[0]) {
+        return;
+    }
+    int n = 1;
+    for (const char *p = rules; *p; p++) {
+        n += *p == ';';
+    }
+    CBMMemberRename *r = (CBMMemberRename *)cbm_arena_alloc(arena, (size_t)n * sizeof(*r));
+    char *copy = cbm_arena_strdup(arena, rules);
+    if (!r || !copy) {
+        rt->member_flags |= CBM_MEMBERS_DECLS_DISAGREE;
+        return;
+    }
+    int count = 0;
+    for (char *entry = copy; entry && *entry;) {
+        char *next = strchr(entry, ';');
+        if (next) {
+            *next++ = '\0';
+        }
+        char *f[4] = {NULL, NULL, NULL, NULL};
+        int nf = 0;
+        for (char *tok = entry; tok && nf < 4;) {
+            char *sp = strchr(tok, ' ');
+            if (sp) {
+                *sp++ = '\0';
+            }
+            f[nf++] = tok;
+            tok = sp;
+        }
+        if (nf == 4 && (f[0][0] == 'x' || f[0][0] == 'a')) {
+            const char *trait = strcmp(f[1], "-") == 0 ? NULL : php_ns_to_dot(arena, f[1]);
+            memset(&r[count], 0, sizeof(r[count]));
+            if (f[0][0] == 'x') {
+                r[count].kind = CBM_RENAME_EXCLUDE;
+                r[count].name = f[2];
+                r[count].from_type = php_ns_to_dot(arena, f[3]);
+            } else {
+                r[count].kind = CBM_RENAME_ALIAS;
+                r[count].name = f[3];
+                r[count].from_type = trait;
+                r[count].from_name = f[2];
+            }
+            count++;
+        }
+        entry = next;
+    }
+    rt->renames = count > 0 ? r : NULL;
+    rt->rename_count = count;
 }
 
 /* ── entry: cbm_run_php_lsp ─────────────────────────────────────── */
@@ -4474,33 +4762,52 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
             rt.short_name = d->name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
 
-            /* Hoist base_classes as embedded_types so php_lookup_method's
-             * parent walk works. */
-            if (d->base_classes) {
-                int bc = 0;
-                while (d->base_classes[bc])
-                    bc++;
-                if (bc > 0) {
-                    const char **emb = (const char **)cbm_arena_alloc(
-                        arena, (size_t)(bc + 1) * sizeof(const char *));
-                    if (emb) {
-                        for (int j = 0; j < bc; j++) {
-                            const char *base = d->base_classes[j];
-                            /* Try same-module, then bare. */
-                            const char *qualified = base;
-                            if (base[0] != '\\' && !strchr(base, '.')) {
-                                qualified = cbm_arena_sprintf(arena, "%s.%s", module_qn, base);
-                            } else if (base[0] == '\\') {
-                                qualified = php_ns_to_dot(arena, base + 1);
-                            } else {
-                                qualified = php_ns_to_dot(arena, base);
-                            }
-                            emb[j] = qualified;
-                        }
-                        emb[bc] = NULL;
-                        rt.embedded_types = emb;
+            /* The supertypes for the member lookup: the bases, then the
+             * traits the body uses (the refinement below replaces them with
+             * the declaration's own, read with the file's `use` map). */
+            static const CBMDefTypeFacts no_facts;
+            const CBMDefTypeFacts *fx = d->type_facts ? d->type_facts : &no_facts;
+            int bc = 0;
+            while (d->base_classes && d->base_classes[bc])
+                bc++;
+            int mc = 0;
+            while (fx->mixins && fx->mixins[mc])
+                mc++;
+            const char **entries =
+                (const char **)cbm_arena_alloc(arena, (size_t)(bc + mc + 1) * sizeof(const char *));
+            if (entries) {
+                for (int j = 0; j < bc; j++) {
+                    const char *base = d->base_classes[j];
+                    /* Try same-module, then bare. */
+                    const char *qualified = base;
+                    if (base[0] != '\\' && !strchr(base, '.')) {
+                        qualified = cbm_arena_sprintf(arena, "%s.%s", module_qn, base);
+                    } else if (base[0] == '\\') {
+                        qualified = php_ns_to_dot(arena, base + 1);
+                    } else {
+                        qualified = php_ns_to_dot(arena, base);
                     }
+                    entries[j] = qualified;
                 }
+                for (int j = 0; j < mc; j++) {
+                    /* As the extractor qualified it where it was written
+                     * (a leading `\`): php_settle_trait reads it so. */
+                    entries[bc + j] = fx->mixins[j];
+                }
+                entries[bc + mc] = NULL;
+                size_t bk = fx->base_kinds ? strlen(fx->base_kinds) : 0;
+                bool more = bk > 0 && fx->base_kinds[bk - 1] == '+';
+                const char *kinds = NULL;
+                if ((fx->base_kinds || bc == 0) && (mc == 0 || fx->mixin_kinds)) {
+                    kinds = cbm_arena_sprintf(arena, "%.*s%s%s", (int)(bk - (more ? 1 : 0)),
+                                              fx->base_kinds ? fx->base_kinds : "",
+                                              mc ? fx->mixin_kinds : "", more ? "+" : "");
+                }
+                php_spell_supertypes(arena, &rt, entries, bc + mc, kinds);
+            }
+            php_spell_rules(arena, &rt, fx->member_rules);
+            if (strcmp(d->label, "Enum") == 0) {
+                rt.member_flags |= CBM_MEMBERS_OPEN; /* cases(), from(), tryFrom() */
             }
             cbm_registry_add_type(&reg, rt);
         }
@@ -4547,6 +4854,9 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
                 rets[1] = NULL;
             }
             rf.signature = cbm_type_func(arena, NULL, param_types, rets);
+            if (d->is_abstract) {
+                rf.flags |= CBM_FUNC_FLAG_ABSTRACTMETHOD; /* a trait's is a requirement */
+            }
             cbm_registry_add_func(&reg, rf);
         }
     }
@@ -4565,6 +4875,15 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
     /* Phase C: run the resolver. */
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
+    /* This file's types by their PHP names, for its trait uses. */
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (d->qualified_name && d->name && d->label &&
+            (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
+             strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Enum") == 0)) {
+            php_fqn_add(&ctx, result->namespace_name, d->name, d->qualified_name);
+        }
+    }
 
     /* Phase B.1: collect typed properties (declared, promoted, ctor-assigned)
      * and merge them onto the registered types. Must run after stdlib +
@@ -4592,12 +4911,16 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         ctx.use_rows = (CBMNameRows){0};
     }
 
-    /* Trait flattening registered methods after the index was built; lookups
-     * would tail-scan them. Re-index once, first-registered as above, so the
-     * answers equal those of the indexed part followed by the tail scan. */
+    /* The refinement registered methods (PHPDoc @method) after the index was
+     * built; lookups would tail-scan them. Re-index once, first-registered as
+     * above, so the answers equal those of the indexed part followed by the
+     * tail scan. */
     cbm_registry_finalize_into(&reg, &idx_arena);
 
+    php_members_begin(&ctx, &reg);
     php_lsp_process_file(&ctx, root);
+    php_members_end(&ctx);
+    php_fqn_free(&ctx);
 
     if (ctx.debug) {
         fprintf(stderr, "[php_lsp] module=%s defs=%d types=%d funcs=%d resolved=%d\n",
@@ -4675,7 +4998,25 @@ void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegi
             rt.qualified_name = d->qualified_name; /* borrowed — d outlives this call */
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
-            rt.embedded_types = php_split_pipe(arena, d->embedded_types);
+            /* The supertypes for the member lookup: bases then trait uses,
+             * one kind letter each (CBMLSPDef.supertype_kinds). */
+            const char **entries = php_split_pipe(arena, d->embedded_types);
+            const char *kinds = d->supertype_kinds;
+            size_t nk = kinds ? strlen(kinds) : 0;
+            int count = 0;
+            while (entries && entries[count]) {
+                /* A trait stays as its declaring file qualified it (a leading
+                 * `\`, php_settle_trait); a base is read as main reads it. */
+                if (!((size_t)count < nk && kinds[count] == 't')) {
+                    entries[count] = php_ns_to_dot(arena, entries[count]);
+                }
+                count++;
+            }
+            php_spell_supertypes(arena, &rt, entries, count, d->supertype_kinds);
+            php_spell_rules(arena, &rt, d->member_rules);
+            if (strcmp(d->label, "Enum") == 0) {
+                rt.member_flags |= CBM_MEMBERS_OPEN; /* cases(), from(), tryFrom() */
+            }
             if (d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = php_split_pipe(arena, d->method_names_str);
             }
@@ -4735,18 +5076,26 @@ void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegi
                 }
             }
             rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
+            if (d->is_abstract) {
+                rf.flags |= CBM_FUNC_FLAG_ABSTRACTMETHOD; /* a trait's is a requirement */
+            }
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
                 rf.receiver_type = d->receiver_type; /* borrowed */
                 /* Auto-register receiver type if cross-file def chain didn't
-                 * include it explicitly, so php_lookup_method's chain walk
-                 * has somewhere to land. */
+                 * include it explicitly, so the member lookup has somewhere
+                 * to land. Its declaration is not here: past its own members
+                 * its ancestry is unknown. */
                 if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                    static const CBMSupertype unknown_ancestry = {NULL, CBM_SUPER_EXTENDS,
+                                                                  CBM_SUPER_UNRESOLVED, 0, 0};
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
                     auto_t.qualified_name = rf.receiver_type;
                     const char *dot = strrchr(d->receiver_type, '.');
                     auto_t.short_name = dot ? dot + 1 : rf.receiver_type; /* borrowed substring */
+                    auto_t.supertypes = &unknown_ancestry;
+                    auto_t.supertype_count = 1;
                     cbm_registry_add_type(reg, auto_t);
                 }
             }
@@ -4883,6 +5232,16 @@ void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, in
 
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
+    /* The registry's types by their PHP names (each from the namespace of the
+     * file that declares it), for trait uses. */
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (d->qualified_name && d->short_name && d->label &&
+            (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
+             strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Enum") == 0)) {
+            php_fqn_add(&ctx, d->namespace_name, d->short_name, d->qualified_name);
+        }
+    }
 
     /* Caller-supplied imports register first. process_file's own AST walk
      * adds file-internal `use` declarations on top of these. */
@@ -4928,7 +5287,10 @@ void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, in
         ctx.use_rows = (CBMNameRows){0};
     }
 
+    php_members_begin(&ctx, &reg);
     php_lsp_process_file(&ctx, root);
+    php_members_end(&ctx);
+    php_fqn_free(&ctx);
     cbm_arena_destroy(&idx_arena);
 
     if (owns_tree && tree)

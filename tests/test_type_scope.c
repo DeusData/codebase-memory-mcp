@@ -553,19 +553,19 @@ static uint64_t ts_decline_work(int n, const char **reason) {
     for (int i = 0; i < n; i++) {
         char *json = (char *)malloc(256);
         snprintf(json, 256,
-                 "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
+                 "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
                  "\"Function\",\"lg\":%d,\"ty\":\"store.T%d=p.store.T%d\"}],\"reg\":[],\"py\":null}",
                  (int)CBM_LANG_GO, i, (int)CBM_LANG_GO, i, i);
         rows[i].defs_json = json;
     }
     char before_row[256];
     snprintf(before_row, sizeof(before_row),
-             "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
              "\"lg\":%d,\"al\":\"Impl\"}],\"reg\":[],\"py\":null}",
              (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
     char after_row[256];
     snprintf(after_row, sizeof(after_row),
-             "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
              "\"lg\":%d,\"al\":null}],\"reg\":[],\"py\":null}",
              (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
     const char *old_rows[] = {before_row};

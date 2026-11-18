@@ -1,0 +1,657 @@
+/*
+ * test_php_member_walk.c — PHP on the shared member lookup (lsp/member_walk.h).
+ *
+ * Each fixture is indexed through the real pipeline twice: as it is (fewer than
+ * 50 files: the sequential resolver) and padded past 50 files (the parallel
+ * resolver); both must give the same CALLS edge. The PHP each fixture encodes
+ * was run with php 8.4 (docker php:8.4-cli-bookworm, script on stdin); the
+ * method PHP runs is named in a comment beside each assertion.
+ */
+#include "../src/foundation/compat.h"
+#include "test_framework.h"
+#include "test_helpers.h"
+#include "cbm.h"
+#include <mcp/mcp.h>
+#include <store/store.h>
+#include <pipeline/pipeline.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+    const char *name;
+    const char *content;
+} PmwFile;
+
+typedef struct {
+    char tmpdir[256];
+    char dbpath[512];
+    char *project;
+    cbm_mcp_server_t *srv;
+    cbm_store_t *store;
+} PmwProj;
+
+enum { PMW_PAD = 52, PMW_FILES_MAX = 80 };
+
+static void pmw_close(PmwProj *p) {
+    if (p->store) {
+        cbm_store_close(p->store);
+    }
+    if (p->srv) {
+        cbm_mcp_server_free(p->srv);
+    }
+    free(p->project);
+    if (p->tmpdir[0]) {
+        th_rmtree(p->tmpdir);
+    }
+    if (p->dbpath[0]) {
+        unlink(p->dbpath);
+        char side[600];
+        snprintf(side, sizeof(side), "%s-wal", p->dbpath);
+        unlink(side);
+        snprintf(side, sizeof(side), "%s-shm", p->dbpath);
+        unlink(side);
+    }
+    memset(p, 0, sizeof(*p));
+}
+
+/* Write the files (plus PMW_PAD Python files when padded) and index them. */
+static bool pmw_index(PmwProj *p, const PmwFile *files, int n, bool padded) {
+    memset(p, 0, sizeof(*p));
+    snprintf(p->tmpdir, sizeof(p->tmpdir), "/tmp/cbm_pmw_XXXXXX");
+    if (!cbm_mkdtemp(p->tmpdir)) {
+        p->tmpdir[0] = '\0';
+        return false;
+    }
+    int total = padded ? n + PMW_PAD : n;
+    for (int i = 0; i < total; i++) {
+        char path[700];
+        char body[96];
+        const char *name;
+        const char *content;
+        char pad_name[64];
+        if (i < n) {
+            name = files[i].name;
+            content = files[i].content;
+        } else {
+            snprintf(pad_name, sizeof(pad_name), "pad/pad_%02d.py", i - n);
+            snprintf(body, sizeof(body), "def pad_%02d():\n    return %d\n", i - n, i - n);
+            name = pad_name;
+            content = body;
+        }
+        snprintf(path, sizeof(path), "%s/%s", p->tmpdir, name);
+        char *slash = strrchr(path, '/');
+        if (slash && slash > path + strlen(p->tmpdir)) {
+            *slash = '\0';
+            cbm_mkdir_p(path, 0755);
+            *slash = '/';
+        }
+        FILE *f = fopen(path, "wb");
+        if (!f) {
+            return false;
+        }
+        fputs(content, f);
+        fclose(f);
+    }
+    p->project = cbm_project_name_from_path(p->tmpdir);
+    if (!p->project) {
+        return false;
+    }
+    const char *home = getenv("HOME");
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home ? home : "/tmp");
+    cbm_mkdir(cache_dir);
+    snprintf(p->dbpath, sizeof(p->dbpath), "%s/%s.db", cache_dir, p->project);
+    unlink(p->dbpath);
+    p->srv = cbm_mcp_server_new(NULL);
+    if (!p->srv) {
+        return false;
+    }
+    char args[700];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", p->tmpdir);
+    char *resp = cbm_mcp_handle_tool(p->srv, "index_repository", args);
+    free(resp);
+    p->store = cbm_store_open_path(p->dbpath);
+    return p->store != NULL;
+}
+
+static bool pmw_tail(const char *qn, const char *tail) {
+    size_t q = qn ? strlen(qn) : 0;
+    size_t t = strlen(tail);
+    return q >= t && strcmp(qn + q - t, tail) == 0 && (q == t || qn[q - t - 1] == '.');
+}
+
+/* The strategy of the CALLS edge from a node whose QN ends in src_tail to one
+ * whose QN ends in tgt_tail, into out; false when there is no such edge. */
+static bool pmw_edge(PmwProj *p, const char *src_tail, const char *tgt_tail, char *out,
+                     size_t out_len) {
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    bool found = false;
+    if (out_len) {
+        out[0] = '\0';
+    }
+    if (cbm_store_find_edges_by_type(p->store, p->project, "CALLS", &edges, &n) != CBM_STORE_OK) {
+        return false;
+    }
+    for (int i = 0; i < n && !found; i++) {
+        cbm_node_t src;
+        cbm_node_t tgt;
+        if (cbm_store_find_node_by_id(p->store, edges[i].source_id, &src) != CBM_STORE_OK) {
+            continue;
+        }
+        if (cbm_store_find_node_by_id(p->store, edges[i].target_id, &tgt) != CBM_STORE_OK) {
+            cbm_node_free_fields(&src);
+            continue;
+        }
+        if (pmw_tail(src.qualified_name, src_tail) && pmw_tail(tgt.qualified_name, tgt_tail)) {
+            found = true;
+            const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+            const char *s = strstr(props, "\"strategy\":\"");
+            if (s && out_len) {
+                s += strlen("\"strategy\":\"");
+                size_t k = 0;
+                while (s[k] && s[k] != '"' && k + 1 < out_len) {
+                    out[k] = s[k];
+                    k++;
+                }
+                out[k] = '\0';
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    cbm_store_free_edges(edges, n);
+    return found;
+}
+
+static bool pmw_php_strategy(const char *s) {
+    return strncmp(s, "php_", 4) == 0;
+}
+
+/* One expectation on a fixture: the edge src -> tgt, and whether the PHP
+ * engine drew it (strategy php_*) or not; want_edge false = no edge at all. */
+typedef struct {
+    const char *src;
+    const char *tgt;
+    bool want_edge;
+    bool want_php; /* when want_edge: drawn by the PHP engine (true) or by a name guess */
+} PmwExpect;
+
+/* Index the fixture on both routes and check every expectation on each. */
+static int pmw_check(const PmwFile *files, int n, const PmwExpect *want, int nwant) {
+    int failures = 0;
+    for (int route = 0; route < 2; route++) {
+        PmwProj p;
+        if (!pmw_index(&p, files, n, route == 1)) {
+            printf("  [pmw] index failed (route %d)\n", route);
+            pmw_close(&p);
+            return failures + 1;
+        }
+        for (int i = 0; i < nwant; i++) {
+            char strategy[64];
+            bool edge = pmw_edge(&p, want[i].src, want[i].tgt, strategy, sizeof(strategy));
+            bool ok = edge == want[i].want_edge &&
+                      (!edge || pmw_php_strategy(strategy) == want[i].want_php);
+            if (!ok) {
+                printf("  [pmw] %s route: %s -> %s: edge=%d strategy=%s (want edge=%d php=%d)\n",
+                       route ? "parallel" : "sequential", want[i].src, want[i].tgt, edge,
+                       strategy, want[i].want_edge, want[i].want_php);
+                failures++;
+            }
+        }
+        pmw_close(&p);
+    }
+    return failures;
+}
+
+/* The parent's concrete method, not the interface's declaration: today's
+ * walk searched the interfaces first (a stack over the bases, last listed
+ * first). php: `$l->both()` runs Base::both. Partner: a method only the
+ * interface declares answers from the interface. */
+TEST(phpmw_parent_method_beats_interface_declaration) {
+    static const PmwFile f[] = {
+        {"src/Shapes.php", "<?php\n"
+                           "interface Ifc { public function both(): string;"
+                           " public function idecl(): string; }\n"
+                           "class Base { public function both(): string { return 'b'; } }\n"
+                           "abstract class Leaf extends Base implements Ifc {}\n"
+                           "class Caller {\n"
+                           "    public function run(Leaf $l): void { $l->both(); }\n"
+                           "    public function decl(Leaf $l): void { $l->idecl(); }\n"
+                           "}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Caller.run", "Base.both", true, true},
+        {"Caller.run", "Ifc.both", false, false},
+        {"Caller.decl", "Ifc.idecl", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 3), 0);
+    PASS();
+}
+
+/* A chain deeper than today's walk could see (it stopped after 32 types). */
+TEST(phpmw_chain_past_the_old_cap) {
+    static char src[4096];
+    size_t used = (size_t)snprintf(src, sizeof(src),
+                                   "<?php\nclass C0 { public function rootm(): int { return 0; } }\n");
+    for (int i = 1; i <= 40; i++) {
+        used += (size_t)snprintf(src + used, sizeof(src) - used, "class C%d extends C%d {}\n", i,
+                                 i - 1);
+    }
+    snprintf(src + used, sizeof(src) - used,
+             "class Caller { public function run(C40 $c): void { $c->rootm(); } }\n");
+    PmwFile f[] = {{"src/Chain.php", src}};
+    static const PmwExpect want[] = {
+        {"Caller.run", "C0.rootm", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 1), 0);
+    PASS();
+}
+
+/* A parent outside the project: the lookup passes it as an unknown place, so
+ * the interface's declaration behind it is a possible answer (prefix not
+ * complete), drawn as today's engine drew it. php: Vendor's both() runs; the
+ * edge names the declaration the call is checked against. Kept, not new:
+ * the base draws the same. Partner: the class's own method. */
+TEST(phpmw_vendor_parent_keeps_todays_answer) {
+    static const PmwFile f[] = {
+        {"src/Kid.php", "<?php\n"
+                        "namespace App;\n"
+                        "use Vendor\\Pkg\\Base;\n"
+                        "interface Ifc { public function both(): string; }\n"
+                        "class Kid extends Base implements Ifc {\n"
+                        "    public function own(): int { return 1; }\n"
+                        "}\n"
+                        "class Caller {\n"
+                        "    public function run(Kid $k): void { $k->both(); $k->own(); }\n"
+                        "}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Caller.run", "Ifc.both", true, true},
+        {"Caller.run", "Kid.own", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
+/* A trait from outside the project beside the parent's method: passed as an
+ * unknown place, the parent's method a possible answer, drawn as today (the
+ * vendor trait could shadow it; then PHP runs the trait's). Kept, not new.
+ * Partner: the same name on an unrelated class gets no edge. */
+TEST(phpmw_vendor_trait_keeps_todays_answer) {
+    static const PmwFile f[] = {
+        {"app/Models/Contact.php",
+         "<?php\nnamespace App\\Models;\nuse Vendor\\Pkg\\HasFactory;\n"
+         "class BaseModel { public function helper(): int { return 1; }"
+         " public function getName(): string { return 'b'; } }\n"
+         "class Contact extends BaseModel {\n    use HasFactory;\n"
+         "    public function run(): void { $this->helper(); $this->getName(); }\n}\n"
+         "class Other { public function getName(): string { return 'o'; } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Contact.run", "BaseModel.helper", true, true},
+        {"Contact.run", "BaseModel.getName", true, true},
+        {"Contact.run", "Other.getName", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 3), 0);
+    PASS();
+}
+
+/* `B::m insteadof A`: the trait the clause names answers (today the clause was
+ * never read and the first trait's copy won). php: B::m runs, its Y return
+ * makes pick() Y::pick. */
+TEST(phpmw_insteadof_picks_the_named_trait) {
+    static const PmwFile f[] = {
+        {"src/Pick.php", "<?php\n"
+                         "class X { public function pick(): string { return 'x'; } }\n"
+                         "class Y { public function pick(): string { return 'y'; } }\n"
+                         "trait A { public function m(): X { return new X(); } }\n"
+                         "trait B { public function m(): Y { return new Y(); } }\n"
+                         "class C {\n"
+                         "    use A, B { B::m insteadof A; }\n"
+                         "    public function run(): void { $this->m()->pick(); }\n"
+                         "}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"C.run", "Y.pick", true, true},
+        {"C.run", "X.pick", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
+/* `make as build`: the alias answers with the trait's method (today the
+ * clause was never read). php: build() runs T::make; spin() is Z::spin.
+ * Partner: the original name answers too. */
+TEST(phpmw_trait_alias_answers) {
+    static const PmwFile f[] = {
+        {"src/Alias.php", "<?php\n"
+                          "class Z { public function spin(): int { return 1; } }\n"
+                          "class Q { public function spin(): int { return 2; } }\n"
+                          "trait T { public function make(): Z { return new Z(); } }\n"
+                          "class C {\n"
+                          "    use T { make as build; }\n"
+                          "    public function viaAlias(): void { $this->build()->spin(); }\n"
+                          "    public function viaName(): void { $this->make()->spin(); }\n"
+                          "}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"C.viaAlias", "Z.spin", true, true},
+        {"C.viaName", "Z.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
+/* A trait used by a class declared in another file: today the cross-file pass
+ * knew nothing of it (trait uses were not extracted). The caller's per-file
+ * registry holds its own module and the modules it imports, so the trait
+ * answers when it is declared there (a trait in a module the caller does not
+ * import stays unknown, as a parent class there does). php: widget() runs
+ * HasWidget::widget, spin() is Widget::spin. */
+TEST(phpmw_cross_file_trait_member) {
+    static const PmwFile f[] = {
+        {"lib/User.php", "<?php\nnamespace Lib;\n"
+                         "class Widget { public function spin(): int { return 1; } }\n"
+                         "trait HasWidget { public function widget(): Widget"
+                         " { return new Widget(); } }\n"
+                         "class User { use HasWidget; }\n"},
+        {"lib/Gadget.php", "<?php\nnamespace Lib;\n"
+                           "class Gadget { public function spin(): int { return 2; } }\n"},
+        {"app/Run.php", "<?php\nnamespace App;\n"
+                        "use Lib\\User;\n"
+                        "class Runner {\n"
+                        "    public function run(User $u): void { $u->widget()->spin(); }\n"
+                        "}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Runner.run", "Widget.spin", true, true},
+        {"Runner.run", "Gadget.spin", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 3, want, 2), 0);
+    PASS();
+}
+
+/* A trait's abstract method is a requirement the parent satisfies. php:
+ * `$this->need()` in a class using the trait runs Base::need. (With no
+ * implementation anywhere the declaration answers: member_walk's
+ * member_walk_mixin_requirement_defers.) */
+TEST(phpmw_trait_abstract_method_is_a_requirement) {
+    static const PmwFile f[] = {
+        {"src/Req.php", "<?php\n"
+                        "trait Needs { abstract public function need(): int;"
+                        " public function useIt(): int { return $this->need(); } }\n"
+                        "class Base { public function need(): int { return 1; } }\n"
+                        "class Kid extends Base { use Needs;"
+                        " public function run(): int { return $this->need(); } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Kid.run", "Base.need", true, true},
+        {"Kid.run", "Needs.need", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
+/* A trait spelled in another file names, there, a vendor trait; a project
+ * trait with the same short name is not it (F2, fx/vtrait; php: the vendor
+ * trait runs, `Right`, never Wrong::spin). Nothing is drawn from the wrong
+ * trait. Partner: a class whose file imports the project trait gets its
+ * member, typed. */
+TEST(phpmw_trait_resolved_where_written) {
+    static const PmwFile f[] = {
+        {"src/Other/Stuff.php",
+         "<?php\nnamespace App\\Other;\n"
+         "trait HasThing { public function thing(): Wrong { return new Wrong(); } }\n"
+         "class Wrong { public function spin() { return 'Wrong'; } }\n"
+         "class Helper { public static function make() { return 1; } }\n"},
+        {"src/Models/Model.php", "<?php\nnamespace App\\Models;\nuse Vendor\\Pkg\\HasThing;\n"
+                                 "class Model { use HasThing; }\n"},
+        {"src/Models/Good.php", "<?php\nnamespace App\\Models;\nuse App\\Other\\HasThing;\n"
+                                "class Good { use HasThing; }\n"},
+        {"src/Other2/Right.php", "<?php\nnamespace App\\Other2;\n"
+                                 "class Right { public function spin() { return 'Right'; } }\n"},
+        {"src/Http/Caller.php",
+         "<?php\nnamespace App\\Http;\nuse App\\Models\\Model;\nuse App\\Models\\Good;\n"
+         "use App\\Other\\Helper;\n"
+         "class Caller {\n"
+         "    public function run(Model $m) { Helper::make(); return $m->thing()->spin(); }\n"
+         "    public function ok(Good $g) { return $g->thing()->spin(); }\n"
+         "}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Caller.run", "Wrong.spin", false, false},
+        {"Caller.ok", "Wrong.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 5, want, 2), 0);
+    PASS();
+}
+
+/* A trait's abstract method beside a vendor trait: the vendor trait may
+ * implement it (php: fx/req2, `Zv`, its m runs), so the requirement itself
+ * answers, as today's flattened copy did, and the parent's m is not reached
+ * (F3). Partner: the requirement's return type still types the chained call,
+ * as on main. */
+TEST(phpmw_requirement_beside_vendor_trait) {
+    static const PmwFile f[] = {
+        {"src/Req2.php",
+         "<?php\nnamespace App\\Req2;\nuse Vendor\\Pkg\\VTrait;\n"
+         "class Zi { public function spin() { return 'Zi'; } }\n"
+         "class Zp extends Zi { public function spin() { return 'Zp'; } }\n"
+         "class Zv extends Zp { public function spin() { return 'Zv'; } }\n"
+         "trait NeedM { abstract public function m(): Zi; }\n"
+         "class P { public function m(): Zp { return new Zp; } }\n"
+         "class C extends P {\n    use NeedM, VTrait;\n"
+         "    public function run() { return $this->m()->spin(); }\n}\n"
+         "class QCaller { public function go(C $c) { return $c->m()->spin(); } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"C.run", "P.m", false, false},
+        {"C.run", "Zp.spin", false, false},
+        {"C.run", "Zi.spin", true, true},
+        {"QCaller.go", "P.m", false, false},
+        {"QCaller.go", "Zi.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 5), 0);
+    PASS();
+}
+
+/* Behind a vendor parent both interfaces declare m (fx/twoifc): a possible
+ * answer, drawn because today's engine drew one here; the walk's order (the
+ * first interface, as php's member table) stands where the old stack took
+ * the last (F5, an accepted change). Partner: the other declaration gets no
+ * edge. */
+TEST(phpmw_possible_answer_in_the_walks_order) {
+    static const PmwFile f[] = {
+        {"src/Two.php", "<?php\nnamespace App\\Two;\nuse Vendor\\Pkg\\VBase;\n"
+                        "interface I1 { public function m(): int; }\n"
+                        "interface I2 { public function m(): int; }\n"
+                        "class C extends VBase implements I1, I2 {}\n"
+                        "class TCaller { public function go(C $c) { return $c->m(); } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"TCaller.go", "I1.m", true, true},
+        {"TCaller.go", "I2.m", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
+/* A possible answer the walk reaches through a trait's trait is beyond what
+ * today's lookup answered: nothing is drawn from it (F5). Partner: the same
+ * requirement through a direct trait is the copy today's flattening made, its
+ * return type typing the chained call. */
+TEST(phpmw_possible_answer_only_where_today_answered) {
+    static const PmwFile f[] = {
+        {"src/Deep.php", "<?php\nnamespace App;\nuse Vendor\\Pkg\\VBase;\n"
+                         "class Zb { public function spin(): int { return 1; } }\n"
+                         "class Decoy { public function spin(): int { return 2; } }\n"
+                         "trait B { abstract public function m(): Zb; }\n"
+                         "trait A { use B; }\n"
+                         "class Deep extends VBase {\n    use A;\n"
+                         "    public function run(): void { $this->m()->spin(); }\n}\n"
+                         "class Flat extends VBase {\n    use B;\n"
+                         "    public function run(): void { $this->m()->spin(); }\n}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Deep.run", "Zb.spin", false, false},
+        {"Flat.run", "Zb.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
+/* A 40,000-deep chain of traits using traits (F1, fx/deep40k): no worker
+ * crashes, the file is indexed on both routes; the member at the bottom is the
+ * using class's copy (main's guess draws the call, as on main) and its return
+ * type types the chained call (php: Zd::spin runs; main guessed the pair). */
+TEST(phpmw_trait_chain_40k) {
+    enum { DEPTH = 40000 };
+    size_t cap = (size_t)DEPTH * 40 + 1024;
+    char *src = (char *)malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t used = (size_t)snprintf(src, cap,
+                                   "<?php\nnamespace App\\Deep;\n"
+                                   "class Zd { public function spin() { return 'Zd'; } }\n"
+                                   "trait T0 { public function m0(): Zd { return new Zd; } }\n");
+    for (int i = 1; i <= DEPTH; i++) {
+        used += (size_t)snprintf(src + used, cap - used, "trait T%d { use T%d; }\n", i, i - 1);
+    }
+    snprintf(src + used, cap - used,
+             "class D { use T%d; public function run() { return $this->m0()->spin(); } }\n"
+             "class DCaller { public function go(D $d) { return $d->m0()->spin(); } }\n",
+             DEPTH);
+    PmwFile f[] = {{"src/Deep.php", src}};
+    static const PmwExpect want[] = {
+        {"D.run", "T0.m0", true, false},
+        {"D.run", "Zd.spin", true, true},
+        {"DCaller.go", "Zd.spin", true, true},
+    };
+    int failures = pmw_check(f, 1, want, 3);
+    free(src);
+    ASSERT_EQ(failures, 0);
+    PASS();
+}
+
+/* The extractor records what the lookup needs and INHERITS does not take:
+ * the kind of each base, the traits, and their rules. */
+TEST(phpmw_extractor_records_kinds_traits_rules) {
+    const char *src = "<?php\n"
+                      "interface I1 {} interface I2 {}\n"
+                      "trait T1 { public function m() {} } trait T2 { public function m() {} }\n"
+                      "class P {}\n"
+                      "class C extends P implements I1, \\Ns\\I2 {\n"
+                      "    use T1, T2 { T1::m insteadof T2; T2::m as m2; m as protected; }\n"
+                      "    use \\Ns\\T3;\n"
+                      "}\n"
+                      "interface J extends I1, I2 {}\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "test", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *c = NULL;
+    const CBMDefinition *j = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "C") == 0) {
+            c = d;
+        } else if (d->name && strcmp(d->name, "J") == 0) {
+            j = d;
+        }
+    }
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(j);
+    ASSERT_NOT_NULL(c->type_facts);
+    ASSERT_NOT_NULL(j->type_facts);
+    const CBMDefTypeFacts *cf = c->type_facts;
+    const CBMDefTypeFacts *jf = j->type_facts;
+    ASSERT_STR_EQ(cf->base_kinds, "eii");
+    ASSERT_NOT_NULL(cf->mixins);
+    /* Traits as the file names them (global namespace here). */
+    ASSERT_STR_EQ(cf->mixins[0], "\\T1");
+    ASSERT_STR_EQ(cf->mixins[1], "\\T2");
+    ASSERT_STR_EQ(cf->mixins[2], "\\Ns\\T3");
+    ASSERT_NULL(cf->mixins[3]);
+    ASSERT_STR_EQ(cf->mixin_kinds, "ttt");
+    ASSERT_STR_EQ(cf->member_rules, "x \\T1 m \\T2;a \\T2 m m2");
+    /* Traits stay out of base_classes (INHERITS). */
+    ASSERT_STR_EQ(c->base_classes[0], "P");
+    ASSERT_NULL(c->base_classes[3]);
+    ASSERT_STR_EQ(jf->base_kinds, "ee");
+    ASSERT_NULL(jf->mixins);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A trait's name is qualified where the class is written, by PHP's own rule:
+ * a `use` alias (plain, `as`, grouped), else the namespace; a bracketed
+ * namespace has its own uses; a function `use` aliases no class. */
+TEST(phpmw_extractor_qualifies_trait_names) {
+    const char *src = "<?php\n"
+                      "namespace App\\Models;\n"
+                      "use Vendor\\Pkg\\HasThing;\n"
+                      "use App\\Traits\\{Greets, Waves as W};\n"
+                      "use function App\\Helpers\\Local;\n"
+                      "class M { use HasThing, Greets, W, Local, Sub\\Deep; }\n"
+                      "namespace Other;\n"
+                      "class N { use HasThing; }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "test", "m.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    const CBMDefTypeFacts *mf = NULL;
+    const CBMDefTypeFacts *nf = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "M") == 0) {
+            mf = d->type_facts;
+        } else if (d->name && strcmp(d->name, "N") == 0) {
+            nf = d->type_facts;
+        }
+    }
+    ASSERT_NOT_NULL(mf);
+    ASSERT_NOT_NULL(nf);
+    ASSERT_STR_EQ(mf->mixins[0], "\\Vendor\\Pkg\\HasThing");
+    ASSERT_STR_EQ(mf->mixins[1], "\\App\\Traits\\Greets");
+    ASSERT_STR_EQ(mf->mixins[2], "\\App\\Traits\\Waves");
+    ASSERT_STR_EQ(mf->mixins[3], "\\App\\Models\\Local");
+    ASSERT_STR_EQ(mf->mixins[4], "\\App\\Models\\Sub\\Deep");
+    /* `namespace Other;` starts anew: no alias carries over. */
+    ASSERT_STR_EQ(nf->mixins[0], "\\Other\\HasThing");
+    cbm_free_result(r);
+    const char *br = "<?php\n"
+                     "namespace A { use X\\Y; }\n"
+                     "namespace B { use Q\\Y; class K { use Y; } }\n";
+    r = cbm_extract_file(br, (int)strlen(br), CBM_LANG_PHP, "test", "b.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    const CBMDefTypeFacts *kf = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "K") == 0) {
+            kf = d->type_facts;
+        }
+    }
+    ASSERT_NOT_NULL(kf);
+    ASSERT_STR_EQ(kf->mixins[0], "\\Q\\Y");
+    cbm_free_result(r);
+    PASS();
+}
+
+SUITE(php_member_walk) {
+    RUN_TEST(phpmw_extractor_records_kinds_traits_rules);
+    RUN_TEST(phpmw_extractor_qualifies_trait_names);
+    RUN_TEST(phpmw_trait_resolved_where_written);
+    RUN_TEST(phpmw_requirement_beside_vendor_trait);
+    RUN_TEST(phpmw_possible_answer_in_the_walks_order);
+    RUN_TEST(phpmw_possible_answer_only_where_today_answered);
+    RUN_TEST(phpmw_trait_chain_40k);
+    RUN_TEST(phpmw_parent_method_beats_interface_declaration);
+    RUN_TEST(phpmw_chain_past_the_old_cap);
+    RUN_TEST(phpmw_vendor_parent_keeps_todays_answer);
+    RUN_TEST(phpmw_vendor_trait_keeps_todays_answer);
+    RUN_TEST(phpmw_insteadof_picks_the_named_trait);
+    RUN_TEST(phpmw_trait_alias_answers);
+    RUN_TEST(phpmw_cross_file_trait_member);
+    RUN_TEST(phpmw_trait_abstract_method_is_a_requirement);
+}

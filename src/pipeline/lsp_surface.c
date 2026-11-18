@@ -48,8 +48,12 @@
  * inputs (the def's type texts, the file's imports in "dl" / "py"), which
  * the planner's probe computes exactly as a full index does; the outputs
  * also depend on other files' type definitions, which the planner gates
- * itself (closure_identity_decline, pipeline_incremental.c). */
-enum { SURFACE_CODEC_VERSION = 5 };
+ * itself (closure_identity_decline, pipeline_incremental.c).
+ * 6: defs carry their supertypes' kinds in "sk" and their mixin rules in "mr"
+ * (the shared member lookup, PHP); a version-5 surface has neither and must be
+ * re-extracted. Both are inputs of the def itself, compared like its other
+ * fields. */
+enum { SURFACE_CODEC_VERSION = 6 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -651,6 +655,8 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         add_str_or_null(doc, o, "al", d->alias_target);
+        add_str_or_null(doc, o, "sk", d->supertype_kinds);
+        add_str_or_null(doc, o, "mr", d->member_rules);
         /* Stored for the routes that resolve against this row without
          * re-extracting it; never hashed (see SURFACE_CODEC_VERSION). */
         if (identities && d->type_scope) {
@@ -1023,6 +1029,8 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         d->alias_target = arena_str_or_null(arena, yyjson_obj_get(o, "al"));
         d->type_scope = arena_str_or_null(arena, yyjson_obj_get(o, "ty"));
+        d->supertype_kinds = arena_str_or_null(arena, yyjson_obj_get(o, "sk"));
+        d->member_rules = arena_str_or_null(arena, yyjson_obj_get(o, "mr"));
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */

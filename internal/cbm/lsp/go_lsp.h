@@ -119,6 +119,15 @@ typedef struct {
      * "spelling=QN|spelling=QN". Read with cbm_type_scope_find (type_rep.h).
      * NULL = no name needs one; the engine then qualifies as before. */
     const char *type_scope;
+    /* Member lookup (member_walk.h): one kind letter per embedded_types entry
+     * ('e' extends, 'i' implements, 't' trait use), plus a trailing '+' when
+     * the extractor left bases unrecorded; NULL = the entries' kinds are
+     * unknown. PHP today (embedded_types then lists the bases, then the
+     * traits). */
+    const char *supertype_kinds;
+    /* The rules the type's mixin uses apply to their members, as
+     * CBMDefTypeFacts.member_rules (PHP `insteadof` / `as`). NULL = none. */
+    const char *member_rules;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.
