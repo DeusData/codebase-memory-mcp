@@ -1860,6 +1860,7 @@ extern void suite_activation_transaction(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
+extern void suite_type_scope(void);
 extern void suite_call_reference_language_complex_contract(void);
 extern void suite_repro_call_scope_usages(void);
 extern void suite_repro_call_argument_usages(void);
@@ -2747,6 +2748,9 @@ int main(int argc, char **argv) {
 
     /* Parallel pipeline */
     RUN_SELECTED_SUITE(parallel);
+
+    /* Declared types resolved in the scope that wrote them */
+    RUN_SELECTED_SUITE(type_scope);
 
     /* Promoted lexical-resolution regression contracts. */
     RUN_SELECTED_SUITE(repro_lexical_binding_precision);

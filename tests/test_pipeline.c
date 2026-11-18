@@ -2416,6 +2416,97 @@ TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
     PASS();
 }
 
+/* IMPORTS edges the Ansible pass drew (via ansible); -1 on a query error. */
+static int ansible_import_edges(cbm_store_t *s, const char *project) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM edges WHERE project=?1 AND type='IMPORTS' AND "
+                           "json_extract(properties,'$.via')='ansible'",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* A playbook extracts no imports of its own: its role and include edges come
+ * from the Ansible pass, so the semantic pass builds its import map from those
+ * IMPORTS edges (the slow path). Those keys were libc copies released through
+ * the memory core, and on macOS, where the core's allocator is not the libc
+ * one, the index worker crashed in the semantic pass on every repository of 50
+ * files or fewer holding a role or an include (any repository at one worker).
+ * Here the memory core's own count binds, whatever the allocator and wherever
+ * the string landed: a block the core takes back without having handed it out
+ * leaves its class below where it started. A first index of the same tree
+ * warms what the process builds once and keeps (the semantic pass's
+ * pretrained token table is one), so the readings are taken around a second,
+ * identical full index and an incremental re-index of the edited playbook
+ * (the incremental route runs the same pass for changed files): the verdict
+ * does not depend on what ran before in the process. */
+TEST(pipeline_semantic_import_map_keys_come_from_the_memory_core) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "site.yml",
+                    "- hosts: localhost\n  roles:\n    - web\n  tasks:\n"
+                    "    - include_tasks: tasks/setup.yml\n");
+    write_temp_file(g_tmpdir, "roles/web/tasks/main.yml",
+                    "- name: Say hi\n  debug:\n    msg: hi\n");
+    write_temp_file(g_tmpdir, "tasks/setup.yml", "- name: Setup\n  debug:\n    msg: setup\n");
+    char warm_path[512];
+    snprintf(warm_path, sizeof(warm_path), "%s/semantic_keys_warm.db", g_tmpdir);
+    int warm_rc = -1;
+    cbm_pipeline_t *warm = cbm_pipeline_new(g_tmpdir, warm_path, CBM_MODE_FULL);
+    if (warm) {
+        warm_rc = cbm_pipeline_run(warm);
+        cbm_pipeline_free(warm);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/semantic_keys.db", g_tmpdir);
+
+    cbm_mem_class_flush_thread();
+    size_t blocks_before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_SEMANTIC);
+    size_t bytes_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+    int full_rc = -1;
+    int incr_rc = -1;
+    int imports = -1;
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    if (p1) {
+        full_rc = cbm_pipeline_run(p1);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        if (s) {
+            imports = ansible_import_edges(s, cbm_pipeline_project_name(p1));
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p1);
+    }
+    write_temp_file(g_tmpdir, "site.yml",
+                    "- hosts: localhost\n  roles:\n    - web\n  tasks:\n"
+                    "    - include_tasks: tasks/setup.yml\n    - debug:\n        msg: edited\n");
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    if (p2) {
+        incr_rc = cbm_pipeline_run(p2);
+        cbm_pipeline_free(p2);
+    }
+    cbm_mem_class_flush_thread();
+    size_t blocks_after = cbm_mem_class_live_blocks(CBM_MEM_CLASS_SEMANTIC);
+    size_t bytes_after = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+    teardown_test_repo();
+
+    ASSERT_EQ(warm_rc, 0);
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(incr_rc, 0);
+    /* The playbook's role and include are the IMPORTS edges the slow path reads. */
+    ASSERT_TRUE(imports >= 2);
+    /* Every SEMANTIC block taken back was handed out: the class is where it began. */
+    ASSERT_TRUE(blocks_after == blocks_before);
+    ASSERT_TRUE(bytes_after == bytes_before);
+    PASS();
+}
+
 /* The CALLS edges an Ansible notify draws (via notify); -1 on a query error. */
 static int ansible_notify_calls(cbm_store_t *s, const char *project) {
     sqlite3_stmt *st = NULL;
@@ -32548,7 +32639,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":4,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":5,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -32679,24 +32770,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"v\":4,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"v\":5,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -32716,7 +32807,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -32744,7 +32835,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":4,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":5,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -32837,7 +32928,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             /* The row is the versioned codec envelope (codec version 4) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -35535,6 +35626,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
     RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
+    RUN_TEST(pipeline_semantic_import_map_keys_come_from_the_memory_core);
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);

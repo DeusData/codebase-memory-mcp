@@ -15,8 +15,11 @@
  * events and unknown effects; other languages carry an explicit null.
  * Field order and array order are fixed by the writer, so byte equality of the
  * serialization is surface equality; the sha256 of these bytes is the
- * stored surface_sha. Rows written by a different codec version fail the
- * "v" check on load and route the run to a full rebuild.
+ * stored surface_sha. A def's declared-type identities ("ty", type_scope.h)
+ * are stored in the row but are not part of the hashed bytes nor of the
+ * Python comparison: they are not file content (see
+ * cbm_lsp_surface_identity_decline). Rows written by a different codec
+ * version fail the "v" check on load and route the run to a full rebuild.
  */
 #ifndef CBM_PIPELINE_LSP_SURFACE_H
 #define CBM_PIPELINE_LSP_SURFACE_H
@@ -67,6 +70,27 @@ int cbm_lsp_surface_python_namespace_from_json(CBMArena *arena, const char *json
  * includes definition properties until a narrower dependency closure is proven.
  */
 int cbm_lsp_surface_python_change(const char *old_json, const char *new_json);
+
+/* Whether a closure repair keeps every stored declared-type identity valid.
+ * An identity depends on the writing file's own content, which the surface
+ * hash covers, and on which project definitions are types of the label its
+ * language row allows; a repair cannot recompute the second for files it does
+ * not re-extract, so the planner declines when it changes:
+ *   - "declared_types_changed": a changed file now has a type definition (a
+ *     QN of a type label of its language's row) it did not have;
+ *   - "identity_target_changed": a type definition some stored identity names
+ *     left a changed or deleted file, or its definition changed (an alias
+ *     that became a defined type, another label, other fields or embedded
+ *     types): the files resolving through that identity are not the type's
+ *     dependents in the graph.
+ * old_rows/new_rows: the stored and the fresh row of each changed file whose
+ * surface changed (new NULL for a deleted file); stored: the whole previous
+ * generation. Returns NULL when the repair keeps them, else the reason. *work
+ * (may be NULL) counts the defs and identity entries examined. */
+const char *cbm_lsp_surface_identity_decline(const char *const *old_rows,
+                                             const char *const *new_rows, int changed_count,
+                                             const cbm_lsp_surface_row_t *stored, int stored_count,
+                                             uint64_t *work);
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* Bracket each file callback, including skipped/error rows. Install only with

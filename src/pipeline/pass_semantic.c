@@ -154,9 +154,17 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             start += strlen("\"local_name\":\"");
             const char *end = strchr(start, '"');
             if (end && end > start) {
-                keys[count] = cbm_strndup(start, end - start);
-                vals[count] = target->qualified_name;
-                count++;
+                /* free_import_map releases every key through the memory core,
+                 * so this key comes from it too, like the fast path's. */
+                size_t len = (size_t)(end - start);
+                char *key = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, len + SKIP_ONE);
+                if (key) {
+                    memcpy(key, start, len);
+                    key[len] = '\0';
+                    keys[count] = key;
+                    vals[count] = target->qualified_name;
+                    count++;
+                }
             }
         }
     }

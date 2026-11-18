@@ -7228,6 +7228,10 @@ static bool c_lsp_cross_with_registry_run(CBMArena *arena, const char *source, i
                                           const CBMFileResult *test_owners,
                                           CBMLSPStatus *status) {
     *status = CBM_LSP_COMPLETE;
+    /* The retained or re-read source is the file on disk; read it the way the
+     * per-file extract did (#1546), so the owner digest, the cached tree and
+     * node text agree. */
+    source = cbm_c_mask_crlf_splices(arena, source, source_len);
     if ((test_owners && test_owners->has_test_definition_owners &&
          source_origin != CBM_SOURCE_ORIGIN_RAW) ||
         !cbm_test_definition_owners_match(test_owners, source, source_len, cpp_mode,
@@ -7319,6 +7323,9 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
                             CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
                             CBMLSPStatus *status) {
     *status = CBM_LSP_COMPLETE;
+    /* Same bytes as the per-file extract (#1546); see
+     * c_lsp_cross_with_registry_run. */
+    source = cbm_c_mask_crlf_splices(arena, source, source_len);
     if ((test_owners && test_owners->has_test_definition_owners &&
          source_origin != CBM_SOURCE_ORIGIN_RAW) ||
         !cbm_test_definition_owners_match(test_owners, source, source_len, cpp_mode,

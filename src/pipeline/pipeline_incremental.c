@@ -71,10 +71,33 @@ cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void) {
     return (cbm_incremental_route_t)atomic_load(&g_incr_test_last_route);
 }
 
+/* The last closure plan's counters (an accepted plan) or decline reason. */
+static atomic_int g_incr_test_plan_files = -1;
+static atomic_int g_incr_test_plan_surface_changed = -1;
+static atomic_int g_incr_test_plan_dependents = -1;
+static _Atomic(const char *) g_incr_test_plan_decline = NULL;
+
+cbm_incremental_closure_plan_t cbm_pipeline_incremental_test_last_closure_plan(void) {
+    return (cbm_incremental_closure_plan_t){.files = atomic_load(&g_incr_test_plan_files),
+                                            .surface_changed =
+                                                atomic_load(&g_incr_test_plan_surface_changed),
+                                            .dependents = atomic_load(&g_incr_test_plan_dependents),
+                                            .decline = atomic_load(&g_incr_test_plan_decline)};
+}
+
+static void incr_test_note_plan(int files, int surface_changed, int dependents,
+                                const char *decline) {
+    atomic_store(&g_incr_test_plan_files, files);
+    atomic_store(&g_incr_test_plan_surface_changed, surface_changed);
+    atomic_store(&g_incr_test_plan_dependents, dependents);
+    atomic_store(&g_incr_test_plan_decline, decline);
+}
+
 void cbm_pipeline_incremental_test_reset_faults(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, false);
     atomic_store(&g_incr_test_force_legacy_partial, false);
     atomic_store(&g_incr_test_last_route, CBM_INCREMENTAL_ROUTE_NONE);
+    incr_test_note_plan(-1, -1, -1, NULL);
     cbm_pipeline_persist_test_reset_faults();
 }
 
@@ -1470,7 +1493,11 @@ static void free_incremental_result_cache(CBMFileResult **cache, int count) {
  * recomputed; a surface change pulls in exactly the files with edges into
  * it. Per-file extraction is a pure function of file content, so an
  * unchanged dependent can never be surface-changed in turn — the closure is
- * structurally depth-1 and needs no fixpoint. Every uncertain case declines
+ * structurally depth-1 and needs no fixpoint. The one part of a stored row
+ * that is not file content, its declared-type identities (type_scope.h), is
+ * kept out of the hash and stays valid because the plan declines whenever the
+ * type definitions they depend on change (cbm_lsp_surface_identity_decline).
+ * Every uncertain case declines
  * to a FULL rebuild: new files, added definition names (yesterday's graph
  * cannot know tomorrow's referencers), virtual/config manifest entries,
  * missing or unreadable surface rows, dependents outside discovery, or a
@@ -3235,9 +3262,13 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
      * query. Python changes require a full rebuild; other surface changes and
      * deletions seed the dependent query. */
     int n_surface_changed = 0;
-    /* dep_targets, then the body-edited files (body_targets) in the same block */
-    const char **dep_targets =
-        (const char **)calloc((size_t)(n_changed + n_deleted + n_changed), sizeof(char *));
+    /* dep_targets, then the body-edited files (body_targets), then the stored
+     * and fresh rows of every surface-changed or deleted file for the
+     * declared-type identity gate (identity_old / identity_new; fresh NULL
+     * for a deleted file), in the same block */
+    int identity_cap = n_changed + n_deleted + 1;
+    const char **dep_targets = (const char **)calloc(
+        (size_t)(n_changed + n_deleted + n_changed + 2 * identity_cap), sizeof(char *));
     if (!dep_targets) {
         cbm_ht_free(rows_by_path);
         decline = "alloc";
@@ -3245,6 +3276,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     body_targets = dep_targets + n_changed + n_deleted;
     int dep_target_count = 0;
+    const char **identity_old = body_targets + n_changed;
+    const char **identity_new = identity_old + identity_cap;
+    int identity_count = 0;
     /* The first file that declines the closure stops both loops; the one exit
      * below releases dep_targets and the row index for every reason. */
     const char *why = NULL;
@@ -3281,6 +3315,8 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         } else {
             n_surface_changed++;
             dep_targets[dep_target_count++] = changed_paths[i];
+            identity_old[identity_count] = stored_row->defs_json;
+            identity_new[identity_count++] = fresh_row->defs_json;
         }
     }
     bool gone_scope_changed = false; /* a deleted file takes its declarations along */
@@ -3294,8 +3330,19 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         if (gone && !doc_scope_repairable(gone->defs_json, NULL, removed_names)) {
             gone_scope_changed = true;
         }
+        if (gone) {
+            identity_old[identity_count] = gone->defs_json;
+            identity_new[identity_count++] = NULL;
+        }
     }
     cbm_ht_free(rows_by_path);
+    /* Declared-type identities (type_scope.h) are not file content: a repair
+     * keeps them only while the project's type definitions they depend on
+     * stay as they were. */
+    if (!why && identity_count > 0) {
+        why = cbm_lsp_surface_identity_decline(identity_old, identity_new, identity_count,
+                                               plan->stored_rows, plan->stored_count, NULL);
+    }
 
     /* A body edit keeps a file's names but moves its lines: a document that
      * bound a reference by lines (`file#L3-L9`, :lines:) would keep a stale
@@ -3308,7 +3355,7 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
                  (body_target_count > 0 &&
                   cbm_store_get_dependent_files(store, project, body_targets, body_target_count,
                                                 &line_docs, &line_doc_count) != CBM_STORE_OK));
-    free(dep_targets); /* body_targets with it */
+    free(dep_targets); /* body_targets and the identity rows with it */
     body_targets = NULL;
     if (why) {
         decline = why;
@@ -3403,6 +3450,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     cbm_log_info("incremental.closure_plan_done", "closure", itoa_buf(plan->count),
                  "doc_link_dependents", itoa_buf(n_row_dependents), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    incr_test_note_plan(plan->count, n_surface_changed, dependent_count, NULL);
+#endif
 
 done:
     cbm_path_alias_collection_free(plan_aliases);
@@ -3420,6 +3470,9 @@ done:
     if (decline) {
         cbm_log_info("incremental.closure_decline", "reason", decline, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        incr_test_note_plan(-1, -1, -1, decline);
+#endif
         cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
         int fatal_rc = plan->fatal_rc;
         cbm_store_free_doc_links(plan->doc_rows, plan->doc_row_count);
