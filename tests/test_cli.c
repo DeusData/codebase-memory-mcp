@@ -1018,6 +1018,24 @@ static unsigned char *create_test_targz(const char *filename, const unsigned cha
     return gz;
 }
 
+/* Two update tests package a native executable as the release, and on macOS
+ * that executable is this test runner. An ASan runner that carries every
+ * vendored grammar sits right at the updater's 500 MiB decompression limit;
+ * the ObjectScript v1.11.0 parse tables took the CI runners past it, and the
+ * archive was refused ("binary not found in archive") before the step under
+ * test ran. The limit has its own test; these tests only need their archive
+ * accepted, so the limit is sized to the fixture. Twice the inflated tar can
+ * never refuse it: the decompression buffer only doubles from below the
+ * inflated size. cbm_cli_set_decompress_max_for_test(0) restores the limit.
+ * Both tests use the tar path, which is POSIX-only. */
+#ifndef _WIN32
+static void cli_update_fit_decompress_limit(long fixture_size) {
+    /* create_test_targz adds a header block, block padding and two end blocks. */
+    enum { TARGZ_OVERHEAD = 4 * 512 };
+    cbm_cli_set_decompress_max_for_test(((size_t)fixture_size + TARGZ_OVERHEAD) * 2U);
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Mandatory daemon activation safety
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3618,6 +3636,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
+    cli_update_fit_decompress_limit(native_size);
     char *argv[] = {"--force"};
     int rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -3643,6 +3662,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     cbm_cli_set_activation_ops_for_test(&failure_ops);
     int config_failure_rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_decompress_max_for_test(0);
     struct stat updated_status;
     bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
                             updated_status.st_size != (off_t)(sizeof(old_binary) - 1U);
@@ -3760,6 +3780,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
+    cli_update_fit_decompress_limit(native_size);
     FILE *capture = tmpfile();
     int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
     int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
@@ -3785,6 +3806,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
         close(saved_stderr);
     }
     cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_decompress_max_for_test(0);
     char output[16384] = {0};
     if (capture) {
         rewind(capture);
