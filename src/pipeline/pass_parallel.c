@@ -1361,6 +1361,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         /* Export XML uses the same cache slot as every physical file, so its
          * generated classes are composed before entering the common registry
          * and resolution lifecycle. */
+        CBMIncludeScope include_scope = cbm_pipeline_include_scope(ec->pctx);
         CBMFileResult *result =
             cbm_pipeline_test_force_extract_null(ec->pctx, fi->language) ? NULL
             : fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT
@@ -1370,7 +1371,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 : cbm_extract_file_ex_with_tests(source, source_len, fi->language, ec->project_name,
                                                  fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL,
                                                  ec->macro_table, ec->return_type_table,
-                                                 ec->pctx->test_declarations, ec->repo_path);
+                                                 ec->pctx->test_declarations, &include_scope);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 

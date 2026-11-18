@@ -458,6 +458,10 @@ typedef struct cbm_tf_release {
 typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
+    /* The rel_path of every file of the run's whole discovery (keys borrowed
+     * from its file list), also when a pass is handed only some of them: the
+     * files a C-family #include may resolve to (#2993). NULL: none resolves. */
+    const CBMHashTable *indexed_files;
     /* An incremental run: the unchanged files whose earlier run declared
      * image builds (docker build ...), read again by the shell pass, as
      * those edges are recomputed whole. Borrowed; NULL in a full run. */
@@ -576,6 +580,13 @@ typedef struct {
     int tf_release_n;
     int tf_release_cap;
 } cbm_pipeline_ctx_t;
+
+/* The set for cbm_pipeline_ctx_t.indexed_files: every rel_path of `files`
+ * (keys borrowed; free with cbm_ht_free). NULL on allocation failure. */
+CBMHashTable *cbm_pipeline_indexed_files_new(const cbm_file_info_t *files, int file_count);
+/* The #include scope of a pass's C-family extraction: the run's repository
+ * root and its indexed files. */
+CBMIncludeScope cbm_pipeline_include_scope(const cbm_pipeline_ctx_t *ctx);
 
 /* Origin-aware LSP returns only success/failure. Never retain partial output
  * when its configured owner proof cannot be applied to current source. */

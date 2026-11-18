@@ -461,6 +461,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_list(c, &r->constants);
     cr_list(c, &r->global_vars);
     cr_list(c, &r->macros);
+    cr_list(c, &r->included_files);
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
     cr_str(c, &r->module_doc);

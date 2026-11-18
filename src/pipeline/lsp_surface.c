@@ -519,6 +519,42 @@ typedef struct {
     _Atomic bool failed;
 } surface_job_t;
 
+/* Row strings are released with cbm_store_free_lsp_surfaces (free), so they
+ * come from the C heap: one place allocates them. */
+static char *surface_row_alloc(size_t n) {
+    return malloc(n);
+}
+
+static char *surface_row_strdup(const char *s) {
+    size_t n = strlen(s);
+    char *copy = surface_row_alloc(n + 1);
+    if (copy) {
+        memcpy(copy, s, n + 1);
+    }
+    return copy;
+}
+
+/* CBMFileResult.included_files, one file per line ("" when none). */
+static char *surface_row_included_files(const CBMFileResult *fr) {
+    size_t len = 0;
+    for (const char *const *f = fr->included_files; f && *f; f++) {
+        len += strlen(*f) + 1;
+    }
+    char *out = surface_row_alloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (const char *const *f = fr->included_files; f && *f; f++) {
+        size_t n = strlen(*f);
+        memcpy(out + at, *f, n);
+        at += n;
+        out[at++] = '\n';
+    }
+    out[at] = '\0';
+    return out;
+}
+
 static void surface_row_build(int i, void *arg) {
     surface_job_t *job = (surface_job_t *)arg;
     if (atomic_load_explicit(&job->failed, memory_order_relaxed)) {
@@ -539,8 +575,11 @@ static void surface_row_build(int i, void *arg) {
     char *json =
         surface_file_to_json(fr, job->files[i].language, job->files[i].rel_path,
                              job->all_defs ? job->all_defs + start : NULL, end - start, &json_len);
+    char *included = surface_row_included_files(fr);
     cbm_pipeline_result_release(fr, loaded);
-    if (!json) {
+    if (!json || !included) {
+        free(json);
+        free(included);
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
         return;
     }
@@ -548,12 +587,13 @@ static void surface_row_build(int i, void *arg) {
     cbm_sha256_hex(json, json_len, sha);
     cbm_lsp_surface_row_t *r = &job->rows[i];
     r->defs_json = json; /* set first: it marks the row present for the compaction */
-    r->project = strdup(job->project);
-    r->rel_path = strdup(job->files[i].rel_path);
-    r->surface_sha = strdup(sha);
+    r->project = surface_row_strdup(job->project);
+    r->rel_path = surface_row_strdup(job->files[i].rel_path);
+    r->surface_sha = surface_row_strdup(sha);
     r->ref_bloom = NULL;
     r->ref_bloom_len = 0;
-    r->config_ctx = strdup("");
+    r->config_ctx = surface_row_strdup("");
+    r->included_files = included;
     if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
     }

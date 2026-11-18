@@ -22,6 +22,11 @@ typedef struct {
     uint32_t *original_line_by_expanded_line; // 1-based; 0 means directive/unmapped.
     uint8_t *belongs_to_main_file;            // 1-based; true only for the original input file.
     int expanded_line_count;
+    /* The repository files the #include lookup read (repository-relative,
+     * sorted, each once), whether or not the run that followed includes kept
+     * its expansion: the expansion depends on their bytes either way. */
+    char **included_files;
+    int included_count;
 } CBMPreprocessedSource;
 
 /* Supplies the files of the indexed repository to the #include lookup of the

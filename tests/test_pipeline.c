@@ -35714,7 +35714,102 @@ TEST(pipeline_c_include_lookup_stays_in_repo_root) {
     PASS();
 }
 
+/* #2993: a C file's graph depends on the in-tree headers its includes read,
+ * so an edit to a header alone changes its includers' graphs. lib/a.c
+ * includes lib/m.h directly, lib/b.c through lib/mid.h; only lib/m.h's macro
+ * changes. The incremental refresh (closure repair) must re-extract both
+ * includers and give the graph a fresh full index gives. 60 filler files take
+ * the fixture past MIN_FILES_FOR_PARALLEL, so the fresh full index resolves
+ * calls on the same parallel path as the repair: the sequential path writes
+ * the same CALLS properties in another key order. */
+TEST(pipeline_c_header_edit_refreshes_includers_incrementally) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incedit_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    write_temp_file(root, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) real_target(x)\n#endif\n");
+    write_temp_file(root, "lib/mid.h", "#ifndef MID_H\n#define MID_H\n#include \"m.h\"\n#endif\n");
+    write_temp_file(root, "lib/a.c",
+                    "#define A_LOCAL 1\n"
+                    "#include \"m.h\"\n"
+                    "\n"
+                    "void caller_a(int v) {\n"
+                    "    DO_WORK(v);\n"
+                    "}\n");
+    write_temp_file(root, "lib/b.c",
+                    "#define B_LOCAL 1\n"
+                    "#include \"mid.h\"\n"
+                    "\n"
+                    "void caller_b(int v) {\n"
+                    "    DO_WORK(v);\n"
+                    "}\n");
+    write_temp_file(root, "lib/t.c",
+                    "void real_target(int x) { (void)x; }\n"
+                    "void other_target(int x) { (void)x; }\n");
+    write_temp_file(root, "lib/u.c", "int unrelated(void) { return 1; }\n");
+    for (int i = 0; i < 60; i++) {
+        char name[64];
+        char body[96];
+        snprintf(name, sizeof(name), "fill/fill_%02d.c", i);
+        snprintf(body, sizeof(body), "int fill_%02d(void) { return %d; }\n", i, i);
+        write_temp_file(root, name, body);
+    }
+    char db[512];
+    char fresh_db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    snprintf(fresh_db, sizeof(fresh_db), "%s/fresh.db", tmp);
+    int rc_full = inc_root_index_from(root, db, root);
+    int before_a = inc_root_calls(db, "caller_a", "real_target");
+
+    write_temp_file(root, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) other_target(x)\n#endif\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    int rc_incr = inc_root_index_from(root, db, root);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int rc_fresh = inc_root_index_from(root, fresh_db, root);
+
+    int incr_rows = 0;
+    int fresh_rows = 0;
+    uint64_t incr_digest = inc_root_graph_digest(db, &incr_rows);
+    uint64_t fresh_digest = inc_root_graph_digest(fresh_db, &fresh_rows);
+    unsigned char incr_content[32] = {0};
+    unsigned char fresh_content[32] = {1};
+    cbm_store_t *incr_store = cbm_store_open_path(db);
+    cbm_store_t *fresh_store = cbm_store_open_path(fresh_db);
+    bool contents_read =
+        incr_store && fresh_store &&
+        cbm_store_graph_content_digest(incr_store, "incroot", incr_content) == CBM_STORE_OK &&
+        cbm_store_graph_content_digest(fresh_store, "incroot", fresh_content) == CBM_STORE_OK;
+    cbm_store_close(incr_store);
+    cbm_store_close(fresh_store);
+    static const char *const callers[] = {"caller_a", "caller_b"};
+    int wrong = 0;
+    for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
+        int now = inc_root_calls(db, callers[i], "other_target");
+        int stale = inc_root_calls(db, callers[i], "real_target");
+        if (now != 1 || stale != 0) {
+            printf("  %s: other_target %d, real_target %d\n", callers[i], now, stale);
+            wrong++;
+        }
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(before_a, 1);
+    ASSERT_EQ(rc_incr, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_fresh, 0);
+    ASSERT_EQ(wrong, 0);
+    ASSERT_EQ(incr_rows, fresh_rows);
+    ASSERT(incr_digest == fresh_digest);
+    ASSERT(contents_read);
+    ASSERT(memcmp(incr_content, fresh_content, sizeof(incr_content)) == 0);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_c_header_edit_refreshes_includers_incrementally);
     RUN_TEST(pipeline_c_include_lookup_uses_repo_root);
     RUN_TEST(pipeline_c_include_error_keeps_expansion_without_includes);
     RUN_TEST(pipeline_c_header_body_stays_with_the_header);

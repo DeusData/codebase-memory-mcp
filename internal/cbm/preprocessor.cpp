@@ -96,6 +96,16 @@ class IncludeTree {
         return first_header_file_;
     }
 
+    // The repository files the lookup read, sorted (the map's order).
+    void read_files(std::vector<std::string> *out) const {
+        for (std::map<std::string, bool>::const_iterator it = loaded_.begin(); it != loaded_.end();
+             ++it) {
+            if (it->second) {
+                out->push_back(it->first);
+            }
+        }
+    }
+
   private:
     struct Pending {
         std::string key;
@@ -705,22 +715,35 @@ static bool expansion_discarded(const simplecpp::TokenList &output,
 
 // One simplecpp run over the file. Every header its #include and
 // __has_include lines reach is resolved through `reader` first (none when it
-// is NULL). Returns false when simplecpp discarded the expansion.
+// is NULL); `read` (may be NULL) receives the repository files the lookup
+// read, also when the run fails. Returns false when simplecpp discarded the
+// expansion.
 static bool preprocess_file(const std::string &src, const std::string &main_name,
                             const simplecpp::DUI &dui, const CBMIncludeReader *reader,
-                            std::string *expanded) {
+                            std::string *expanded, std::vector<std::string> *read) {
     std::vector<std::string> files;
     files.push_back(main_name);
     std::istringstream istr(src);
     simplecpp::TokenList rawtokens(istr, files, files[0]);
     simplecpp::FileDataCache cache;
     IncludeTree tree(reader, files, cache);
-    tree.add_main_file(rawtokens);
-    simplecpp::TokenList output(files);
-    simplecpp::OutputList outputs;
-    simplecpp::preprocess(output, rawtokens, files, cache, dui, &outputs);
-    const bool kept = !expansion_discarded(output, outputs);
-    *expanded = stringify_source_spacing(output, tree.first_header_file());
+    bool kept = false;
+    try {
+        tree.add_main_file(rawtokens);
+        simplecpp::TokenList output(files);
+        simplecpp::OutputList outputs;
+        simplecpp::preprocess(output, rawtokens, files, cache, dui, &outputs);
+        kept = !expansion_discarded(output, outputs);
+        *expanded = stringify_source_spacing(output, tree.first_header_file());
+    } catch (...) {
+        if (read) {
+            tree.read_files(read);
+        }
+        throw;
+    }
+    if (read) {
+        tree.read_files(read);
+    }
     simplecpp::cleanup(cache);
     return kept;
 }
@@ -728,14 +751,16 @@ static bool preprocess_file(const std::string &src, const std::string &main_name
 // The file's expansion with its includes followed. When what an include
 // brought in stops simplecpp (an #error reached inside a header, a header
 // directive it cannot evaluate, a failure while reading one), the file keeps
-// its expansion without includes instead of losing it.
+// its expansion without includes instead of losing it. `read` receives the
+// repository files the include-following run read.
 static std::string preprocess_with_fallback(const std::string &src, const std::string &main_name,
                                             const simplecpp::DUI &dui,
-                                            const CBMIncludeReader *reader) {
+                                            const CBMIncludeReader *reader,
+                                            std::vector<std::string> *read) {
     std::string expanded;
     if (reader) {
         try {
-            if (preprocess_file(src, main_name, dui, reader, &expanded)) {
+            if (preprocess_file(src, main_name, dui, reader, &expanded, read)) {
                 return expanded;
             }
         } catch (...) {
@@ -743,8 +768,30 @@ static std::string preprocess_with_fallback(const std::string &src, const std::s
         }
         expanded.clear();
     }
-    (void)preprocess_file(src, main_name, dui, nullptr, &expanded);
+    (void)preprocess_file(src, main_name, dui, nullptr, &expanded, nullptr);
     return expanded;
+}
+
+// A malloc'd copy of `read` for CBMPreprocessedSource.included_files; false on
+// allocation failure (everything copied so far is released by the caller).
+static bool copy_included_files(const std::vector<std::string> &read, CBMPreprocessedSource *pp) {
+    if (read.empty()) {
+        return true;
+    }
+    pp->included_files = (char **)calloc(read.size(), sizeof(char *));
+    if (!pp->included_files) {
+        return false;
+    }
+    for (size_t i = 0; i < read.size(); i++) {
+        char *copy = (char *)malloc(read[i].size() + 1);
+        if (!copy) {
+            return false;
+        }
+        memcpy(copy, read[i].c_str(), read[i].size() + 1);
+        pp->included_files[i] = copy;
+        pp->included_count = (int)i + 1;
+    }
+    return true;
 }
 
 static bool build_line_map(const std::string &expanded, const std::string &main_file,
@@ -831,10 +878,15 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
 
         const std::string src(source, source_len);
         const std::string main_name(filename ? filename : "<input>");
-        std::string result = preprocess_with_fallback(src, main_name, dui, reader);
+        std::vector<std::string> read;
+        std::string result = preprocess_with_fallback(src, main_name, dui, reader, &read);
 
         CBMPreprocessedSource *pp = (CBMPreprocessedSource *)calloc(1, sizeof(*pp));
         if (!pp) {
+            return NULL;
+        }
+        if (!copy_included_files(read, pp)) {
+            cbm_preprocessed_source_free(pp);
             return NULL;
         }
         int line_count = count_expanded_lines(result);
@@ -884,6 +936,10 @@ void cbm_preprocessed_source_free(CBMPreprocessedSource *pp) {
     free(pp->source);
     free(pp->original_line_by_expanded_line);
     free(pp->belongs_to_main_file);
+    for (int i = 0; i < pp->included_count; i++) {
+        free(pp->included_files[i]);
+    }
+    free(pp->included_files);
     free(pp);
 }
 
