@@ -65,17 +65,43 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * row) and the per-file def selection follows them. */
 bool cbm_pxc_wants_identities(CBMLanguage lang);
 
+/* The run's package table: which modules declare each package (namespace),
+ * one entry per (package, module) pair over every file of the run that
+ * declares one, the module being the one its language gives the file (the
+ * directory for Java and Go, the file for the others). Built once per run by
+ * the collector in its arena, read-only afterwards; lookups are binary
+ * searches. */
+typedef struct cbm_pxc_packages cbm_pxc_packages_t;
+
+/* The modules of `package` (len bytes): their count, *out_first the first of
+ * them (a sorted array of `count`). 0 for an unknown package or a NULL table. */
+int cbm_pxc_package_modules(const cbm_pxc_packages_t *t, const char *package, size_t len,
+                            const char *const **out_first);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Build a table from parallel arrays (packages[i] declared by modules[i]) in
+ * `arena`, for the growth tests; and the work counter: one per comparison of
+ * the build's sorts and of every lookup. */
+const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs(CBMArena *arena, const char *const *packages,
+                                                      const char *const *modules, int count);
+uint64_t cbm_pxc_packages_test_work(void);
+#endif
+
 /* One file's declared-type scope, exactly as the collector builds it to
  * attach the file's identities (the project registry, the file's module and
- * LSP import map, and for a lexical row the file's definitions and module
- * facts): a walk reads the calling file's own identity table from it
- * (cbm_type_scope_file_imports). NULL without a pipeline context or for an
- * engine that reads no identities; else end it with cbm_type_scope_file_end
- * once the walk is done. */
+ * LSP import map -- or, for an engine row with scope_imports_from_rows, the
+ * map built from the file's own import rows over the run's package table --
+ * and for a lexical row the file's definitions and module facts): a walk
+ * reads the calling file's own identity table from it
+ * (cbm_type_scope_file_imports). Temporaries live in `scratch`, which must
+ * outlive the scope. NULL without a pipeline context or for an engine that
+ * reads no identities; else end it with cbm_type_scope_file_end once the walk
+ * is done. */
 cbm_type_scope_file_t *cbm_pxc_file_scope(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
                                           const CBMFileResult *result, const char *module_qn,
                                           const char **imp_keys, const char **imp_vals,
-                                          int imp_count);
+                                          int imp_count, const cbm_pxc_packages_t *packages,
+                                          CBMArena *scratch);
 
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
@@ -101,6 +127,15 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                     CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, int *out_def_starts);
+/* As cbm_pxc_collect_all_defs, and *out_packages (nullable) receives the run's
+ * package table the collector built in `arena` (NULL when no engine row reads
+ * import rows over it, or without a pipeline context): a driver hands it to
+ * the walks in CBMCrossLspRegistries.packages. */
+CBMLSPDef *cbm_pxc_collect_all_defs_ex(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                       CBMFileResult **cache, const cbm_file_info_t *files,
+                                       int file_count, const char *project_name, char **def_modules,
+                                       int *out_count, int *out_def_starts,
+                                       const cbm_pxc_packages_t **out_packages);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -188,6 +223,9 @@ typedef struct {
      * calling file's own identities: cbm_pxc_file_scope). Every driver sets
      * it, also when it builds no registry; NULL in a harness without one. */
     const cbm_pipeline_ctx_t *ctx;
+    /* The run's package table (cbm_pxc_collect_all_defs_ex), sealed: the
+     * walks build a calling file's import map over it. NULL: none. */
+    const cbm_pxc_packages_t *packages;
 } CBMCrossLspRegistries;
 
 /* Build one row's shared registry over all defs into out->by_engine[engine].

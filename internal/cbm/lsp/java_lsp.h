@@ -44,7 +44,16 @@ enum {
     CBM_JAVA_IMPORT_STATIC = 1,    /* import static com.foo.Bar.method; */
     CBM_JAVA_IMPORT_ON_DEMAND = 2, /* import com.foo.*; — package on-demand */
     CBM_JAVA_IMPORT_STATIC_OD = 3, /* import static com.foo.Bar.*; */
+    /* A name the calling file's imports bind to a project type, verified by
+     * the declared-type step (src/pipeline/type_scope.h): the registered QN of
+     * that type. Handed in by the cross-file walks. */
+    CBM_JAVA_IMPORT_IDENTITY = 4,
 };
+
+/* True when `name` (len bytes) is one of the java.lang types the engine knows:
+ * the implicit on-demand import of every compilation unit (the declared-type
+ * step's implicit external scope for Java). */
+bool cbm_java_lang_type(const char *name, size_t len);
 
 /* Per-file resolution context. */
 typedef struct {
@@ -74,6 +83,7 @@ typedef struct {
     int import_count;
     int import_cap;
     CBMNameRows import_rows; /* import_local_names by name, rows in table order */
+    bool imports_scanned;    /* the file's package and import declarations are read */
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
@@ -154,14 +164,28 @@ const CBMType *java_lookup_field_type(JavaLSPContext *ctx, const char *class_qn,
 void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root);
 
-/* Cross-file LSP: build registry from defs + stdlib, re-parse if needed,
- * walk and resolve. defs include both local + cross-file definitions. */
+/* Cross-file LSP: register defs into a registry. A def's declared types (its
+ * return, parameter and field types and its supertypes) take the identities
+ * the declared-type step resolved in the scope of the file that wrote them
+ * (CBMLSPDef.type_scope, in the registry's QN form); a spelling without one
+ * gets no project type. Register every type def first and call
+ * cbm_java_mark_ambiguous_types before the methods: an identity two defs
+ * share is no answer. */
 void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count);
 
+/* Mark every type QN that two or more of the type defs register (a nested
+ * type flattened onto a same-named one of its package, one class in two
+ * source trees): no identity naming it is used. Before finalize. */
+void cbm_java_mark_ambiguous_types(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                   int def_count);
+
 /* Tier 2 (#1669): build the shared JVM cross registry ONCE per run, then
  * resolve each file against it with a small own-module overlay. Skips the
- * per-file registry build that made cross-file LSP O(files x corpus_defs). */
+ * per-file registry build that made cross-file LSP O(files x corpus_defs).
+ * In both cross entry points below, import_names / import_qns are the calling
+ * file's verified import identities (CBM_JAVA_IMPORT_IDENTITY), local name ->
+ * registered QN; the file's own import declarations are read from its AST. */
 CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
 void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result,
                                           const char *source, int source_len, const char *module_qn,

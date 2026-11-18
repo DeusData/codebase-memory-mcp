@@ -763,16 +763,19 @@ TEST(type_scope_calling_file_scope_per_engine) {
     cbm_pipeline_ctx_t *ctx = calloc(1, sizeof(*ctx));
     ASSERT_NOT_NULL(ctx);
     ctx->registry = u.reg;
-    cbm_type_scope_file_t *f = cbm_pxc_file_scope(ctx, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1);
+    cbm_type_scope_file_t *f =
+        cbm_pxc_file_scope(ctx, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1, NULL, NULL);
     ASSERT_NOT_NULL(f);
     const char *const *locals = NULL;
     const char *const *qns = NULL;
     ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 1);
     ASSERT_STR_EQ(qns[0], "p.a.Store");
     cbm_type_scope_file_end(f);
-    ASSERT_NULL(cbm_pxc_file_scope(NULL, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1));
-    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_CPP, fr, "p.app", keys, vals, 1));
-    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_JAVA, fr, "p.app", keys, vals, 1));
+    ASSERT_NULL(cbm_pxc_file_scope(NULL, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1, NULL, NULL));
+    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_CPP, fr, "p.app", keys, vals, 1, NULL, NULL));
+    /* Java reads identities since B1 (its map comes from import rows, built in
+     * the scratch arena it is handed); Kotlin reads none yet. */
+    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_KOTLIN, fr, "p.app", keys, vals, 1, NULL, NULL));
     free(ctx);
     free(fr);
     ts_unit_end(&u);

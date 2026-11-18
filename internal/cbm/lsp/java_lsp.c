@@ -34,6 +34,7 @@
 #include "java_lsp.h"
 #include "lsp_work.h"
 #include "../helpers.h"
+#include "../../../src/foundation/hash_table.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -96,6 +97,7 @@ static void resolve_method_reference(JavaLSPContext *ctx, TSNode mref,
                                      const CBMRegisteredFunc *outer_resolved, int arg_index,
                                      const CBMType *recv_type);
 static bool is_map_like(const char *qn);
+static bool java_is_project_type(const CBMRegisteredType *rt);
 
 /* ── Built-in primitive table ─────────────────────────────────────── */
 
@@ -187,6 +189,75 @@ static const char *JAVA_LANG_TYPES[] = {"Object",
                                         "FunctionalInterface",
                                         "Void",
                                         NULL};
+
+bool cbm_java_lang_type(const char *name, size_t len) {
+    for (int i = 0; name && JAVA_LANG_TYPES[i]; i++) {
+        if (strlen(JAVA_LANG_TYPES[i]) == len && memcmp(JAVA_LANG_TYPES[i], name, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── Ambiguous type QNs ───────────────────────────────────────────── */
+
+/* The cross registry keys a type by `<package>.<name>`, so a nested type and a
+ * same-named type of its package, or one class in two source trees, share one
+ * QN: the registry cannot tell them apart, and an identity naming that QN has
+ * no answer. Each such QN carries a mark: a registered alias under the
+ * reserved key "\x1f<QN>", which no source spelling can reach (a QN never
+ * starts with a control byte; alias entries are skipped by every scan). */
+#define JAVA_AMBIGUOUS_MARK "\x1f"
+
+static bool java_type_ambiguous(const CBMTypeRegistry *reg, const char *qn) {
+    char key[JAVA_LSP_BUF];
+    int n = snprintf(key, sizeof(key), JAVA_AMBIGUOUS_MARK "%s", qn ? qn : "");
+    /* A QN too long to mark is never marked: treat it as ambiguous. */
+    return !qn || n <= 0 || (size_t)n >= sizeof(key) || cbm_registry_lookup_type(reg, key) != NULL;
+}
+
+static bool java_type_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0);
+}
+
+void cbm_java_mark_ambiguous_types(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                   int def_count) {
+    if (!arena || !reg || !defs || def_count <= 0) {
+        return;
+    }
+    /* QN -> the first def that registers it, or `seen_twice` once marked. */
+    static char seen_twice;
+    CBMHashTable *seen = cbm_ht_create((uint32_t)(def_count / 4 + 16));
+    if (!seen) {
+        return;
+    }
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !java_type_label(d->label)) {
+            continue;
+        }
+        CBM_LSP_WORK(1);
+        void *prev = cbm_ht_get(seen, d->qualified_name);
+        if (!prev) {
+            cbm_ht_set(seen, d->qualified_name, (void *)d);
+            continue;
+        }
+        if (prev == &seen_twice) {
+            continue;
+        }
+        cbm_ht_set(seen, d->qualified_name, &seen_twice);
+        CBMRegisteredType mark;
+        memset(&mark, 0, sizeof(mark));
+        mark.qualified_name = cbm_arena_sprintf(arena, JAVA_AMBIGUOUS_MARK "%s", d->qualified_name);
+        mark.short_name = JAVA_AMBIGUOUS_MARK;
+        mark.alias_of = d->qualified_name;
+        if (mark.qualified_name) {
+            cbm_registry_add_type(reg, mark);
+        }
+    }
+    cbm_ht_free(seen);
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -357,6 +428,24 @@ static void pop_enclosing_class(JavaLSPContext *ctx) {
 
 static const CBMType *parse_type_arguments(JavaLSPContext *ctx, TSNode targs_node);
 
+/* `Outer.Inner` written with Outer resolved to another file's project type
+ * `head_qn`: the cross registry keys a nested type by its package and name
+ * (`<package>.Inner`, pxc_jvm_def_qn). That QN when the registry holds it
+ * once (never a QN two types share), else NULL. */
+static const char *java_flattened_member(JavaLSPContext *ctx, const char *head_qn,
+                                         const char *spelled) {
+    const CBMRegisteredType *head = cbm_registry_lookup_type(ctx->registry, head_qn);
+    const char *leaf = strrchr(spelled, '.');
+    if (!head || !java_is_project_type(head) || !leaf || !leaf[1]) {
+        return NULL;
+    }
+    const char *flat = cbm_arena_sprintf(ctx->arena, "%s%s", head->namespace_qn, leaf);
+    return flat && strcmp(flat, head_qn) != 0 && cbm_registry_lookup_type(ctx->registry, flat) &&
+                   !java_type_ambiguous(ctx->registry, flat)
+               ? flat
+               : NULL;
+}
+
 const CBMType *java_parse_type_node(JavaLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -399,8 +488,11 @@ const CBMType *java_parse_type_node(JavaLSPContext *ctx, TSNode node) {
             char *head = cbm_arena_strndup(ctx->arena, full, (size_t)(dot - full));
             const char *head_qn = java_resolve_type_name(ctx, head);
             if (head_qn) {
-                return cbm_type_named(ctx->arena,
-                                      cbm_arena_sprintf(ctx->arena, "%s%s", head_qn, dot));
+                const char *member = cbm_arena_sprintf(ctx->arena, "%s%s", head_qn, dot);
+                const char *flat = cbm_registry_lookup_type(ctx->registry, member)
+                                       ? NULL
+                                       : java_flattened_member(ctx, head_qn, full);
+                return cbm_type_named(ctx->arena, flat ? flat : member);
             }
         }
         return cbm_type_named(ctx->arena, full);
@@ -514,7 +606,17 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         }
     }
 
-    /* 2. Single-type imports. */
+    /* 2. Single-type imports: the calling file's verified identity (the
+     * declared-type step's, one type of the project registered once here)
+     * first, then the imported name as written. */
+    for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
+        const char *target = ctx->import_target_qns[i];
+        if (ctx->import_kinds[i] == CBM_JAVA_IMPORT_IDENTITY && target &&
+            !java_type_ambiguous(ctx->registry, target) &&
+            cbm_registry_lookup_type(ctx->registry, target)) {
+            return target;
+        }
+    }
     for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE)
             continue;
@@ -563,7 +665,6 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     if (cbm_registry_lookup_type(ctx->registry, name)) {
         return cbm_arena_strdup(ctx->arena, name);
     }
-
     /* Cross-file sole-definer fallback. A same-package static call
      * `Util.square()` references class `Util` whose graph QN embeds the
      * defining file's path ("<project>.Util.Util"), which the caller's
@@ -1749,10 +1850,11 @@ static void java_process_class_decl(JavaLSPContext *ctx, TSNode node) {
     ctx->enclosing_class_short = saved_short;
 }
 
-void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
-    if (ts_node_is_null(root))
+/* The file's package declaration and import declarations, once. */
+static void java_lsp_scan_imports(JavaLSPContext *ctx, TSNode root) {
+    if (ts_node_is_null(root) || ctx->imports_scanned)
         return;
-    /* First scan: package_declaration + imports (already pushed via init). */
+    ctx->imports_scanned = true;
     uint32_t n = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < n; i++) {
         TSNode c = ts_node_named_child(root, i);
@@ -1807,6 +1909,14 @@ void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
             }
         }
     }
+}
+
+void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
+    if (ts_node_is_null(root))
+        return;
+    /* First scan: package_declaration + imports (already pushed via init). */
+    java_lsp_scan_imports(ctx, root);
+    uint32_t n = ts_node_named_child_count(root);
 
     /* Second scan: top-level type declarations. */
     for (uint32_t i = 0; i < n; i++) {
@@ -3214,10 +3324,36 @@ static const char **split_generic_args(CBMArena *a, const char *inside, int *out
     return result;
 }
 
-/* Parse a type-text into a CBMType, with full inner-class qualification.
- * `parent_class` is the QN of the enclosing class (NULL at file scope), used
- * to qualify unqualified inner-class references. `reg` is consulted to
- * confirm matches before committing to a candidate QN.
+/* The text inside the outermost angle brackets of a type text ("String,
+ * List<Integer>" for "Map<String, List<Integer>>"), or NULL. */
+static const char *java_generic_args_inner(CBMArena *a, const char *no_arr) {
+    const char *lt = no_arr ? strchr(no_arr, '<') : NULL;
+    if (!lt) {
+        return NULL;
+    }
+    /* find matching '>' at depth 0 */
+    int depth = 0;
+    const char *gt = NULL;
+    for (const char *p = lt; *p; p++) {
+        if (*p == '<')
+            depth++;
+        else if (*p == '>') {
+            depth--;
+            if (depth == 0) {
+                gt = p;
+                break;
+            }
+        }
+    }
+    return gt && gt > lt + 1 ? cbm_arena_strndup(a, lt + 1, (size_t)(gt - lt - 1)) : NULL;
+}
+
+/* Parse a type-text of this file's own definitions into a CBMType, with
+ * inner-class qualification. `parent_class` is the QN of the enclosing class
+ * (NULL at file scope), used to qualify unqualified inner-class references
+ * through the enclosing classes of this file down to its module `module_qn`.
+ * `reg` is consulted to confirm matches before committing to a candidate QN.
+ * Another file's declared types are resolved by java_decl_type.
  *
  * Preserves generic template arguments: "Consumer<String>" parses to a
  * TEMPLATE("java.util.function.Consumer", [String]) so the SAM-binder
@@ -3229,31 +3365,7 @@ static const CBMType *parse_param_text_full(CBMArena *a, const char *text, const
     int dim = 0;
     const char *no_arr = unwrap_array_text(a, text, &dim);
     const char *no_gen = strip_generics(a, no_arr);
-
-    /* Extract the inside-of-angles for generic-arg recursion. */
-    const char *gen_args_inner = NULL;
-    if (no_arr) {
-        const char *lt = strchr(no_arr, '<');
-        if (lt) {
-            /* find matching '>' at depth 0 */
-            int depth = 0;
-            const char *gt = NULL;
-            for (const char *p = lt; *p; p++) {
-                if (*p == '<')
-                    depth++;
-                else if (*p == '>') {
-                    depth--;
-                    if (depth == 0) {
-                        gt = p;
-                        break;
-                    }
-                }
-            }
-            if (gt && gt > lt + 1) {
-                gen_args_inner = cbm_arena_strndup(a, lt + 1, (size_t)(gt - lt - 1));
-            }
-        }
-    }
+    const char *gen_args_inner = java_generic_args_inner(a, no_arr);
 
     const CBMType *base = NULL;
     if (no_gen && is_java_primitive(no_gen)) {
@@ -3269,10 +3381,12 @@ static const CBMType *parse_param_text_full(CBMArena *a, const char *text, const
                     break;
                 }
             }
-            /* Walk parent_class chain trying parent.X, parent.parent.X, ... */
+            /* Walk the enclosing classes, parent.X, parent.parent.X, ...,
+             * down to the file's own module (the walk stops there). */
+            size_t module_len = module_qn ? strlen(module_qn) : 0;
             if (!base && parent_class && reg) {
                 const char *cur = parent_class;
-                while (cur) {
+                while (cur && strlen(cur) >= module_len) {
                     const char *cand = cbm_arena_sprintf(a, "%s.%s", cur, no_gen);
                     if (cbm_registry_lookup_type(reg, cand)) {
                         base = cbm_type_named(a, cand);
@@ -3330,10 +3444,78 @@ static const CBMType *parse_param_text_full(CBMArena *a, const char *text, const
     return base;
 }
 
-/* Backwards-compatible wrapper for callers that don't know the parent_class
- * context. Used by cbm_run_java_lsp_cross. */
-static const CBMType *parse_param_text(CBMArena *a, const char *text, const char *module_qn) {
-    return parse_param_text_full(a, text, NULL, module_qn, NULL);
+/* ── Another file's declared types (the cross registrar) ──────────────
+ *
+ * A declared type text of another file's definition (a return, parameter or
+ * field type, a supertype) is read through the identities the declared-type
+ * step gave its spellings in the scope of the file that wrote it
+ * (CBMLSPDef.type_scope, in this registry's QN form). A spelling with one
+ * names that project type, unless two types share its QN here (no answer).
+ * A spelling without one names no project type: a primitive, a spelling
+ * written fully qualified, a java.lang type, for a parameter (as before) a
+ * type of the JDK packages the seed registers, and otherwise nothing. */
+typedef struct {
+    const cbm_type_scope_index_t *ix; /* the def's identities, or NULL */
+    const CBMTypeRegistry *reg;
+    bool library_packages; /* the JDK package fallback (parameters) */
+} JavaDeclScope;
+
+static const CBMType *java_decl_type(CBMArena *a, const char *text, const JavaDeclScope *s) {
+    if (!text || !s)
+        return cbm_type_unknown();
+    int dim = 0;
+    const char *no_arr = unwrap_array_text(a, text, &dim);
+    const char *no_gen = strip_generics(a, no_arr);
+    const char *gen_args_inner = java_generic_args_inner(a, no_arr);
+    if (!no_gen || !no_gen[0])
+        return cbm_type_unknown();
+    const CBMType *base = NULL;
+    const char *identity = cbm_type_scope_find(s->ix, no_gen, strlen(no_gen));
+    if (is_java_primitive(no_gen)) {
+        base = cbm_type_builtin(a, no_gen);
+    } else if (identity) {
+        /* A project type: the identity, or nothing when the registry holds
+         * it as two types (or not at all). */
+        if (s->reg && !java_type_ambiguous(s->reg, identity) &&
+            cbm_registry_lookup_type(s->reg, identity)) {
+            base = cbm_type_named(a, identity);
+        }
+    } else if (strchr(no_gen, '.')) {
+        base = cbm_type_named(a, no_gen);
+    } else if (cbm_java_lang_type(no_gen, strlen(no_gen))) {
+        base = cbm_type_named(a, cbm_arena_sprintf(a, "java.lang.%s", no_gen));
+    } else if (s->library_packages && s->reg) {
+        for (int i = 0; JAVA_FALLBACK_PACKAGES[i] && !base; i++) {
+            const char *cand = cbm_arena_sprintf(a, "%s.%s", JAVA_FALLBACK_PACKAGES[i], no_gen);
+            if (cbm_registry_lookup_type(s->reg, cand)) {
+                base = cbm_type_named(a, cand);
+            }
+        }
+    }
+    if (!base)
+        return cbm_type_unknown();
+    if (gen_args_inner && base->kind == CBM_TYPE_NAMED) {
+        int gc = 0;
+        const char **arg_strs = split_generic_args(a, gen_args_inner, &gc);
+        if (arg_strs && gc > 0) {
+            const CBMType **gargs =
+                (const CBMType **)cbm_arena_alloc(a, (size_t)(gc + 1) * sizeof(*gargs));
+            if (!gargs)
+                return base;
+            for (int i = 0; i < gc; i++) {
+                gargs[i] = java_decl_type(a, arg_strs[i], s);
+            }
+            gargs[gc] = NULL;
+            base = cbm_type_template(a, base->data.named.qualified_name, gargs, gc);
+        }
+    }
+    while (dim-- > 0)
+        base = cbm_type_slice(a, base);
+    return base;
+}
+
+static const CBMType *java_decl_parse_type(CBMArena *arena, const char *text, void *parser_ctx) {
+    return java_decl_type(arena, text, (const JavaDeclScope *)parser_ctx);
 }
 
 typedef struct {
@@ -3918,65 +4100,152 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
 /* ── Cross-file LSP ───────────────────────────────────────────────── */
 
-void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+/* The '|'-separated pieces of `text` as a NULL-terminated arena array, or
+ * NULL for none. */
+static const char **java_split_pipe(CBMArena *arena, const char *text) {
+    if (!text || !text[0])
+        return NULL;
+    int n = 1;
+    for (const char *p = text; *p; p++)
+        if (*p == '|')
+            n++;
+    const char **out = (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*out));
+    if (!out)
+        return NULL;
+    int idx = 0;
+    const char *start = text;
+    while (*start) {
+        const char *end = start;
+        while (*end && *end != '|')
+            end++;
+        if (end > start) {
+            out[idx++] = cbm_arena_strndup(arena, start, (size_t)(end - start));
+        }
+        if (!*end)
+            break;
+        start = end + 1;
+    }
+    out[idx] = NULL;
+    return out;
+}
+
+/* Register the type defs: QN, short name, the interface flag, the package that
+ * marks a project type, and the supertypes as written (their identities come
+ * with java_register_type_details). */
+static void java_register_types(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                int def_count) {
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->short_name || !java_type_label(d->label))
+            continue;
+        CBMRegisteredType rt;
+        memset(&rt, 0, sizeof(rt));
+        rt.qualified_name = d->qualified_name;
+        rt.short_name = d->short_name;
+        rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
+        /* Project marker (java_is_project_type) and the package that
+         * qualifies the type's own member signatures. */
+        rt.namespace_qn = (d->namespace_name && d->namespace_name[0]) ? d->namespace_name
+                          : (d->def_module_qn && d->def_module_qn[0]) ? d->def_module_qn
+                                                                      : d->qualified_name;
+        /* Embedded types from "|"-separated text. */
+        rt.embedded_types = java_split_pipe(arena, d->embedded_types);
+        cbm_registry_add_type(reg, rt);
+    }
+}
+
+/* A type def's supertypes and fields through its identities: each supertype
+ * spelling with one becomes that registered type (the member lookup follows
+ * it), and each field "name:type" of field_defs is registered with its type
+ * (no JDK package fallback: a field's type is either known or nothing). Runs
+ * after every type is registered and the ambiguous QNs are marked; a QN two
+ * defs register keeps its raw supertypes and no fields. */
+static void java_register_type_details(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                       int def_count) {
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !java_type_label(d->label) || !d->type_scope ||
+            java_type_ambiguous(reg, d->qualified_name)) {
+            continue;
+        }
+        CBMRegisteredType *slot = cbm_registry_first_own_type(reg, d->qualified_name);
+        if (!slot)
+            continue;
+        JavaDeclScope scope = {.ix = cbm_type_scope_index(arena, d->type_scope),
+                               .reg = reg,
+                               .library_packages = false};
+        int emb_count = 0;
+        while (slot->embedded_types && slot->embedded_types[emb_count])
+            emb_count++;
+        if (emb_count > 0) {
+            const char **emb =
+                (const char **)cbm_arena_alloc(arena, (size_t)(emb_count + 1) * sizeof(*emb));
+            for (int j = 0; emb && j < emb_count; j++) {
+                const CBMType *t = java_decl_type(arena, slot->embedded_types[j], &scope);
+                const char *qn = t->kind == CBM_TYPE_NAMED ? t->data.named.qualified_name
+                                 : t->kind == CBM_TYPE_TEMPLATE
+                                     ? t->data.template_type.template_name
+                                     : NULL;
+                /* Only an identity replaces the spelling as written. */
+                const char *no_gen = strip_generics(arena, slot->embedded_types[j]);
+                bool proven = qn && no_gen && cbm_type_scope_find(scope.ix, no_gen, strlen(no_gen));
+                emb[j] = proven ? qn : slot->embedded_types[j];
+            }
+            if (emb) {
+                emb[emb_count] = NULL;
+                slot->embedded_types = emb;
+            }
+        }
+        const char **fields = java_split_pipe(arena, d->field_defs);
+        int field_count = 0;
+        while (fields && fields[field_count])
+            field_count++;
+        if (field_count == 0)
+            continue;
+        const char **names =
+            (const char **)cbm_arena_alloc(arena, (size_t)(field_count + 1) * sizeof(*names));
+        const CBMType **types =
+            (const CBMType **)cbm_arena_alloc(arena, (size_t)(field_count + 1) * sizeof(*types));
+        if (!names || !types)
+            continue;
+        int kept = 0;
+        for (int j = 0; j < field_count; j++) {
+            const char *colon = strchr(fields[j], ':');
+            if (!colon || colon == fields[j])
+                continue;
+            names[kept] = cbm_arena_strndup(arena, fields[j], (size_t)(colon - fields[j]));
+            types[kept] = java_decl_type(arena, colon + 1, &scope);
+            kept++;
+        }
+        names[kept] = NULL;
+        types[kept] = NULL;
+        slot->field_names = names;
+        slot->field_types = types;
+    }
+}
+
+/* Register the method defs: parameter and return types through the def's
+ * identities (parameters keep the JDK package fallback they had). */
+static void java_register_funcs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count) {
     for (int i = 0; i < def_count; i++) {
         const CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
-        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
-            strcmp(d->label, "Enum") == 0 || strcmp(d->label, "Type") == 0) {
-            CBMRegisteredType rt;
-            memset(&rt, 0, sizeof(rt));
-            rt.qualified_name = d->qualified_name;
-            rt.short_name = d->short_name;
-            rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
-            /* Project marker (java_is_project_type) and the package that
-             * qualifies the type's own member signatures. */
-            rt.namespace_qn = (d->namespace_name && d->namespace_name[0]) ? d->namespace_name
-                              : (d->def_module_qn && d->def_module_qn[0]) ? d->def_module_qn
-                                                                          : d->qualified_name;
-            /* Embedded types from "|"-separated text. */
-            if (d->embedded_types && d->embedded_types[0]) {
-                int n = 1;
-                for (const char *p = d->embedded_types; *p; p++)
-                    if (*p == '|')
-                        n++;
-                const char **emb =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*emb));
-                int idx = 0;
-                const char *start = d->embedded_types;
-                while (*start) {
-                    const char *end = start;
-                    while (*end && *end != '|')
-                        end++;
-                    if (end > start) {
-                        emb[idx++] = cbm_arena_strndup(arena, start, (size_t)(end - start));
-                    }
-                    if (!*end)
-                        break;
-                    start = end + 1;
-                }
-                emb[idx] = NULL;
-                rt.embedded_types = emb;
-            }
-            cbm_registry_add_type(reg, rt);
-        } else if (strcmp(d->label, "Method") == 0 || strcmp(d->label, "Function") == 0 ||
-                   strcmp(d->label, "Constructor") == 0) {
+        if (strcmp(d->label, "Method") == 0 || strcmp(d->label, "Function") == 0 ||
+            strcmp(d->label, "Constructor") == 0) {
             CBMRegisteredFunc rf;
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
             rf.min_params = -1;
             rf.receiver_type = d->receiver_type;
-            JavaSignatureParseContext parse_ctx = {
-                .parent_class = d->receiver_type,
-                .module_qn = d->def_module_qn,
-                .registry = reg,
-            };
+            const cbm_type_scope_index_t *ix = cbm_type_scope_index(arena, d->type_scope);
+            JavaDeclScope params = {.ix = ix, .reg = reg, .library_packages = true};
+            JavaDeclScope result = {.ix = ix, .reg = reg, .library_packages = false};
             const CBMType **ptypes = cbm_type_materialize_signature_params(
-                arena, d->signature_param_types, d->signature_param_count,
-                java_signature_parse_type, &parse_ctx);
+                arena, d->signature_param_types, d->signature_param_count, java_decl_parse_type,
+                &params);
             /* Build single-return signature from return_types text. */
             const CBMType *ret = NULL;
             if (d->return_types && d->return_types[0]) {
@@ -3988,7 +4257,7 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
                 } else {
                     first = no_pipe;
                 }
-                ret = parse_param_text(arena, first, d->def_module_qn);
+                ret = java_decl_type(arena, first, &result);
             }
             const CBMType **rtypes = NULL;
             if (ret) {
@@ -4000,6 +4269,14 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
             cbm_registry_add_func(reg, rf);
         }
     }
+}
+
+void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                int def_count) {
+    java_register_types(arena, reg, defs, def_count);
+    cbm_java_mark_ambiguous_types(arena, reg, defs, def_count);
+    java_register_type_details(arena, reg, defs, def_count);
+    java_register_funcs(arena, reg, defs, def_count);
 }
 
 /* ── Tier 2: shared cross-registry + per-file overlay (#1669) ──────────
@@ -4073,10 +4350,14 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
             jvm[total++] = defs[i];
         }
     }
-    cbm_java_register_lsp_defs(arena, reg, jvm, type_count);
+    /* Types, the marks of the QNs two of them share, then (indexed) their
+     * supertypes and fields through their identities, then the methods. */
+    java_register_types(arena, reg, jvm, type_count);
+    cbm_java_mark_ambiguous_types(arena, reg, jvm, type_count);
     cbm_registry_finalize(reg);
+    java_register_type_details(arena, reg, jvm, type_count);
     if (total > type_count) { /* jvm is NULL for an empty corpus: no offset */
-        cbm_java_register_lsp_defs(arena, reg, jvm + type_count, total - type_count);
+        java_register_funcs(arena, reg, jvm + type_count, total - type_count);
     }
     cbm_registry_finalize(reg);
     /* java_receiver_is_external asks "does the project declare a type in
@@ -4084,6 +4365,36 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     cbm_registry_build_type_qn_order(reg, arena);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
+}
+
+/* The cross walk's own types: a supertype the file's own types do not declare
+ * was left as written by register_local_func_or_type_from_file (it runs before
+ * the imports are known). Once they are, each such spelling is resolved in
+ * the file's scope (java_resolve_type_name: its verified imports, its
+ * package, its on-demand imports) and replaced when the registry holds the
+ * answer. */
+static void java_own_supertypes(JavaLSPContext *ctx, CBMTypeRegistry *overlay,
+                                const CBMFileResult *result) {
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->qualified_name || !d->base_classes || !java_type_label(d->label))
+            continue;
+        CBMRegisteredType *slot = cbm_registry_first_own_type(overlay, d->qualified_name);
+        for (int j = 0;
+             slot && slot->embedded_types && slot->embedded_types[j] && d->base_classes[j]; j++) {
+            CBM_LSP_WORK(1);
+            const char *spelled = strip_generics(ctx->arena, d->base_classes[j]);
+            if (!spelled || !spelled[0] || strchr(spelled, '.') ||
+                cbm_registry_lookup_type(ctx->registry, slot->embedded_types[j])) {
+                continue;
+            }
+            const char *qn = java_resolve_type_name(ctx, spelled);
+            if (qn && cbm_registry_lookup_type(ctx->registry, qn) &&
+                !java_type_ambiguous(ctx->registry, qn)) {
+                slot->embedded_types[j] = qn;
+            }
+        }
+    }
 }
 
 /* Per-file resolve against the shared base. The overlay holds exactly THIS
@@ -4146,8 +4457,13 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
         if (!import_names[i] || !import_qns[i]) {
             continue;
         }
-        java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_TYPE);
+        java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_IDENTITY);
     }
+    /* The file's own scope is complete once its import declarations are read
+     * (the AST scan of java_lsp_process_file records them and the package):
+     * read them first, then resolve the own types' supertypes in it. */
+    java_lsp_scan_imports(&ctx, root);
+    java_own_supertypes(&ctx, &overlay, result);
 
     java_lsp_process_file(&ctx, root);
     cbm_arena_destroy(&idx_arena);
@@ -4171,16 +4487,20 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
     cbm_registry_init(&reg, arena);
     cbm_java_stdlib_register(&reg, arena);
 
-    /* Register cross-file defs. */
-    cbm_java_register_lsp_defs(arena, &reg, defs, def_count);
-
-    /* Build the hash indexes: without this every lookup_type/func/method in
-     * the walk below is a LINEAR scan over the whole cross registry —
-     * O(lookups x defs) per file. Index allocations go to a per-call scratch
-     * arena: reg's arena is the pipeline-lifetime result arena, and per-file
-     * bucket allocations there accumulate GBs across a large repo. */
+    /* Register cross-file defs as the shared build does: types, the marks of
+     * shared QNs, then (indexed) supertypes and fields, then the methods.
+     * Without the hash indexes every lookup_type/func/method in the walk
+     * below is a LINEAR scan over the whole cross registry -- O(lookups x
+     * defs) per file. Index allocations go to a per-call scratch arena: reg's
+     * arena is the pipeline-lifetime result arena, and per-file bucket
+     * allocations there accumulate GBs across a large repo. */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
+    java_register_types(arena, &reg, defs, def_count);
+    cbm_java_mark_ambiguous_types(arena, &reg, defs, def_count);
+    cbm_registry_finalize_into(&reg, &idx_arena);
+    java_register_type_details(arena, &reg, defs, def_count);
+    java_register_funcs(arena, &reg, defs, def_count);
     cbm_registry_finalize_into(&reg, &idx_arena);
 
     /* Parse if needed. */
@@ -4202,11 +4522,11 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &reg, NULL, module_qn, out);
 
-    /* Apply caller-supplied imports. */
+    /* The calling file's verified import identities. */
     for (int i = 0; i < import_count; i++) {
         if (!import_names[i] || !import_qns[i])
             continue;
-        java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_TYPE);
+        java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_IDENTITY);
     }
 
     java_lsp_process_file(&ctx, root);

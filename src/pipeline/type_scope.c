@@ -13,6 +13,7 @@
 
 #include "foundation/constants.h"
 #include "graph_buffer/graph_buffer.h" /* the module check of a target */
+#include "lsp/java_lsp.h"              /* cbm_java_lang_type (the Java row) */
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -27,6 +28,8 @@
 static const char *const go_labels[] = {"Struct", "Interface", "Type", "Class", "Enum", NULL};
 /* Python: what py_register_lsp_defs registers as a type. */
 static const char *const py_labels[] = {"Class", "Interface", "Protocol", "Type", NULL};
+/* Java: what cbm_java_register_lsp_defs registers as a type. */
+static const char *const java_labels[] = {"Class", "Interface", "Enum", "Type", NULL};
 
 /* One row per language whose engine reads identities. A row states every
  * field; a further language plugs in by appending its row. */
@@ -61,6 +64,25 @@ static const cbm_type_scope_lang_t type_scope_langs[] = {
      .param_types = true,
      .field_types = false, /* folded as resolved QNs (pass_lsp_cross.c) */
      .embedded_types = false /* bases arrive as resolved QNs */},
+    /* Java: its import map is built from its own import rows over the run's
+     * packages (the engine row's scope_imports_from_rows); its registry keys
+     * namespace QNs, so every identity is stored (the collector rewrites them
+     * into that form with the defs). */
+    {.lang = CBM_LANG_JAVA,
+     .scope_source = CBM_TYPE_SCOPE_MODULE_IMPORTS,
+     .quoted_names = false,
+     .colon_paths = false,
+     .labels = java_labels,
+     .engine_qualifies_own_module = false,
+     .imports_bind_modules = false, /* `import a.B;` binds the type B */
+     .lexical_scopes = false,
+     .open_imports = true, /* `import a.*;` and `import static a.B.*;` */
+     .implicit_external = cbm_java_lang_type,
+     .nested_types = true,
+     .return_types = true,
+     .param_types = true,
+     .field_types = true,
+     .embedded_types = true},
 };
 
 const cbm_type_scope_lang_t *cbm_type_scope_lang(CBMLanguage lang) {
