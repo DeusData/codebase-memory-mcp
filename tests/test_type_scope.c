@@ -1501,11 +1501,12 @@ static const ts_file_t go_shadowtype_files[] = {
                  "func Direct[T interface{ Own() string }](x T) string { return x.Own() }\n\n"
                  "func Pkg() string {\n\tvar t T\n\treturn t.Hello()\n}\n\n"
                  "func First[T any](xs []T) T { return xs[0] }\n\n"
-                 "type Box[T any] struct{ v T }\n\n"
-                 "func (b Box[T]) Get() T { return b.v }\n"},
+                 "type Box[T any] struct{ V T }\n\n"
+                 "func (b Box[T]) Get() T { return b.V }\n"},
     {"app/app.go", "package app\n\nimport (\n\t\"example.com/demo/m\"\n\t\"example.com/demo/p2\"\n)\n\n"
                    "func Call() string { return m.First([]p2.E{{}}).Hello() }\n\n"
-                   "func Boxed() string { return m.Box[p2.E]{}.Get().Hello() }\n"},
+                   "func Boxed() string { return m.Box[p2.E]{}.Get().Hello() }\n\n"
+                   "func Field(b m.Box[p2.E]) string { return b.V.Hello() }\n"},
     {NULL, NULL}};
 
 static int go_shadowtype_check(cbm_store_t *s, const char *project, const char *label) {
@@ -1513,7 +1514,8 @@ static int go_shadowtype_check(cbm_store_t *s, const char *project, const char *
                 ts_calls_to(s, project, "Generic", "p1.E.Hello", NULL) +
                 ts_calls_to(s, project, "Direct", "m.T.Own", NULL) +
                 ts_calls_to(s, project, "Call", "p1.E.Hello", NULL) +
-                ts_calls_to(s, project, "Boxed", "p1.E.Hello", NULL);
+                ts_calls_to(s, project, "Boxed", "p1.E.Hello", NULL) +
+                ts_calls_to(s, project, "Field", "p1.E.Hello", NULL);
     int pkg = ts_calls_to(s, project, "Pkg", "p1.E.Hello", NULL);
     printf("  go function-declared types (%s): wrong=%d, package T Pkg=%d\n", label, wrong, pkg);
     return !(wrong == 0 && pkg == 1);
@@ -2022,6 +2024,33 @@ TEST(type_scope_incremental_python_declaring_change_matches_full) {
     PASS();
 }
 
+/* Round 3, N2 on the incremental routes: a class-body edit that binds the
+ * name a method annotation uses (`marker = OtherConfig` becomes `Config =
+ * OtherConfig`: same lines, same bytes otherwise) changes the class's
+ * identities. The class's bindings are part of its stored row, so the run is
+ * not a one-file repair that keeps the caller's stale `run ->
+ * pkg.mod.Config.load`. */
+TEST(type_scope_incremental_python_class_body_binding_matches_full) {
+    const ts_file_t files[] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/other.py", "class OtherConfig:\n    def load(self):\n        return 'other'\n"},
+        {"pkg/mod.py", "from pkg.other import OtherConfig\n\n\n"
+                       "class Config:\n    def load(self):\n        return 'module'\n\n\n"
+                       "class Model:\n    marker = OtherConfig\n\n"
+                       "    def cfg(self) -> Config:\n        return Config()\n"},
+        {"pkg/use.py", "from pkg.mod import Model\n\n\ndef run():\n    return Model().cfg().load()\n"},
+        {NULL, NULL}};
+    const ts_file_t edit[] = {
+        {"pkg/mod.py", "from pkg.other import OtherConfig\n\n\n"
+                       "class Config:\n    def load(self):\n        return 'module'\n\n\n"
+                       "class Model:\n    Config = OtherConfig\n\n"
+                       "    def cfg(self) -> Config:\n        return Config()\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_PYTHON, 0, edit, "py class-body binding");
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
 SUITE(type_scope) {
     RUN_TEST(type_scope_import_binding_is_the_identity);
     RUN_TEST(type_scope_dotted_spelling_through_its_head);
@@ -2065,6 +2094,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_incremental_named_type_embed_change_matches_full);
     RUN_TEST(type_scope_incremental_many_embedded_types_match_full);
     RUN_TEST(type_scope_incremental_many_fields_match_full);
+    RUN_TEST(type_scope_incremental_python_class_body_binding_matches_full);
     RUN_TEST(type_scope_incremental_type_shape_changes_match_full);
     RUN_TEST(type_scope_incremental_other_def_edit_stays_a_repair);
     RUN_TEST(type_scope_incremental_python_body_edits);
