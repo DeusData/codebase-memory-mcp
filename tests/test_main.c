@@ -11,7 +11,7 @@ int tf_deselected_count = 0;
 
 #include "test_framework.h"
 #include "test_helpers.h"
-#include "test_daemon_runtime_contract.h"
+#include "test_image_probe.h"
 #include "foundation/compat.h"         /* cbm_setenv — #845 supervisor kill switch */
 #include "foundation/compat_fs.h"      /* cbm_fopen — worker response file */
 #include "foundation/constants.h"      /* CBM_SZ_4K — forced stderr buffer */
@@ -48,10 +48,6 @@ int tf_deselected_count = 0;
 #include <limits.h>   /* INT_MAX: a handed-down descriptor */
 #include <sys/wait.h> /* waitpid: the process-tree probe root */
 #include <unistd.h>
-#ifdef __APPLE__
-#include <fcntl.h>
-#include <sys/mman.h>
-#endif
 #ifdef CBM_TEST_COVERAGE
 #include <dlfcn.h>    /* the libc functions behind the profile-keeping ones */
 #include <fcntl.h>    /* the marker of a forked child */
@@ -657,129 +653,12 @@ static int tf_maybe_run_version_cohort_crash_holder(int argc, char **argv) {
 #endif
 }
 
-static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
-#ifdef _WIN32
-    if (argc != 3 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
-        return -1;
-    }
-    HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, argv[2]);
-    bool announced = ready && SetEvent(ready) != 0;
-    if (ready) {
-        (void)CloseHandle(ready);
-    }
-    if (!announced) {
-        return 24;
-    }
-    Sleep(INFINITE);
-    return 25;
-#else
-    /* POSIX copied-image holder: block reading stdin until the parent closes
-     * the release pipe, exactly like the cat(1) donor this replaced. A system
-     * utility cannot serve as the copied image — a multi-call coreutils
-     * binary (uutils cat) refuses to execute under the copied name. */
-    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
-        return -1;
-    }
-    char release[16];
-    ssize_t count;
-    do {
-        count = read(STDIN_FILENO, release, sizeof(release));
-    } while (count > 0 || (count < 0 && errno == EINTR));
-    return count == 0 ? 0 : 25;
-#endif
-}
-
-/* Real copied-image HELLO probe used by daemon_runtime. Keeping this in the
- * test runner avoids any production-only test hook: the daemon authenticates
- * and fingerprints an ordinary, separately executed process image. */
-static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
-    if (argc != 6 || strcmp(argv[1], "__cbm_runtime_hello_client") != 0) {
-        return -1;
-    }
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_ipc_endpoint_new(argv[3], argv[2]);
-    cbm_daemon_build_identity_t identity = {
-        .semantic_version = argv[4],
-        .build_fingerprint = argv[5],
-    };
-    cbm_daemon_runtime_connect_result_t result;
-    memset(&result, 0, sizeof(result));
-    cbm_daemon_runtime_client_t *client =
-        endpoint ? cbm_daemon_runtime_client_connect(endpoint, &identity,
-                                                     TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result)
-                 : NULL;
-    bool accepted = client && result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED &&
-                    result.hello_status == CBM_DAEMON_HELLO_COMPATIBLE;
-    bool closed =
-        !client || cbm_daemon_runtime_client_close(client, TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS);
-    cbm_daemon_ipc_endpoint_free(endpoint);
-    if (!accepted) {
-        return 26;
-    }
-    return closed ? 0 : 27;
-}
-
-/* Real copied-image activation probe. The request identity is supplied by the
- * executing copy so the daemon must authenticate that peer image rather than
- * require the active generation's build fingerprint. */
-static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
-    if (argc != 7 || strcmp(argv[1], "__cbm_runtime_activation_client") != 0) {
-        return -1;
-    }
-    char *action_end = NULL;
-    unsigned long action_value = strtoul(argv[6], &action_end, 10);
-    bool action_valid = action_end != argv[6] && *action_end == '\0' &&
-                        action_value >= (unsigned long)CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL &&
-                        action_value <= (unsigned long)CBM_DAEMON_RUNTIME_ACTIVATION_UNINSTALL;
-    cbm_daemon_ipc_endpoint_t *endpoint =
-        action_valid ? cbm_daemon_ipc_endpoint_new(argv[3], argv[2]) : NULL;
-    cbm_daemon_build_identity_t identity = {
-        .semantic_version = argv[4],
-        .build_fingerprint = argv[5],
-    };
-    cbm_daemon_runtime_activation_result_t result;
-    memset(&result, 0, sizeof(result));
-    bool exchanged =
-        endpoint && cbm_daemon_runtime_request_activation_shutdown(
-                        endpoint, &identity, (cbm_daemon_runtime_activation_action_t)action_value,
-                        TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result);
-    cbm_daemon_ipc_endpoint_free(endpoint);
-    return exchanged && result.accepted ? 0 : 29;
-}
-
-/* macOS adversarial HELLO probe: execute this mode from a foreign process
- * image while mapping the genuine runner RX. The daemon must authenticate the
- * main image, not merely find its own vnode in an arbitrary executable map. */
-static int tf_maybe_run_runtime_mapped_hello_client(int argc, char **argv) {
-#ifdef __APPLE__
-    if (argc != 7 || strcmp(argv[1], "__cbm_runtime_mapped_hello_client") != 0) {
-        return -1;
-    }
-    int image_fd = open(argv[2], O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    void *mapping =
-        image_fd >= 0 ? mmap(NULL, 1, PROT_READ | PROT_EXEC, MAP_PRIVATE, image_fd, 0) : MAP_FAILED;
-    bool mapped = mapping != MAP_FAILED;
-    if (image_fd >= 0 && close(image_fd) != 0) {
-        mapped = false;
-    }
-    if (!mapped) {
-        if (mapping != MAP_FAILED) {
-            (void)munmap(mapping, 1);
-        }
-        return 28;
-    }
-
-    char *hello_argv[] = {argv[0], "__cbm_runtime_hello_client", argv[3], argv[4], argv[5],
-                          argv[6]};
-    int result = tf_maybe_run_runtime_hello_client(6, hello_argv);
-    if (munmap(mapping, 1) != 0) {
-        return 28;
-    }
-    return result >= 0 ? result : 28;
-#else
-    (void)argc;
-    (void)argv;
-    return -1;
-#endif
+/* The image probe's roles (tests/image_probe_roles.c, tests/test_image_probe.h).
+ * The runner itself dispatches only the image holder through here; tf_roles
+ * names the probe's other literals under TF_PHASE_PROBE so the test-impact
+ * engine still maps a change those roles reach to the tests that start them. */
+static int tf_role_image_probe(int argc, char **argv) {
+    return tf_image_probe_dispatch(argc, argv);
 }
 
 static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
@@ -2289,6 +2168,7 @@ typedef enum {
     TF_PHASE_SEAMED,    /* after the spill and build-fingerprint pins */
     TF_PHASE_WORKER,    /* after the fingerprint capture; the literal anywhere in argv */
     TF_PHASE_SPAWNER,   /* never dispatched: one more literal a spawner names */
+    TF_PHASE_PROBE,     /* never dispatched here: the image probe runs the role */
 } tf_phase_t;
 
 typedef struct {
@@ -2314,10 +2194,11 @@ static const tf_role_t tf_roles[] = {
     TF_ROLE(TF_PHASE_INSTALL, "--build-config", tf_role_build_config),
     TF_ROLE(TF_PHASE_SEAMED, "--userns-secure-probe", tf_role_userns_secure_probe),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_mcp_idxfailclosed_probe", tf_maybe_run_mcp_idxfailclosed_probe),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_image_holder", tf_maybe_run_runtime_image_holder),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_hello_client", tf_maybe_run_runtime_hello_client),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_activation_client", tf_maybe_run_runtime_activation_client),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_mapped_hello_client", tf_maybe_run_runtime_mapped_hello_client),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_image_holder", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_serve", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_hello_client", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_activation_client", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_mapped_hello_client", tf_role_image_probe),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_version_cohort_crash_holder", tf_maybe_run_version_cohort_crash_holder),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_daemon_ipc_lock_probe", tf_maybe_run_daemon_ipc_lock_probe),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_deleted_self_probe", tf_maybe_run_deleted_self_probe),
