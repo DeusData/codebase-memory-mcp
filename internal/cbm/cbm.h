@@ -1419,6 +1419,9 @@ bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *sou
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_py_namespace_test_capture_fail_after(int successful_allocations);
 void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
+/* Work of building Go structs' embedded-type texts (field-list entries
+ * visited plus spelling bytes): the growth test counts it at three sizes. */
+uint64_t cbm_extract_test_go_embedded_work(void);
 #endif
 
 // Growable array push functions (arena-allocated, no individual free needed).

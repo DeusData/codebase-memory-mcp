@@ -911,6 +911,48 @@ TEST(type_scope_python_class_and_module_of_one_qn) {
     return ts_twins("pyclassmod", py_classmod_files, CBM_LANG_PYTHON, py_classmod_check);
 }
 
+/* A struct's embedded-type text is built once, with one buffer: the
+ * extractor's work for n embedded types is linear in n. */
+static uint64_t ts_go_embedded_work(int n) {
+    size_t cap = (size_t)n * 24 + 256;
+    char *src = (char *)calloc(cap, 1);
+    if (!src) {
+        return 0;
+    }
+    size_t at = (size_t)snprintf(src, cap,
+                                 "package p\n\nimport \"example.com/demo/parts\"\n\ntype S struct {\n");
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at, "\tparts.E%d\n", i);
+    }
+    at += (size_t)snprintf(src + at, cap - at, "}\n");
+    uint64_t before = cbm_extract_test_go_embedded_work();
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)at, CBM_LANG_GO, "proj", "p/s.go", 0, NULL, NULL);
+    uint64_t work = cbm_extract_test_go_embedded_work() - before;
+    /* the whole list is there: n spellings, the last one included */
+    char last[32];
+    snprintf(last, sizeof(last), "parts.E%d", n - 1);
+    bool whole = false;
+    for (int i = 0; r && i < r->defs.count; i++) {
+        const CBMDefTypeFacts *f = r->defs.items[i].type_facts;
+        whole = whole || (f && f->go_embedded && strstr(f->go_embedded, last));
+    }
+    cbm_free_result(r);
+    free(src);
+    return whole ? work : 0;
+}
+
+TEST(type_scope_go_embedded_text_work_grows_linearly) {
+    uint64_t small = ts_go_embedded_work(2000);
+    uint64_t mid = ts_go_embedded_work(4000);
+    uint64_t large = ts_go_embedded_work(8000);
+    printf("  go embedded text work: 2000 embeds=%llu 4000=%llu 8000=%llu\n",
+           (unsigned long long)small, (unsigned long long)mid, (unsigned long long)large);
+    ASSERT_TRUE(ts_linear(small, mid));
+    ASSERT_TRUE(ts_linear(mid, large));
+    PASS();
+}
+
 /* Finding 6: `-> Self` chains across files keep main's edges; `Self` comes
  * from typing, which the project does not define. A decoy declares the same
  * method names. */
@@ -2176,6 +2218,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_promotion_takes_the_shallowest_depth);
     RUN_TEST(type_scope_go_embedded_field_names_are_fields);
     RUN_TEST(type_scope_go_function_declared_types_are_not_the_package_types);
+    RUN_TEST(type_scope_go_embedded_text_work_grows_linearly);
     RUN_TEST(type_scope_go_struct_fields_have_no_limit);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go_values);

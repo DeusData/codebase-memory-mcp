@@ -16,6 +16,7 @@
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <limits.h>          // INT_MAX
+#include <stdatomic.h>       // test-seam work counters
 #include <stdint.h>          // uint32_t, SIZE_MAX
 #include <stdio.h>           // snprintf (ObjectScript storage/trigger sidecars)
 #include <stdlib.h>          // malloc/free (child-collection scratch)
@@ -8895,29 +8896,84 @@ static const char *cs_type_decl_namespace(CBMExtractCtx *ctx, TSNode node) {
     return ts_node_has_error(top) ? NULL : "";
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_go_embedded_text_work;
+uint64_t cbm_extract_test_go_embedded_work(void) {
+    return atomic_load_explicit(&g_go_embedded_text_work, memory_order_relaxed);
+}
+#define GO_EMBEDDED_TEXT_WORK(n) \
+    atomic_fetch_add_explicit(&g_go_embedded_text_work, (uint64_t)(n), memory_order_relaxed)
+#else
+#define GO_EMBEDDED_TEXT_WORK(n) ((void)0)
+#endif
+
+/* The type of an embedded field (an unnamed field declaration) of a struct's
+ * field list, or a null node. */
+static TSNode go_embedded_field_type(TSNode field) {
+    if (strcmp(ts_node_type(field), "field_declaration") != 0 ||
+        !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("name")))) {
+        return (TSNode){0};
+    }
+    return ts_node_child_by_field_name(field, TS_FIELD("type"));
+}
+
+/* Its spelling's span when it can join a '|'-list (non-empty, no '|'). */
+static bool go_embedded_span(TSNode type, const char *source, uint32_t *start, uint32_t *len) {
+    if (ts_node_is_null(type)) {
+        return false;
+    }
+    *start = ts_node_start_byte(type);
+    *len = ts_node_end_byte(type) - *start;
+    GO_EMBEDDED_TEXT_WORK(*len);
+    return *len > 0 && !memchr(source + *start, '|', *len);
+}
+
 /* Go: the types a struct type_spec embeds (its unnamed field declarations),
- * '|'-joined as written, or NULL. */
+ * '|'-joined as written, or NULL. Two passes over the field list with a
+ * cursor (measure, then copy once): linear in the struct's size. */
 static const char *go_struct_embedded_text(CBMArena *a, TSNode spec, const char *source) {
     TSNode st = ts_node_child_by_field_name(spec, TS_FIELD("type"));
     if (ts_node_is_null(st) || strcmp(ts_node_type(st), "struct_type") != 0) {
         return NULL;
     }
     TSNode list = cbm_find_child_by_kind(st, "field_declaration_list");
-    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
-    const char *out = NULL;
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode field = ts_node_named_child(list, i);
-        if (strcmp(ts_node_type(field), "field_declaration") != 0 ||
-            !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("name")))) {
-            continue;
-        }
-        TSNode type = ts_node_child_by_field_name(field, TS_FIELD("type"));
-        const char *text = ts_node_is_null(type) ? NULL : cbm_node_text(a, type, source);
-        if (!text || !text[0] || strchr(text, '|')) {
-            continue;
-        }
-        out = out ? cbm_arena_sprintf(a, "%s|%s", out, text) : text;
+    if (ts_node_is_null(list)) {
+        return NULL;
     }
+    size_t total = 0;
+    char *out = NULL;
+    size_t at = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        TSTreeCursor cur = ts_tree_cursor_new(list);
+        for (bool ok = ts_tree_cursor_goto_first_child(&cur); ok;
+             ok = ts_tree_cursor_goto_next_sibling(&cur)) {
+            GO_EMBEDDED_TEXT_WORK(1);
+            uint32_t start = 0;
+            uint32_t len = 0;
+            TSNode field = ts_tree_cursor_current_node(&cur);
+            if (!ts_node_is_named(field) ||
+                !go_embedded_span(go_embedded_field_type(field), source, &start, &len)) {
+                continue;
+            }
+            if (pass == 0) {
+                total += len + 1;
+                continue;
+            }
+            if (at) {
+                out[at++] = '|';
+            }
+            memcpy(out + at, source + start, len);
+            at += len;
+        }
+        ts_tree_cursor_delete(&cur);
+        if (pass == 0) {
+            out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
+            if (!out) {
+                return NULL;
+            }
+        }
+    }
+    out[at] = '\0';
     return out;
 }
 
