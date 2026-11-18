@@ -885,19 +885,26 @@ TEST(type_scope_python_class_body_bindings_shadow_the_module) {
  * their members `run` share pkg.a.Thing.run, so no member edge through an
  * identity Thing=pkg.a.Thing is that class's (the graph keeps the module's
  * nodes). Python: `from pkg.a import Thing` is the class while nothing imports
- * the submodule, and the submodule once something does. */
+ * the submodule, and the submodule once something does. The partner: a class
+ * of the same __init__ with no module of its QN (Other) is reached through
+ * the same kind of identity. */
 static const ts_file_t py_classmod_files[] = {
     {"pkg/__init__.py", ""},
-    {"pkg/a/__init__.py", "class Thing:\n    def run(self):\n        return 'class'\n"},
+    {"pkg/a/__init__.py", "class Thing:\n    def run(self):\n        return 'class'\n\n\n"
+                          "class Other:\n    def run(self):\n        return 'other'\n"},
     {"pkg/a/Thing.py", "def run():\n    return 'module'\n"},
-    {"pkg/b.py", "from pkg.a import Thing\n\n\ndef make() -> Thing:\n    return Thing()\n"},
-    {"pkg/c.py", "from pkg.b import make\n\n\ndef go():\n    return make().run()\n"},
+    {"pkg/b.py", "from pkg.a import Other, Thing\n\n\ndef make() -> Thing:\n    return Thing()\n\n\n"
+                 "def make_other() -> Other:\n    return Other()\n"},
+    {"pkg/c.py", "from pkg.b import make, make_other\n\n\ndef go():\n    return make().run()\n\n\n"
+                 "def go_other():\n    return make_other().run()\n"},
     {NULL, NULL}};
 
 static int py_classmod_check(cbm_store_t *s, const char *project, const char *label) {
     int member = ts_calls_to(s, project, "go", "pkg.a.Thing.run", NULL);
-    printf("  python class and module of one QN (%s): go -> Thing.run=%d\n", label, member);
-    return member != 0;
+    int other = ts_calls_to(s, project, "go_other", "pkg.a.Other.run", NULL);
+    printf("  python class and module of one QN (%s): go -> Thing.run=%d, go_other -> Other.run=%d\n",
+           label, member, other);
+    return !(member == 0 && other == 1);
 }
 
 TEST(type_scope_python_class_and_module_of_one_qn) {
@@ -1427,13 +1434,18 @@ TEST(type_scope_go_promotion_takes_the_shallowest_depth) {
  * the same in one file; an embedded type the project does not have
  * (sync.Mutex) still shadows a deeper `Mutex`; and build variants of one
  * struct, one of which declares a field `Item` the other does not, select no
- * deeper `Item`. `go run` agrees on each. */
+ * `Item` at all: `v.Item` is base.Item on a linux build and Deep's Item2
+ * elsewhere (`go run` on darwin: item2), so no one edge is right. Each "no
+ * edge" case has a positive partner: a promoted method of Outer (Ping), the
+ * explicit path to the deeper Mutex (Lock2), a field both variants declare
+ * alike (UseSame); Here's edge is the embedded Cfg's. `go run` agrees. */
 static const ts_file_t go_embfield_files[] = {
     {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
     {"base/base.go", "package base\n\ntype Config struct{ n int }\n\n"
                      "func (c *Config) Validate() string { return \"base\" }\n\n"
                      "type Handler struct {\n\tConfig *Config\n}\n\n"
                      "type W struct{ n int }\n\nfunc (w W) Logger(s string) string { return s }\n\n"
+                     "func (w W) Ping() string { return \"p\" }\n\n"
                      "type M struct{ n int }\n\nfunc (m *M) Lock() {}\n\n"
                      "type Locker struct {\n\tMutex *M\n}\n\n"
                      "type Item struct{ n int }\n\nfunc (i *Item) Do() string { return \"item\" }\n\n"
@@ -1448,14 +1460,17 @@ static const ts_file_t go_embfield_files[] = {
                       "type U struct {\n\tsync.Mutex\n\tbase.Locker\n}\n"},
     {"srv/local.go", "package srv\n\nfunc Local(s *Server) string { return s.Config.Validate() }\n"},
     {"srv/v_linux.go", "//go:build linux\n\npackage srv\n\nimport \"example.com/demo/base\"\n\n"
-                       "type V struct {\n\tItem *base.Item\n\tbase.Deep\n}\n"},
+                       "type V struct {\n\tItem *base.Item\n\tSame *base.Item\n\tbase.Deep\n}\n"},
     {"srv/v_other.go", "//go:build !linux\n\npackage srv\n\nimport \"example.com/demo/base\"\n\n"
-                       "type V struct {\n\tbase.Deep\n}\n"},
+                       "type V struct {\n\tSame *base.Item\n\tbase.Deep\n}\n"},
     {"app/app.go", "package app\n\nimport \"example.com/demo/srv\"\n\n"
                    "func Run(s *srv.Server) string { return s.Config.Validate() }\n\n"
                    "func Log(o srv.Outer) string { return o.Logger(\"x\") }\n\n"
                    "func Lock(u *srv.U) { u.Mutex.Lock() }\n\n"
-                   "func Use(v *srv.V) string { return v.Item.Do() }\n"},
+                   "func Use(v *srv.V) string { return v.Item.Do() }\n\n"
+                   "func Ping(o srv.Outer) string { return o.Ping() }\n\n"
+                   "func Lock2(u *srv.U) { u.Locker.Mutex.Lock() }\n\n"
+                   "func UseSame(v *srv.V) string { return v.Same.Do() }\n"},
     {"one/one.go", "package one\n\ntype Cfg struct{ n int }\n\nfunc (c Cfg) Check() string { return \"cfg\" }\n\n"
                    "type Other struct{ n int }\n\nfunc (o Other) Check() string { return \"other\" }\n\n"
                    "type H struct {\n\tCfg Other\n}\n\n"
@@ -1466,16 +1481,23 @@ static const ts_file_t go_embfield_files[] = {
 static int go_embfield_check(cbm_store_t *s, const char *project, const char *label) {
     int run_right = ts_calls_to(s, project, "Run", "srv.Config.Validate", NULL);
     int local_right = ts_calls_to(s, project, "Local", "srv.Config.Validate", NULL);
+    int here_right = ts_calls_to(s, project, "Here", "one.Cfg.Check", NULL);
+    int ping = ts_calls_to(s, project, "Ping", "base.W.Ping", NULL);
+    int lock2 = ts_calls_to(s, project, "Lock2", "base.M.Lock", NULL);
+    int same = ts_calls_to(s, project, "UseSame", "base.Item.Do", NULL);
     int wrong = ts_calls_to(s, project, "Run", "base.Config.Validate", NULL) +
                 ts_calls_to(s, project, "Local", "base.Config.Validate", NULL) +
                 ts_calls_to(s, project, "Log", "base.W.Logger", NULL) +
                 ts_calls_to(s, project, "Lock", "base.M.Lock", NULL) +
-                ts_calls_to(s, project, "Use", "base.Item2.Do", NULL) +
                 ts_calls_to(s, project, "Here", "one.Other.Check", NULL);
-    int here_right = ts_calls_to(s, project, "Here", "one.Cfg.Check", NULL);
-    printf("  go embedded field names (%s): Run=%d Local=%d Here=%d, wrong=%d\n", label, run_right,
-           local_right, here_right, wrong);
-    return !(run_right == 1 && local_right == 1 && here_right <= 1 && wrong == 0);
+    /* the answer of a build: Item on linux, Item2 elsewhere */
+    int by_build = ts_calls_to(s, project, "Use", "base.Item2.Do", NULL) +
+                   ts_calls_to(s, project, "Use", "base.Item.Do", NULL);
+    printf("  go embedded field names (%s): Run=%d Local=%d Here=%d Ping=%d Lock2=%d UseSame=%d, "
+           "wrong=%d, by build=%d\n",
+           label, run_right, local_right, here_right, ping, lock2, same, wrong, by_build);
+    return !(run_right == 1 && local_right == 1 && here_right == 1 && ping == 1 && lock2 == 1 &&
+             same == 1 && wrong == 0 && by_build == 0);
 }
 
 TEST(type_scope_go_embedded_field_names_are_fields) {
@@ -1518,8 +1540,12 @@ static int go_shadowtype_check(cbm_store_t *s, const char *project, const char *
                 ts_calls_to(s, project, "Boxed", "p1.E.Hello", NULL) +
                 ts_calls_to(s, project, "Field", "p1.E.Hello", NULL);
     int pkg = ts_calls_to(s, project, "Pkg", "p1.E.Hello", NULL);
-    printf("  go function-declared types (%s): wrong=%d, package T Pkg=%d\n", label, wrong, pkg);
-    return !(wrong == 0 && pkg == 1);
+    /* the signatures are read: the calls themselves resolve */
+    int direct = ts_calls_to(s, project, "Call", "m.First", NULL) +
+                 ts_calls_to(s, project, "Boxed", "m.Box.Get", NULL);
+    printf("  go function-declared types (%s): wrong=%d, package T Pkg=%d, First/Get=%d\n", label,
+           wrong, pkg, direct);
+    return !(wrong == 0 && pkg == 1 && direct == 2);
 }
 
 TEST(type_scope_go_function_declared_types_are_not_the_package_types) {
@@ -1648,13 +1674,31 @@ typedef struct {
     cbm_incremental_route_t route;
     cbm_incremental_closure_plan_t plan;
     bool same_graph;
+    int before_bad; /* the `before` check on the first index (0 = right) */
+    int after_bad;  /* the `after` check on the repaired graph (0 = right) */
 } ts_incr_result_t;
+
+/* Run `check` on one database of the harness: 0 when it holds (or there is
+ * no check), else nonzero (also when the index named no project). */
+static int ts_db_check(const char *db, const char *project, ts_check_fn check, const char *label) {
+    if (!check || !project[0]) {
+        return check ? 1 : 0;
+    }
+    cbm_store_t *s = cbm_store_open_path(db);
+    int bad = s ? check(s, project, label) : 1;
+    if (s) {
+        cbm_store_close(s);
+    }
+    return bad;
+}
 
 /* Index `files` (plus `pad` Go or Python fillers), apply `edits`, index again
  * incrementally into the same database, then index the edited tree afresh;
- * the two graphs must be equal whatever route the incremental run took. */
-static ts_incr_result_t ts_incremental(const ts_file_t *files, CBMLanguage pad_lang, int pad,
-                                       const ts_file_t *edits, const char *tag) {
+ * the two graphs must be equal whatever route the incremental run took.
+ * `before` (optional) checks the first index, `after` the repaired graph. */
+static ts_incr_result_t ts_incremental_checked(const ts_file_t *files, CBMLanguage pad_lang,
+                                               int pad, const ts_file_t *edits, const char *tag,
+                                               ts_check_fn before, ts_check_fn after) {
     ts_incr_result_t r = {.route = CBM_INCREMENTAL_ROUTE_NONE};
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tscope_incr_XXXXXX");
@@ -1671,6 +1715,7 @@ static ts_incr_result_t ts_incremental(const ts_file_t *files, CBMLanguage pad_l
         snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(base));
     }
     cbm_pipeline_free(base);
+    r.before_bad = ts_db_check(db, project, before, "before the edit");
 
     ts_write(tmp, edits);
     cbm_pipeline_incremental_test_reset_faults();
@@ -1679,6 +1724,7 @@ static ts_incr_result_t ts_incremental(const ts_file_t *files, CBMLanguage pad_l
     r.route = cbm_pipeline_incremental_test_last_route();
     r.plan = cbm_pipeline_incremental_test_last_closure_plan();
     cbm_pipeline_free(incr);
+    r.after_bad = rc == 0 ? ts_db_check(db, project, after, "repaired") : 1;
 
     char full_db[512];
     snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
@@ -1701,6 +1747,11 @@ static ts_incr_result_t ts_incremental(const ts_file_t *files, CBMLanguage pad_l
     free(fresh);
     th_rmtree(tmp);
     return r;
+}
+
+static ts_incr_result_t ts_incremental(const ts_file_t *files, CBMLanguage pad_lang, int pad,
+                                       const ts_file_t *edits, const char *tag) {
+    return ts_incremental_checked(files, pad_lang, pad, edits, tag, NULL, NULL);
 }
 
 /* Only the caller is re-parsed (a closure of one file: the per-file Go
@@ -1913,6 +1964,14 @@ static void go_emb_sources(void) {
              fields);
 }
 
+/* The repaired graph has the edge through the 17th embedded type. */
+static int go_emb16_after(cbm_store_t *s, const char *project, const char *label) {
+    int m16 = ts_calls_to(s, project, "Use", "big.E16.M16", NULL);
+    int m14 = ts_calls_to(s, project, "Use", "big.E14.M14", NULL);
+    printf("  go 17 embedded types (%s): Use -> E16.M16=%d E14.M14=%d\n", label, m16, m14);
+    return !(m16 == 1 && m14 == 1);
+}
+
 TEST(type_scope_incremental_many_embedded_types_match_full) {
     go_emb_sources();
     const ts_file_t files[] = {
@@ -1926,24 +1985,37 @@ TEST(type_scope_incremental_many_embedded_types_match_full) {
                        "func Run(b *big.Big) string { return b.M16() }\n"},
         {NULL, NULL}};
     const ts_file_t edit[] = {{"big/big.go", g_go_emb_big_edited}, {NULL, NULL}};
-    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 40, edit, "go 17 embedded types");
+    ts_incr_result_t r = ts_incremental_checked(files, CBM_LANG_GO, 40, edit, "go 17 embedded types",
+                                                NULL, go_emb16_after);
     ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(r.plan.files, 1);
     ASSERT_TRUE(r.same_graph);
+    ASSERT_EQ(r.after_bad, 0);
     PASS();
 }
 
-/* The same for a struct of 66 fields (the 63-field limit beside N4). */
+/* The same for a struct of 66 fields (the 63-field limit beside N4): the
+ * repaired graph is the full index's and has the calls through fields 65
+ * and 66 (both routes cut at 63 before). */
+static int go_wide_after(cbm_store_t *s, const char *project, const char *label) {
+    int use = ts_calls_to(s, project, "Use", "kind.K.Name", NULL) +
+              ts_calls_to(s, project, "Use", "kind.L.Name", NULL);
+    printf("  go 66 fields (%s): Use through fields 65 and 66=%d\n", label, use);
+    return use != 2;
+}
+
 TEST(type_scope_incremental_many_fields_match_full) {
     ts_file_t files[8];
     go_wide_fixture(files);
     const ts_file_t edit[] = {
         {"wide/wide.go", go_wide_source(g_go_wide_edited, sizeof(g_go_wide_edited), true)},
         {NULL, NULL}};
-    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 40, edit, "go 66 fields");
+    ts_incr_result_t r = ts_incremental_checked(files, CBM_LANG_GO, 40, edit, "go 66 fields", NULL,
+                                                go_wide_after);
     ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(r.plan.files, 1);
     ASSERT_TRUE(r.same_graph);
+    ASSERT_EQ(r.after_bad, 0);
     PASS();
 }
 
@@ -2030,7 +2102,20 @@ TEST(type_scope_incremental_python_declaring_change_matches_full) {
  * OtherConfig`: same lines, same bytes otherwise) changes the class's
  * identities. The class's bindings are part of its stored row, so the run is
  * not a one-file repair that keeps the caller's stale `run ->
- * pkg.mod.Config.load`. */
+ * pkg.mod.Config.load`: before the edit the edge is there (Config is the
+ * module's), after it the repaired graph has none (python3: OtherConfig). */
+static int py_classedit_before(cbm_store_t *s, const char *project, const char *label) {
+    int edge = ts_calls_to(s, project, "run", "pkg.mod.Config.load", NULL);
+    printf("  py class-body edit (%s): run -> Config.load=%d\n", label, edge);
+    return edge != 1;
+}
+
+static int py_classedit_after(cbm_store_t *s, const char *project, const char *label) {
+    int edge = ts_calls_to(s, project, "run", "pkg.mod.Config.load", NULL);
+    printf("  py class-body edit (%s): run -> Config.load=%d\n", label, edge);
+    return edge != 0;
+}
+
 TEST(type_scope_incremental_python_class_body_binding_matches_full) {
     const ts_file_t files[] = {
         {"pkg/__init__.py", ""},
@@ -2047,8 +2132,12 @@ TEST(type_scope_incremental_python_class_body_binding_matches_full) {
                        "class Model:\n    Config = OtherConfig\n\n"
                        "    def cfg(self) -> Config:\n        return Config()\n"},
         {NULL, NULL}};
-    ts_incr_result_t r = ts_incremental(files, CBM_LANG_PYTHON, 0, edit, "py class-body binding");
+    ts_incr_result_t r = ts_incremental_checked(files, CBM_LANG_PYTHON, 0, edit,
+                                                "py class-body binding", py_classedit_before,
+                                                py_classedit_after);
     ASSERT_TRUE(r.same_graph);
+    ASSERT_EQ(r.before_bad, 0);
+    ASSERT_EQ(r.after_bad, 0);
     PASS();
 }
 
