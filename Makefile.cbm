@@ -1232,12 +1232,14 @@ IMAGE_PROBE_SRCS = tests/image_probe_main.c tests/image_probe_roles.c \
                    src/daemon/service.c $(IMAGE_PROBE_FOUNDATION_SRCS)
 CFLAGS_IMAGE_PROBE = $(filter-out $(TEST_COVERAGE_FLAGS) $(TEST_COVERAGE_DEFINE),$(CFLAGS_TEST))
 
-$(BUILD_DIR)/test-runner-image-probe: $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+# TRE_OBJ_* is empty except on Windows, where compat_regex.c is backed by TRE.
+$(BUILD_DIR)/test-runner-image-probe: $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TEST) $(TRE_OBJ_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_IMAGE_PROBE) -Itests -o $@ $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TEST) \
-		$(LDFLAGS_TEST)
+		$(TRE_OBJ_TEST) $(LDFLAGS_TEST)
 
-$(BUILD_DIR)/test-runner-tsan-image-probe: $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TSAN) -Itests -o $@ $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TSAN) $(LDFLAGS_TSAN)
+$(BUILD_DIR)/test-runner-tsan-image-probe: $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TSAN) $(TRE_OBJ_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TSAN) -Itests -o $@ $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TSAN) $(TRE_OBJ_TSAN) \
+		$(LDFLAGS_TSAN)
 
 $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR) $(BUILD_DIR)/test-runner-image-probe
 	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
