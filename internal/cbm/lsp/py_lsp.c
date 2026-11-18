@@ -4420,6 +4420,12 @@ static const char **py_split_subscript_args(CBMArena *arena, const char *s, int 
     return out;
 }
 
+/* The resolved type identities of the cross-file def whose annotations are
+ * being parsed (CBMLSPDef.type_scope, resolved once in the scope of the module
+ * that wrote them, indexed). Bound by py_register_lsp_defs around one def's
+ * texts only; NULL for every parse of the walked file's own source. */
+static _Thread_local const cbm_type_scope_index_t *g_py_type_scope;
+
 static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
                                             const char *module_qn) {
     if (!ann || !ann[0])
@@ -4574,6 +4580,11 @@ static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
         if (strcmp(ann, builtins[i]) == 0) {
             return cbm_type_builtin(arena, ann);
         }
+    }
+    // A name the defining module's scope resolved (its import, or its own class).
+    const char *scoped = cbm_type_scope_find(g_py_type_scope, ann, strlen(ann));
+    if (scoped) {
+        return cbm_type_named(arena, scoped);
     }
     // Bare unqualified name: qualify with module_qn if it doesn't already
     // contain a dot. Skips obvious typing-module names so `Optional` /
@@ -6453,9 +6464,20 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             rf.short_name = d->short_name;
             py_register_func_decorators(&rf, d->decorators);
 
-            // Build FUNC type from "|"-separated return types.
-            const char **ret_strs = py_split_pipe(arena, d->return_types);
+            /* this def's annotations only */
+            g_py_type_scope = cbm_type_scope_index(arena, d->type_scope);
+            // Build FUNC type from "|"-separated return types. A def whose
+            // annotations carry resolved identities is one annotation, parsed
+            // as the per-file registrar parses it (`T | None` is a union).
+            const char **ret_strs = g_py_type_scope ? NULL : py_split_pipe(arena, d->return_types);
             const CBMType **ret_types = NULL;
+            if (g_py_type_scope && d->return_types && d->return_types[0]) {
+                ret_types = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                if (ret_types) {
+                    ret_types[0] = py_parse_type_text_qn(arena, d->return_types, NULL);
+                    ret_types[1] = NULL;
+                }
+            }
             if (ret_strs) {
                 int n = 0;
                 while (ret_strs[n])
@@ -6473,12 +6495,15 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             /* Fallback definitions can be mixed-language. Only authoritative
              * Python metadata opts into package scope normalization. */
             if (d->lang == CBM_LANG_PYTHON &&
-                !py_symbol_scope(arena, d->def_module_qn, "register", &symbol_scope))
+                !py_symbol_scope(arena, d->def_module_qn, "register", &symbol_scope)) {
+                g_py_type_scope = NULL;
                 return false;
+            }
             PySignatureParamParserContext parser_ctx = {.module_qn = symbol_scope};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 py_signature_param_type_adapter, &parser_ctx);
+            g_py_type_scope = NULL;
             rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {

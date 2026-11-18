@@ -328,7 +328,43 @@ typedef struct {
      * for a defined type `type A B` (its method set is its own) and in every
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
+    /* Go and Python only: the facts the declared-type scope step and the
+     * cross-file registrars read (CBMDefTypeFacts), in the result arena; NULL
+     * for a definition without one and in every other language. One pointer,
+     * so the other languages pay 8 bytes per definition. Tail field:
+     * zero-init stays valid. */
+    const struct CBMDefTypeFacts *type_facts;
 } CBMDefinition;
+
+/* Facts of one Go or Python definition that no graph property carries; only
+ * the cross-file step reads them (src/pipeline/type_scope.h, the Go and
+ * Python cross registrars). Every field is NULL when absent. */
+typedef struct CBMDefTypeFacts {
+    /* The names its type parameter lists declare, '|'-joined: Python PEP 695
+     * (`def f[T, *Ts, **P]`, `class C[T]`), Go (`func F[K, V any]`, a generic
+     * receiver `(s *Set[T])`, `type Box[T any]`). They never name a type of
+     * the project. */
+    const char *type_params;
+    /* Go: the type a package-level `var`/`const` declares, or the type its
+     * single initializer spells (`T{}` is T, `&T{}` and `new(T)` are *T, a
+     * const block's bare spec repeats the previous one's): the Variable's
+     * type in the cross-file LSP (go_lsp.c, package-level values). */
+    const char *value_type;
+    /* Go: the types a struct embeds, '|'-joined as written
+     * ("logging.LogHolder|*Base"): the cross-file LSP promotes their members
+     * and names them as fields (go_lsp.c, embedded-member hook). */
+    const char *go_embedded;
+    /* Python class: the names its body binds other than by a nested def or
+     * class (assignments, annotated assignments with a value, imports,
+     * for/with/except/match targets, walrus, global/nonlocal/del; an
+     * annotation alone binds nothing), '|'-joined. A method annotation naming
+     * one of them means the class attribute, not the module's name. */
+    const char *class_bindings;
+    /* Python function or class: the names its body declares `global` and
+     * binds, '|'-joined. The body rebinds them in the module, so no
+     * annotation of the file names them through the module's other binding. */
+    const char *global_names;
+} CBMDefTypeFacts;
 
 /* extra_props key of a generated member, one the compiler writes and the
  * source never spells: a Java record's implicit accessor carries
@@ -1387,6 +1423,9 @@ bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *sou
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_py_namespace_test_capture_fail_after(int successful_allocations);
 void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
+/* Work of building Go structs' embedded-type texts (field-list entries
+ * visited plus spelling bytes): the growth test counts it at three sizes. */
+uint64_t cbm_extract_test_go_embedded_work(void);
 #endif
 
 // Growable array push functions (arena-allocated, no individual free needed).
