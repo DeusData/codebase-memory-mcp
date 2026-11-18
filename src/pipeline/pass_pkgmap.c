@@ -124,12 +124,29 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     e->items[e->count].manifest_rel = NULL;
     e->items[e->count].source_rel = NULL;
     e->items[e->count].source_seq = 0;
+    e->items[e->count].npm_dependency = false;
     e->count++;
+}
+
+/* A registry dependency a package.json declares, recorded by name only:
+ * entry_rel stays NULL, so it never becomes an import target. Its name is
+ * owned by the memory core (cbm_pkg_entries_free knows by npm_dependency). */
+static void pkg_entries_push_npm_dependency(cbm_pkg_entries_t *e, const char *name) {
+    int before = e->count;
+    pkg_entries_push(e, NULL, NULL);
+    if (e->count > before) {
+        e->items[before].pkg_name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name);
+        e->items[before].npm_dependency = true;
+    }
 }
 
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     for (int i = 0; i < e->count; i++) {
-        free(e->items[i].pkg_name);
+        if (e->items[i].npm_dependency) {
+            cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].pkg_name);
+        } else {
+            free(e->items[i].pkg_name);
+        }
         free(e->items[i].entry_rel);
         cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
         cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].source_rel);
@@ -291,7 +308,44 @@ static const char *resolve_pkg_entry(yyjson_val *root) {
     return "src/index.ts"; /* last resort default */
 }
 
-/* JS/TS: package.json — name + entry point resolution */
+/* A dependency version that points into the tree (`workspace:*`,
+ * `file:../x`, `link:`, `portal:`) names a local package, not a registry one. */
+static bool npm_version_is_local(const char *version) {
+    static const char *const local[] = {"workspace:", "file:", "link:", "portal:"};
+    for (size_t i = 0; i < sizeof(local) / sizeof(local[0]); i++) {
+        if (strncmp(version, local[i], strlen(local[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The registry dependencies of one package.json: every section a module
+ * import can resolve from. */
+static void push_npm_dependencies(yyjson_val *root, cbm_pkg_entries_t *entries) {
+    static const char *const sections[] = {"dependencies", "devDependencies", "peerDependencies",
+                                           "optionalDependencies"};
+    for (size_t s = 0; s < sizeof(sections) / sizeof(sections[0]); s++) {
+        yyjson_val *deps = yyjson_obj_get(root, sections[s]);
+        if (!yyjson_is_obj(deps)) {
+            continue;
+        }
+        size_t idx;
+        size_t max;
+        yyjson_val *key;
+        yyjson_val *val;
+        yyjson_obj_foreach(deps, idx, max, key, val) {
+            const char *name = yyjson_get_str(key);
+            const char *version = yyjson_get_str(val);
+            if (name && name[0] && version && !npm_version_is_local(version)) {
+                pkg_entries_push_npm_dependency(entries, name);
+            }
+        }
+    }
+}
+
+/* JS/TS: package.json — name + entry point resolution, and the names of its
+ * registry dependencies (a manifest without a name still declares those). */
 static void parse_package_json(const char *source, int source_len, const char *rel_path,
                                cbm_pkg_entries_t *entries) {
     yyjson_doc *doc = yyjson_read(source, (size_t)source_len, 0);
@@ -305,17 +359,8 @@ static void parse_package_json(const char *source, int source_len, const char *r
     }
 
     yyjson_val *name_val = yyjson_obj_get(root, "name");
-    if (!yyjson_is_str(name_val)) {
-        yyjson_doc_free(doc);
-        return;
-    }
-    const char *name = yyjson_get_str(name_val);
-    if (!name || name[0] == '\0') {
-        yyjson_doc_free(doc);
-        return;
-    }
-
-    const char *entry = resolve_pkg_entry(root);
+    const char *name = yyjson_is_str(name_val) ? yyjson_get_str(name_val) : NULL;
+    const char *entry = name && name[0] ? resolve_pkg_entry(root) : NULL;
     if (entry) {
         char *dir = path_dirname(rel_path);
         char *resolved = join_and_strip(dir, entry);
@@ -324,6 +369,7 @@ static void parse_package_json(const char *source, int source_len, const char *r
         }
         free(dir);
     }
+    push_npm_dependencies(root, entries);
 
     yyjson_doc_free(doc);
 }
@@ -1142,6 +1188,56 @@ static int pkgmap_candidate_cmp(const void *lhs, const void *rhs) {
     return strcmp(a->entry_rel, b->entry_rel);
 }
 
+/* The package map also records the names of the registry dependencies that
+ * package.json files declare, each under this prefix. No module specifier or
+ * package name starts with a control byte, so such a key never answers a
+ * module lookup; only pkgmap_declares_npm_dependency reads them. The key is
+ * owned by the memory core and every such entry shares one static value
+ * (pkgmap_free_entry tells them apart by the prefix). */
+static const char PKGMAP_NPM_DEPENDENCY_KEY[] = "\x01npm-dependency:";
+static char pkgmap_npm_dependency_value[] = "";
+
+static bool pkgmap_is_npm_dependency_key(const char *key) {
+    return strncmp(key, PKGMAP_NPM_DEPENDENCY_KEY, sizeof(PKGMAP_NPM_DEPENDENCY_KEY) - SKIP_ONE) ==
+           0;
+}
+
+/* Record every declared registry dependency once. Returns how many. */
+static int pkgmap_add_npm_dependencies(CBMHashTable *map, const cbm_pkg_entries_t *worker_entries,
+                                       int worker_count) {
+    int added = 0;
+    for (int w = 0; w < worker_count; w++) {
+        const cbm_pkg_entries_t *we = &worker_entries[w];
+        for (int i = 0; i < we->count; i++) {
+            const cbm_pkg_entry_t *entry = &we->items[i];
+            if (!entry->npm_dependency || !entry->pkg_name) {
+                continue;
+            }
+            size_t len = sizeof(PKGMAP_NPM_DEPENDENCY_KEY) + strlen(entry->pkg_name);
+            char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, len);
+            if (!key) {
+                continue;
+            }
+            snprintf(key, len, "%s%s", PKGMAP_NPM_DEPENDENCY_KEY, entry->pkg_name);
+            if (cbm_ht_has(map, key)) {
+                cbm_free(CBM_MEM_CLASS_OTHER, key);
+                continue;
+            }
+            cbm_ht_set(map, key, pkgmap_npm_dependency_value);
+            added++;
+        }
+    }
+    return added;
+}
+
+/* True when some package.json of the tree declares `package` as a registry
+ * dependency. */
+static bool pkgmap_declares_npm_dependency(const CBMHashTable *pkgmap, const char *package) {
+    char key[PKGMAP_PATH_BUF];
+    int n = snprintf(key, sizeof(key), "%s%s", PKGMAP_NPM_DEPENDENCY_KEY, package);
+    return pkgmap && n > 0 && (size_t)n < sizeof(key) && cbm_ht_has(pkgmap, key);
+}
+
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name) {
     /* Count total entries */
@@ -1197,12 +1293,16 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
         merged++;
     }
     cbm_free(CBM_MEM_CLASS_OTHER, candidates);
+    int declared = pkgmap_add_npm_dependencies(map, worker_entries, worker_count);
 
-    if (merged == 0) {
+    if (merged == 0 && declared == 0) {
         cbm_ht_free(map);
         return NULL;
     }
     cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merged));
+    if (declared > 0) {
+        cbm_log_info("pkgmap.build", "npm_dependencies", pkgmap_itoa(declared));
+    }
     return map;
 }
 
@@ -1486,6 +1586,10 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
 
 static void pkgmap_free_entry(const char *key, void *value, void *userdata) {
     (void)userdata;
+    if (pkgmap_is_npm_dependency_key(key)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)key); /* the value is the shared static one */
+        return;
+    }
     free((void *)key);
     free(value);
 }
@@ -2381,21 +2485,18 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
-/* The File an explicit relative import (`./x`, `../x`) names exactly, for
- * files whose File QN differs from the module QN Strategy 1 tries
- * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). Resolved in
- * stack buffers by cbm_repo_rel_join, which refuses a path above the
- * repository root. */
-static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
-                                                    const char *source_rel, const char *module_path,
-                                                    bool php_only) {
+/* The repository path an explicit relative import (`./x`, `../x`) names,
+ * joined into `out` in stack buffers by cbm_repo_rel_join, which refuses a
+ * path above the repository root. False when there is none. */
+static bool relative_import_path(const char *source_rel, const char *module_path, char *out,
+                                 size_t cap) {
     if (!source_rel || !module_path || !explicit_relative_path(module_path)) {
-        return NULL;
+        return false;
     }
     char dir[PKGMAP_PATH_BUF];
     int dir_len = snprintf(dir, sizeof(dir), "%s", source_rel);
     if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
-        return NULL;
+        return false;
     }
     char *slash = strrchr(dir, '/');
     if (slash) {
@@ -2403,12 +2504,246 @@ static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ct
     } else {
         dir[0] = '\0';
     }
+    return cbm_repo_rel_join(dir, module_path, out, cap);
+}
+
+/* The File an explicit relative import (`./x`, `../x`) names exactly, for
+ * files whose File QN differs from the module QN Strategy 1 tries
+ * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). */
+static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
+                                                    const char *source_rel, const char *module_path,
+                                                    bool php_only) {
     char path[PKGMAP_PATH_BUF];
-    if (!cbm_repo_rel_join(dir, module_path, path, sizeof(path))) {
+    if (!relative_import_path(source_rel, module_path, path, sizeof(path))) {
         return NULL;
     }
     const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
     return file && (!php_only || node_in_php_file(file)) ? file : NULL;
+}
+
+/* Python/TS from-import of a member: module_path is often "pkg.mod.symbol"
+ * while module resolution lands on the Module node "pkg.mod". Prefer the
+ * member Function/Class when it exists — required for `from M import f as g`
+ * so CALLS can import_map to f (local_name g ≠ f). */
+static const cbm_gbuf_node_t *prefer_import_member(const cbm_pipeline_ctx_t *ctx,
+                                                   const CBMImport *imp,
+                                                   const cbm_gbuf_node_t *target, bool php_only) {
+    if (!target->label ||
+        (strcmp(target->label, "Module") != 0 && strcmp(target->label, "File") != 0)) {
+        return target;
+    }
+    char symbuf[256];
+    const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
+    if (!sym || !sym[0] || strcmp(sym, "*") == 0) {
+        return target;
+    }
+    const char *mod_tail =
+        import_last_segment(target->qualified_name ? target->qualified_name : "");
+    if (mod_tail && strcmp(mod_tail, sym) == 0) {
+        return target;
+    }
+    char member_qn[CBM_SZ_512];
+    snprintf(member_qn, sizeof(member_qn), "%s.%s", target->qualified_name, sym);
+    const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+    if (member && (!php_only || node_in_php_file(member)) &&
+        import_targetable_label(member->label) && strcmp(member->label, "Module") != 0 &&
+        strcmp(member->label, "File") != 0) {
+        return member;
+    }
+    return target;
+}
+
+/* ── ECMAScript import specifiers ─────────────────────────────────── */
+
+/* Importing-file languages whose imports are ECMAScript module specifiers:
+ * the script languages and the markup hosts that embed their scripts. */
+static bool es_module_importer(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
+    case CBM_LANG_HTML:
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_ASTRO:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Node's built-in modules and their documented sub-paths, which a bare
+ * specifier names without the `node:` scheme. */
+static bool node_builtin_module(const char *spec) {
+    static const char builtins[] =
+        "|assert|assert/strict|async_hooks|buffer|child_process|cluster|console|constants|crypto"
+        "|dgram|diagnostics_channel|dns|dns/promises|domain|events|fs|fs/promises|http|http2"
+        "|https|inspector|inspector/promises|module|net|os|path|path/posix|path/win32|perf_hooks"
+        "|process|punycode|querystring|readline|readline/promises|repl|stream|stream/consumers"
+        "|stream/promises|stream/web|string_decoder|sys|timers|timers/promises|tls|trace_events"
+        "|tty|url|util|util/types|v8|vm|wasi|worker_threads|zlib|";
+    char key[CBM_SZ_64];
+    int n = snprintf(key, sizeof(key), "|%s|", spec);
+    return n > 0 && (size_t)n < sizeof(key) && strstr(builtins, key) != NULL;
+}
+
+/* `node:fs`, `npm:x`, `jsr:@std/path`, `https://...`: a URL scheme names no
+ * file of the tree. Two characters at least, so a drive letter never counts. */
+static bool es_specifier_has_scheme(const char *spec) {
+    if (!isalpha((unsigned char)spec[0])) {
+        return false;
+    }
+    size_t i = SKIP_ONE;
+    while (isalnum((unsigned char)spec[i]) || spec[i] == '+' || spec[i] == '-' || spec[i] == '.') {
+        i++;
+    }
+    return spec[i] == ':' && i >= PAIR_LEN;
+}
+
+/* The package a bare specifier names, `@scope/name` or `name`, without its
+ * sub-path. False when the specifier has no package shape. */
+static bool es_specifier_package(const char *spec, char *out, size_t cap) {
+    if (spec[0] == '\0' || spec[0] == '/' || spec[0] == '.' || spec[0] == '#') {
+        return false;
+    }
+    const char *end = strchr(spec, '/');
+    if (spec[0] == '@') {
+        if (!end || end[SKIP_ONE] == '\0') {
+            return false;
+        }
+        end = strchr(end + SKIP_ONE, '/');
+    }
+    size_t len = end ? (size_t)(end - spec) : strlen(spec);
+    if (len == 0 || len >= cap) {
+        return false;
+    }
+    memcpy(out, spec, len);
+    out[len] = '\0';
+    return true;
+}
+
+typedef enum {
+    ES_SPECIFIER_OTHER = 0, /* a bare specifier without evidence either way */
+    ES_SPECIFIER_TREE_PATH, /* one file of the tree */
+    ES_SPECIFIER_EXTERNAL,  /* a module outside the tree */
+} es_specifier_t;
+
+/* A bundler query on the basename (`./worker.ts?worker`, `~/a.svg?raw`) is
+ * no part of the path; a `?` in a folder name is. */
+static void cut_basename_query(char *path) {
+    char *slash = strrchr(path, '/');
+    char *query = strchr(slash ? slash + SKIP_ONE : path, '?');
+    if (query) {
+        *query = '\0';
+    }
+}
+
+/* What an ES import specifier names. TREE_PATH: one file of the tree, by an
+ * explicit relative path or a tsconfig/jsconfig alias (paths or baseUrl),
+ * read as cbm_pipeline_resolve_module reads them; `path` receives that
+ * repository path (empty when it has none). EXTERNAL: a module outside the
+ * tree, by a URL scheme (checked before the aliases, whose baseUrl rule would
+ * read `node:fs/promises` as a path), a Node builtin or a registry dependency
+ * some package.json declares, unless a package of the tree has that name.
+ * OTHER: a bare specifier without such evidence (a bundler's module
+ * directories can still make it a project path). */
+static es_specifier_t es_specifier_kind(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                        const char *spec, char *path, size_t cap) {
+    path[0] = '\0';
+    if (explicit_relative_path(spec) || strcmp(spec, ".") == 0 || strcmp(spec, "..") == 0) {
+        if (!relative_import_path(source_rel, spec, path, cap)) {
+            path[0] = '\0';
+        }
+        cut_basename_query(path);
+        return ES_SPECIFIER_TREE_PATH;
+    }
+    if (es_specifier_has_scheme(spec)) {
+        return ES_SPECIFIER_EXTERNAL;
+    }
+    if (ctx->path_aliases && source_rel) {
+        const cbm_path_alias_map_t *amap =
+            cbm_path_alias_find_for_file(ctx->path_aliases, source_rel);
+        if (amap && cbm_path_alias_resolve_into(amap, spec, path, cap)) {
+            cut_basename_query(path);
+            return ES_SPECIFIER_TREE_PATH;
+        }
+        path[0] = '\0';
+    }
+    char package[PKGMAP_PATH_BUF];
+    if (!es_specifier_package(spec, package, sizeof(package))) {
+        return ES_SPECIFIER_OTHER;
+    }
+    const CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (pkgmap && cbm_ht_has(pkgmap, package)) {
+        return ES_SPECIFIER_OTHER; /* a package of the tree */
+    }
+    if (node_builtin_module(spec) || pkgmap_declares_npm_dependency(pkgmap, package)) {
+        return ES_SPECIFIER_EXTERNAL;
+    }
+    return ES_SPECIFIER_OTHER;
+}
+
+/* The Module a module loader finds for `path`: path plus a script
+ * extension, then path/index plus one. Looked up by the Module node's name,
+ * which is its file path, so a directory whose QN segment is not its name
+ * (`.vitepress` keeps its dot in the path, not in the Module QN) resolves
+ * too. */
+static const cbm_gbuf_node_t *es_module_for_path(const cbm_pipeline_ctx_t *ctx, const char *path) {
+    static const char suffixes[] = ".ts|.tsx|.mts|.cts|.js|.jsx|.mjs|.cjs|/index.ts|/index.tsx|/"
+                                   "index.js|/index.jsx|/index.mjs";
+    char candidate[PKGMAP_PATH_BUF];
+    for (const char *s = suffixes; *s;) {
+        const char *bar = strchr(s, '|');
+        int slen = bar ? (int)(bar - s) : (int)strlen(s);
+        int w = snprintf(candidate, sizeof(candidate), "%s%.*s", path, slen, s);
+        s = bar ? bar + SKIP_ONE : s + slen;
+        if (w <= 0 || (size_t)w >= sizeof(candidate)) {
+            continue;
+        }
+        const cbm_gbuf_node_t **hits = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_name(ctx->gbuf, candidate, &hits, &count) != 0 || !hits) {
+            continue;
+        }
+        for (int h = 0; h < count; h++) {
+            const cbm_gbuf_node_t *n = hits[h];
+            if (n && n->label && strcmp(n->label, "Module") == 0 && n->file_path &&
+                strcmp(n->file_path, candidate) == 0) {
+                return n;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* The node of the one file an ES tree-path specifier names at `path`, once
+ * Strategy 1 found none: for an explicit relative path, the module of the
+ * file at exactly that path (`./App.vue`, whose Module QN drops the
+ * extension Strategy 1 keeps) or that file's File node (Strategy 1c); then,
+ * for any tree path, the module a loader finds for it by extension or index
+ * file. Nothing else. */
+static const cbm_gbuf_node_t *resolve_es_tree_file(const cbm_pipeline_ctx_t *ctx,
+                                                   const char *source_rel,
+                                                   const char *source_file_qn, const CBMImport *imp,
+                                                   const char *path) {
+    if (!path[0]) {
+        return NULL;
+    }
+    if (explicit_relative_path(imp->module_path)) {
+        const cbm_gbuf_node_t *sibling =
+            resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path, false);
+        if (sibling && sibling->file_path && strcmp(sibling->file_path, path) == 0) {
+            return sibling;
+        }
+        const cbm_gbuf_node_t *file =
+            resolve_relative_file(ctx, source_rel, imp->module_path, false);
+        if (file) {
+            return file;
+        }
+    }
+    const cbm_gbuf_node_t *module = es_module_for_path(ctx, path);
+    return module ? prefer_import_member(ctx, imp, module, false) : NULL;
 }
 
 /* ── PHP PSR-4 class imports (#1186) ──────────────────────────────── */
@@ -3274,32 +3609,7 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
     if (target && (!php_only || node_in_php_file(target))) {
-        /* Python/TS from-import of a member: module_path is often
-         * "pkg.mod.symbol" while resolve_module lands on the Module node
-         * "pkg.mod". Prefer the member Function/Class when it exists —
-         * required for `from M import f as g` so CALLS can import_map to f
-         * (local_name g ≠ f). */
-        if (target->label &&
-            (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
-            char symbuf[256];
-            const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
-            if (sym && sym[0] && strcmp(sym, "*") != 0) {
-                const char *mod_tail =
-                    import_last_segment(target->qualified_name ? target->qualified_name : "");
-                if (!mod_tail || strcmp(mod_tail, sym) != 0) {
-                    char member_qn[CBM_SZ_512];
-                    snprintf(member_qn, sizeof(member_qn), "%s.%s", target->qualified_name, sym);
-                    const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
-                    if (member && (!php_only || node_in_php_file(member)) &&
-                        import_targetable_label(member->label) &&
-                        strcmp(member->label, "Module") != 0 &&
-                        strcmp(member->label, "File") != 0) {
-                        return member;
-                    }
-                }
-            }
-        }
-        return target;
+        return prefer_import_member(ctx, imp, target, php_only);
     }
 
     /* Rust: a `use` path names an item of one crate, never a same-named
@@ -3312,6 +3622,24 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         case RUST_USE_SCOPED:
             return rust_use_resolve(ctx, source_rel, source_file_qn, &ru);
         case RUST_USE_UNSCOPED:
+            break;
+        }
+    }
+
+    /* ECMAScript: a specifier that names one file of the tree, or a module
+     * outside it, has one right target, which Strategy 1 has just missed. The
+     * name-guess fallbacks below would bind it to an unrelated definition
+     * (`./App.vue` absent -> a test's App, `ws` -> the ws.ts beside the
+     * importer, `node:assert/strict` -> a spec's assert), so such an import
+     * stays unbound, as a Go import does (#1934). */
+    if (!php_only && es_module_importer(src_lang)) {
+        char path[CBM_PATH_ALIAS_RESULT_MAX];
+        switch (es_specifier_kind(ctx, source_rel, imp->module_path, path, sizeof(path))) {
+        case ES_SPECIFIER_EXTERNAL:
+            return NULL;
+        case ES_SPECIFIER_TREE_PATH:
+            return resolve_es_tree_file(ctx, source_rel, source_file_qn, imp, path);
+        case ES_SPECIFIER_OTHER:
             break;
         }
     }
