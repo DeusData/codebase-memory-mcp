@@ -4696,6 +4696,84 @@ TEST(cpp_gtest_f_unique_name_issue1266) {
     PASS();
 }
 
+/* A call written in a GoogleTest body belongs to the test's own node. The def
+ * walk names TEST(Suite, Case) TEST_Suite_Case (#1266), so the three places
+ * that name the caller of a call must name it the same way: the call-scope
+ * walk (CBMCall.enclosing_func_qn), the enclosing-function helper behind the
+ * reference extractors (CBMUsage.enclosing_func_qn) and the C/C++ engine
+ * (CBMResolvedCall.caller_qn). Under the bare macro name no node exists, and
+ * the pipeline sources every such call at the file. One row per macro form
+ * the def walk renames, plus one inside a namespace. */
+static const char gtest_caller_src[] =
+    "int helper_sum(int a, int b) { return a + b; }\n"
+    "int kLimit = 3;\n"
+    "TEST(WidgetSuite, Adds) { helper_sum(1, kLimit); }\n"
+    "TEST_F(WidgetFixture, Runs) { helper_sum(2, kLimit); }\n"
+    "TEST_P(WidgetParam, Each) { helper_sum(3, kLimit); }\n"
+    "TYPED_TEST(WidgetTyped, Holds) { helper_sum(4, kLimit); }\n"
+    "TYPED_TEST_P(WidgetTypedP, Keeps) { helper_sum(5, kLimit); }\n"
+    "namespace demo {\n"
+    "TEST(NsSuite, Inside) { helper_sum(6, kLimit); }\n"
+    "}\n";
+
+static const char *const gtest_caller_names[] = {
+    "TEST_WidgetSuite_Adds",        "TEST_F_WidgetFixture_Runs",       "TEST_P_WidgetParam_Each",
+    "TYPED_TEST_WidgetTyped_Holds", "TYPED_TEST_P_WidgetTypedP_Keeps", "demo.TEST_NsSuite_Inside"};
+
+static int count_resolved_from(const CBMFileResult *r, const char *caller_qn,
+                               const char *callee_suffix) {
+    int count = 0;
+    size_t sl = strlen(callee_suffix);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t cl = rc->callee_qn ? strlen(rc->callee_qn) : 0;
+        if (rc->caller_qn && strcmp(rc->caller_qn, caller_qn) == 0 && cl >= sl &&
+            strcmp(rc->callee_qn + cl - sl, callee_suffix) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+TEST(cpp_gtest_body_caller_is_test_node) {
+    CBMFileResult *r = extract(gtest_caller_src, CBM_LANG_CPP, "t", "widget_test.cc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* Inputs reached: every body's call and reference was extracted. */
+    ASSERT_EQ(count_calls_named(r, "helper_sum"), 6);
+    ASSERT_EQ(count_usages_named(r, "kLimit"), 6);
+    for (size_t i = 0; i < sizeof(gtest_caller_names) / sizeof(gtest_caller_names[0]); i++) {
+        const CBMDefinition *def = find_def_in_module(r, gtest_caller_names[i]);
+        if (!def) {
+            printf("  no definition %s\n", gtest_caller_names[i]);
+        }
+        ASSERT_NOT_NULL(def);
+        int calls = count_calls_from(r, "helper_sum", def->qualified_name);
+        int refs = count_usages_from(r, "kLimit", def->qualified_name);
+        int lsp = count_resolved_from(r, def->qualified_name, ".helper_sum");
+        if (calls != 1 || refs != 1 || lsp != 1) {
+            printf("  %s: calls %d, references %d, engine %d\n", def->qualified_name, calls, refs,
+                   lsp);
+        }
+        ASSERT_EQ(calls, 1); /* RED on 08a7a586: the call-scope walk says <module>.TEST */
+        ASSERT_EQ(refs, 1);  /* RED on 08a7a586: cbm_enclosing_func_qn says <module>.TEST */
+        ASSERT_EQ(lsp, 1);   /* RED on 08a7a586: the engine's caller is <module>.TEST */
+    }
+    /* Nothing is left on the bare macro names (the positive rows above are the
+     * partner: the same calls, under the test names). */
+    static const char *const bare[] = {"TEST",       "TEST_F",       "TEST_P",
+                                       "TYPED_TEST", "TYPED_TEST_P", "demo.TEST"};
+    for (size_t i = 0; i < sizeof(bare) / sizeof(bare[0]); i++) {
+        char qn[256];
+        snprintf(qn, sizeof(qn), "%s.%s", r->module_qn, bare[i]);
+        ASSERT_EQ(count_calls_from(r, "helper_sum", qn), 0);
+        ASSERT_EQ(count_usages_from(r, "kLimit", qn), 0);
+        ASSERT_EQ(count_resolved_from(r, qn, ".helper_sum"), 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C++ out-of-line method definitions (#428) ---
  * A .cpp defining methods of a class declared elsewhere (not in this TU).
  * Pre-fix these were recorded as free Functions (label "Function", no
@@ -16084,6 +16162,7 @@ SUITE(extraction) {
     RUN_TEST(cpp_function);
     RUN_TEST(cpp_gtest_same_name_collision_issue1266);
     RUN_TEST(cpp_gtest_f_unique_name_issue1266);
+    RUN_TEST(cpp_gtest_body_caller_is_test_node);
     RUN_TEST(cpp_out_of_line_method_issue428);
     RUN_TEST(cobol_paragraph);
     RUN_TEST(verilog_module);

@@ -2125,17 +2125,17 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
          * resolution as a separate map, so pass NULL/0 and let the LSP
          * fall back to its own #include scan. */
         if (r->has_test_definition_owners) {
-            if (!cbm_run_c_lsp_cross_with_test_owners(&scratch, source, source_len, module_qn,
-                                                      cpp_mode, defs, def_count, NULL, NULL, 0,
-                                                      tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
+            if (!cbm_run_c_lsp_cross_with_test_owners(
+                    &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, NULL, NULL,
+                    0, tree, &out, CBM_SOURCE_ORIGIN_RAW, r, r->cpp_test_macro_names)) {
                 cbm_pipeline_test_owner_error(r);
                 pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
                 return; /* out may be partial: never append it */
             }
         } else {
-            CBMLSPStatus status =
-                cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
-                                           def_count, NULL, NULL, 0, tree, &out);
+            CBMLSPStatus status = cbm_run_c_lsp_cross_status(
+                &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, NULL, NULL, 0,
+                tree, &out, r->cpp_test_macro_names);
             if (status != CBM_LSP_COMPLETE)
                 cbm_c_lsp_record_failure(r, status);
         }
@@ -2329,7 +2329,7 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                 if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
                         &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
                         imp_keys, imp_vals, imp_count, result->cached_tree, &out,
-                        CBM_SOURCE_ORIGIN_RAW, result)) {
+                        CBM_SOURCE_ORIGIN_RAW, result, result->cpp_test_macro_names)) {
                     cbm_pipeline_test_owner_error(result);
                     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
                     return; /* no append and no fallback on an invalid proof */
@@ -2337,7 +2337,8 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             } else {
                 CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
                     &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                    imp_keys, imp_vals, imp_count, result->cached_tree, &out);
+                    imp_keys, imp_vals, imp_count, result->cached_tree, &out,
+                    result->cpp_test_macro_names);
                 if (status != CBM_LSP_COMPLETE)
                     cbm_c_lsp_record_failure(result, status);
             }

@@ -3799,6 +3799,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         language == CBM_LANG_PYTHON ? CBM_PY_NS_NOT_CAPTURED : CBM_PY_NS_NOT_APPLICABLE;
     cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
+    result->cpp_test_macro_names = cbm_cpp_test_macro_names_on(language, test_declarations);
     if (!cbm_test_declarations_validate(result, test_declarations)) {
         return result;
     }

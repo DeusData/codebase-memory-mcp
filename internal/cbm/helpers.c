@@ -1547,8 +1547,8 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
 }
 
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path,
-                                  const char *module_qn) {
+                                  const char *project, const char *rel_path, const char *module_qn,
+                                  bool test_macro_names) {
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
         return module_qn;
@@ -1556,6 +1556,11 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
     const char *name = func_node_name(a, func_node, source, lang);
     if (!name || !name[0]) {
         return module_qn;
+    }
+    /* GoogleTest TEST(Suite, Case): the def walk's TEST_Suite_Case (#1266). */
+    const char *test_name = cbm_cpp_test_macro_name(a, test_macro_names, name, func_node, source);
+    if (test_name) {
+        name = test_name;
     }
 
     // Check if the function is inside a class — compute classQN.funcName.
@@ -1623,8 +1628,9 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
     }
 
     // Cache miss: compute via parent walk
-    const char *qn = cbm_enclosing_func_qn(ctx->arena, node, ctx->language, ctx->source,
-                                           ctx->project, ctx->rel_path, ctx->module_qn);
+    const char *qn = cbm_enclosing_func_qn(
+        ctx->arena, node, ctx->language, ctx->source, ctx->project, ctx->rel_path, ctx->module_qn,
+        cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations));
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);

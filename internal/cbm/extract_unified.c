@@ -1307,6 +1307,17 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
+    /* GoogleTest `TEST(Suite, Case) {...}` and its four siblings: the def
+     * extractor names the definition TEST_Suite_Case (#1266). Name the call
+     * scope through the same helper, or every call in the body names a
+     * definition that was never minted and is sourced at the File node. */
+    char *test_name = cbm_cpp_test_macro_name(
+        ctx->arena, cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), name, node,
+        ctx->source);
+    if (test_name) {
+        name = test_name;
+    }
+
     /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor
      * records this as Method "proj.file.Foo.bar". The call-scope QN must match
      * (be class-qualified) so an in-body call sources to the method, not a bare

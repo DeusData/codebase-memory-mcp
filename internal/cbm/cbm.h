@@ -1017,6 +1017,10 @@ typedef struct CBMFileResult {
     int test_owner_source_len;
     CBMLanguage test_owner_language;
     char test_owner_source_sha256[65]; /* exact raw source; identity, not authentication */
+    /* The def walk named this file's GoogleTest macro heads TEST_Suite_Case
+     * (cbm_cpp_test_macro_names_on): the C/C++ engine, per file and across
+     * files, names the callers in those bodies the same way. */
+    bool cpp_test_macro_names;
 
     /* Doc-comment references of this file's definitions (doclink.h), and the
      * file's doc-link scope: a language-tagged text blob with what OTHER
@@ -1168,6 +1172,21 @@ const char *cbm_test_definition_qn(CBMExtractCtx *ctx, TSNode function);
 bool cbm_test_definition_owners_match(const CBMFileResult *owners, const char *source,
                                       int source_len, bool cpp_mode, const char *module_qn);
 const char *cbm_test_definition_owner_qn(const CBMFileResult *owners, TSNode function);
+
+/* GoogleTest test-case macros (TEST, TEST_F, TEST_P, TYPED_TEST, TYPED_TEST_P)
+ * parse as function definitions named by the bare macro. With the gtest preset
+ * on, a C++/CUDA definition is named <MACRO>_<Suite>_<Case> (#1266), and every
+ * place that names the caller of a call in such a body names it through this
+ * one function: the def walk, the call-scope walk (compute_func_qn),
+ * cbm_enclosing_func_qn_cached and the C/C++ engine (c_process_function).
+ * `func_node` is the function_definition. NULL when `enabled` is false, `name`
+ * is not one of the five macros, or the head carries no argument; the caller
+ * keeps its own name then. */
+char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNode func_node,
+                              const char *source);
+/* The `enabled` argument above for a file of `language`: C++ or CUDA with the
+ * gtest preset on (on when nothing is configured). */
+bool cbm_cpp_test_macro_names_on(CBMLanguage language, const cbm_test_declarations_t *declarations);
 
 // --- Public API ---
 

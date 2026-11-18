@@ -35310,6 +35310,333 @@ TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153) {
     PASS();
 }
 
+/* GoogleTest bodies: the CALLS edges of a call written in a TEST or TEST_F
+ * body start at the test's own node (TEST_Suite_Case, #1266), not at the File
+ * node. local_helper is bound by the C/C++ engine in the file's own pass, so
+ * its lsp_ strategy also proves the engine and the text path name the same
+ * caller (they join by exact caller QN); cross_helper lives in another file.
+ * pad_files > 0 adds filler C++ files past MIN_FILES_FOR_PARALLEL. */
+static void write_cpp_gtest_caller_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "lib/helper.h", "int cross_helper(int v);\n");
+    write_temp_file(tmp, "lib/helper.cc",
+                    "#include \"helper.h\"\n"
+                    "int cross_helper(int v) { return v + 1; }\n");
+    write_temp_file(tmp, "test/widget_test.cc",
+                    "#include \"../lib/helper.h\"\n"
+                    "static int local_helper(int v) { return v * 2; }\n"
+                    "class WidgetFixture {\n"
+                    " public:\n"
+                    "  int Prepare() { return 1; }\n"
+                    "};\n"
+                    "TEST(WidgetSuite, Adds) {\n"
+                    "  local_helper(1);\n"
+                    "  cross_helper(2);\n"
+                    "}\n"
+                    "TEST_F(WidgetFixture, Runs) {\n"
+                    "  local_helper(3);\n"
+                    "  cross_helper(4);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.cc", i);
+        snprintf(body, sizeof(body), "int filler%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int assert_cpp_gtest_caller_edges(cbm_store_t *s, const char *project, bool parallel) {
+    static const char *const tests[] = {".test.widget_test.TEST_WidgetSuite_Adds",
+                                        ".test.widget_test.TEST_F_WidgetFixture_Runs"};
+    const char *mode = parallel ? "parallel" : "sequential";
+    int local[2];
+    int cross[2];
+    for (int i = 0; i < 2; i++) {
+        local[i] = go_calls_between(s, project, tests[i], ".test.widget_test.local_helper",
+                                    "\"strategy\":\"lsp_");
+        cross[i] = go_calls_between(s, project, tests[i], ".lib.helper.cross_helper", NULL);
+        if (local[i] != 1 || cross[i] != 1) {
+            printf("  [%s] %s: local_helper %d (lsp), cross_helper %d\n", mode, tests[i], local[i],
+                   cross[i]);
+        }
+    }
+    /* The File node keeps no copy (the rows above are the positive partner;
+     * its DEFINES edge proves the File node's name, which keeps the file's
+     * extension). */
+    const char *file_qn = ".test.widget_test.cc.__file__";
+    int file_defines =
+        go_edges_between(s, project, "DEFINES", file_qn, ".test.widget_test.local_helper");
+    int file_local = go_calls_between(s, project, file_qn, ".test.widget_test.local_helper", NULL);
+    int file_cross = go_calls_between(s, project, file_qn, ".lib.helper.cross_helper", NULL);
+    if (file_local != 0 || file_cross != 0) {
+        printf("  [%s] File node: local_helper %d, cross_helper %d\n", mode, file_local,
+               file_cross);
+    }
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(local[i], 1); /* RED on 08a7a586: sourced at the File node */
+        ASSERT_EQ(cross[i], 1); /* RED on 08a7a586: sourced at the File node */
+    }
+    ASSERT_EQ(file_defines, 1);
+    ASSERT_EQ(file_local, 0);
+    ASSERT_EQ(file_cross, 0);
+    return 0;
+}
+
+TEST(pipeline_cpp_gtest_body_calls_start_at_test_node) {
+    int runs[2] = {-1, -1};
+    int verdicts[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_caller_XXXXXX");
+        if (!cbm_mkdtemp(tmp)) {
+            FAIL("tmpdir");
+        }
+        write_cpp_gtest_caller_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/gtest_caller.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run == 0 ? cbm_store_open_path(db_path) : NULL;
+        int verdict =
+            s ? assert_cpp_gtest_caller_edges(s, cbm_pipeline_project_name(p), parallel) : -1;
+        if (s) {
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+        runs[mode] = run;
+        verdicts[mode] = verdict;
+    }
+    ASSERT_EQ(runs[0], 0);
+    ASSERT_EQ(runs[1], 0);
+    ASSERT_EQ(verdicts[0], 0); /* sequential resolver */
+    ASSERT_EQ(verdicts[1], 0); /* parallel resolver */
+    PASS();
+}
+
+/* Every node (qualified name, label) and every edge (type, source QN, target
+ * QN, properties by key) of a store, one row each, sorted. Node ids and the
+ * index bookkeeping differ between two stores; the graph content must not. */
+typedef struct {
+    char **rows;
+    int count;
+} CppGtestRows;
+
+static void cpp_gtest_rows_free(CppGtestRows *r) {
+    for (int i = 0; i < r->count; i++) {
+        free(r->rows[i]);
+    }
+    free(r->rows);
+    r->rows = NULL;
+    r->count = 0;
+}
+
+static int cpp_gtest_row_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static bool cpp_gtest_rows_add(CppGtestRows *out, int *cap, sqlite3_stmt *stmt) {
+    const char *cols[4];
+    size_t len = 4;
+    for (int c = 0; c < 4; c++) {
+        cols[c] = (const char *)sqlite3_column_text(stmt, c);
+        len += cols[c] ? strlen(cols[c]) : 0;
+    }
+    if (out->count == *cap) {
+        int grown_cap = *cap ? *cap * 2 : 256;
+        char **grown = realloc(out->rows, (size_t)grown_cap * sizeof(char *));
+        if (!grown) {
+            return false;
+        }
+        out->rows = grown;
+        *cap = grown_cap;
+    }
+    char *row = malloc(len + 1);
+    if (!row) {
+        return false;
+    }
+    snprintf(row, len + 1, "%s|%s|%s|%s", cols[0] ? cols[0] : "", cols[1] ? cols[1] : "",
+             cols[2] ? cols[2] : "", cols[3] ? cols[3] : "");
+    out->rows[out->count++] = row;
+    return true;
+}
+
+static bool cpp_gtest_rows(const char *db_path, CppGtestRows *out) {
+    memset(out, 0, sizeof(*out));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return false;
+    }
+    static const char *const queries[] = {
+        "SELECT 'N', qualified_name, label, '' FROM nodes",
+        /* Properties with their top-level keys sorted: the incremental route
+         * writes CALLS properties in another key order than a full index
+         * (on 08a7a586 as well), which is not a difference of content. */
+        "SELECT 'E' || e.type, s.qualified_name, t.qualified_name, "
+        "CASE WHEN json_valid(e.properties) THEN (SELECT group_concat(key || '=' || value, ',') "
+        "FROM (SELECT key, value FROM json_each(e.properties) ORDER BY key)) "
+        "ELSE coalesce(e.properties, '') END "
+        "FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id"};
+    int cap = 0;
+    bool ok = true;
+    for (size_t q = 0; q < 2 && ok; q++) {
+        sqlite3_stmt *stmt = NULL;
+        ok = sqlite3_prepare_v2(cbm_store_get_db(s), queries[q], -1, &stmt, NULL) == SQLITE_OK;
+        while (ok && sqlite3_step(stmt) == SQLITE_ROW) {
+            ok = cpp_gtest_rows_add(out, &cap, stmt);
+        }
+        sqlite3_finalize(stmt);
+    }
+    cbm_store_close(s);
+    if (!ok) {
+        cpp_gtest_rows_free(out);
+        return false;
+    }
+    qsort(out->rows, (size_t)out->count, sizeof(char *), cpp_gtest_row_cmp);
+    return true;
+}
+
+/* 0 when both stores hold the same rows; else prints the first difference. */
+static int cpp_gtest_rows_diff(const char *label, const CppGtestRows *a, const CppGtestRows *b) {
+    int i = 0;
+    int j = 0;
+    while (i < a->count && j < b->count) {
+        int c = strcmp(a->rows[i], b->rows[j]);
+        if (c != 0) {
+            printf("  [%s] first difference: %s\n      against: %s\n", label,
+                   c < 0 ? a->rows[i] : b->rows[j],
+                   c < 0 ? "(missing on the right)" : "(missing on the left)");
+            return 1;
+        }
+        i++;
+        j++;
+    }
+    if (i < a->count || j < b->count) {
+        printf("  [%s] row counts %d vs %d\n", label, a->count, b->count);
+        return 1;
+    }
+    return 0;
+}
+
+/* A single-file edit of a gtest file, taken by the incremental route, gives
+ * the graph a full index of the edited tree gives (every node and every edge
+ * by content), sequential and parallel; the edited body's remaining call
+ * starts at the test's own node and the removed one is gone. The caller naming lives in extraction
+ * and in the C/C++ engine dispatch, which every route shares; this pins that no route names a test
+ * body differently. */
+TEST(pipeline_cpp_gtest_caller_incremental_matches_full) {
+    int verdicts[2] = {-1, -1};
+    int routes[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        char dbs[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_incr_XXXXXX");
+        snprintf(dbs, sizeof(dbs), "/tmp/cbm_cpp_gtest_incr_db_XXXXXX");
+        if (!cbm_mkdtemp(tmp) || !cbm_mkdtemp(dbs)) {
+            FAIL("tmpdir");
+        }
+        write_cpp_gtest_caller_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char incr_db[512];
+        char full_db[512];
+        snprintf(incr_db, sizeof(incr_db), "%s/incr.db", dbs);
+        snprintf(full_db, sizeof(full_db), "%s/full.db", dbs);
+        int verdict = 1;
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, incr_db, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_pipeline_free(p);
+        /* A body-only edit (a new definition name would decline the closure
+         * planner to a full rebuild): the TEST body drops its local_helper
+         * call and keeps cross_helper. */
+        if (run == 0) {
+            write_temp_file(tmp, "test/widget_test.cc",
+                            "#include \"../lib/helper.h\"\n"
+                            "static int local_helper(int v) { return v * 2; }\n"
+                            "class WidgetFixture {\n"
+                            " public:\n"
+                            "  int Prepare() { return 1; }\n"
+                            "};\n"
+                            "TEST(WidgetSuite, Adds) {\n"
+                            "  cross_helper(2);\n"
+                            "}\n"
+                            "TEST_F(WidgetFixture, Runs) {\n"
+                            "  local_helper(3);\n"
+                            "  cross_helper(4);\n"
+                            "}\n");
+            p = cbm_pipeline_new(tmp, incr_db, CBM_MODE_FULL);
+            run = p ? cbm_pipeline_run(p) : -1;
+            routes[mode] = (int)cbm_pipeline_incremental_test_last_route();
+            cbm_store_t *s = run == 0 ? cbm_store_open_path(incr_db) : NULL;
+            const char *proj = p ? cbm_pipeline_project_name(p) : NULL;
+            int kept = s ? go_calls_between(s, proj, ".test.widget_test.TEST_WidgetSuite_Adds",
+                                            ".lib.helper.cross_helper", NULL)
+                         : -1;
+            int dropped = s ? go_calls_between(s, proj, ".test.widget_test.TEST_WidgetSuite_Adds",
+                                               ".test.widget_test.local_helper", NULL)
+                            : -1;
+            int later = kept == 1 && dropped == 0 ? 1 : 0;
+            if (s) {
+                cbm_store_close(s);
+            }
+            cbm_pipeline_free(p);
+            cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+            int full_run = full ? cbm_pipeline_run(full) : -1;
+            cbm_pipeline_free(full);
+            CppGtestRows a;
+            CppGtestRows b;
+            bool read = run == 0 && full_run == 0 && cpp_gtest_rows(incr_db, &a);
+            bool read_b = read && cpp_gtest_rows(full_db, &b);
+            if (later != 1) {
+                printf("  [%s] after the edit TEST_WidgetSuite_Adds: cross_helper %d, "
+                       "local_helper %d (want 1, 0)\n",
+                       parallel ? "parallel" : "sequential", kept, dropped);
+            }
+            verdict = read_b && later == 1 && a.count > 0
+                          ? cpp_gtest_rows_diff(parallel ? "parallel" : "sequential", &a, &b)
+                          : 1;
+            if (read) {
+                cpp_gtest_rows_free(&a);
+            }
+            if (read_b) {
+                cpp_gtest_rows_free(&b);
+            }
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+        th_rmtree(dbs);
+        verdicts[mode] = verdict;
+    }
+    printf("  routes: sequential %d, parallel %d  ", routes[0], routes[1]);
+    /* Both edits took an incremental route, not a full rebuild. */
+    ASSERT_TRUE(routes[0] == CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL ||
+                routes[0] == CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(routes[1] == CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL ||
+                routes[1] == CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(verdicts[0], 0);
+    ASSERT_EQ(verdicts[1], 0);
+    PASS();
+}
+
 /* ── calls_append_args: an argument longer than its formatting buffer ────── */
 
 #if !defined(_WIN32)
@@ -35982,6 +36309,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153);
     RUN_TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153);
     RUN_TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153);
+    RUN_TEST(pipeline_cpp_gtest_body_calls_start_at_test_node);
+    RUN_TEST(pipeline_cpp_gtest_caller_incremental_matches_full);
     RUN_TEST(pipeline_calls_args_overlong_argument_stops_cleanly);
 }
 

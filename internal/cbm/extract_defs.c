@@ -5971,6 +5971,17 @@ static bool is_cpp_test_macro(const char *name) {
  * Returns an arena-allocated string, or NULL when the parameters cannot be
  * resolved (caller keeps the original name in that case). */
 static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
+                                         const char *source);
+
+char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNode func_node,
+                              const char *source) {
+    if (!enabled || !name || !source || ts_node_is_null(func_node) || !is_cpp_test_macro(name)) {
+        return NULL;
+    }
+    return resolve_cpp_test_macro_name(a, name, func_node, source);
+}
+
+static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
                                          const char *source) {
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
     if (ts_node_is_null(params)) {
@@ -6126,11 +6137,21 @@ bool cbm_test_declarations_validate(CBMFileResult *result,
     return result->test_declarations_status == CBM_TEST_EXTRACT_OK;
 }
 
-static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
-    if (!ctx->test_declarations)
+static bool tdx_preset_of(const cbm_test_declarations_t *declarations, cbm_test_preset_t preset) {
+    if (!declarations)
         return preset != CBM_TEST_PRESET_C_CBM;
     bool enabled = false;
-    return cbm_test_declarations_preset(ctx->test_declarations, preset, &enabled) && enabled;
+    return cbm_test_declarations_preset(declarations, preset, &enabled) && enabled;
+}
+
+static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
+    return tdx_preset_of(ctx->test_declarations, preset);
+}
+
+bool cbm_cpp_test_macro_names_on(CBMLanguage language,
+                                 const cbm_test_declarations_t *declarations) {
+    return (language == CBM_LANG_CPP || language == CBM_LANG_CUDA) &&
+           tdx_preset_of(declarations, CBM_TEST_PRESET_GTEST);
 }
 
 static bool tdx_equal(const char *name, const char *text, size_t size) {
@@ -7023,7 +7044,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     /* C++/CUDA: GoogleTest macros (TEST, TEST_F, TEST_P, ...) parse as
      * function definitions whose name resolves to the bare macro identifier.
      * Multiple test cases per file collide on qualified name; derive a unique
-     * name from the macro arguments so each gets its own graph node (#1266). */
+     * name from the macro arguments so each gets its own graph node (#1266).
+     * The callers of calls in the body are named by the same helper. */
     bool is_gtest = false;
     const char *configured_name = NULL;
     TDXRule configured_rule;
@@ -7033,14 +7055,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
         name = (char *)configured_name;
     }
-    if (!configured && tdx_preset(ctx, CBM_TEST_PRESET_GTEST) &&
-        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        is_cpp_test_macro(name)) {
-        char *gtest_name = resolve_cpp_test_macro_name(a, name, node, ctx->source);
-        if (gtest_name) {
-            name = gtest_name;
-            is_gtest = true;
-        }
+    char *gtest_name =
+        configured ? NULL
+                   : cbm_cpp_test_macro_name(
+                         a, cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations),
+                         name, node, ctx->source);
+    if (gtest_name) {
+        name = gtest_name;
+        is_gtest = true;
     }
 
     /* Nix `"${foo}" = x: …`: an interpolated attrpath segment has no statically
