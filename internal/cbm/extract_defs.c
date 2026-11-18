@@ -7176,8 +7176,38 @@ static void py_bind_as_targets(tf_names_t *b, TSNode node, const char *source, i
 
 static void py_bind_block(tf_names_t *b, TSNode block, const char *source, int depth);
 
+static bool py_defines_kind(const char *kind) {
+    return strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0 ||
+           strcmp(kind, "decorated_definition") == 0;
+}
+
+/* Statement-level nodes a scope's statements nest in (not expressions). */
+static bool py_statement_level(const char *kind) {
+    return strcmp(kind, "block") == 0 || strstr(kind, "_statement") != NULL ||
+           strstr(kind, "_clause") != NULL;
+}
+
+/* Whether a definition stands among the statements of `node`. */
+static bool py_has_def(TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > TF_BIND_DEPTH) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *ck = ts_node_type(c);
+        if (py_defines_kind(ck) || (py_statement_level(ck) && py_has_def(c, depth + 1))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Python: the names one statement of a class body binds (it recurses into
- * compound statements, whose bodies are the same scope). */
+ * compound statements, whose bodies are the same scope). `del` binds nothing
+ * (py_class_body_bindings unbinds at the body's top level), and neither does
+ * `except ... as E`: Python unbinds E when the clause ends, so it is a binding
+ * only for a definition inside the clause. */
 static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int depth) {
     if (ts_node_is_null(s) || depth > TF_BIND_DEPTH) {
         return;
@@ -7238,9 +7268,11 @@ static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int d
         }
         return;
     }
-    if (strcmp(kind, "global_statement") == 0 || strcmp(kind, "nonlocal_statement") == 0 ||
-        strcmp(kind, "delete_statement") == 0) {
+    if (strcmp(kind, "global_statement") == 0 || strcmp(kind, "nonlocal_statement") == 0) {
         py_bind_target(b, s, source, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "delete_statement") == 0) {
         return;
     }
     if (strcmp(kind, "type_alias_statement") == 0) {
@@ -7258,6 +7290,19 @@ static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int d
         const char *ck = ts_node_type(c);
         if (strcmp(ck, "block") == 0) {
             py_bind_block(b, c, source, depth + 1);
+        } else if (strncmp(ck, "except", 6) == 0 && strstr(ck, "_clause") != NULL) {
+            if (py_has_def(c, depth + 1)) {
+                py_bind_as_targets(b, c, source, depth + 1);
+            }
+            uint32_t m = ts_node_named_child_count(c);
+            for (uint32_t j = 0; j < m; j++) {
+                TSNode part = ts_node_named_child(c, j);
+                if (strcmp(ts_node_type(part), "block") == 0) {
+                    py_bind_block(b, part, source, depth + 2);
+                } else {
+                    py_bind_walrus(b, part, source, depth + 2);
+                }
+            }
         } else if (strstr(ck, "_clause") != NULL) {
             py_bind_as_targets(b, c, source, depth + 1);
             py_bind_statement(b, c, source, depth + 1);
@@ -7275,17 +7320,82 @@ static void py_bind_block(tf_names_t *b, TSNode block, const char *source, int d
     }
 }
 
-/* Python: the names a class body binds besides its nested definitions,
- * '|'-joined (repeats allowed), or NULL. */
-static const char *py_class_body_bindings(CBMArena *a, TSNode node, const char *source) {
+static TSNode py_def_body(TSNode node) {
     if (strcmp(ts_node_type(node), "decorated_definition") == 0) {
         node = ts_node_child_by_field_name(node, TS_FIELD("definition"));
     }
-    TSNode body =
-        ts_node_is_null(node) ? node : ts_node_child_by_field_name(node, TS_FIELD("body"));
-    tf_names_t b = {.a = a};
-    py_bind_block(&b, body, source, 0);
-    return b.len ? b.buf : NULL;
+    return ts_node_is_null(node) ? node : ts_node_child_by_field_name(node, TS_FIELD("body"));
+}
+
+/* Python: the names a class body binds besides its nested definitions,
+ * '|'-joined, each once, or NULL. The top-level statements are taken in
+ * order: a binding holds from its statement on, and a later top-level `del`
+ * unbinds it -- unless a definition stands between the two, which saw the
+ * name bound when its annotations were evaluated at definition time (a
+ * top-level one: a definition inside a compound statement is no method the
+ * extractor lists). A `del` inside a compound statement may not run: the name
+ * stays bound. */
+static const char *py_class_body_bindings(CBMArena *a, TSNode node, const char *source) {
+    TSNode body = py_def_body(node);
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    CBMHashTable *state = cbm_ht_create(32); /* name -> epoch of its binding, or 1: unbound */
+    if (!state) {
+        return NULL;
+    }
+    tf_names_t order = {.a = a}; /* every name bound once, in first-binding order */
+    uintptr_t epoch = 2;         /* moves on at each definition */
+    TSTreeCursor cur = ts_tree_cursor_new(body);
+    for (bool ok = ts_tree_cursor_goto_first_child(&cur); ok;
+         ok = ts_tree_cursor_goto_next_sibling(&cur)) {
+        TSNode s = ts_tree_cursor_current_node(&cur);
+        if (!ts_node_is_named(s)) {
+            continue;
+        }
+        const char *kind = ts_node_type(s);
+        if (py_defines_kind(kind)) {
+            epoch++;
+            continue;
+        }
+        tf_names_t one = {.a = a};
+        bool del = strcmp(kind, "delete_statement") == 0;
+        if (del) {
+            py_bind_target(&one, s, source, 1);
+        } else {
+            py_bind_statement(&one, s, source, 0);
+        }
+        for (const char *p = one.buf; p && *p;) {
+            const char *bar = strchr(p, '|');
+            size_t len = bar ? (size_t)(bar - p) : strlen(p);
+            char *name = cbm_arena_strndup(a, p, len);
+            uintptr_t was = name ? (uintptr_t)cbm_ht_get(state, name) : 0;
+            if (name && del) {
+                if (was == epoch) {
+                    cbm_ht_set(state, name, (void *)(uintptr_t)1);
+                }
+            } else if (name) {
+                if (!was) {
+                    tf_names_add(&order, name, len);
+                }
+                cbm_ht_set(state, name, (void *)epoch);
+            }
+            p = bar ? bar + 1 : p + len;
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    tf_names_t out = {.a = a};
+    for (const char *p = order.buf; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = cbm_arena_strndup(a, p, len);
+        if (name && (uintptr_t)cbm_ht_get(state, name) > 1) {
+            tf_names_add(&out, name, len);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+    cbm_ht_free(state);
+    return out.len ? out.buf : NULL;
 }
 
 /* Make: a rule names several targets (`up down: deps`), each a goal

@@ -911,6 +911,45 @@ TEST(type_scope_python_class_and_module_of_one_qn) {
     return ts_twins("pyclassmod", py_classmod_files, CBM_LANG_PYTHON, py_classmod_check);
 }
 
+/* `except ValueError as E` unbinds E when the clause
+ * ends, and `D = Other; del D` leaves D unbound: methods defined after them
+ * name the module's E and D (python3 agrees). A `del` after a method that saw
+ * the binding (`D2 = Other`, `def md2(self) -> D2`, `del D2`) keeps the
+ * abstention: evaluated at definition time (Python before 3.14) the annotation
+ * is Other, evaluated lazily (3.14 on) the module's D2 -- no one answer. */
+static const ts_file_t py_unbind_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/mod.py", "class Other:\n    def load(self):\n        return 'other'\n\n\n"
+                   "class D:\n    def load(self):\n        return 'D'\n\n\n"
+                   "class E:\n    def load(self):\n        return 'E'\n\n\n"
+                   "class D2:\n    def load(self):\n        return 'D2'\n\n\n"
+                   "class Model:\n"
+                   "    try:\n        raise ValueError()\n    except ValueError as E:\n        pass\n"
+                   "    D = Other\n    del D\n    D2 = Other\n\n"
+                   "    def md2(self) -> D2:\n        return D2()\n\n"
+                   "    del D2\n\n"
+                   "    def me(self) -> E:\n        return E()\n\n"
+                   "    def md(self) -> D:\n        return D()\n"},
+    {"pkg/use.py", "from pkg.mod import Model\n\n\n"
+                   "def run_e():\n    return Model().me().load()\n\n\n"
+                   "def run_d():\n    return Model().md().load()\n\n\n"
+                   "def run_d2():\n    return Model().md2().load()\n"},
+    {NULL, NULL}};
+
+static int py_unbind_check(cbm_store_t *s, const char *project, const char *label) {
+    int e = ts_calls_to(s, project, "run_e", "pkg.mod.E.load", NULL);
+    int d = ts_calls_to(s, project, "run_d", "pkg.mod.D.load", NULL);
+    int d2 = ts_calls_to(s, project, "run_d2", "pkg.mod.D2.load", NULL) +
+             ts_calls_to(s, project, "run_d2", "pkg.mod.Other.load", NULL);
+    printf("  python class-body unbinding (%s): E=%d D=%d, D2 (bound at definition)=%d\n", label, e,
+           d, d2);
+    return !(e == 1 && d == 1 && d2 == 0);
+}
+
+TEST(type_scope_python_unbound_class_names_are_the_module_names) {
+    return ts_twins("pyunbind", py_unbind_files, CBM_LANG_PYTHON, py_unbind_check);
+}
+
 /* A struct's embedded-type text is built once, with one buffer: the
  * extractor's work for n embedded types is linear in n. */
 static uint64_t ts_go_embedded_work(int n) {
@@ -2204,6 +2243,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_nested_class_is_not_the_module_class);
     RUN_TEST(type_scope_python_class_body_bindings_shadow_the_module);
     RUN_TEST(type_scope_python_class_and_module_of_one_qn);
+    RUN_TEST(type_scope_python_unbound_class_names_are_the_module_names);
     RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
     RUN_TEST(type_scope_python_type_parameter_is_no_import);
     RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_per_file);
