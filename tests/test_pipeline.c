@@ -4905,6 +4905,85 @@ static int deploy_inc_fresh_files(const char *tmp, const char *repo, const char 
     return k8s_inc_index(repo, fresh) == 0 ? deploy_inc_files(fresh) : -1;
 }
 
+/* An Ansible playbook naming a role, the common content of a deploy/
+ * directory, indexed through the sequential semantic pass: a small tree at
+ * the default worker count (fewer than 51 files never take the parallel
+ * pass), the same tree at one worker, and a tree of more than 50 files at one
+ * worker. Each must index and draw the role import main draws for the same
+ * files under any other directory name. `workers` NULL keeps the default.
+ * This runner's memory core is libc malloc/free, so a fault on this path that
+ * needs the production allocator binding shows in the smoke instead
+ * (scripts/smoke-test.sh, Phase 2), which indexes the same playbook with the
+ * shipped binary. */
+static int ansible_deploy_index(const char *tmp, const char *name, int padding, const char *workers,
+                                int *imports, int *nodes) {
+    char repo[400];
+    char db_path[512];
+    snprintf(repo, sizeof(repo), "%s/%s", tmp, name);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", tmp, name);
+    write_temp_file(repo, "app/main.py", "def serve():\n    return 1\n");
+    write_temp_file(repo, "deploy/site.yml", "- hosts: web\n  roles:\n    - web\n");
+    write_temp_file(repo, "deploy/roles/web/tasks/main.yml",
+                    "- name: Install\n  apt:\n    name: nginx\n");
+    for (int i = 0; i < padding; i++) {
+        char rel[64];
+        char body[64];
+        snprintf(rel, sizeof(rel), "app/m%d.py", i);
+        snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
+        write_temp_file(repo, rel, body);
+    }
+    char saved[32] = "";
+    const char *was = getenv("CBM_WORKERS");
+    bool had = was != NULL;
+    if (had) {
+        snprintf(saved, sizeof(saved), "%s", was);
+    }
+    if (workers) {
+        cbm_setenv("CBM_WORKERS", workers, 1);
+    }
+    int rc = k8s_inc_index(repo, db_path);
+    if (workers && had) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+    } else if (workers) {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    *imports = rc == 0
+                   ? k8s_inc_count(db_path, "SELECT COUNT(*) FROM edges e JOIN nodes s ON "
+                                            "s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                                            "WHERE e.type = 'IMPORTS' AND s.file_path = "
+                                            "'deploy/site.yml' AND t.label = 'Folder' AND "
+                                            "t.file_path = 'deploy/roles/web' AND "
+                                            "json_extract(e.properties, '$.via') = 'ansible'")
+                   : -1;
+    *nodes = rc == 0 ? k8s_inc_count(db_path, "SELECT COUNT(*) FROM nodes") : -1;
+    return rc;
+}
+
+TEST(pipeline_ansible_under_deploy_sequential_pass) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ansdep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    int imports_default = -1, nodes_default = -1;
+    int imports_one = -1, nodes_one = -1;
+    int imports_big = -1, nodes_big = -1;
+    int rc_default = ansible_deploy_index(tmp, "small", 0, NULL, &imports_default, &nodes_default);
+    int rc_one = ansible_deploy_index(tmp, "small1", 0, "1", &imports_one, &nodes_one);
+    int rc_big = ansible_deploy_index(tmp, "big1", 60, "1", &imports_big, &nodes_big);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_default, 0);
+    ASSERT_EQ(imports_default, 1);
+    ASSERT_EQ(rc_one, 0);
+    ASSERT_EQ(imports_one, 1);
+    ASSERT_EQ(nodes_one, nodes_default); /* the worker count changes nothing */
+    ASSERT_EQ(rc_big, 0);
+    ASSERT_EQ(imports_big, 1);
+    ASSERT_GT(nodes_big, nodes_one); /* the padding is indexed too */
+    PASS();
+}
+
 TEST(incremental_sees_config_added_under_deploy) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_depinc_XXXXXX");
@@ -36218,6 +36297,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(incremental_sees_config_added_under_deploy);
+    RUN_TEST(pipeline_ansible_under_deploy_sequential_pass);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(incremental_deleted_caller_drops_its_route);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
