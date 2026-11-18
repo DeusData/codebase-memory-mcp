@@ -90,6 +90,7 @@ static char g_overload_differ_mark;
 #define TYPE_SCOPE_NEST_LOCAL ((void *)&g_nest_local_mark) /* inside a function */
 #define TYPE_SCOPE_OVERLOAD ((void *)&g_overload_mark)     /* declared with @overload */
 #define TYPE_SCOPE_OVERLOAD_DIFFER ((void *)&g_overload_differ_mark)
+#define TYPE_SCOPE_ALIAS_MAX 256 /* a decorator name read through the imports */
 
 struct cbm_type_scope_file {
     const cbm_type_scope_lang_t *lang;
@@ -103,6 +104,8 @@ struct cbm_type_scope_file {
     CBMHashTable *class_binds;   /* "<class QN>.<name>" a class body binds (not a def) */
     CBMHashTable *overloaded;    /* QN some def declares with @overload -> the return text
                                   * all its defs share, or TYPE_SCOPE_OVERLOAD_DIFFER */
+    CBMHashTable *ovl_alias;     /* local name a module-level `from typing import overload
+                                  * as X` binds */
     CBMHashTable *tparams;       /* every type parameter name the file declares */
     CBMHashTable *nesting;       /* def QN -> TYPE_SCOPE_NEST_OPEN / _LOCAL (memo) */
     CBMHashTable *bindings;      /* module-level name -> count of binding facts (1, 2+) */
@@ -201,9 +204,26 @@ static void type_scope_index_global_names(cbm_type_scope_file_t *f, const CBMDef
     }
 }
 
-/* Whether a decorator's text is typing's @overload (`@overload`,
- * `@typing.overload`, `@t.overload`). */
-static bool type_scope_overload_decorator(const char *text) {
+/* The local names the module's imports bind to typing's overload under another
+ * name (`from typing import overload as ovl`, typing_extensions too). */
+static void type_scope_index_ovl_alias(cbm_type_scope_file_t *f) {
+    const CBMPyNamespaceFacts *facts = f->scope.module_facts;
+    for (int i = 0; facts && i < facts->count; i++) {
+        const CBMPyNamespaceFact *x = &facts->items[i];
+        TYPE_SCOPE_WORK(1);
+        if (x->kind == CBM_PY_NS_IMPORT_NAME && x->relative_level == 0 && x->local_name &&
+            x->module_name && x->member_name && strcmp(x->member_name, "overload") == 0 &&
+            (strcmp(x->module_name, "typing") == 0 ||
+             strcmp(x->module_name, "typing_extensions") == 0)) {
+            cbm_ht_set(f->ovl_alias, x->local_name, (void *)x->local_name);
+        }
+    }
+}
+
+/* Whether a decorator's text is typing's @overload: its last dotted name is
+ * `overload` (`@overload`, `@typing.overload`, `@t.overload`), or it is a
+ * plain name the module imports as typing's overload (`@ovl`). */
+static bool type_scope_overload_decorator(const cbm_type_scope_file_t *f, const char *text) {
     while (text && (*text == '@' || *text == ' ' || *text == '\t')) {
         text++;
     }
@@ -217,8 +237,17 @@ static bool type_scope_overload_decorator(const char *text) {
             name = text + i + 1;
         }
     }
-    return (size_t)(text + len - name) == strlen("overload") &&
-           memcmp(name, "overload", strlen("overload")) == 0;
+    if ((size_t)(text + len - name) == strlen("overload") &&
+        memcmp(name, "overload", strlen("overload")) == 0) {
+        return true;
+    }
+    char local[TYPE_SCOPE_ALIAS_MAX];
+    if (name != text || len >= sizeof(local) || cbm_ht_count(f->ovl_alias) == 0) {
+        return false;
+    }
+    memcpy(local, text, len);
+    local[len] = '\0';
+    return cbm_ht_get(f->ovl_alias, local) != NULL;
 }
 
 /* A function with @overload declarations: callers see the overloads, which
@@ -229,7 +258,7 @@ static bool type_scope_overload_decorator(const char *text) {
 static void type_scope_index_overload(cbm_type_scope_file_t *f, const CBMDefinition *d) {
     for (int i = 0; d->decorators && d->decorators[i] && d->qualified_name; i++) {
         TYPE_SCOPE_WORK(1);
-        if (type_scope_overload_decorator(d->decorators[i])) {
+        if (type_scope_overload_decorator(f, d->decorators[i])) {
             cbm_ht_set(f->overloaded, d->qualified_name, TYPE_SCOPE_OVERLOAD);
             return;
         }
@@ -260,12 +289,14 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
     f->defs = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(n + 1));
     f->class_binds = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->overloaded = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
+    f->ovl_alias = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->tparams = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->nesting = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(n + 1));
-    if (!f->defs || !f->class_binds || !f->overloaded || !f->tparams || !f->nesting ||
-        !type_scope_index_module_facts(f)) {
+    if (!f->defs || !f->class_binds || !f->overloaded || !f->ovl_alias || !f->tparams ||
+        !f->nesting || !type_scope_index_module_facts(f)) {
         return false;
     }
+    type_scope_index_ovl_alias(f);
     for (int i = 0; i < n; i++) {
         const CBMDefinition *d = &f->scope.file_defs[i];
         if (d->qualified_name && !cbm_ht_get(f->defs, d->qualified_name)) {
@@ -338,6 +369,7 @@ void cbm_type_scope_file_end(cbm_type_scope_file_t *file) {
     cbm_ht_free(file->defs);
     cbm_ht_free(file->class_binds);
     cbm_ht_free(file->overloaded);
+    cbm_ht_free(file->ovl_alias);
     cbm_ht_free(file->tparams);
     cbm_ht_free(file->nesting);
     cbm_ht_free(file->bindings);

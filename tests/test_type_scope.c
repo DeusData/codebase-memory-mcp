@@ -1030,6 +1030,43 @@ TEST(type_scope_python_overloaded_method_takes_no_identity) {
     return ts_twins("pyoverload", py_overload_files, CBM_LANG_PYTHON, py_overload_check);
 }
 
+/* The same through an import under another name (`from typing import
+ * overload as ovl`, `@ovl`): the name is read through the module's imports
+ * (python3: `replace(cls=AliasText)` runs AliasText.css). A method of the
+ * same class under a plain decorator keeps its identity (run_kept, python3
+ * Alias.css). */
+static const ts_file_t py_overload_alias_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/resp.py", "from __future__ import annotations\n\nfrom typing import Self, TypeVar\n"
+                    "from typing import overload as ovl\n\n"
+                    "T = TypeVar(\"T\", bound=\"Alias\")\n\n\n"
+                    "def keep(fn):\n    return fn\n\n\n"
+                    "class Alias:\n    def css(self):\n        return 'alias'\n\n"
+                    "    @ovl\n    def replace(self, cls: type[T]) -> T: ...\n\n"
+                    "    @ovl\n    def replace(self, cls: None = None) -> Self: ...\n\n"
+                    "    def replace(self, cls=None) -> Alias:\n"
+                    "        return (cls or type(self))()\n\n"
+                    "    @keep\n    def kept(self) -> Alias:\n        return Alias()\n\n\n"
+                    "class AliasText(Alias):\n    def css(self):\n        return 'text'\n"},
+    {"pkg/make.py", "from pkg.resp import Alias\n\n\ndef make() -> Alias:\n    return Alias()\n"},
+    {"pkg/use.py", "from pkg.make import make\nfrom pkg.resp import AliasText\n\n\n"
+                   "def run_alias():\n    return make().replace(cls=AliasText).css()\n\n\n"
+                   "def run_kept():\n    return make().kept().css()\n"},
+    {NULL, NULL}};
+
+static int py_overload_alias_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "run_alias", "pkg.resp.Alias.css", NULL);
+    int kept = ts_calls_to(s, project, "run_kept", "pkg.resp.Alias.css", NULL);
+    printf("  python overload under another name (%s): run_alias -> Alias.css=%d, run_kept=%d\n",
+           label, wrong, kept);
+    return !(wrong == 0 && kept == 1);
+}
+
+TEST(type_scope_python_overload_imported_under_another_name) {
+    return ts_twins("pyovlalias", py_overload_alias_files, CBM_LANG_PYTHON,
+                    py_overload_alias_check);
+}
+
 /* A struct's embedded-type text is built once, with one buffer: the
  * extractor's work for n embedded types is linear in n. */
 static uint64_t ts_go_embedded_work(int n) {
@@ -2391,6 +2428,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_global_rebinding_takes_no_identity);
     RUN_TEST(type_scope_python_unbound_class_names_are_the_module_names);
     RUN_TEST(type_scope_python_overloaded_method_takes_no_identity);
+    RUN_TEST(type_scope_python_overload_imported_under_another_name);
     RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
     RUN_TEST(type_scope_python_type_parameter_is_no_import);
     RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_per_file);
