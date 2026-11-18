@@ -12,6 +12,7 @@
 #include "pipeline/type_scope.h"
 
 #include "foundation/constants.h"
+#include "graph_buffer/graph_buffer.h" /* the module check of a target */
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -95,6 +96,7 @@ struct cbm_type_scope_file {
     CBMHashTable *seen;    /* spelling -> serial of the last def that wrote it */
     /* lexical scopes only */
     CBMHashTable *defs;          /* file def QN -> index + 1 into scope.file_defs */
+    CBMHashTable *class_binds;   /* "<class QN>.<name>" a class body binds (not a def) */
     CBMHashTable *tparams;       /* every type parameter name the file declares */
     CBMHashTable *nesting;       /* def QN -> TYPE_SCOPE_NEST_OPEN / _LOCAL (memo) */
     CBMHashTable *bindings;      /* module-level name -> count of binding facts (1, 2+) */
@@ -159,13 +161,33 @@ static bool type_scope_rebound(const cbm_type_scope_file_t *f, const char *head)
     return f->bindings && cbm_ht_get(f->bindings, head) == TYPE_SCOPE_BOUND_MANY;
 }
 
-/* Hash the file's own definitions and its type parameter names. */
+/* Each name a class body binds besides its definitions, keyed as a member of
+ * the class ("<class QN>.<name>", the key type_scope_shadowed probes). */
+static void type_scope_index_class_bindings(cbm_type_scope_file_t *f, const CBMDefinition *d) {
+    const char *bound = d->type_facts ? d->type_facts->class_bindings : NULL;
+    for (const char *p = bound; p && *p && d->qualified_name;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        TYPE_SCOPE_WORK(len + 1);
+        char *key = len ? cbm_arena_sprintf(&f->keys, "%s.%.*s", d->qualified_name, (int)len, p)
+                        : NULL;
+        if (key && !cbm_ht_get(f->class_binds, key)) {
+            cbm_ht_set(f->class_binds, key, key);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+}
+
+/* Hash the file's own definitions, its type parameter names and the names
+ * its class bodies bind. */
 static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
     int n = f->scope.file_def_count;
     f->defs = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(n + 1));
+    f->class_binds = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->tparams = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->nesting = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(n + 1));
-    if (!f->defs || !f->tparams || !f->nesting || !type_scope_index_module_facts(f)) {
+    if (!f->defs || !f->class_binds || !f->tparams || !f->nesting ||
+        !type_scope_index_module_facts(f)) {
         return false;
     }
     for (int i = 0; i < n; i++) {
@@ -174,7 +196,8 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
             TYPE_SCOPE_WORK(1);
             cbm_ht_set(f->defs, d->qualified_name, (void *)(uintptr_t)(i + 1));
         }
-        for (const char *p = d->type_params; p && *p;) {
+        type_scope_index_class_bindings(f, d);
+        for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
             const char *bar = strchr(p, '|');
             size_t len = bar ? (size_t)(bar - p) : strlen(p);
             char *name = len ? cbm_arena_strndup(&f->keys, p, len) : NULL;
@@ -234,6 +257,7 @@ void cbm_type_scope_file_end(cbm_type_scope_file_t *file) {
     cbm_ht_free(file->memo);
     cbm_ht_free(file->seen);
     cbm_ht_free(file->defs);
+    cbm_ht_free(file->class_binds);
     cbm_ht_free(file->tparams);
     cbm_ht_free(file->nesting);
     cbm_ht_free(file->bindings);
@@ -243,7 +267,9 @@ void cbm_type_scope_file_end(cbm_type_scope_file_t *file) {
 
 /* ── Resolution ───────────────────────────────────────────────────── */
 
-/* `qn` when it names a project definition of an allowed label, else NULL. */
+/* `qn` when it names a project definition of an allowed label, else NULL. A
+ * QN the graph holds as a module (a class and a module of one QN) is none:
+ * the two share their members' QNs. */
 static const char *type_scope_target(const cbm_type_scope_file_t *f, const char *qn) {
     TYPE_SCOPE_WORK(1);
     const char *label = cbm_registry_label_of(f->scope.reg, qn);
@@ -252,7 +278,10 @@ static const char *type_scope_target(const cbm_type_scope_file_t *f, const char 
     }
     for (const char *const *l = f->lang->labels; *l; l++) {
         if (strcmp(*l, label) == 0) {
-            return qn;
+            const cbm_gbuf_node_t *node =
+                f->lang->lexical_scopes && f->scope.graph ? cbm_gbuf_find_by_qn(f->scope.graph, qn)
+                                                          : NULL;
+            return node && node->label && strcmp(node->label, "Module") == 0 ? NULL : qn;
         }
     }
     return NULL;
@@ -449,7 +478,8 @@ static const char *type_scope_enclosing_class(cbm_type_scope_file_t *f, const ch
 
 /* True when the def's own scopes bind the head of this spelling before the
  * module does: a type parameter the file declares, or a name the enclosing
- * class body declares. */
+ * class body declares (a nested definition) or binds (an assignment, an
+ * import, a loop or with or except target...). */
 static bool type_scope_shadowed(cbm_type_scope_file_t *f, const char *name, size_t len) {
     size_t head_len = type_scope_head_len(name, len);
     char head[CBM_SZ_256];
@@ -465,7 +495,8 @@ static bool type_scope_shadowed(cbm_type_scope_file_t *f, const char *name, size
     }
     const char *member = cbm_arena_sprintf(&f->keys, "%s.%s", f->enclosing_class, head);
     TYPE_SCOPE_WORK(1);
-    return !member || cbm_ht_get(f->defs, member) != NULL;
+    return !member || cbm_ht_get(f->defs, member) != NULL ||
+           cbm_ht_get(f->class_binds, member) != NULL;
 }
 
 /* ── Reduction of a type text to the names it writes ──────────────── */

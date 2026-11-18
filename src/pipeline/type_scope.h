@@ -67,9 +67,12 @@ typedef struct {
     /* Python: an annotation is evaluated in the def's enclosing scopes before
      * the module. A def nested in a function sees that function's locals,
      * which the step cannot list, so it gets no identity; a name the
-     * immediately enclosing class body declares and a PEP 695 type parameter
-     * of the file get none, and neither does a name the module binds more
-     * than once (cbm_type_scope_t.module_facts). */
+     * immediately enclosing class body declares or binds (any binding:
+     * CBMDefTypeFacts.class_bindings) and a PEP 695 type parameter of the
+     * file get none, and neither does a name the module binds more than once
+     * (cbm_type_scope_t.module_facts), nor a type whose QN the graph holds as
+     * a module (a class `Thing` in pkg/a/__init__.py beside pkg/a/Thing.py:
+     * their members share QNs, so no member answer is that class's). */
     bool lexical_scopes;
     /* Which CBMLSPDef texts hold raw type spellings for this language. */
     bool return_types;
@@ -91,7 +94,7 @@ typedef struct {
     const char *const *imp_vals;
     int imp_count;
     /* lexical_scopes only: the file's extraction definitions, in any order
-     * (their QNs, labels and type_params); NULL with def_count 0 = none. */
+     * (their QNs, labels and type facts); NULL with def_count 0 = none. */
     const CBMDefinition *file_defs;
     int file_def_count;
     /* lexical_scopes only: the module's ordered namespace facts. Without a
@@ -99,6 +102,10 @@ typedef struct {
      * no identity; a name the module binds twice (two imports, an import and
      * a definition, a later assignment) gets none. */
     const CBMPyNamespaceFacts *module_facts;
+    /* lexical_scopes only: the graph the import map reads (its nodes'
+     * labels), so a QN that is a module's gets no identity; NULL = not
+     * checked. */
+    const struct cbm_gbuf *graph;
 } cbm_type_scope_t;
 
 /* Per-file working state: the import map by key, the file's own scopes, and

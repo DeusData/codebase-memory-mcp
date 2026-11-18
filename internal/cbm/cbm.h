@@ -328,26 +328,38 @@ typedef struct {
      * for a defined type `type A B` (its method set is its own) and in every
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
-    /* Python only: the names a PEP 695 type parameter list declares
-     * (`def f[T, *Ts, **P]`, `class C[T]`), '|'-joined. The cross-file type
-     * step keeps them from taking a real type's identity (type_scope.h); never
-     * written to the graph. NULL when none and in every other language. Tail
-     * field: zero-init stays valid. */
-    const char *type_params;
-    /* Go only: the type a package-level `var`/`const` declares, or the type
-     * its single initializer spells (`T{}` is T, `&T{}` and `new(T)` are *T,
-     * a const block's bare spec repeats the previous one's). It reaches the
-     * cross-file LSP as the Variable's type (go_lsp.c, package-level values)
-     * and is never written to the graph. NULL for anything else and in every
-     * other language. Tail field: zero-init stays valid. */
-    const char *value_type;
-    /* Go only: the types a struct embeds, '|'-joined as written
-     * ("logging.LogHolder|*Base"). The cross-file LSP promotes their members
-     * (go_lsp.c, embedded-member hook); no graph edge is drawn from it. NULL
-     * when none and in every other language. Tail field: zero-init stays
-     * valid. */
-    const char *go_embedded;
+    /* Go and Python only: the facts the declared-type scope step and the
+     * cross-file registrars read (CBMDefTypeFacts), in the result arena; NULL
+     * for a definition without one and in every other language. One pointer,
+     * so the other languages pay 8 bytes per definition. Tail field:
+     * zero-init stays valid. */
+    const struct CBMDefTypeFacts *type_facts;
 } CBMDefinition;
+
+/* Facts of one Go or Python definition that no graph property carries; only
+ * the cross-file step reads them (src/pipeline/type_scope.h, the Go and
+ * Python cross registrars). Every field is NULL when absent. */
+typedef struct CBMDefTypeFacts {
+    /* The names its type parameter lists declare, '|'-joined: Python PEP 695
+     * (`def f[T, *Ts, **P]`, `class C[T]`), Go (`func F[K, V any]`, a generic
+     * receiver `(s *Set[T])`, `type Box[T any]`). They never name a type of
+     * the project. */
+    const char *type_params;
+    /* Go: the type a package-level `var`/`const` declares, or the type its
+     * single initializer spells (`T{}` is T, `&T{}` and `new(T)` are *T, a
+     * const block's bare spec repeats the previous one's): the Variable's
+     * type in the cross-file LSP (go_lsp.c, package-level values). */
+    const char *value_type;
+    /* Go: the types a struct embeds, '|'-joined as written
+     * ("logging.LogHolder|*Base"): the cross-file LSP promotes their members
+     * and names them as fields (go_lsp.c, embedded-member hook). */
+    const char *go_embedded;
+    /* Python class: the names its body binds other than by a nested def or
+     * class (assignments, annotated names, imports, for/with/except/match
+     * targets, walrus, global/nonlocal/del), '|'-joined. A method annotation
+     * naming one of them means the class attribute, not the module's name. */
+    const char *class_bindings;
+} CBMDefTypeFacts;
 
 /* extra_props key of a generated member, one the compiler writes and the
  * source never spells: a Java record's implicit accessor carries

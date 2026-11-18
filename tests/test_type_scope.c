@@ -285,6 +285,38 @@ TEST(type_scope_python_enclosing_scopes) {
     PASS();
 }
 
+/* Round 3, N2: a name the class body binds without defining it (`Config =
+ * Other`, an import, a loop, with or except target) is the class attribute in
+ * its methods' annotations, so it gets no identity; a name the body does not
+ * bind keeps the module's. */
+TEST(type_scope_python_class_body_bindings) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "Config", "p.app.Config", "Class", false);
+    cbm_registry_add(u.reg, "Keep", "p.app.Keep", "Class", false);
+    static const CBMDefTypeFacts model_binds = {.class_bindings = "x|Config|Other"};
+    const CBMDefinition defs[] = {
+        {.qualified_name = "p.app.Config", .label = "Class"},
+        {.qualified_name = "p.app.Keep", .label = "Class"},
+        {.qualified_name = "p.app.Model", .label = "Class", .type_facts = &model_binds},
+        {.qualified_name = "p.app.Model.cfg", .label = "Method"},
+        {.qualified_name = "p.app.top", .label = "Function"},
+    };
+    ts_attach_t in = {.lang = CBM_LANG_PYTHON,
+                      .file_defs = defs,
+                      .file_def_count = (int)(sizeof(defs) / sizeof(defs[0])),
+                      .def_qn = "p.app.Model.cfg",
+                      .ret = "Optional[Config]"};
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    in.ret = "Keep";
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Keep=p.app.Keep");
+    in.def_qn = "p.app.top"; /* outside the class: the module's Config */
+    in.ret = "Config";
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Config=p.app.Config");
+    ts_unit_end(&u);
+    PASS();
+}
+
 /* Type parameters: a PEP 695 parameter of the file (`def f[T]`,
  * `class C[T]`) and a TypeVar the module assigns over an import never take a
  * real type's identity. */
@@ -293,10 +325,12 @@ TEST(type_scope_python_type_parameters) {
     ts_unit_begin(&u);
     cbm_registry_add(u.reg, "T", "p.app.T", "Class", false);
     cbm_registry_add(u.reg, "Item", "p.a.Item", "Class", false);
+    static const CBMDefTypeFacts wrap_params = {.type_params = "T"};
+    static const CBMDefTypeFacts box_params = {.type_params = "K|T"};
     const CBMDefinition defs[] = {
         {.qualified_name = "p.app.T", .label = "Class"},
-        {.qualified_name = "p.app.wrap", .label = "Function", .type_params = "T"},
-        {.qualified_name = "p.app.Box", .label = "Class", .type_params = "K|T"},
+        {.qualified_name = "p.app.wrap", .label = "Function", .type_facts = &wrap_params},
+        {.qualified_name = "p.app.Box", .label = "Class", .type_facts = &box_params},
         {.qualified_name = "p.app.Box.get", .label = "Method"},
     };
     ts_attach_t in = {.lang = CBM_LANG_PYTHON,
@@ -783,6 +817,90 @@ static int py_nested_check(cbm_store_t *s, const char *project, const char *labe
 
 TEST(type_scope_python_nested_class_is_not_the_module_class) {
     return ts_twins("pynest", py_nested_files, CBM_LANG_PYTHON, py_nested_check);
+}
+
+/* Round 3, N2 (the review's py-classattr): a class body that binds a name
+ * without defining it -- `Config = OtherConfig`, an import, an annotated
+ * assignment, a for, with or except target, a walrus -- makes that name the
+ * class attribute in its methods' annotations (Python: get_type_hints gives
+ * OtherConfig, Other, None, 1...). None of them may become the module-level
+ * class of that name; a name the body does not bind (Keep) still does. */
+static const ts_file_t py_classbind_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/other.py", "class OtherConfig:\n    def load(self):\n        return 'other'\n\n\n"
+                     "class Other:\n    def load(self):\n        return 'other'\n"},
+    {"pkg/mod.py",
+     "import contextlib\nfrom pkg.other import Other, OtherConfig\n\n\n"
+     "class Config:\n    def load(self):\n        return 'module'\n\n\n"
+     "class A:\n    def load(self):\n        return 'A'\n\n\n"
+     "class B:\n    def load(self):\n        return 'B'\n\n\n"
+     "class C:\n    def load(self):\n        return 'C'\n\n\n"
+     "class D:\n    def load(self):\n        return 'D'\n\n\n"
+     "class F:\n    def load(self):\n        return 'F'\n\n\n"
+     "class Keep:\n    def load(self):\n        return 'keep'\n\n\n"
+     "class Model:\n"
+     "    Config = OtherConfig\n"
+     "    from pkg.other import Other as A\n"
+     "    B: type = Other\n"
+     "    for C in (1,):\n        pass\n"
+     "    with contextlib.nullcontext() as D:\n        pass\n"
+     "    (F := 1)\n\n"
+     "    def cfg(self) -> Config:\n        return OtherConfig()\n\n"
+     "    def ma(self) -> A:\n        return Other()\n\n"
+     "    def mb(self) -> B:\n        return Other()\n\n"
+     "    def mc(self) -> C:\n        return None\n\n"
+     "    def md(self) -> D:\n        return None\n\n"
+     "    def mf(self) -> F:\n        return None\n\n"
+     "    def keep(self) -> Keep:\n        return Keep()\n"},
+    {"pkg/use.py", "from pkg.mod import Model\n\n\n"
+                   "def run():\n    return Model().cfg().load()\n\n\n"
+                   "def run_a():\n    return Model().ma().load()\n\n\n"
+                   "def run_b():\n    return Model().mb().load()\n\n\n"
+                   "def run_c():\n    return Model().mc().load()\n\n\n"
+                   "def run_d():\n    return Model().md().load()\n\n\n"
+                   "def run_f():\n    return Model().mf().load()\n\n\n"
+                   "def run_keep():\n    return Model().keep().load()\n"},
+    {NULL, NULL}};
+
+static int py_classbind_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "run", "pkg.mod.Config.load", NULL) +
+                ts_calls_to(s, project, "run_a", "pkg.mod.A.load", NULL) +
+                ts_calls_to(s, project, "run_b", "pkg.mod.B.load", NULL) +
+                ts_calls_to(s, project, "run_c", "pkg.mod.C.load", NULL) +
+                ts_calls_to(s, project, "run_d", "pkg.mod.D.load", NULL) +
+                ts_calls_to(s, project, "run_f", "pkg.mod.F.load", NULL);
+    int keep = ts_calls_to(s, project, "run_keep", "pkg.mod.Keep.load", NULL);
+    printf("  python class-body bindings (%s): module-class edges=%d, keep=%d\n", label, wrong,
+           keep);
+    return !(wrong == 0 && keep == 1);
+}
+
+TEST(type_scope_python_class_body_bindings_shadow_the_module) {
+    return ts_twins("pybind", py_classbind_files, CBM_LANG_PYTHON, py_classbind_check);
+}
+
+/* Round 3 (a class and a module of one QN): pkg/a/__init__.py defines class
+ * Thing beside the module pkg/a/Thing.py; both share the QN pkg.a.Thing and
+ * their members `run` share pkg.a.Thing.run, so no member edge through an
+ * identity Thing=pkg.a.Thing is that class's (the graph keeps the module's
+ * nodes). Python: `from pkg.a import Thing` is the class while nothing imports
+ * the submodule, and the submodule once something does. */
+static const ts_file_t py_classmod_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/a/__init__.py", "class Thing:\n    def run(self):\n        return 'class'\n"},
+    {"pkg/a/Thing.py", "def run():\n    return 'module'\n"},
+    {"pkg/b.py", "from pkg.a import Thing\n\n\ndef make() -> Thing:\n    return Thing()\n"},
+    {"pkg/c.py", "from pkg.b import make\n\n\ndef go():\n    return make().run()\n"},
+    {NULL, NULL}};
+
+static int py_classmod_check(cbm_store_t *s, const char *project, const char *label) {
+    int member = ts_calls_to(s, project, "go", "pkg.a.Thing.run", NULL);
+    printf("  python class and module of one QN (%s): go -> Thing.run=%d\n", label, member);
+    return member != 0;
+}
+
+TEST(type_scope_python_class_and_module_of_one_qn) {
+    return ts_twins("pyclassmod", py_classmod_files, CBM_LANG_PYTHON, py_classmod_check);
 }
 
 /* Finding 6: `-> Self` chains across files keep main's edges; `Self` comes
@@ -1729,3 +1847,6 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_incremental_python_body_edits);
     RUN_TEST(type_scope_incremental_python_declaring_change_matches_full);
 }
+    RUN_TEST(type_scope_python_class_body_bindings);
+    RUN_TEST(type_scope_python_class_body_bindings_shadow_the_module);
+    RUN_TEST(type_scope_python_class_and_module_of_one_qn);
