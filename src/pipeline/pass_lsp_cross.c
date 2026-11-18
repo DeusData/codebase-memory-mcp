@@ -16,6 +16,8 @@
 #include "pipeline/pass_lsp_cross.h"
 
 #include "pipeline/lsp_surface.h"
+#include "pipeline/pipeline.h"
+#include "cbm.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h"
 #include "resolve_stats.h"
@@ -50,6 +52,7 @@
 enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
+    PXC_HASH_SPARE = 1,
 };
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
@@ -2083,6 +2086,80 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
     return out;
 }
 
+/* Preserve a negative receiver-identity decision at the exact raw/preprocessed
+ * occurrence. Both sequential and fused-parallel CALLS passes already honor
+ * requires_lsp_resolution; unrelated unresolved calls keep their fallback. */
+static void pxc_require_unambiguous_receivers(CBMFileResult *result,
+                                              const CBMResolvedCallArray *out) {
+    CBMArena keys;
+    CBMHashTable *blocked = NULL;
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *r = &out->items[i];
+        if (!r->strategy || strcmp(r->strategy, "lsp_ambiguous_receiver") != 0 ||
+            r->kind != CBM_RESOLVED_INVOCATION || !r->caller_qn ||
+            r->site_end_byte <= r->site_start_byte) {
+            continue;
+        }
+        if (!blocked) {
+            pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
+            blocked = cbm_ht_create((uint32_t)(out->count + PXC_HASH_SPARE));
+        }
+        char *key = cbm_arena_sprintf(&keys, "%s:%u:%u:%u", r->caller_qn, r->site_start_byte,
+                                      r->site_end_byte, (unsigned)r->source_origin);
+        cbm_ht_set(blocked, key, blocked);
+    }
+    for (int i = 0; blocked && i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || call->site_end_byte <= call->site_start_byte) {
+            continue;
+        }
+        char *key =
+            cbm_arena_sprintf(&keys, "%s:%u:%u:%u", call->enclosing_func_qn, call->site_start_byte,
+                              call->site_end_byte, (unsigned)call->source_origin);
+        if (cbm_ht_get(blocked, key)) {
+            call->requires_lsp_resolution = true;
+        }
+    }
+    if (blocked) {
+        cbm_ht_free(blocked);
+        pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
+    }
+}
+
+/* The C LSP compares its include list with type QNs, which live in the
+ * filename-stem module (proj.dir.foo), while a C/C++ include binds the
+ * included File node (proj.dir.foo.h.__file__). Convert only this list: the
+ * shared import map also feeds base-class, usage and write resolution and
+ * keeps its values. An include reaches a File node by its path, extension
+ * included, so the segment before __file__ is that extension; other values
+ * (Module targets) are already module QNs and pass unchanged. */
+static const char **pxc_c_include_modules(CBMArena *arena, const char **qns, int count) {
+    static const char file_suffix[] = ".__file__";
+    const size_t suffix_len = sizeof(file_suffix) - SKIP_ONE;
+    const char **modules =
+        count > 0 ? (const char **)cbm_arena_alloc(arena, (size_t)count * sizeof(*modules)) : NULL;
+    if (!modules) {
+        return qns;
+    }
+    for (int i = 0; i < count; i++) {
+        modules[i] = qns[i];
+        size_t len = qns[i] ? strlen(qns[i]) : 0;
+        if (len <= suffix_len || strcmp(qns[i] + len - suffix_len, file_suffix) != 0) {
+            continue;
+        }
+        size_t stem_len = len - suffix_len;
+        while (stem_len > 0 && qns[i][stem_len - SKIP_ONE] != '.') {
+            stem_len--;
+        }
+        char *module =
+            stem_len > SKIP_ONE ? cbm_arena_strndup(arena, qns[i], stem_len - SKIP_ONE) : NULL;
+        if (module) {
+            modules[i] = module;
+        }
+    }
+    return modules;
+}
+
 /* Run cross-file LSP for a single file inside a scratch arena that gets
  * freed when the call returns. The LSP would otherwise allocate a fresh
  * type registry + stdlib + all project defs into the supplied arena, and
@@ -2120,14 +2197,12 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
     case CBM_LANG_CPP:
     case CBM_LANG_CUDA: {
         bool cpp_mode = (lang != CBM_LANG_C);
-        /* C/C++ cross LSP takes include_paths/include_ns_qns instead of
-         * imports — the existing pipeline doesn't carry C-style include
-         * resolution as a separate map, so pass NULL/0 and let the LSP
-         * fall back to its own #include scan. */
+        /* Use the same module-form include list as the prebuilt-registry path. */
+        const char **includes = pxc_c_include_modules(&scratch, imp_qns, imp_count);
         if (r->has_test_definition_owners) {
-            if (!cbm_run_c_lsp_cross_with_test_owners(&scratch, source, source_len, module_qn,
-                                                      cpp_mode, defs, def_count, NULL, NULL, 0,
-                                                      tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
+            if (!cbm_run_c_lsp_cross_with_test_owners(
+                    &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, imp_names,
+                    includes, imp_count, tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
                 cbm_pipeline_test_owner_error(r);
                 pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
                 return; /* out may be partial: never append it */
@@ -2135,7 +2210,7 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         } else {
             CBMLSPStatus status =
                 cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
-                                           def_count, NULL, NULL, 0, tree, &out);
+                                           def_count, imp_names, includes, imp_count, tree, &out);
             if (status != CBM_LSP_COMPLETE)
                 cbm_c_lsp_record_failure(r, status);
         }
@@ -2178,6 +2253,9 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         break;
     }
 
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        pxc_require_unambiguous_receivers(r, &out);
+    }
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -2324,11 +2402,12 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         case CBM_LANG_C:
         case CBM_LANG_CPP:
-        case CBM_LANG_CUDA:
+        case CBM_LANG_CUDA: {
+            const char **includes = pxc_c_include_modules(&scratch, imp_vals, imp_count);
             if (result->has_test_definition_owners) {
                 if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
                         &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                        imp_keys, imp_vals, imp_count, result->cached_tree, &out,
+                        imp_keys, includes, imp_count, result->cached_tree, &out,
                         CBM_SOURCE_ORIGIN_RAW, result)) {
                     cbm_pipeline_test_owner_error(result);
                     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -2337,12 +2416,13 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             } else {
                 CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
                     &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                    imp_keys, imp_vals, imp_count, result->cached_tree, &out);
+                    imp_keys, includes, imp_count, result->cached_tree, &out);
                 if (status != CBM_LSP_COMPLETE)
                     cbm_c_lsp_record_failure(result, status);
             }
             used_prebuilt = true;
             break;
+        }
         case CBM_LANG_CSHARP:
             cbm_run_cs_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
                                                imp_vals, imp_count, result->cached_tree, &out);
@@ -2390,6 +2470,9 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         }
         if (used_prebuilt) {
+            if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+                pxc_require_unambiguous_receivers(result, &out);
+            }
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
         }

@@ -17074,7 +17074,102 @@ TEST(clsp_issue1527_depth_failure_reports_all_entry_points) {
     PASS();
 }
 
+/* Receiver candidates must declare this member; forward declarations and
+ * unrelated homonyms must not hide the single usable definition. */
+TEST(clsp_duplicate_receiver_member_candidates) {
+    for (int reverse = 0; reverse < 2; reverse++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry reg;
+        cbm_registry_init(&reg, &arena);
+        const char *qns[] = {"test.primary.Beacon", "test.mirror.Beacon", "test.forward.Beacon",
+                             "test.idle.Beacon"};
+        for (int n = 0; n < 4; n++) {
+            int i = reverse ? 3 - n : n;
+            CBMRegisteredType t = {0};
+            t.qualified_name = qns[i];
+            t.short_name = "Beacon";
+            cbm_registry_add_type(&reg, t);
+            if (i < 2 || i == 3) {
+                CBMRegisteredFunc f = {0};
+                f.qualified_name =
+                    cbm_arena_sprintf(&arena, "%s.%s", qns[i], i == 3 ? "Idle" : "Fire");
+                f.receiver_type = qns[i];
+                f.short_name = i == 3 ? "Idle" : "Fire";
+                cbm_registry_add_func(&reg, f);
+            }
+        }
+        cbm_registry_finalize(&reg);
+        CBMResolvedCallArray out = {0};
+        CLSPContext ctx;
+        c_lsp_init(&ctx, &arena, "", 0, &reg, "test.caller", true, &out);
+        ASSERT_NULL(c_lookup_member(&ctx, "test.caller.Beacon", "Fire"));
+        const CBMRegisteredFunc *f = c_lookup_member(&ctx, "test.caller.Beacon", "Idle");
+        ASSERT_NOT_NULL(f);
+        ASSERT_STR_EQ(f->qualified_name, "test.idle.Beacon.Idle");
+        c_lsp_add_include(&ctx, "primary.h", "test.primary");
+        f = c_lookup_member(&ctx, "test.caller.Beacon", "Fire");
+        ASSERT_NOT_NULL(f);
+        ASSERT_STR_EQ(f->qualified_name, "test.primary.Beacon.Fire");
+        c_lsp_add_include(&ctx, "mirror.h", "test.mirror");
+        ASSERT_NULL(c_lookup_member(&ctx, "test.caller.Beacon", "Fire"));
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
+/* Synthetic duplicate receiver candidates: include provenance, module
+ * boundaries, explicit namespace and insertion order must all be respected. */
+TEST(clsp_duplicate_receiver_include_selection) {
+    for (int reverse = 0; reverse < 2; reverse++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry reg;
+        cbm_registry_init(&reg, &arena);
+        const char *qns[] = {
+            "test.fixture_latch.FixtureLatch", "test.mirror.fixture_latch.FixtureLatch",
+            "test.fixture_latch_extra.FixtureLatch", "test.fixture_latch.North.FixtureLatch",
+            "test.fixture_latch.South.FixtureLatch"};
+        for (int n = 0; n < 5; n++) {
+            int i = reverse ? 4 - n : n;
+            CBMRegisteredType t = {0};
+            t.qualified_name = qns[i];
+            t.short_name = "FixtureLatch";
+            cbm_registry_add_type(&reg, t);
+            CBMRegisteredFunc f = {0};
+            f.qualified_name = cbm_arena_sprintf(&arena, "%s.Acquire", qns[i]);
+            f.receiver_type = qns[i];
+            f.short_name = "Acquire";
+            cbm_registry_add_func(&reg, f);
+        }
+        cbm_registry_finalize(&reg);
+        CLSPContext ctx;
+        CBMResolvedCallArray out = {0};
+        c_lsp_init(&ctx, &arena, "", 0, &reg, "test.caller", true, &out);
+        ASSERT_NULL(c_lookup_member(&ctx, "test.caller.FixtureLatch", "Acquire"));
+        c_lsp_add_include(&ctx, "fixture_latch.h", "test.fixture_latch");
+        const CBMRegisteredFunc *f = c_lookup_member(&ctx, "North.FixtureLatch", "Acquire");
+        ASSERT_NOT_NULL(f);
+        ASSERT_STR_EQ(f->qualified_name, "test.fixture_latch.North.FixtureLatch.Acquire");
+        f = c_lookup_member(&ctx, "test.caller.South.FixtureLatch", "Acquire");
+        ASSERT_NOT_NULL(f);
+        ASSERT_STR_EQ(f->qualified_name, "test.fixture_latch.South.FixtureLatch.Acquire");
+        ASSERT_NULL(c_lookup_member(&ctx, "Absent.FixtureLatch", "Acquire"));
+        // Directly declared FixtureLatch outranks namespaced homonyms and the
+        // textual-prefix sibling fixture_latch_extra.
+        f = c_lookup_member(&ctx, "test.caller.FixtureLatch", "Acquire");
+        ASSERT_NOT_NULL(f);
+        ASSERT_STR_EQ(f->qualified_name, "test.fixture_latch.FixtureLatch.Acquire");
+        c_lsp_add_include(&ctx, "mirror/fixture_latch.h", "test.mirror.fixture_latch");
+        ASSERT_NULL(c_lookup_member(&ctx, "test.caller.FixtureLatch", "Acquire"));
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
 SUITE(c_lsp) {
+    RUN_TEST(clsp_duplicate_receiver_include_selection);
+    RUN_TEST(clsp_duplicate_receiver_member_candidates);
     RUN_TEST(clsp_issue1527_depth_failure_reports_all_entry_points);
     RUN_TEST(scope_issue1527_recovery_sizes_from_all_bindings);
     RUN_TEST(clsp_issue1527_memo_allocation_failure_is_reported);
