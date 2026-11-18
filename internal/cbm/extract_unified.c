@@ -1139,6 +1139,14 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (configured_qn) {
         return configured_qn;
     }
+    /* The preprocessed view of a C/C++ file: a body whose lines are a raw
+     * GoogleTest definition's is that test, whatever its expanded head reads. */
+    if (ctx->pp_test_spans && strcmp(ts_node_type(node), "function_definition") == 0) {
+        const char *raw_test = cbm_test_span_owner_qn(ctx->pp_test_spans, node);
+        if (raw_test) {
+            return raw_test;
+        }
+    }
 
     /* C# local functions nested in a member have no graph node. Attribute calls
      * in them to the enclosing function, whose definition span contains the

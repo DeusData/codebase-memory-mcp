@@ -5769,6 +5769,11 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
             }
         }
     }
+    if (!func_qn && ctx->pp_test_spans) {
+        /* The preprocessed view: a raw GoogleTest definition's body is that
+         * test, whatever its expanded head reads (cbm_test_span_owner_qn). */
+        func_qn = cbm_test_span_owner_qn(ctx->pp_test_spans, func_node);
+    }
     if (!func_qn) {
         /* GoogleTest `TEST(Suite, Case)`: the definition is TEST_Suite_Case
          * (#1266), named by the same helper as the def walk and the call
@@ -6832,16 +6837,30 @@ static void c_add_type_indexed(CBMTypeRegistry *reg, CTypeFirstIndex *ix, CBMAre
     }
 }
 
+static bool c_lsp_file_run(CBMArena *arena, CBMFileResult *result, const char *source,
+                           int source_len, TSNode root, bool cpp_mode,
+                           CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
+                           const CBMTestSpanMap *pp_test_spans);
+
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin) {
-    (void)cbm_run_c_lsp_with_test_owners(arena, result, source, source_len, root,
-                                       cpp_mode, source_origin, NULL);
+                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
+                   const CBMTestSpanMap *pp_test_spans) {
+    (void)c_lsp_file_run(arena, result, source, source_len, root, cpp_mode, source_origin, NULL,
+                         pp_test_spans);
 }
 
-bool cbm_run_c_lsp_with_test_owners(
-    CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-    TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners) {
+bool cbm_run_c_lsp_with_test_owners(CBMArena *arena, CBMFileResult *result, const char *source,
+                                    int source_len, TSNode root, bool cpp_mode,
+                                    CBMSourceOrigin source_origin,
+                                    const CBMFileResult *test_owners) {
+    return c_lsp_file_run(arena, result, source, source_len, root, cpp_mode, source_origin,
+                          test_owners, NULL);
+}
+
+static bool c_lsp_file_run(CBMArena *arena, CBMFileResult *result, const char *source,
+                           int source_len, TSNode root, bool cpp_mode,
+                           CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
+                           const CBMTestSpanMap *pp_test_spans) {
     if ((test_owners && test_owners->has_test_definition_owners &&
          source_origin != CBM_SOURCE_ORIGIN_RAW) ||
         !cbm_test_definition_owners_match(test_owners, source, source_len, cpp_mode,
@@ -7030,6 +7049,7 @@ bool cbm_run_c_lsp_with_test_owners(
     ctx.source_origin = source_origin;
     ctx.test_definition_owners = test_owners;
     ctx.test_macro_names = cpp_mode && result->cpp_test_macro_names;
+    ctx.pp_test_spans = pp_test_spans;
     c_memo_test_stage(&ctx,
                       source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED ? "preprocessed" : "raw");
 

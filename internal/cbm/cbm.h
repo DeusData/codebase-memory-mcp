@@ -1062,6 +1062,26 @@ typedef struct {
 // Forward declaration: ObjectScript macro table (defined in macro_table.h).
 typedef struct CBMMacroTable CBMMacroTable;
 
+/* The raw line span of a GoogleTest definition the def walk named with
+ * cbm_cpp_test_macro_name, and its qualified name. */
+typedef struct {
+    uint32_t start_line;
+    uint32_t end_line;
+    const char *qualified_name;
+} CBMTestSpan;
+
+/* What the preprocessed second view of a C/C++ file needs to name a test body
+ * as the raw view did: the raw test definitions sorted by (start_line,
+ * end_line), and the preprocessor's 1-based map from expanded lines to raw
+ * lines (0 = no raw line) with the lines that belong to the file itself. */
+typedef struct {
+    const CBMTestSpan *spans;
+    int count;
+    const uint32_t *raw_line_by_line;
+    const uint8_t *in_main_file;
+    int line_count;
+} CBMTestSpanMap;
+
 // Method-return-type table for ObjectScript variable type inference. Populated
 // from definition nodes (method QN -> declared return type) so a later
 // `Set x = obj.Method()` can resolve x's class.
@@ -1149,6 +1169,14 @@ typedef struct {
     /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
      * allocated in `scratch`. */
     void *go_block_bindings;
+    /* C++/CUDA raw view: the GoogleTest definitions the def walk named
+     * (CBMTestSpan, in `scratch`), in walk order. */
+    CBMTestSpan *test_spans;
+    int test_span_count;
+    int test_span_cap;
+    /* The preprocessed second view only: the raw view's test definitions and
+     * the line map (cbm_test_span_owner_qn). NULL in every raw view. */
+    const CBMTestSpanMap *pp_test_spans;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1187,6 +1215,22 @@ char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNod
 /* The `enabled` argument above for a file of `language`: C++ or CUDA with the
  * gtest preset on (on when nothing is configured). */
 bool cbm_cpp_test_macro_names_on(CBMLanguage language, const cbm_test_declarations_t *declarations);
+/* The preprocessed view reads a head after macro expansion and without its
+ * comments, so it can spell a test differently from the raw view (a project
+ * macro among the arguments, a project's own TEST macro). A function
+ * definition of that view whose first and last lines map to exactly one raw
+ * test definition's span (CBMTestSpanMap) is that test: its QN, else NULL and
+ * the caller names the body as usual. Two raw tests on one line span share it
+ * and get NULL. Used by the call scope, the enclosing-function helper and the
+ * C/C++ engine, the three places that name a caller. Constant work plus a
+ * binary search over the file's tests. */
+const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Steps of cbm_test_span_owner_qn's searches plus spans indexed, since reset. */
+void cbm_test_span_test_reset(void);
+uint64_t cbm_test_span_test_work(void);
+void cbm_test_span_test_count(uint64_t work);
+#endif
 
 // --- Public API ---
 

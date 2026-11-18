@@ -35426,6 +35426,118 @@ TEST(pipeline_cpp_gtest_body_calls_start_at_test_node) {
     PASS();
 }
 
+/* The reviewer's shapes (ctest-review finding 5): the preprocessed second view
+ * of a file spells the head differently from the raw view (a project macro in
+ * the arguments, comments, a project's own TEST macro). Each call written in
+ * such a body has one source, the test's node; the File keeps none. */
+static void write_cpp_gtest_pp_view_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "lib/sites.h",
+                    "int s01();\nint s02();\nint s09();\nint s10();\nint s11();\nint s17();\n");
+    write_temp_file(
+        tmp, "lib/sites.cc",
+        "#include \"sites.h\"\n"
+        "int s01() { return 1; }\nint s02() { return 2; }\nint s09() { return 9; }\n"
+        "int s10() { return 10; }\nint s11() { return 11; }\nint s17() { return 17; }\n");
+    write_temp_file(tmp, "test/misc_test.cc",
+                    "#include \"../lib/sites.h\"\n"
+                    "#define MY_SUITE RealSuite\n"
+                    "TEST(MY_SUITE, ViaMacro) { s09(); }\n"
+                    "TEST(CommentSuite, /* why */ Commented) { s10(); }\n"
+                    "TEST(LineCommentSuite,  // why\n"
+                    "     LineCommented) {\n"
+                    "  s11();\n"
+                    "}\n"
+                    "TEST(BlockSuite /* c */, Commented) { s17(); }\n");
+    write_temp_file(tmp, "test/own_test_macro.cc",
+                    "#include \"../lib/sites.h\"\n"
+                    "#define TEST(name) void test_##name()\n"
+                    "TEST(alpha) { s01(); }\n"
+                    "TEST(beta) { s02(); }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.cc", i);
+        snprintf(body, sizeof(body), "int filler%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int assert_cpp_gtest_pp_view_edges(cbm_store_t *s, const char *project, bool parallel) {
+    static const struct {
+        const char *file;
+        const char *test;
+        const char *callee;
+    } rows[] = {
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_MY_SUITE_ViaMacro", ".lib.sites.s09"},
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_CommentSuite_Commented",
+         ".lib.sites.s10"},
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_LineCommentSuite_LineCommented",
+         ".lib.sites.s11"},
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_BlockSuite_Commented",
+         ".lib.sites.s17"},
+        {".test.own_test_macro.cc.__file__", ".test.own_test_macro.TEST_alpha", ".lib.sites.s01"},
+        {".test.own_test_macro.cc.__file__", ".test.own_test_macro.TEST_beta", ".lib.sites.s02"},
+    };
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        int defines = go_edges_between(s, project, "DEFINES", rows[i].file, rows[i].test);
+        int from_test = go_calls_between(s, project, rows[i].test, rows[i].callee, NULL);
+        int from_file = go_calls_between(s, project, rows[i].file, rows[i].callee, NULL);
+        if (defines != 1 || from_test != 1 || from_file != 0) {
+            printf("  [%s] %s -> %s: DEFINES %d, from the test %d, from the File %d\n",
+                   parallel ? "parallel" : "sequential", rows[i].test, rows[i].callee, defines,
+                   from_test, from_file);
+            bad++;
+        }
+    }
+    ASSERT_EQ(bad, 0); /* RED on cbm-ctest-caller-c2a10ffd: the File keeps a second edge */
+    return 0;
+}
+
+TEST(pipeline_cpp_gtest_preprocessed_view_one_source) {
+    int runs[2] = {-1, -1};
+    int verdicts[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_ppview_XXXXXX");
+        if (!cbm_mkdtemp(tmp)) {
+            FAIL("tmpdir");
+        }
+        write_cpp_gtest_pp_view_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/gtest_ppview.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run == 0 ? cbm_store_open_path(db_path) : NULL;
+        int verdict =
+            s ? assert_cpp_gtest_pp_view_edges(s, cbm_pipeline_project_name(p), parallel) : -1;
+        if (s) {
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+        runs[mode] = run;
+        verdicts[mode] = verdict;
+    }
+    ASSERT_EQ(runs[0], 0);
+    ASSERT_EQ(runs[1], 0);
+    ASSERT_EQ(verdicts[0], 0); /* sequential resolver */
+    ASSERT_EQ(verdicts[1], 0); /* parallel resolver */
+    PASS();
+}
+
 /* Every node (qualified name, label) and every edge (type, source QN, target
  * QN, properties by key) of a store, one row each, sorted. Node ids and the
  * index bookkeeping differ between two stores; the graph content must not. */
@@ -36311,6 +36423,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153);
     RUN_TEST(pipeline_cpp_gtest_body_calls_start_at_test_node);
     RUN_TEST(pipeline_cpp_gtest_caller_incremental_matches_full);
+    RUN_TEST(pipeline_cpp_gtest_preprocessed_view_one_source);
     RUN_TEST(pipeline_calls_args_overlong_argument_stops_cleanly);
 }
 

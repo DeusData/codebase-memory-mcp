@@ -16,6 +16,9 @@
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <limits.h>          // INT_MAX
+#ifdef CBM_ENABLE_TEST_SEAMS
+#include <stdatomic.h> // cbm_test_span_test_work
+#endif
 #include <stdint.h>          // uint32_t, SIZE_MAX
 #include <stdio.h>           // snprintf (ObjectScript storage/trigger sidecars)
 #include <stdlib.h>          // malloc/free (child-collection scratch)
@@ -5981,31 +5984,72 @@ char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNod
     return resolve_cpp_test_macro_name(a, name, func_node, source);
 }
 
-static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
-                                         const char *source) {
+/* An argument's text without comments and without the blanks around it, in
+ * place: `Suite /\* c *\/` reads `Suite`, as the compiler (and the second,
+ * preprocessed view) sees it. */
+static char *cpp_test_arg_text(char *text) {
+    if (!text) {
+        return NULL;
+    }
+    char *w = text;
+    for (const char *r = text; *r;) {
+        if (r[0] == '/' && r[1] == '*') {
+            const char *close = strstr(r + 2, "*/");
+            r = close ? close + 2 : r + strlen(r);
+            *w++ = ' ';
+        } else if (r[0] == '/' && r[1] == '/') {
+            while (*r && *r != '\n') {
+                r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+    while (w > text && (w[-1] == ' ' || w[-1] == '\t' || w[-1] == '\n' || w[-1] == '\r')) {
+        *--w = '\0';
+    }
+    char *start = text;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') {
+        start++;
+    }
+    return start;
+}
+
+/* The first two arguments of a GoogleTest-style head `MACRO(a, b) {`: the text
+ * of each named parameter, its type node where the grammar gives one (`Suite`
+ * parses as a parameter whose type is that name). A comment in the head is an
+ * extra of the grammar, not an argument. Returns how many it found, at most
+ * two. */
+static int cpp_test_macro_args(CBMArena *a, TSNode node, const char *source, const char *args[2]) {
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
     if (ts_node_is_null(params)) {
         params = find_c_params(node);
     }
     if (ts_node_is_null(params)) {
-        return NULL;
+        return 0;
     }
-
-    const char *args[2] = {NULL, NULL};
     int count = 0;
     uint32_t nc = ts_node_named_child_count(params);
     for (uint32_t i = 0; i < nc && count < 2; i++) {
         TSNode child = ts_node_named_child(params, i);
-        if (ts_node_is_null(child)) {
+        if (ts_node_is_null(child) || strcmp(ts_node_type(child), "comment") == 0) {
             continue;
         }
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        char *text = cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source);
+        char *text = cpp_test_arg_text(
+            cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source));
         if (text && text[0]) {
             args[count++] = text;
         }
     }
+    return count;
+}
 
+static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
+                                         const char *source) {
+    const char *args[2] = {NULL, NULL};
+    int count = cpp_test_macro_args(a, node, source, args);
     if (count == 2) {
         return cbm_arena_sprintf(a, "%s_%s_%s", macro, args[0], args[1]);
     }
@@ -6013,6 +6057,83 @@ static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode 
         return cbm_arena_sprintf(a, "%s_%s", macro, args[0]);
     }
     return NULL;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_test_span_work = 0;
+void cbm_test_span_test_reset(void) {
+    atomic_store_explicit(&g_test_span_work, 0, memory_order_relaxed);
+}
+uint64_t cbm_test_span_test_work(void) {
+    return atomic_load_explicit(&g_test_span_work, memory_order_relaxed);
+}
+void cbm_test_span_test_count(uint64_t work) {
+    atomic_fetch_add_explicit(&g_test_span_work, work, memory_order_relaxed);
+}
+#define TEST_SPAN_WORK(n) cbm_test_span_test_count(n)
+#else
+#define TEST_SPAN_WORK(n) ((void)0)
+#endif
+
+static int test_span_cmp(const CBMTestSpan *s, uint32_t start, uint32_t end) {
+    if (s->start_line != start) {
+        return s->start_line < start ? -1 : 1;
+    }
+    return s->end_line == end ? 0 : (s->end_line < end ? -1 : 1);
+}
+
+const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function) {
+    if (!map || map->count <= 0 || !map->raw_line_by_line || !map->in_main_file ||
+        ts_node_is_null(function)) {
+        return NULL;
+    }
+    uint32_t first = ts_node_start_point(function).row + 1;
+    uint32_t last = ts_node_end_point(function).row + 1;
+    if (last < first || last > (uint32_t)map->line_count || !map->in_main_file[first] ||
+        !map->in_main_file[last]) {
+        return NULL;
+    }
+    uint32_t start = map->raw_line_by_line[first];
+    uint32_t end = map->raw_line_by_line[last];
+    if (!start || !end) {
+        return NULL;
+    }
+    int lo = 0;
+    int hi = map->count;
+    while (lo < hi) { /* the first span not below (start, end) */
+        int mid = lo + (hi - lo) / 2;
+        TEST_SPAN_WORK(1);
+        if (test_span_cmp(&map->spans[mid], start, end) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= map->count || test_span_cmp(&map->spans[lo], start, end) != 0 ||
+        (lo + 1 < map->count && test_span_cmp(&map->spans[lo + 1], start, end) == 0)) {
+        return NULL; /* none, or two raw tests on one span */
+    }
+    return map->spans[lo].qualified_name;
+}
+
+/* Record a raw test definition's span for the preprocessed view (in scratch;
+ * amortised constant work per test). */
+static void record_test_span(CBMExtractCtx *ctx, const CBMDefinition *def) {
+    if (ctx->test_span_count == ctx->test_span_cap) {
+        int cap = ctx->test_span_cap ? ctx->test_span_cap * 2 : 16;
+        CBMArena *scratch = ctx->scratch ? ctx->scratch : ctx->arena;
+        CBMTestSpan *grown = cbm_arena_alloc(scratch, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return; /* the second view then names this body from its own head */
+        }
+        if (ctx->test_span_count) {
+            memcpy(grown, ctx->test_spans, (size_t)ctx->test_span_count * sizeof(*grown));
+        }
+        ctx->test_spans = grown;
+        ctx->test_span_cap = cap;
+    }
+    ctx->test_spans[ctx->test_span_count++] =
+        (CBMTestSpan){def->start_line, def->end_line, def->qualified_name};
 }
 
 /* Configured macro definitions are interpreted only in their raw source.
@@ -7345,6 +7466,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_defs_push(&ctx->result->defs, a, def);
+    if (is_gtest && ctx->test_declarations_raw_source && def.qualified_name) {
+        record_test_span(ctx, &def);
+    }
     if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
         push_make_rule_targets(ctx, node, &def);
     }

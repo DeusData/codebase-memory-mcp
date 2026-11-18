@@ -83,6 +83,9 @@ typedef struct {
     CBMResolvedCallArray *resolved_calls;
     CBMSourceOrigin source_origin; // source buffer represented by emitted occurrence spans
     const CBMFileResult *test_definition_owners; /* borrowed, prevalidated raw source identity */
+    /* The preprocessed per-file run only: the raw view's GoogleTest spans and
+     * the line map (cbm_test_span_owner_qn). Borrowed; NULL otherwise. */
+    const CBMTestSpanMap *pp_test_spans;
     int test_owner_seen_count;
     bool test_owner_error;
 
@@ -177,8 +180,11 @@ const CBMType *c_simplify_type(CLSPContext *ctx, const CBMType *t, bool unwrap_p
 // --- Entry points ---
 
 // Single-file LSP: build registry from file defs + stdlib, run resolution.
+// pp_test_spans: for the preprocessed view, the raw GoogleTest spans and line
+// map (cbm_test_span_owner_qn); NULL otherwise.
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin);
+                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
+                   const CBMTestSpanMap *pp_test_spans);
 
 // A memo allocation/capacity failure is an explicit incomplete-refinement error.
 #define CBM_C_LSP_DEPTH_ERROR "C/C++ expression recursion depth limit exceeded"
