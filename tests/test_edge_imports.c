@@ -139,6 +139,28 @@ static cbm_store_t *ei_index_files(EILangProj *lp, const EILangFile *files, int 
     return cbm_store_open_path(lp->dbpath);
 }
 
+/* Rewrite one already-indexed fixture file and index the same repository
+ * again, closing `store` first. One changed file and nothing new keeps the
+ * second run on an incremental route. Returns the reopened store. */
+static cbm_store_t *ei_rewrite_and_reindex(EILangProj *lp, cbm_store_t *store,
+                                           const EILangFile *file) {
+    cbm_store_close(store);
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", lp->tmpdir, file->name);
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return NULL;
+    fputs(file->content, f);
+    fclose(f);
+
+    char args[700];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
+    char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
+    if (resp)
+        free(resp);
+    return cbm_store_open_path(lp->dbpath);
+}
+
 static char *ei_slurp_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -273,7 +295,7 @@ typedef struct {
 } EIFileEdgeExpect;
 
 static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFileEdgeExpect *want,
-                               int nwant, int expected_count) {
+                               int nwant, int expected_count, const char *target_label) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
     int ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == expected_count;
@@ -293,7 +315,14 @@ static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFile
                 cbm_node_t target;
                 memset(&target, 0, sizeof(target));
                 if (cbm_store_find_node_by_id(store, edges[j].target_id, &target) == CBM_STORE_OK) {
-                    found = target.file_path && strcmp(target.file_path, want[i].target) == 0;
+                    found = target.file_path && strcmp(target.file_path, want[i].target) == 0 &&
+                            (!target_label ||
+                             (target.label && strcmp(target.label, target_label) == 0));
+                    if (!found && target_label && edge_count == 1) {
+                        fprintf(stderr, "  [IMPORTS] %s -> %s (%s), expected %s (%s)\n",
+                                want[i].importer, target.file_path ? target.file_path : "",
+                                target.label ? target.label : "", want[i].target, target_label);
+                    }
                     cbm_node_free_fields(&target);
                 }
                 if (found) {
@@ -359,7 +388,7 @@ TEST(ei_relative_astro_css_imports_issue2558) {
     };
 
     ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
-                                    (int)(sizeof(want) / sizeof(want[0])), 12));
+                                    (int)(sizeof(want) / sizeof(want[0])), 12, NULL));
     PASS();
 }
 
@@ -386,7 +415,7 @@ TEST(ei_nix_parent_relative_import_issue2797) {
     };
 
     ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
-                                    (int)(sizeof(want) / sizeof(want[0])), 3));
+                                    (int)(sizeof(want) / sizeof(want[0])), 3, NULL));
     PASS();
 }
 
@@ -404,7 +433,7 @@ TEST(ei_thrift_parent_relative_import_issue2797) {
     };
 
     ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
-                                    (int)(sizeof(want) / sizeof(want[0])), 1));
+                                    (int)(sizeof(want) / sizeof(want[0])), 1, NULL));
     PASS();
 }
 
@@ -594,6 +623,192 @@ TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682) {
     ASSERT_TRUE(saw_type);
     ASSERT_TRUE(helper_target_ok);
     ASSERT_TRUE(type_target_ok);
+    PASS();
+}
+
+/* #514 follow-up: the tsconfig `paths` branch must preserve dotted basenames
+ * like the relative branch (#1682). It stripped `.service` from
+ * `@app/cats/cat.service`, missed the module, and bound the import by last
+ * segment to an unrelated node. */
+TEST(ei_typescript_dotted_alias_import_targets_source_module) {
+    static const char *service_path = "apps/api/src/cats/cat.service.ts";
+    static const char *controller_path = "apps/api/src/cats/cat.controller.ts";
+    static const EILangFile f[] = {
+        {"apps/api/tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{\"@app/*\":[\"src/*\"]}}}\n"},
+        {"apps/api/src/cats/cat.service.ts", "export class CatService {\n"
+                                             "  findAll(): string[] {\n"
+                                             "    return [\"a\"];\n"
+                                             "  }\n"
+                                             "}\n"},
+        {"apps/api/src/cats/cat.controller.ts",
+         "import { CatService } from \"@app/cats/cat.service\";\n"
+         "export class CatController {\n"
+         "  constructor(private readonly catService: CatService) {}\n"
+         "}\n"},
+        {"apps/api/src/other/service.ts", "export function service(): number {\n"
+                                          "  return 1;\n"
+                                          "}\n"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t controller_id = ei_node_id_for_file_label(store, lp.project, controller_path, "File");
+    ASSERT_GT(controller_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, controller_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+
+    bool saw_import = false;
+    bool target_ok = false;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        if (!strstr(props, "\"local_name\":\"CatService\"")) {
+            continue;
+        }
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        saw_import = true;
+        target_ok = target->file_path && strcmp(target->file_path, service_path) == 0 &&
+                    target->label && strcmp(target->label, "Module") == 0;
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+
+    ASSERT_TRUE(saw_import);
+    ASSERT_TRUE(target_ok);
+    PASS();
+}
+
+/* An import that spells the module extension of a dotted name gets that
+ * file, not the shorter file beside it: ~/tokens.css.ts is tokens.css.ts
+ * (never tokens.css), and ~/worker.task.mjs.ts is worker.task.mjs.ts (never
+ * worker.task.mjs). */
+TEST(ei_typescript_alias_import_spelled_ext_on_dotted_name) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/tokens.css", ":root { --gap: 4px; }\n"},
+        {"src/tokens.css.ts", "export const tokens = { gap: 4 };\n"},
+        {"src/worker.task.mjs", "export function run() {}\n"},
+        {"src/worker.task.mjs.ts", "export function typedRun(): void {}\n"},
+        {"src/a.ts", "import { tokens } from '~/tokens.css.ts';\nexport const a = tokens;\n"},
+        {"src/b.ts", "import { typedRun } from '~/worker.task.mjs.ts';\nexport const b = typedRun;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/a.ts", "src/tokens.css.ts"},
+        {"src/b.ts", "src/worker.task.mjs.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 2, "Module"));
+    PASS();
+}
+
+#ifndef _WIN32
+/* A `?` in a folder name is part of the path, not a bundler query: the alias
+ * import ~/dir?name/file names src/dir?name/file.ts, never src/dir.ts.
+ * Windows file names cannot hold `?`. */
+TEST(ei_typescript_alias_import_keeps_question_mark_folder) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/dir?name/file.ts", "export const wanted = 1;\n"},
+        {"src/dir.ts", "export const decoy = 2;\n"},
+        {"src/user.ts", "import { wanted } from '~/dir?name/file';\n"
+                        "export const u = wanted;\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/user.ts", "src/dir?name/file.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 1, "Module"));
+    PASS();
+}
+#endif
+
+/* The alias branch keeps a dotted basename, but an alias import of a non-JS
+ * file still names that file: `~/styles/globals.css` and the bundler query
+ * form `~/styles.css?url` reach the CSS modules, not src/styles/css.ts or the
+ * unrelated `css` function a last-segment guess finds. A dotted name that is
+ * itself a module stays whole: theme.css.ts imported as `~/theme.css` or
+ * `~/theme.css.ts`, and `~/cats/cat.service`. Explicit .mjs/.cjs/.mts/.cts/.json imports
+ * drop their module extension even beside a dotted TypeScript module. The
+ * reverse import ~/styles/css still names src/styles/css.ts, and ~/cat.service
+ * must keep its basename even with src/cat/service.ts alongside it. A file
+ * that exists under the imported name wins over a dotted module beside it
+ * (tokens.css over tokens.css.ts), and a #fragment does not hide the
+ * extension (~/tokens.css#frag from another folder, with unrelated functions
+ * named like its segments). */
+TEST(ei_typescript_alias_import_non_js_file_targets_its_module) {
+    static const EILangFile f[] = {
+        {"tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"~/*\":[\"src/*\"]}}}\n"},
+        {"src/styles/globals.css", "body { margin: 0; }\n"},
+        {"src/styles.css", "html { color: black; }\n"},
+        {"src/styles/css.ts", "export const decoy = 1;\n"},
+        {"src/cat.service.ts", "export const cat = 1;\n"},
+        {"src/cat/service.ts", "export const decoy = 2;\n"},
+        {"src/theme.css.ts", "export const vars = { gap: 4 };\n"},
+        {"src/worker.task.mjs", "export function run() {}\n"},
+        {"src/worker.task.mjs.ts", "export function other() {}\n"},
+        {"src/helper.task.cjs", "exports.helper = function() {};\n"},
+        {"src/typed.task.mts", "export function typed() {}\n"},
+        {"src/compat.task.cts", "export function compat() {}\n"},
+        {"src/config.task.json", "{\"gap\":4}\n"},
+        {"src/cats/cat.service.ts", "export class CatService {\n"
+                                    "  findAll(): string[] { return []; }\n"
+                                    "}\n"},
+        {"src/lib/highlighter.ts", "export function css(): number { return 1; }\n"
+                                   "export function service(): number { return 2; }\n"},
+        {"src/app.ts", "import '~/styles/globals.css';\n"
+                       "import appCss from '~/styles.css?url';\n"
+                       "import { run } from '~/worker.task.mjs';\n"
+                       "import { helper } from '~/helper.task.cjs';\n"
+                       "import { typed } from '~/typed.task.mts';\n"
+                       "import { compat } from '~/compat.task.cts';\n"
+                       "import config from '~/config.task.json';\n"
+                       "import { CatService } from '~/cats/cat.service';\n"
+                       "export function app(): unknown[] { return [appCss, CatService]; }\n"},
+        {"src/panel.ts", "import { vars } from '~/theme.css';\n"
+                         "export function panel(): number { return vars.gap; }\n"},
+        {"src/card.ts", "import { vars } from '~/theme.css.ts';\n"
+                        "export function card(): number { return vars.gap; }\n"},
+        {"src/plain.ts", "import appCss from '~/styles.css';\n"},
+        {"src/nested.ts", "import { decoy } from '~/styles/css';\n"},
+        {"src/cat-user.ts", "import { cat } from '~/cat.service';\n"},
+        {"src/tokens.css", "a { gap: 4px; }\n"},
+        {"src/tokens.css.ts", "export const tokens = 4;\n"},
+        {"src/tokens-plain.ts", "import tokensCss from '~/tokens.css';\n"},
+        {"src/tokens-url.ts", "import tokensUrl from '~/tokens.css?url';\n"},
+        {"aaa/decoy.ts", "export function tokens(): number { return 1; }\n"
+                         "export function frag(): number { return 2; }\n"},
+        {"apps/frag.ts", "import tokensFrag from '~/tokens.css#frag';\n"},
+        {"src/lib/worker.ts", "export const w = 1;\n"},
+        {"src/worker-user.ts", "import W from '~/lib/worker.ts?worker';\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/app.ts", "src/styles/globals.css"},    {"src/app.ts", "src/styles.css"},
+        {"src/app.ts", "src/cats/cat.service.ts"},   {"src/app.ts", "src/worker.task.mjs"},
+        {"src/app.ts", "src/helper.task.cjs"},       {"src/app.ts", "src/typed.task.mts"},
+        {"src/app.ts", "src/compat.task.cts"},       {"src/app.ts", "src/config.task.json"},
+        {"src/panel.ts", "src/theme.css.ts"},        {"src/card.ts", "src/theme.css.ts"},
+        {"src/plain.ts", "src/styles.css"},          {"src/nested.ts", "src/styles/css.ts"},
+        {"src/cat-user.ts", "src/cat.service.ts"},   {"src/tokens-plain.ts", "src/tokens.css"},
+        {"src/tokens-url.ts", "src/tokens.css"},     {"apps/frag.ts", "src/tokens.css"},
+        {"src/worker-user.ts", "src/lib/worker.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 17, "Module"));
     PASS();
 }
 
@@ -1118,6 +1333,433 @@ TEST(ei_cpp_header_include_targets_header_file) {
 
     ASSERT_TRUE(saw_node_header);
     ASSERT_TRUE(saw_system_header);
+
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
+/* Scala packages do not have to mirror the repository path. Concrete imports
+ * must resolve to the symbol declared in the source package, while package
+ * wildcards may only resolve inside that exact package. External wildcards
+ * must fail closed instead of selecting an unrelated same-name node. */
+TEST(ei_scala_package_imports_ignore_physical_layout) {
+    static const EILangFile f[] = {
+        {"modules/model/src/odd/layout/Target.scala",
+         "package com.example.model\nobject Target { def build(): Int = 1 }\n"},
+        {"modules/model/src/another/layout/Aux.scala",
+         "package com.example.model\nobject Aux { def value: Int = 2 }\n"},
+        {"modules/decoy/src/App.scala", "package unrelated\nobject App\n"},
+        {"modules/client/src/Consumer.scala",
+         "package com.example.client\n"
+         "import com.example.model.Target\n"
+         "import com.example.model._\n"
+         "import outside.library._\n"
+         "object Consumer { def run(): Int = Target.build() }\n"}};
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    int64_t source_id =
+        ei_node_id_for_file_label(store, lp.project, "modules/client/src/Consumer.scala", "File");
+    ASSERT_GT(source_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 2);
+
+    bool saw_target_symbol = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        ASSERT_NOT_NULL(target->file_path);
+        ASSERT_TRUE(strstr(target->file_path, "modules/model/src/") == target->file_path);
+        if (target->name && strcmp(target->name, "Target") == 0 &&
+            strstr(target->file_path, "Target.scala") != NULL) {
+            saw_target_symbol = true;
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_TRUE(saw_target_symbol);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
+/* Scala package clauses feed only the Scala resolver. A Java import whose
+ * package is external must not bind to a Scala file that merely declares a
+ * shared prefix of that package. */
+TEST(ei_java_import_ignores_scala_package_prefix) {
+    static const EILangFile f[] = {
+        {"core/src/main/scala/com/acme/package.scala",
+         "package com.acme\npackage object core { val marker: Int = 1 }\n"},
+        {"client/src/main/java/com/acme/client/Consumer.java",
+         "package com.acme.client;\n"
+         "import com.acme.util.Future;\n"
+         "public class Consumer { Future pending; }\n"}};
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    int64_t source_id = ei_node_id_for_file_label(
+        store, lp.project, "client/src/main/java/com/acme/client/Consumer.java", "File");
+    ASSERT_GT(source_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 0);
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
+/* Index `files`, return the IMPORTS edges leaving `source_file` and, when
+ * exactly one is expected, the name and file of its target. */
+static int ei_scala_single_import_target(const EILangFile *files, int nfiles,
+                                         const char *source_file, char *target_name, size_t name_sz,
+                                         char *target_file, size_t file_sz) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    if (!store) {
+        return -1;
+    }
+    int64_t source_id = ei_node_id_for_file_label(store, lp.project, source_file, "File");
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (source_id <= 0 || cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges,
+                                                              &edge_count) != CBM_STORE_OK) {
+        ei_cleanup(&lp, store);
+        return -1;
+    }
+    if (edge_count == 1) {
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        if (target &&
+            cbm_store_find_node_by_id(store, edges[0].target_id, target) == CBM_STORE_OK) {
+            snprintf(target_name, name_sz, "%s", target->name ? target->name : "");
+            snprintf(target_file, file_sz, "%s", target->file_path ? target->file_path : "");
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+    return edge_count;
+}
+
+/* The most common mixed-package case: a Scala file imports a Java class that
+ * lives in the same source package but a different source root. */
+TEST(ei_scala_imports_java_class_from_mixed_package) {
+    static const EILangFile f[] = {
+        {"core/src/main/java/com/acme/core/Codec.java",
+         "package com.acme.core;\npublic class Codec { public static int size() { return 1; } }\n"},
+        {"core/src/main/scala/com/acme/core/Util.scala", "package com.acme.core\nobject Util\n"},
+        {"client/src/main/scala/com/acme/client/Consumer.scala",
+         "package com.acme.client\n"
+         "import com.acme.core.Codec\n"
+         "object Consumer { def run(): Int = Codec.size() }\n"}};
+    char name[64] = "";
+    char file[256] = "";
+    ASSERT_EQ(ei_scala_single_import_target(f, 3,
+                                            "client/src/main/scala/com/acme/client/Consumer.scala",
+                                            name, sizeof(name), file, sizeof(file)),
+              1);
+    ASSERT_STR_EQ(name, "Codec");
+    ASSERT_TRUE(strstr(file, "Codec.java") != NULL);
+    PASS();
+}
+
+/* A package declared by both Java and Scala files: a Java import still binds
+ * the Java declaring file exactly as on main, never a Scala sibling. */
+TEST(ei_java_import_of_mixed_package_binds_java_file) {
+    static const EILangFile f[] = {{"a/src/main/scala/com/acme/shared/Helper.scala",
+                                    "package com.acme.shared\nobject Helper\n"},
+                                   {"b/src/main/java/com/acme/shared/Shared.java",
+                                    "package com.acme.shared;\npublic class Shared {}\n"},
+                                   {"c/src/main/java/com/acme/app/App.java",
+                                    "package com.acme.app;\nimport com.acme.shared.Shared;\npublic "
+                                    "class App { Shared s; }\n"}};
+    char name[64] = "";
+    char file[256] = "";
+    ASSERT_EQ(ei_scala_single_import_target(f, 3, "c/src/main/java/com/acme/app/App.java", name,
+                                            sizeof(name), file, sizeof(file)),
+              1);
+    ASSERT_TRUE(strstr(file, "Shared.java") != NULL);
+    PASS();
+}
+
+/* Two files of a split package both declare a top-level `Codec`: the import is
+ * ambiguous and must produce no edge rather than pick one. */
+TEST(ei_scala_split_package_same_name_top_level_is_ambiguous) {
+    static const EILangFile f[] = {{"main/src/com/acme/model/Codec.scala",
+                                    "package com.acme.model\nobject Codec { def a(): Int = 1 }\n"},
+                                   {"bench/src/com/acme/model/Codec.scala",
+                                    "package com.acme.model\nobject Codec { def b(): Int = 2 }\n"},
+                                   {"client/src/Consumer.scala",
+                                    "package com.acme.client\n"
+                                    "import com.acme.model.Codec\n"
+                                    "object Consumer { def run(): Int = Codec.a() }\n"}};
+    char name[64] = "";
+    char file[256] = "";
+    ASSERT_EQ(ei_scala_single_import_target(f, 3, "client/src/Consumer.scala", name, sizeof(name),
+                                            file, sizeof(file)),
+              0);
+    PASS();
+}
+
+/* `import pkg.Name` matches only a top-level Name. A nested object of the same
+ * name neither becomes the target nor makes the real top-level one ambiguous. */
+TEST(ei_scala_import_ignores_nested_same_name) {
+    static const EILangFile f[] = {
+        {"model/src/Codec.scala", "package com.acme.model\nobject Codec { def a(): Int = 1 }\n"},
+        {"model/src/Outer.scala",
+         "package com.acme.model\nobject Outer { object Codec { def b(): Int = 2 } }\n"},
+        {"client/src/Consumer.scala", "package com.acme.client\n"
+                                      "import com.acme.model.Codec\n"
+                                      "object Consumer { def run(): Int = Codec.a() }\n"}};
+    char name[64] = "";
+    char file[256] = "";
+    ASSERT_EQ(ei_scala_single_import_target(f, 3, "client/src/Consumer.scala", name, sizeof(name),
+                                            file, sizeof(file)),
+              1);
+    ASSERT_STR_EQ(name, "Codec");
+    ASSERT_TRUE(strstr(file, "model/src/Codec.scala") != NULL);
+    PASS();
+}
+
+/* `import pkg.Owner.member` binds the member under the owner's QN. When the
+ * member does not exist the import fails closed: no IMPORTS edge, and the bare
+ * `missing()` call must not become a CALLS edge to the `Config` class. */
+TEST(ei_scala_unresolvable_member_import_yields_no_owner_edge) {
+    static const EILangFile f[] = {
+        {"model/src/Config.scala",
+         "package com.acme.model\nobject Config { def load(): Int = 1 }\n"},
+        {"client/src/Loader.scala", "package com.acme.client\n"
+                                    "import com.acme.model.Config.load\n"
+                                    "object Loader { def run(): Int = load() }\n"},
+        {"client/src/Consumer.scala", "package com.acme.client\n"
+                                      "import com.acme.model.Config.missing\n"
+                                      "object Consumer { def run(): Int = missing() }\n"}};
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 3);
+    ASSERT_NOT_NULL(store);
+
+    int64_t loader_id =
+        ei_node_id_for_file_label(store, lp.project, "client/src/Loader.scala", "File");
+    ASSERT_GT(loader_id, 0);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, loader_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 1);
+    cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(cbm_store_find_node_by_id(store, edges[0].target_id, target), CBM_STORE_OK);
+    ASSERT_STR_EQ(target->name, "load");
+    cbm_store_free_nodes(target, 1);
+    cbm_store_free_edges(edges, edge_count);
+
+    int64_t consumer_id =
+        ei_node_id_for_file_label(store, lp.project, "client/src/Consumer.scala", "File");
+    ASSERT_GT(consumer_id, 0);
+    edges = NULL;
+    edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, consumer_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 0);
+    cbm_store_free_edges(edges, edge_count);
+
+    cbm_node_t *configs = NULL;
+    int config_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "Config", &configs, &config_count),
+              CBM_STORE_OK);
+    ASSERT_GT(config_count, 0);
+    for (int i = 0; i < config_count; i++) {
+        cbm_edge_t *calls = NULL;
+        int call_count = 0;
+        ASSERT_EQ(
+            cbm_store_find_edges_by_target_type(store, configs[i].id, "CALLS", &calls, &call_count),
+            CBM_STORE_OK);
+        ASSERT_EQ(call_count, 0);
+        cbm_store_free_edges(calls, call_count);
+    }
+    cbm_store_free_nodes(configs, config_count);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
+/* Consecutive `package a` / `package b` clauses declare a.b. */
+TEST(ei_scala_chained_package_clauses_resolve) {
+    static const EILangFile f[] = {
+        {"model/src/Target.scala",
+         "package com.acme\npackage model\nobject Target { def build(): Int = 1 }\n"},
+        {"client/src/Consumer.scala", "package com.acme.client\n"
+                                      "import com.acme.model.Target\n"
+                                      "object Consumer { def run(): Int = Target.build() }\n"}};
+    char name[64] = "";
+    char file[256] = "";
+    ASSERT_EQ(ei_scala_single_import_target(f, 2, "client/src/Consumer.scala", name, sizeof(name),
+                                            file, sizeof(file)),
+              1);
+    ASSERT_STR_EQ(name, "Target");
+    ASSERT_TRUE(strstr(file, "Target.scala") != NULL);
+    PASS();
+}
+
+/* Java class QNs are directory-based (`Request` in Request.java is
+ * <dir>.Request), so its nested `Builder` sits one segment below the stem
+ * module QN. It is not a top-level symbol of the package and must neither
+ * bind `import pkg.Builder` nor make the real top-level Scala `Builder`
+ * ambiguous. */
+TEST(ei_scala_import_ignores_java_nested_type_of_same_name) {
+    static const EILangFile f[] = {
+        {"core/src/main/java/com/acme/core/Request.java",
+         "package com.acme.core;\n"
+         "public class Request {\n"
+         "  public static class Builder { public Request build() { return null; } }\n"
+         "}\n"},
+        {"core/src/main/scala/com/acme/core/Builder.scala",
+         "package com.acme.core\nobject Builder { def make(): Int = 1 }\n"},
+        {"client/src/Consumer.scala", "package com.acme.client\n"
+                                      "import com.acme.core.Builder\n"
+                                      "object Consumer { def run(): Int = Builder.make() }\n"}};
+    char name[64] = "";
+    char file[256] = "";
+    ASSERT_EQ(ei_scala_single_import_target(f, 3, "client/src/Consumer.scala", name, sizeof(name),
+                                            file, sizeof(file)),
+              1);
+    ASSERT_STR_EQ(name, "Builder");
+    ASSERT_TRUE(strstr(file, "Builder.scala") != NULL);
+    PASS();
+}
+
+/* The Scala IMPORTS of client/src/Consumer.scala in the incremental fixture
+ * below: exactly the symbol import of `Target` and the wildcard bound to the
+ * package's smallest declaring file, plus the `run() -> build()` CALLS edge
+ * the import map yields. */
+static int ei_scala_incr_consumer_edges_ok(cbm_store_t *store, const char *project) {
+    int64_t source_id =
+        ei_node_id_for_file_label(store, project, "client/src/Consumer.scala", "File");
+    if (source_id <= 0) {
+        fprintf(stderr, "  no File node for Consumer.scala\n");
+        return 0;
+    }
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return 0;
+    }
+    bool saw_target = false;
+    bool saw_wildcard = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        if (!target ||
+            cbm_store_find_node_by_id(store, edges[i].target_id, target) != CBM_STORE_OK) {
+            free(target);
+            continue;
+        }
+        if (target->name && strcmp(target->name, "Target") == 0 && target->file_path &&
+            strstr(target->file_path, "model/src/Target.scala")) {
+            saw_target = true;
+        } else if (target->label && strcmp(target->label, "File") == 0 && target->file_path &&
+                   strcmp(target->file_path, "model/src/Aux.scala") == 0) {
+            saw_wildcard = true;
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    if (edge_count != 2 || !saw_target || !saw_wildcard) {
+        fprintf(stderr, "  Consumer IMPORTS: count=%d target=%d wildcard=%d\n", edge_count,
+                saw_target, saw_wildcard);
+        return 0;
+    }
+
+    cbm_node_t *runs = NULL;
+    int run_count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, "run", &runs, &run_count) != CBM_STORE_OK) {
+        return 0;
+    }
+    bool saw_call = false;
+    for (int i = 0; i < run_count && !saw_call; i++) {
+        cbm_edge_t *calls = NULL;
+        int call_count = 0;
+        if (cbm_store_find_edges_by_source_type(store, runs[i].id, "CALLS", &calls, &call_count) !=
+            CBM_STORE_OK) {
+            continue;
+        }
+        for (int j = 0; j < call_count && !saw_call; j++) {
+            cbm_node_t *callee = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+            if (callee &&
+                cbm_store_find_node_by_id(store, calls[j].target_id, callee) == CBM_STORE_OK &&
+                callee->name && strcmp(callee->name, "build") == 0) {
+                saw_call = true;
+            }
+            if (callee) {
+                cbm_store_free_nodes(callee, 1);
+            }
+        }
+        cbm_store_free_edges(calls, call_count);
+    }
+    cbm_store_free_nodes(runs, run_count);
+    if (!saw_call) {
+        fprintf(stderr, "  no CALLS run -> build\n");
+    }
+    return saw_call;
+}
+
+/* Graph content must not depend on whether the last index was full or
+ * incremental. An incremental run hands the passes only the changed file, so
+ * the namespace map and the Scala index must be completed from the package
+ * clauses persisted for the unchanged files; otherwise the fail-closed Scala
+ * resolver drops every import into an unchanged package, and the CALLS built
+ * on them, until the next full index. Exercised on both incremental routes
+ * (closure repair, then the legacy partial fallback), each proven by the
+ * route probe so a silent fall-back to a full reindex cannot pass this. */
+TEST(ei_scala_incremental_reindex_keeps_imports_into_unchanged_packages) {
+    static const EILangFile f[] = {
+        {"model/src/Target.scala",
+         "package com.acme.model\nobject Target { def build(): Int = 1 }\n"},
+        {"model/src/Aux.scala", "package com.acme.model\nobject Aux { def value: Int = 2 }\n"},
+        {"client/src/Consumer.scala", "package com.acme.client\n"
+                                      "import com.acme.model.Target\n"
+                                      "import com.acme.model._\n"
+                                      "object Consumer { def run(): Int = Target.build() }\n"}};
+    /* Body-only edits: a new definition name makes the closure route decline
+     * (another file might reference it), which would fall back to a full
+     * reindex and void the route proof below. */
+    static const EILangFile edit1 = {"client/src/Consumer.scala",
+                                     "package com.acme.client\n"
+                                     "import com.acme.model.Target\n"
+                                     "import com.acme.model._\n"
+                                     "object Consumer { def run(): Int = Target.build() + 1 }\n"};
+    static const EILangFile edit2 = {"client/src/Consumer.scala",
+                                     "package com.acme.client\n"
+                                     "import com.acme.model.Target\n"
+                                     "import com.acme.model._\n"
+                                     "object Consumer { def run(): Int = Target.build() + 2 }\n"};
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 3);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(ei_scala_incr_consumer_edges_ok(store, lp.project));
+
+    store = ei_rewrite_and_reindex(&lp, store, &edit1);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ((int)cbm_pipeline_incremental_test_last_route(),
+              (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(ei_scala_incr_consumer_edges_ok(store, lp.project));
+
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    store = ei_rewrite_and_reindex(&lp, store, &edit2);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ((int)cbm_pipeline_incremental_test_last_route(),
+              (int)CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_TRUE(ei_scala_incr_consumer_edges_ok(store, lp.project));
 
     ei_cleanup(&lp, store);
     PASS();
@@ -1970,8 +2612,8 @@ static int ei_php_null_map_candidate(bool direct_collision) {
         .local_name = "fmt", .module_path = "Lib\\render", .kind = CBM_IMPORT_KIND_FUNCTION};
     CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
     cbm_pipeline_set_pkgmap(NULL);
-    const cbm_gbuf_node_t *target =
-        cbm_pipeline_resolve_import_node(&ctx, "main.php", "phpimports.main.__file__", &imp, NULL);
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "main.php", "phpimports.main.__file__", CBM_LANG_PHP, &imp, NULL, NULL);
     int ok = decoy > 0 && valid > 0 && target && target->id == valid;
     cbm_pipeline_set_pkgmap(saved_pkgmap);
     cbm_gbuf_free(gbuf);
@@ -1996,8 +2638,8 @@ TEST(ei_php_require_path_keeps_generic_resolution_issue1186) {
     CBMHashTable *map = cbm_pipeline_namespace_map_build_names("phpimports", NULL, NULL, 0);
     CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
     cbm_pipeline_set_pkgmap(NULL);
-    const cbm_gbuf_node_t *target =
-        cbm_pipeline_resolve_import_node(&ctx, "main.php", "phpimports.main.__file__", &imp, map);
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "main.php", "phpimports.main.__file__", CBM_LANG_PHP, &imp, map, NULL);
     int ok = map && valid > 0 && target && target->id == valid;
     cbm_pipeline_set_pkgmap(saved_pkgmap);
     cbm_pipeline_namespace_map_free(map);
@@ -2620,6 +3262,12 @@ SUITE(edge_imports) {
     /* ── GREEN GUARDS — TypeScript (must stay passing) ── */
     RUN_TEST(ei_typescript_named_relative_import);
     RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
+    RUN_TEST(ei_typescript_dotted_alias_import_targets_source_module);
+    RUN_TEST(ei_typescript_alias_import_non_js_file_targets_its_module);
+    RUN_TEST(ei_typescript_alias_import_spelled_ext_on_dotted_name);
+#ifndef _WIN32
+    RUN_TEST(ei_typescript_alias_import_keeps_question_mark_folder);
+#endif
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);
@@ -2640,6 +3288,18 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
+
+    /* ── GREEN GUARDS — Scala package-aware resolution ── */
+    RUN_TEST(ei_scala_package_imports_ignore_physical_layout);
+    RUN_TEST(ei_java_import_ignores_scala_package_prefix);
+    RUN_TEST(ei_scala_imports_java_class_from_mixed_package);
+    RUN_TEST(ei_java_import_of_mixed_package_binds_java_file);
+    RUN_TEST(ei_scala_split_package_same_name_top_level_is_ambiguous);
+    RUN_TEST(ei_scala_import_ignores_nested_same_name);
+    RUN_TEST(ei_scala_unresolvable_member_import_yields_no_owner_edge);
+    RUN_TEST(ei_scala_chained_package_clauses_resolve);
+    RUN_TEST(ei_scala_import_ignores_java_nested_type_of_same_name);
+    RUN_TEST(ei_scala_incremental_reindex_keeps_imports_into_unchanged_packages);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_rust_mod_plus_use);
