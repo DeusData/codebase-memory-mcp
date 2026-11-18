@@ -90,7 +90,7 @@ jobs:
         run: |
           scripts/ci/prepare-release-candidates.sh \
             "${{ matrix.goos }}" "${{ matrix.goarch }}" \
-            --binary build/c/codebase-memory-mcp \
+            --binary build/c/codebase-memory-mcp-neo4j \
             --out-dir release-candidates
           scripts/gen-third-party-notices.sh \
             "release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/THIRD_PARTY_NOTICES.md"
@@ -148,7 +148,7 @@ jobs:
         shell: msys2 {0}
         run: |
           scripts/ci/prepare-release-candidates.sh windows amd64 \
-            --binary build/c/codebase-memory-mcp.exe \
+            --binary build/c/codebase-memory-mcp-neo4j.exe \
             --out-dir release-candidates
           scripts/gen-third-party-notices.sh \
             release-candidates/windows-amd64/THIRD_PARTY_NOTICES.md
@@ -210,7 +210,7 @@ jobs:
         shell: msys2 {0}
         run: |
           scripts/ci/prepare-release-candidates.sh windows arm64 \
-            --binary build/c/codebase-memory-mcp.exe \
+            --binary build/c/codebase-memory-mcp-neo4j.exe \
             --out-dir release-candidates
           scripts/gen-third-party-notices.sh \
             release-candidates/windows-arm64/THIRD_PARTY_NOTICES.md
@@ -266,14 +266,14 @@ jobs:
 
       - name: Verify release static linking
         run: |
-          file build/c/codebase-memory-mcp
-          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
+          file build/c/codebase-memory-mcp-neo4j
+          ldd build/c/codebase-memory-mcp-neo4j 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp-neo4j 2>&1 | grep -q "statically linked"
 
       - name: Derive immutable stripped and unstripped release candidates
         run: |
           scripts/ci/prepare-release-candidates.sh \
             linux "${{ matrix.arch }}-portable" \
-            --binary build/c/codebase-memory-mcp \
+            --binary build/c/codebase-memory-mcp-neo4j \
             --out-dir release-candidates
           scripts/gen-third-party-notices.sh \
             "release-candidates/linux-${{ matrix.arch }}-portable/THIRD_PARTY_NOTICES.md"
@@ -395,8 +395,8 @@ jobs:
             windows-amd64 windows-arm64; do
             goos="${target%%-*}"
             goarch="${target#*-}"
-            selected_name=codebase-memory-mcp
-            test "$goos" != windows || selected_name=codebase-memory-mcp.exe
+            selected_name=codebase-memory-mcp-neo4j
+            test "$goos" != windows || selected_name=codebase-memory-mcp-neo4j.exe
             selected="release-selection/selected/$target/$selected_name"
             notices="release-candidate-scan/notices/$target/THIRD_PARTY_NOTICES.md"
             test -f "$selected"

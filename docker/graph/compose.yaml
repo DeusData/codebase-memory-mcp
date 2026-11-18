@@ -1,4 +1,4 @@
-# Local code-graph stack: Neo4j plus the codebase-memory-mcp indexer and MCP
+# Local code-graph stack: Neo4j plus the codebase-memory-mcp-neo4j indexer and MCP
 # server, all reading the same login from docker/graph/.env (copy
 # .env.example). Every container loads that file itself (env_file), so a
 # NEO4J_PASSWORD left in the shell or the Windows user environment is ignored:
@@ -88,7 +88,7 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
-    entrypoint: ["codebase-memory-mcp"]
+    entrypoint: ["codebase-memory-mcp-neo4j"]
     stdin_open: true
     env_file: [.env]
     environment:

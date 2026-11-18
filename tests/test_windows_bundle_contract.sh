@@ -2,8 +2,8 @@
 # INVERTED release-surface contract: Windows ships ONE binary.
 #
 # History this guards against. The Windows release used to be a PAIR — a small
-# permanent launcher (codebase-memory-mcp.exe) plus the real product binary
-# (codebase-memory-mcp.payload.exe). The launcher existed for exactly one
+# permanent launcher (codebase-memory-mcp-neo4j.exe) plus the real product binary
+# (codebase-memory-mcp-neo4j.payload.exe). The launcher existed for exactly one
 # reason: a running .exe cannot replace its own image on Windows, so an
 # in-process self-update needs a second resident binary to do the swap.
 #
@@ -73,8 +73,8 @@ def yaml_run_blocks(text: str) -> list[str]:
     return blocks
 
 
-binary = "codebase-memory-mcp.exe"
-payload = "codebase-memory-mcp.payload.exe"
+binary = "codebase-memory-mcp-neo4j.exe"
+payload = "codebase-memory-mcp-neo4j.payload.exe"
 windows_archive_names = (binary, "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.md")
 
 # ── 1. The archive is exactly four files, defined in ONE place ───────────────
@@ -106,7 +106,7 @@ require(
 # of a launcher build/copy) means the flagged two-binary design is back.
 launcher_markers = (
     payload,
-    "codebase-memory-mcp-launcher",
+    "codebase-memory-mcp-neo4j-launcher",
     "windows_launcher_state",
     "src/launcher/",
 )
@@ -115,7 +115,7 @@ shipped_surfaces = (
     "install.ps1",
     "pkg/npm/install.js",
     "pkg/npm/bin.js",
-    "pkg/pypi/src/codebase_memory_mcp/_cli.py",
+    "pkg/pypi/src/codebase_memory_mcp_neo4j/_cli.py",
     ".github/workflows/_build.yml",
 )
 for relative in shipped_surfaces:
@@ -142,7 +142,7 @@ for relative in (
     )
 makefile = read("Makefile.cbm")
 require(
-    "codebase-memory-mcp-launcher" not in makefile and "WINDOWS_LAUNCHER" not in makefile,
+    "codebase-memory-mcp-neo4j-launcher" not in makefile and "WINDOWS_LAUNCHER" not in makefile,
     "Makefile.cbm must not expose a Windows launcher target or variable",
 )
 
@@ -277,16 +277,16 @@ require(
 # ── 4. Package-manager shims resolve the single Windows binary ───────────────
 single_binary_contracts = {
     "pkg/npm/install.js": (
-        r"const\s+WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
+        r"const\s+WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp-neo4j\.exe['\"]",
         r"installWindowsBinaryAtomically\(",
         r"windowsBinaryReady\(",
     ),
     "pkg/npm/bin.js": (
-        r"binName\s*=\s*isWindows\s*\?\s*['\"]codebase-memory-mcp\.exe['\"]",
+        r"binName\s*=\s*isWindows\s*\?\s*['\"]codebase-memory-mcp-neo4j\.exe['\"]",
         r"const\s+executionPath\s*=\s*binPath",
     ),
-    "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
-        r"_WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
+    "pkg/pypi/src/codebase_memory_mcp_neo4j/_cli.py": (
+        r"_WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp-neo4j\.exe['\"]",
         r"def\s+_runtime_set_ready\(",
     ),
 }
@@ -318,7 +318,7 @@ exact_archive_guards = {
         "'install.ps1'",
         "THIRD_PARTY_NOTICES.md",
     ),
-    "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
+    "pkg/pypi/src/codebase_memory_mcp_neo4j/_cli.py": (
         "name not in required_set",
         "len(seen) != len(required)",
         "_WINDOWS_BINARY_NAME",
@@ -364,13 +364,13 @@ require(
 # A portable mutation refusal must point to the owning package manager.
 guidance_contracts = {
     "pkg/npm/bin.js": (
-        "npm install codebase-memory-mcp@latest",
-        "npm uninstall codebase-memory-mcp",
-        "codebase-memory-mcp install --yes",
+        "npm install codebase-memory-mcp-neo4j@latest",
+        "npm uninstall codebase-memory-mcp-neo4j",
+        "codebase-memory-mcp-neo4j install --yes",
     ),
-    "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
-        "python -m pip install --upgrade codebase-memory-mcp",
-        "python -m pip uninstall codebase-memory-mcp",
+    "pkg/pypi/src/codebase_memory_mcp_neo4j/_cli.py": (
+        "python -m pip install --upgrade codebase-memory-mcp-neo4j",
+        "python -m pip uninstall codebase-memory-mcp-neo4j",
         "install --yes",
     ),
 }
@@ -473,7 +473,7 @@ require(
             '"install.ps1" in lowered',
             "result.returncode == 0",
             "sha256_file(binary) == before",
-            "codebase-memory-mcp.payload.exe",
+            "codebase-memory-mcp-neo4j.payload.exe",
         )
     ),
     "the native update guard must assert exit 0, the printed install.ps1 command, an "
@@ -676,7 +676,7 @@ require(bool(windows_smoke), "_smoke.yml must contain the smoke-windows job")
 vm_smoke = read("test-infrastructure/vm/vm-smoke.sh")
 smoke_local = read("scripts/smoke-local.sh")
 require(
-    'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"' in vm_smoke,
+    'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp-neo4j.exe"' in vm_smoke,
     f"Windows smoke wrapper must execute the canonical {binary}",
 )
 require(
@@ -694,8 +694,8 @@ require(
         for needle in (
             'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
             'SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-vm-smoke.XXXXXX")"',
-            'cp "$BINARY_SRC" "$SMOKE_DIR/codebase-memory-mcp.exe"',
-            'CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")"',
+            'cp "$BINARY_SRC" "$SMOKE_DIR/codebase-memory-mcp-neo4j.exe"',
+            'CBM_NEO4J_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")"',
             'SMOKE_TEMP_ROOT="$SMOKE_DIR"',
         )
     ),
@@ -713,8 +713,8 @@ require(
         needle in windows_release_version_blocks[0]
         for needle in (
             'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
-            'cp "$ARTIFACT_DIR/codebase-memory-mcp.exe" "$LAUNCH_DIR/"',
-            '"$LAUNCH_DIR/codebase-memory-mcp.exe" --version',
+            'cp "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe" "$LAUNCH_DIR/"',
+            '"$LAUNCH_DIR/codebase-memory-mcp-neo4j.exe" --version',
         )
     ),
     "Windows release version checks must execute the single binary beneath the current "
@@ -740,7 +740,7 @@ require(
 windows_release_security_blocks = [
     re.sub(r"\s+", " ", re.sub(r"\\\s*\n\s*", " ", block)).strip()
     for block in smoke_blocks
-    if 'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"' in block
+    if 'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp-neo4j.exe"' in block
 ]
 require(
     len(windows_release_security_blocks) == 1
@@ -749,9 +749,9 @@ require(
         for needle in (
             'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
             'SECURITY_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-security.XXXXXX")"',
-            'cp "$ARTIFACT_DIR/codebase-memory-mcp.exe" "$SECURITY_DIR/"',
+            'cp "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe" "$SECURITY_DIR/"',
             'TMPDIR="$SECURITY_DIR" '
-            'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"',
+            'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp-neo4j.exe"',
         )
     ),
     "Windows release install audit must execute the single binary beneath the current "
@@ -761,8 +761,8 @@ require(
 # ── 9. Update transport stays HTTPS-only in production ───────────────────────
 smoke_script = read("scripts/smoke-test.sh")
 require(
-    'copy_smoke_binary "$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"' not in smoke_script
-    and 'copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"' not in smoke_script,
+    'copy_smoke_binary "$FAKE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"' not in smoke_script
+    and 'copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"' not in smoke_script,
     "Windows smoke must leave canonical targets absent for an authenticated install",
 )
 require(
@@ -864,7 +864,7 @@ update_windows_block = (
 )
 require(
     update_start >= 0
-    and "install.ps1" in update_windows_block
+    and "install-neo4j.ps1" in update_windows_block
     and "powershell -File" in update_windows_block,
     "cbm_cmd_update must print the install.ps1 command on Windows",
 )

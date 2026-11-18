@@ -1076,7 +1076,7 @@ static void handle_ui_log_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 #endif
 #include <signal.h>
 
-/* GET /api/processes — list codebase-memory-mcp processes via ps */
+/* GET /api/processes — list codebase-memory-mcp-neo4j processes via ps */
 static void handle_processes(cbm_http_conn_t *c) {
     char buf[8192];
     int pos = 0;
@@ -1108,14 +1108,14 @@ static void handle_processes(cbm_http_conn_t *c) {
         (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s,
         self_memory_available ? "true" : "false");
 
-    /* Enumerate all codebase-memory-mcp.exe processes via toolhelp snapshot */
+    /* Enumerate all codebase-memory-mcp-neo4j.exe processes via toolhelp snapshot */
     int proc_count = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32 pe;
         pe.dwSize = sizeof(pe);
         for (BOOL ok = Process32First(hSnap, &pe); ok; ok = Process32Next(hSnap, &pe)) {
-            if (_stricmp(pe.szExeFile, "codebase-memory-mcp.exe") == 0) {
+            if (_stricmp(pe.szExeFile, "codebase-memory-mcp-neo4j.exe") == 0) {
                 HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
                                            pe.th32ProcessID);
                 if (hProc) {
@@ -1160,7 +1160,7 @@ static void handle_processes(cbm_http_conn_t *c) {
                         buf, sizeof(buf), &pos,
                         "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
                         "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
-                        "\"command\":\"codebase-memory-mcp\","
+                        "\"command\":\"codebase-memory-mcp-neo4j\","
                         "\"is_self\":%s,\"cpu_available\":%s,\"memory_available\":%s}",
                         pe.th32ProcessID, cpu_user + cpu_sys, (double)proc_rss / (1024.0 * 1024.0),
                         elapsed_sec / 86400, (elapsed_sec % 86400) / 3600,
@@ -3396,7 +3396,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* GET /api/processes → list running codebase-memory-mcp processes */
+    /* GET /api/processes → list running codebase-memory-mcp-neo4j processes */
     if (is_get && cbm_http_path_match(req->path, "/api/processes")) {
         handle_processes(c);
         return;

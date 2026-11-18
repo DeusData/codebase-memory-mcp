@@ -779,4 +779,4 @@ jobs:
         # against the real supervisor->worker spawn path: under the mandatory
         # coordination daemon, CBM_INDEX_SUPERVISOR=0 is a fail-closed refusal, so
         # the driver no longer sets it anywhere.
-        run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe
+        run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp-neo4j.exe

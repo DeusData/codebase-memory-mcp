@@ -251,16 +251,16 @@ static bool tf_setup_cache_sentinel(void) {
         return false;
     }
     /* Legacy integration fixtures derive DB paths from HOME, while production
-     * cache_dir() prefers CBM_CACHE_DIR. A private HOME plus no inherited cache
+     * cache_dir() prefers CBM_NEO4J_CACHE_DIR. A private HOME plus no inherited cache
      * override keeps both conventions pointed at the same isolated tree. */
     cbm_setenv("HOME", tf_home_sentinel, 1);
-    cbm_unsetenv("CBM_CACHE_DIR");
+    cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     for (size_t i = 0U; i < sizeof(tf_client_home_overrides) / sizeof(tf_client_home_overrides[0]);
          i++) {
         cbm_unsetenv(tf_client_home_overrides[i]);
     }
     atexit(tf_cleanup_cache_sentinel);
-    /* HOME and CBM_CACHE_DIR do not move the daemon rendezvous: its key is a
+    /* HOME and CBM_NEO4J_CACHE_DIR do not move the daemon rendezvous: its key is a
      * constant product hash under the system temp root. Without this, an
      * install/uninstall/update test or any endpoint resolved with no explicit
      * parent reaches the developer's live daemon. The run always gets a fresh
@@ -272,7 +272,7 @@ static bool tf_setup_cache_sentinel(void) {
         tf_runtime_sentinel[0] = '\0';
         return false;
     }
-    if (cbm_setenv("CBM_RUNTIME_DIR", tf_runtime_sentinel, 1) != 0) {
+    if (cbm_setenv("CBM_NEO4J_RUNTIME_DIR", tf_runtime_sentinel, 1) != 0) {
         return false;
     }
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -291,13 +291,13 @@ static bool tf_path_has_parent(const char *path, const char *parent) {
 
 /* The daemon rendezvous is not derived from HOME or the cache: its key is a
  * constant product hash and its default parent is the system temp root. With
- * CBM_RUNTIME_DIR unset, every endpoint a test resolves is therefore the
- * developer's live daemon socket (<tmp>/cbm-daemon-<uid>/cbm-<key>.sock).
+ * CBM_NEO4J_RUNTIME_DIR unset, every endpoint a test resolves is therefore the
+ * developer's live daemon socket (<tmp>/cbm-neo4j-daemon-<uid>/cbm-<key>.sock).
  * Every check runs before anything is resolved, so a run without isolation
  * fails here and this test never reaches that socket itself. */
 TEST(runner_isolation_daemon_runtime_dir_is_private) {
     char runtime_env[sizeof(tf_runtime_sentinel)] = {0};
-    const char *value = cbm_safe_getenv("CBM_RUNTIME_DIR", runtime_env, sizeof(runtime_env), NULL);
+    const char *value = cbm_safe_getenv("CBM_NEO4J_RUNTIME_DIR", runtime_env, sizeof(runtime_env), NULL);
     ASSERT_NOT_NULL(value);
     ASSERT_TRUE(value[0] != '\0');
     /* The fresh per-run directory, never a value inherited from the caller. */
@@ -325,7 +325,7 @@ TEST(runner_isolation_daemon_runtime_dir_is_private) {
     ASSERT_TRUE(tf_path_has_parent(canonical_resolved, canonical_run));
 #ifndef _WIN32
     char live_default[CBM_SZ_4K];
-    (void)snprintf(live_default, sizeof(live_default), "%s/cbm-daemon-%lu", canonical_root,
+    (void)snprintf(live_default, sizeof(live_default), "%s/cbm-neo4j-daemon-%lu", canonical_root,
                    (unsigned long)geteuid());
     ASSERT_TRUE(strcmp(canonical_resolved, live_default) != 0);
 #endif
@@ -340,12 +340,12 @@ TEST(runner_isolation_refuses_default_daemon_runtime) {
     ASSERT_TRUE(tf_runtime_sentinel[0] != '\0');
     bool allowed_with_run_dir = !cbm_daemon_bootstrap_default_runtime_refused_for_test(NULL);
 
-    (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+    (void)cbm_unsetenv("CBM_NEO4J_RUNTIME_DIR");
     bool refused_without = cbm_daemon_bootstrap_default_runtime_refused_for_test(NULL);
     bool explicit_allowed =
         !cbm_daemon_bootstrap_default_runtime_refused_for_test(tf_runtime_sentinel);
     /* Restore before asserting: a failed assertion returns immediately. */
-    bool restored = cbm_setenv("CBM_RUNTIME_DIR", tf_runtime_sentinel, 1) == 0;
+    bool restored = cbm_setenv("CBM_NEO4J_RUNTIME_DIR", tf_runtime_sentinel, 1) == 0;
 
     ASSERT_TRUE(restored);
     ASSERT_TRUE(allowed_with_run_dir);
@@ -1976,7 +1976,7 @@ static int tf_role_version(int argc, char **argv) {
     if (argc != 2) {
         return -1;
     }
-    (void)puts("codebase-memory-mcp test-runner");
+    (void)puts("codebase-memory-mcp-neo4j test-runner");
     return 0;
 }
 
@@ -2245,7 +2245,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!g_list_only) {
-        printf("\n  codebase-memory-mcp  C test suite\n");
+        printf("\n  codebase-memory-mcp-neo4j  C test suite\n");
     }
 
     /* Runner isolation first: nothing below may reach the developer's daemon. */

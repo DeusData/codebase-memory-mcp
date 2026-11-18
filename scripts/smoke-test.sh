@@ -23,7 +23,7 @@ HOME/TEMP/agent-config destinations. Called bare, the download/checksum/
 install-script phases (12-13) SKIP for lack of a fixture server, and the run
 mutates the REAL profile — the venue-parity contract forbids that in any venue.
 The daemon runtime and cache are private to the run either way: every product
-process is started under a CBM_RUNTIME_DIR/CBM_CACHE_DIR this harness owns.
+process is started under a CBM_NEO4J_RUNTIME_DIR/CBM_NEO4J_CACHE_DIR this harness owns.
 
 Arguments:
   <binary-path>         product binary to smoke
@@ -45,7 +45,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
 # Every product process below — the phases, the install/update E2E and the
 # daemon retirements — must reach a daemon rendezvous this run owns. Only
-# CBM_RUNTIME_DIR moves that rendezvous; the wrappers' HOME/TMPDIR/CBM_CACHE_DIR
+# CBM_NEO4J_RUNTIME_DIR moves that rendezvous; the wrappers' HOME/TMPDIR/CBM_NEO4J_CACHE_DIR
 # sandbox does not, so without this the retirements land on the operator's live
 # account daemon (#1691, #1696).
 # shellcheck source=test-runtime.sh
@@ -216,14 +216,14 @@ smoke_dump_worker_log() {
   if [ -z "$log" ] || [ ! -f "$log" ]; then
     # The path is only printed for some failures; fall back to the newest log
     # the run produced.
-    log=$(ls -t "${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"/logs/.worker-log-* 2>/dev/null | head -1)
+    log=$(ls -t "${CBM_NEO4J_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp-neo4j}"/logs/.worker-log-* 2>/dev/null | head -1)
   fi
   if [ -n "$log" ] && [ -f "$log" ]; then
     echo "--- worker log: $log ---"
     tail -80 "$log"
     echo "--- end worker log ---"
   else
-    echo "--- no worker log found (cache ${CBM_CACHE_DIR:-unset}) ---"
+    echo "--- no worker log found (cache ${CBM_NEO4J_CACHE_DIR:-unset}) ---"
   fi
 }
 
@@ -601,12 +601,12 @@ esac
 
 echo "=== Phase 3z3: config get prints real defaults and rejects unknown keys (#1522) ==="
 CFG_HOME=$(smoke_mktemp_dir)
-CFG_WATCH=$(CBM_CACHE_DIR="$CFG_HOME" "$BINARY" config get auto_watch 2>/dev/null || true)
+CFG_WATCH=$(CBM_NEO4J_CACHE_DIR="$CFG_HOME" "$BINARY" config get auto_watch 2>/dev/null || true)
 if [ "$CFG_WATCH" != "true" ] && [ "$CFG_WATCH" != "false" ]; then
   echo "FAIL: config get auto_watch printed '$CFG_WATCH' (expected the stored value or the default 'true')"
   rm -rf "$CFG_HOME"; exit 1
 fi
-if CBM_CACHE_DIR="$CFG_HOME" "$BINARY" config get totally_bogus_key >/dev/null 2>&1; then
+if CBM_NEO4J_CACHE_DIR="$CFG_HOME" "$BINARY" config get totally_bogus_key >/dev/null 2>&1; then
   echo "FAIL: config get of an unknown key exited 0"
   rm -rf "$CFG_HOME"; exit 1
 fi
@@ -986,10 +986,10 @@ echo "OK: clean shutdown"
 if command -v pgrep &>/dev/null && [ "$(uname)" != "MINGW64_NT" ] 2>/dev/null; then
   # Give a moment for any child processes to clean up
   sleep 1
-  RESIDUAL=$(pgrep -f "codebase-memory-mcp.*cli" 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+  RESIDUAL=$(pgrep -f "codebase-memory-mcp-neo4j.*cli" 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
   RESIDUAL="${RESIDUAL:-0}"
   if [ "$RESIDUAL" -gt 0 ]; then
-    echo "WARNING: $RESIDUAL residual codebase-memory-mcp process(es) found"
+    echo "WARNING: $RESIDUAL residual codebase-memory-mcp-neo4j process(es) found"
   else
     echo "OK: no residual processes"
   fi
@@ -1037,8 +1037,8 @@ mcp_dump_diagnostics() {
     echo "--- frontend stderr ---"
     cat "${output_file}.err"
   fi
-  local cache="${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"
-  for log in cbm-daemon.log daemon-conflicts.ndjson; do
+  local cache="${CBM_NEO4J_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp-neo4j}"
+  for log in cbm-neo4j-daemon.log daemon-conflicts.ndjson; do
     if [ -s "$cache/logs/$log" ]; then
       echo "--- $log (tail) ---"
       tail -20 "$cache/logs/$log"
@@ -1157,7 +1157,7 @@ echo ""
 echo "=== Phase 6: CLI subcommands ==="
 
 DRYRUN_HOME=$(smoke_mktemp_dir)
-DRYRUN_CACHE="$DRYRUN_HOME/.cache/codebase-memory-mcp"
+DRYRUN_CACHE="$DRYRUN_HOME/.cache/codebase-memory-mcp-neo4j"
 mkdir -p "$DRYRUN_CACHE" \
   "$DRYRUN_HOME/.local/bin" \
   "$DRYRUN_HOME/.config" \
@@ -1169,7 +1169,7 @@ run_dryrun_env() {
     XDG_CONFIG_HOME="$DRYRUN_HOME/.config" \
     APPDATA="$DRYRUN_HOME/AppData/Roaming" \
     LOCALAPPDATA="$DRYRUN_HOME/AppData/Local" \
-    CBM_CACHE_DIR="$DRYRUN_CACHE" \
+    CBM_NEO4J_CACHE_DIR="$DRYRUN_CACHE" \
     PATH="$DRYRUN_HOME/.local/bin:$PATH" \
     "$@"
 }
@@ -1288,11 +1288,11 @@ INSTALL_DIR="$REPLACE_DIR/install"
 mkdir -p "$INSTALL_DIR"
 
 # 1. Copy binary to "install dir" as the "currently installed" version
-copy_smoke_binary "$INSTALL_DIR/codebase-memory-mcp"
-chmod 755 "$INSTALL_DIR/codebase-memory-mcp"
+copy_smoke_binary "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+chmod 755 "$INSTALL_DIR/codebase-memory-mcp-neo4j"
 
 # Verify installed binary works
-INSTALLED_VER=$("$INSTALL_DIR/codebase-memory-mcp" --version 2>&1)
+INSTALLED_VER=$("$INSTALL_DIR/codebase-memory-mcp-neo4j" --version 2>&1)
 if ! echo "$INSTALLED_VER" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
   echo "FAIL: installed binary --version failed: $INSTALLED_VER"
   smoke_rmtree "$REPLACE_DIR"
@@ -1300,15 +1300,15 @@ if ! echo "$INSTALLED_VER" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
 fi
 
 # 2. Copy binary as the "downloaded" new version
-copy_smoke_binary "$REPLACE_DIR/smoke-codebase-memory-mcp"
+copy_smoke_binary "$REPLACE_DIR/smoke-codebase-memory-mcp-neo4j"
 
 # 3. Simulate cbm_replace_binary: unlink old, copy new
-rm -f "$INSTALL_DIR/codebase-memory-mcp"
-cp "$REPLACE_DIR/smoke-codebase-memory-mcp" "$INSTALL_DIR/codebase-memory-mcp"
-chmod 755 "$INSTALL_DIR/codebase-memory-mcp"
+rm -f "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+cp "$REPLACE_DIR/smoke-codebase-memory-mcp-neo4j" "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+chmod 755 "$INSTALL_DIR/codebase-memory-mcp-neo4j"
 
 # 4. Verify replaced binary works
-REPLACED_VER=$("$INSTALL_DIR/codebase-memory-mcp" --version 2>&1)
+REPLACED_VER=$("$INSTALL_DIR/codebase-memory-mcp-neo4j" --version 2>&1)
 if ! echo "$REPLACED_VER" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
   echo "FAIL: replaced binary --version failed: $REPLACED_VER"
   smoke_rmtree "$REPLACE_DIR"
@@ -1318,11 +1318,11 @@ echo "OK: binary replacement succeeded (version: $REPLACED_VER)"
 
 # 5. Test replacement of read-only binary (edge case — cbm_replace_binary
 #    handles this via unlink-before-write, which works even on read-only files)
-chmod 444 "$INSTALL_DIR/codebase-memory-mcp"
-rm -f "$INSTALL_DIR/codebase-memory-mcp"
-cp "$REPLACE_DIR/smoke-codebase-memory-mcp" "$INSTALL_DIR/codebase-memory-mcp"
-chmod 755 "$INSTALL_DIR/codebase-memory-mcp"
-READONLY_VER=$("$INSTALL_DIR/codebase-memory-mcp" --version 2>&1)
+chmod 444 "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+rm -f "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+cp "$REPLACE_DIR/smoke-codebase-memory-mcp-neo4j" "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+chmod 755 "$INSTALL_DIR/codebase-memory-mcp-neo4j"
+READONLY_VER=$("$INSTALL_DIR/codebase-memory-mcp-neo4j" --version 2>&1)
 if ! echo "$READONLY_VER" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
   echo "FAIL: read-only replacement --version failed: $READONLY_VER"
   smoke_rmtree "$REPLACE_DIR"
@@ -1415,25 +1415,25 @@ fi
 GITLAB_MCP="$GITLAB_DIR/mcp.json"
 DEVIN_CONFIG="$DEVIN_DIR/config.json"
 DEVIN_INSTRUCTIONS="$DEVIN_DIR/AGENTS.md"
-DEVIN_SKILL="$DEVIN_DIR/skills/codebase-memory/SKILL.md"
+DEVIN_SKILL="$DEVIN_DIR/skills/codebase-memory-neo4j/SKILL.md"
 CODEBUDDY_MCP="$FAKE_HOME/.codebuddy/.mcp.json"
 CODEBUDDY_INSTRUCTIONS="$FAKE_HOME/.codebuddy/CODEBUDDY.md"
-CODEBUDDY_SKILL="$FAKE_HOME/.codebuddy/skills/codebase-memory/SKILL.md"
-CODEBUDDY_AGENT="$FAKE_HOME/.codebuddy/agents/codebase-memory.md"
+CODEBUDDY_SKILL="$FAKE_HOME/.codebuddy/skills/codebase-memory-neo4j/SKILL.md"
+CODEBUDDY_AGENT="$FAKE_HOME/.codebuddy/agents/codebase-memory-neo4j.md"
 CODEBUDDY_SETTINGS="$FAKE_HOME/.codebuddy/settings.json"
 BOB_IDE_MCP="$FAKE_HOME/.bob/mcp.json"
 BOB_SHELL_MCP="$FAKE_HOME/.bob/mcp_settings.json"
-BOB_RULE="$FAKE_HOME/.bob/rules/codebase-memory.md"
-BOB_SKILL="$FAKE_HOME/.bob/skills/codebase-memory/SKILL.md"
-BOB_AGENT="$FAKE_HOME/.bob/agents/codebase-memory.md"
+BOB_RULE="$FAKE_HOME/.bob/rules/codebase-memory-neo4j.md"
+BOB_SKILL="$FAKE_HOME/.bob/skills/codebase-memory-neo4j/SKILL.md"
+BOB_AGENT="$FAKE_HOME/.bob/agents/codebase-memory-neo4j.md"
 POCHI_MCP="$FAKE_HOME/.pochi/config.jsonc"
 POCHI_INSTRUCTIONS="$FAKE_HOME/.pochi/README.pochi.md"
-POCHI_SKILL="$FAKE_HOME/.pochi/skills/codebase-memory/SKILL.md"
-POCHI_AGENT="$FAKE_HOME/.pochi/agents/codebase-memory.md"
+POCHI_SKILL="$FAKE_HOME/.pochi/skills/codebase-memory-neo4j/SKILL.md"
+POCHI_AGENT="$FAKE_HOME/.pochi/agents/codebase-memory-neo4j.md"
 ROVO_MCP="$FAKE_HOME/.rovodev/mcp.json"
 ROVO_INSTRUCTIONS="$FAKE_HOME/.rovodev/AGENTS.md"
-ROVO_SKILL="$FAKE_HOME/.rovodev/skills/codebase-memory/SKILL.md"
-ROVO_AGENT="$FAKE_HOME/.rovodev/subagents/codebase-memory.md"
+ROVO_SKILL="$FAKE_HOME/.rovodev/skills/codebase-memory-neo4j/SKILL.md"
+ROVO_AGENT="$FAKE_HOME/.rovodev/subagents/codebase-memory-neo4j.md"
 AMAZON_Q_MCP="$FAKE_HOME/.aws/amazonq/default.json"
 mkdir -p "$GITLAB_DIR" "$(dirname "$GITLAB_HOOKS")" "$DEVIN_DIR"
 mkdir -p "$FAKE_HOME/.local/bin"
@@ -1442,10 +1442,10 @@ mkdir -p "$FAKE_HOME/.local/bin"
 # seeding it would mean running the fixture binary out of the very location the
 # install is about to publish to, which Windows' image lock forbids.
 if [[ "$BINARY" == *.exe ]]; then
-  SELF_PATH="$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"
+  SELF_PATH="$FAKE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
 else
-  cp "$BINARY" "$FAKE_HOME/.local/bin/codebase-memory-mcp"
-  SELF_PATH="$FAKE_HOME/.local/bin/codebase-memory-mcp"
+  cp "$BINARY" "$FAKE_HOME/.local/bin/codebase-memory-mcp-neo4j"
+  SELF_PATH="$FAKE_HOME/.local/bin/codebase-memory-mcp-neo4j"
 fi
 create_agent_stub() {
   local name="$1"
@@ -1506,7 +1506,7 @@ if [[ "$BINARY" == *.exe ]]; then
     echo "FAIL 8-0: install exited rc=$PHASE8_INSTALL_RC"
     exit 1
   fi
-  PHASE8_CANONICAL="$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"
+  PHASE8_CANONICAL="$FAKE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
   if [ ! -f "$PHASE8_CANONICAL" ]; then
     echo "FAIL 8-0: installed binary missing after install"
     exit 1
@@ -1518,7 +1518,7 @@ if [[ "$BINARY" == *.exe ]]; then
     echo "FAIL 8-0: installed binary is not a single-link file (links=$PHASE8_LINKS)"
     exit 1
   fi
-  if [ -e "$FAKE_HOME/.local/bin/codebase-memory-mcp.payload.exe" ]; then
+  if [ -e "$FAKE_HOME/.local/bin/codebase-memory-mcp-neo4j.payload.exe" ]; then
     echo "FAIL 8-0: install produced a launcher/payload pair"
     exit 1
   fi
@@ -1586,9 +1586,9 @@ assert_tier_profile_set() {
   local access="$4"
   local spec slug tier file
   for spec in \
-    "codebase-memory-scout|Tier 1" \
-    "codebase-memory|Tier 2" \
-    "codebase-memory-auditor|Tier 3"; do
+    "codebase-memory-neo4j-scout|Tier 1" \
+    "codebase-memory-neo4j|Tier 2" \
+    "codebase-memory-neo4j-auditor|Tier 3"; do
     slug=${spec%%|*}
     tier=${spec##*|}
     file="$directory/$slug$suffix"
@@ -1609,7 +1609,7 @@ assert_tier_profile_set() {
       fi
     elif ! grep -q 'parent agent must supply' "$file" 2>/dev/null ||
          ! grep -q 'must not call or claim access to MCP' "$file" 2>/dev/null ||
-         grep -qE '(mcpServers|mcp__codebase-memory-mcp__|mcp_codebase-memory-mcp_|@codebase-memory-mcp/|codebase-memory-mcp/)' "$file" 2>/dev/null; then
+         grep -qE '(mcpServers|mcp__codebase-memory-neo4j__|mcp_codebase-memory-neo4j_|@codebase-memory-neo4j/|codebase-memory-mcp-neo4j/)' "$file" 2>/dev/null; then
       echo "FAIL 8aw: $label $tier handoff profile exposes child MCP or lacks parent evidence"
       exit 1
     fi
@@ -1621,7 +1621,7 @@ assert_tier_profile_set_removed() {
   local directory="$2"
   local suffix="$3"
   local slug file
-  for slug in codebase-memory-scout codebase-memory codebase-memory-auditor; do
+  for slug in codebase-memory-neo4j-scout codebase-memory-neo4j codebase-memory-neo4j-auditor; do
     file="$directory/$slug$suffix"
     if [ -e "$file" ]; then
       echo "FAIL 9n-i: owned $label tier profile remains: $file"
@@ -1636,9 +1636,9 @@ assert_tier_prompt_set() {
   local suffix="$3"
   local spec slug tier file
   for spec in \
-    "codebase-memory-scout|Tier 1" \
-    "codebase-memory|Tier 2" \
-    "codebase-memory-auditor|Tier 3"; do
+    "codebase-memory-neo4j-scout|Tier 1" \
+    "codebase-memory-neo4j|Tier 2" \
+    "codebase-memory-neo4j-auditor|Tier 3"; do
     slug=${spec%%|*}
     tier=${spec##*|}
     file="$directory/$slug$suffix"
@@ -1654,7 +1654,7 @@ assert_tier_prompt_set() {
 }
 
 # 8a: Claude Code MCP (new path) — correct command
-CMD=$(json_get "$FAKE_HOME/.claude.json" "d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command','')")
+CMD=$(json_get "$FAKE_HOME/.claude.json" "d.get('mcpServers',{}).get('codebase-memory-neo4j',{}).get('command','')")
 if [ -z "$CMD" ] || ! path_match "$CMD" "$SELF_PATH"; then
   echo "DEBUG 8a: file=$FAKE_HOME/.claude.json"
   cat "$FAKE_HOME/.claude.json" 2>/dev/null | head -5 || echo "(file not found)"
@@ -1675,7 +1675,7 @@ echo "OK 8b: .claude.json preserved existing keys"
 if [ -f "$FAKE_HOME/.claude/.mcp.json" ] && cat "$FAKE_HOME/.claude/.mcp.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-sys.exit(0 if 'codebase-memory-mcp' in d.get('mcpServers', {}) else 1)
+sys.exit(0 if 'codebase-memory-mcp-neo4j' in d.get('mcpServers', {}) else 1)
 " 2>/dev/null; then
   echo "FAIL 8c: install recreated undocumented .claude/.mcp.json entry"
   exit 1
@@ -1684,12 +1684,12 @@ echo "OK 8c: undocumented nested Claude MCP path absent"
 
 # 8c-i: Claude gets a dedicated exact-tool graph subagent in addition to the
 # catch-all SubagentStart context hook.
-CLAUDE_AGENT="$FAKE_HOME/.claude/agents/codebase-memory.md"
-if ! grep -q '^mcpServers: \[codebase-memory-mcp\]$' "$CLAUDE_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp__codebase-memory-mcp__search_graph' "$CLAUDE_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CLAUDE_AGENT" 2>/dev/null ||
+CLAUDE_AGENT="$FAKE_HOME/.claude/agents/codebase-memory-neo4j.md"
+if ! grep -q '^mcpServers: \[codebase-memory-neo4j\]$' "$CLAUDE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-neo4j__search_graph' "$CLAUDE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-neo4j__check_index_coverage' "$CLAUDE_AGENT" 2>/dev/null ||
    ! grep -q '^permissionMode: plan$' "$CLAUDE_AGENT" 2>/dev/null ||
-   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$CLAUDE_AGENT" 2>/dev/null; then
+   grep -qE 'mcp__codebase-memory-neo4j__(index_repository|delete_project|manage_adr|ingest_traces)' "$CLAUDE_AGENT" 2>/dev/null; then
   echo "FAIL 8c-i: Claude exact-tool graph subagent missing or over-privileged"
   exit 1
 fi
@@ -1721,18 +1721,18 @@ echo "OK 8d: Claude Code PreToolUse Grep|Glob|Bash + PostToolUse Read"
 # Windows. Branch by platform prefix instead.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate.cmd"
+    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-neo4j-code-discovery-gate.cmd"
     if [ ! -f "$GATE_SCRIPT" ]; then
       echo "FAIL 8e: .cmd shim missing on Windows"
       exit 1
     fi
-    if [ -f "$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate" ]; then
+    if [ -f "$FAKE_HOME/.claude/hooks/cbm-neo4j-code-discovery-gate" ]; then
       echo "FAIL 8e: legacy extensionless shim still installed on Windows"
       exit 1
     fi
     ;;
   *)
-    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate"
+    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-neo4j-code-discovery-gate"
     if [ ! -x "$GATE_SCRIPT" ]; then
       echo "FAIL 8e: shim script not executable or missing"
       exit 1
@@ -1750,7 +1750,7 @@ fi
 echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
 
 # 8f-8h: Codex TOML
-if ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$FAKE_HOME/.codex/config.toml"; then
+if ! grep -q '\[mcp_servers.codebase-memory-neo4j\]' "$FAKE_HOME/.codex/config.toml"; then
   echo "FAIL 8f: Codex TOML missing MCP section"
   exit 1
 fi
@@ -1765,9 +1765,9 @@ echo "OK 8f-h: Codex TOML (MCP + preserved existing)"
 # so Codex-only reinstalls cannot perturb the all-agent fixture below.
 CODEX_POINTER_EXPECTED=$(smoke_mktemp_file)
 printf '%s\n' \
-  '<!-- codebase-memory-mcp:start -->' \
-  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
-  '<!-- codebase-memory-mcp:end -->' > "$CODEX_POINTER_EXPECTED"
+  '<!-- codebase-memory-mcp-neo4j:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory-neo4j` skill.' \
+  '<!-- codebase-memory-mcp-neo4j:end -->' > "$CODEX_POINTER_EXPECTED"
 if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] ||
    [ "$(smoke_file_sha256 "$FAKE_HOME/.codex/AGENTS.md")" != \
      "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ]; then
@@ -1790,11 +1790,11 @@ HOME="$CODEX_LIFECYCLE_HOME" \
 if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
    [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
      "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
-   ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
-   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
-   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
-   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
-   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
+   ! grep -q '\[mcp_servers.codebase-memory-neo4j\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory-neo4j/SKILL.md" ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-neo4j-scout.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-neo4j.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-neo4j-auditor.toml" ] ||
    ! grep -q 'SessionStart' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
    ! grep -q 'SubagentStart' "$CODEX_LIFECYCLE_ROOT/config.toml"; then
   echo "FAIL 8i: isolated fresh Codex install lost the pointer or another surface"
@@ -1803,16 +1803,16 @@ fi
 
 printf '%s\n' \
   '# Personal Codex guidance' \
-  '<!-- codebase-memory-mcp:start -->' \
+  '<!-- codebase-memory-mcp-neo4j:start -->' \
   'legacy managed guidance' \
-  '<!-- codebase-memory-mcp:end -->' \
+  '<!-- codebase-memory-mcp-neo4j:end -->' \
   '# Keep this line' > "$CODEX_INSTRUCTIONS"
 CODEX_EXPECTED_MIGRATED=$(smoke_mktemp_file)
 printf '%s\n' \
   '# Personal Codex guidance' \
-  '<!-- codebase-memory-mcp:start -->' \
-  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
-  '<!-- codebase-memory-mcp:end -->' \
+  '<!-- codebase-memory-mcp-neo4j:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory-neo4j` skill.' \
+  '<!-- codebase-memory-mcp-neo4j:end -->' \
   '# Keep this line' > "$CODEX_EXPECTED_MIGRATED"
 CODEX_EXPECTED_USER=$(smoke_mktemp_file)
 printf '%s\n' '# Personal Codex guidance' '# Keep this line' > "$CODEX_EXPECTED_USER"
@@ -1871,7 +1871,7 @@ HOME="$CODEX_LIFECYCLE_HOME" \
 if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
    [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
      "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ] ||
-   [ "$(grep -c '<!-- codebase-memory-mcp:start -->' "$CODEX_INSTRUCTIONS")" -ne 1 ]; then
+   [ "$(grep -c '<!-- codebase-memory-mcp-neo4j:start -->' "$CODEX_INSTRUCTIONS")" -ne 1 ]; then
   echo "FAIL 8i: Codex reinstall changed or duplicated the activation pointer"
   exit 1
 fi
@@ -1895,7 +1895,7 @@ fi
 echo "OK 8i: isolated Codex activation-pointer lifecycle"
 
 # 8j-l: Gemini MCP + hooks + merge
-CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8j: Gemini MCP command='$CMD'"
   exit 1
@@ -1932,15 +1932,15 @@ echo "OK 8m: Gemini instructions"
 
 # 8m-i: Gemini dedicated graph subagent uses an explicit built-in + MCP tool
 # allowlist; omitted tools would inherit every parent tool.
-GEMINI_AGENT="$FAKE_HOME/.gemini/agents/codebase-memory.md"
-if ! grep -q '^name: codebase-memory$' "$GEMINI_AGENT" 2>/dev/null ||
+GEMINI_AGENT="$FAKE_HOME/.gemini/agents/codebase-memory-neo4j.md"
+if ! grep -q '^name: codebase-memory-neo4j$' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q '^kind: local$' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q 'search_graph' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q 'graph project' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q '^tools:' "$GEMINI_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp_codebase-memory-mcp_search_graph' "$GEMINI_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp_codebase-memory-mcp_check_index_coverage' "$GEMINI_AGENT" 2>/dev/null ||
-   grep -qE 'mcp_codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$GEMINI_AGENT" 2>/dev/null; then
+   ! grep -q 'mcp_codebase-memory-neo4j_search_graph' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp_codebase-memory-neo4j_check_index_coverage' "$GEMINI_AGENT" 2>/dev/null ||
+   grep -qE 'mcp_codebase-memory-neo4j_(index_repository|delete_project|manage_adr|ingest_traces)' "$GEMINI_AGENT" 2>/dev/null; then
   echo "FAIL 8m-i: Gemini dedicated graph subagent is incomplete"
   exit 1
 fi
@@ -1955,7 +1955,7 @@ else
   ZED_CFG="$FAKE_HOME/.config/zed/settings.json"
 fi
 if [ -f "$ZED_CFG" ]; then
-  CMD=$(json_get "$ZED_CFG" "d['context_servers']['codebase-memory-mcp']['command']")
+  CMD=$(json_get "$ZED_CFG" "d['context_servers']['codebase-memory-mcp-neo4j']['command']")
   if ! path_match "$CMD" "$SELF_PATH"; then
     echo "FAIL 8n: Zed command='$CMD'"
     exit 1
@@ -1978,7 +1978,7 @@ echo "OK 8n-i: Zed durable instructions"
 
 # 8o-p: OpenCode MCP + instructions
 # OpenCode detection requires binary on PATH — may not be found on Windows
-CMD=$(json_get "$FAKE_HOME/.config/opencode/opencode.json" "d['mcp']['codebase-memory-mcp']['command'][0]")
+CMD=$(json_get "$FAKE_HOME/.config/opencode/opencode.json" "d['mcp']['codebase-memory-mcp-neo4j']['command'][0]")
 if [ -n "$CMD" ]; then
   if ! path_match "$CMD" "$SELF_PATH"; then
     echo "FAIL 8o: OpenCode command='$CMD'"
@@ -1995,7 +1995,7 @@ else
 fi
 
 # 8q-r: Antigravity (shared MCP config and global GEMINI.md instructions).
-CMD=$(json_get "$FAKE_HOME/.gemini/config/mcp_config.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.gemini/config/mcp_config.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8q: Antigravity command='$CMD'"
   exit 1
@@ -2011,7 +2011,7 @@ echo "OK 8r: Antigravity global instructions; undocumented legacy files absent"
 
 # 8s: Aider instructions (detection requires binary on PATH)
 if [ -f "$FAKE_HOME/CONVENTIONS.md" ]; then
-  if ! grep -q 'codebase-memory-mcp' "$FAKE_HOME/CONVENTIONS.md"; then
+  if ! grep -q 'codebase-memory-mcp-neo4j' "$FAKE_HOME/CONVENTIONS.md"; then
     echo "FAIL 8s: Aider CONVENTIONS.md missing content"
     exit 1
   fi
@@ -2026,7 +2026,7 @@ fi
 
 # 8t: KiloCode standalone config (modern JSONC schema).
 KILO_CFG="$FAKE_HOME/.config/kilo/kilo.jsonc"
-CMD=$(json_get "$KILO_CFG" "d['mcp']['codebase-memory-mcp']['command'][0]")
+CMD=$(json_get "$KILO_CFG" "d['mcp']['codebase-memory-mcp-neo4j']['command'][0]")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8t: KiloCode command='$CMD'"
   exit 1
@@ -2034,7 +2034,7 @@ fi
 echo "OK 8t: KiloCode MCP"
 
 # 8u: KiloCode rules file and explicit instructions reference.
-KILO_RULE="$FAKE_HOME/.config/kilo/rules/codebase-memory-mcp.md"
+KILO_RULE="$FAKE_HOME/.config/kilo/rules/codebase-memory-mcp-neo4j.md"
 if [ ! -f "$KILO_RULE" ]; then
   echo "FAIL 8u: KiloCode rules file missing"
   exit 1
@@ -2045,14 +2045,14 @@ if ! json_instructions_contain_path "$KILO_CFG" "$KILO_RULE"; then
   echo "FAIL 8u: KiloCode config does not load its installed rule"
   exit 1
 fi
-KILO_AGENT="$FAKE_HOME/.config/kilo/agents/codebase-memory.md"
+KILO_AGENT="$FAKE_HOME/.config/kilo/agents/codebase-memory-neo4j.md"
 if ! grep -q '^mode: subagent$' "$KILO_AGENT" 2>/dev/null ||
    ! grep -Fq '"*": deny' "$KILO_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_search_graph": allow' "$KILO_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_get_code_snippet": allow' "$KILO_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_check_index_coverage": allow' "$KILO_AGENT" 2>/dev/null ||
-   grep -Fq '"codebase-memory-mcp_*": allow' "$KILO_AGENT" 2>/dev/null ||
-   grep -qE 'codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-neo4j_search_graph": allow' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-neo4j_get_code_snippet": allow' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-neo4j_check_index_coverage": allow' "$KILO_AGENT" 2>/dev/null ||
+   grep -Fq '"codebase-memory-mcp-neo4j_*": allow' "$KILO_AGENT" 2>/dev/null ||
+   grep -qE 'codebase-memory-mcp-neo4j_(index_repository|delete_project|manage_adr|ingest_traces)' "$KILO_AGENT" 2>/dev/null ||
    grep -qE '^  (edit|bash|shell): allow$' "$KILO_AGENT" 2>/dev/null; then
   echo "FAIL 8u: KiloCode global read-only subagent is missing or over-permissive"
   exit 1
@@ -2067,13 +2067,13 @@ elif [[ "$BINARY" == *.exe ]]; then
 else
   VSCODE_CFG="$FAKE_HOME/.config/Code/User/mcp.json"
 fi
-CMD=$(json_get "$VSCODE_CFG" "d['servers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$VSCODE_CFG" "d['servers']['codebase-memory-mcp-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8v: VS Code command='$CMD'"
   exit 1
 fi
 echo "OK 8v: VS Code MCP"
-CMD=$(json_get "$VSCODE_PROFILE_CFG" "d['servers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$VSCODE_PROFILE_CFG" "d['servers']['codebase-memory-mcp-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8v-i: VS Code profile command='$CMD'"
   exit 1
@@ -2081,12 +2081,12 @@ fi
 echo "OK 8v-i: VS Code profile MCP"
 
 # 8w: OpenClaw MCP
-CMD=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "d['mcp']['servers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "d['mcp']['servers']['codebase-memory-mcp-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8w: OpenClaw command='$CMD'"
   exit 1
 fi
-ENABLED=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "d['mcp']['servers']['codebase-memory-mcp'].get('enabled')")
+ENABLED=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "d['mcp']['servers']['codebase-memory-mcp-neo4j'].get('enabled')")
 if [ "$ENABLED" = "False" ]; then
   echo "FAIL 8w: fresh OpenClaw entry is unexpectedly disabled"
   exit 1
@@ -2095,13 +2095,13 @@ echo "OK 8w: OpenClaw MCP (client-default enabled policy preserved)"
 for OPENCLAW_CONTEXT in \
   "$FAKE_HOME/.openclaw/workspace/AGENTS.md" \
   "$FAKE_HOME/.openclaw/workspace/TOOLS.md"; do
-  if ! grep -q '^## Codebase Knowledge Graph (codebase-memory-mcp)$' "$OPENCLAW_CONTEXT" 2>/dev/null ||
+  if ! grep -q '^## Codebase Knowledge Graph (codebase-memory-mcp-neo4j)$' "$OPENCLAW_CONTEXT" 2>/dev/null ||
      ! grep -q 'subagent' "$OPENCLAW_CONTEXT" 2>/dev/null; then
     echo "FAIL 8w-i: OpenClaw durable context missing in $OPENCLAW_CONTEXT"
     exit 1
   fi
 done
-OPENCLAW_COMPACTION=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "str('Codebase Knowledge Graph (codebase-memory-mcp)' in d['agents']['defaults']['compaction']['postCompactionSections'])")
+OPENCLAW_COMPACTION=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "str('Codebase Knowledge Graph (codebase-memory-mcp-neo4j)' in d['agents']['defaults']['compaction']['postCompactionSections'])")
 if [ "$OPENCLAW_COMPACTION" != "True" ]; then
   echo "FAIL 8w-i: OpenClaw compaction reinjection missing"
   exit 1
@@ -2109,24 +2109,24 @@ fi
 echo "OK 8w-i: OpenClaw session, compaction, and subagent context"
 
 # 8w-ii: Kiro MCP + always-on steering.
-CMD=$(json_get "$FAKE_HOME/.kiro/settings/mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
-KIRO_AGENT="$FAKE_HOME/.kiro/agents/codebase-memory.json"
-KIRO_AGENT_CMD=$(json_get "$KIRO_AGENT" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.kiro/settings/mcp.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
+KIRO_AGENT="$FAKE_HOME/.kiro/agents/codebase-memory-neo4j.json"
+KIRO_AGENT_CMD=$(json_get "$KIRO_AGENT" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! path_match "$KIRO_AGENT_CMD" "$SELF_PATH" ||
-   ! grep -q 'search_graph' "$FAKE_HOME/.kiro/steering/codebase-memory.md" 2>/dev/null ||
+   ! grep -q 'search_graph' "$FAKE_HOME/.kiro/steering/codebase-memory-neo4j.md" 2>/dev/null ||
    ! cat "$KIRO_AGENT" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 tools = d.get('tools', [])
-server = d.get('mcpServers', {}).get('codebase-memory-mcp', {})
-ok = (d.get('name') == 'codebase-memory' and tools[:3] == ['read', 'grep', 'glob'] and
-      '@codebase-memory-mcp/search_graph' in tools and
-      '@codebase-memory-mcp/check_index_coverage' in tools and
-      all('@codebase-memory-mcp/' + name not in tools for name in
+server = d.get('mcpServers', {}).get('codebase-memory-neo4j', {})
+ok = (d.get('name') == 'codebase-memory-neo4j' and tools[:3] == ['read', 'grep', 'glob'] and
+      '@codebase-memory-neo4j/search_graph' in tools and
+      '@codebase-memory-neo4j/check_index_coverage' in tools and
+      all('@codebase-memory-mcp-neo4j/' + name not in tools for name in
           ('index_repository', 'delete_project', 'manage_adr', 'ingest_traces')) and
-      '@codebase-memory-mcp' not in tools and d.get('includeMcpJson') is False and
-      set(d.get('mcpServers', {})) == {'codebase-memory-mcp'} and
+      '@codebase-memory-mcp-neo4j' not in tools and d.get('includeMcpJson') is False and
+      set(d.get('mcpServers', {})) == {'codebase-memory-neo4j'} and
       server.get('args') == ['--tool-profile', 'analysis'] and
       'search_graph' in d.get('prompt', ''))
 sys.exit(0 if ok else 1)
@@ -2143,18 +2143,18 @@ if [[ "$BINARY" == *.exe ]]; then
 else
   HERMES_HOME_DIR="$FAKE_HOME/.hermes"
 fi
-HERMES_CMD=$(sed -n '/^  codebase-memory-mcp:/{n;s/^ *command: *//p;}' \
+HERMES_CMD=$(sed -n '/^  codebase-memory-mcp-neo4j:/{n;s/^ *command: *//p;}' \
   "$HERMES_HOME_DIR/config.yaml" 2>/dev/null | head -1)
 if ! grep -q '^mcp_servers:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
-   ! grep -q '^  codebase-memory-mcp:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+   ! grep -q '^  codebase-memory-mcp-neo4j:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
    ! quoted_path_value_matches "$HERMES_CMD" "$SELF_PATH"; then
   echo "FAIL 8x: Hermes MCP mapping missing or malformed"
   exit 1
 fi
 echo "OK 8x: Hermes Agent MCP"
-if ! grep -q '^name: codebase-memory$' "$HERMES_HOME_DIR/skills/codebase-memory/SKILL.md" 2>/dev/null ||
-   ! grep -q 'delegate_task' "$HERMES_HOME_DIR/skills/codebase-memory/SKILL.md" 2>/dev/null ||
-   ! grep -q '`context`' "$HERMES_HOME_DIR/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+if ! grep -q '^name: codebase-memory-neo4j$' "$HERMES_HOME_DIR/skills/codebase-memory-neo4j/SKILL.md" 2>/dev/null ||
+   ! grep -q 'delegate_task' "$HERMES_HOME_DIR/skills/codebase-memory-neo4j/SKILL.md" 2>/dev/null ||
+   ! grep -q '`context`' "$HERMES_HOME_DIR/skills/codebase-memory-neo4j/SKILL.md" 2>/dev/null; then
   echo "FAIL 8x-i: Hermes delegation skill missing"
   exit 1
 fi
@@ -2169,24 +2169,24 @@ fi
 echo "OK 8x-ii: Hermes pre_llm_call context hook"
 
 # 8y: OpenHands MCP
-CMD=$(json_get "$FAKE_HOME/.openhands/mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.openhands/mcp.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8y: OpenHands command='$CMD'"
   exit 1
 fi
 echo "OK 8y: OpenHands MCP"
-if ! grep -q '^name: codebase-memory$' "$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md" 2>/dev/null ||
-   ! grep -q 'trace_path' "$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+if ! grep -q '^name: codebase-memory-neo4j$' "$FAKE_HOME/.agents/skills/codebase-memory-neo4j/SKILL.md" 2>/dev/null ||
+   ! grep -q 'trace_path' "$FAKE_HOME/.agents/skills/codebase-memory-neo4j/SKILL.md" 2>/dev/null; then
   echo "FAIL 8y-i: OpenHands shared skill missing"
   exit 1
 fi
 echo "OK 8y-i: OpenHands shared skill"
 
 # 8z: Cline CLI + IDE MCP and rules
-CLINE_RULE="$FAKE_HOME/.cline/rules/codebase-memory-mcp.md"
+CLINE_RULE="$FAKE_HOME/.cline/rules/codebase-memory-mcp-neo4j.md"
 for CLINE_CFG in "$FAKE_HOME/.cline/mcp.json" \
                  "$FAKE_HOME/.cline/data/settings/cline_mcp_settings.json"; do
-  CMD=$(json_get "$CLINE_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
+  CMD=$(json_get "$CLINE_CFG" "d['mcpServers']['codebase-memory-neo4j']['command']")
   if ! path_match "$CMD" "$SELF_PATH"; then
     echo "FAIL 8z: Cline command='$CMD' in $CLINE_CFG"
     exit 1
@@ -2217,7 +2217,7 @@ done
 echo "OK 8z: Cline MCP + instructions; unreliable automatic hooks withheld"
 
 # 8aa: Qwen Code MCP + instructions
-CMD=$(json_get "$FAKE_HOME/.qwen/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.qwen/settings.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH" || [ ! -f "$FAKE_HOME/.qwen/QWEN.md" ]; then
   echo "FAIL 8aa: Qwen Code integration incomplete"
   exit 1
@@ -2235,22 +2235,22 @@ echo "OK 8aa: Qwen Code MCP + instructions"
 if cat "$FAKE_HOME/.copilot/mcp-config.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-sys.exit(0 if 'codebase-memory-mcp' in d.get('mcpServers', {}) else 1)
+sys.exit(0 if 'codebase-memory-mcp-neo4j' in d.get('mcpServers', {}) else 1)
 " 2>/dev/null; then
   echo "FAIL 8ab: VS Code-only install created a Copilot CLI MCP entry"
   exit 1
 fi
-COPILOT_SKILL="$FAKE_HOME/.copilot/skills/codebase-memory/SKILL.md"
-COPILOT_AGENT="$FAKE_HOME/.copilot/agents/codebase-memory.agent.md"
+COPILOT_SKILL="$FAKE_HOME/.copilot/skills/codebase-memory-neo4j/SKILL.md"
+COPILOT_AGENT="$FAKE_HOME/.copilot/agents/codebase-memory-neo4j.agent.md"
 if ! grep -q 'search_graph' "$COPILOT_SKILL" 2>/dev/null ||
    ! grep -q '^tools:' "$COPILOT_AGENT" 2>/dev/null ||
-   ! grep -q 'codebase-memory-mcp/trace_path' "$COPILOT_AGENT" 2>/dev/null ||
-   grep -qE '^  - (edit|shell|bash|codebase-memory-mcp/(index_repository|delete_project|manage_adr|ingest_traces))$' "$COPILOT_AGENT" 2>/dev/null; then
+   ! grep -q 'codebase-memory-neo4j/trace_path' "$COPILOT_AGENT" 2>/dev/null ||
+   grep -qE '^  - (edit|shell|bash|codebase-memory-mcp-neo4j/(index_repository|delete_project|manage_adr|ingest_traces))$' "$COPILOT_AGENT" 2>/dev/null; then
   echo "FAIL 8ab: VS Code-only durable skill or read-only agent is wrong"
   exit 1
 fi
 echo "OK 8ab: VS Code-only durable skill + read-only agent; no CLI MCP config"
-COPILOT_HOOKS="$FAKE_HOME/.copilot/hooks/codebase-memory-mcp.json"
+COPILOT_HOOKS="$FAKE_HOME/.copilot/hooks/codebase-memory-mcp-neo4j.json"
 if ! grep -q 'sessionStart' "$COPILOT_HOOKS" 2>/dev/null ||
    ! grep -q 'subagentStart' "$COPILOT_HOOKS" 2>/dev/null ||
    ! grep -q 'powershell' "$COPILOT_HOOKS" 2>/dev/null ||
@@ -2261,8 +2261,8 @@ fi
 echo "OK 8ab-i: VS Code SessionStart + SubagentStart hooks"
 
 # 8ac: Factory Droid stdio MCP schema
-CMD=$(json_get "$FAKE_HOME/.factory/mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
-FACTORY_TYPE=$(json_get "$FAKE_HOME/.factory/mcp.json" "d['mcpServers']['codebase-memory-mcp']['type']")
+CMD=$(json_get "$FAKE_HOME/.factory/mcp.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
+FACTORY_TYPE=$(json_get "$FAKE_HOME/.factory/mcp.json" "d['mcpServers']['codebase-memory-neo4j']['type']")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$FACTORY_TYPE" != "stdio" ]; then
   echo "FAIL 8ac: Factory Droid MCP schema is wrong"
   exit 1
@@ -2290,24 +2290,24 @@ elif ! grep -q 'SessionStart' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
 else
   echo "OK 8ac-i: Factory durable instructions + SessionStart/PostToolUse Read"
 fi
-FACTORY_AGENT="$FAKE_HOME/.factory/droids/codebase-memory.md"
+FACTORY_AGENT="$FAKE_HOME/.factory/droids/codebase-memory-neo4j.md"
 if ! grep -q '^tools: \["Read", "LS", "Grep", "Glob",' "$FACTORY_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp__codebase-memory-mcp__search_graph' "$FACTORY_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$FACTORY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-neo4j__search_graph' "$FACTORY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-neo4j__check_index_coverage' "$FACTORY_AGENT" 2>/dev/null ||
    grep -q '^mcpServers:' "$FACTORY_AGENT" 2>/dev/null ||
-   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$FACTORY_AGENT" 2>/dev/null; then
+   grep -qE 'mcp__codebase-memory-neo4j__(index_repository|delete_project|manage_adr|ingest_traces)' "$FACTORY_AGENT" 2>/dev/null; then
   echo "FAIL 8ac-ii: Factory exact-tool Verify droid missing or over-privileged"
   exit 1
 fi
 echo "OK 8ac-ii: Factory exact-tool Verify droid"
 
 # 8ad: Crush stdio MCP schema + instructions
-CMD=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp']['command']")
-CRUSH_TYPE=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp']['type']")
-CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p).endswith('codebase-memory.md') for p in d['options']['context_paths']))")
+CMD=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp-neo4j']['command']")
+CRUSH_TYPE=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp-neo4j']['type']")
+CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p).endswith('codebase-memory-neo4j.md') for p in d['options']['context_paths']))")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$CRUSH_TYPE" != "stdio" ] ||
    [ "$CRUSH_CONTEXT" != "True" ] ||
-   ! grep -q 'does not inherit MCP access' "$FAKE_HOME/.config/crush/codebase-memory.md" 2>/dev/null; then
+   ! grep -q 'does not inherit MCP access' "$FAKE_HOME/.config/crush/codebase-memory-neo4j.md" 2>/dev/null; then
   echo "FAIL 8ad: Crush integration incomplete"
   exit 1
 fi
@@ -2319,10 +2319,10 @@ if [[ "$BINARY" == *.exe ]]; then
 else
   GOOSE_CFG="$FAKE_HOME/.config/goose/config.yaml"
 fi
-GOOSE_CMD=$(sed -n '/^  codebase-memory-mcp:/,/^  [^ ]/{s/^ *cmd: *//p;}' \
+GOOSE_CMD=$(sed -n '/^  codebase-memory-mcp-neo4j:/,/^  [^ ]/{s/^ *cmd: *//p;}' \
   "$GOOSE_CFG" 2>/dev/null | head -1)
 if ! grep -q '^extensions:' "$GOOSE_CFG" 2>/dev/null ||
-   ! grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
+   ! grep -q '^  codebase-memory-mcp-neo4j:' "$GOOSE_CFG" 2>/dev/null ||
    ! quoted_path_value_matches "$GOOSE_CMD" "$SELF_PATH"; then
   echo "FAIL 8ae: Goose extension missing or malformed"
   exit 1
@@ -2338,7 +2338,7 @@ echo "OK 8ae-i: Goose durable hints"
 # 8af: Mistral Vibe TOML array table
 VIBE_CMD=$(sed -n 's/^command *= *//p' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null | head -1)
 if ! grep -q '^\[\[mcp_servers\]\]' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
-   ! grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
+   ! grep -q '^name = "codebase-memory-mcp-neo4j"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
    ! quoted_path_value_matches "$VIBE_CMD" "$SELF_PATH"; then
   echo "FAIL 8af: Mistral Vibe MCP table missing or malformed"
   exit 1
@@ -2349,15 +2349,15 @@ if ! grep -q 'search_graph' "$FAKE_HOME/.vibe/AGENTS.md" 2>/dev/null ||
   echo "FAIL 8af-i: Vibe durable AGENTS.md missing"
   exit 1
 fi
-VIBE_AGENT="$FAKE_HOME/.vibe/agents/codebase-memory.toml"
-VIBE_PROMPT="$FAKE_HOME/.vibe/prompts/codebase-memory.md"
+VIBE_AGENT="$FAKE_HOME/.vibe/agents/codebase-memory-neo4j.toml"
+VIBE_PROMPT="$FAKE_HOME/.vibe/prompts/codebase-memory-neo4j.md"
 if ! grep -q '^agent_type = "subagent"$' "$VIBE_AGENT" 2>/dev/null ||
-   ! grep -Fq 'enabled_tools = ["read_file", "grep_search", "codebase-memory-mcp_search_graph"' "$VIBE_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_get_code_snippet"' "$VIBE_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_check_index_coverage"' "$VIBE_AGENT" 2>/dev/null ||
-   grep -Fq '"codebase-memory-mcp_*"' "$VIBE_AGENT" 2>/dev/null ||
-   grep -qE 'codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$VIBE_AGENT" 2>/dev/null ||
-   ! grep -q '^system_prompt_id = "codebase-memory"$' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq 'enabled_tools = ["read_file", "grep_search", "codebase-memory-neo4j_search_graph"' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-neo4j_get_code_snippet"' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-neo4j_check_index_coverage"' "$VIBE_AGENT" 2>/dev/null ||
+   grep -Fq '"codebase-memory-mcp-neo4j_*"' "$VIBE_AGENT" 2>/dev/null ||
+   grep -qE 'codebase-memory-mcp-neo4j_(index_repository|delete_project|manage_adr|ingest_traces)' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -q '^system_prompt_id = "codebase-memory-neo4j"$' "$VIBE_AGENT" 2>/dev/null ||
    ! grep -q 'search_graph' "$VIBE_PROMPT" 2>/dev/null ||
    ! grep -q 'Never edit files or perform state-changing actions' "$VIBE_PROMPT" 2>/dev/null; then
   echo "FAIL 8af-i: Vibe global subagent or prompt missing"
@@ -2366,7 +2366,7 @@ fi
 echo "OK 8af-i: Vibe durable instructions + graph-only subagent and prompt"
 
 # 8ag: Windsurf MCP + always-on global rules.
-CMD=$(json_get "$FAKE_HOME/.codeium/windsurf/mcp_config.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$FAKE_HOME/.codeium/windsurf/mcp_config.json" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q 'search_graph' "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" 2>/dev/null ||
    ! grep -q 'subagent' "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" 2>/dev/null; then
@@ -2383,17 +2383,17 @@ echo "OK 8ag: Windsurf MCP + global rules"
 # 8ah: Augment/Auggie MCP, durable rule, dedicated subagent, and matcher-free
 # SessionStart hook.
 AUGMENT_SETTINGS="$FAKE_HOME/.augment/settings.json"
-AUGMENT_RULE="$FAKE_HOME/.augment/rules/codebase-memory.md"
-AUGMENT_AGENT="$FAKE_HOME/.augment/agents/codebase-memory.md"
+AUGMENT_RULE="$FAKE_HOME/.augment/rules/codebase-memory-neo4j.md"
+AUGMENT_AGENT="$FAKE_HOME/.augment/agents/codebase-memory-neo4j.md"
 if [[ "$BINARY" == *.exe ]]; then
-  AUGMENT_SCRIPT="$FAKE_HOME/.augment/hooks/codebase-memory-session.ps1"
+  AUGMENT_SCRIPT="$FAKE_HOME/.augment/hooks/codebase-memory-neo4j-session.ps1"
 else
-  AUGMENT_SCRIPT="$FAKE_HOME/.augment/hooks/codebase-memory-session.sh"
+  AUGMENT_SCRIPT="$FAKE_HOME/.augment/hooks/codebase-memory-neo4j-session.sh"
 fi
-CMD=$(json_get "$AUGMENT_SETTINGS" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$AUGMENT_SETTINGS" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q 'search_graph' "$AUGMENT_RULE" 2>/dev/null ||
-   ! grep -q '^name: codebase-memory$' "$AUGMENT_AGENT" 2>/dev/null ||
+   ! grep -q '^name: codebase-memory-neo4j$' "$AUGMENT_AGENT" 2>/dev/null ||
    ! grep -q 'graph project' "$AUGMENT_AGENT" 2>/dev/null ||
    ! grep -q 'hook-augment' "$AUGMENT_SCRIPT" 2>/dev/null ||
    ! grep -q 'SessionStart' "$AUGMENT_SCRIPT" 2>/dev/null; then
@@ -2404,7 +2404,7 @@ if ! cat "$AUGMENT_SETTINGS" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 entries = d.get('hooks', {}).get('SessionStart', [])
-owned = [e for e in entries if any('codebase-memory-session' in str(h.get('command', '')) for h in e.get('hooks', []))]
+owned = [e for e in entries if any('codebase-memory-neo4j-session' in str(h.get('command', '')) for h in e.get('hooks', []))]
 ok = owned and all('matcher' not in e for e in owned) and any(h.get('timeout') == 5000 for e in owned for h in e.get('hooks', []))
 sys.exit(0 if ok else 1)
 " 2>/dev/null; then
@@ -2418,9 +2418,9 @@ fi
 echo "OK 8ah: Augment/Auggie MCP + SessionStart + subagent"
 
 # 8ai: Consolidated skill installed without recursively deleting legacy content.
-SKILL_FILE="$FAKE_HOME/.claude/skills/codebase-memory/SKILL.md"
+SKILL_FILE="$FAKE_HOME/.claude/skills/codebase-memory-neo4j/SKILL.md"
 if [ ! -s "$SKILL_FILE" ]; then
-  echo "FAIL 8ai: skill codebase-memory missing or empty"
+  echo "FAIL 8ai: skill codebase-memory-neo4j missing or empty"
   exit 1
 fi
 echo "OK 8ai: skill installed"
@@ -2428,16 +2428,16 @@ echo "OK 8ai: skill installed"
 # 8aj: Qoder MCP, skill, directly attached read-only graph agent, and current
 # lifecycle/read hooks. Legacy UserPromptSubmit is removed during migration.
 QODER_SETTINGS="$FAKE_HOME/.qoder/settings.json"
-QODER_SKILL="$FAKE_HOME/.qoder/skills/codebase-memory/SKILL.md"
-QODER_AGENT="$FAKE_HOME/.qoder/agents/codebase-memory.md"
-CMD=$(json_get "$QODER_SETTINGS" "d['mcpServers']['codebase-memory-mcp']['command']")
+QODER_SKILL="$FAKE_HOME/.qoder/skills/codebase-memory-neo4j/SKILL.md"
+QODER_AGENT="$FAKE_HOME/.qoder/agents/codebase-memory-neo4j.md"
+CMD=$(json_get "$QODER_SETTINGS" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q 'search_graph' "$QODER_SKILL" 2>/dev/null ||
-   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph' "$QODER_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-neo4j__search_graph' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-neo4j__check_index_coverage' "$QODER_AGENT" 2>/dev/null ||
    ! grep -q '^mcpServers:$' "$QODER_AGENT" 2>/dev/null ||
-   ! grep -q '^  - codebase-memory-mcp$' "$QODER_AGENT" 2>/dev/null ||
-   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q '^  - codebase-memory-mcp-neo4j$' "$QODER_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-neo4j__(index_repository|delete_project|manage_adr|ingest_traces)' "$QODER_AGENT" 2>/dev/null ||
    grep -q 'parent agent' "$QODER_AGENT" 2>/dev/null; then
   echo "FAIL 8aj: Qoder MCP, skill, or exact-tool Verify agent missing"
   exit 1
@@ -2476,9 +2476,9 @@ echo "OK 8aj: Qoder MCP + direct graph agent + lifecycle/read hooks"
 
 # 8ak: Kimi honors KIMI_CODE_HOME for MCP and durable parent/subagent context.
 KIMI_MCP="$CUSTOM_KIMI_HOME/mcp.json"
-KIMI_SKILL="$CUSTOM_KIMI_HOME/skills/codebase-memory/SKILL.md"
+KIMI_SKILL="$CUSTOM_KIMI_HOME/skills/codebase-memory-neo4j/SKILL.md"
 KIMI_CONFIG="$CUSTOM_KIMI_HOME/config.toml"
-CMD=$(json_get "$KIMI_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$KIMI_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
 KIMI_HOOK_COUNT=$(grep -cF '[[hooks]]' "$KIMI_CONFIG" 2>/dev/null || true)
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Kimi guidance$' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
@@ -2499,8 +2499,8 @@ echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hoo
 # 8al: Pi has documented instructions and skill, no invented MCP config, and
 # an installed generated extension that uses the non-deprecated stdin bridge.
 PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
-PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
-PI_EXTENSION="$FAKE_HOME/.pi/agent/extensions/cbmem.ts"
+PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory-neo4j/SKILL.md"
+PI_EXTENSION="$FAKE_HOME/.pi/agent/extensions/cbmem-neo4j.ts"
 if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
    ! grep -Fq "spawn(BIN, ['cli', '--json', tool], {" "$PI_EXTENSION" 2>/dev/null ||
@@ -2617,7 +2617,7 @@ else
 fi
 
 # 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
-WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
+WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory-neo4j/SKILL.md"
 if ! grep -q 'Sessions and Subagents' "$WARP_SKILL" 2>/dev/null ||
    [ -e "$FAKE_HOME/.warp/mcp.json" ] ||
    [ -e "$FAKE_HOME/.config/warp-terminal/mcp.json" ]; then
@@ -2631,13 +2631,13 @@ echo "OK 8am: Warp shared skill only (MCP remains manual)"
 # SessionStart augmentation remains withheld because current EAP docs say its
 # additionalContext output is ignored.
 JUNIE_MCP="$FAKE_HOME/.junie/mcp/mcp.json"
-JUNIE_SKILL="$FAKE_HOME/.junie/skills/codebase-memory/SKILL.md"
-JUNIE_AGENT="$FAKE_HOME/.junie/agents/codebase-memory.md"
-CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
-JUNIE_SCOUT_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-scout']['command']")
-JUNIE_ANALYSIS_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-analysis']['command']")
-JUNIE_SCOUT_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-scout']['args']")
-JUNIE_ANALYSIS_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-analysis']['args']")
+JUNIE_SKILL="$FAKE_HOME/.junie/skills/codebase-memory-neo4j/SKILL.md"
+JUNIE_AGENT="$FAKE_HOME/.junie/agents/codebase-memory-neo4j.md"
+CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
+JUNIE_SCOUT_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-neo4j-scout']['command']")
+JUNIE_ANALYSIS_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-neo4j-analysis']['command']")
+JUNIE_SCOUT_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-neo4j-scout']['args']")
+JUNIE_ANALYSIS_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-neo4j-analysis']['args']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! path_match "$JUNIE_SCOUT_CMD" "$SELF_PATH" ||
    ! path_match "$JUNIE_ANALYSIS_CMD" "$SELF_PATH" ||
@@ -2646,7 +2646,7 @@ if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q 'Sessions and Subagents' "$JUNIE_SKILL" 2>/dev/null ||
    ! grep -q 'description: "Default task-directed graph verification' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'tools: \["Read", "Grep", "Glob"\]' "$JUNIE_AGENT" 2>/dev/null ||
-   ! grep -q 'mcpServers: \["codebase-memory-analysis"\]' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcpServers: \["codebase-memory-neo4j-analysis"\]' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'hard-enforces the analysis tool profile' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'check_index_coverage' "$JUNIE_AGENT" 2>/dev/null ||
    grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$JUNIE_AGENT" 2>/dev/null ||
@@ -2657,7 +2657,7 @@ fi
 echo "OK 8an: Junie MCP + skill + restricted-server Verify agent"
 
 # 8ao: Conditional registry clients install only when an explicit config exists.
-CMD=$(json_get "$ROO_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$ROO_CFG" "d['mcpServers']['codebase-memory-neo4j']['command']")
 ROO_KEEP=$(json_get "$ROO_CFG" "d.get('keep', '')")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$ROO_KEEP" != "roo" ]; then
   echo "FAIL 8ao: explicit Roo config was not merged safely"
@@ -2667,7 +2667,7 @@ echo "OK 8ao: explicit conditional Roo config merged safely"
 
 # 8ap: GitLab Duo uses its documented MCP path. The optional SessionStart
 # augmenter is Unix-only and must preserve a pre-existing user hook.
-CMD=$(json_get "$GITLAB_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$GITLAB_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
 GITLAB_KEEP=$(json_get "$GITLAB_MCP" "d.get('keep', '')")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$GITLAB_KEEP" != "gitlab-mcp" ]; then
   echo "FAIL 8ap: GitLab Duo MCP is incomplete"
@@ -2710,7 +2710,7 @@ fi
 # 8aq: Devin receives MCP and durable context. On Unix, its prompt/compaction
 # augmentations are installed while SessionStart is inherited from Claude in
 # this fixture; on Windows all optional hooks are withheld.
-CMD=$(json_get "$DEVIN_CONFIG" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$DEVIN_CONFIG" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Devin guidance$' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
@@ -2762,19 +2762,19 @@ fi
 
 # 8ar: CodeBuddy Code CLI uses the current .mcp.json and durable skill/agent
 # surfaces. Beta settings hooks remain untouched.
-CMD=$(json_get "$CODEBUDDY_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+CMD=$(json_get "$CODEBUDDY_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
 CODEBUDDY_KEEP=$(json_get "$CODEBUDDY_MCP" "d.get('keep', '')")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$CODEBUDDY_KEEP" != "codebuddy" ] ||
    ! grep -q '^# Personal CodeBuddy guidance$' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'Sessions and Subagents' "$CODEBUDDY_SKILL" 2>/dev/null ||
    ! grep -q '^permissionMode: plan$' "$CODEBUDDY_AGENT" 2>/dev/null ||
-   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
-   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CODEBUDDY_AGENT" 2>/dev/null ||
-   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-neo4j__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-neo4j__check_index_coverage' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-neo4j__(index_repository|delete_project|manage_adr|ingest_traces)' "$CODEBUDDY_AGENT" 2>/dev/null ||
    grep -q '^tools:$' "$CODEBUDDY_AGENT" 2>/dev/null ||
-   grep -q 'mcp__codebase-memory__search_graph' "$CODEBUDDY_AGENT" 2>/dev/null ||
-   ! grep -q '^skills: codebase-memory$' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   grep -q 'mcp__codebase-memory-neo4j__search_graph' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q '^skills: codebase-memory-neo4j$' "$CODEBUDDY_AGENT" 2>/dev/null ||
    [ -e "$CODEBUDDY_SETTINGS" ]; then
   echo "FAIL 8ar: CodeBuddy current MCP, durable context, or read-only agent missing"
   exit 1
@@ -2783,8 +2783,8 @@ echo "OK 8ar: CodeBuddy .mcp.json + CODEBUDDY.md + skill/agent; no beta hooks"
 
 # 8as: Bob IDE is conditional on its existing mcp.json while Bob Shell is
 # detected from the bob executable. Both share rules; only the IDE gets a skill.
-BOB_IDE_CMD=$(json_get "$BOB_IDE_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
-BOB_SHELL_CMD=$(json_get "$BOB_SHELL_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+BOB_IDE_CMD=$(json_get "$BOB_IDE_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
+BOB_SHELL_CMD=$(json_get "$BOB_SHELL_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
 BOB_IDE_KEEP=$(json_get "$BOB_IDE_MCP" "d.get('keep', '')")
 BOB_SHELL_KEEP=$(json_get "$BOB_SHELL_MCP" "d.get('keep', '')")
 if ! path_match "$BOB_IDE_CMD" "$SELF_PATH" ||
@@ -2802,7 +2802,7 @@ echo "OK 8as: Bob IDE conditional MCP + Bob Shell MCP + shared rules/IDE skill"
 # 8at: Pochi keeps JSONC user content while adding the current mcp root. Its
 # handoff agent is intentionally limited to readFile because MCP allowlist names
 # are not documented for child agents.
-POCHI_CMD=$(sed '/^[[:space:]]*\/\//d' "$POCHI_MCP" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['mcp']['codebase-memory-mcp']['command'])" 2>/dev/null || echo "")
+POCHI_CMD=$(sed '/^[[:space:]]*\/\//d' "$POCHI_MCP" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['mcp']['codebase-memory-mcp-neo4j']['command'])" 2>/dev/null || echo "")
 POCHI_TOOL_COUNT=$(grep -c '^  - ' "$POCHI_AGENT" 2>/dev/null || true)
 if ! path_match "$POCHI_CMD" "$SELF_PATH" ||
    ! grep -q 'Personal Pochi setting' "$POCHI_MCP" 2>/dev/null ||
@@ -2822,7 +2822,7 @@ echo "OK 8at: Pochi config.jsonc + README/skill + readFile-only handoff agent"
 
 # 8au: Rovo's documented global AGENTS.md memory complements its skill and
 # handoff subagent; no undocumented lifecycle hook is invented.
-ROVO_CMD=$(json_get "$ROVO_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+ROVO_CMD=$(json_get "$ROVO_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$ROVO_CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Rovo guidance$' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
@@ -2836,7 +2836,7 @@ echo "OK 8au: Rovo MCP + global memory + skill/handoff agent"
 
 # 8av: The dedicated Amazon Q IDE page uses root default.json. Existing
 # agents/default.json and mcp.json remain compatibility fallbacks.
-AMAZON_Q_CMD=$(json_get "$AMAZON_Q_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+AMAZON_Q_CMD=$(json_get "$AMAZON_Q_MCP" "d['mcpServers']['codebase-memory-neo4j']['command']")
 if ! path_match "$AMAZON_Q_CMD" "$SELF_PATH" ||
    [ -e "$FAKE_HOME/.aws/amazonq/agents/default.json" ] ||
    [ -e "$FAKE_HOME/.aws/amazonq/mcp.json" ]; then
@@ -2862,7 +2862,7 @@ assert_tier_profile_set "Qwen" "$FAKE_HOME/.qwen/agents" ".md" "direct"
 assert_tier_profile_set "Factory" "$FAKE_HOME/.factory/droids" ".md" "direct"
 assert_tier_profile_set "Vibe" "$FAKE_HOME/.vibe/agents" ".toml" "direct"
 assert_tier_prompt_set "Vibe" "$FAKE_HOME/.vibe/prompts" ".md"
-for VIBE_SLUG in codebase-memory-scout codebase-memory codebase-memory-auditor; do
+for VIBE_SLUG in codebase-memory-neo4j-scout codebase-memory-neo4j codebase-memory-neo4j-auditor; do
   if ! grep -Fq "system_prompt_id = \"$VIBE_SLUG\"" "$FAKE_HOME/.vibe/agents/$VIBE_SLUG.toml" 2>/dev/null; then
     echo "FAIL 8aw: Vibe agent/prompt identifier mismatch for $VIBE_SLUG"
     exit 1
@@ -2881,24 +2881,24 @@ echo "OK 8aw: all supported Scout/Verify/Auditor profile sets"
 # hook: Grok's passive hook events discard stdout, so context hooks are withheld.
 GROK_CONFIG="$FAKE_HOME/.grok/config.toml"
 GROK_CMD=$(sed -n 's/^command *= *//p' "$GROK_CONFIG" 2>/dev/null | head -1)
-if ! grep -q '^\[mcp_servers\.codebase-memory-mcp\]$' "$GROK_CONFIG" 2>/dev/null ||
-   [ "$(grep -c '^\[mcp_servers\.codebase-memory-mcp\]$' "$GROK_CONFIG" 2>/dev/null)" != "1" ] ||
+if ! grep -q '^\[mcp_servers\.codebase-memory-mcp-neo4j\]$' "$GROK_CONFIG" 2>/dev/null ||
+   [ "$(grep -c '^\[mcp_servers\.codebase-memory-mcp-neo4j\]$' "$GROK_CONFIG" 2>/dev/null)" != "1" ] ||
    ! grep -q '^args = \[\]$' "$GROK_CONFIG" 2>/dev/null ||
    ! quoted_path_value_matches "$GROK_CMD" "$SELF_PATH"; then
   echo "FAIL 8ax: Grok Build MCP table missing or malformed"
   exit 1
 fi
-if ! grep -q 'search_graph' "$FAKE_HOME/.grok/rules/codebase-memory.md" 2>/dev/null ||
-   ! grep -q 'search_graph' "$FAKE_HOME/.grok/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+if ! grep -q 'search_graph' "$FAKE_HOME/.grok/rules/codebase-memory-neo4j.md" 2>/dev/null ||
+   ! grep -q 'search_graph' "$FAKE_HOME/.grok/skills/codebase-memory-neo4j/SKILL.md" 2>/dev/null; then
   echo "FAIL 8ax: Grok Build rules file or skill missing"
   exit 1
 fi
-GROK_AGENT="$FAKE_HOME/.grok/agents/codebase-memory.md"
+GROK_AGENT="$FAKE_HOME/.grok/agents/codebase-memory-neo4j.md"
 if ! grep -Fq 'tools: read_file, grep, list_dir, search_tool, use_tool' "$GROK_AGENT" 2>/dev/null ||
-   ! grep -Fq '    - codebase-memory-mcp' "$GROK_AGENT" 2>/dev/null ||
-   ! grep -Fq 'codebase-memory-mcp__search_graph' "$GROK_AGENT" 2>/dev/null ||
-   ! grep -Fq 'codebase-memory-mcp__check_index_coverage' "$GROK_AGENT" 2>/dev/null ||
-   grep -Fq 'codebase-memory-mcp__*' "$GROK_AGENT" 2>/dev/null; then
+   ! grep -Fq '    - codebase-memory-mcp-neo4j' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq 'codebase-memory-mcp-neo4j__search_graph' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq 'codebase-memory-mcp-neo4j__check_index_coverage' "$GROK_AGENT" 2>/dev/null ||
+   grep -Fq 'codebase-memory-mcp-neo4j__*' "$GROK_AGENT" 2>/dev/null; then
   echo "FAIL 8ax: Grok Build graph agent lacks named inheritance or dispatcher tool ids"
   exit 1
 fi
@@ -2930,7 +2930,7 @@ HOME="$FAKE_HOME" \
 if cat "$FAKE_HOME/.claude.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-if 'codebase-memory-mcp' in d.get('mcpServers', {}):
+if 'codebase-memory-mcp-neo4j' in d.get('mcpServers', {}):
     sys.exit(1)
 if not d.get('existingKey', False):
     sys.exit(2)
@@ -2946,7 +2946,7 @@ fi
 if [ ! -f "$FAKE_HOME/.claude/.mcp.json" ] || cat "$FAKE_HOME/.claude/.mcp.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-sys.exit(1 if 'codebase-memory-mcp' in d.get('mcpServers', {}) else 0)
+sys.exit(1 if 'codebase-memory-mcp-neo4j' in d.get('mcpServers', {}) else 0)
 " 2>/dev/null; then
   echo "OK 9c: legacy .mcp.json cleaned"
 else
@@ -2961,16 +2961,16 @@ d = json.load(sys.stdin)
 hooks = d.get('hooks', {})
 # Shim names cover legacy shell registrations; the exec form (#1733) carries
 # no shim name, so its 'hook-augment' argument is the owned marker there.
-found = any('cbm-code-discovery-gate' in str(h) or
-            'cbm-session-reminder' in str(h) or
-            'cbm-subagent-reminder' in str(h) or
+found = any('cbm-neo4j-code-discovery-gate' in str(h) or
+            'cbm-neo4j-session-reminder' in str(h) or
+            'cbm-neo4j-subagent-reminder' in str(h) or
             any('hook-augment' in str(x.get('args', [])) or
                 'hook-augment' in str(x.get('command', ''))
                 for x in h.get('hooks', []))
             for entries in hooks.values() for h in entries)
 sys.exit(1 if found else 0)
 " 2>/dev/null; then
-  for HOOK_SCRIPT in cbm-code-discovery-gate cbm-session-reminder cbm-subagent-reminder; do
+  for HOOK_SCRIPT in cbm-neo4j-code-discovery-gate cbm-neo4j-session-reminder cbm-neo4j-subagent-reminder; do
     if [ -e "$FAKE_HOME/.claude/hooks/$HOOK_SCRIPT" ]; then
       echo "FAIL 9d: owned hook script still present: $HOOK_SCRIPT"
       exit 1
@@ -2983,7 +2983,7 @@ else
 fi
 
 # 9e-f: Codex TOML cleaned, existing preserved
-if grep -q '\[mcp_servers.codebase-memory-mcp\]' "$FAKE_HOME/.codex/config.toml" 2>/dev/null; then
+if grep -q '\[mcp_servers.codebase-memory-neo4j\]' "$FAKE_HOME/.codex/config.toml" 2>/dev/null; then
   echo "FAIL 9e: Codex TOML still has MCP section"
   exit 1
 fi
@@ -2997,10 +2997,10 @@ echo "OK 9e-f: Codex TOML cleaned, existing preserved"
 if cat "$FAKE_HOME/.gemini/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-has_mcp = 'codebase-memory-mcp' in d.get('mcpServers', {})
+has_mcp = 'codebase-memory-mcp-neo4j' in d.get('mcpServers', {})
 has_existing = d.get('existingKey', False)
 hooks = d.get('hooks', {}).get('BeforeTool', [])
-has_hook = any('codebase-memory-mcp' in str(h) for h in hooks)
+has_hook = any('codebase-memory-mcp-neo4j' in str(h) for h in hooks)
 sys.exit(0 if (not has_mcp and has_existing and not has_hook) else 1)
 " 2>/dev/null; then
   echo "OK 9g-i: Gemini MCP removed, existing preserved, hooks removed"
@@ -3019,7 +3019,7 @@ for VSCODE_CHECK in "$VSCODE_CFG" "$VSCODE_PROFILE_CFG"; do
   if ! cat "$VSCODE_CHECK" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-sys.exit(1 if 'codebase-memory-mcp' in d.get('servers', {}) else 0)
+sys.exit(1 if 'codebase-memory-mcp-neo4j' in d.get('servers', {}) else 0)
 " 2>/dev/null; then
     echo "FAIL 9j: VS Code MCP still present in $VSCODE_CHECK"
     exit 1
@@ -3031,12 +3031,12 @@ echo "OK 9j: VS Code default and profile MCP removed"
 if cat "$FAKE_HOME/.openclaw/openclaw.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-has_mcp = 'codebase-memory-mcp' in d.get('mcp', {}).get('servers', {})
+has_mcp = 'codebase-memory-mcp-neo4j' in d.get('mcp', {}).get('servers', {})
 sections = d.get('agents', {}).get('defaults', {}).get('compaction', {}).get('postCompactionSections', [])
-sys.exit(1 if has_mcp or 'Codebase Knowledge Graph (codebase-memory-mcp)' in sections else 0)
+sys.exit(1 if has_mcp or 'Codebase Knowledge Graph (codebase-memory-mcp-neo4j)' in sections else 0)
 " 2>/dev/null; then
-  if grep -q 'codebase-memory-mcp:start' "$FAKE_HOME/.openclaw/workspace/AGENTS.md" 2>/dev/null ||
-     grep -q 'codebase-memory-mcp:start' "$FAKE_HOME/.openclaw/workspace/TOOLS.md" 2>/dev/null; then
+  if grep -q 'codebase-memory-mcp-neo4j:start' "$FAKE_HOME/.openclaw/workspace/AGENTS.md" 2>/dev/null ||
+     grep -q 'codebase-memory-mcp-neo4j:start' "$FAKE_HOME/.openclaw/workspace/TOOLS.md" 2>/dev/null; then
     echo "FAIL 9k: OpenClaw workspace context remains"
     exit 1
   fi
@@ -3073,7 +3073,7 @@ for SPEC in \
   if ! cat "$CFG" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-sys.exit(1 if 'codebase-memory-mcp' in d.get('$ROOT', {}) else 0)
+sys.exit(1 if 'codebase-memory-mcp-neo4j' in d.get('$ROOT', {}) else 0)
 " 2>/dev/null; then
     echo "FAIL 9l: MCP entry remains in $CFG"
     exit 1
@@ -3083,7 +3083,7 @@ if ! cat "$JUNIE_MCP" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 servers = d.get('mcpServers', {})
-names = {'codebase-memory-mcp', 'codebase-memory-scout', 'codebase-memory-analysis'}
+names = {'codebase-memory-mcp-neo4j', 'codebase-memory-neo4j-scout', 'codebase-memory-neo4j-analysis'}
 sys.exit(1 if names.intersection(servers) else 0)
 " 2>/dev/null; then
   echo "FAIL 9l: Junie default or restricted MCP alias remains"
@@ -3092,7 +3092,7 @@ fi
 POCHI_MCP_AFTER=$(sed '/^[[:space:]]*\/\//d' "$POCHI_MCP" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-print('present' if 'codebase-memory-mcp' in d.get('mcp', {}) else 'absent')
+print('present' if 'codebase-memory-mcp-neo4j' in d.get('mcp', {}) else 'absent')
 " 2>/dev/null || echo "invalid")
 if [ "$POCHI_MCP_AFTER" != "absent" ]; then
   echo "FAIL 9l: Pochi MCP entry remains or config.jsonc became invalid"
@@ -3103,9 +3103,9 @@ if grep -q 'hook-augment' "$QODER_SETTINGS" 2>/dev/null ||
    grep -q 'hook-augment' "$GITLAB_HOOKS" 2>/dev/null ||
    grep -q -- '--dialect devin' "$DEVIN_CONFIG" 2>/dev/null ||
    grep -q 'hook-augment' "$FAKE_HOME/.qwen/settings.json" 2>/dev/null ||
-   grep -q 'hook-augment' "$FAKE_HOME/.copilot/hooks/codebase-memory-mcp.json" 2>/dev/null ||
+   grep -q 'hook-augment' "$FAKE_HOME/.copilot/hooks/codebase-memory-mcp-neo4j.json" 2>/dev/null ||
    grep -q 'hook-augment' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
-   grep -q 'codebase-memory-session' "$AUGMENT_SETTINGS" 2>/dev/null ||
+   grep -q 'codebase-memory-neo4j-session' "$AUGMENT_SETTINGS" 2>/dev/null ||
    [ -e "$AUGMENT_AGENT" ] || [ -e "$AUGMENT_SCRIPT" ]; then
   echo "FAIL 9l: lifecycle hook entry remains"
   exit 1
@@ -3125,7 +3125,7 @@ if [ "$(json_get "$ROO_CFG" "d.get('keep', '')")" != "roo" ]; then
   echo "FAIL 9l: explicit Roo config lost its user key"
   exit 1
 fi
-if CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p).endswith('codebase-memory.md') for p in d.get('options', {}).get('context_paths', [])))") &&
+if CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p).endswith('codebase-memory-neo4j.md') for p in d.get('options', {}).get('context_paths', [])))") &&
    [ "$CRUSH_CONTEXT" = "True" ]; then
   echo "FAIL 9l: Crush context path remains"
   exit 1
@@ -3164,11 +3164,11 @@ fi
 echo "OK 9l: JSON agents, lifecycle hooks, and Kilo cleaned; foreign settings preserved"
 
 # 9m: YAML/TOML new agents are cleaned.
-if grep -q '^  codebase-memory-mcp:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+if grep -q '^  codebase-memory-mcp-neo4j:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
    grep -q '^  pre_llm_call:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
-   grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
-   grep -q 'codebase-memory-mcp' "$FAKE_HOME/.grok/config.toml" 2>/dev/null ||
-   grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
+   grep -q '^  codebase-memory-mcp-neo4j:' "$GOOSE_CFG" 2>/dev/null ||
+   grep -q 'codebase-memory-mcp-neo4j' "$FAKE_HOME/.grok/config.toml" 2>/dev/null ||
+   grep -q '^name = "codebase-memory-mcp-neo4j"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
   echo "FAIL 9m: YAML/TOML MCP entry remains"
   exit 1
 fi
@@ -3181,15 +3181,15 @@ echo "OK 9m: Hermes, Goose, Vibe, and Aider cleaned"
 # 9m-i: Durable managed blocks are removed without deleting user files.
 for CONTEXT_FILE in \
   "$ZED_INSTR" \
-  "$FAKE_HOME/.kiro/steering/codebase-memory.md" \
+  "$FAKE_HOME/.kiro/steering/codebase-memory-neo4j.md" \
   "$FAKE_HOME/.factory/AGENTS.md" \
   "$AUGMENT_RULE" \
-  "$FAKE_HOME/.config/crush/codebase-memory.md" \
+  "$FAKE_HOME/.config/crush/codebase-memory-neo4j.md" \
   "$FAKE_HOME/.config/goose/.goosehints" \
   "$KILO_RULE" \
   "$CLINE_RULE" \
   "$FAKE_HOME/.vibe/AGENTS.md" \
-  "$FAKE_HOME/.grok/rules/codebase-memory.md" \
+  "$FAKE_HOME/.grok/rules/codebase-memory-neo4j.md" \
   "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" \
   "$DEVIN_INSTRUCTIONS" \
   "$CODEBUDDY_INSTRUCTIONS" \
@@ -3198,7 +3198,7 @@ for CONTEXT_FILE in \
   "$ROVO_INSTRUCTIONS" \
   "$CUSTOM_KIMI_HOME/AGENTS.md" \
   "$PI_INSTRUCTIONS"; do
-  if grep -q 'codebase-memory-mcp:start' "$CONTEXT_FILE" 2>/dev/null; then
+  if grep -q 'codebase-memory-mcp-neo4j:start' "$CONTEXT_FILE" 2>/dev/null; then
     echo "FAIL 9m-i: managed instructions remain in $CONTEXT_FILE"
     exit 1
   fi
@@ -3218,17 +3218,17 @@ fi
 echo "OK 9m-i: durable instruction blocks removed"
 
 # 9n: Skills removed (consolidated skill dir)
-if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ] ||
-   [ -d "$HERMES_HOME_DIR/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.agents/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.qoder/skills/codebase-memory" ] ||
-   [ -d "$CUSTOM_KIMI_HOME/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.pi/agent/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.junie/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.rovodev/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.copilot/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.vibe/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.grok/skills/codebase-memory" ] ||
+if [ -d "$FAKE_HOME/.claude/skills/codebase-memory-neo4j" ] ||
+   [ -d "$HERMES_HOME_DIR/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.agents/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.qoder/skills/codebase-memory-neo4j" ] ||
+   [ -d "$CUSTOM_KIMI_HOME/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.pi/agent/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.junie/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.rovodev/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.copilot/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.vibe/skills/codebase-memory-neo4j" ] ||
+   [ -d "$FAKE_HOME/.grok/skills/codebase-memory-neo4j" ] ||
    [ -e "$DEVIN_SKILL" ] ||
    [ -e "$CODEBUDDY_SKILL" ] ||
    [ -e "$BOB_SKILL" ] ||
@@ -3331,18 +3331,18 @@ fi
 IDEM_HOME=$(smoke_mktemp_dir)
 mkdir -p "$IDEM_HOME/.local/bin"
 mark_claude_code_installed "$IDEM_HOME"
-copy_smoke_binary "$IDEM_HOME/.local/bin/codebase-memory-mcp"
+copy_smoke_binary "$IDEM_HOME/.local/bin/codebase-memory-mcp-neo4j"
 run_no_crash 9b-2 env HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$BINARY" install -y
 IDEM_INSTALLER="$BINARY"
 if [[ "$BINARY" == *.exe ]]; then
-  IDEM_INSTALLER="$IDEM_HOME/.local/bin/codebase-memory-mcp.exe"
+  IDEM_INSTALLER="$IDEM_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
 fi
 run_no_crash 9b-2-second env HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$IDEM_INSTALLER" install -y
 # Count MCP entries — should be exactly 1
 COUNT=$(cat "$IDEM_HOME/.claude.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-print(list(d.get('mcpServers',{}).keys()).count('codebase-memory-mcp'))
+print(list(d.get('mcpServers',{}).keys()).count('codebase-memory-neo4j'))
 " 2>/dev/null || echo "0")
 if [ "$COUNT" != "1" ]; then
   echo "FAIL 9b-2: double install created $COUNT entries (expected 1)"
@@ -3369,7 +3369,7 @@ smoke_rmtree "$CLEAN_HOME"
 # 9b-4: Install over corrupt JSON
 CORRUPT_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CORRUPT_HOME/.claude" "$CORRUPT_HOME/.local/bin"
-copy_smoke_binary "$CORRUPT_HOME/.local/bin/codebase-memory-mcp"
+copy_smoke_binary "$CORRUPT_HOME/.local/bin/codebase-memory-mcp-neo4j"
 echo '{invalid json here' > "$CORRUPT_HOME/.claude.json"
 run_no_crash 9b-4 env HOME="$CORRUPT_HOME" "$BINARY" install -y
 # Should either fix it or handle gracefully — not crash
@@ -3381,11 +3381,11 @@ smoke_rmtree "$CORRUPT_HOME"
 DBL_HOME=$(smoke_mktemp_dir)
 mkdir -p "$DBL_HOME/.local/bin"
 mark_claude_code_installed "$DBL_HOME"
-copy_smoke_binary "$DBL_HOME/.local/bin/codebase-memory-mcp"
+copy_smoke_binary "$DBL_HOME/.local/bin/codebase-memory-mcp-neo4j"
 run_no_crash 9b-8-install env HOME="$DBL_HOME" "$BINARY" install -y
 DBL_UNINSTALLER="$BINARY"
 if [[ "$BINARY" == *.exe ]]; then
-  DBL_UNINSTALLER="$DBL_HOME/.local/bin/codebase-memory-mcp.exe"
+  DBL_UNINSTALLER="$DBL_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
 fi
 run_no_crash 9b-8-first env HOME="$DBL_HOME" "$DBL_UNINSTALLER" uninstall -y -n
 run_no_crash 9b-8-second env HOME="$DBL_HOME" "$BINARY" uninstall -y -n
@@ -3417,7 +3417,7 @@ echo ""
 echo "=== Phase 10: binary security E2E ==="
 
 SECURITY_DIR=$(smoke_mktemp_dir)
-SECURITY_BIN="$SECURITY_DIR/codebase-memory-mcp"
+SECURITY_BIN="$SECURITY_DIR/codebase-memory-mcp-neo4j"
 copy_smoke_binary "$SECURITY_BIN"
 chmod 755 "$SECURITY_BIN"
 
@@ -3573,18 +3573,18 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   # through install.sh or `install`. The binary is self-contained, so a staged
   # copy is immediately able to render and remove its own integrations.
   if [[ "$BINARY" == *.exe ]]; then
-    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
     mkdir -p "$UPDATE_HOME/retired-install"
-    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp.exe"
+    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp-neo4j.exe"
   else
-    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
-    chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j"
+    chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j"
     mkdir -p "$UPDATE_HOME/retired-install"
-    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp"
-    chmod 755 "$UPDATE_HOME/retired-install/codebase-memory-mcp"
+    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp-neo4j"
+    chmod 755 "$UPDATE_HOME/retired-install/codebase-memory-mcp-neo4j"
     if [ "$(uname -s)" = "Darwin" ]; then
-      codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp" 2>/dev/null || true
-      codesign --sign - --force "$UPDATE_HOME/retired-install/codebase-memory-mcp" \
+      codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j" 2>/dev/null || true
+      codesign --sign - --force "$UPDATE_HOME/retired-install/codebase-memory-mcp-neo4j" \
         2>/dev/null || true
     fi
   fi
@@ -3594,9 +3594,9 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   # from the installed binary, and the installed copy drives the later
   # uninstall phases.
   if [[ "$BINARY" == *.exe ]]; then
-    UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+    UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
   else
-    UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j"
   fi
 
   # Pre-install agent config with positive prior-install identity. POSIX runs
@@ -3614,7 +3614,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
     STALE_CMD=$(cygpath -m "$STALE_CMD")
   fi
   STALE_CMD="$STALE_CMD" python3 -c \
-    'import json, os; print(json.dumps({"mcpServers":{"codebase-memory-mcp":{"command":os.environ["STALE_CMD"]}}}))' \
+    'import json, os; print(json.dumps({"mcpServers":{"codebase-memory-neo4j":{"command":os.environ["STALE_CMD"]}}}))' \
     > "$UPDATE_HOME/.claude.json"
 
   # 14a: Run actual update command (one composition ships — no variant flag)
@@ -3651,9 +3651,9 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
 
   # 14b: Verify new binary exists and runs
   if [[ "$BINARY" == *.exe ]]; then
-    UPD_BIN="$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+    UPD_BIN="$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe"
   else
-    UPD_BIN="$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    UPD_BIN="$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j"
   fi
   if [ ! -f "$UPD_BIN" ]; then
     echo "FAIL 14b: binary missing after update"
@@ -3685,7 +3685,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   HOME="$UPDATE_HOME" "$UPD_BIN" uninstall -y 2>&1
 
   # 14e: Verify binary removed
-  if [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp" ] || [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe" ]; then
+  if [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j" ] || [ -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j.exe" ]; then
     echo "FAIL 14e: binary still exists after uninstall"
     exit 1
   fi
@@ -3695,7 +3695,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   if cat "$UPDATE_HOME/.claude.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-if 'codebase-memory-mcp' in d.get('mcpServers', {}): sys.exit(1)
+if 'codebase-memory-mcp-neo4j' in d.get('mcpServers', {}): sys.exit(1)
 sys.exit(0)
 " 2>/dev/null; then
     echo "OK 14f: agent config removed by uninstall"
@@ -3710,16 +3710,16 @@ else
   # Local mode: basic binary replacement test (no download)
   UPDATE_DIR=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_DIR/install"
-  copy_smoke_binary "$UPDATE_DIR/install/codebase-memory-mcp"
-  chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp"
+  copy_smoke_binary "$UPDATE_DIR/install/codebase-memory-mcp-neo4j"
+  chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp-neo4j"
   copy_smoke_binary "$UPDATE_DIR/smoke-downloaded"
-  rm -f "$UPDATE_DIR/install/codebase-memory-mcp"
-  cp "$UPDATE_DIR/smoke-downloaded" "$UPDATE_DIR/install/codebase-memory-mcp"
-  chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp"
+  rm -f "$UPDATE_DIR/install/codebase-memory-mcp-neo4j"
+  cp "$UPDATE_DIR/smoke-downloaded" "$UPDATE_DIR/install/codebase-memory-mcp-neo4j"
+  chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp-neo4j"
   if [ "$(uname -s)" = "Darwin" ]; then
-    codesign --sign - --force "$UPDATE_DIR/install/codebase-memory-mcp" 2>/dev/null || true
+    codesign --sign - --force "$UPDATE_DIR/install/codebase-memory-mcp-neo4j" 2>/dev/null || true
   fi
-  if ! "$UPDATE_DIR/install/codebase-memory-mcp" --version > /dev/null 2>&1; then
+  if ! "$UPDATE_DIR/install/codebase-memory-mcp-neo4j" --version > /dev/null 2>&1; then
     echo "FAIL 14: binary replacement failed"
     exit 1
   fi
@@ -3770,7 +3770,7 @@ if [ "$DL_OS" = "darwin" ] || [ "$DL_OS" = "linux" ]; then
 else
   DL_EXT="zip"
 fi
-DL_ARCHIVE="codebase-memory-mcp-${DL_OS}-${DL_ARCH}.${DL_EXT}"
+DL_ARCHIVE="codebase-memory-mcp-neo4j-${DL_OS}-${DL_ARCH}.${DL_EXT}"
 
 # 12a: curl download
 echo "--- Phase 12a: curl download ---"
@@ -3823,15 +3823,15 @@ echo "OK 12c: checksum verified"
 echo "--- Phase 12d: extraction ---"
 (cd "$DL_DIR" && if [ "$DL_EXT" = "zip" ]; then unzip -q "$DL_ARCHIVE"; else tar -xzf "$DL_ARCHIVE"; fi)
 if [ "$DL_OS" = "windows" ]; then
-  DL_BIN="$DL_DIR/codebase-memory-mcp.exe"
+  DL_BIN="$DL_DIR/codebase-memory-mcp-neo4j.exe"
   # ONE binary per platform: a second executable in the archive would mean the
   # AV-flagged launcher/payload split came back.
-  if [ -e "$DL_DIR/codebase-memory-mcp.payload.exe" ]; then
+  if [ -e "$DL_DIR/codebase-memory-mcp-neo4j.payload.exe" ]; then
     echo "FAIL 12d: Windows archive still ships a launcher/payload pair"
     exit 1
   fi
 else
-  DL_BIN="$DL_DIR/codebase-memory-mcp"
+  DL_BIN="$DL_DIR/codebase-memory-mcp-neo4j"
 fi
 if [ ! -f "$DL_BIN" ]; then
   echo "FAIL 12d: binary not found after extraction"
@@ -3885,7 +3885,7 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
     "$REPO_ROOT/install.sh" --dir="$INSTALL_TEST_DIR" 2>&1 || true
 
   # 13b: binary placed
-  if [ ! -f "$INSTALL_TEST_DIR/codebase-memory-mcp" ]; then
+  if [ ! -f "$INSTALL_TEST_DIR/codebase-memory-mcp-neo4j" ]; then
     echo "FAIL 13b: binary not placed by install.sh"
     exit 1
   fi
@@ -3894,9 +3894,9 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
   # 13c: binary runs
   # Sign if needed on macOS
   if [ "$DL_OS" = "darwin" ]; then
-    codesign --sign - --force "$INSTALL_TEST_DIR/codebase-memory-mcp" 2>/dev/null || true
+    codesign --sign - --force "$INSTALL_TEST_DIR/codebase-memory-mcp-neo4j" 2>/dev/null || true
   fi
-  if ! "$INSTALL_TEST_DIR/codebase-memory-mcp" --version > /dev/null 2>&1; then
+  if ! "$INSTALL_TEST_DIR/codebase-memory-mcp-neo4j" --version > /dev/null 2>&1; then
     echo "FAIL 13c: installed binary doesn't run"
     exit 1
   fi
@@ -3904,7 +3904,7 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
 
   # 13d: macOS signature check
   if [ "$DL_OS" = "darwin" ]; then
-    if codesign -v "$INSTALL_TEST_DIR/codebase-memory-mcp" 2>/dev/null; then
+    if codesign -v "$INSTALL_TEST_DIR/codebase-memory-mcp-neo4j" 2>/dev/null; then
       echo "OK 13d: macOS binary signed"
     else
       echo "FAIL 13d: macOS binary not signed after install.sh"
@@ -3916,7 +3916,7 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
 
   # 13e: agent configs created (at least Claude Code: the fixture home is a
   # Claude Code user's)
-  if [ -f "$INSTALL_TEST_HOME/.claude.json" ] && grep -q 'codebase-memory-mcp' "$INSTALL_TEST_HOME/.claude.json" 2>/dev/null; then
+  if [ -f "$INSTALL_TEST_HOME/.claude.json" ] && grep -q 'codebase-memory-mcp-neo4j' "$INSTALL_TEST_HOME/.claude.json" 2>/dev/null; then
     echo "OK 13e: agent configs created by install.sh"
   else
     echo "FAIL 13e: install.sh did not create agent configs"
@@ -3972,9 +3972,9 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   fi
 
   # 13g: binary placed
-  PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp.exe"
-  if [ ! -f "$PS1_BIN" ] && [ -f "$PS1_TEST_DIR/codebase-memory-mcp" ]; then
-    PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp"
+  PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp-neo4j.exe"
+  if [ ! -f "$PS1_BIN" ] && [ -f "$PS1_TEST_DIR/codebase-memory-mcp-neo4j" ]; then
+    PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp-neo4j"
   fi
   if [ -f "$PS1_BIN" ]; then
     echo "OK 13g: binary placed by install.ps1"

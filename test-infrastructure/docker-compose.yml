@@ -180,7 +180,7 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
-        scripts/smoke-local.sh ./build/linux-arm64/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/linux-arm64/codebase-memory-mcp-neo4j
 
   smoke-amd64:
     build:
@@ -193,7 +193,7 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-amd64 &&
-        scripts/smoke-local.sh ./build/linux-amd64/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/linux-amd64/codebase-memory-mcp-neo4j
 
   # ── Soak (both CI legs) ────────────────────────────────────
   # The sequence (quick + #581 query-leak) lives in the canonical entry
@@ -211,7 +211,7 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
-        scripts/soak-legs.sh ./build/linux-arm64/codebase-memory-mcp ${CBM_SOAK_MINUTES:-10}
+        scripts/soak-legs.sh ./build/linux-arm64/codebase-memory-mcp-neo4j ${CBM_SOAK_MINUTES:-10}
 
   # ── Windows smoke (cross-compile + Wine) ──────────────────
   smoke-windows:
@@ -225,9 +225,9 @@ services:
     command:
       - |
         scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ BUILD_DIR=build/win-cross &&
-        test ! -e build/win-cross/codebase-memory-mcp.payload.exe &&
-        WINEDEBUG=-all wine64 ./build/win-cross/codebase-memory-mcp.exe --version &&
-        WINEDEBUG=-all wine64 cmd /c build/win-cross/codebase-memory-mcp.exe --version
+        test ! -e build/win-cross/codebase-memory-mcp-neo4j.payload.exe &&
+        WINEDEBUG=-all wine64 ./build/win-cross/codebase-memory-mcp-neo4j.exe --version &&
+        WINEDEBUG=-all wine64 cmd /c build/win-cross/codebase-memory-mcp-neo4j.exe --version
 
   # ── Linux portable (Alpine musl static) ────────────────────
   test-portable:
@@ -262,9 +262,9 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ STATIC=1 BUILD_DIR=build/alpine &&
-        file build/alpine/codebase-memory-mcp | grep -q "statically linked" &&
+        file build/alpine/codebase-memory-mcp-neo4j | grep -q "statically linked" &&
         echo "=== Verified: statically linked ===" &&
-        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp-neo4j
 
   # ── Artifact-flow smoke (package → extract → wrapper) ──────
   # The release venue smokes the shipped archive; this lane reproduces that
@@ -298,11 +298,11 @@ services:
     command:
       - |
         set -e
-        file build/alpine/codebase-memory-mcp | grep -q "statically linked"
+        file build/alpine/codebase-memory-mcp-neo4j | grep -q "statically linked"
         echo "=== glibc-floor: portable binary smoke on glibc 2.35 ==="
-        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp-neo4j
         echo "=== glibc-floor: dynamic binary must refuse (glibc 2.38+ floor) ==="
-        if build/linux-arm64/codebase-memory-mcp --version 2>/tmp/dynamic-floor.err; then
+        if build/linux-arm64/codebase-memory-mcp-neo4j --version 2>/tmp/dynamic-floor.err; then
           echo "ERROR: dynamic binary ran on glibc 2.35 — floor contract broken"
           exit 1
         fi

@@ -88,8 +88,8 @@ function fakeSource(jobs: () => IndexJob[] = () => []): ProjectsSource & { calls
             selfPid: 42,
             selfRssMb: 120.5,
             processes: [
-                { pid: 42, cpu: 0.2, rssMb: 120.5, elapsed: '00:10', command: 'codebase-memory-mcp', isSelf: true },
-                { pid: 43, cpu: 12.5, rssMb: 900, elapsed: '01:00', command: 'codebase-memory-mcp', isSelf: false },
+                { pid: 42, cpu: 0.2, rssMb: 120.5, elapsed: '00:10', command: 'codebase-memory-mcp-neo4j', isSelf: true },
+                { pid: 43, cpu: 12.5, rssMb: 900, elapsed: '01:00', command: 'codebase-memory-mcp-neo4j', isSelf: false },
             ],
         })),
     };

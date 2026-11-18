@@ -82,15 +82,15 @@ static bool cv_index(cv_proj_t *p, const cv_file_t *files, int count) {
     if (!p->project) {
         return false;
     }
-    /* Where the MCP server writes the project DB: CBM_CACHE_DIR, else the
+    /* Where the MCP server writes the project DB: CBM_NEO4J_CACHE_DIR, else the
      * per-user cache (same resolution as test_lang_contract.c). */
     char cache[700];
-    const char *configured = getenv("CBM_CACHE_DIR");
+    const char *configured = getenv("CBM_NEO4J_CACHE_DIR");
     const char *home = getenv("HOME");
     if (configured && configured[0]) {
         snprintf(cache, sizeof(cache), "%s", configured);
     } else {
-        snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home ? home : "/tmp");
+        snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp-neo4j", home ? home : "/tmp");
     }
     cbm_mkdir_p(cache, 0755);
     snprintf(p->dbpath, sizeof(p->dbpath), "%s/%s.db", cache, p->project);

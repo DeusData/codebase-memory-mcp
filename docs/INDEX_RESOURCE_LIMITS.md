@@ -14,9 +14,9 @@ existing large-repository workloads retain their current behavior.
 Set or reset them with the normal configuration command:
 
 ```bash
-codebase-memory-mcp config set index_max_files 250000
-codebase-memory-mcp config set index_max_source_mb 16384
-codebase-memory-mcp config reset index_max_files
+codebase-memory-mcp-neo4j config set index_max_files 250000
+codebase-memory-mcp-neo4j config set index_max_source_mb 16384
+codebase-memory-mcp-neo4j config reset index_max_files
 ```
 
 Values use base-10 integers. MiB means 1,048,576 bytes. Empty values, zero,

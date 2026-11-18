@@ -34,7 +34,7 @@ enum { PLATFORM_MKDTEMP_THREADS = 8, PLATFORM_MKDTEMP_ITERATIONS = 32 };
 #include <stdio.h>
 #include <string.h>
 
-/* Worker staging files land under CBM_CACHE_DIR, which users may place at
+/* Worker staging files land under CBM_NEO4J_CACHE_DIR, which users may place at
  * non-ASCII paths. On Windows the templates must round-trip through the wide
  * APIs; the ANSI CRT (_mktemp/_open) mangles UTF-8 bytes and fails. */
 /* Store DB paths embed full repo-path-derived project names; deep repo or
@@ -368,7 +368,7 @@ TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode) {
 /* The policy is per CALL SITE, not per path. The same user-owned link is
  * followed by the opted-in walk a configuration root uses and refused by the
  * plain walk a checkout uses: `~/.claude -> ~/dotfiles/claude` works for the
- * installer, while a repository that ships `.codebase-memory -> <a directory
+ * installer, while a repository that ships `.codebase-memory-neo4j -> <a directory
  * the user owns>` cannot redirect the artifact writer. Under euid 0 the
  * checked-in link is demoted to a non-root owner, since root-owned links are
  * trusted by both walks and a privileged walk never follows a user's link. */
@@ -404,7 +404,7 @@ TEST(platform_mkdir_p_follow_owned_is_per_call_site) {
     char artifacts_through_link[CBM_SZ_1K];
     char artifacts_outside[CBM_SZ_1K];
     (void)snprintf(outside, sizeof(outside), "%s/outside", base);
-    (void)snprintf(artifact_link, sizeof(artifact_link), "%s/repo/.codebase-memory", base);
+    (void)snprintf(artifact_link, sizeof(artifact_link), "%s/repo/.codebase-memory-neo4j", base);
     (void)snprintf(artifacts_through_link, sizeof(artifacts_through_link), "%s/artifacts",
                    artifact_link);
     (void)snprintf(artifacts_outside, sizeof(artifacts_outside), "%s/artifacts", outside);
@@ -729,11 +729,11 @@ static void *platform_capture_path_buffers(void *opaque) {
  * separate storage; process-global mutable buffers are a C data race. */
 TEST(platform_path_helpers_use_per_thread_storage) {
     const char *saved_home = getenv("HOME");
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
     ASSERT_EQ(cbm_setenv("HOME", "/tmp/cbm-platform-thread-home", 1), 0);
-    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", "/tmp/cbm-platform-thread-cache", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_NEO4J_CACHE_DIR", "/tmp/cbm-platform-thread-cache", 1), 0);
 
     atomic_int ready;
     atomic_int release;
@@ -772,9 +772,9 @@ TEST(platform_path_helpers_use_per_thread_storage) {
         (void)cbm_unsetenv("HOME");
     }
     if (saved_cache_copy) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache_copy, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_home_copy);
     free(saved_cache_copy);
@@ -791,7 +791,7 @@ TEST(platform_path_helpers_use_per_thread_storage) {
  * value and silently using the prefix would admit/log one root while placing
  * data somewhere the user never selected. Reject it instead of falling back. */
 TEST(platform_cache_dir_rejects_truncated_override) {
-    const char *saved = getenv("CBM_CACHE_DIR");
+    const char *saved = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
     size_t length = 5000U;
     char *value = malloc(length + 1U);
@@ -799,14 +799,14 @@ TEST(platform_cache_dir_rejects_truncated_override) {
     memcpy(value, "/tmp/", 5U);
     memset(value + 5U, 'a', length - 5U);
     value[length] = '\0';
-    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", value, 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_NEO4J_CACHE_DIR", value, 1), 0);
 
     const char *resolved = cbm_resolve_cache_dir();
 
     if (saved_copy) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_copy, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_copy);
     free(value);
@@ -949,29 +949,29 @@ TEST(platform_env_dup_honours_the_settings_resolver) {
 TEST(platform_setenv_preserves_utf8_in_wide_environment) {
     static const char utf8[] = "C:/cbm-cache-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac";
     static const wchar_t wide[] = L"C:/cbm-cache-\u0394-\u65e5\u672c";
-    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", utf8, 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_NEO4J_CACHE_DIR", utf8, 1), 0);
     wchar_t observed_wide[128];
-    ASSERT_EQ(GetEnvironmentVariableW(L"CBM_CACHE_DIR", observed_wide, 128), (DWORD)(wcslen(wide)));
+    ASSERT_EQ(GetEnvironmentVariableW(L"CBM_NEO4J_CACHE_DIR", observed_wide, 128), (DWORD)(wcslen(wide)));
     ASSERT_EQ(wcscmp(observed_wide, wide), 0);
     char observed_utf8[128];
-    ASSERT_NOT_NULL(cbm_safe_getenv("CBM_CACHE_DIR", observed_utf8, sizeof(observed_utf8), NULL));
+    ASSERT_NOT_NULL(cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", observed_utf8, sizeof(observed_utf8), NULL));
     ASSERT_STR_EQ(observed_utf8, utf8);
-    (void)cbm_unsetenv("CBM_CACHE_DIR");
+    (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     PASS();
 }
 
 /* Empty and absent variables have different fallback semantics. In
- * particular, an explicitly empty CBM_CACHE_DIR means "use the default"; it
+ * particular, an explicitly empty CBM_NEO4J_CACHE_DIR means "use the default"; it
  * must not be misreported as a failed wide-environment read. Unset is also
  * required to stay idempotent because test and process cleanup call it after
  * partially initialized paths. */
 TEST(platform_windows_empty_environment_is_read_and_unset_idempotently) {
-    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", "", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_NEO4J_CACHE_DIR", "", 1), 0);
     char observed[9] = "sentinel";
-    ASSERT_NOT_NULL(cbm_safe_getenv("CBM_CACHE_DIR", observed, sizeof(observed), "fallback"));
+    ASSERT_NOT_NULL(cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", observed, sizeof(observed), "fallback"));
     ASSERT_STR_EQ(observed, "");
-    ASSERT_EQ(cbm_unsetenv("CBM_CACHE_DIR"), 0);
-    ASSERT_EQ(cbm_unsetenv("CBM_CACHE_DIR"), 0);
+    ASSERT_EQ(cbm_unsetenv("CBM_NEO4J_CACHE_DIR"), 0);
+    ASSERT_EQ(cbm_unsetenv("CBM_NEO4J_CACHE_DIR"), 0);
     PASS();
 }
 #endif

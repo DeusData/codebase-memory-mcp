@@ -110,7 +110,7 @@ UI_HTTP_NEEDLES=(
 # Canary: proves the needle scan can actually see this file's strings. Without
 # it, handing the gate a gzip, a stub or a 0-byte file would pass every
 # absence assertion. 168+ occurrences in a real artifact, 0 in anything else.
-CANARY_NEEDLE='codebase-memory-mcp'
+CANARY_NEEDLE='codebase-memory-mcp-neo4j'
 
 # ── Args ────────────────────────────────────────────────────────────
 TARGETS=()
@@ -302,7 +302,7 @@ skipped_files=0
 check_file() {
     file="$1"
     # Two path components: the binary is literally named
-    # "codebase-memory-mcp", so the parent directory disambiguates the log.
+    # "codebase-memory-mcp-neo4j", so the parent directory disambiguates the log.
     token=$(printf '%s' "$file" | awk -F/ '{ if (NF > 1) print $(NF - 1) "/" $NF; else print $NF }')
     fmt=$(detect_format "$file")
     if [ "$fmt" = other ]; then

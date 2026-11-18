@@ -41,7 +41,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w0-spike';
 const SYMBOL = 'createUser';

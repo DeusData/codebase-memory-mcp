@@ -23,7 +23,7 @@ const {
   TAR_PATH_SKIP, buildZip, patternBytes, writeTarGz,
 } = require('./archive-fixtures.js');
 
-const EXECUTABLE = 'codebase-memory-mcp';
+const EXECUTABLE = 'codebase-memory-mcp-neo4j';
 // Spans several pipe chunks, so the counted writer sees a multi-chunk stream.
 const LARGE_EXECUTABLE = patternBytes(300 * 1024);
 // The size cap the 0.12.0 wrappers enforced, which refused every release.
@@ -91,7 +91,7 @@ test('tar extraction leaves no file when tar fails mid-stream', { skip: TAR_PATH
         fakeTarListing(UNIX_ARCHIVE_NAMES),
       ),
       // Non-zero exit, and tar's own diagnostic text after the colon.
-      /tar exited with status [1-9]\d* while extracting codebase-memory-mcp: \S/,
+      /tar exited with status [1-9]\d* while extracting codebase-memory-mcp-neo4j: \S/,
     );
     assert.deepEqual(fs.readdirSync(destination), []);
   }));
@@ -105,7 +105,7 @@ test('tar extraction rejects an empty executable', { skip: TAR_PATH_SKIP }, () =
 
     await assert.rejects(
       extractExactTarArchive(archive, destination, UNIX_ARCHIVE_NAMES, EXECUTABLE),
-      /archive member codebase-memory-mcp is empty/,
+      /archive member codebase-memory-mcp-neo4j is empty/,
     );
     assert.deepEqual(fs.readdirSync(destination), []);
   }));
@@ -250,7 +250,7 @@ function withLoopbackServer(handler, callback) {
 
 test('a loopback download fetches from a local server and refuses its redirects', () =>
   withScratch((root) => withLoopbackServer((request, response) => {
-    if (request.url === '/release/codebase-memory-mcp.tar.gz') {
+    if (request.url === '/release/codebase-memory-mcp-neo4j.tar.gz') {
       response.writeHead(200, { 'content-type': 'application/octet-stream' });
       response.end('loopback payload');
       return;
@@ -259,7 +259,7 @@ test('a loopback download fetches from a local server and refuses its redirects'
     response.end();
   }, async (origin) => {
     const archive = path.join(root, 'release.tar.gz');
-    await download(`${origin}/release/codebase-memory-mcp.tar.gz`, archive, true);
+    await download(`${origin}/release/codebase-memory-mcp-neo4j.tar.gz`, archive, true);
     assert.equal(fs.readFileSync(archive, 'utf8'), 'loopback payload');
 
     const redirected = path.join(root, 'redirected.tar.gz');
@@ -272,7 +272,7 @@ test('a loopback download fetches from a local server and refuses its redirects'
 
 test('CBM_DOWNLOAD_URL follows install.sh: HTTPS or exact-loopback HTTP only', () => {
   const { version } = require('../package.json');
-  const githubBase = `https://github.com/DeusData/codebase-memory-mcp/releases/download/v${version}`;
+  const githubBase = `https://github.com/haiderRizvii/codebase-memory-mcp/releases/download/v${version}`;
   assert.deepEqual(resolveDownloadBase({}), { base: githubBase, loopback: false });
   assert.deepEqual(
     resolveDownloadBase({ CBM_DOWNLOAD_URL: '' }), { base: githubBase, loopback: false },
@@ -305,7 +305,7 @@ test('CBM_DOWNLOAD_URL follows install.sh: HTTPS or exact-loopback HTTP only', (
     'HTTP://localhost/',
     'file:///tmp/releases',
     'ftp://localhost/releases',
-    'github.com/DeusData/codebase-memory-mcp',
+    'github.com/haiderRizvii/codebase-memory-mcp',
   ]) {
     assert.throws(
       () => resolveDownloadBase({ CBM_DOWNLOAD_URL: base }),

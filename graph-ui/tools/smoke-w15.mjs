@@ -13,7 +13,7 @@ import { startStaticProxy } from './lib/static-proxy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'verification', 'w15');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const SIDECAR = 'http://127.0.0.1:4141';
 const MIN_PORT = 4680;
@@ -56,7 +56,7 @@ async function main() {
         await mkdir(OUT, { recursive: true });
         home = await mkdtemp(join(tmpdir(), 'codeatlas-w15-home-'));
         runtime = await mkdtemp('/private/tmp/codeatlas-w15-runtime-');
-        process.env.CBM_RUNTIME_DIR = runtime;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtime;
         await indexRepository(BINARY, { home, repoPath: FIXTURE, project: 'codeatlasweb-w15' });
         serverPort = await findFreePort(MIN_PORT);
         server = (await startServer(BINARY, { home, port: serverPort, log: [] })).child;

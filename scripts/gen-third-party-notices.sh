@@ -16,7 +16,7 @@ mkdir -p "$(dirname "$OUT")"
 {
     echo "# Third-Party Notices"
     echo
-    echo "This file accompanies the codebase-memory-mcp binary distribution."
+    echo "This file accompanies the codebase-memory-mcp-neo4j binary distribution."
     echo "It aggregates THIRD_PARTY.md, the vendored grammar provenance"
     echo "manifest, and the verbatim license / notice texts of every vendored"
     echo "component, satisfying binary-redistribution notice requirements"

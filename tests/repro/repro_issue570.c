@@ -2,7 +2,7 @@
  * repro_issue570.c -- Reproduce-first case for OPEN bug #570.
  *
  * BUG #570: "Installer adds hooks to both hooks.json and config.toml"
- *   https://github.com/DeusData/codebase-memory-mcp/issues/570
+ *   https://github.com/haiderRizvii/codebase-memory-mcp/issues/570
  *
  * TWO FILES WRONGLY WRITTEN (Codex SessionStart hook):
  *   ~/.codex/config.toml   -- always written by cbm_upsert_codex_hooks()
@@ -128,7 +128,7 @@ TEST(repro_issue570_no_dual_hook_write) {
         FAIL("failed to create hooks.json");
 
     /* Build the dry-run install plan -- no files are mutated. */
-    char *json = cbm_build_install_plan_json(home, "/usr/local/bin/codebase-memory-mcp");
+    char *json = cbm_build_install_plan_json(home, "/usr/local/bin/codebase-memory-mcp-neo4j");
     ASSERT_NOT_NULL(json);
 
     /* Sanity: plan must be valid and detect Codex. */

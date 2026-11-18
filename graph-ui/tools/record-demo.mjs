@@ -78,7 +78,7 @@ import { startSocketSampler } from './lib/socket-sampler.mjs';
 const execFileAsync = promisify(execFile);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const OUT_DIR = join(ROOT, 'verification', 'w6', 'demo');
@@ -317,7 +317,7 @@ async function main() {
         // ---------------------------------------------- 2. HOME, Rendezvous
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-demo-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-demo-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         workspace = await mkdtemp(join(tmpdir(), 'codeatlasweb-demo-fixture-'));
         videoDir = await mkdtemp(join(tmpdir(), 'codeatlasweb-demo-video-'));
         log('isoliertes HOME:', home);

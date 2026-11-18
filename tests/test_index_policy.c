@@ -151,9 +151,9 @@ TEST(index_policy_cli_lists_both_operator_keys) {
 TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite) {
     char *cache = th_mktempdir("cbm_index_policy_cli");
     ASSERT_NOT_NULL(cache);
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1);
 
     char *set_valid[] = {"set", CBM_INDEX_CONFIG_MAX_FILES, "7"};
     char *set_invalid[] = {"set", CBM_INDEX_CONFIG_MAX_FILES, "0"};
@@ -172,9 +172,9 @@ TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite) {
     cbm_config_close(config);
 
     if (saved_cache_copy) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache_copy, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache_copy);
     th_cleanup(cache);
@@ -234,9 +234,9 @@ static int index_policy_config_stderr(int argc, char **argv, char *out, size_t c
 TEST(index_policy_cli_set_reports_a_failed_write) {
     char *cache = th_mktempdir("cbm_index_policy_cli_write");
     ASSERT_NOT_NULL(cache);
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1);
 
     char db_path[1024];
     (void)snprintf(db_path, sizeof(db_path), "%s/_config.db", cache);
@@ -254,9 +254,9 @@ TEST(index_policy_cli_set_reports_a_failed_write) {
     int rc = index_policy_config_stderr(3, set_valid, captured, sizeof(captured));
 
     if (saved_cache_copy) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache_copy, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache_copy);
     th_cleanup(cache);
@@ -293,9 +293,9 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
     ASSERT_NOT_NULL(cache);
     ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first(void) { return 1; }\n"), 0);
 
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1);
     cbm_config_t *config = cbm_config_open(cache);
     cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
     if (server && config) {
@@ -373,9 +373,9 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
     th_cleanup(repo);
     th_cleanup(cache);
     if (saved_cache_copy) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache_copy, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache_copy);
 

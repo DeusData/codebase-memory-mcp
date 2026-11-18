@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Publish byte-identical ui-*-named copies of the release archives.
 #
-# Every codebase-memory-mcp 0.9.x binary in the field asks for
-# codebase-memory-mcp-ui-<platform>.<ext> when its (now-removed) variant chooser
+# Every codebase-memory-mcp-neo4j 0.9.x binary in the field asks for
+# codebase-memory-mcp-neo4j-ui-<platform>.<ext> when its (now-removed) variant chooser
 # is answered "ui". v0.10.0 consolidated to a single archive per platform with
 # the UI always embedded, so that asset stopped existing and those updaters 404
 # with no path forward but a manual reinstall (#1538, discussion #1526).
@@ -23,16 +23,16 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 gh release download "$VERSION" --dir "$work" --repo "$REPOSITORY" \
-  --pattern 'codebase-memory-mcp-*.tar.gz' --pattern 'codebase-memory-mcp-*.zip'
+  --pattern 'codebase-memory-mcp-neo4j-*.tar.gz' --pattern 'codebase-memory-mcp-neo4j-*.zip'
 
 shopt -s nullglob
 aliases=()
-for archive in "$work"/codebase-memory-mcp-*; do
+for archive in "$work"/codebase-memory-mcp-neo4j-*; do
   base="$(basename "$archive")"
   case "$base" in
-  codebase-memory-mcp-ui-*) continue ;;
+  codebase-memory-mcp-neo4j-ui-*) continue ;;
   esac
-  alias_path="$work/${base/codebase-memory-mcp-/codebase-memory-mcp-ui-}"
+  alias_path="$work/${base/codebase-memory-mcp-neo4j-/codebase-memory-mcp-neo4j-ui-}"
   cp -- "$archive" "$alias_path"
   aliases+=("$alias_path")
 done

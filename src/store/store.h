@@ -406,8 +406,8 @@ typedef struct {
     const char *const *exclude_labels; /* NULL-terminated, or NULL */
     const char *relationship;          /* node touches an edge of this type; NULL = any */
     bool exclude_entry_points;
-    const char *kind;           /* properties kind (exact); NULL/"" = any */
-    const char *namespace_name; /* third obj_key segment (any case); NULL/"" = any */
+    const char *kind;                    /* properties kind (exact); NULL/"" = any */
+    const char *namespace_name;          /* third obj_key segment (any case); NULL/"" = any */
     const char *const *name_contains_ci; /* NULL-terminated literals, all required */
     const char *const *qn_contains_ci;
     const char *const *file_contains_ci;
@@ -420,7 +420,7 @@ typedef struct {
 typedef enum {
     CBM_REMOTE_COUNT_NODES = 0,
     CBM_REMOTE_COUNT_EDGES,
-    CBM_REMOTE_COUNT_EDGES_BY_TYPE, /* arg = type */
+    CBM_REMOTE_COUNT_EDGES_BY_TYPE,  /* arg = type */
     CBM_REMOTE_COUNT_NODES_BY_LABEL, /* arg = label */
 } cbm_remote_count_t;
 
@@ -450,8 +450,8 @@ typedef struct cbm_store_remote_ops {
     int (*search)(void *ctx, const cbm_remote_search_t *q, cbm_search_result_t **out, int *count,
                   int *total);
     /* Distinct caller / callee names over CALLS, HTTP_CALLS, ASYNC_CALLS. */
-    int (*neighbor_names)(void *ctx, int64_t node_id, int limit, char ***callers,
-                          int *caller_count, char ***callees, int *callee_count);
+    int (*neighbor_names)(void *ctx, int64_t node_id, int limit, char ***callers, int *caller_count,
+                          char ***callees, int *callee_count);
     /* Same set and order as cbm_store_list_files. */
     int (*list_files)(void *ctx, const char *project, char ***out, int *count);
     /* Label / edge-type counts, and with_props the property keys, like

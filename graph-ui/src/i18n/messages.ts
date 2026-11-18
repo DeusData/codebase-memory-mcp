@@ -992,7 +992,7 @@ export const messages = {
         listLoading: 'asking the server ...',
         listEmpty:
             'nothing is indexed yet. Index a repository below, or on the command line: '
-            + 'codebase-memory-mcp cli index_repository',
+            + 'codebase-memory-mcp-neo4j cli index_repository',
         listError: (detail: string): string => `the list did not arrive: ${detail}`,
         refresh: 'refresh',
         openNow: 'open now',
@@ -1076,8 +1076,8 @@ export const messages = {
         processesSource: 'read from GET /api/processes',
         processesSelf: (pid: number, mb: string): string => `serving this page: pid ${pid}, ${mb} MB resident`,
         processesOthers: (count: number): string =>
-            count === 1 ? 'one other codebase-memory-mcp process' : `${count} other codebase-memory-mcp processes`,
-        processesNone: 'no other codebase-memory-mcp process is running',
+            count === 1 ? 'one other codebase-memory-mcp-neo4j process' : `${count} other codebase-memory-mcp-neo4j processes`,
+        processesNone: 'no other codebase-memory-mcp-neo4j process is running',
         processRow: (pid: number, cpu: string, mb: string, elapsed: string): string =>
             `pid ${pid}: ${cpu}% cpu, ${mb} MB, up ${elapsed}`,
         processesError: (detail: string): string => `the process list did not arrive: ${detail}`,

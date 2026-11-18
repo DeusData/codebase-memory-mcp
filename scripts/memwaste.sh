@@ -61,9 +61,9 @@ fi
 
 case "$LANE" in
 event) BUILD_ARGS=(BUILD_DIR=build/memwaste MEMWASTE=1 ${CC:+CC=$CC} ${CXX:+CXX=$CXX})
-    BIN="$ROOT/build/memwaste/codebase-memory-mcp" ;;
+    BIN="$ROOT/build/memwaste/codebase-memory-mcp-neo4j" ;;
 access) BUILD_ARGS=(BUILD_DIR=build/memwaste-access MEMWASTE_ACCESS=1 CC=clang CXX=clang++)
-    BIN="$ROOT/build/memwaste-access/codebase-memory-mcp" ;;
+    BIN="$ROOT/build/memwaste-access/codebase-memory-mcp-neo4j" ;;
 *) echo "memwaste.sh: --lane must be event or access" >&2; exit 2 ;;
 esac
 if [ "$BUILD" -eq 1 ]; then
@@ -106,8 +106,8 @@ if command -v cygpath >/dev/null 2>&1 && ! command -v winepath >/dev/null 2>&1; 
         exit 2
     fi
     mkdir -p "$WORK/cache" "$WORK/rt"
-    cp "$BIN.exe" "$WORK/codebase-memory-mcp.exe" 2>/dev/null || cp "$BIN" "$WORK/codebase-memory-mcp.exe"
-    RUN_BIN="$WORK/codebase-memory-mcp.exe"
+    cp "$BIN.exe" "$WORK/codebase-memory-mcp-neo4j.exe" 2>/dev/null || cp "$BIN" "$WORK/codebase-memory-mcp-neo4j.exe"
+    RUN_BIN="$WORK/codebase-memory-mcp-neo4j.exe"
     CACHE_DIR="$WORK_W\\cache"
     RUNTIME="$WORK_W\\rt"
     DUMP_ENV="$(cygpath -w "$DUMP")"
@@ -143,7 +143,7 @@ MEMWASTE_BUDGET_MB="${CBM_MEM_BUDGET_MB:-4096}"
 
 INDEX_RC=0
 CBM_MEM_BUDGET_MB="$MEMWASTE_BUDGET_MB" \
-    CBM_MEMWASTE=1 CBM_MEMWASTE_OUT="$DUMP_ENV" CBM_CACHE_DIR="$CACHE_DIR" CBM_RUNTIME_DIR="$RUNTIME" \
+    CBM_MEMWASTE=1 CBM_MEMWASTE_OUT="$DUMP_ENV" CBM_NEO4J_CACHE_DIR="$CACHE_DIR" CBM_NEO4J_RUNTIME_DIR="$RUNTIME" \
     CBM_LOG_LEVEL=error "$RUN_BIN" cli index_repository --repo-path "$REPO" --mode full \
     >"$OUT/index.json" || INDEX_RC=$?
 if [ "$INDEX_RC" -ne 0 ]; then

@@ -68,18 +68,18 @@ static void capture_reset(void) {
 static char *index_capture(RProj *lp) {
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
-    char *prior = getenv("CBM_CACHE_DIR");
+    char *prior = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved = prior ? strdup(prior) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", lp->cachedir, 1);
     capture_reset();
     cbm_log_set_sink_ex(capture_sink, CBM_LOG_SINK_TEE);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
     cbm_log_set_sink(NULL);
     if (saved) {
-        cbm_setenv("CBM_CACHE_DIR", saved, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved, 1);
         free(saved);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     return resp;
 }
@@ -121,14 +121,14 @@ TEST(index_format_siblings_distinct_and_searchable) {
      * merges both, so assert against the file list. */
     snprintf(args, sizeof(args),
              "{\"project\":\"%s\",\"pattern\":\"repro-marker\",\"mode\":\"files\"}", lp.project);
-    char *saved_dup = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", lp.cachedir, 1);
+    char *saved_dup = getenv("CBM_NEO4J_CACHE_DIR") ? strdup(getenv("CBM_NEO4J_CACHE_DIR")) : NULL;
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", lp.cachedir, 1);
     char *resp = cbm_mcp_handle_tool(lp.srv, "search_code", args);
     if (saved_dup) {
-        cbm_setenv("CBM_CACHE_DIR", saved_dup, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_dup, 1);
         free(saved_dup);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     ASSERT_NOT_NULL(resp);
     for (int i = 0; i < k_nfiles; i++) {

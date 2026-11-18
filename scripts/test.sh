@@ -289,6 +289,9 @@ bash "$ROOT/tests/test_soak_runtime_isolation_contract.sh"
 echo "=== Step 0e: Windows launcher bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
+echo "=== Step 0e1: Docker graph entrypoint contract ==="
+bash "$ROOT/tests/test_docker_graph_entrypoint.sh"
+
 echo "=== Step 0e2: activation refusal diagnostic contract ==="
 bash "$ROOT/tests/test_activation_diagnostic_contract.sh"
 
@@ -493,7 +496,7 @@ fi
 # they stay that way.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
-WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
+WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp-neo4j"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
 # Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which

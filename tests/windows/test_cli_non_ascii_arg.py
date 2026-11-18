@@ -2,7 +2,7 @@
 
 Guards the CLI-argv fix for issue #636 / #423 / #20 on native Windows.
 
-The documented entrypoint `codebase-memory-mcp cli index_repository '<json>'`
+The documented entrypoint `codebase-memory-mcp-neo4j cli index_repository '<json>'`
 receives its JSON argument through argv. main() used to take only the narrow
 `int main(int argc, char **argv)` (src/main.c), so on Windows the C runtime handed
 it argv in the active ANSI code page: a repo_path containing non-ASCII characters
@@ -23,7 +23,7 @@ argv path delivery was lossy.
 Exit code: 0 == honored (green), 1 == rejected/mangled (red), 2 == setup error.
 
 Usage:
-    python test_cli_non_ascii_arg.py <path-to-codebase-memory-mcp[.exe]>
+    python test_cli_non_ascii_arg.py <path-to-codebase-memory-mcp-neo4j[.exe]>
 """
 import json
 import os
@@ -76,7 +76,7 @@ def main():
         ctrl_err = ""
         for attempt in ("cache_ascii", "cache_ascii_retry"):
             env = dict(os.environ)
-            env["CBM_CACHE_DIR"] = os.path.join(work, attempt)
+            env["CBM_NEO4J_CACHE_DIR"] = os.path.join(work, attempt)
             ctrl = subprocess.run(
                 [binary, "cli", "index_repository",
                  json.dumps({"repo_path": ascii_repo})],
@@ -98,7 +98,7 @@ def main():
             return 2
 
         env2 = dict(os.environ)
-        env2["CBM_CACHE_DIR"] = cache
+        env2["CBM_NEO4J_CACHE_DIR"] = cache
         # Exercise the DEFAULT (supervisor-enabled) path, not in-process. The non-ASCII
         # repo path must survive BOTH the argv read (main() wide command line) AND the
         # supervisor -> worker spawn (CreateProcessW). The suite runner sets
@@ -124,7 +124,7 @@ def main():
         cjk_repo = os.path.join(work, "\u96f7\u9054\u6e2c\u8a66")
         make_fixture(cjk_repo)
         env3 = dict(os.environ)
-        env3["CBM_CACHE_DIR"] = os.path.join(work, "cache_cjk")
+        env3["CBM_NEO4J_CACHE_DIR"] = os.path.join(work, "cache_cjk")
         env3.pop("CBM_INDEX_SUPERVISOR", None)
         p2 = subprocess.run([binary, "cli", "index_repository",
                              "--repo-path", cjk_repo, "--mode", "fast"],

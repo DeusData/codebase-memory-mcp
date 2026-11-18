@@ -12,17 +12,17 @@ RUN apt-get update -qq \
 WORKDIR /src
 COPY . .
 RUN make -f Makefile.cbm cbm BUILD_DIR=/build -j"$(nproc)" \
- && /build/codebase-memory-mcp --version
+ && /build/codebase-memory-mcp-neo4j --version
 
 # ── Runtime ──────────────────────────────────────────────────────────
 # gcc:14 is Debian 13; the binary needs its newer libstdc++/libgcc_s.
 FROM debian:trixie-slim
 RUN apt-get update -qq \
- && apt-get install -y -qq --no-install-recommends git rsync zlib1g ca-certificates curl \
+ && apt-get install -y -qq --no-install-recommends git rsync zlib1g ca-certificates curl jq \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/lib64/libstdc++.so.6* /usr/local/lib64/libgcc_s.so.1 /usr/local/lib64/
 RUN echo /usr/local/lib64 > /etc/ld.so.conf.d/gcc14.conf && ldconfig
-COPY --from=build /build/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
+COPY --from=build /build/codebase-memory-mcp-neo4j /usr/local/bin/codebase-memory-mcp-neo4j
 COPY docker/graph/cbm-graph.sh /usr/local/bin/cbm-graph
 RUN sed -i 's/\r$//' /usr/local/bin/cbm-graph && chmod 0755 /usr/local/bin/cbm-graph
 

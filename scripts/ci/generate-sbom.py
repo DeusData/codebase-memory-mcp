@@ -31,11 +31,11 @@ sbom = {
     "spdxVersion": "SPDX-2.3",
     "dataLicense": "CC0-1.0",
     "SPDXID": "SPDXRef-DOCUMENT",
-    "name": f"codebase-memory-mcp-{version}",
-    "documentNamespace": f"https://github.com/DeusData/codebase-memory-mcp/releases/{version}",
+    "name": f"codebase-memory-mcp-neo4j-{version}",
+    "documentNamespace": f"https://github.com/haiderRizvii/codebase-memory-mcp/releases/{version}",
     "creationInfo": {
         "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "creators": ["Tool: codebase-memory-mcp-release-pipeline"],
+        "creators": ["Tool: codebase-memory-mcp-neo4j-release-pipeline"],
     },
     "packages": [
         {"SPDXID": "SPDXRef-Package-sqlite3", "name": "sqlite3", "versionInfo": "3.51.3", "licenseDeclared": "blessing", "downloadLocation": "https://sqlite.org", "filesAnalyzed": False},

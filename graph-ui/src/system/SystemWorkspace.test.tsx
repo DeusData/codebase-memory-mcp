@@ -7,7 +7,7 @@ import { readHealth, readLogs, readProcesses } from '../projects/projects-model'
 
 let container: HTMLDivElement;
 let root: Root;
-const processes = (unit = 'percent') => readProcesses({ self_pid: 42, self_rss_mb: 150.5, cpu_unit: unit, memory_kind: 'resident', self_memory_kind: 'peak_resident', processes: [{ pid: 42, cpu: 2.5, rss_mb: 120, elapsed: '01:00', command: 'codebase-memory-mcp', is_self: true }] });
+const processes = (unit = 'percent') => readProcesses({ self_pid: 42, self_rss_mb: 150.5, cpu_unit: unit, memory_kind: 'resident', self_memory_kind: 'peak_resident', processes: [{ pid: 42, cpu: 2.5, rss_mb: 120, elapsed: '01:00', command: 'codebase-memory-mcp-neo4j', is_self: true }] });
 const source = (): SystemWorkspaceProps['api'] => ({
     processes: vi.fn().mockResolvedValue(processes()),
     logs: vi.fn().mockResolvedValue({ lines: ['level=INFO msg=ready', 'level=ERROR msg=Index_failed', '{"level":"warn","event":"slow"}'], total: 10 }),

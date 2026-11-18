@@ -301,7 +301,7 @@ TEST(diagnostics_soak_discovers_daemon_emitted_paths) {
     char *script = diagnostics_read_file("scripts/soak-test.sh");
     ASSERT_NOT_NULL(script);
     bool parses_start_event = strstr(script, "\"event\":\"diagnostics.start\"") != NULL;
-    bool isolates_daemon = strstr(script, "CBM_CACHE_DIR=\"$SOAK_CACHE_DIR_VALUE\"") != NULL;
+    bool isolates_daemon = strstr(script, "CBM_NEO4J_CACHE_DIR=\"$SOAK_CACHE_DIR_VALUE\"") != NULL;
     bool legacy_predictable_path = strstr(script, "/tmp/cbm-diagnostics-${SERVER_PID}") != NULL;
     free(script);
 

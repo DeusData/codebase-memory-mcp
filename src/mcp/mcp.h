@@ -1,5 +1,5 @@
 /*
- * mcp.h — MCP (Model Context Protocol) server for codebase-memory-mcp.
+ * mcp.h — MCP (Model Context Protocol) server for codebase-memory-mcp-neo4j.
  *
  * Implements JSON-RPC 2.0 over stdio with the MCP tool calling protocol.
  * Provides 14 graph analysis tools (search, trace, query, index, etc.)

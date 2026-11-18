@@ -2,7 +2,7 @@ r"""GREEN regression guard — the PreToolUse hook augmenter fires on Windows.
 
 Guards the fix for issue #618 (landed on main via #619) at the product surface.
 
-`codebase-memory-mcp hook-augment` is the non-blocking Claude Code PreToolUse
+`codebase-memory-mcp-neo4j hook-augment` is the non-blocking Claude Code PreToolUse
 Grep/Glob augmenter: given a hook payload it should emit a `hookSpecificOutput`
 with `additionalContext` listing graph symbols that match the searched token.
 
@@ -24,7 +24,7 @@ contract regresses. Also passes on Linux/macOS (`cwd` starts with `/`).
 Exit code: 0 == augmenter fired (green), 1 == no-op (regression), 2 == setup error.
 
 Usage:
-    python test_hook_augment.py <path-to-codebase-memory-mcp[.exe]>
+    python test_hook_augment.py <path-to-codebase-memory-mcp-neo4j[.exe]>
 """
 import json
 import os
@@ -41,8 +41,8 @@ SRC = "export function %s(a: number): number { return a + 1; }\n" % SYMBOL
 
 def run_cli(binary, cache, args, stdin=None, timeout=120):
     env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = cache
-    env["CBM_RUNTIME_DIR"] = os.path.join(cache, "runtime")
+    env["CBM_NEO4J_CACHE_DIR"] = cache
+    env["CBM_NEO4J_RUNTIME_DIR"] = os.path.join(cache, "runtime")
     return subprocess.run([binary] + args, capture_output=True, timeout=timeout,
                           env=env, input=stdin)
 

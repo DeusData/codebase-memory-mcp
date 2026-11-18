@@ -40,9 +40,9 @@ def fail(message):
 def fresh_fixture():
     shutil.copy(root / "server.json", fix / "server.json")
     (fix / "checksums.txt").write_text(
-        f"{SHA_B}  codebase-memory-mcp-windows-amd64.zip\n"
-        f"{SHA_B}  codebase-memory-mcp-windows-amd64.mcpb\n"
-        f"{SHA_A}  codebase-memory-mcp-darwin-arm64.mcpb\n",
+        f"{SHA_B}  codebase-memory-mcp-neo4j-windows-amd64.zip\n"
+        f"{SHA_B}  codebase-memory-mcp-neo4j-windows-amd64.mcpb\n"
+        f"{SHA_A}  codebase-memory-mcp-neo4j-darwin-arm64.mcpb\n",
         encoding="utf-8",
     )
 
@@ -76,8 +76,8 @@ if len(mcpb) != 2:
     fail(f"expected 2 mcpb entries (only .mcpb lines count), got {len(mcpb)}")
 else:
     first = mcpb[0]
-    wanted_url = ("https://github.com/DeusData/codebase-memory-mcp/releases/"
-                  "download/v9.9.9/codebase-memory-mcp-darwin-arm64.mcpb")
+    wanted_url = ("https://github.com/haiderRizvii/codebase-memory-mcp/releases/"
+                  "download/v9.9.9/codebase-memory-mcp-neo4j-darwin-arm64.mcpb")
     if first.get("identifier") != wanted_url:
         fail(f"darwin identifier wrong: {first.get('identifier')}")
     if first.get("version") != "9.9.9":
@@ -106,7 +106,7 @@ if len(mcpb) != 2:
 # ── fail-closed: zero bundles, malformed hash ───────────────────────────────
 fresh_fixture()
 (fix / "checksums-none.txt").write_text(
-    f"{SHA_B}  codebase-memory-mcp-windows-amd64.zip\n", encoding="utf-8")
+    f"{SHA_B}  codebase-memory-mcp-neo4j-windows-amd64.zip\n", encoding="utf-8")
 result = run("checksums-none.txt")
 if result.returncode == 0:
     fail("a checksums file without .mcpb lines must be fatal, not an empty publish")
@@ -115,7 +115,7 @@ elif "no .mcpb lines" not in result.stderr:
 
 fresh_fixture()
 with (fix / "checksums.txt").open("a", encoding="utf-8") as handle:
-    handle.write("deadbeef  codebase-memory-mcp-darwin-amd64.mcpb\n")
+    handle.write("deadbeef  codebase-memory-mcp-neo4j-darwin-amd64.mcpb\n")
 result = run()
 if result.returncode == 0:
     fail("a malformed sha256 must be fatal")

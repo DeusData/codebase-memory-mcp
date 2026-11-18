@@ -234,14 +234,14 @@ TEST(httpd_parse_simple_get) {
 
 TEST(httpd_parse_security_headers_and_rejects_duplicates) {
     const char *raw = "POST /rpc HTTP/1.1\r\n"
-                      "Host: 127.0.0.1:9749\r\n"
+                      "Host: 127.0.0.1:9750\r\n"
                       "Content-Type: application/json\r\n"
-                      "Origin: http://127.0.0.1:9749\r\n"
+                      "Origin: http://127.0.0.1:9750\r\n"
                       "Content-Length: 0\r\n\r\n";
     cbm_http_req_t req;
     size_t body_off = 0, content_length = 0;
     ASSERT_EQ(cbm_http_parse_head(raw, strlen(raw), &req, &body_off, &content_length), 0);
-    ASSERT_STR_EQ(req.host, "127.0.0.1:9749");
+    ASSERT_STR_EQ(req.host, "127.0.0.1:9750");
     ASSERT_STR_EQ(req.content_type, "application/json");
 
     static const char *duplicates[] = {
@@ -278,12 +278,12 @@ TEST(httpd_parse_post_with_body_offset) {
 
 TEST(httpd_parse_origin_case_insensitive) {
     const char *raw = "GET / HTTP/1.1\r\n"
-                      "origin: http://127.0.0.1:9749\r\n"
+                      "origin: http://127.0.0.1:9750\r\n"
                       "\r\n";
     cbm_http_req_t req;
     size_t body_off = 0, clen = 0;
     ASSERT_EQ(cbm_http_parse_head(raw, strlen(raw), &req, &body_off, &clen), 0);
-    ASSERT_STR_EQ(req.origin, "http://127.0.0.1:9749");
+    ASSERT_STR_EQ(req.origin, "http://127.0.0.1:9750");
     PASS();
 }
 
@@ -429,7 +429,7 @@ TEST(httpd_path_match_matrix) {
     ASSERT_FALSE(cbm_http_path_match("/api%2fbrowse", "/api/browse*"));
     /* CORS origin patterns */
     ASSERT_TRUE(cbm_http_path_match("http://localhost:5173", "http://localhost:*"));
-    ASSERT_TRUE(cbm_http_path_match("http://127.0.0.1:9749", "http://127.0.0.1:*"));
+    ASSERT_TRUE(cbm_http_path_match("http://127.0.0.1:9750", "http://127.0.0.1:*"));
     ASSERT_FALSE(cbm_http_path_match("http://evil.com", "http://localhost:*"));
     ASSERT_FALSE(cbm_http_path_match("https://localhost:5173", "http://localhost:*"));
     ASSERT_FALSE(cbm_http_path_match("http://localhost.evil.com:80", "http://localhost:*"));
@@ -446,7 +446,7 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
     ASSERT_NOT_NULL(td);
 
     char exe[512];
-    snprintf(exe, sizeof(exe), "%s/codebase-memory-mcp", td);
+    snprintf(exe, sizeof(exe), "%s/codebase-memory-mcp-neo4j", td);
     FILE *f = fopen(exe, "w");
     ASSERT_NOT_NULL(f);
     fputs("#!/bin/sh\nexit 0\n", f);
@@ -458,7 +458,7 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
 
     char resolved[1024];
     ASSERT_TRUE(
-        cbm_http_server_resolve_binary_path("codebase-memory-mcp", resolved, sizeof(resolved)));
+        cbm_http_server_resolve_binary_path("codebase-memory-mcp-neo4j", resolved, sizeof(resolved)));
     ASSERT_STR_EQ(resolved, exe);
 
     if (old_path) {
@@ -765,12 +765,12 @@ static int ui_delete_fixture_init(ui_delete_fixture_t *fx) {
     snprintf(fx->cache_dir, sizeof(fx->cache_dir), "%s/cache", fx->tmpdir);
     snprintf(fx->root_dir, sizeof(fx->root_dir), "%s/root", fx->tmpdir);
 
-    const char *saved = getenv("CBM_CACHE_DIR");
+    const char *saved = getenv("CBM_NEO4J_CACHE_DIR");
     fx->saved_cache_dir = saved ? strdup(saved) : NULL;
     if (th_mkdir_p(fx->cache_dir) != 0 || th_mkdir_p(fx->root_dir) != 0) {
         return -1;
     }
-    cbm_setenv("CBM_CACHE_DIR", fx->cache_dir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", fx->cache_dir, 1);
 
     fx->store = cbm_store_open_memory();
     fx->watcher = cbm_watcher_new(fx->store, NULL, NULL);
@@ -783,10 +783,10 @@ static void ui_delete_fixture_cleanup(ui_delete_fixture_t *fx) {
     if (fx->store)
         cbm_store_close(fx->store);
     if (fx->saved_cache_dir) {
-        cbm_setenv("CBM_CACHE_DIR", fx->saved_cache_dir, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", fx->saved_cache_dir, 1);
         free(fx->saved_cache_dir);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     th_cleanup(fx->tmpdir);
 }
@@ -3823,8 +3823,8 @@ TEST(ui_server_configuration_is_atomic_and_origin_protected) {
     char directory[256];
     snprintf(directory, sizeof(directory), "%s/cbm-http-settings-XXXXXX", cbm_tmpdir());
     ASSERT_NOT_NULL(cbm_mkdtemp(directory));
-    char *previous = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
-    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", directory, 1), 0);
+    char *previous = getenv("CBM_NEO4J_CACHE_DIR") ? strdup(getenv("CBM_NEO4J_CACHE_DIR")) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_NEO4J_CACHE_DIR", directory, 1), 0);
     th_server_t server;
     ASSERT_EQ(th_server_start(&server), 0);
     int port = cbm_http_server_port(server.srv);
@@ -3870,10 +3870,10 @@ TEST(ui_server_configuration_is_atomic_and_origin_protected) {
     th_server_stop(&server);
     free(response);
     if (previous) {
-        cbm_setenv("CBM_CACHE_DIR", previous, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", previous, 1);
         free(previous);
     } else
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     char path[512];
     snprintf(path, sizeof(path), "%s/_config.db", directory);
     remove(path);

@@ -416,6 +416,46 @@ TEST(grammar_regression_all) {
     PASS();
 }
 
+extern void *tree_sitter_objectscript_udl_external_scanner_create(void);
+extern void tree_sitter_objectscript_udl_external_scanner_deserialize(void *, const char *,
+                                                                      unsigned);
+extern unsigned tree_sitter_objectscript_udl_external_scanner_serialize(void *, char *);
+extern void tree_sitter_objectscript_udl_external_scanner_destroy(void *);
+extern void *tree_sitter_objectscript_routine_external_scanner_create(void);
+extern void tree_sitter_objectscript_routine_external_scanner_deserialize(void *, const char *,
+                                                                          unsigned);
+extern unsigned tree_sitter_objectscript_routine_external_scanner_serialize(void *, char *);
+extern void tree_sitter_objectscript_routine_external_scanner_destroy(void *);
+
+TEST(grammar_regression_objectscript_empty_scanner_state) {
+    void *(*create[])(void) = {tree_sitter_objectscript_udl_external_scanner_create,
+                               tree_sitter_objectscript_routine_external_scanner_create};
+    void (*deserialize[])(void *, const char *, unsigned) = {
+        tree_sitter_objectscript_udl_external_scanner_deserialize,
+        tree_sitter_objectscript_routine_external_scanner_deserialize};
+    unsigned (*serialize[])(void *,
+                            char *) = {tree_sitter_objectscript_udl_external_scanner_serialize,
+                                       tree_sitter_objectscript_routine_external_scanner_serialize};
+    void (*destroy[])(void *) = {tree_sitter_objectscript_udl_external_scanner_destroy,
+                                 tree_sitter_objectscript_routine_external_scanner_destroy};
+    for (size_t i = 0; i < 2; i++) {
+        char before[1024], after[1024];
+        void *scanner = create[i]();
+        ASSERT_NOT_NULL(scanner);
+        unsigned length = serialize[i](scanner, before);
+        ASSERT_TRUE(length > 0 && length <= sizeof(before));
+        deserialize[i](scanner, NULL, 0); /* Tree-sitter's empty-state contract. */
+        ASSERT_EQ(serialize[i](scanner, after), length);
+        ASSERT_EQ(memcmp(before, after, length), 0);
+        deserialize[i](scanner, before, length);
+        ASSERT_EQ(serialize[i](scanner, after), length);
+        ASSERT_EQ(memcmp(before, after, length), 0);
+        destroy[i](scanner);
+    }
+    PASS();
+}
+
 void suite_grammar_regression(void) {
+    RUN_TEST(grammar_regression_objectscript_empty_scanner_state);
     RUN_TEST(grammar_regression_all);
 }

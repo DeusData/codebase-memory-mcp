@@ -384,7 +384,7 @@ TEST(watcher_poll_nonexistent_path) {
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Shared fixture for the stale-root pruning tests: a temp project root, a
- * temp CBM_CACHE_DIR seeded with db/-wal/-shm files for "stale-project",
+ * temp CBM_NEO4J_CACHE_DIR seeded with db/-wal/-shm files for "stale-project",
  * and saved copies of the env vars the tests override. */
 typedef struct {
     char rootdir[256];
@@ -410,11 +410,11 @@ static bool prune_fixture_setup(prune_fixture_t *f, const char *grace_s) {
         return false;
     }
 
-    f->had_cache_dir = cbm_safe_getenv("CBM_CACHE_DIR", f->saved_cache_dir,
+    f->had_cache_dir = cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", f->saved_cache_dir,
                                        sizeof(f->saved_cache_dir), NULL) != NULL;
     f->had_grace = cbm_safe_getenv("CBM_WATCHER_PRUNE_GRACE_S", f->saved_grace,
                                    sizeof(f->saved_grace), NULL) != NULL;
-    cbm_setenv("CBM_CACHE_DIR", f->cachedir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", f->cachedir, 1);
     cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", grace_s, 1);
 
     snprintf(f->db_path, sizeof(f->db_path), "%s/stale-project.db", f->cachedir);
@@ -428,9 +428,9 @@ static bool prune_fixture_setup(prune_fixture_t *f, const char *grace_s) {
 
 static void prune_fixture_teardown(prune_fixture_t *f) {
     if (f->had_cache_dir) {
-        cbm_setenv("CBM_CACHE_DIR", f->saved_cache_dir, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", f->saved_cache_dir, 1);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     if (f->had_grace) {
         cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", f->saved_grace, 1);
@@ -1737,7 +1737,7 @@ TEST(watcher_no_change_no_reindex) {
 }
 
 /* #1953: the reindex's OWN OUTPUT must never count as a change. After every
- * publish the pipeline re-exports <root>/.codebase-memory/graph.db.zst (plus
+ * publish the pipeline re-exports <root>/.codebase-memory-neo4j/graph.db.zst (plus
  * artifact.json) whenever an artifact already lives there — a `persistence:
  * true` index leaves one behind, and a linked worktree checks the team's
  * committed one out. The dirty signature folded that file's (size, mtime)
@@ -2540,7 +2540,7 @@ static int own_output_index_callback(const char *name, const char *path, void *u
 }
 
 /* The signature must only see what the indexer would index. Paths discovery
- * skips — cbm's own .codebase-memory output, built-in skip dirs, .cbmignore'd
+ * skips — cbm's own .codebase-memory-neo4j output, built-in skip dirs, .cbmignore'd
  * paths, non-source files — never trigger, and in particular a reindex that
  * rewrites cbm's own output must not look like a new change on the next poll
  * (the runaway-reindex history of #841/#937/#1953). */

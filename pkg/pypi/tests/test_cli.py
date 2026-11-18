@@ -21,7 +21,7 @@ from unittest import mock
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_ROOT / "src"))
 
-from codebase_memory_mcp import _cli  # noqa: E402
+from codebase_memory_mcp_neo4j import _cli  # noqa: E402
 
 
 class BinarySelectionTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class BinarySelectionTests(unittest.TestCase):
         self.assertEqual(_cli._execution_path(binary, "win32"), binary)
 
     def test_non_windows_executes_the_cached_binary(self):
-        binary = Path("cache") / "0.8.1" / "codebase-memory-mcp"
+        binary = Path("cache") / "0.8.1" / "codebase-memory-mcp-neo4j"
 
         self.assertEqual(_cli._execution_path(binary, "linux"), binary)
 
@@ -62,7 +62,7 @@ class BinarySelectionTests(unittest.TestCase):
                 "win32",
                 windows_local_app_data
                 / "Programs"
-                / "codebase-memory-mcp",
+                / "codebase-memory-mcp-neo4j",
                 mock.patch.dict(
                     os.environ,
                     {"LOCALAPPDATA": str(windows_local_app_data)},
@@ -107,9 +107,9 @@ class BinarySelectionTests(unittest.TestCase):
 
         output = "".join(call.args[0] for call in stderr.write.call_args_list)
         self.assertIn(
-            "python -m pip install --upgrade codebase-memory-mcp", output
+            "python -m pip install --upgrade codebase-memory-mcp-neo4j", output
         )
-        self.assertIn("codebase-memory-mcp install --yes", output)
+        self.assertIn("codebase-memory-mcp-neo4j install --yes", output)
         self.assertNotIn("install.sh", output)
 
 
@@ -209,8 +209,8 @@ class ProcessLivenessTests(unittest.TestCase):
 class RuntimeSetTests(unittest.TestCase):
     def test_candidate_probe_requires_the_binary_to_execute(self):
         candidates = (
-            Path("/tmp/codebase-memory-mcp"),
-            PureWindowsPath("/tmp/codebase-memory-mcp"),
+            Path("/tmp/codebase-memory-mcp-neo4j"),
+            PureWindowsPath("/tmp/codebase-memory-mcp-neo4j"),
         )
 
         for candidate in candidates:
@@ -227,7 +227,7 @@ class RuntimeSetTests(unittest.TestCase):
     def test_concurrent_publishers_preserve_the_first_complete_winner(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
-            binary_name = "codebase-memory-mcp"
+            binary_name = "codebase-memory-mcp-neo4j"
 
             def stages(tag):
                 staged = directory / f".stage-{tag}-{binary_name}"
@@ -309,12 +309,12 @@ from pathlib import Path
 
 source_root, directory_raw, staged_raw, marker_raw, crash_name = sys.argv[1:]
 sys.path.insert(0, source_root)
-from codebase_memory_mcp import _cli
+from codebase_memory_mcp_neo4j import _cli
 
 directory = Path(directory_raw)
 staged = Path(staged_raw)
 marker = Path(marker_raw)
-binary_name = "codebase-memory-mcp"
+binary_name = "codebase-memory-mcp-neo4j"
 staged_paths = {
     binary_name: staged / binary_name,
 }
@@ -339,7 +339,7 @@ _cli._publish_runtime_set(
     verifier=verifier,
 )
 """
-        binary_name = "codebase-memory-mcp"
+        binary_name = "codebase-memory-mcp-neo4j"
         for crash_name, expected_ready in (
             (binary_name, True),
         ):
@@ -450,7 +450,7 @@ _cli._publish_runtime_set(
     def test_publication_failure_restores_prior_complete_runtime_set(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
-            binary_name = "codebase-memory-mcp"
+            binary_name = "codebase-memory-mcp-neo4j"
             (directory / binary_name).write_text("binary:old")
             staged_paths = {}
             for name, contents in (
@@ -496,7 +496,7 @@ _cli._publish_runtime_set(
     def test_failure_never_deletes_a_complete_foreign_winner(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
-            binary_name = "codebase-memory-mcp"
+            binary_name = "codebase-memory-mcp-neo4j"
             (directory / binary_name).write_bytes(b"binary:old")
             staged_paths = {}
             for name, contents in (
@@ -540,7 +540,7 @@ _cli._publish_runtime_set(
     def test_orphan_reconciliation_rejects_multiply_linked_backup_members(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
-            binary = directory / "codebase-memory-mcp"
+            binary = directory / "codebase-memory-mcp-neo4j"
             backup = directory / f".cbm-runtime-backup-{'a' * 32}"
             backup.mkdir()
             (backup / ".retirement-complete").write_bytes(b"")
@@ -797,14 +797,14 @@ _cli._publish_runtime_set(
                     tf,
                     str(destination),
                     _cli._UNIX_ARCHIVE_NAMES,
-                    ("codebase-memory-mcp",),
+                    ("codebase-memory-mcp-neo4j",),
                 )
 
     def test_unix_tar_rejects_hardlink_members(self):
         with tempfile.TemporaryDirectory() as root:
             archive = Path(root) / "release.tar.gz"
             with tarfile.open(archive, "w:gz") as tf:
-                info = tarfile.TarInfo("codebase-memory-mcp")
+                info = tarfile.TarInfo("codebase-memory-mcp-neo4j")
                 info.type = tarfile.LNKTYPE
                 info.linkname = "LICENSE"
                 tf.addfile(info)
@@ -814,8 +814,8 @@ _cli._publish_runtime_set(
                 _cli._safe_extract_tar(
                     tf,
                     str(destination),
-                    ("codebase-memory-mcp",),
-                    ("codebase-memory-mcp",),
+                    ("codebase-memory-mcp-neo4j",),
+                    ("codebase-memory-mcp-neo4j",),
                     False,
                 )
 
@@ -967,20 +967,20 @@ class ArchiveExtractionTests(unittest.TestCase):
                     tf,
                     str(destination),
                     _cli._UNIX_ARCHIVE_NAMES,
-                    ("codebase-memory-mcp",),
+                    ("codebase-memory-mcp-neo4j",),
                 )
-            self.assertEqual(extracted, ("codebase-memory-mcp",))
+            self.assertEqual(extracted, ("codebase-memory-mcp-neo4j",))
             self.assertEqual(
-                (destination / "codebase-memory-mcp").read_bytes(),
-                b"payload of codebase-memory-mcp",
+                (destination / "codebase-memory-mcp-neo4j").read_bytes(),
+                b"payload of codebase-memory-mcp-neo4j",
             )
-            self.assertEqual(os.listdir(destination), ["codebase-memory-mcp"])
+            self.assertEqual(os.listdir(destination), ["codebase-memory-mcp-neo4j"])
 
     def test_archive_copy_accepts_a_member_larger_than_the_former_cap(self):
         size = _FORMER_MEMBER_CAP_BYTES + 1024 * 1024
         sink = _CountingSink()
         copied = _cli._copy_archive_member(
-            _ZeroSource(size), sink, "codebase-memory-mcp", size
+            _ZeroSource(size), sink, "codebase-memory-mcp-neo4j", size
         )
         self.assertEqual(copied, size)
         self.assertEqual(sink.written, size)
@@ -995,10 +995,10 @@ class ArchiveExtractionTests(unittest.TestCase):
 
     def test_archive_member_write_removes_the_partial_file_on_failure(self):
         with tempfile.TemporaryDirectory() as root:
-            target = os.path.join(root, "codebase-memory-mcp")
+            target = os.path.join(root, "codebase-memory-mcp-neo4j")
             with self.assertRaises(SystemExit):
                 _cli._write_archive_member(
-                    io.BytesIO(b"x" * 100), target, "codebase-memory-mcp", 10
+                    io.BytesIO(b"x" * 100), target, "codebase-memory-mcp-neo4j", 10
                 )
             self.assertFalse(os.path.exists(target))
 
@@ -1034,7 +1034,7 @@ class ArchiveExtractionTests(unittest.TestCase):
             self.assertEqual(extracted, (_cli._WINDOWS_BINARY_NAME,))
             self.assertEqual(
                 (destination / _cli._WINDOWS_BINARY_NAME).read_bytes(),
-                b"payload of codebase-memory-mcp.exe",
+                b"payload of codebase-memory-mcp-neo4j.exe",
             )
             self.assertEqual(os.listdir(destination), [_cli._WINDOWS_BINARY_NAME])
 
@@ -1072,7 +1072,7 @@ def _loopback_server(routes):
 
 
 class DownloadBaseTests(unittest.TestCase):
-    GITHUB_BASE = "https://github.com/DeusData/codebase-memory-mcp/releases/download/v1.2.3"
+    GITHUB_BASE = "https://github.com/haiderRizvii/codebase-memory-mcp/releases/download/v1.2.3"
 
     def test_unset_or_empty_uses_the_github_release_base(self):
         self.assertEqual(_cli._download_base("1.2.3", {}), (self.GITHUB_BASE, False))
@@ -1115,7 +1115,7 @@ class DownloadBaseTests(unittest.TestCase):
             "HTTP://localhost/",
             "file:///tmp/releases",
             "ftp://localhost/releases",
-            "github.com/DeusData/codebase-memory-mcp",
+            "github.com/haiderRizvii/codebase-memory-mcp",
         ):
             with self.subTest(base=base), self.assertRaises(SystemExit) as raised:
                 _cli._download_base("1.2.3", {"CBM_DOWNLOAD_URL": base})
@@ -1168,7 +1168,7 @@ class DownloadBaseTests(unittest.TestCase):
         else:
             ext, names = "tar.gz", _cli._UNIX_ARCHIVE_NAMES
         portable = "-portable" if os_name == "linux" else ""
-        archive_name = f"codebase-memory-mcp-{os_name}-{arch}{portable}.{ext}"
+        archive_name = f"codebase-memory-mcp-neo4j-{os_name}-{arch}{portable}.{ext}"
         with tempfile.TemporaryDirectory() as root:
             fixture = Path(root) / archive_name
             if ext == "zip":
@@ -1191,7 +1191,7 @@ class DownloadBaseTests(unittest.TestCase):
             binary_name = (
                 _cli._WINDOWS_BINARY_NAME
                 if os_name == "windows"
-                else "codebase-memory-mcp"
+                else "codebase-memory-mcp-neo4j"
             )
             self.assertEqual(
                 installed.read_bytes(), f"payload of {binary_name}".encode()

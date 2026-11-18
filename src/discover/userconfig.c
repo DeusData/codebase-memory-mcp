@@ -3,8 +3,8 @@
  * userconfig.c — User-defined extension→language mappings.
  *
  * Reads extra_extensions from:
- *   Global:  $XDG_CONFIG_HOME/codebase-memory-mcp/config.json
- *            (falls back to ~/.config/codebase-memory-mcp/config.json)
+ *   Global:  $XDG_CONFIG_HOME/codebase-memory-mcp-neo4j/config.json
+ *            (falls back to ~/.config/codebase-memory-mcp-neo4j/config.json)
  *   Project: {repo_root}/.codebase-memory.json
  *
  * Project config wins over global. Unknown language values warn and are
@@ -417,7 +417,8 @@ static cbm_userconfig_t *userconfig_load(const char *repo_path, bool retain_sour
     const char *cfg_base = cbm_app_config_dir();
     const char *cfg_fallback = cfg_base ? cfg_base : "/tmp";
     char global_path[PATH_BUF_SZ];
-    snprintf(global_path, sizeof(global_path), "%s/codebase-memory-mcp/config.json", cfg_fallback);
+    snprintf(global_path, sizeof(global_path), "%s/codebase-memory-mcp-neo4j/config.json",
+             cfg_fallback);
 
     if (load_config_file(global_path, &entries, &count, cfg->global_source_sha256) != 0) {
         for (int i = 0; i < count; i++) {

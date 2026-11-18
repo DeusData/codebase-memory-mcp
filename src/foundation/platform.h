@@ -195,7 +195,7 @@ const char *cbm_app_local_dir(void);
 /* ── Cache directory ────────────────────────────────────────────── */
 
 /* Resolve the database cache directory. All project indexes are stored here.
- * Priority: CBM_CACHE_DIR env var > ~/.cache/codebase-memory-mcp (default).
+ * Priority: CBM_NEO4J_CACHE_DIR env var > ~/.cache/codebase-memory-mcp-neo4j (default).
  * Returns static buffer or NULL if home is unavailable. */
 const char *cbm_resolve_cache_dir(void);
 

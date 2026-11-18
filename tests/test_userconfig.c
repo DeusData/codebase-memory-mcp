@@ -64,7 +64,7 @@ TEST(userconfig_global_via_env) {
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/uctest_global_xdg", cbm_tmpdir());
 
     char app_dir[512];
-    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp", cfg_dir);
+    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp-neo4j", cfg_dir);
     cbm_mkdir_p(app_dir, 0755);
 
     char global_path[768];
@@ -107,7 +107,7 @@ TEST(userconfig_project_wins_over_global) {
     snprintf(xdg_dir, sizeof(xdg_dir), "%s/uctest_priority_xdg", cbm_tmpdir());
 
     char app_dir[512];
-    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp", xdg_dir);
+    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp-neo4j", xdg_dir);
     cbm_mkdir_p(app_dir, 0755);
 
     char global_path[768];

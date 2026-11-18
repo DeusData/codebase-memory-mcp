@@ -603,9 +603,9 @@ TEST(daemon_ipc_windows_generation_address_binds_account_key_and_nonce) {
     ASSERT_TRUE(strcmp(address_a, address_b) != 0);
     ASSERT_TRUE(strcmp(address_a, address_other_key) != 0);
     ASSERT_TRUE(strcmp(address_a, address_other_nonce) != 0);
-    ASSERT_STR_EQ(address_a, "\\\\.\\pipe\\cbm-daemon-"
-                             "e861648d9f8bc786dce31bbb16eda2ab"
-                             "ffa330a770752832ab5f2e4feaa506f1");
+    ASSERT_STR_EQ(address_a, "\\\\.\\pipe\\cbm-neo4j-daemon-"
+                             "578c47d0703ab0b319fc31169857db6e5"
+                             "ae039f394fee4048f3fe9850c68ff14");
     ASSERT_TRUE(strstr(address_a, "S-1-") == NULL);
     ASSERT_TRUE(strstr(address_a, key) == NULL);
     PASS();
@@ -618,9 +618,9 @@ TEST(daemon_ipc_windows_legacy_names_are_frozen_for_migration) {
                                                        "0123456789abcdef", pipe_name, startup_name);
 
     ASSERT_TRUE(derived);
-    ASSERT_STR_EQ(pipe_name, "\\\\.\\pipe\\cbm-daemon-72380d6ef7f19c0c-"
+    ASSERT_STR_EQ(pipe_name, "\\\\.\\pipe\\cbm-neo4j-daemon-72380d6ef7f19c0c-"
                              "0123456789abcdef");
-    ASSERT_STR_EQ(startup_name, "Local\\cbm-daemon-72380d6ef7f19c0c-"
+    ASSERT_STR_EQ(startup_name, "Local\\cbm-neo4j-daemon-72380d6ef7f19c0c-"
                                 "0123456789abcdef-startup");
     PASS();
 }
@@ -631,7 +631,7 @@ TEST(daemon_ipc_windows_rendezvous_record_is_exact_and_canonical) {
         0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95,
         0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
     };
-    static const char address[] = "\\\\.\\pipe\\cbm-daemon-"
+    static const char address[] = "\\\\.\\pipe\\cbm-neo4j-daemon-"
                                   "0123456789abcdef0123456789abcdef"
                                   "0123456789abcdef0123456789abcdef";
     uint8_t record[CBM_DAEMON_IPC_WINDOWS_RENDEZVOUS_RECORD_SIZE];
@@ -661,7 +661,7 @@ TEST(daemon_ipc_windows_rendezvous_record_is_exact_and_canonical) {
 
     memcpy(corrupt, record, sizeof(corrupt));
     const size_t address_offset = 8U + CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE;
-    corrupt[address_offset + strlen("\\\\.\\pipe\\cbm-daemon-")] = 'A';
+    corrupt[address_offset + strlen("\\\\.\\pipe\\cbm-neo4j-daemon-")] = 'A';
     ASSERT_FALSE(cbm_daemon_ipc_windows_rendezvous_record_decode(corrupt, sizeof(corrupt),
                                                                  decoded_nonce, decoded_address));
     PASS();
@@ -1958,8 +1958,8 @@ TEST(daemon_ipc_endpoint_is_namespaced_by_instance_key) {
             a_address && other_address && strcmp(a_address, other_address) != 0;
 #ifdef _WIN32
         address_contains_key = a_address &&
-                               strncmp(a_address, "\\\\.\\pipe\\cbm-daemon-",
-                                       strlen("\\\\.\\pipe\\cbm-daemon-")) == 0 &&
+                               strncmp(a_address, "\\\\.\\pipe\\cbm-neo4j-daemon-",
+                                       strlen("\\\\.\\pipe\\cbm-neo4j-daemon-")) == 0 &&
                                strstr(a_address, key_a) == NULL && other_address &&
                                strstr(other_address, key_b) == NULL;
 #else
@@ -4777,7 +4777,7 @@ TEST(daemon_ipc_macos_rejects_allow_acl_on_ancestor_without_mutation) {
 
     bool parent_ok = ipc_test_parent_new(parent, "mac-acl-ancestor-allow");
     int runtime_written = parent_ok
-                              ? snprintf(runtime_dir, sizeof(runtime_dir), "%s/cbm-daemon-%lu",
+                              ? snprintf(runtime_dir, sizeof(runtime_dir), "%s/cbm-neo4j-daemon-%lu",
                                          parent, (unsigned long)geteuid())
                               : -1;
     int acl_fixture = parent_ok ? ipc_test_macos_set_mutating_acl(parent, false) : -1;
@@ -5547,7 +5547,7 @@ TEST(daemon_ipc_posix_foreign_owned_ancestor_refusal_names_directory_issue1717) 
     ASSERT_TRUE(!result.cache_created); /* nothing is created below a foreign ancestor */
     ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs'"));
     ASSERT_NOT_NULL(strstr(result.detail, owner_text));
-    ASSERT_NOT_NULL(strstr(result.detail, "CBM_CACHE_DIR"));
+    ASSERT_NOT_NULL(strstr(result.detail, "CBM_NEO4J_CACHE_DIR"));
     ASSERT_TRUE(strstr(result.detail, "errno") == NULL);
     ASSERT_TRUE(result.secured_without_seam);
     PASS();
@@ -5587,7 +5587,7 @@ TEST(daemon_ipc_posix_foreign_owned_ancestor_long_path_keeps_remedy_issue1717) {
     ipc_test_foreign_ancestor_run("posix-foreign-long", IPC_TEST_FOREIGN_MAX_DEPTH, named_uid,
                                   &result);
     static const char remedy[] =
-        "Use a location whose parent directories are yours or root's (e.g. set CBM_CACHE_DIR)";
+        "Use a location whose parent directories are yours or root's (e.g. set CBM_NEO4J_CACHE_DIR)";
 
     ASSERT_TRUE(result.paths_ok);
     ASSERT_TRUE(result.foreign_path_length > 384); /* the input really overflows */
@@ -5841,7 +5841,7 @@ static bool ipc_test_network_warning_emitted(unsigned long magic, const char *fs
     char expected[32];
     (void)snprintf(expected, sizeof(expected), "fs=%s", fs_name);
     const char *line = strstr(ipc_test_log_capture, "daemon.cache_root_network_fs");
-    return warned && line && strstr(line, expected) && strstr(line, "CBM_CACHE_DIR") &&
+    return warned && line && strstr(line, expected) && strstr(line, "CBM_NEO4J_CACHE_DIR") &&
            strstr(line, "path=/shared/fs/me/.cache/cbm");
 }
 

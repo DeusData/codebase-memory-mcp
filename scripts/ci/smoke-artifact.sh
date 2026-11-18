@@ -82,7 +82,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SOURCE_BINARY="$BUILD_DIR/codebase-memory-mcp"
+SOURCE_BINARY="$BUILD_DIR/codebase-memory-mcp-neo4j"
 if [ "$GOOS" = "windows" ] && [ -f "${SOURCE_BINARY}.exe" ]; then
     SOURCE_BINARY="${SOURCE_BINARY}.exe"
 fi
@@ -95,8 +95,8 @@ CANDIDATE_ROOT="$WORK_DIR/candidates"
 scripts/ci/prepare-release-candidates.sh "$GOOS" "$GOARCH" \
     --binary "$SOURCE_BINARY" --out-dir "$CANDIDATE_ROOT"
 
-SELECTED_NAME="codebase-memory-mcp"
-[ "$GOOS" = "windows" ] && SELECTED_NAME="codebase-memory-mcp.exe"
+SELECTED_NAME="codebase-memory-mcp-neo4j"
+[ "$GOOS" = "windows" ] && SELECTED_NAME="codebase-memory-mcp-neo4j.exe"
 SELECTED_BINARY="$CANDIDATE_ROOT/${GOOS}-${GOARCH}/stripped/$SELECTED_NAME"
 [ -f "$SELECTED_BINARY" ] || {
     echo "smoke-artifact: candidate derivation did not produce $SELECTED_BINARY" >&2
@@ -129,24 +129,24 @@ scripts/package-release.sh "$GOOS" "$GOARCH" \
     --third-party-notices "$NOTICES" \
     --out-dir "$WORK_DIR"
 
-NAME="codebase-memory-mcp-${GOOS}-${GOARCH}"
+NAME="codebase-memory-mcp-neo4j-${GOOS}-${GOARCH}"
 EXTRACT_DIR="$WORK_DIR/extract"
 mkdir -p "$EXTRACT_DIR"
 if [ "$GOOS" = "windows" ]; then
     unzip -q -o "$WORK_DIR/$NAME.zip" -d "$EXTRACT_DIR"
-    test -s "$EXTRACT_DIR/codebase-memory-mcp.exe"
+    test -s "$EXTRACT_DIR/codebase-memory-mcp-neo4j.exe"
     # ONE binary per platform: a payload sibling means the AV-flagged launcher
     # stub came back.
-    test ! -e "$EXTRACT_DIR/codebase-memory-mcp.payload.exe"
+    test ! -e "$EXTRACT_DIR/codebase-memory-mcp-neo4j.payload.exe"
     echo "=== smoke-artifact: smoking EXTRACTED $NAME.zip via vm-smoke.sh ==="
     SMOKE_ARCH="$GOARCH" \
         CBM_SMOKE_ARTIFACT_DIR="$EXTRACT_DIR" \
         bash test-infrastructure/vm/vm-smoke.sh
 else
     tar -xzf "$WORK_DIR/$NAME.tar.gz" -C "$EXTRACT_DIR"
-    chmod +x "$EXTRACT_DIR/codebase-memory-mcp"
+    chmod +x "$EXTRACT_DIR/codebase-memory-mcp-neo4j"
     echo "=== smoke-artifact: smoking EXTRACTED $NAME.tar.gz via smoke-local.sh ==="
     CBM_SMOKE_ARTIFACT_DIR="$EXTRACT_DIR" \
-        scripts/smoke-local.sh "$EXTRACT_DIR/codebase-memory-mcp"
+        scripts/smoke-local.sh "$EXTRACT_DIR/codebase-memory-mcp-neo4j"
 fi
 echo "=== smoke-artifact: $NAME passed ==="

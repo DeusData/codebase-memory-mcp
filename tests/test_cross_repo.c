@@ -26,7 +26,7 @@ typedef struct {
 
 static bool cross_repo_fixture_begin(cross_repo_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
-    const char *saved = getenv("CBM_CACHE_DIR");
+    const char *saved = getenv("CBM_NEO4J_CACHE_DIR");
     if (saved) {
         fixture->saved_cache = strdup(saved);
         if (!fixture->saved_cache) {
@@ -35,14 +35,14 @@ static bool cross_repo_fixture_begin(cross_repo_fixture_t *fixture) {
     }
     snprintf(fixture->cache, sizeof(fixture->cache), "/tmp/cbm-cross-hardening-XXXXXX");
     return cbm_mkdtemp(fixture->cache) != NULL &&
-           cbm_setenv("CBM_CACHE_DIR", fixture->cache, 1) == 0;
+           cbm_setenv("CBM_NEO4J_CACHE_DIR", fixture->cache, 1) == 0;
 }
 
 static void cross_repo_fixture_end(cross_repo_fixture_t *fixture) {
     if (fixture->saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", fixture->saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", fixture->saved_cache, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     if (fixture->cache[0]) {
         th_rmtree(fixture->cache);

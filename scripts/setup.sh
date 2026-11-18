@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# codebase-memory-mcp setup script (macOS + Linux)
+# codebase-memory-mcp-neo4j setup script (macOS + Linux)
 # Default: install the latest pre-built binary through install.sh
 # --from-source: build from source (requires Go + C compiler)
 
 REPO="haiderRizvii/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
-BINARY_NAME="codebase-memory-mcp"
-SOURCE_DIR="$HOME/.local/share/codebase-memory-mcp"
+BINARY_NAME="codebase-memory-mcp-neo4j"
+SOURCE_DIR="$HOME/.local/share/codebase-memory-mcp-neo4j"
 CLEANUP_DIR=""  # set by install_release for EXIT trap
 
 # --- Colors ---
@@ -197,7 +197,7 @@ build_from_source() {
     echo "${BOLD}Building binary (this may take a minute)...${RESET}"
     mkdir -p "$INSTALL_DIR"
 
-    (cd "$SOURCE_DIR" && scripts/build.sh && cp build/c/codebase-memory-mcp "${INSTALL_DIR}/${BINARY_NAME}")
+    (cd "$SOURCE_DIR" && scripts/build.sh && cp build/c/codebase-memory-mcp-neo4j "${INSTALL_DIR}/${BINARY_NAME}")
 
     ok "Built and installed to ${INSTALL_DIR}/${BINARY_NAME}"
 }
@@ -210,7 +210,7 @@ configure_claude() {
     local claude_config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     local settings_file="${claude_config_dir}/settings.json"
 
-    printf "%s" "${BOLD}Configure Claude Code to use codebase-memory-mcp? [y/N] ${RESET}"
+    printf "%s" "${BOLD}Configure Claude Code to use codebase-memory-mcp-neo4j? [y/N] ${RESET}"
     read -r answer
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
         echo ""
@@ -218,7 +218,7 @@ configure_claude() {
         echo ""
         echo '  {'
         echo '    "mcpServers": {'
-        echo '      "codebase-memory-mcp": {'
+        echo '      "codebase-memory-neo4j": {'
         echo '        "type": "stdio",'
         echo "        \"command\": \"${binary_path}\""
         echo '      }'
@@ -240,10 +240,10 @@ JSONEOF
         if [ -f "$settings_file" ]; then
             local tmp
             tmp=$(mktemp)
-            jq --argjson entry "$mcp_entry" '.mcpServers["codebase-memory-mcp"] = $entry' "$settings_file" > "$tmp"
+            jq --argjson entry "$mcp_entry" '.mcpServers["codebase-memory-neo4j"] = $entry' "$settings_file" > "$tmp"
             mv "$tmp" "$settings_file"
         else
-            echo "{}" | jq --argjson entry "$mcp_entry" '.mcpServers["codebase-memory-mcp"] = $entry' > "$settings_file"
+            echo "{}" | jq --argjson entry "$mcp_entry" '.mcpServers["codebase-memory-neo4j"] = $entry' > "$settings_file"
         fi
         ok "Updated ${settings_file}"
     elif command -v python3 &>/dev/null; then
@@ -254,7 +254,7 @@ data = {}
 if os.path.exists(path):
     with open(path) as f:
         data = json.load(f)
-data.setdefault('mcpServers', {})['codebase-memory-mcp'] = json.loads('$mcp_entry')
+data.setdefault('mcpServers', {})['codebase-memory-neo4j'] = json.loads('$mcp_entry')
 with open(path, 'w') as f:
     json.dump(data, f, indent=2)
 print()
@@ -266,7 +266,7 @@ print()
         info "Add this to ${settings_file} manually:"
         echo ""
         echo '  "mcpServers": {'
-        echo '    "codebase-memory-mcp": {'
+        echo '    "codebase-memory-neo4j": {'
         echo '      "type": "stdio",'
         echo "      \"command\": \"${binary_path}\""
         echo '    }'
@@ -289,7 +289,7 @@ check_path() {
 # --- Main ---
 
 echo ""
-echo "${BOLD}codebase-memory-mcp installer${RESET}"
+echo "${BOLD}codebase-memory-mcp-neo4j installer${RESET}"
 echo ""
 
 if [ "$FROM_SOURCE" = true ]; then
@@ -328,4 +328,4 @@ echo ""
 info "To uninstall:"
 info "  rm ${INSTALL_DIR}/${BINARY_NAME}"
 info "  rm -rf ${SOURCE_DIR}  # if built from source"
-info "  rm -rf ~/.cache/codebase-memory-mcp/  # graph database"
+info "  rm -rf ~/.cache/codebase-memory-mcp-neo4j/  # graph database"

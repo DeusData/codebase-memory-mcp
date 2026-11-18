@@ -1,20 +1,20 @@
 # Configuration Reference
 
-This page documents the configuration files that `codebase-memory-mcp` reads or writes today.
+This page documents the configuration files that `codebase-memory-mcp-neo4j` reads or writes today.
 
 ## At a Glance
 
 | Purpose | Path | Format | Notes |
 |---|---|---|---|
-| Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
+| Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp-neo4j/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp-neo4j/config.json` when `XDG_CONFIG_HOME` is unset. |
 | Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
-| CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
-| UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
-| Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
-| Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
-| Activation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
+| CLI-managed runtime settings | `${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/_config.db` | SQLite | Written by `codebase-memory-mcp-neo4j config set/reset`. |
+| UI settings | `${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
+| Daemon operation log | `${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/logs/cbm-neo4j-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
+| Admission conflict log | `${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
+| Activation log | `${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
 
-CBM resolves `CBM_CACHE_DIR` to a canonical per-account path before using any of these locations. The log directory and files are private to the account.
+CBM resolves `CBM_NEO4J_CACHE_DIR` to a canonical per-account path before using any of these locations. The log directory and files are private to the account.
 
 ## 1. Custom File Extension Mapping
 
@@ -25,13 +25,13 @@ Two optional JSON files let you map additional file extensions to built-in langu
 Default path:
 
 ```text
-$XDG_CONFIG_HOME/codebase-memory-mcp/config.json
+$XDG_CONFIG_HOME/codebase-memory-mcp-neo4j/config.json
 ```
 
 Fallback when `XDG_CONFIG_HOME` is unset:
 
 ```text
-~/.config/codebase-memory-mcp/config.json
+~/.config/codebase-memory-mcp-neo4j/config.json
 ```
 
 ### Per-project config
@@ -67,18 +67,18 @@ Notes:
 The `config` subcommand stores runtime settings in a small SQLite database:
 
 ```text
-${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db
+${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/_config.db
 ```
 
 Inspect or change values with the CLI:
 
 ```bash
-codebase-memory-mcp config list
-codebase-memory-mcp config get auto_index
-codebase-memory-mcp config set auto_index true
-codebase-memory-mcp config set auto_index_limit 50000
-codebase-memory-mcp config set watcher_enabled false
-codebase-memory-mcp config reset auto_index
+codebase-memory-mcp-neo4j config list
+codebase-memory-mcp-neo4j config get auto_index
+codebase-memory-mcp-neo4j config set auto_index true
+codebase-memory-mcp-neo4j config set auto_index_limit 50000
+codebase-memory-mcp-neo4j config set watcher_enabled false
+codebase-memory-mcp-neo4j config reset auto_index
 ```
 
 Current keys:
@@ -90,7 +90,7 @@ Current keys:
 | `auto_watch` | `true` | Global switch for MCP session watch registration. On the next refresh or registration request, `true` allows session roots and successful `index_repository` targets to be watched; `false` removes all watches. The background watcher can still run with no registered projects. |
 | `doc_candidates` | `auto` | Score documentation sections against code to store doc↔code candidates (the possible targets of a section, and the sections that may describe a function or file, each with a judged probability). Unset (`auto`), the index mode decides: on for `full` indexes (the default mode), off for `moderate` and `fast`. Set `true` or `false` to choose for every mode; `config reset doc_candidates` returns to `auto`. The scoring grows with sections × functions: under a second up to ~100k functions, ~15 s at ~400k, ~3 minutes on the Linux kernel. Off stores no candidates and leaves the rest of the graph unchanged; on in `fast` mode stores candidates without adding `fast`'s skipped `SIMILAR_TO` / `SEMANTICALLY_RELATED` edges. `index_repository` also takes `doc_candidates` for a single index, which wins over this setting. Applies from the next index. |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Active MCP sessions can register their root project and successful explicit index targets; `index_status` reports the current state in its `watch` object. |
-| `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
+| `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory-neo4j/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 
@@ -125,9 +125,9 @@ has not run yet).
 >   the daemon so the next one picks the new value up:
 >
 > ```bash
-> codebase-memory-mcp config set watcher_enabled false
-> codebase-memory-mcp daemon stop     # next session starts a daemon without the watcher
-> codebase-memory-mcp daemon status   # confirm
+> codebase-memory-mcp-neo4j config set watcher_enabled false
+> codebase-memory-mcp-neo4j daemon stop     # next session starts a daemon without the watcher
+> codebase-memory-mcp-neo4j daemon status   # confirm
 > ```
 >
 > Disabling the watcher does not disable anything else: the daemon still starts,
@@ -147,7 +147,7 @@ error-response details.
 The optional built-in graph UI stores its settings in:
 
 ```text
-${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json
+${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}/config.json
 ```
 
 Current format:
@@ -155,15 +155,15 @@ Current format:
 ```json
 {
   "ui_enabled": false,
-  "ui_port": 9749
+  "ui_port": 9750
 }
 ```
 
 Notes:
 
 - If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
-- `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
-- CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
+- `CBM_NEO4J_CACHE_DIR` changes both the UI config location and the runtime settings database location.
+- CBM resolves `CBM_NEO4J_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
 ## 4. Environment Variables
 
@@ -172,11 +172,11 @@ These environment variables affect runtime behavior:
 | Variable | Default | Description |
 |---|---|---|
 | `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction — but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
-| `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
-| `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
+| `CBM_NEO4J_CACHE_DIR` | `~/.cache/codebase-memory-mcp-neo4j` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
+| `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_NEO4J_CACHE_DIR}/logs/cbm-neo4j-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
-| `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
-| `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
+| `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_NEO4J_CACHE_DIR}/logs/cbm-neo4j-daemon.log`. |
+| `CBM_NEO4J_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-neo4j-daemon-<uid>` (`cbm-neo4j-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_NEO4J_CACHE_DIR` does **not** move the rendezvous. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
 ### Relocating the daemon rendezvous directory
@@ -196,17 +196,17 @@ command fails, `config list` included, so the settings surface cannot be reached
 either:
 
 ```text
-codebase-memory-mcp: secure daemon endpoint could not be created
+codebase-memory-mcp-neo4j: secure daemon endpoint could not be created
 ```
 
-`CBM_RUNTIME_DIR` points the rendezvous at an ancestry you choose:
+`CBM_NEO4J_RUNTIME_DIR` points the rendezvous at an ancestry you choose:
 
 ```bash
-export CBM_RUNTIME_DIR="$HOME/cbm-runtime"   # any directory you own
+export CBM_NEO4J_RUNTIME_DIR="$HOME/cbm-runtime"   # any directory you own
 ```
 
 ```powershell
-$env:CBM_RUNTIME_DIR = "D:\cbm-runtime"
+$env:CBM_NEO4J_RUNTIME_DIR = "D:\cbm-runtime"
 ```
 
 The check is not relaxed for the directory you name: it goes through exactly the
@@ -216,7 +216,7 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-**WSL2 and Windows drives (`/mnt/c`, `/mnt/e`, ...).** `CBM_CACHE_DIR` goes through
+**WSL2 and Windows drives (`/mnt/c`, `/mnt/e`, ...).** `CBM_NEO4J_CACHE_DIR` goes through
 the same private-directory check. With WSL's default automount options, DrvFs
 reports every directory as `0777` and ignores `chmod`, so a cache under
 `/mnt/<drive>` is refused, and the refusal names this remedy. Either turn on
@@ -227,10 +227,10 @@ permission metadata in `/etc/wsl.conf`, then run `wsl --shutdown` and reopen WSL
 options = "metadata,umask=22,fmask=11"
 ```
 
-or keep the cache on the Linux filesystem (the default `~/.cache/codebase-memory-mcp`),
+or keep the cache on the Linux filesystem (the default `~/.cache/codebase-memory-mcp-neo4j`),
 which is also much faster than a 9p-mounted Windows drive.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_NEO4J_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
 
 ### Roots that are always refused
@@ -257,8 +257,8 @@ On clusters and other shared machines, home directories often live on a network
 filesystem (NFS, Lustre, GPFS, SMB/CIFS), and `~/.cache` is sometimes a symlink
 into a shared tree. Three rules keep CBM working there:
 
-- **Put the cache and the rendezvous on local storage.** Set `CBM_CACHE_DIR` (indexes,
-  `_config.db`) and, if needed, `CBM_RUNTIME_DIR` (the daemon rendezvous) to a
+- **Put the cache and the rendezvous on local storage.** Set `CBM_NEO4J_CACHE_DIR` (indexes,
+  `_config.db`) and, if needed, `CBM_NEO4J_RUNTIME_DIR` (the daemon rendezvous) to a
   local disk you own, for example `/local/scratch/$USER/cbm` or `/tmp/$USER-cbm`.
   Set the same values in your MCP client's environment and your shell.
 - **Do not route the cache into another account's tree.** A symlinked `~/.cache` is
@@ -285,7 +285,7 @@ The `install` command can also write MCP entries and instruction blocks into age
 Those target paths vary by tool and platform, so the easiest way to inspect the exact files for your machine is:
 
 ```bash
-codebase-memory-mcp install --dry-run
+codebase-memory-mcp-neo4j install --dry-run
 ```
 
 That prints the specific config files the installer would modify without writing anything.

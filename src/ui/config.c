@@ -1,8 +1,8 @@
 /*
  * config.c — Persistent UI configuration (JSON via yyjson).
  *
- * Config file: ~/.cache/codebase-memory-mcp/config.json
- * Format: {"ui_enabled": false, "ui_port": 9749}
+ * Config file: ~/.cache/codebase-memory-mcp-neo4j/config.json
+ * Format: {"ui_enabled": false, "ui_port": 9750}
  */
 #include "foundation/constants.h"
 #include "ui/config.h"

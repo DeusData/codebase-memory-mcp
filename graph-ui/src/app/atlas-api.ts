@@ -250,7 +250,7 @@ export class AtlasApi {
         return readLogs(await this.getJson(`/api/logs?${query.toString()}`));
     }
 
-    /** The codebase-memory-mcp processes on this machine, as the server sees them. */
+    /** The codebase-memory-mcp-neo4j processes on this machine, as the server sees them. */
     async processes(): Promise<ProcessReport> {
         return readProcesses(await this.getJson('/api/processes'));
     }

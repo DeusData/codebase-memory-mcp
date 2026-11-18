@@ -49,7 +49,7 @@ static cbm_daemon_build_identity_t version_test_identity(const char *version, co
 
 static bool version_test_temp_dir(char out[VERSION_TEST_PATH_CAP], const char *tag) {
     int written =
-        snprintf(out, VERSION_TEST_PATH_CAP, "%s/cbm-daemon-%s-XXXXXX", cbm_tmpdir(), tag);
+        snprintf(out, VERSION_TEST_PATH_CAP, "%s/cbm-neo4j-daemon-%s-XXXXXX", cbm_tmpdir(), tag);
     return written > 0 && written < VERSION_TEST_PATH_CAP && cbm_mkdtemp(out) != NULL;
 }
 
@@ -306,8 +306,8 @@ TEST(daemon_conflict_remedy_names_session_managed_daemon_and_its_sessions) {
     ASSERT_NOT_NULL(strstr(remedy, "version 0.10.3"));
     ASSERT_NOT_NULL(strstr(remedy, "session-managed"));
     ASSERT_NOT_NULL(strstr(remedy, "5151, 6262"));
-    ASSERT_NOT_NULL(strstr(remedy, "which -a codebase-memory-mcp"));
-    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon stop"));
+    ASSERT_NOT_NULL(strstr(remedy, "which -a codebase-memory-mcp-neo4j"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp-neo4j daemon stop"));
     PASS();
 }
 
@@ -324,7 +324,7 @@ TEST(daemon_conflict_remedy_names_permanent_daemon_and_truncated_session_list) {
     ASSERT_NOT_NULL(strstr(remedy, "pid 77"));
     ASSERT_NOT_NULL(strstr(remedy, "permanent"));
     ASSERT_NOT_NULL(strstr(remedy, "1007 and 3 more"));
-    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon stop"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp-neo4j daemon stop"));
     PASS();
 }
 
@@ -343,9 +343,9 @@ TEST(daemon_conflict_remedy_without_status_points_at_daemon_status) {
     char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
 
     ASSERT_TRUE(cbm_daemon_conflict_remedy_format(NULL, remedy, sizeof(remedy)));
-    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon status"));
-    ASSERT_NOT_NULL(strstr(remedy, "which -a codebase-memory-mcp"));
-    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp daemon stop"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp-neo4j daemon status"));
+    ASSERT_NOT_NULL(strstr(remedy, "which -a codebase-memory-mcp-neo4j"));
+    ASSERT_NOT_NULL(strstr(remedy, "codebase-memory-mcp-neo4j daemon stop"));
     PASS();
 }
 

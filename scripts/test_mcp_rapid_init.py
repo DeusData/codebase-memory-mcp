@@ -34,7 +34,7 @@ def main():
         # Default: look for build artifact relative to this script's directory
         script_dir = os.path.dirname(os.path.abspath(__file__))
         repo_root = os.path.dirname(script_dir)
-        binary = os.path.join(repo_root, "build", "c", "codebase-memory-mcp")
+        binary = os.path.join(repo_root, "build", "c", "codebase-memory-mcp-neo4j")
 
     if not os.path.isfile(binary):
         print(f"FAIL: binary not found at {binary}")

@@ -22,7 +22,7 @@ awaiting-reporter:
     reproduce it ourselves:
 
 
-    - the `codebase-memory-mcp --version` you're on
+    - the `codebase-memory-mcp-neo4j --version` you're on
 
     - the exact steps or command you ran
 

@@ -957,7 +957,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * Without this distinction, a fast-mode reindex after a full-mode index
  * would silently purge every file under `tools/`, `scripts/`, `bin/`,
  * `build/`, `docs/`, `__tests__/`, etc. — see task
- * claude-connectors/codebase-memory-index-repository-is-destructive-...
+ * claude-connectors/codebase-memory-neo4j-index-repository-is-destructive-...
  * and the 2026-04-13 Skyline incident (packages/mcp/src/tools/ vanished
  * from a live graph mid-session).
  *

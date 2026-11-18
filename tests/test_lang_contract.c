@@ -77,7 +77,7 @@ static cbm_store_t *lang_open_indexed(LangProj *lp) {
         return NULL;
     }
     char cache_dir[512];
-    const char *configured_cache = getenv("CBM_CACHE_DIR");
+    const char *configured_cache = getenv("CBM_NEO4J_CACHE_DIR");
     if (configured_cache && configured_cache[0]) {
         snprintf(cache_dir, sizeof(cache_dir), "%s", configured_cache);
     } else {
@@ -85,7 +85,7 @@ static cbm_store_t *lang_open_indexed(LangProj *lp) {
         if (!home) {
             home = "/tmp";
         }
-        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp-neo4j", home);
     }
     cbm_mkdir_p(cache_dir, 0755);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);

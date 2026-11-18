@@ -355,7 +355,7 @@ TEST(doc_mentions_cs_namespace_publication) {
     cbm_mkdir_p(cache, 0700);
     cbm_mkdir_p(repo, 0700); /* project identity canonicalizes the existing path */
     char *project = cbm_project_name_from_path(repo);
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_copy = saved_cache ? strdup(saved_cache) : NULL;
     bool correct = project && (!saved_cache || saved_copy);
     if (!correct) {
@@ -365,7 +365,7 @@ TEST(doc_mentions_cs_namespace_publication) {
         ASSERT(correct);
     }
     snprintf(db, sizeof(db), "%s/%s.db", cache, project);
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1);
     for (size_t i = 0; i < sizeof(dm_namespace_cases) / sizeof(dm_namespace_cases[0]); i++) {
         for (int file_scoped = 0; file_scoped < 2; file_scoped++) {
             char source[2048], label[128];
@@ -433,9 +433,9 @@ TEST(doc_mentions_cs_namespace_publication) {
         }
     }
     if (saved_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_copy, 1);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_copy);
     free(project);
@@ -712,7 +712,7 @@ TEST(doc_mentions_cs_control_publication) {
     cbm_mkdir_p(cache, 0700);
     cbm_mkdir_p(repo, 0700);
     char *project = cbm_project_name_from_path(repo);
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_copy = saved_cache ? strdup(saved_cache) : NULL;
     bool correct = project && (!saved_cache || saved_copy);
     if (!correct) {
@@ -722,7 +722,7 @@ TEST(doc_mentions_cs_control_publication) {
         ASSERT(correct);
     }
     snprintf(db, sizeof(db), "%s/%s.db", cache, project);
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1);
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         for (size_t j = 0; j < sizeof(bytes) / sizeof(bytes[0]); j++) {
             char source[2048], label[128];
@@ -802,9 +802,9 @@ TEST(doc_mentions_cs_control_publication) {
         }
     }
     if (saved_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_copy, 1);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_copy);
     free(project);
@@ -4521,7 +4521,7 @@ static int dm_preview_fixture(int (*check)(const char *db, const char *project))
     dm_write_resolver_fixture(repo);
     cbm_mkdir_p(cache_dir, 0700);
     char *project = cbm_project_name_from_path(repo);
-    const char *saved = getenv("CBM_CACHE_DIR");
+    const char *saved = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
     if (!project || (saved && !saved_copy)) {
         free(project);
@@ -4530,15 +4530,15 @@ static int dm_preview_fixture(int (*check)(const char *db, const char *project))
         return 1;
     }
     snprintf(db, sizeof(db), "%s/%s.db", cache_dir, project);
-    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", cache_dir, 1);
     int rc = dm_index(repo, db, NULL);
     if (rc == 0) {
         rc = check(db, project);
     }
     if (saved_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_copy, 1);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_copy);
     dm_unlink_db(db);
@@ -5275,15 +5275,15 @@ TEST(doc_mentions_index_status_and_delete) {
     cbm_mkdir_p(cache_dir, 0700);
     /* the tool reads the project's database from the cache directory: a
      * private one for this test, restored whatever the checks say */
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_cache = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", cache_dir, 1);
     int rc = dm_index_status_checks(tmp, repo, cache_dir);
     if (saved_cache_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache_copy, 1);
         free(saved_cache_copy);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     th_rmtree(tmp);
     return rc;

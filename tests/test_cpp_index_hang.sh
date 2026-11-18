@@ -30,7 +30,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/build/c/codebase-memory-mcp"
+BIN="$ROOT/build/c/codebase-memory-mcp-neo4j"
 
 # Number of classes/methods in the synthetic TU. Each class has a method that
 # calls the next class's method by value-of-known-type → routes through the
@@ -49,7 +49,7 @@ fi
 [ -x "$BIN" ] || { echo "[hang] FAIL — binary not found at $BIN"; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; rm -f "$HOME/.cache/codebase-memory-mcp/$PROJ.db"* 2>/dev/null' EXIT
+trap 'rm -rf "$WORK"; rm -f "$HOME/.cache/codebase-memory-mcp-neo4j/$PROJ.db"* 2>/dev/null' EXIT
 
 HDR="$WORK/model.hpp"
 SRC="$WORK/main.cpp"
@@ -81,7 +81,7 @@ echo "[hang] generating synthetic TU: $CLASSES classes/methods ..."
 } > "$SRC"
 
 PROJ="$(printf '%s' "$WORK" | sed 's#^/##; s#[^A-Za-z0-9._-]#-#g')"
-rm -f "$HOME/.cache/codebase-memory-mcp/$PROJ.db"* 2>/dev/null
+rm -f "$HOME/.cache/codebase-memory-mcp-neo4j/$PROJ.db"* 2>/dev/null
 
 echo "[hang] indexing with ${TIMEOUT}s wall-clock budget ..."
 START=$(date +%s)

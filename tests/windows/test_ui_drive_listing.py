@@ -23,7 +23,7 @@ Exit code: 0 == all drives advertised in roots and reachable (green),
 2 == precondition not met (no UI build / server down).
 
 Usage:
-    python test_ui_drive_listing.py <path-to-codebase-memory-mcp-ui[.exe]> [port]
+    python test_ui_drive_listing.py <path-to-codebase-memory-mcp-neo4j-ui[.exe]> [port]
 """
 import json
 import os
@@ -110,8 +110,8 @@ def main():
     work = tempfile.mkdtemp(prefix="cbm_win_uidrv_")
     port = int(sys.argv[2]) if len(sys.argv) > 2 else free_port()
     env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = os.path.join(work, "cache")
-    os.makedirs(env["CBM_CACHE_DIR"], exist_ok=True)
+    env["CBM_NEO4J_CACHE_DIR"] = os.path.join(work, "cache")
+    os.makedirs(env["CBM_NEO4J_CACHE_DIR"], exist_ok=True)
     proc = subprocess.Popen([binary, "--ui=true", "--port=%d" % port],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env)

@@ -79,11 +79,11 @@ bool cbm_mkdir_p(const char *path, int mode);
  *
  * CBM_MKDIR_FOLLOW_OWNED also follows a symlink component owned by the invoking
  * user. Opt in ONLY for paths rooted in the user's own configuration -- HOME,
- * XDG, CBM_CACHE_DIR: agent roots, config, cache and log directories -- where a
+ * XDG, CBM_NEO4J_CACHE_DIR: agent roots, config, cache and log directories -- where a
  * link the user owns is the user's own arrangement (a dotfile manager, a config
  * tree kept on another volume). Never for a path derived from a repository:
  * git creates symlinks owned by whoever cloned, so a checked-in
- * `.codebase-memory -> ~/.ssh` is user-owned without being user-intended.
+ * `.codebase-memory-neo4j -> ~/.ssh` is user-owned without being user-intended.
  * Whatever a followed link lands on must itself be a directory owned by root
  * or the invoking user and not world-writable unless sticky. Windows ignores
  * the policy. */

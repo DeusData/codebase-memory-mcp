@@ -40,7 +40,7 @@
  * keinen Diff, sondern nur einen Index. fixtures/atlas-sample bleibt
  * byte-identisch.
  *
- * **CBM_RUNTIME_DIR wird gesetzt.** Der Daemon des Servers und jede CLI
+ * **CBM_NEO4J_RUNTIME_DIR wird gesetzt.** Der Daemon des Servers und jede CLI
  * verabreden sich in einem Rendezvous-Verzeichnis, das per Konto und nicht per
  * HOME gilt. Ohne das waere ein Lauf neben einer anderen CBM-Instanz nicht rot,
  * sondern kaputt. Wortgleich mit tools/smoke-w4c.mjs.
@@ -72,7 +72,7 @@ import {
 import { startStaticProxy } from './lib/static-proxy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w5c';
@@ -642,7 +642,7 @@ async function main() {
         // ---------------------------------------------- 2. HOME, Rendezvous
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-w5c-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w5c-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         log('isoliertes HOME:', home);
         log('Rendezvous:', runtimeDir);
 

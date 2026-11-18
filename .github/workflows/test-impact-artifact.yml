@@ -73,7 +73,7 @@ jobs:
           if [ "$EVENT" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
             before="$BEFORE"
           fi
-          scripts/ci/test-impact-publish.sh --binary build/c/codebase-memory-mcp \
+          scripts/ci/test-impact-publish.sh --binary build/c/codebase-memory-mcp-neo4j \
             --runner build/cov/test-runner --llvm-bin /usr/lib/llvm-21/bin \
             --out "$RUNNER_TEMP/bundle" --mode "$mode" --before "$before"
 
@@ -82,6 +82,6 @@ jobs:
         with:
           name: test-impact-${{ github.sha }}
           path: ${{ runner.temp }}/bundle
-          include-hidden-files: true # the graph lives in .codebase-memory/
+          include-hidden-files: true # the graph lives in .codebase-memory-neo4j/
           retention-days: 30
           if-no-files-found: error

@@ -2938,8 +2938,8 @@ static int toml_legacy_command_is_owned(const char *data, const toml_assignment_
             basename_start = i + 1U;
         }
     }
-    static const char binary_name[] = "codebase-memory-mcp";
-    static const char windows_binary_name[] = "codebase-memory-mcp.exe";
+    static const char binary_name[] = "codebase-memory-mcp-neo4j";
+    static const char windows_binary_name[] = "codebase-memory-mcp-neo4j.exe";
     size_t basename_len = value.len - basename_start;
     *owned = (basename_len == sizeof(binary_name) - 1U &&
               memcmp(value.data + basename_start, binary_name, basename_len) == 0) ||
@@ -2972,7 +2972,7 @@ static int toml_legacy_args_are_empty(const char *data, const toml_assignment_t 
 
 /* #1720: the only names cbm has ever listed in env_vars (#1562, #1664). */
 static int toml_legacy_env_name_is_owned(const toml_string_t *name) {
-    static const char *const owned[] = {"CBM_CACHE_DIR", "CBM_RUNTIME_DIR"};
+    static const char *const owned[] = {"CBM_NEO4J_CACHE_DIR", "CBM_NEO4J_RUNTIME_DIR"};
     for (size_t i = 0U; i < sizeof(owned) / sizeof(owned[0]); ++i) {
         size_t owned_len = strlen(owned[i]);
         if (name->len == owned_len && memcmp(name->data, owned[i], owned_len) == 0) {
@@ -3354,15 +3354,15 @@ static int toml_codex_current_command_is_owned(const char *command, size_t len) 
         }
     }
     size_t basename_len = word_end - basename;
-    return (basename_len == strlen("codebase-memory-mcp") &&
-            memcmp(executable + basename, "codebase-memory-mcp", basename_len) == 0) ||
-           (basename_len == strlen("codebase-memory-mcp.exe") &&
-            memcmp(executable + basename, "codebase-memory-mcp.exe", basename_len) == 0);
+    return (basename_len == strlen("codebase-memory-mcp-neo4j") &&
+            memcmp(executable + basename, "codebase-memory-mcp-neo4j", basename_len) == 0) ||
+           (basename_len == strlen("codebase-memory-mcp-neo4j.exe") &&
+            memcmp(executable + basename, "codebase-memory-mcp-neo4j.exe", basename_len) == 0);
 }
 static int toml_codex_command_kind(const toml_string_t *command) {
-    static const char legacy_short[] = "echo \"Code discovery: prefer codebase-memory-mcp\"";
+    static const char legacy_short[] = "echo \"Code discovery: prefer codebase-memory-mcp-neo4j\"";
     static const char legacy_released[] =
-        "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, "
+        "echo \"Code discovery: prefer codebase-memory-mcp-neo4j (search_graph, trace_path, "
         "get_code_snippet, query_graph, search_code) over grep/file-read; run index_repository "
         "first if the project is not indexed.\"";
     if ((command->len == sizeof(legacy_short) - 1U &&

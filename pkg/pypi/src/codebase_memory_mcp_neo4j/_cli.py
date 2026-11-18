@@ -1,4 +1,4 @@
-"""Downloads codebase-memory-mcp on first run, then runs its native entry point."""
+"""Downloads codebase-memory-mcp-neo4j on first run, then runs its native entry point."""
 
 import errno
 import hashlib
@@ -19,10 +19,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-REPO = "DeusData/codebase-memory-mcp"
-_WINDOWS_BINARY_NAME = "codebase-memory-mcp.exe"
+REPO = "haiderRizvii/codebase-memory-mcp"
+_WINDOWS_BINARY_NAME = "codebase-memory-mcp-neo4j.exe"
 _UNIX_ARCHIVE_NAMES = (
-    "codebase-memory-mcp",
+    "codebase-memory-mcp-neo4j",
     "LICENSE",
     "install.sh",
     "THIRD_PARTY_NOTICES.md",
@@ -48,11 +48,11 @@ _MAX_REDIRECTS = 5
 _NETWORK_TIMEOUT_SECONDS = 120
 _CANDIDATE_TIMEOUT_SECONDS = 15
 # Entry-count guard for the archive namespace check. Keep in sync with the
-# Go wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the npm wrapper.
+# Go wrapper (pkg/go/cmd/codebase-memory-mcp-neo4j/main.go) and the npm wrapper.
 _MAX_ARCHIVE_MEMBERS = 64
 _ARCHIVE_COPY_CHUNK_BYTES = 64 * 1024
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
-_RUNTIME_LOCK_NAME = ".codebase-memory-mcp-runtime.lock"
+_RUNTIME_LOCK_NAME = ".codebase-memory-mcp-neo4j-runtime.lock"
 _RUNTIME_LOCK_WAIT_SECONDS = 45
 _RUNTIME_OWNERLESS_STALE_SECONDS = 30
 _RUNTIME_LOCK_POLL_SECONDS = 0.025
@@ -99,7 +99,7 @@ def _download_base(version: str, environ=None):
     if _LOOPBACK_HTTP_URL.fullmatch(override):
         return override, True
     sys.exit(
-        f"codebase-memory-mcp: refusing non-HTTPS download URL "
+        f"codebase-memory-mcp-neo4j: refusing non-HTTPS download URL "
         f"(CBM_DOWNLOAD_URL): {override}"
     )
 
@@ -114,7 +114,7 @@ def _validate_loopback_url(url: str) -> None:
         or parsed.username is not None
         or parsed.password is not None
     ):
-        sys.exit(f"codebase-memory-mcp: refusing non-loopback HTTP URL: {url}")
+        sys.exit(f"codebase-memory-mcp-neo4j: refusing non-loopback HTTP URL: {url}")
 
 
 def _validate_url_scheme(url: str) -> None:
@@ -127,7 +127,7 @@ def _validate_url_scheme(url: str) -> None:
         or parsed.password is not None
     ):
         sys.exit(
-            f"codebase-memory-mcp: refusing to fetch invalid, credentialed, or "
+            f"codebase-memory-mcp-neo4j: refusing to fetch invalid, credentialed, or "
             f"non-https URL: {url}"
         )
 
@@ -146,7 +146,7 @@ def _download_file(url: str, dest: str, loopback: bool = False) -> None:
     for redirect_count in range(_MAX_REDIRECTS + 1):
         _validate_download_url(current_url, loopback)
         request = urllib.request.Request(
-            current_url, headers={"User-Agent": "codebase-memory-mcp-installer"}
+            current_url, headers={"User-Agent": "codebase-memory-mcp-neo4j-installer"}
         )
         try:
             response = opener.open(request, timeout=_NETWORK_TIMEOUT_SECONDS)
@@ -242,32 +242,32 @@ def _validate_archive_names(names, archive_names, casefold: bool = False):
         key = name.casefold() if casefold else name
         if key in seen:
             sys.exit(
-                f"codebase-memory-mcp: refusing unsafe archive entry "
+                f"codebase-memory-mcp-neo4j: refusing unsafe archive entry "
                 f"(duplicate or case conflict: {name!r})"
             )
         seen.add(key)
         if name not in required_set:
             sys.exit(
-                f"codebase-memory-mcp: archive must contain only the exact "
+                f"codebase-memory-mcp-neo4j: archive must contain only the exact "
                 f"root files: {', '.join(required)}"
             )
         found.add(name)
     if found != required_set or len(seen) != len(required):
         sys.exit(
-            f"codebase-memory-mcp: archive must contain exactly one of each "
+            f"codebase-memory-mcp-neo4j: archive must contain exactly one of each "
             f"required root file: {', '.join(required)}"
         )
 
 
 def _require_regular_archive(archive_path: str) -> None:
     if not stat.S_ISREG(os.stat(archive_path).st_mode):
-        sys.exit("codebase-memory-mcp: release archive is not a regular file")
+        sys.exit("codebase-memory-mcp-neo4j: release archive is not a regular file")
 
 
 def _require_member_count_within_limit(count: int, max_members: int) -> None:
     if count > max_members:
         sys.exit(
-            f"codebase-memory-mcp: archive exceeds the {max_members}-member "
+            f"codebase-memory-mcp-neo4j: archive exceeds the {max_members}-member "
             f"safety limit"
         )
 
@@ -275,7 +275,7 @@ def _require_member_count_within_limit(count: int, max_members: int) -> None:
 def _require_declared_size(name: str, size: int) -> None:
     if size < 0:
         sys.exit(
-            f"codebase-memory-mcp: archive member has a negative declared "
+            f"codebase-memory-mcp-neo4j: archive member has a negative declared "
             f"size: {name!r}"
         )
 
@@ -294,7 +294,7 @@ def _copy_archive_member(source, output, name: str, declared_size: int) -> int:
         output.write(chunk)
     if copied != declared_size:
         sys.exit(
-            f"codebase-memory-mcp: archive member {name!r} actual size {copied} "
+            f"codebase-memory-mcp-neo4j: archive member {name!r} actual size {copied} "
             f"does not match declared size {declared_size}"
         )
     return copied
@@ -323,7 +323,7 @@ def _safe_extract_tar(
     for member in members:
         if not member.isfile():
             sys.exit(
-                f"codebase-memory-mcp: refusing unsafe tar entry "
+                f"codebase-memory-mcp-neo4j: refusing unsafe tar entry "
                 f"(not a regular root file: {member.name!r})"
             )
         _require_declared_size(member.name, member.size)
@@ -334,7 +334,7 @@ def _safe_extract_tar(
     for name in runtime_names:
         source = tf.extractfile(by_name[name])
         if source is None:
-            sys.exit(f"codebase-memory-mcp: could not read archive member: {name}")
+            sys.exit(f"codebase-memory-mcp-neo4j: could not read archive member: {name}")
         target = os.path.join(dest_abs, name)
         with source:
             _write_archive_member(source, target, name, by_name[name].size)
@@ -373,20 +373,20 @@ def _safe_extract_zip(
             or any(segment.endswith((".", " ")) for segment in segments)
         ):
             sys.exit(
-                f"codebase-memory-mcp: refusing unsafe zip entry "
+                f"codebase-memory-mcp-neo4j: refusing unsafe zip entry "
                 f"(invalid path: {raw_name!r})"
             )
         unix_type = stat.S_IFMT((info.external_attr >> 16) & 0xFFFF)
         if info.is_dir() or unix_type not in (0, stat.S_IFREG):
             sys.exit(
-                f"codebase-memory-mcp: refusing unsafe zip entry "
+                f"codebase-memory-mcp-neo4j: refusing unsafe zip entry "
                 f"(not a regular root file: {raw_name!r})"
             )
         names.append(name)
         member_abs = os.path.abspath(os.path.join(dest_abs, *segments))
         if not (member_abs == dest_abs or member_abs.startswith(dest_abs + os.sep)):
             sys.exit(
-                f"codebase-memory-mcp: refusing unsafe zip entry "
+                f"codebase-memory-mcp-neo4j: refusing unsafe zip entry "
                 f"(escapes dest: {raw_name!r})"
             )
     _validate_archive_names(names, archive_names, casefold=True)
@@ -426,18 +426,18 @@ def _verify_checksum(
                     ch not in "0123456789abcdef" for ch in digest
                 ):
                     sys.exit(
-                        f"codebase-memory-mcp: invalid SHA256 checksum for "
+                        f"codebase-memory-mcp-neo4j: invalid SHA256 checksum for "
                         f"{archive_name}"
                     )
                 if expected is not None and expected != digest:
                     sys.exit(
-                        f"codebase-memory-mcp: conflicting SHA256 checksums for "
+                        f"codebase-memory-mcp-neo4j: conflicting SHA256 checksums for "
                         f"{archive_name}"
                     )
                 expected = digest
         if expected is None:
             sys.exit(
-                f"codebase-memory-mcp: no checksum for {archive_name} in checksums.txt"
+                f"codebase-memory-mcp-neo4j: no checksum for {archive_name} in checksums.txt"
             )
         h = hashlib.sha256()
         with open(archive_path, "rb") as af:
@@ -446,15 +446,15 @@ def _verify_checksum(
         actual = h.hexdigest()
         if expected != actual:
             sys.exit(
-                f"codebase-memory-mcp: CHECKSUM MISMATCH for {archive_name}\n"
+                f"codebase-memory-mcp-neo4j: CHECKSUM MISMATCH for {archive_name}\n"
                 f"  expected: {expected}\n"
                 f"  actual:   {actual}"
             )
-        print("codebase-memory-mcp: checksum verified.", file=sys.stderr)
+        print("codebase-memory-mcp-neo4j: checksum verified.", file=sys.stderr)
     except SystemExit:
         raise
     except Exception as exc:
-        sys.exit(f"codebase-memory-mcp: checksum verification failed: {exc}")
+        sys.exit(f"codebase-memory-mcp-neo4j: checksum verification failed: {exc}")
     finally:
         if tmp_path is not None:
             try:
@@ -466,7 +466,7 @@ def _verify_checksum(
 def _version() -> str:
     try:
         from importlib.metadata import version
-        return version("codebase-memory-mcp")
+        return version("codebase-memory-mcp-neo4j")
     except Exception:
         return "0.12.1"
 
@@ -479,7 +479,7 @@ def _os_name() -> str:
         return "darwin"
     if p == "win32":
         return "windows"
-    sys.exit(f"codebase-memory-mcp: unsupported platform: {p}")
+    sys.exit(f"codebase-memory-mcp-neo4j: unsupported platform: {p}")
 
 
 def _arch() -> str:
@@ -488,7 +488,7 @@ def _arch() -> str:
         return "arm64"
     if m in ("x86_64", "amd64"):
         return "amd64"
-    sys.exit(f"codebase-memory-mcp: unsupported architecture: {m}")
+    sys.exit(f"codebase-memory-mcp-neo4j: unsupported architecture: {m}")
 
 
 def _cache_dir() -> Path:
@@ -498,7 +498,7 @@ def _cache_dir() -> Path:
         base = Path.home() / "Library" / "Caches"
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return base / "codebase-memory-mcp"
+    return base / "codebase-memory-mcp-neo4j"
 
 
 def _runtime_dir(version: str) -> Path:
@@ -510,7 +510,7 @@ def _bin_path(version: str) -> Path:
     name = (
         _WINDOWS_BINARY_NAME
         if sys.platform == "win32"
-        else "codebase-memory-mcp"
+        else "codebase-memory-mcp-neo4j"
     )
     return _runtime_dir(version) / name
 
@@ -1294,7 +1294,7 @@ def _download(version: str) -> Path:
     # dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
     # have no such variant. Keep in sync with install.sh / install.js / cli.c.
     portable = "-portable" if os_name == "linux" else ""
-    archive = f"codebase-memory-mcp-{os_name}-{arch}{portable}.{ext}"
+    archive = f"codebase-memory-mcp-neo4j-{os_name}-{arch}{portable}.{ext}"
     base, loopback = _download_base(version)
     url = f"{base}/{archive}"
     _validate_download_url(url, loopback)
@@ -1303,7 +1303,7 @@ def _download(version: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     print(
-        f"codebase-memory-mcp: downloading v{version} for {os_name}/{arch}...",
+        f"codebase-memory-mcp-neo4j: downloading v{version} for {os_name}/{arch}...",
         file=sys.stderr,
     )
 
@@ -1313,7 +1313,7 @@ def _download(version: str) -> Path:
             _download_file(url, tmp_archive, loopback)
         except (OSError, RuntimeError, urllib.error.URLError) as e:
             sys.exit(
-                f"codebase-memory-mcp: download failed ({e})\n"
+                f"codebase-memory-mcp-neo4j: download failed ({e})\n"
                 f"URL: {url}\n"
                 f"See https://github.com/{REPO}/releases for available versions."
             )
@@ -1322,7 +1322,7 @@ def _download(version: str) -> Path:
         _require_regular_archive(tmp_archive)
 
         bin_name = (
-            _WINDOWS_BINARY_NAME if os_name == "windows" else "codebase-memory-mcp"
+            _WINDOWS_BINARY_NAME if os_name == "windows" else "codebase-memory-mcp-neo4j"
         )
         extraction_names = (bin_name,)
         archive_names = (
@@ -1354,7 +1354,7 @@ def _download(version: str) -> Path:
             extracted_path = Path(tmp) / name
             if not _regular_file(extracted_path):
                 sys.exit(
-                    f"codebase-memory-mcp: required runtime member not found after "
+                    f"codebase-memory-mcp-neo4j: required runtime member not found after "
                     f"extraction: {name}"
                 )
             if name == bin_name:
@@ -1365,13 +1365,13 @@ def _download(version: str) -> Path:
             extracted_paths[name] = extracted_path
         if _runtime_set_names(Path(tmp), bin_name) is None:
             sys.exit(
-                "codebase-memory-mcp: extracted runtime set failed content "
+                "codebase-memory-mcp-neo4j: extracted runtime set failed content "
                 "verification"
             )
         try:
             _verify_candidate(extracted_paths[bin_name])
         except (OSError, RuntimeError) as exc:
-            sys.exit(f"codebase-memory-mcp: {exc}")
+            sys.exit(f"codebase-memory-mcp-neo4j: {exc}")
 
         staged_paths = {}
         try:
@@ -1406,7 +1406,7 @@ def _download(version: str) -> Path:
             )
             _verify_candidate(dest)
         except (OSError, RuntimeError) as exc:
-            sys.exit(f"codebase-memory-mcp: {exc}")
+            sys.exit(f"codebase-memory-mcp-neo4j: {exc}")
         finally:
             for staged_path in staged_paths.values():
                 try:
@@ -1424,9 +1424,9 @@ def main() -> None:
     if mutation == "update":
         print(
             "This PyPI copy is maintained by pip. Update it with "
-            '"python -m pip install --upgrade codebase-memory-mcp". '
+            '"python -m pip install --upgrade codebase-memory-mcp-neo4j". '
             "For a managed standalone installation, run "
-            '"codebase-memory-mcp install --yes".',
+            '"codebase-memory-mcp-neo4j install --yes".',
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -1449,9 +1449,9 @@ def main() -> None:
         if sys.platform == "win32" and result != 0 and mutation == "uninstall":
             print(
                 'This PyPI Windows copy is portable. Use '
-                '"python -m pip uninstall codebase-memory-mcp" for package maintenance. '
+                '"python -m pip uninstall codebase-memory-mcp-neo4j" for package maintenance. '
                 "To create or repair a managed standalone installation, run "
-                '"codebase-memory-mcp install --yes".',
+                '"codebase-memory-mcp-neo4j install --yes".',
                 file=sys.stderr,
             )
         raise SystemExit(result)
@@ -1483,7 +1483,7 @@ def _default_managed_install_dir() -> Path:
     local_app_data = Path(
         os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
     )
-    return local_app_data / "Programs" / "codebase-memory-mcp"
+    return local_app_data / "Programs" / "codebase-memory-mcp-neo4j"
 
 
 def _native_args(args):

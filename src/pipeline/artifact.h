@@ -2,7 +2,7 @@
  * artifact.h — Persistent artifact export/import for team sharing.
  *
  * Exports the SQLite knowledge graph as a zstd-compressed artifact
- * to .codebase-memory/graph.db.zst in the repository. Teammates
+ * to .codebase-memory-neo4j/graph.db.zst in the repository. Teammates
  * can import the artifact to bootstrap their local index instead
  * of running a full pipeline from scratch.
  */
@@ -20,7 +20,7 @@
 
 #define CBM_ARTIFACT_FILENAME "graph.db.zst"
 #define CBM_ARTIFACT_META "artifact.json"
-#define CBM_ARTIFACT_DIR ".codebase-memory"
+#define CBM_ARTIFACT_DIR ".codebase-memory-neo4j"
 
 /* Export quality levels */
 enum {
@@ -28,9 +28,9 @@ enum {
     CBM_ARTIFACT_BEST = 1, /* zstd -9 + drop indexes + VACUUM INTO (explicit index) */
 };
 
-/* Export DB to .codebase-memory/graph.db.zst artifact.
+/* Export DB to .codebase-memory-neo4j/graph.db.zst artifact.
  * quality: CBM_ARTIFACT_FAST or CBM_ARTIFACT_BEST.
- * Creates .codebase-memory/ dir, .gitattributes, and artifact.json.
+ * Creates .codebase-memory-neo4j/ dir, .gitattributes, and artifact.json.
  * Returns 0 on success, -1 on error. */
 int cbm_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
                         int quality);
@@ -51,12 +51,12 @@ const char *cbm_artifact_export_last_error(void);
  * evaluation always answers tree_not_clean regardless of the real cause. */
 const char *cbm_artifact_reconcile_basis_last_blocker(void);
 
-/* Import artifact from .codebase-memory/graph.db.zst to cache_db_path.
+/* Import artifact from .codebase-memory-neo4j/graph.db.zst to cache_db_path.
  * Decompresses, runs integrity check, recreates indexes.
  * Returns 0 on success, -1 on error. */
 int cbm_artifact_import(const char *repo_path, const char *cache_db_path);
 
-/* Check if a compatible artifact exists in repo_path/.codebase-memory/.
+/* Check if a compatible artifact exists in repo_path/.codebase-memory-neo4j/.
  * Returns true only if both graph.db.zst and artifact.json exist
  * and schema_version is compatible. */
 bool cbm_artifact_exists(const char *repo_path);

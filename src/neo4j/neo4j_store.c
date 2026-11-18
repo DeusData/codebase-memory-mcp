@@ -39,10 +39,10 @@
 #define N4S_NODE_NCOLS 9
 /* The same columns under their own names, for a query that also returns
  * edge columns over the same variables (a RETURN may not repeat a name). */
-#define N4S_FAR_COLS(v) \
-    v ".id AS f_id, " v ".project AS f_project, " v ".label AS f_label, " v \
-      ".name AS f_name, " v ".qualified_name AS f_qn, " v ".file_path AS f_file, " v \
-      ".start_line AS f_start, " v ".end_line AS f_end, " v ".properties_json AS f_props"
+#define N4S_FAR_COLS(v)                                                                           \
+    v ".id AS f_id, " v ".project AS f_project, " v ".label AS f_label, " v ".name AS f_name, " v \
+      ".qualified_name AS f_qn, " v ".file_path AS f_file, " v ".start_line AS f_start, " v       \
+      ".end_line AS f_end, " v ".properties_json AS f_props"
 
 /* Edges prefetched for a set of nodes in one round trip (one per direction).
  * types == NULL holds every type; otherwise only the listed ones. */
@@ -73,9 +73,9 @@ typedef struct {
      * therefore also return the far-end nodes, and a caller about to expand
      * many nodes prefetches all their edges at once (cbm_store_prefetch_edges).
      * Both are read-through caches of the same immutable generation. */
-    n4s_edge_cache_t edge_cache[2]; /* [0] by source, [1] by target */
+    n4s_edge_cache_t edge_cache[2];  /* [0] by source, [1] by target */
     n4s_node_cache_t chunk_nodes[2]; /* far ends of the last prefetch, per direction */
-    n4s_node_cache_t last_nodes;    /* far ends of the last single-node edge read */
+    n4s_node_cache_t last_nodes;     /* far ends of the last single-node edge read */
     /* Wall-clock ms after which a multi-page read gives up between pages
      * (CBM_STORE_SCAN_LIMIT); 0 = none. Set by the Cypher engine. */
     uint64_t read_deadline_ms;
@@ -671,15 +671,14 @@ static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char 
     /* The far ends come back too: a caller walking these edges looks every
      * one of them up next (find_node_by_id answers from last_nodes). */
     const char *cypher =
-        by_target
-            ? "MATCH (a:CbmNode)-[r]->(b:CbmNode {db: $db, gen: $gen, id: $id}) "
-              "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type) "
-              "AND ($after IS NULL OR r.id > $after)" N4S_EDGE_RET ", " N4S_FAR_COLS(
-                  "a") " ORDER BY r.id LIMIT $lim"
-            : "MATCH (a:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(b:CbmNode) "
-              "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type) "
-              "AND ($after IS NULL OR r.id > $after)" N4S_EDGE_RET ", " N4S_FAR_COLS(
-                  "b") " ORDER BY r.id LIMIT $lim";
+        by_target ? "MATCH (a:CbmNode)-[r]->(b:CbmNode {db: $db, gen: $gen, id: $id}) "
+                    "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type) "
+                    "AND ($after IS NULL OR r.id > $after)" N4S_EDGE_RET
+                    ", " N4S_FAR_COLS("a") " ORDER BY r.id LIMIT $lim"
+                  : "MATCH (a:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(b:CbmNode) "
+                    "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type) "
+                    "AND ($after IS NULL OR r.id > $after)" N4S_EDGE_RET
+                    ", " N4S_FAR_COLS("b") " ORDER BY r.id LIMIT $lim";
     const int page = g_n4s_edge_page;
     cbm_edge_t *all_e = NULL;
     cbm_node_t *all_n = NULL;
@@ -752,15 +751,15 @@ static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char 
     return CBM_STORE_OK;
 }
 
-#define N4S_PREFETCH_EDGES_TARGET                                                            \
+#define N4S_PREFETCH_EDGES_TARGET                                                               \
     "MATCH (b:CbmNode {db: $db, gen: $gen}) WHERE b.id IN $ids AND COUNT { (b)<--() } <= $hub " \
-    "MATCH (a:CbmNode)-[r]->(b) "                                                             \
-    "WHERE a.db = $db AND a.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET  \
+    "MATCH (a:CbmNode)-[r]->(b) "                                                               \
+    "WHERE a.db = $db AND a.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET   \
     ", " N4S_FAR_COLS("a") " LIMIT $cap"
-#define N4S_PREFETCH_EDGES_SOURCE                                                            \
+#define N4S_PREFETCH_EDGES_SOURCE                                                               \
     "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE a.id IN $ids AND COUNT { (a)-->() } <= $hub " \
-    "MATCH (a)-[r]->(b:CbmNode) "                                                             \
-    "WHERE b.db = $db AND b.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET  \
+    "MATCH (a)-[r]->(b:CbmNode) "                                                               \
+    "WHERE b.db = $db AND b.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET   \
     ", " N4S_FAR_COLS("b") " LIMIT $cap"
 
 /* Parameters of one prefetch edge statement. */
@@ -873,7 +872,8 @@ static int op_prefetch_edges(void *ctx, const int64_t *ids, int n, bool by_targe
     int edge_count = 0;
     cbm_node_t *far = NULL;
     int far_count = 0;
-    int erc = edges_from_data(cbm_neo4j_result_data(&res, 1), &edges, &edge_count, &far, &far_count);
+    int erc =
+        edges_from_data(cbm_neo4j_result_data(&res, 1), &edges, &edge_count, &far, &far_count);
     cbm_neo4j_result_free(&res);
     if (erc != CBM_STORE_OK) {
         free(deg);
@@ -979,8 +979,7 @@ static void op_cache_clear(void *ctx) {
 }
 
 /* Append the node rows of r (columns from off) to *arr. */
-static int append_node_rows(cbm_neo4j_result_t *r, size_t off, cbm_node_t **arr, int *n,
-                            int *cap) {
+static int append_node_rows(cbm_neo4j_result_t *r, size_t off, cbm_node_t **arr, int *n, int *cap) {
     yyjson_val *data = cbm_neo4j_result_data(r, 0);
     size_t rows = yyjson_arr_size(data);
     if (rows == 0) {
@@ -1110,13 +1109,13 @@ static int op_scan_nodes(void *ctx, const char *project, const char *label, bool
      * and sorts that label's remaining rows by id: a rare label costs its
      * own size, not a walk of the whole graph in id order. */
 #define N4S_SCAN_LABEL_WHERE                                                       \
-    "WHERE n.db = $db AND n.gen = $gen AND n.id > $after_id AND n.label = $label "  \
+    "WHERE n.db = $db AND n.gen = $gen AND n.id > $after_id AND n.label = $label " \
     "AND ($project IS NULL OR n.project = $project) "                              \
     "RETURN " N4S_NODE_COLS("n") " ORDER BY n.id LIMIT $max"
-#define N4S_SCAN_ALL_WHERE                                                         \
-    "WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file "            \
-    "AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) "       \
-    "AND ($project IS NULL OR n.project = $project) "                              \
+#define N4S_SCAN_ALL_WHERE                                                   \
+    "WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file "      \
+    "AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) " \
+    "AND ($project IS NULL OR n.project = $project) "                        \
     "RETURN " N4S_NODE_COLS("n") " ORDER BY n.db, n.gen, n.file_path, n.id LIMIT $max"
     /* With the hint, a page that the planner cannot serve from the index
      * (still populating, dropped by hand) is an error, not a slow scan:
@@ -1666,8 +1665,8 @@ static void q_opt_str(n4s_q_t *q, const char *key, const char *val) {
 }
 
 /* The edge types search_graph's in/out degree counts (store.c search). */
-static const char *const k_search_degree_types[] = {"CALLS", "USAGE", "CALL_REFERENCE", "INHERITS",
-                                                    "IMPLEMENTS", NULL};
+static const char *const k_search_degree_types[] = {"CALLS",    "USAGE",      "CALL_REFERENCE",
+                                                    "INHERITS", "IMPLEMENTS", NULL};
 
 /* Everything after MATCH (n): the filters of cbm_store_search's WHERE, then
  * the degree columns its degree filter and rows need. */
@@ -1707,8 +1706,8 @@ static void q_search_params(n4s_q_t *q, const cbm_remote_search_t *s) {
     q_int(q, "max_degree", s->max_degree);
 }
 
-static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_t **out,
-                     int *count, int *total) {
+static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_t **out, int *count,
+                     int *total) {
     n4s_ctx_t *x = ctx;
     *out = NULL;
     *count = 0;
@@ -1760,10 +1759,10 @@ static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_
     }
     *out = rows;
     *count = (int)n;
-    *total = paged ? (int)cbm_neo4j_val_int(
-                         cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 1)), 0),
-                         0)
-                   : (int)n;
+    *total = paged
+                 ? (int)cbm_neo4j_val_int(
+                       cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 1)), 0), 0)
+                 : (int)n;
     cbm_neo4j_result_free(&r);
     return CBM_STORE_OK;
 }
@@ -1835,11 +1834,10 @@ static int op_neighbor_names(void *ctx, int64_t node_id, int limit, char ***call
  * planner to the (db, gen, file_path) index, which holds every node of the
  * project, and the label filter then reads them all. (path <> '' is also
  * false for a null path.) */
-static const char k_list_file_nodes[] =
-    "MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) "
-    "WHERE n.project = $project "
-    "WITH n.file_path AS path WHERE path <> '' "
-    "RETURN DISTINCT path ORDER BY path";
+static const char k_list_file_nodes[] = "MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) "
+                                        "WHERE n.project = $project "
+                                        "WITH n.file_path AS path WHERE path <> '' "
+                                        "RETURN DISTINCT path ORDER BY path";
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 const char *cbm_neo4j_test_list_file_nodes_cypher(void) {
@@ -1893,8 +1891,10 @@ static int op_list_files(void *ctx, const char *project, char ***out, int *count
 
 /* Property keys the sync stores itself; never reported as graph properties. */
 static const char *const k_internal_node_keys[] = {
-    "db",        "gen",        "project",  "id",           "label",         "name", "qualified_name",
-    "file_path", "start_line", "end_line", "properties_json", "prop_keys", NULL};
+    "db",         "gen",      "project",         "id",
+    "label",      "name",     "qualified_name",  "file_path",
+    "start_line", "end_line", "properties_json", "prop_keys",
+    NULL};
 static const char *const k_internal_edge_keys[] = {"id", "type", "properties_json", "prop_keys",
                                                    NULL};
 
@@ -2199,9 +2199,9 @@ static const char *native_write_keyword(const char *q) {
      * (cbm_neo4j_set_read_only); this keyword check only gives an early,
      * clear refusal. It lexes like Neo4j: block and line comments, string
      * escapes, backtick identifiers (no escapes; `` is a literal backtick). */
-    static const char *const kw[] = {"CREATE", "MERGE",  "DELETE", "DETACH", "SET",    "REMOVE",
-                                     "DROP",   "FOREACH", "LOAD",  "CALL",   "INSERT", "USE",
-                                     "ALTER",  "GRANT",  "DENY",   "REVOKE", "RENAME", NULL};
+    static const char *const kw[] = {"CREATE", "MERGE",   "DELETE", "DETACH", "SET",    "REMOVE",
+                                     "DROP",   "FOREACH", "LOAD",   "CALL",   "INSERT", "USE",
+                                     "ALTER",  "GRANT",   "DENY",   "REVOKE", "RENAME", NULL};
     for (const char *p = q; *p;) {
         if (*p == '\'' || *p == '"') {
             char quote = *p++;
@@ -2303,7 +2303,6 @@ static int native_rows(cbm_neo4j_result_t *r, int max_rows, bool engine_compat,
 }
 
 /* ── Engine dialect → scoped Neo4j Cypher ──────────────────────── */
-
 
 /* True when q (outside string literals) holds syntax the engine's lexer and
  * Neo4j's read differently, so a token-level rewrite of what the engine
@@ -2523,7 +2522,7 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
     /* up to three insertions per node pattern (label, its closing ')',
      * scope) and one per hop range */
     n4s_insert_t *ins = calloc((size_t)count * 4 + 1, sizeof(n4s_insert_t));
-    char(*nums)[24] = calloc((size_t)count * 4 + 1, sizeof(*nums));
+    char (*nums)[24] = calloc((size_t)count * 4 + 1, sizeof(*nums));
     if (!ins || !nums) {
         free(ins);
         free(nums);
@@ -2569,8 +2568,9 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
          * pattern can match different strings ([[:digit:]] matches nothing). */
         if (ty == TOK_EQTILDE) {
             if (why) {
-                (void)snprintf(why, why_sz, "regular expressions (=~) differ between the engine "
-                                            "and Neo4j");
+                (void)snprintf(why, why_sz,
+                               "regular expressions (=~) differ between the engine "
+                               "and Neo4j");
             }
             ok = false;
             break;
@@ -2579,8 +2579,7 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
         if (ty == TOK_DOT && i + 1 < count &&
             (tok_is_word(&t[i + 1], "in_degree") || tok_is_word(&t[i + 1], "out_degree"))) {
             if (why) {
-                (void)snprintf(why, why_sz, "it reads the engine-only property %s",
-                               t[i + 1].text);
+                (void)snprintf(why, why_sz, "it reads the engine-only property %s", t[i + 1].text);
             }
             ok = false;
             break;
@@ -2592,8 +2591,7 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
                 (tok_is_word(&t[i + 1], "db") || tok_is_word(&t[i + 1], "gen") ||
                  tok_is_word(&t[i + 1], "project"))) {
                 if (why) {
-                    (void)snprintf(why, why_sz, "it sets the reserved property %s",
-                                   t[i + 1].text);
+                    (void)snprintf(why, why_sz, "it sets the reserved property %s", t[i + 1].text);
                 }
                 ok = false;
                 break;

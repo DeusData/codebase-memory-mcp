@@ -148,9 +148,9 @@ static void profile_buffer_discard(profile_buffer_t *buffer) {
 
 const char *cbm_graph_tier_slug(cbm_graph_tier_t tier) {
     static const char *const slugs[CBM_GRAPH_TIER_COUNT] = {
-        "codebase-memory-scout",
-        "codebase-memory",
-        "codebase-memory-auditor",
+        "codebase-memory-neo4j-scout",
+        "codebase-memory-neo4j",
+        "codebase-memory-neo4j-auditor",
     };
     return tier_valid(tier) ? slugs[tier] : NULL;
 }
@@ -221,7 +221,8 @@ char *cbm_render_graph_prompt(cbm_graph_tier_t tier, cbm_graph_access_t access) 
         }
         profile_buffer_append(
             &buffer,
-            "Use codebase-memory-mcp in the exact graph project. Use only read-only graph and "
+            "Use the codebase-memory-neo4j MCP registration in the exact graph project. Use only "
+            "read-only graph and "
             "source tools. Locate candidates with search_graph, "
             "inspect relationships with trace_path, and verify material definitions with "
             "get_code_snippet. Use query_graph or get_architecture only when available and "
@@ -298,23 +299,23 @@ static const char *dialect_tool_prefix(cbm_graph_profile_dialect_t dialect) {
     case CBM_GRAPH_DIALECT_QODER:
     case CBM_GRAPH_DIALECT_CODEBUDDY:
     case CBM_GRAPH_DIALECT_FACTORY:
-        return "mcp__codebase-memory-mcp__";
+        return "mcp__codebase-memory-neo4j__";
     case CBM_GRAPH_DIALECT_CODEX:
         return "";
     case CBM_GRAPH_DIALECT_GEMINI:
-        return "mcp_codebase-memory-mcp_";
+        return "mcp_codebase-memory-neo4j_";
     case CBM_GRAPH_DIALECT_COPILOT:
-        return "codebase-memory-mcp/";
+        return "codebase-memory-neo4j/";
     case CBM_GRAPH_DIALECT_OPENCODE:
     case CBM_GRAPH_DIALECT_KILO:
     case CBM_GRAPH_DIALECT_VIBE:
-        return "codebase-memory-mcp_";
+        return "codebase-memory-neo4j_";
     case CBM_GRAPH_DIALECT_KIRO:
-        return "@codebase-memory-mcp/";
+        return "@codebase-memory-neo4j/";
     case CBM_GRAPH_DIALECT_OMP:
-        return "mcp__codebase_memory_mcp_";
+        return "mcp__codebase_memory_neo4j_";
     case CBM_GRAPH_DIALECT_GROK:
-        return "codebase-memory-mcp__";
+        return "codebase-memory-neo4j__";
     default:
         return NULL;
     }
@@ -448,7 +449,7 @@ static char *render_kiro_profile(cbm_graph_tier_t tier, cbm_graph_access_t acces
              yyjson_mut_arr_add_str(doc, args, "--tool-profile") &&
              yyjson_mut_arr_add_strcpy(doc, args, tier_server_profile(tier)) &&
              yyjson_mut_obj_add_val(doc, server, "args", args) &&
-             yyjson_mut_obj_add_val(doc, servers, "codebase-memory-mcp", server) &&
+             yyjson_mut_obj_add_val(doc, servers, "codebase-memory-neo4j", server) &&
              yyjson_mut_obj_add_val(doc, root, "mcpServers", servers);
     }
     char *result = ok ? yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL) : NULL;
@@ -475,7 +476,7 @@ static bool append_codex_profile(profile_buffer_t *buffer, cbm_graph_tier_t tier
     if (access != CBM_GRAPH_ACCESS_DIRECT) {
         return true;
     }
-    if (!profile_buffer_append(buffer, "\n[mcp_servers.codebase-memory-mcp]\n")) {
+    if (!profile_buffer_append(buffer, "\n[mcp_servers.codebase-memory-neo4j]\n")) {
         return false;
     }
     if (!rc1_transportless) {
@@ -527,9 +528,9 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         if (!append_yaml_identity(buffer, slug, description) ||
             !profile_buffer_append(buffer, "tools:\n  - Read\n  - Grep\n  - Glob\n") ||
             (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
-            (direct && !profile_buffer_append(buffer, "mcpServers: [codebase-memory-mcp]\n")) ||
-            !profile_buffer_append(buffer,
-                                   "permissionMode: plan\nskills: [codebase-memory]\n---\n") ||
+            (direct && !profile_buffer_append(buffer, "mcpServers: [codebase-memory-neo4j]\n")) ||
+            !profile_buffer_append(
+                buffer, "permissionMode: plan\nskills: [codebase-memory-neo4j]\n---\n") ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -582,7 +583,7 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             !profile_buffer_append(buffer, "\"\ndescription: \"") ||
             !profile_buffer_append(buffer, description) ||
             !profile_buffer_append(buffer, "\"\ntools: [\"Read\", \"Grep\", \"Glob\"]\n") ||
-            (direct && !profile_buffer_append(buffer, "mcpServers: [\"codebase-memory-")) ||
+            (direct && !profile_buffer_append(buffer, "mcpServers: [\"codebase-memory-neo4j-")) ||
             (direct && !profile_buffer_append(buffer, tier_server_profile(tier))) ||
             (direct && !profile_buffer_append(buffer, "\"]\n")) ||
             !profile_buffer_append(buffer, "---\n") ||
@@ -601,7 +602,8 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             (direct && (!profile_buffer_append(buffer, ",") ||
                         !append_csv_mcp_tools(buffer, dialect, tier))) ||
             !profile_buffer_append(buffer, "\n") ||
-            (direct && !profile_buffer_append(buffer, "mcpServers:\n  - codebase-memory-mcp\n")) ||
+            (direct &&
+             !profile_buffer_append(buffer, "mcpServers:\n  - codebase-memory-neo4j\n")) ||
             !profile_buffer_append(buffer, "---\n") || !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -612,7 +614,8 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             (direct && (!profile_buffer_append(buffer, ",") ||
                         !append_csv_mcp_tools(buffer, dialect, tier))) ||
             !profile_buffer_append(
-                buffer, "\nmodel: inherit\npermissionMode: plan\nskills: codebase-memory\n---\n") ||
+                buffer,
+                "\nmodel: inherit\npermissionMode: plan\nskills: codebase-memory-neo4j\n---\n") ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -649,14 +652,15 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             !profile_buffer_append(buffer, "tools: read_file, grep, list_dir") ||
             (direct && !profile_buffer_append(buffer, ", search_tool, use_tool")) ||
             !profile_buffer_append(
-                buffer, direct ? "\nmcpInheritance:\n  named:\n    - codebase-memory-mcp\n---\n"
+                buffer, direct ? "\nmcpInheritance:\n  named:\n    - codebase-memory-neo4j\n---\n"
                                : "\nmcpInheritance: none\n---\n") ||
-            (direct && (!profile_buffer_append(
-                            buffer, "Reach the graph only through `search_tool`/`use_tool`. "
-                                    "The only allowed tool ids are ") ||
-                        !append_csv_mcp_tools(buffer, dialect, tier) ||
-                        !profile_buffer_append(
-                            buffer, "; never call any other codebase-memory-mcp tool.\n\n"))) ||
+            (direct &&
+             (!profile_buffer_append(buffer,
+                                     "Reach the graph only through `search_tool`/`use_tool`. "
+                                     "The only allowed tool ids are ") ||
+              !append_csv_mcp_tools(buffer, dialect, tier) ||
+              !profile_buffer_append(
+                  buffer, "; never call any other codebase-memory-mcp-neo4j tool.\n\n"))) ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -682,7 +686,7 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             !profile_buffer_append(buffer, "tools:\n  - read\n  - grep\n  - glob\n") ||
             (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
             !profile_buffer_append(
-                buffer, "read-summarize: false\nautoloadSkills: [codebase-memory]\n---\n") ||
+                buffer, "read-summarize: false\nautoloadSkills: [codebase-memory-neo4j]\n---\n") ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }

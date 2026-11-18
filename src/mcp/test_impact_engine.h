@@ -95,7 +95,7 @@ typedef struct {
 cbm_test_impact_status_t cbm_test_impact_publish(const cbm_test_impact_publish_t *request,
                                                  char *diagnostic, size_t diagnostic_len);
 
-/* `codebase-memory-mcp test-impact <publish|select> ...` (test_impact_cli.c);
+/* `codebase-memory-mcp-neo4j test-impact <publish|select> ...` (test_impact_cli.c);
  * argv starts at the subcommand. The process exit code. */
 int cbm_test_impact_cli(int argc, char **argv);
 

@@ -52,15 +52,15 @@ isolated() { # wrapper dir, command...
     shift
     mkdir -p "$dir/home" "$dir/cache" "$dir/localappdata"
     HOME="$dir/home" USERPROFILE="$dir/home" XDG_CACHE_HOME="$dir/cache" \
-        LOCALAPPDATA="$dir/localappdata" CBM_CACHE_DIR="$dir/cbm-cache" \
+        LOCALAPPDATA="$dir/localappdata" CBM_NEO4J_CACHE_DIR="$dir/cbm-cache" \
         CBM_DOWNLOAD_URL="$URL" "$@"
 }
 
 ran() { # wrapper, output file, rc
-    # The binary's own answer ("codebase-memory-mcp 0.12.0"), not a wrapper
-    # message ("codebase-memory-mcp: downloading ..."), proves it ran.
-    if [ "$3" -eq 0 ] && grep -E -q '^codebase-memory-mcp [^:]+$' "$2"; then
-        echo "OK $1: installed and ran the release binary: $(grep -E '^codebase-memory-mcp [^:]+$' "$2" | tail -1)"
+    # The binary's own answer ("codebase-memory-mcp-neo4j 0.12.0"), not a wrapper
+    # message ("codebase-memory-mcp-neo4j: downloading ..."), proves it ran.
+    if [ "$3" -eq 0 ] && grep -E -q '^codebase-memory-mcp-neo4j [^:]+$' "$2"; then
+        echo "OK $1: installed and ran the release binary: $(grep -E '^codebase-memory-mcp-neo4j [^:]+$' "$2" | tail -1)"
     else
         echo "FAIL $1: the installed wrapper did not run the release binary (rc=$3):"
         sed 's/^/    /' "$2" | tail -20
@@ -78,7 +78,7 @@ smoke_npm() {
     (cd "$ROOT/pkg/npm" && npm pack --silent --pack-destination "$dir") >"$dir/pack.out"
     while IFS= read -r line; do [ -n "$line" ] && tgz="$line"; done <"$dir/pack.out"
     # A global install from the packed tarball runs postinstall (install.js)
-    # exactly as `npm i -g codebase-memory-mcp` does.
+    # exactly as `npm i -g codebase-memory-mcp-neo4j` does.
     isolated "$dir" npm install --global --prefix "$dir/prefix" --cache "$dir/cache/npm" \
         --foreground-scripts --no-audit --no-fund "$dir/$tgz" >"$dir/install.log" 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -88,7 +88,7 @@ smoke_npm() {
     local modules
     npm root --global --prefix "$dir/prefix" >"$dir/root.out"
     IFS= read -r modules <"$dir/root.out"
-    isolated "$dir" node "$modules/codebase-memory-mcp/bin.js" --version >"$dir/run.log" 2>&1 ||
+    isolated "$dir" node "$modules/codebase-memory-mcp-neo4j/bin.js" --version >"$dir/run.log" 2>&1 ||
         rc=$?
     ran npm "$dir/run.log" "$rc"
 }
@@ -117,7 +117,7 @@ smoke_pypi() {
     fi
     # The console script's entry point; the first run downloads the binary.
     isolated "$dir" "$vpy" -c \
-        'import sys, codebase_memory_mcp; sys.argv = ["codebase-memory-mcp", "--version"]; codebase_memory_mcp.main()' \
+        'import sys, codebase_memory_mcp_neo4j; sys.argv = ["codebase-memory-mcp-neo4j", "--version"]; codebase_memory_mcp_neo4j.main()' \
         >"$dir/run.log" 2>&1 || rc=$?
     ran pypi "$dir/run.log" "$rc"
 }
@@ -134,14 +134,14 @@ smoke_go() {
     # HOME (the smoke harness could not delete its profile afterwards).
     (cd "$ROOT/pkg/go" && GOTOOLCHAIN="${GOTOOLCHAIN:-auto}" \
         GOPATH="$dir/gopath" GOMODCACHE="$dir/gomodcache" GOCACHE="$dir/gocache" \
-        go build -o "$dir/codebase-memory-mcp$EXE" ./cmd/codebase-memory-mcp) \
+        go build -o "$dir/codebase-memory-mcp-neo4j$EXE" ./cmd/codebase-memory-mcp-neo4j) \
         >"$dir/install.log" 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
         ran go "$dir/install.log" "$rc"
         return
     fi
     # The first run downloads the binary into the wrapper's cache.
-    isolated "$dir" "$dir/codebase-memory-mcp$EXE" --version >"$dir/run.log" 2>&1 || rc=$?
+    isolated "$dir" "$dir/codebase-memory-mcp-neo4j$EXE" --version >"$dir/run.log" 2>&1 || rc=$?
     ran go "$dir/run.log" "$rc"
 }
 

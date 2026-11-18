@@ -155,7 +155,7 @@ TEST(artifact_import_rejects_size_mismatch) {
     ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
 
     char meta[1024];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", g_repo);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", g_repo);
     ASSERT_TRUE(
         bump_artifact_original_size(meta, 4096)); /* claim 4 KiB more than the frame holds */
 
@@ -178,13 +178,13 @@ TEST(artifact_export_fast_roundtrip) {
 
     /* Verify artifact files exist */
     char zst[1024];
-    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory-neo4j/graph.db.zst", g_repo);
     struct stat st;
     ASSERT_EQ(stat(zst, &st), 0);
     ASSERT_GT((int)st.st_size, 0);
 
     char meta[1024];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", g_repo);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", g_repo);
     ASSERT_EQ(stat(meta, &st), 0);
 
     /* Import to a new path */
@@ -273,7 +273,7 @@ TEST(artifact_schema_version_mismatch) {
 
     /* Overwrite artifact.json with incompatible schema version */
     char meta[1024];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", g_repo);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", g_repo);
     FILE *fp = fopen(meta, "w");
     ASSERT_NOT_NULL(fp);
     fprintf(fp, "{\"schema_version\": 999, \"original_size\": 1000}");
@@ -312,7 +312,7 @@ TEST(artifact_gitattributes_created) {
     cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST);
 
     char ga[1024];
-    snprintf(ga, sizeof(ga), "%s/.codebase-memory/.gitattributes", g_repo);
+    snprintf(ga, sizeof(ga), "%s/.codebase-memory-neo4j/.gitattributes", g_repo);
     struct stat st;
     ASSERT_EQ(stat(ga, &st), 0);
 
@@ -370,12 +370,12 @@ TEST(artifact_roundtrip_non_ascii_paths) {
 
     ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
     char zst[1024];
-    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", repo);
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory-neo4j/graph.db.zst", repo);
     ASSERT_TRUE(cbm_file_exists(zst));
     ASSERT_TRUE(cbm_artifact_exists(repo));
 
     char ga[1024];
-    snprintf(ga, sizeof(ga), "%s/.codebase-memory/.gitattributes", repo);
+    snprintf(ga, sizeof(ga), "%s/.codebase-memory-neo4j/.gitattributes", repo);
     char ga_content[512];
     ASSERT_TRUE(read_small_file_utf8(ga, ga_content, sizeof(ga_content)) > 0);
     ASSERT_NOT_NULL(strstr(ga_content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
@@ -415,7 +415,7 @@ TEST(artifact_export_rename_failure_logs_specific_error) {
     create_test_db(g_db);
 
     char art_dir[1024];
-    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", g_repo);
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory-neo4j", g_repo);
     cbm_mkdir_p(art_dir, 0755);
 
     char zst[1024];
@@ -447,7 +447,7 @@ TEST(pipeline_persistence_export_failure_returns_error) {
     write_text_file(src, "int main(void) { return 0; }\n");
 
     char art_dir[1024];
-    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", g_repo);
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory-neo4j", g_repo);
     cbm_mkdir_p(art_dir, 0755);
 
     char zst[1024];
@@ -472,7 +472,7 @@ TEST(pipeline_persistence_export_failure_returns_error) {
     PASS();
 }
 
-/* A checkout can ship `.codebase-memory` as a symlink. Git creates it owned by
+/* A checkout can ship `.codebase-memory-neo4j` as a symlink. Git creates it owned by
  * whoever cloned, so it is user-owned without being user-intended, and the
  * export uses the plain walk that does not follow user-owned links: nothing
  * may land behind the link, and the failure names the stage. With the link
@@ -734,10 +734,10 @@ static int64_t t_mtime_ns(const char *path) {
 #endif
 }
 
-/* True iff <repo>/.codebase-memory/artifact.json contains substr. */
+/* True iff <repo>/.codebase-memory-neo4j/artifact.json contains substr. */
 static bool meta_contains(const char *repo, const char *substr) {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/.codebase-memory/artifact.json", repo);
+    snprintf(path, sizeof(path), "%s/.codebase-memory-neo4j/artifact.json", repo);
     FILE *fp = fopen(path, "r");
     if (!fp) {
         return false;
@@ -801,7 +801,7 @@ static void build_repo_errf(const char *fmt, ...) {
 static void describe_missing_marker(const char *repo) {
     const char *blocker = cbm_artifact_reconcile_basis_last_blocker();
     char meta[1152];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repo);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", repo);
     struct stat st;
     build_repo_errf(
         "step=reconcile_basis: marker absent from %s (artifact.json %s); export blocked by: %s",
@@ -812,7 +812,7 @@ static void describe_missing_marker(const char *repo) {
 }
 
 /* Build a git repo at g_repo with 5 .rs files, full-index + export (clean tree
- * -> reconcile_basis marker set), and commit .codebase-memory so a clone receives
+ * -> reconcile_basis marker set), and commit .codebase-memory-neo4j so a clone receives
  * the artifact. Returns the derived project name (caller frees) or NULL, with
  * g_build_repo_err naming the failing step. */
 static char *build_trusted_artifact_repo(void) {
@@ -923,7 +923,7 @@ TEST(artifact_export_marks_clean_basis) {
     }
 
     /* Dirty the source tree (uncommitted edit). Re-export must omit the marker:
-     * the tree is non-clean outside .codebase-memory (and the a.rs hash row no
+     * the tree is non-clean outside .codebase-memory-neo4j (and the a.rs hash row no
      * longer matches disk). */
     write_text_file(src, "pub fn dirty() {}\n");
     ASSERT_EQ(cbm_artifact_export(g_db, g_repo, proj, CBM_ARTIFACT_FAST), 0);
@@ -1054,7 +1054,7 @@ TEST(artifact_reconcile_skips_untrusted_metadata) {
     cbm_store_close(s);
 
     char meta[1152];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", repoB);
     /* Rewrite artifact.json without reconcile_basis (schema_version preserved). */
     FILE *fp = fopen(meta, "w");
     ASSERT_NOT_NULL(fp);
@@ -1091,7 +1091,7 @@ TEST(artifact_reconcile_skips_unknown_commit) {
     /* Rewrite artifact.json: keep the marker but point commit at a hex-valid
      * SHA that does not exist locally -> the object-existence gate fails. */
     char meta[1152];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", repoB);
     FILE *fp = fopen(meta, "w");
     ASSERT_NOT_NULL(fp);
     fprintf(fp,
@@ -1121,7 +1121,7 @@ TEST(artifact_reconcile_skips_non_hex_commit) {
     /* A commit field carrying shell metacharacters must never reach a command
      * string: is_hex_oid is the hard gate in front of every interpolation. */
     char meta[1152];
-    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory-neo4j/artifact.json", repoB);
     FILE *fp = fopen(meta, "w");
     ASSERT_NOT_NULL(fp);
     fprintf(fp, "{\"schema_version\":2,\"commit\":\"a$(touch pwned)b\","

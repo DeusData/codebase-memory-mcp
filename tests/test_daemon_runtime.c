@@ -1567,7 +1567,7 @@ static bool runtime_test_read_log(const char *path, char out[RUNTIME_TEST_LOG_CA
  * Windows same-process participant guard rejects the nested host one stage
  * earlier, and that platform-correct refusal must be equally durable. */
 TEST(daemon_host_early_coordination_failure_is_durable) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool snapshot_ok = !had_cache || saved_cache;
@@ -1579,10 +1579,10 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
         snapshot_ok && th_secure_runtime_parent_new(parent, sizeof(parent), "host-early-log");
     int cache_written = parent_created ? snprintf(cache, sizeof(cache), "%s/cache", parent) : -1;
     int log_written =
-        parent_created ? snprintf(log_path, sizeof(log_path), "%s/logs/cbm-daemon.log", cache) : -1;
+        parent_created ? snprintf(log_path, sizeof(log_path), "%s/logs/cbm-neo4j-daemon.log", cache) : -1;
     bool environment_ready = cache_written > 0 && cache_written < (int)sizeof(cache) &&
                              log_written > 0 && log_written < (int)sizeof(log_path) &&
-                             cbm_mkdir_p(cache, 0700) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+                             cbm_mkdir_p(cache, 0700) && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     cbm_daemon_ipc_endpoint_t *endpoint =
         environment_ready ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
     cbm_version_cohort_manager_t *active_manager =
@@ -1633,7 +1633,7 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
         cbm_usleep(1000);
     }
     cbm_daemon_ipc_endpoint_free(endpoint);
-    runtime_test_restore_environment("CBM_CACHE_DIR", saved_cache, had_cache);
+    runtime_test_restore_environment("CBM_NEO4J_CACHE_DIR", saved_cache, had_cache);
     free(saved_cache);
     bool cleaned = !parent_created || th_rmtree(parent) == 0;
 
@@ -1653,7 +1653,7 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
  * silently converted into default settings, so startup continued and could
  * enable background behavior the user had explicitly disabled. */
 TEST(daemon_host_refuses_unopenable_runtime_config_database) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool snapshot_ok = !had_cache || saved_cache;
@@ -1670,14 +1670,14 @@ TEST(daemon_host_refuses_unopenable_runtime_config_database) {
     bool blocker_created = cache_written > 0 && cache_written < (int)sizeof(cache) &&
                            blocker_written > 0 && blocker_written < (int)sizeof(config_blocker) &&
                            cbm_mkdir_p(cache, 0700) && cbm_mkdir_p(config_blocker, 0700);
-    bool environment_ready = blocker_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool environment_ready = blocker_created && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     cbm_daemon_ipc_endpoint_t *endpoint =
         environment_ready ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
     bool endpoint_created = endpoint != NULL;
     bool prepared = endpoint && cbm_daemon_host_state_prepare_for_test(endpoint);
 
     cbm_daemon_ipc_endpoint_free(endpoint);
-    runtime_test_restore_environment("CBM_CACHE_DIR", saved_cache, had_cache);
+    runtime_test_restore_environment("CBM_NEO4J_CACHE_DIR", saved_cache, had_cache);
     free(saved_cache);
     bool cleaned = !parent_created || th_rmtree(parent) == 0;
 
@@ -1759,9 +1759,9 @@ static int runtime_test_failed_host_child(const char *parent, const char *key) {
     char cache[RUNTIME_TEST_PATH_CAP];
     char log_path[RUNTIME_TEST_PATH_CAP];
     int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
-    int log_written = snprintf(log_path, sizeof(log_path), "%s/logs/cbm-daemon.log", cache);
+    int log_written = snprintf(log_path, sizeof(log_path), "%s/logs/cbm-neo4j-daemon.log", cache);
     if (cache_written <= 0 || cache_written >= (int)sizeof(cache) || log_written <= 0 ||
-        log_written >= (int)sizeof(log_path) || cbm_setenv("CBM_CACHE_DIR", cache, 1) != 0) {
+        log_written >= (int)sizeof(log_path) || cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) != 0) {
         return 40;
     }
 
@@ -1829,7 +1829,7 @@ static _Noreturn void runtime_test_forced_host_shutdown_child(const char *parent
     char cache[RUNTIME_TEST_PATH_CAP];
     int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
     if (written <= 0 || written >= (int)sizeof(cache) ||
-        cbm_setenv("CBM_CACHE_DIR", cache, 1) != 0) {
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) != 0) {
         _exit(80);
     }
     (void)alarm(2);
@@ -1845,7 +1845,7 @@ static _Noreturn void runtime_test_persistent_cleanup_failure_child(const char *
     char cache[RUNTIME_TEST_PATH_CAP];
     int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
     if (written <= 0 || written >= (int)sizeof(cache) ||
-        cbm_setenv("CBM_CACHE_DIR", cache, 1) != 0) {
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) != 0) {
         _exit(81);
     }
     cbm_daemon_host_cleanup_release_until_complete_for_test(
@@ -1867,7 +1867,7 @@ TEST(daemon_host_persistent_cleanup_release_failure_is_process_bounded) {
     bool parent_created =
         parent_written > 0 && parent_written < (int)sizeof(parent) && cbm_mkdtemp(parent) != NULL;
     int log_written = parent_created ? snprintf(log_path, sizeof(log_path),
-                                                "%s/cache/logs/cbm-daemon.log", parent)
+                                                "%s/cache/logs/cbm-neo4j-daemon.log", parent)
                                      : -1;
     bool path_ok = log_written > 0 && log_written < (int)sizeof(log_path);
     pid_t child = path_ok ? fork() : -1;
@@ -1917,7 +1917,7 @@ TEST(daemon_host_forced_shutdown_is_logged_flushed_and_process_bounded) {
     bool parent_created =
         parent_written > 0 && parent_written < (int)sizeof(parent) && cbm_mkdtemp(parent) != NULL;
     int log_written = parent_created ? snprintf(log_path, sizeof(log_path),
-                                                "%s/cache/logs/cbm-daemon.log", parent)
+                                                "%s/cache/logs/cbm-neo4j-daemon.log", parent)
                                      : -1;
     bool path_ok = log_written > 0 && log_written < (int)sizeof(log_path);
     pid_t child = path_ok ? fork() : -1;
@@ -2027,7 +2027,7 @@ TEST(daemon_runtime_image_rejection_reaches_client_issue1383) {
 }
 
 /* #1539: a peer whose image cannot be EXAMINED is not a peer that failed a
- * check — it is a peer we could not look at. Every `npx codebase-memory-mcp`
+ * check — it is a peer we could not look at. Every `npx codebase-memory-mcp-neo4j`
  * invocation lands here (ephemeral cache path, unfingerprintable), and the old
  * gate rejected all of them: the MCP client saw a 30 s wait and zero bytes.
  * The HELLO exchange that already succeeded proves version, build fingerprint
@@ -3994,7 +3994,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
         CHILD_CANCEL_BOUND_MS = 3000,
         CHILD_CLEANUP_BOUND_MS = 5000,
     };
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     const char *old_path = getenv("PATH");
     const char *old_marker = getenv(RUNTIME_TEST_BLOCKING_GIT_MARKER_ENV);
     bool had_cache = old_cache != NULL;
@@ -4071,7 +4071,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
         (void)snprintf(test_path, path_length, "%s:%s", path_bin, saved_path ? saved_path : "");
 #endif
     }
-    bool environment_ready = test_path && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+    bool environment_ready = test_path && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0 &&
                              cbm_setenv("PATH", test_path, 1) == 0 &&
                              cbm_setenv(RUNTIME_TEST_BLOCKING_GIT_MARKER_ENV, marker, 1) == 0;
 
@@ -4217,7 +4217,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     runtime_test_restore_environment(RUNTIME_TEST_BLOCKING_GIT_MARKER_ENV, saved_marker,
                                      had_marker);
     runtime_test_restore_environment("PATH", saved_path, had_path);
-    runtime_test_restore_environment("CBM_CACHE_DIR", saved_cache, had_cache);
+    runtime_test_restore_environment("CBM_NEO4J_CACHE_DIR", saved_cache, had_cache);
     free(call.response);
     free(test_path);
     free(project);

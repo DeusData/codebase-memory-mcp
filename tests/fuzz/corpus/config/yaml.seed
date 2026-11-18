@@ -1,5 +1,5 @@
 ymcp_servers:
   other:
     command: other
-  codebase-memory:
+  codebase-memory-neo4j:
     command: old

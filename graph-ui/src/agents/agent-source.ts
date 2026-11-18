@@ -10,11 +10,11 @@ import { emptyAgentsState, withEvent } from './agent-store';
 import type { AgentsState } from './agent-store';
 
 /** Kept as a source compatibility name; the current daemon port is used. */
-export const DEFAULT_BRIDGE_PORT = 9749;
+export const DEFAULT_BRIDGE_PORT = 9750;
 export const RECONNECT_MS = 3000;
 export const POLL_MS = 1000;
 export function bridgeCommand(_port: number): string {
-    return 'codebase-memory-mcp --ui';
+    return 'codebase-memory-mcp-neo4j --ui';
 }
 
 /** Die Lage der Quelle. */

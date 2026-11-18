@@ -1,7 +1,7 @@
 """GREEN native-Windows guard for the `update` -> install.ps1 handoff.
 
 Windows ships one executable in its runtime set, exactly like Linux and macOS:
-``codebase-memory-mcp.exe``.
+``codebase-memory-mcp-neo4j.exe``.
 
 There used to be a second, permanently resident launcher stub whose only job
 was to swap the product binary out from under itself, because a running .exe
@@ -27,7 +27,7 @@ came back.
 Exit code: 0 == contract honored, 1 == regression, 2 == precondition failure.
 
 Usage:
-    python test_windows_update_handoff.py <codebase-memory-mcp.exe>
+    python test_windows_update_handoff.py <codebase-memory-mcp-neo4j.exe>
 """
 
 import hashlib
@@ -89,7 +89,7 @@ def isolated_environment(work):
             "USERPROFILE": str(home),
             "APPDATA": str(home / "AppData" / "Roaming"),
             "LOCALAPPDATA": str(home / "AppData" / "Local"),
-            "CBM_CACHE_DIR": str(cache),
+            "CBM_NEO4J_CACHE_DIR": str(cache),
             "PYTHONUTF8": "1",
         }
     )
@@ -98,7 +98,7 @@ def isolated_environment(work):
 
 def copy_binary(source, directory):
     directory.mkdir(parents=True, exist_ok=True)
-    binary = directory / "codebase-memory-mcp.exe"
+    binary = directory / "codebase-memory-mcp-neo4j.exe"
     shutil.copy2(source, binary)
     return binary
 
@@ -146,7 +146,7 @@ def assert_update_hands_off_to_install_script(source, env, work):
         "replace itself; that is exactly what the removed launcher stub was for)",
     )
     require(
-        not (binary.parent / "codebase-memory-mcp.payload.exe").exists(),
+        not (binary.parent / "codebase-memory-mcp-neo4j.payload.exe").exists(),
         "update recreated a launcher/payload pair beside the binary",
     )
     require(
@@ -186,7 +186,7 @@ def main():
         print("PRECONDITION: native Windows is required")
         return 2
     if len(sys.argv) != 2:
-        print("usage: python test_windows_update_handoff.py <codebase-memory-mcp.exe>")
+        print("usage: python test_windows_update_handoff.py <codebase-memory-mcp-neo4j.exe>")
         return 2
 
     source = pathlib.Path(sys.argv[1]).resolve()

@@ -51,7 +51,7 @@ fi
 # section 4 below still fails if any of them states a count again unregistered.
 SURFACES=(
     README.md
-    pkg/chocolatey/codebase-memory-mcp.nuspec
+    pkg/chocolatey/codebase-memory-mcp-neo4j.nuspec
 )
 
 # Files that legitimately say "<N> languages" about something OTHER than the

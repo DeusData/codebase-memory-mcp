@@ -262,7 +262,7 @@ describe('die Quelle', () => {
         });
         expect(textOf('atlas-agents-reading')).toContain('no daemon is answering');
         expect(one('atlas-agents-command')?.getAttribute('data-command'))
-            .toBe('codebase-memory-mcp --ui');
+            .toBe('codebase-memory-mcp-neo4j --ui');
     });
 
     it('gibt eine Wiedergabe als Wiedergabe aus und nicht als Gegenwart', async () => {

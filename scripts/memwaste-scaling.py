@@ -96,8 +96,8 @@ def run_leg(binary: str, profdata: str, corpus: str, work: str, copies: int) -> 
     env.update({
         "LLVM_PROFILE_FILE": os.path.join(raw_dir, "cbm-%p.profraw"),
         "CBM_PROFILE_DIR": raw_dir,  # the index worker names its own: worker-<pid>.profraw
-        "CBM_CACHE_DIR": os.path.join(leg, "cache"),
-        "CBM_RUNTIME_DIR": runtime,
+        "CBM_NEO4J_CACHE_DIR": os.path.join(leg, "cache"),
+        "CBM_NEO4J_RUNTIME_DIR": runtime,
         "CBM_LOG_LEVEL": "error",
     })
     env.pop("CBM_MEMWASTE", None)  # production code paths: the event layer stays dormant
@@ -182,7 +182,7 @@ def main() -> int:
     corpus = os.path.abspath(os.path.expanduser(args.corpus))
     if not os.path.isdir(corpus):
         sys.exit(f"memwaste-scaling: {corpus} is not a directory")
-    binary = os.path.join(ROOT, BUILD_DIR, "codebase-memory-mcp")
+    binary = os.path.join(ROOT, BUILD_DIR, "codebase-memory-mcp-neo4j")
     if not args.no_build:
         cxx = "clang++" if args.cc == "clang" else args.cc.replace("clang", "clang++")
         subprocess.run([os.path.join(ROOT, "scripts", "build.sh"), f"BUILD_DIR={BUILD_DIR}",

@@ -91,7 +91,7 @@ export const BUG_WIZARD_NO_TRACES_HOW =
 export function bugWizardIngestCommand(project: string): string {
     return `echo '{"project":"${project}","label":"my-run","traces":[`
         + '{"path":["<caller qualified name>","<callee qualified name>"],"count":1}'
-        + "]}' | codebase-memory-mcp cli ingest_traces";
+        + "]}' | codebase-memory-mcp-neo4j cli ingest_traces";
 }
 
 export const BUG_WIZARD_NO_TRACES_FORMAT =

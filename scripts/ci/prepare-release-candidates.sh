@@ -138,8 +138,8 @@ cleanup() {
 trap cleanup EXIT
 
 STAGE="$WORK/$TARGET"
-BINARY_NAME=codebase-memory-mcp
-[ "$GOOS" = windows ] && BINARY_NAME=codebase-memory-mcp.exe
+BINARY_NAME=codebase-memory-mcp-neo4j
+[ "$GOOS" = windows ] && BINARY_NAME=codebase-memory-mcp-neo4j.exe
 mkdir -p "$STAGE/unstripped" "$STAGE/debug-stripped" "$STAGE/stripped"
 UNSTRIPPED="$STAGE/unstripped/$BINARY_NAME"
 DEBUG_STRIPPED="$STAGE/debug-stripped/$BINARY_NAME"

@@ -1,4 +1,4 @@
-# codebase-memory-mcp setup script (Windows)
+# codebase-memory-mcp-neo4j setup script (Windows)
 # Default: install the pre-built native Windows binary through install.ps1
 # -FromSource: build from source inside WSL (requires Go + gcc in WSL)
 
@@ -10,8 +10,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Repo = "haiderRizvii/codebase-memory-mcp"
-$BinaryName = "codebase-memory-mcp"
-$InstallDir = Join-Path $env:LOCALAPPDATA "codebase-memory-mcp"
+$BinaryName = "codebase-memory-mcp-neo4j"
+$InstallDir = Join-Path $env:LOCALAPPDATA "codebase-memory-mcp-neo4j"
 
 # --- Helpers ---
 
@@ -55,7 +55,7 @@ function Write-SettingsJson($Path, $Settings) {
 
 function Configure-ClaudeCode($McpConfig) {
     Write-Host ""
-    $answer = Read-Host "Configure Claude Code to use codebase-memory-mcp? [y/N]"
+    $answer = Read-Host "Configure Claude Code to use codebase-memory-mcp-neo4j? [y/N]"
 
     if ($answer -match '^[Yy]$') {
         $settingsPath = Join-Path $env:USERPROFILE ".claude\settings.json"
@@ -71,14 +71,14 @@ function Configure-ClaudeCode($McpConfig) {
             $settings["mcpServers"] = [ordered]@{}
         }
 
-        $settings["mcpServers"]["codebase-memory-mcp"] = $McpConfig
+        $settings["mcpServers"]["codebase-memory-neo4j"] = $McpConfig
         Write-SettingsJson $settingsPath $settings
         Write-Ok "Updated $settingsPath"
     } else {
         Write-Host ""
         Write-Host "  Add this to your .mcp.json or %USERPROFILE%\.claude\settings.json:" -ForegroundColor White
         Write-Host ""
-        $snippet = @{ mcpServers = @{ "codebase-memory-mcp" = $McpConfig } }
+        $snippet = @{ mcpServers = @{ "codebase-memory-neo4j" = $McpConfig } }
         $snippet | ConvertTo-Json -Depth 10 | Write-Host
     }
 }
@@ -130,7 +130,7 @@ if ($Help) {
 }
 
 Write-Host ""
-Write-Host "codebase-memory-mcp installer (Windows)" -ForegroundColor White
+Write-Host "codebase-memory-mcp-neo4j installer (Windows)" -ForegroundColor White
 Write-Host ""
 
 if ($FromSource) {
@@ -198,7 +198,7 @@ if ($FromSource) {
 
     # Clone or update
     Write-Host ""
-    $sourceDir = "/home/$wslUser/.local/share/codebase-memory-mcp"
+    $sourceDir = "/home/$wslUser/.local/share/codebase-memory-mcp-neo4j"
     try {
         Invoke-WSL "test -d $sourceDir/.git" | Out-Null
         Write-Host "Updating source..." -ForegroundColor White
@@ -213,7 +213,7 @@ if ($FromSource) {
     Write-Host ""
     Write-Host "Building binary (this may take a minute)..." -ForegroundColor White
     $wslBinaryPath = "/home/$wslUser/.local/bin/$BinaryName"
-    Invoke-WSL "mkdir -p /home/$wslUser/.local/bin && cd $sourceDir && scripts/build.sh && cp build/c/codebase-memory-mcp $wslBinaryPath"
+    Invoke-WSL "mkdir -p /home/$wslUser/.local/bin && cd $sourceDir && scripts/build.sh && cp build/c/codebase-memory-mcp-neo4j $wslBinaryPath"
     Write-Ok "Built to $wslBinaryPath (inside WSL)"
 
     # Verify
@@ -240,7 +240,7 @@ if ($FromSource) {
     Write-Host "  To uninstall:" -ForegroundColor White
     Write-Host "    wsl.exe -- rm $wslBinaryPath"
     Write-Host "    wsl.exe -- rm -rf $sourceDir"
-    Write-Host "    wsl.exe -- rm -rf ~/.cache/codebase-memory-mcp/"
+    Write-Host "    wsl.exe -- rm -rf ~/.cache/codebase-memory-mcp-neo4j/"
 
 } else {
     # --- Download + install through install.ps1 ---
@@ -386,5 +386,5 @@ if ($FromSource) {
     Write-Host ""
     Write-Host "  To uninstall:" -ForegroundColor White
     Write-Host "    Remove-Item -Recurse -Force '$InstallDir'"
-    Write-Host "    Remove-Item -Recurse -Force `"$env:LOCALAPPDATA\codebase-memory-mcp`"  # graph database"
+    Write-Host "    Remove-Item -Recurse -Force `"$env:LOCALAPPDATA\codebase-memory-mcp-neo4j`"  # graph database"
 }

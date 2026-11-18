@@ -34,7 +34,7 @@ CANONICAL entries:
 Environment:
   CBM_VM_RUNNER      sanitizer-variant runner path (ubsan/trap-ubsan builds);
                      switches to direct-runner mode for those iteration tools.
-  CBM_VM_SOAK_BINARY product binary for --soak (default build/c/codebase-memory-mcp.exe)
+  CBM_VM_SOAK_BINARY product binary for --soak (default build/c/codebase-memory-mcp-neo4j.exe)
   CBM_VM_TEST_LOG    VM-side log path (default /tmp/win-test.log)
 
 Exit codes: 0 success · 2 usage · 90 = GUARD: no completion summary (a run
@@ -155,7 +155,7 @@ if [ "$1" = "--soak" ]; then
     esac
     [ "$duration" -gt 0 ] ||
         { echo "usage: vm-run-tests.sh --soak <positive-minutes>" >&2; exit 2; }
-    binary="${CBM_VM_SOAK_BINARY:-build/c/codebase-memory-mcp.exe}"
+    binary="${CBM_VM_SOAK_BINARY:-build/c/codebase-memory-mcp-neo4j.exe}"
     [ -x "$binary" ] || { echo "ERROR: binary '$binary' missing — build first" >&2; exit 2; }
     artifact="$binary"
 elif [ -n "$RUNNER" ]; then

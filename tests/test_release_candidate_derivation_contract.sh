@@ -38,7 +38,7 @@ arm64 | aarch64 | ARM64) GOARCH=arm64 ;;
 esac
 
 TARGET="$GOOS-$GOARCH"
-BINARY_NAME=codebase-memory-mcp
+BINARY_NAME=codebase-memory-mcp-neo4j
 [[ "$GOOS" == windows ]] && BINARY_NAME+=.exe
 INPUT="$FIX/$BINARY_NAME"
 
@@ -51,7 +51,7 @@ pathlib.Path(sys.argv[1]).write_text(
 #include <stdlib.h>
 #include <string.h>
 static const char release_canary[] =
-    "codebase-memory-mcp OMIT_LOAD_EXTENSION candidate-derivation-contract";
+    "codebase-memory-mcp-neo4j OMIT_LOAD_EXTENSION candidate-derivation-contract";
 static _Thread_local unsigned long release_tls_counter;
 static int visible_symbol_for_real_strip(int value) { return value + 17; }
 int main(int argc, char **argv) {
@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     }
     release_tls_counter += (unsigned long)argc;
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        puts("codebase-memory-mcp 0.0.0-candidate-contract");
+        puts("codebase-memory-mcp-neo4j 0.0.0-candidate-contract");
         return 0;
     }
     puts(release_canary);

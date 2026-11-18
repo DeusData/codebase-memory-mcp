@@ -40,9 +40,9 @@ int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marke
 int cbm_toml_remove_managed_block_owned(const char *file_path, const char *begin_marker,
                                         const char *end_marker, const char *owned_tables);
 
-/* Remove one pre-marker codebase-memory-mcp table only when it has the known
+/* Remove one pre-marker codebase-memory-mcp-neo4j table only when it has the known
  * historical schema: one owned command basename, optional empty args, optional
- * env_vars naming only CBM_CACHE_DIR/CBM_RUNTIME_DIR, and no unknown
+ * env_vars naming only CBM_NEO4J_CACHE_DIR/CBM_NEO4J_RUNTIME_DIR, and no unknown
  * assignments or descendant tables. A lone orphaned managed marker (left when
  * a client rewrote the table and dropped its comments, #1720) is dropped in
  * the same write. Returns 1 for a syntactically valid same-name foreign table

@@ -142,7 +142,7 @@ describe('BugWizard', () => {
         expect(message?.textContent).toContain('No observed call came back');
         expect(at('atlas-bugwizard-no-traces-how')?.textContent).toContain('CLI');
         const command = at('atlas-bugwizard-no-traces-command')?.textContent ?? '';
-        expect(command).toContain('codebase-memory-mcp cli ingest_traces');
+        expect(command).toContain('codebase-memory-mcp-neo4j cli ingest_traces');
         expect(command).toContain('"project":"codeatlasweb-w4b"');
         expect(command).toContain('"path"');
         expect(at('atlas-bugwizard-no-traces-format')?.textContent).toContain('2 to 256 qualified names');

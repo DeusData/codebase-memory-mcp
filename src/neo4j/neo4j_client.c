@@ -344,9 +344,8 @@ int cbm_neo4j_set_read_only(cbm_neo4j_t *c, int max_execution_ms) {
     }
     /* The server stops the query at max_execution_ms and says so: waiting
      * much longer than that only delays the error of a hung request. */
-    cbm_neo4j_http_set_max_wait(c->http, max_execution_ms > 0
-                                             ? max_execution_ms + CBM_NEO4J_WAIT_MARGIN_MS
-                                             : 0);
+    cbm_neo4j_http_set_max_wait(
+        c->http, max_execution_ms > 0 ? max_execution_ms + CBM_NEO4J_WAIT_MARGIN_MS : 0);
     return cbm_neo4j_http_set_extra_headers(c->http, hdrs);
 }
 

@@ -36,7 +36,7 @@
  * geaendert wird. Es wird ausschliesslich in der Kopie initialisiert und
  * committet; kein fremdes Repository wird beruehrt.
  *
- * **CBM_RUNTIME_DIR wird gesetzt.** Der Daemon des Servers und jede CLI
+ * **CBM_NEO4J_RUNTIME_DIR wird gesetzt.** Der Daemon des Servers und jede CLI
  * verabreden sich in einem Rendezvous-Verzeichnis, das per Konto und nicht per
  * HOME gilt: laeuft irgendwo sonst auf der Maschine eine CBM-Instanz mit einem
  * anderen Cache-Verzeichnis, lehnt jede CLI dieses Laufs mit "the active account
@@ -69,7 +69,7 @@ import { startStaticProxy } from './lib/static-proxy.mjs';
 const execFileAsync = promisify(execFile);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w4b';
@@ -374,7 +374,7 @@ async function main() {
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w4b-run-');
         // Von hier an erbt jeder Kindprozess das eigene Rendezvous: die CLI
         // ueber `run`, der Server ueber startServer. Siehe Kopf dieser Datei.
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         workspace = await mkdtemp(join(tmpdir(), 'codeatlasweb-w4b-fixture-'));
         const repo = join(workspace, 'atlas-sample');
         await cp(FIXTURE, repo, { recursive: true });
@@ -446,7 +446,7 @@ async function main() {
             && before.noTraces.present
             && before.noTraces.message.length > 20
             && before.noTraces.how.length > 20
-            && before.noTraces.command.includes('codebase-memory-mcp cli ingest_traces')
+            && before.noTraces.command.includes('codebase-memory-mcp-neo4j cli ingest_traces')
             && before.noTraces.command.includes(PROJECT)
             && before.noTraces.format.includes('caller')
             && before.noTraces.where.length > 20

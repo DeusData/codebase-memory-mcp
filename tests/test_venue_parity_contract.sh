@@ -116,7 +116,7 @@ ALLOWED_EXTRA = {
     "_test.yml": {"npm"},
     "release.yml": {"npm", "pip", "pip3", "twine", "python", "make",
                     "./mcp-publisher"},
-    "_smoke.yml": {"codebase-memory-mcp"},  # brew-installed CLI version check
+    "_smoke.yml": {"codebase-memory-mcp-neo4j"},  # brew-installed CLI version check
 }
 # Steps that are scanners/data-generators with inherently inline bodies, keyed
 # "<file>:<step name>". Additions here are DELIBERATE holes — keep tiny.

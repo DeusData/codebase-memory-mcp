@@ -1,6 +1,6 @@
 # Measuring quality, latency, and agent savings
 
-This guide describes how to measure codebase-memory-mcp (CBM) on your own
+This guide describes how to measure codebase-memory-mcp-neo4j (CBM) on your own
 repository without mixing three different questions:
 
 1. Does the agent give a better answer?
@@ -86,7 +86,7 @@ GRAPH_SHA=$(git -C "$GRAPH_REPO" rev-parse HEAD) || exit 1
 GRAPH_STATUS=$(git -C "$GRAPH_REPO" status --porcelain=v1 --untracked-files=all) || exit 1
 test "$GRAPH_SHA" = "$SHA" || exit 1
 test -z "$GRAPH_STATUS" || exit 1
-codebase-memory-mcp cli index_repository \
+codebase-memory-mcp-neo4j cli index_repository \
   --repo-path "$GRAPH_REPO" \
   --mode "$MODE" || exit 1
 GRAPH_SHA_AFTER=$(git -C "$GRAPH_REPO" rev-parse HEAD) || exit 1
@@ -99,8 +99,8 @@ Take `PROJECT_NAME` from the successful indexing response. A verbose status call
 is useful only as a root/current-HEAD cross-check:
 
 ```bash
-codebase-memory-mcp cli list_projects
-codebase-memory-mcp cli index_status --project PROJECT_NAME --verbose
+codebase-memory-mcp-neo4j cli list_projects
+codebase-memory-mcp-neo4j cli index_status --project PROJECT_NAME --verbose
 ```
 
 Confirm that `root_path` is `GRAPH_REPO`, `git.head_sha` is `SHA`, and the Git
@@ -113,7 +113,7 @@ Finally, run one or more representative queries whose expected symbols you
 have verified directly at the recorded SHA:
 
 ```bash
-codebase-memory-mcp cli search_graph \
+codebase-memory-mcp-neo4j cli search_graph \
   --project PROJECT_NAME \
   --name-pattern 'KNOWN_SYMBOL_PATTERN' \
   --limit 10
@@ -156,7 +156,7 @@ reduction is only useful when the answer still meets the chosen quality bar.
 Record indexing time separately from query latency, and classify the index run
 as full-source, artifact-assisted, or incremental. When no local project
 database exists, `index_repository` can import a compatible
-`.codebase-memory/graph.db.zst` and then take the incremental-manifest route.
+`.codebase-memory-neo4j/graph.db.zst` and then take the incremental-manifest route.
 Before timing, record whether that artifact exists in `GRAPH_REPO`, retain the
 index log, and require the later successful `artifact.import` record containing
 `db` and `size_mb` before classifying the run as artifact-assisted. A bootstrap
@@ -183,8 +183,8 @@ CBM creates a fresh randomized, owner-private diagnostics directory below the
 system temporary directory. Do not assume or construct an old predictable
 `/tmp` filename. Discover the exact `snapshot` and `trajectory` paths from the
 `diagnostics.start` JSON record in
-`${CBM_CACHE_DIR}/logs/cbm-daemon.log` (the default cache directory is
-`~/.cache/codebase-memory-mcp`). The record is emitted even when the configured
+`${CBM_NEO4J_CACHE_DIR}/logs/cbm-neo4j-daemon.log` (the default cache directory is
+`~/.cache/codebase-memory-mcp-neo4j`). The record is emitted even when the configured
 log level suppresses ordinary logging. The README's
 [diagnostics section](../README.md#troubleshooting--diagnostics) explains the
 files and retention behavior.
@@ -203,7 +203,7 @@ its counters to one workload.
 From a source checkout, the canonical endurance entry point is:
 
 ```bash
-scripts/soak-legs.sh build/c/codebase-memory-mcp 10
+scripts/soak-legs.sh build/c/codebase-memory-mcp-neo4j 10
 ```
 
 It runs the quick mixed workload and the read-only query-leak workload, checks

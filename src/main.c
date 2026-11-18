@@ -1,5 +1,5 @@
 /*
- * main.c — Entry point for codebase-memory-mcp.
+ * main.c — Entry point for codebase-memory-mcp-neo4j.
  *
  * Modes:
  *   (default)       Run as MCP server on stdin/stdout (JSON-RPC 2.0)
@@ -9,7 +9,7 @@
  *   cli --quiet     Show errors only; disable automatic terminal progress
  *   cli --verbose   Include informational logs for one-shot commands
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
- *   --port=N        Set HTTP UI port (persisted, default 9749)
+ *   --port=N        Set HTTP UI port (persisted, default 9750)
  *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
  *
  * Long-lived MCP and hook frontends are thin clients of one mandatory
@@ -238,7 +238,7 @@ static void main_local_maintenance_finish(cbm_daemon_maintenance_monitor_t **mon
 static _Noreturn void main_coordination_cleanup_fail_stop(const char *component) {
     cbm_log_error("coordination.cleanup_timeout", "component", component, "action", "process_exit");
     (void)fprintf(stderr,
-                  "codebase-memory-mcp: coordination cleanup timed out (%s); "
+                  "codebase-memory-mcp-neo4j: coordination cleanup timed out (%s); "
                   "terminating so the OS releases retained claims\n",
                   component ? component : "unknown");
     (void)fflush(stdout);
@@ -1121,25 +1121,25 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
 /* ── Help ───────────────────────────────────────────────────────── */
 
 static void print_help(void) {
-    printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
+    printf("codebase-memory-mcp-neo4j %s\n\n", CBM_VERSION);
     printf("Usage:\n");
-    printf("  codebase-memory-mcp              Run MCP server on stdio\n");
-    printf("  codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool> "
+    printf("  codebase-memory-mcp-neo4j              Run MCP server on stdio\n");
+    printf("  codebase-memory-mcp-neo4j cli [--quiet] [--progress] [--verbose] [--json] <tool> "
            "[args]\n");
     printf("                                      Run one tool locally, then exit\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] "
+    printf("  codebase-memory-mcp-neo4j install [-y|-n] [--force] [--dry-run] "
            "[--dir=<path>] [--skip-config]\n");
     printf("                                      [--clients=<tokens>]  Run "
            "'install --clients' to list tokens\n");
-    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");
-    printf("  codebase-memory-mcp update [-y|-n]\n");
-    printf("  codebase-memory-mcp config <list|get|set|reset>\n");
-    printf("  codebase-memory-mcp daemon <start|stop|status>\n");
+    printf("  codebase-memory-mcp-neo4j uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");
+    printf("  codebase-memory-mcp-neo4j update [-y|-n]\n");
+    printf("  codebase-memory-mcp-neo4j config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp-neo4j daemon <start|stop|status>\n");
     printf("                                      start keeps a daemon warm: CLI calls skip\n");
     printf("                                      the per-command start-up, and hooks add\n");
     printf("                                      graph context only while a daemon runs\n");
-    printf("  codebase-memory-mcp --version    Print version\n");
-    printf("  codebase-memory-mcp --help       Print this help\n");
+    printf("  codebase-memory-mcp-neo4j --version    Print version\n");
+    printf("  codebase-memory-mcp-neo4j --help       Print this help\n");
     printf("\nCLI output options:\n");
     printf("  --quiet       Show errors only; disable automatic terminal progress\n");
     printf("  --progress    Show lifecycle progress even with redirected stderr\n");
@@ -1149,7 +1149,7 @@ static void print_help(void) {
     printf("\nUI options:\n");
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
-    printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("  --port=N     Set UI port (default 9750, persisted)\n");
     printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
     printf("\nSupported automatic/conditional client surfaces (45):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
@@ -1224,10 +1224,10 @@ static int main_run_allow_root(int argc, char **argv) {
                    "always-refused roots (see docs/CONFIGURATION.md)\n");
         }
         if (!path && !list_only) {
-            (void)fprintf(stderr,
-                          "usage: codebase-memory-mcp allow-root [--approve-sensitive] <path>\n"
-                          "       codebase-memory-mcp allow-root --approve-manifest <project>\n"
-                          "       codebase-memory-mcp allow-root --list\n");
+            (void)fprintf(
+                stderr, "usage: codebase-memory-mcp-neo4j allow-root [--approve-sensitive] <path>\n"
+                        "       codebase-memory-mcp-neo4j allow-root --approve-manifest <project>\n"
+                        "       codebase-memory-mcp-neo4j allow-root --list\n");
             return EXIT_FAILURE;
         }
         return 0;
@@ -1288,7 +1288,7 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
     }
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
-            printf("codebase-memory-mcp %s\n", CBM_VERSION);
+            printf("codebase-memory-mcp-neo4j %s\n", CBM_VERSION);
             return 0;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -1493,7 +1493,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * fingerprint joins the account-wide cohort. Keeping an original symlink
      * spelling in the environment would let a later retarget move storage
      * while the process still advertises the old canonical root. */
-    if (cbm_setenv("CBM_CACHE_DIR", canonical_cache, 1) != 0) {
+    if (cbm_setenv("CBM_NEO4J_CACHE_DIR", canonical_cache, 1) != 0) {
         return MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT;
     }
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), cache_fingerprint);
@@ -1787,7 +1787,7 @@ static void main_report_client_failure(cbm_daemon_process_role_t role, const cha
                       escaped);
         (void)fflush(stdout);
     }
-    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", detail);
+    (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s\n", detail);
 }
 
 static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
@@ -1847,19 +1847,20 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
         return status;
     }
     if (report_lifecycle) {
-        (void)fprintf(stderr,
-                      "codebase-memory-mcp: retiring the active permanent daemon (%s, pid %lu) "
-                      "for this newer build (%s)\n",
-                      active.semantic_version, (unsigned long)active.daemon_pid,
-                      config->identity->semantic_version);
+        (void)fprintf(
+            stderr,
+            "codebase-memory-mcp-neo4j: retiring the active permanent daemon (%s, pid %lu) "
+            "for this newer build (%s)\n",
+            active.semantic_version, (unsigned long)active.daemon_pid,
+            config->identity->semantic_version);
     }
     cbm_daemon_runtime_activation_result_t drain;
     if (!cbm_daemon_runtime_request_activation_shutdown(config->endpoint, config->identity,
                                                         CBM_DAEMON_RUNTIME_ACTIVATION_UPDATE,
                                                         main_startup_timeout_ms(), &drain) ||
         !drain.accepted) {
-        (void)fprintf(stderr, "codebase-memory-mcp: the active daemon did not accept the "
-                              "upgrade drain; run `codebase-memory-mcp daemon stop`\n");
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: the active daemon did not accept the "
+                              "upgrade drain; run `codebase-memory-mcp-neo4j daemon stop`\n");
         main_conflict_remedy_probe(config->endpoint, config->identity, &active, result->remedy,
                                    sizeof(result->remedy));
         return status;
@@ -1917,9 +1918,10 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
          * opts into this detail. It is advice for a person, so it is a plain
          * stderr line rather than a structured record whose value escaping
          * would turn `daemon start` into `daemon_start`. */
-        (void)fprintf(stderr, "hint: this command started a temporary CBM daemon. "
-                              "`codebase-memory-mcp daemon start` keeps one warm and removes this "
-                              "startup cost from every CLI command.\n");
+        (void)fprintf(stderr,
+                      "hint: this command started a temporary CBM daemon. "
+                      "`codebase-memory-mcp-neo4j daemon start` keeps one warm and removes this "
+                      "startup cost from every CLI command.\n");
     }
     char session_root[MAIN_PATH_CAP];
     char allowed_root[MAIN_PATH_CAP];
@@ -2012,9 +2014,9 @@ static void main_hook_report_absent_daemon(const char *hook_dialect) {
     if (!main_hook_absent_notice_due()) {
         return;
     }
-    (void)fprintf(stderr, "codebase-memory-mcp: no CBM daemon is running, so graph "
+    (void)fprintf(stderr, "codebase-memory-mcp-neo4j: no CBM daemon is running, so graph "
                           "augmentation is skipped. Start an MCP session or run "
-                          "`codebase-memory-mcp daemon start` to enable it.\n");
+                          "`codebase-memory-mcp-neo4j daemon start` to enable it.\n");
     const char *notice = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, hook_dialect);
     if (notice) {
         (void)fputs(notice, stdout);
@@ -2575,7 +2577,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         }
     }
     if (!arguments_valid || !subcommand) {
-        (void)fprintf(stderr, "usage: codebase-memory-mcp daemon <start|stop|status> "
+        (void)fprintf(stderr, "usage: codebase-memory-mcp-neo4j daemon <start|stop|status> "
                               "[--open] [--port=N]\n");
         return EXIT_FAILURE;
     }
@@ -2595,12 +2597,12 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
                        (unsigned long long)status.muted_endpoint_holder_pid);
                 printf("hint: that process holds the daemon endpoint but answered nothing; "
                        "its runtime is likely dead. Terminate pid %llu, then run "
-                       "`codebase-memory-mcp daemon start`.\n",
+                       "`codebase-memory-mcp-neo4j daemon start`.\n",
                        (unsigned long long)status.muted_endpoint_holder_pid);
                 return EXIT_FAILURE;
             }
             printf("daemon: not running\n");
-            printf("hint: `codebase-memory-mcp daemon start` keeps a daemon warm so CLI "
+            printf("hint: `codebase-memory-mcp-neo4j daemon start` keeps a daemon warm so CLI "
                    "commands and hooks skip the per-command startup cost.\n");
             return EXIT_FAILURE;
         }
@@ -2713,7 +2715,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
                                               : "the permanent daemon could not be started");
         if (start_status == CBM_DAEMON_BOOTSTRAP_CONFLICT) {
             (void)fprintf(stderr, "hint: a daemon of a different build is active; "
-                                  "`codebase-memory-mcp daemon stop` retires it.\n");
+                                  "`codebase-memory-mcp-neo4j daemon stop` retires it.\n");
         }
         return EXIT_FAILURE;
     }
@@ -2775,7 +2777,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     } else {
         printf("daemon: started (permanent)\n");
     }
-    printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
+    printf("It survives idle periods and session ends; `codebase-memory-mcp-neo4j daemon stop` "
            "retires it.\n");
     /* Skipped when the handshake was refused: that path announces the port as
      * warming, which would be a promise nothing is keeping. */
@@ -2820,7 +2822,7 @@ int main(int argc, char **argv) {
         cbm_log_set_crash_durable(true);
     }
     if (role == CBM_DAEMON_PROCESS_INVALID) {
-        (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: invalid internal process arguments\n");
         return EXIT_FAILURE;
     }
 #ifndef _WIN32
@@ -2835,7 +2837,8 @@ int main(int argc, char **argv) {
         configure_stateless) {
         const char *settings_cache = cbm_resolve_cache_dir();
         if (settings_cache && !cbm_runtime_settings_init(settings_cache)) {
-            (void)fprintf(stderr, "codebase-memory-mcp: could not load saved runtime settings\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: could not load saved runtime settings\n");
             return EXIT_FAILURE;
         }
     }
@@ -2858,8 +2861,9 @@ int main(int argc, char **argv) {
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
         cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) != 0) {
-        (void)fprintf(stderr, "codebase-memory-mcp: --tool-profile requires the supported value "
-                              "'analysis' or 'scout'\n");
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp-neo4j: --tool-profile requires the supported value "
+                      "'analysis' or 'scout'\n");
         return 2;
     }
     const char *hook_event = NULL;
@@ -2964,10 +2968,11 @@ int main(int argc, char **argv) {
              * right it granted — and the daemon-endpoint path a few hundred
              * lines below has printed it since #1582. This path did not. */
             const char *why = cbm_daemon_ipc_validation_detail();
-            (void)fprintf(
-                stderr,
-                "codebase-memory-mcp: secure CLI coordination could not be created (%s)%s%s\n",
-                coordination_failure, (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: secure CLI coordination could not be created "
+                          "(%s)%s%s\n",
+                          coordination_failure, (why && why[0]) ? ": " : "",
+                          (why && why[0]) ? why : "");
             goto local_cli_cleanup;
         }
         cbm_http_server_set_binary_path(local_executable);
@@ -2985,7 +2990,7 @@ int main(int argc, char **argv) {
                 main_conflict_remedy_probe(local_endpoint, &local_identity, NULL, remedy,
                                            sizeof(remedy));
             }
-            (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
+            (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s%s%s\n",
                           formatted ? message
                                     : "CLI exact-build admission could not be verified; retry "
                                       "after active CBM operations exit",
@@ -2998,8 +3003,9 @@ int main(int argc, char **argv) {
             cbm_daemon_maintenance_monitor_start(cohort_manager, main_local_command_cancel,
                                                  &maintenance_context, EXIT_FAILURE, "CLI command");
         if (!maintenance_monitor) {
-            (void)fprintf(stderr,
-                          "codebase-memory-mcp: CLI maintenance observer could not start safely\n");
+            (void)fprintf(
+                stderr,
+                "codebase-memory-mcp-neo4j: CLI maintenance observer could not start safely\n");
             goto local_cli_cleanup;
         }
 
@@ -3013,16 +3019,17 @@ int main(int argc, char **argv) {
                  * that the OS has not reclaimed. "Busy" alone sent reporters
                  * hunting for a CBM session that had already exited. */
                 (void)fprintf(stderr,
-                              "codebase-memory-mcp: CLI startup coordination stayed busy for "
+                              "codebase-memory-mcp-neo4j: CLI startup coordination stayed busy for "
                               "%d seconds. Either another CBM command is still running, or a "
                               "previous one was force-killed and the operating system has not "
                               "released its lock yet. Check for running CBM processes; if there "
                               "are none, retry shortly.\n",
                               MAIN_STARTUP_CONTENTION_CEILING_MS / 1000);
             } else {
-                (void)fprintf(stderr, "codebase-memory-mcp: CLI startup coordination could not "
-                                      "be verified safely; retry after active CBM sessions "
-                                      "exit\n");
+                (void)fprintf(stderr,
+                              "codebase-memory-mcp-neo4j: CLI startup coordination could not "
+                              "be verified safely; retry after active CBM sessions "
+                              "exit\n");
             }
             goto local_cli_cleanup;
         }
@@ -3031,7 +3038,7 @@ int main(int argc, char **argv) {
             if (seal_status == 0) {
                 (void)cbm_version_cohort_log_uncoordinated_daemon(&local_identity);
             }
-            (void)fprintf(stderr, "codebase-memory-mcp: CBM CLI could not start because a "
+            (void)fprintf(stderr, "codebase-memory-mcp-neo4j: CBM CLI could not start because a "
                                   "pre-coordination or unverified CBM generation is active; close "
                                   "all CBM sessions and commands, then retry\n");
             goto local_cli_cleanup;
@@ -3044,20 +3051,21 @@ int main(int argc, char **argv) {
             daemon_presence != CBM_VERSION_COHORT_DAEMON_COORDINATED) {
             if (daemon_presence == CBM_VERSION_COHORT_DAEMON_UNCOORDINATED) {
                 (void)cbm_version_cohort_log_uncoordinated_daemon(&local_identity);
-                (void)fprintf(stderr, "codebase-memory-mcp: CBM CLI could not start because "
+                (void)fprintf(stderr, "codebase-memory-mcp-neo4j: CBM CLI could not start because "
                                       "an active pre-coordination or unverified CBM daemon is "
                                       "running. Close all CBM sessions and commands, then "
                                       "retry.\n");
             } else {
-                (void)fprintf(stderr, "codebase-memory-mcp: active daemon coordination could "
+                (void)fprintf(stderr, "codebase-memory-mcp-neo4j: active daemon coordination could "
                                       "not be verified safely; retry after active CBM sessions "
                                       "exit\n");
             }
             goto local_cli_cleanup;
         }
         if (!cbm_daemon_ipc_local_transition_begin_work(local_transition)) {
-            (void)fprintf(stderr, "codebase-memory-mcp: CLI startup coordination could not enter "
-                                  "local work safely\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: CLI startup coordination could not enter "
+                          "local work safely\n");
             goto local_cli_cleanup;
         }
 
@@ -3085,7 +3093,7 @@ int main(int argc, char **argv) {
     cbm_daemon_build_identity_t identity;
     if (!main_resolve_executable(argv[0], executable_path)) {
         (void)fprintf(stderr,
-                      "codebase-memory-mcp: exact executable identity could not be verified "
+                      "codebase-memory-mcp-neo4j: exact executable identity could not be verified "
                       "(executable-path)\n");
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -3093,7 +3101,7 @@ int main(int argc, char **argv) {
     if (identity_status != MAIN_BUILD_IDENTITY_OK) {
         const char *validation_detail = cbm_daemon_ipc_validation_detail();
         (void)fprintf(stderr,
-                      "codebase-memory-mcp: exact executable identity could not be verified "
+                      "codebase-memory-mcp-neo4j: exact executable identity could not be verified "
                       "(%s)%s%s\n",
                       main_build_identity_status_name(identity_status),
                       validation_detail[0] ? " - " : "", validation_detail);
@@ -3319,7 +3327,7 @@ int main(int argc, char **argv) {
                 main_conflict_remedy_probe(endpoint, &identity, NULL, remedy, sizeof(remedy));
             }
         }
-        (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s%s%s\n",
                       formatted ? message : "client exact-build admission failed",
                       remedy[0] ? " " : "", remedy);
         if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
@@ -3342,7 +3350,7 @@ int main(int argc, char **argv) {
                 char conflict_detail[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
                 if (cbm_daemon_conflict_format(&hook_connect.conflict, conflict_detail,
                                                sizeof(conflict_detail))) {
-                    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", conflict_detail);
+                    (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s\n", conflict_detail);
                 }
                 main_hook_report_conflicted_daemon(hook_dialect);
             } else {
@@ -3392,7 +3400,7 @@ int main(int argc, char **argv) {
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
         !main_set_client_context(g_daemon_client, NULL, tool_profile, NULL, NULL,
                                  bootstrap_config.startup_timeout_ms)) {
-        (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: daemon session context was rejected\n");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
@@ -3413,23 +3421,25 @@ int main(int argc, char **argv) {
             cbm_daemon_application_client_set_ui_config(
                 g_daemon_client, update_mask, ui_enabled, ui_port,
                 bootstrap_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
-            (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_FAILURE;
         }
         if (explicitly_enabled && !(CBM_EMBEDDED_FILE_COUNT > 0)) {
-            (void)fprintf(stderr, "codebase-memory-mcp: --ui requested, but this binary was built "
-                                  "without UI support; rebuild with `make -f Makefile.cbm "
-                                  "cbm-with-ui`.\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: --ui requested, but this binary was built "
+                          "without UI support; rebuild with `make -f Makefile.cbm "
+                          "cbm-with-ui`.\n");
         }
     }
     /* The Windows branch of this call is the #914 fix: identical placement and
      * failure handling as POSIX (fail-closed — a client that cannot arm its
      * parent watchdog would linger as an orphan after the editor dies). */
     if (!client_start_parent_watchdog(process_initial_ppid)) {
-        (void)fprintf(stderr, "codebase-memory-mcp: parent-death watchdog could not start\n");
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: parent-death watchdog could not start\n");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);

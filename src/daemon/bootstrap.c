@@ -232,16 +232,16 @@ bool cbm_daemon_process_role_requires_client(cbm_daemon_process_role_t role) {
  * command needs this endpoint, `config list` included, so the operator cannot
  * even reconfigure their way out. The only relocation hook was
  * CBM_TEST_DAEMON_RUNTIME_PARENT, compiled out unless CBM_ENABLE_TEST_SEAMS is
- * defined, so a test build started while the shipped build did not. CBM_CACHE_DIR
+ * defined, so a test build started while the shipped build did not. CBM_NEO4J_CACHE_DIR
  * does not help either — it moves the cache, never the rendezvous.
  *
- * CBM_RUNTIME_DIR does NOT relax the check. The directory it names goes through
+ * CBM_NEO4J_RUNTIME_DIR does NOT relax the check. The directory it names goes through
  * exactly the same validation as the default; the operator only chooses an
  * ancestry that passes, and a value that fails is refused rather than ignored.
  * cbm_safe_getenv never truncates: a value too long for the buffer is reported
  * as absent, so no half a path can ever become a runtime parent. */
 static const char *bootstrap_runtime_parent_override(char *buffer, size_t capacity) {
-    const char *value = cbm_safe_getenv("CBM_RUNTIME_DIR", buffer, capacity, NULL);
+    const char *value = cbm_safe_getenv("CBM_NEO4J_RUNTIME_DIR", buffer, capacity, NULL);
     return value && value[0] != '\0' ? value : NULL;
 }
 
@@ -282,9 +282,10 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime
         bootstrap_runtime_parent_resolve(runtime_parent, override_parent, sizeof(override_parent));
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (!parent && g_bootstrap_default_runtime_forbidden) {
-        (void)fprintf(stderr, "codebase-memory-mcp: test run refused the default daemon runtime "
-                              "directory (no explicit parent and CBM_RUNTIME_DIR unset): the "
-                              "developer's live daemon listens there\n");
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp-neo4j: test run refused the default daemon runtime "
+                      "directory (no explicit parent and CBM_NEO4J_RUNTIME_DIR unset): the "
+                      "developer's live daemon listens there\n");
         return NULL;
     }
 #endif
@@ -324,7 +325,7 @@ static uint64_t bootstrap_deadline_after(uint32_t timeout_ms) {
 
 static _Noreturn void bootstrap_cleanup_fail_stop(const char *component) {
     (void)fprintf(stderr,
-                  "codebase-memory-mcp: coordination cleanup failed (%s); "
+                  "codebase-memory-mcp-neo4j: coordination cleanup failed (%s); "
                   "terminating so the OS releases retained claims\n",
                   component ? component : "unknown");
     (void)fflush(stderr);
@@ -336,7 +337,7 @@ static _Noreturn void bootstrap_cleanup_fail_stop(const char *component) {
 #endif
 }
 
-static const char BOOTSTRAP_START_FAILURE_LOG_NAME[] = "cbm-daemon.start-failures.log";
+static const char BOOTSTRAP_START_FAILURE_LOG_NAME[] = "cbm-neo4j-daemon.start-failures.log";
 
 bool cbm_daemon_bootstrap_log_directory(char *out, size_t capacity) {
     if (!out || capacity == 0) {
@@ -462,7 +463,7 @@ static FILE *bootstrap_start_failure_open(const char *log_directory, int *status
     }
 #endif
     /* The directory is the trust boundary (owner-only, no symlinked
-     * ancestry); the same validation guards cbm-daemon.log itself. */
+     * ancestry); the same validation guards cbm-neo4j-daemon.log itself. */
     if (!cbm_daemon_ipc_private_directory_secure(log_directory)) {
         *status_out = -1;
         return NULL;
@@ -546,7 +547,7 @@ void cbm_daemon_bootstrap_start_failure_format(const cbm_daemon_bootstrap_start_
                                                : "startup";
     char where[BOOTSTRAP_PATH_CAP];
     if (log_directory && log_directory[0]) {
-        (void)snprintf(where, sizeof(where), "see %s/cbm-daemon.log", log_directory);
+        (void)snprintf(where, sizeof(where), "see %s/cbm-neo4j-daemon.log", log_directory);
     } else {
         (void)snprintf(where, sizeof(where), "see the daemon log");
     }
@@ -650,13 +651,14 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
     result->client = NULL;
     if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_CONFLICT) {
         result->status = CBM_DAEMON_BOOTSTRAP_CONFLICT;
-        (void)snprintf(result->message, sizeof(result->message), "%s",
-                       connect_result && connect_result->message[0]
-                           ? connect_result->message
-                           : "CBM could not start because a conflicting CBM process is active; "
-                             "close all CBM sessions and commands, then retry. If a permanent "
-                             "daemon from another build is running, `codebase-memory-mcp daemon "
-                             "stop` retires it");
+        (void)snprintf(
+            result->message, sizeof(result->message), "%s",
+            connect_result && connect_result->message[0]
+                ? connect_result->message
+                : "CBM could not start because a conflicting CBM process is active; "
+                  "close all CBM sessions and commands, then retry. If a permanent "
+                  "daemon from another build is running, `codebase-memory-mcp-neo4j daemon "
+                  "stop` retires it");
         if (ops->visible_diagnostic) {
             ops->visible_diagnostic(ops->context, result->message);
         }
@@ -1366,7 +1368,7 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
     bootstrap_production_context_t *production = context;
 #ifdef _WIN32
     if (production && production->spawn_error != ERROR_SUCCESS) {
-        (void)fprintf(stderr, "codebase-memory-mcp: %s (daemon launch error %lu)\n",
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s (daemon launch error %lu)\n",
                       message ? message : "daemon startup failed",
                       (unsigned long)production->spawn_error);
         (void)fflush(stderr);
@@ -1374,7 +1376,7 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
     }
 #elif defined(__APPLE__)
     if (production && production->spawn_error != 0) {
-        (void)fprintf(stderr, "codebase-memory-mcp: %s (daemon launch: %s)\n",
+        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s (daemon launch: %s)\n",
                       message ? message : "daemon startup failed",
                       strerror(production->spawn_error));
         (void)fflush(stderr);
@@ -1383,7 +1385,8 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
 #else
     (void)production;
 #endif
-    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", message ? message : "daemon startup failed");
+    (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s\n",
+                  message ? message : "daemon startup failed");
     (void)fflush(stderr);
 }
 

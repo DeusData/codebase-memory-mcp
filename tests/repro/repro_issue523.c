@@ -177,7 +177,7 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
     /* ── Cross-repo match ─────────────────────────────────────── */
     /*
      * cbm_cross_repo_match opens both project DBs from the cache directory
-     * (the same $HOME/.cache/codebase-memory-mcp/<project>.db paths that
+     * (the same $HOME/.cache/codebase-memory-mcp-neo4j/<project>.db paths that
      * rh_open_indexed wrote).  It iterates HTTP_CALLS edges in the client DB
      * and looks for matching Route QNs in the server DB.
      *

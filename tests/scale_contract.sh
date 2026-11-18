@@ -21,7 +21,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/build/c/codebase-memory-mcp"
+BIN="$ROOT/build/c/codebase-memory-mcp-neo4j"
 BENCH="${CBM_BENCH_DIR:-$HOME/cbm-bench-validate}"
 PY="${PYTHON:-python3.9}"
 FAILURES=0
@@ -61,7 +61,7 @@ assert_lang() {
     RAN=$((RAN + 1))
     local proj
     proj="$(project_name "$repo")"
-    rm -f "$HOME/.cache/codebase-memory-mcp/$proj.db"*
+    rm -f "$HOME/.cache/codebase-memory-mcp-neo4j/$proj.db"*
 
     echo "[scale] $lang — indexing $repo ..."
     "$BIN" cli index_repository "{\"repo_path\":\"$repo\"}" >/dev/null 2>&1

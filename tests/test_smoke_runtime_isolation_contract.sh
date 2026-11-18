@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # scripts/smoke-test.sh is the process that actually starts the product during
 # a smoke run, and it retires "the account daemon" seven times through
-# `daemon stop`. Its wrappers sandbox HOME/XDG/TMPDIR and CBM_CACHE_DIR, but
-# only CBM_RUNTIME_DIR moves the daemon rendezvous (docs/CONFIGURATION.md), so
+# `daemon stop`. Its wrappers sandbox HOME/XDG/TMPDIR and CBM_NEO4J_CACHE_DIR, but
+# only CBM_NEO4J_RUNTIME_DIR moves the daemon rendezvous (docs/CONFIGURATION.md), so
 # without a private runtime every one of those stops lands on the operator's
 # live daemon. Drive the harness with an environment-probe fixture and require
 # that no product process ever receives the caller's runtime or cache.
@@ -31,7 +31,7 @@ normalize_path() {
 ENV_PROBE="$WORKDIR/environment-probe"
 cat > "$ENV_PROBE" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\t%s\n' "${CBM_CACHE_DIR-}" "${CBM_RUNTIME_DIR-}" >> "$CBM_SMOKE_ENV_PROBE"
+printf '%s\t%s\n' "${CBM_NEO4J_CACHE_DIR-}" "${CBM_NEO4J_RUNTIME_DIR-}" >> "$CBM_SMOKE_ENV_PROBE"
 case "${1-}" in
     --version) echo "v0.0.0-probe"; exit 0 ;;
     daemon) [[ "${2-}" == status ]] && exit 1; exit 0 ;;
@@ -48,8 +48,8 @@ mkdir -p "$CALLER_CACHE" "$CALLER_RUNTIME"
 
 # The fixture answers nothing beyond --version, so the smoke fails early; only
 # the environment it handed to the product is under test here.
-CBM_CACHE_DIR="$CALLER_CACHE" \
-CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+CBM_NEO4J_CACHE_DIR="$CALLER_CACHE" \
+CBM_NEO4J_RUNTIME_DIR="$CALLER_RUNTIME" \
 CBM_SMOKE_ENV_PROBE="$ENV_LOG" \
     "$ROOT/scripts/smoke-test.sh" "$ENV_PROBE" > "$WORKDIR/smoke.out" 2>&1 || true
 
@@ -62,10 +62,10 @@ while IFS=$'\t' read -r child_cache_raw child_runtime_raw; do
     child_cache=$(normalize_path "$child_cache_raw")
     child_runtime=$(normalize_path "$child_runtime_raw")
     if [[ -z "$child_runtime" || "$child_runtime" == "$CALLER_RUNTIME_NORMALIZED" ]]; then
-        fail "smoke-test exposed the caller CBM_RUNTIME_DIR to a product process"
+        fail "smoke-test exposed the caller CBM_NEO4J_RUNTIME_DIR to a product process"
     fi
     if [[ -z "$child_cache" || "$child_cache" == "$CALLER_CACHE_NORMALIZED" ]]; then
-        fail "smoke-test exposed the caller CBM_CACHE_DIR to a product process"
+        fail "smoke-test exposed the caller CBM_NEO4J_CACHE_DIR to a product process"
     fi
     if [[ "${child_runtime%/*}" != "${child_cache%/*}" ||
           "${child_runtime##*/}" != "runtime" || "${child_cache##*/}" != "cache" ]]; then

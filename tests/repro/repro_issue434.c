@@ -27,7 +27,7 @@
  *
  * Expected (correct) behaviour:
  *   Calling index_repository with persistence=true on a repo that has no
- *   prior artifact MUST create .codebase-memory/graph.db.zst after the run.
+ *   prior artifact MUST create .codebase-memory-neo4j/graph.db.zst after the run.
  *   cbm_artifact_exists(repo_path) MUST return true after the first
  *   persistence=true index, not only after a second run.
  *
@@ -115,7 +115,7 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
 
     /*
      * RED assertion: after a FIRST index_repository call with persistence=true
-     * the artifact MUST exist in .codebase-memory/graph.db.zst.
+     * the artifact MUST exist in .codebase-memory-neo4j/graph.db.zst.
      *
      * On buggy code (pipeline_incremental.c dump_and_persist only checks
      * cbm_artifact_exists() not p->persistence) the artifact is NOT written
@@ -139,7 +139,7 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
 
     /* Remove the artifact dir and the fixture repo */
     char art_dir[600];
-    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", lp.tmpdir);
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory-neo4j", lp.tmpdir);
     th_rmtree(art_dir);
     th_rmtree(lp.tmpdir);
 
@@ -148,7 +148,7 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
         const char *home = getenv("HOME");
         if (!home) home = "/tmp";
         char dbpath[600];
-        snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp/%s.db",
+        snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp-neo4j/%s.db",
                  home, proj);
         unlink(dbpath);
         free(proj);

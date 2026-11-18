@@ -125,7 +125,7 @@ bool cbm_daemon_ipc_warn_if_network_cache_root(const char *cache_root) {
     }
     cbm_log_warn("daemon.cache_root_network_fs", "path", cache_root, "fs", kind, "reason",
                  "sqlite_wal_unreliable_on_network_fs", "hint",
-                 "set CBM_CACHE_DIR to local storage (docs/CONFIGURATION.md)");
+                 "set CBM_NEO4J_CACHE_DIR to local storage (docs/CONFIGURATION.md)");
     return true;
 }
 
@@ -328,12 +328,12 @@ bool cbm_daemon_ipc_windows_legacy_names(const char *canonical_runtime_parent,
         hash ^= *cursor++;
         hash *= UINT64_C(1099511628211);
     }
-    int pipe_length =
-        snprintf(pipe_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP, "\\\\.\\pipe\\cbm-daemon-%016llx-%s",
-                 (unsigned long long)hash, instance_key);
-    int mutex_length =
-        snprintf(startup_mutex_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
-                 "Local\\cbm-daemon-%016llx-%s-startup", (unsigned long long)hash, instance_key);
+    int pipe_length = snprintf(pipe_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
+                               "\\\\.\\pipe\\cbm-neo4j-daemon-%016llx-%s", (unsigned long long)hash,
+                               instance_key);
+    int mutex_length = snprintf(startup_mutex_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
+                                "Local\\cbm-neo4j-daemon-%016llx-%s-startup",
+                                (unsigned long long)hash, instance_key);
     return pipe_length > 0 && (size_t)pipe_length < CBM_DAEMON_IPC_WINDOWS_NAME_CAP &&
            mutex_length > 0 && (size_t)mutex_length < CBM_DAEMON_IPC_WINDOWS_NAME_CAP;
 }
@@ -350,7 +350,7 @@ static bool windows_sid_valid(const uint8_t *sid, size_t sid_length) {
 }
 
 static bool windows_pipe_address_valid(const char *address) {
-    static const char prefix[] = "\\\\.\\pipe\\cbm-daemon-";
+    static const char prefix[] = "\\\\.\\pipe\\cbm-neo4j-daemon-";
     if (!address || strncmp(address, prefix, sizeof(prefix) - 1U) != 0) {
         return false;
     }
@@ -368,7 +368,7 @@ bool cbm_daemon_ipc_windows_generation_address(
     const uint8_t *sid, size_t sid_length, const char *instance_key,
     const uint8_t nonce[CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE],
     char address_out[CBM_DAEMON_IPC_WINDOWS_NAME_CAP]) {
-    static const uint8_t domain[] = "cbm-daemon-win-pipe-v1";
+    static const uint8_t domain[] = "cbm-neo4j-daemon-win-pipe-v1";
     if (!windows_sid_valid(sid, sid_length) || !instance_key_valid(instance_key) || !nonce ||
         !address_out) {
         return false;
@@ -390,7 +390,7 @@ bool cbm_daemon_ipc_windows_generation_address(
     }
     digest_hex[CBM_SHA256_HEX_LEN] = '\0';
     int written = snprintf(address_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
-                           "\\\\.\\pipe\\cbm-daemon-%s", digest_hex);
+                           "\\\\.\\pipe\\cbm-neo4j-daemon-%s", digest_hex);
     return written > 0 && (size_t)written < CBM_DAEMON_IPC_WINDOWS_NAME_CAP;
 }
 
@@ -1067,7 +1067,7 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     endpoint->dir_fd = -1;
     endpoint->runtime_dir =
         string_format("%s%s%s%lu", parent, parent[strlen(parent) - 1] == '/' ? "" : "/",
-                      "cbm-daemon-", (unsigned long)geteuid());
+                      "cbm-neo4j-daemon-", (unsigned long)geteuid());
     endpoint->socket_name = string_format("cbm-%s.sock", instance_key);
     endpoint->socket_anchor_name = string_format("cbm-%s.anc", instance_key);
     endpoint->socket_identity_name = string_format("cbm-%s.sock.identity", instance_key);
@@ -1590,7 +1590,7 @@ static char *private_log_directory_path_copy(const char *directory_path) {
  *
  * The private directory itself is never tolerated as overflow: it is created by
  * us (euid-owned) and re-checked `== geteuid()` by the created/final/snapshot
- * gates, which stay strict. A host-squatted /tmp/cbm-daemon-<uid> appears
+ * gates, which stay strict. A host-squatted /tmp/cbm-neo4j-daemon-<uid> appears
  * overflow-owned and is refused there. */
 #define POSIX_NO_OVERFLOW_UID ((uid_t) - 1)
 
@@ -1961,7 +1961,7 @@ static void posix_foreign_owner_detail_set(const char *child_path, uid_t owner) 
     int tail_length = snprintf(tail, sizeof(tail),
                                "' is owned by %s, not by you (uid %ld) or root; that account "
                                "controls this path. Use a location whose parent directories are "
-                               "yours or root's (e.g. set CBM_CACHE_DIR)",
+                               "yours or root's (e.g. set CBM_NEO4J_CACHE_DIR)",
                                owner_text, (long)geteuid());
     if (tail_length < 0) {
         return;
@@ -2045,7 +2045,7 @@ static int private_directory_tree_open(const char *directory_path) {
                  * directory we are already in — but the message printed
                  * `component`, the child about to be entered. So #1537 read
                  * "ancestor '.cache'" when /Users/<user> was refusing, and
-                 * #1621 read "cbm-daemon-501" when /private/tmp was. Both
+                 * #1621 read "cbm-neo4j-daemon-501" when /private/tmp was. Both
                  * reporters inspected a directory that was not the one
                  * refusing, found it clean, and said so — correctly. Naming the
                  * containing directory is the difference between a report we
@@ -5707,8 +5707,8 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     char legacy_startup[CBM_DAEMON_IPC_WINDOWS_NAME_CAP];
     bool legacy_names_ok =
         cbm_daemon_ipc_windows_legacy_names(parent_utf8, instance_key, legacy_pipe, legacy_startup);
-    endpoint->runtime_dir =
-        string_format("%s%scbm-daemon-%s", parent_utf8, has_separator ? "" : "/", instance_key);
+    endpoint->runtime_dir = string_format("%s%scbm-neo4j-daemon-%s", parent_utf8,
+                                          has_separator ? "" : "/", instance_key);
     endpoint->legacy_pipe_name = legacy_names_ok ? utf8_to_wide(legacy_pipe) : NULL;
     endpoint->legacy_startup_mutex_name = legacy_names_ok ? utf8_to_wide(legacy_startup) : NULL;
     (void)memcpy(endpoint->instance_key, instance_key, sizeof(endpoint->instance_key));

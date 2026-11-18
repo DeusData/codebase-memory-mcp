@@ -8,7 +8,7 @@ import type { Route } from '../test-support/rpc-recordings';
 /*
  * Was diese Datei prueft, ist die Uebersetzung zwischen dem, was der Server
  * schickt, und dem, was der portierte Provider erwartet. Die Nutzlasten unten
- * sind Ausschnitte der Antworten, die cbm/build/c/codebase-memory-mcp am
+ * sind Ausschnitte der Antworten, die cbm/build/c/codebase-memory-mcp-neo4j am
  * 2026-08-28 auf POST /rpc geliefert hat.
  */
 

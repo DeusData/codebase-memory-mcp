@@ -644,7 +644,7 @@ TEST(pipeline_structure_nodes) {
  * is still present and unchanged. */
 /* #1665: a persistence artifact export failure must not be reported as a
  * repo_path problem. Create the artifact directory as a regular FILE so
- * cbm_mkdir_p(.codebase-memory) fails deterministically (works as root too),
+ * cbm_mkdir_p(.codebase-memory-neo4j) fails deterministically (works as root too),
  * run with persistence enabled, and assert: the run fails, the DB was
  * published (publish happens before export), the pipeline snapshots the export
  * error, and a clean re-run leaves the snapshot empty. */
@@ -665,10 +665,10 @@ TEST(pipeline_export_error_snapshot_on_artifact_failure) {
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
 
-    /* Block the artifact directory: a FILE at .codebase-memory makes the
+    /* Block the artifact directory: a FILE at .codebase-memory-neo4j makes the
      * export's mkdir_p fail with a deterministic error on every platform. */
     char art_block[512];
-    snprintf(art_block, sizeof(art_block), "%s/.codebase-memory", tmp);
+    snprintf(art_block, sizeof(art_block), "%s/.codebase-memory-neo4j", tmp);
     f = fopen(art_block, "w");
     ASSERT_NOT_NULL(f);
     fprintf(f, "block\n");
@@ -20775,7 +20775,7 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     cbm_file_hash_t git_input = {0};
     int git_input_rc =
         store ? cbm_store_get_file_hash(
-                    store, project, ".codebase-memory/.semantic-input/git-context-v1", &git_input)
+                    store, project, ".codebase-memory-neo4j/.semantic-input/git-context-v1", &git_input)
               : CBM_STORE_NOT_FOUND;
     cbm_store_clear_file_hash(&git_input);
     if (store) {
@@ -20813,7 +20813,7 @@ TEST(pipeline_global_extension_config_change_forces_full) {
     char repo[512], config_root[512], app_dir[768], config_path[1024], db_path[512];
     snprintf(repo, sizeof(repo), "%s/repo", tmp);
     snprintf(config_root, sizeof(config_root), "%s/config-root", tmp);
-    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp", config_root);
+    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp-neo4j", config_root);
     snprintf(config_path, sizeof(config_path), "%s/config.json", app_dir);
     snprintf(db_path, sizeof(db_path), "%s/config.db", tmp);
     ASSERT_EQ(th_mkdir_p(repo), 0);
@@ -20872,7 +20872,7 @@ TEST(pipeline_global_extension_config_change_forces_full) {
                 cbm_file_hash_t config_input = {0};
                 config_input_rc = cbm_store_get_file_hash(
                     changed_store, project,
-                    ".codebase-memory/.semantic-input/global-extension-config-v1", &config_input);
+                    ".codebase-memory-neo4j/.semantic-input/global-extension-config-v1", &config_input);
                 cbm_store_clear_file_hash(&config_input);
                 cbm_store_close(changed_store);
             }

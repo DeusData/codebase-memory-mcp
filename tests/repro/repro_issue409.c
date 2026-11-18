@@ -16,12 +16,12 @@
  * Expected (correct) behaviour after cbm_upsert_claude_hooks +
  * cbm_install_hook_gate_script:
  *   1. The gate script written to
- *      <home>/.claude/hooks/cbm-code-discovery-gate
+ *      <home>/.claude/hooks/cbm-neo4j-code-discovery-gate
  *      MUST contain "hook-augment" (delegating to the compiled augmenter).
  *   2. The gate script MUST NOT contain "PPID" (the $PPID-keyed blocking
  *      logic) or "exit 2" (the blocking exit code).
  *   3. The settings.json PreToolUse command must reference
- *      "cbm-code-discovery-gate" (the shim), not an inline blocking script.
+ *      "cbm-neo4j-code-discovery-gate" (the shim), not an inline blocking script.
  *
  * Actual (buggy) behaviour (if bug is present):
  *   The gate script still contains $PPID and exit 2; the assertions below
@@ -118,7 +118,7 @@ static int rp409_mkdirp(const char *path) {
  * (the actual install/update flow), asserts that:
  *   1. The gate script is OVERWRITTEN with the non-blocking shim
  *      (contains "hook-augment", does NOT contain "PPID" or "exit 2").
- *   2. settings.json PreToolUse command references "cbm-code-discovery-gate"
+ *   2. settings.json PreToolUse command references "cbm-neo4j-code-discovery-gate"
  *      (the shim path), not inline blocking code.
  *   3. settings.json uses the current non-blocking matcher "Grep|Glob"
  *      (not the old "Grep|Glob|Read" that was silently upgrading Read-gating
@@ -128,7 +128,7 @@ static int rp409_mkdirp(const char *path) {
  *   - The gate script still contains "PPID"  (old blocking logic not cleared)
  *   - The gate script still contains "exit 2" (old blocking exit not cleared)
  *   - The gate script does NOT contain "hook-augment" (shim not written)
- *   - settings.json does NOT contain "cbm-code-discovery-gate" (wrong command)
+ *   - settings.json does NOT contain "cbm-neo4j-code-discovery-gate" (wrong command)
  *
  * Oracle used: cbm_upsert_claude_hooks(settings_path) +
  *              cbm_install_hook_gate_script(home, binary_path)
@@ -152,16 +152,16 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
      * overwritten (truncated) by cbm_install_hook_gate_script. */
     char script_path[512];
     snprintf(script_path, sizeof(script_path),
-             "%s/cbm-code-discovery-gate", hooks_dir);
+             "%s/cbm-neo4j-code-discovery-gate", hooks_dir);
     rp409_write_file(script_path,
         "#!/bin/bash\n"
-        "# Gate hook: nudges Claude toward codebase-memory-mcp for code discovery.\n"
+        "# Gate hook: nudges Claude toward codebase-memory-mcp-neo4j for code discovery.\n"
         "# First Grep/Glob/Read per session -> block. Subsequent -> allow.\n"
         "# PPID = Claude Code process PID, unique per session.\n"
-        "GATE=/tmp/cbm-code-discovery-gate-$PPID\n"
+        "GATE=/tmp/cbm-neo4j-code-discovery-gate-$PPID\n"
         "if [ -f \"$GATE\" ]; then exit 0; fi\n"
         "touch \"$GATE\"\n"
-        "echo 'BLOCKED: use codebase-memory-mcp' >&2\n"
+        "echo 'BLOCKED: use codebase-memory-mcp-neo4j' >&2\n"
         "exit 2\n");
 
     /* Pre-seed settings.json with a stale CMM hook entry (old matcher). */
@@ -172,20 +172,20 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
         "{\"hooks\":{\"PreToolUse\":["
         "{\"matcher\":\"Grep|Glob|Read\","
         "\"hooks\":[{\"type\":\"command\","
-        "\"command\":\"~/.claude/hooks/cbm-code-discovery-gate\"}]}]}}");
+        "\"command\":\"~/.claude/hooks/cbm-neo4j-code-discovery-gate\"}]}]}}");
 
     /* Run the actual install/update hook wiring (same two calls as
      * install_claude_code_config in src/cli/cli.c lines 3045-3046). */
     int rc = cbm_upsert_claude_hooks(settings_path);
     ASSERT_EQ(rc, 0);
-    cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp-neo4j");
 
     /* ── Assert the gate script was OVERWRITTEN with the non-blocking shim ── */
     const char *script_data = rp409_read_file(script_path);
     ASSERT_NOT_NULL(script_data);
 
     /* MUST NOT contain $PPID: the old blocking gate used
-     * /tmp/cbm-code-discovery-gate-$PPID as a per-invocation state file.
+     * /tmp/cbm-neo4j-code-discovery-gate-$PPID as a per-invocation state file.
      * If present, the blocking gate was not overwritten -> RED for #409. */
     ASSERT(strstr(script_data, "PPID") == NULL);
 
@@ -204,7 +204,7 @@ TEST(repro_issue409_install_wires_hook_augment_not_blocking_gate) {
 
     /* The PreToolUse command must reference the shim (by its well-known name),
      * not an inline blocking script. */
-    ASSERT(strstr(settings_data, "cbm-code-discovery-gate") != NULL);
+    ASSERT(strstr(settings_data, "cbm-neo4j-code-discovery-gate") != NULL);
 
     /* The old "Grep|Glob|Read" matcher (which gated Read calls, breaking
      * the read-before-edit invariant per issue #362) must have been replaced

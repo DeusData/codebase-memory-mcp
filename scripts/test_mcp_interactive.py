@@ -69,7 +69,7 @@ def drain(stream: BinaryIO, chunks: list[bytes]) -> None:
 
 
 def cache_log_tail(name: str, limit: int = 16384) -> str:
-    cache_dir = os.environ.get("CBM_CACHE_DIR")
+    cache_dir = os.environ.get("CBM_NEO4J_CACHE_DIR")
     if not cache_dir:
         return ""
     path = os.path.join(cache_dir, "logs", name)
@@ -385,7 +385,7 @@ def main() -> int:
     except SmokeFailure as error:
         stop_process(process)
         stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-        daemon_log = cache_log_tail("cbm-daemon.log")
+        daemon_log = cache_log_tail("cbm-neo4j-daemon.log")
         conflicts = cache_log_tail("daemon-conflicts.ndjson")
         print(f"FAIL: {error}", file=sys.stderr)
         if stderr:

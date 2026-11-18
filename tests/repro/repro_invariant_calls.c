@@ -8,7 +8,7 @@
  *   Zero CALLS edges may be sourced at a "Module" node.
  *
  * BASIS (QUALITY_ANALYSIS.md, 2026-06-24):
- *   Graph quality audit over the real codebase-memory-mcp repo showed only
+ *   Graph quality audit over the real codebase-memory-mcp-neo4j repo showed only
  *   3.69% of CALLS edges are callable-sourced (207/5607). The dominant
  *   failure mode is cbm_enclosing_func_qn returning the module QN when
  *   cbm_find_enclosing_func cannot walk the TSNode ancestry back to a

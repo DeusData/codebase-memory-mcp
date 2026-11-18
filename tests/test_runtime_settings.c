@@ -25,11 +25,11 @@ static bool fixture_open(settings_fixture_t *fixture) {
     snprintf(fixture->path, sizeof(fixture->path), "%s/cbm-settings-XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(fixture->path))
         return false;
-    fixture->cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    fixture->cache = getenv("CBM_NEO4J_CACHE_DIR") ? strdup(getenv("CBM_NEO4J_CACHE_DIR")) : NULL;
     fixture->workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
     fixture->cross =
         getenv("CBM_DISABLE_LSP_CROSS") ? strdup(getenv("CBM_DISABLE_LSP_CROSS")) : NULL;
-    return cbm_setenv("CBM_CACHE_DIR", fixture->path, 1) == 0;
+    return cbm_setenv("CBM_NEO4J_CACHE_DIR", fixture->path, 1) == 0;
 }
 static void restore_env(const char *key, char *value) {
     if (value)
@@ -40,7 +40,7 @@ static void restore_env(const char *key, char *value) {
 }
 static void fixture_close(settings_fixture_t *fixture) {
     cbm_runtime_settings_reset_for_tests();
-    restore_env("CBM_CACHE_DIR", fixture->cache);
+    restore_env("CBM_NEO4J_CACHE_DIR", fixture->cache);
     restore_env("CBM_WORKERS", fixture->workers);
     restore_env("CBM_DISABLE_LSP_CROSS", fixture->cross);
     char path[512];
@@ -117,7 +117,7 @@ TEST(runtime_settings_strict_allowlist_and_types) {
     ASSERT_TRUE(fixture_open(&fixture));
     const char *invalid[] = {"{\"CBM_TEST_CRASH_ON\":\"1\"}",
                              "{\"CBM_WALK_DEFS_MAX\":\"1024\"}",
-                             "{\"CBM_CACHE_DIR\":\"/tmp/no\"}",
+                             "{\"CBM_NEO4J_CACHE_DIR\":\"/tmp/no\"}",
                              "{\"CBM_WORKERS\":4}",
                              "{\"CBM_WORKERS\":\"4\",\"CBM_WORKERS\":\"8\"}",
                              "{\"CBM_SEMANTIC_THRESHOLD\":\"NaN\"}",
@@ -136,7 +136,7 @@ TEST(runtime_settings_strict_allowlist_and_types) {
     ASSERT_NOT_NULL(snapshot);
     ASSERT_NULL(item(snapshot, "CBM_TEST_CRASH_ON"));
     ASSERT_NULL(item(snapshot, "CBM_WALK_DEFS_MAX"));
-    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(item(snapshot, "CBM_CACHE_DIR"), "editable")));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(item(snapshot, "CBM_NEO4J_CACHE_DIR"), "editable")));
     yyjson_doc_free(snapshot);
     fixture_close(&fixture);
     PASS();

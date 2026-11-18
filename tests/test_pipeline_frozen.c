@@ -823,7 +823,7 @@ TEST(pipeline_frozen_preserves_artifacts_and_destination_namespace) {
     cbm_pipeline_frozen_t *owner = NULL;
     bool setup = pf_open(&f), control = setup && pf_real_control(&f);
     char artifact[1024], graph[1024], metadata[1024], attributes[1024];
-    bool paths = control && pf_path(artifact, sizeof(artifact), f.source, ".codebase-memory") &&
+    bool paths = control && pf_path(artifact, sizeof(artifact), f.source, ".codebase-memory-neo4j") &&
                  th_mkdir_p(artifact) == 0 &&
                  pf_path(graph, sizeof(graph), artifact, "graph.db.zst") &&
                  pf_path(metadata, sizeof(metadata), artifact, "meta.json") &&

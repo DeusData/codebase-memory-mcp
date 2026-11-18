@@ -261,8 +261,8 @@ void cbm_store_backend_usage(const cbm_store_t *s, cbm_store_backend_usage_t *ou
     if (!s || !s->remote_ops) {
         return;
     }
-    out->remote_queries = store_remote_queries(s) - s->remote_queries_base +
-                          s->remote_queries_extra;
+    out->remote_queries =
+        store_remote_queries(s) - s->remote_queries_base + s->remote_queries_extra;
     out->local_reads = s->local_graph_reads;
     snprintf(out->local_what, sizeof(out->local_what), "%s", s->local_graph_what);
 }
@@ -3491,8 +3491,8 @@ int cbm_store_prefetch_edges(cbm_store_t *s, const int64_t *ids, int n, bool by_
     if (s && s->remote_ops && s->remote_ops->prefetch_edges && ids && n > 0) {
         /* A failed prefetch only means the reads go one by one; the error
          * stays readable through cbm_store_error. */
-        (void)remote_status(s, s->remote_ops->prefetch_edges(s->remote_ctx, ids, n, by_target,
-                                                             types, type_count));
+        (void)remote_status(
+            s, s->remote_ops->prefetch_edges(s->remote_ctx, ids, n, by_target, types, type_count));
     }
     return CBM_STORE_OK;
 }
@@ -3551,7 +3551,8 @@ int cbm_store_find_nodes_by_ids(cbm_store_t *s, const int64_t *ids, int n, cbm_n
         return CBM_STORE_OK;
     }
     if (s->remote_ops && s->remote_ops->find_nodes_by_ids) {
-        return remote_status(s, s->remote_ops->find_nodes_by_ids(s->remote_ctx, ids, n, out, count));
+        return remote_status(s,
+                             s->remote_ops->find_nodes_by_ids(s->remote_ctx, ids, n, out, count));
     }
     cbm_node_t *arr = malloc((size_t)n * sizeof(cbm_node_t));
     if (!arr) {
@@ -3836,8 +3837,7 @@ static int node_scan_remote_fill(cbm_store_node_scan_t *scan) {
     return CBM_STORE_OK;
 }
 
-static int node_scan_page_remote(cbm_store_node_scan_t *scan, cbm_node_t *out, int max,
-                                 int *got) {
+static int node_scan_page_remote(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *got) {
     *got = 0;
     if (scan->rbuf_next >= scan->rbuf_count) {
         if (scan->remote_done) {
@@ -3978,7 +3978,7 @@ void cbm_store_node_scan_close(cbm_store_node_scan_t *scan) {
     }
     sqlite3_value_free(scan->last_file);
     free(scan->after_file);
-    cbm_store_free_nodes(scan->rbuf, scan->rbuf_count); /* handed-out rows are zeroed */
+    cbm_store_free_nodes(scan->rbuf, scan->rbuf_count);   /* handed-out rows are zeroed */
     cbm_store_free_nodes(scan->eager, scan->eager_count); /* rows not handed out */
     cbm_free(CBM_MEM_CLASS_STORE, scan->project);
     cbm_free(CBM_MEM_CLASS_STORE, scan->label);
@@ -6202,7 +6202,8 @@ static int store_remote_qn_candidates(cbm_store_t *s, cbm_remote_node_query_t ki
                                       const void *keep_arg, cbm_node_t **out, int *count) {
     cbm_node_t *cand = NULL;
     int n = 0;
-    int rc = remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, kind, project, text, &cand, &n));
+    int rc =
+        remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, kind, project, text, &cand, &n));
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -6601,10 +6602,9 @@ int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, ch
     *callee_count = 0;
 
     if (s->remote_ops) {
-        return remote_status(s, s->remote_ops->neighbor_names(s->remote_ctx, node_id, limit,
-                                                              out_callers, caller_count,
-                                                              out_callees, callee_count)) ==
-                       CBM_STORE_OK
+        return remote_status(s, s->remote_ops->neighbor_names(
+                                    s->remote_ctx, node_id, limit, out_callers, caller_count,
+                                    out_callees, callee_count)) == CBM_STORE_OK
                    ? 0
                    : CBM_STORE_ERR;
     }
@@ -7986,10 +7986,10 @@ static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params
         for (int i = 0; i < n; i++) {
             const cbm_node_t *node = &rows[i].node;
             bool keep =
-                (!name_re_ok || cbm_regexec(&name_re, node->name ? node->name : "", 0, NULL, 0) == 0) &&
-                (!qn_re_ok ||
-                 cbm_regexec(&qn_re, node->qualified_name ? node->qualified_name : "", 0, NULL, 0) ==
-                     0) &&
+                (!name_re_ok ||
+                 cbm_regexec(&name_re, node->name ? node->name : "", 0, NULL, 0) == 0) &&
+                (!qn_re_ok || cbm_regexec(&qn_re, node->qualified_name ? node->qualified_name : "",
+                                          0, NULL, 0) == 0) &&
                 (!file_like ||
                  sqlite3_strlike(file_like, node->file_path ? node->file_path : "", 0) == 0);
             if (keep && matched >= offset && kept < limit) {

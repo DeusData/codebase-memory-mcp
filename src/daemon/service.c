@@ -147,7 +147,7 @@ bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]) {
     }
     /* This product-domain string is intentionally the only key input. Account
      * isolation comes from the authenticated IPC runtime, not spoofable text. */
-    static const unsigned char domain[] = "codebase-memory-mcp:coordination-daemon";
+    static const unsigned char domain[] = "codebase-memory-mcp-neo4j:coordination-daemon";
     uint64_t hash = 14695981039346656037ULL;
     for (size_t i = 0; i < sizeof(domain) - 1; i++) {
         hash ^= domain[i];
@@ -224,7 +224,7 @@ bool cbm_daemon_conflict_format(const cbm_daemon_conflict_t *conflict, char *out
                      "CBM could not start because the active account daemon uses a "
                      "different cache directory (active cache %s; requested cache %s). "
                      "Close all CBM sessions and commands, then retry with one "
-                     "consistent CBM_CACHE_DIR.",
+                     "consistent CBM_NEO4J_CACHE_DIR.",
                      conflict->active_cache_fingerprint, conflict->requested_cache_fingerprint);
     } else {
         written = snprintf(out, out_size,

@@ -1,4 +1,4 @@
-// codebase-memory-mcp — Go installer wrapper.
+// codebase-memory-mcp-neo4j — Go installer wrapper.
 //
 // On first run, downloads the pre-built binary for the current platform from
 // GitHub Releases, caches it, and replaces the current process with it.
@@ -6,10 +6,10 @@
 //
 // Install:
 //
-//	go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest
+//	go install github.com/haiderRizvii/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp-neo4j@latest
 //
 // For testing, CBM_DOWNLOAD_URL overrides the download base URL (default
-// https://github.com/DeusData/codebase-memory-mcp/releases/download/v<version>):
+// https://github.com/haiderRizvii/codebase-memory-mcp/releases/download/v<version>):
 // the archive and checksums.txt are fetched from <CBM_DOWNLOAD_URL>/<file>. It
 // must be https://, or plain http:// to exactly localhost, 127.0.0.1, or [::1]
 // (optional port; no proxy, no redirects).
@@ -43,9 +43,9 @@ import (
 )
 
 const (
-	repo              = "DeusData/codebase-memory-mcp"
+	repo              = "haiderRizvii/codebase-memory-mcp"
 	version           = "0.12.1"
-	windowsBinaryName = "codebase-memory-mcp.exe"
+	windowsBinaryName = "codebase-memory-mcp-neo4j.exe"
 
 	maxRedirects          = 5
 	requestTimeout        = 2 * time.Minute
@@ -54,7 +54,7 @@ const (
 	candidateTimeout      = 15 * time.Second
 	maxArchiveMembers     = 64
 
-	runtimeSetLockName               = ".codebase-memory-mcp-runtime.lock"
+	runtimeSetLockName               = ".codebase-memory-mcp-neo4j-runtime.lock"
 	runtimeSetLockWait               = 45 * time.Second
 	runtimeSetOwnerlessStale         = 30 * time.Second
 	runtimeSetLockLease              = 5 * time.Minute
@@ -112,13 +112,13 @@ func main() {
 	if mutation == "update" {
 		fmt.Fprintln(
 			os.Stderr,
-			"This Go wrapper is maintained by Go. Update it with \"go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest\".",
+			"This Go wrapper is maintained by Go. Update it with \"go install github.com/haiderRizvii/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp-neo4j@latest\".",
 		)
 		os.Exit(2)
 	}
 	executable, err := ensureBinary()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "codebase-memory-mcp: %v\n", err)
+		fmt.Fprintf(os.Stderr, "codebase-memory-mcp-neo4j: %v\n", err)
 		os.Exit(1)
 	}
 	args := nativeArgs(os.Args[1:])
@@ -135,7 +135,7 @@ func main() {
 				os.Exit(exitErr.ExitCode())
 			}
 		}
-		fmt.Fprintf(os.Stderr, "codebase-memory-mcp: %v\n", err)
+		fmt.Fprintf(os.Stderr, "codebase-memory-mcp-neo4j: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -167,7 +167,7 @@ func binaryNameForOS(targetOS string) string {
 	if targetOS == "windows" {
 		return windowsBinaryName
 	}
-	return "codebase-memory-mcp"
+	return "codebase-memory-mcp-neo4j"
 }
 
 func executionPathForOS(binary, targetOS string) string {
@@ -179,12 +179,12 @@ func printPortableMutationGuidance(args []string) {
 	if action != "uninstall" {
 		return
 	}
-	packageCommand := "Remove-Item (Get-Command codebase-memory-mcp).Source"
+	packageCommand := "Remove-Item (Get-Command codebase-memory-mcp-neo4j).Source"
 	fmt.Fprintf(
 		os.Stderr,
 		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed installation with coordinated self-update/uninstall.\n",
 		packageCommand,
-		"codebase-memory-mcp install --yes",
+		"codebase-memory-mcp-neo4j install --yes",
 	)
 }
 
@@ -214,12 +214,12 @@ func defaultManagedInstallDir() string {
 				base = filepath.Join(home, "AppData", "Local")
 			}
 		}
-		return filepath.Join(base, "Programs", "codebase-memory-mcp")
+		return filepath.Join(base, "Programs", "codebase-memory-mcp-neo4j")
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(home, ".local", "bin")
 	}
-	return filepath.Join(os.TempDir(), "codebase-memory-mcp-managed")
+	return filepath.Join(os.TempDir(), "codebase-memory-mcp-neo4j-managed")
 }
 
 func nativeArgs(args []string) []string {
@@ -290,26 +290,26 @@ func mutationSnapshotEnvironment() []string {
 }
 
 func cacheDir() string {
-	if d := os.Getenv("CBM_CACHE_DIR"); d != "" {
+	if d := os.Getenv("CBM_NEO4J_CACHE_DIR"); d != "" {
 		return d
 	}
 	switch runtime.GOOS {
 	case "windows":
 		if d := os.Getenv("LOCALAPPDATA"); d != "" {
-			return filepath.Join(d, "codebase-memory-mcp")
+			return filepath.Join(d, "codebase-memory-mcp-neo4j")
 		}
 	case "darwin":
 		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, "Library", "Caches", "codebase-memory-mcp")
+			return filepath.Join(home, "Library", "Caches", "codebase-memory-mcp-neo4j")
 		}
 	}
 	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
-		return filepath.Join(d, "codebase-memory-mcp")
+		return filepath.Join(d, "codebase-memory-mcp-neo4j")
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".cache", "codebase-memory-mcp")
+		return filepath.Join(home, ".cache", "codebase-memory-mcp-neo4j")
 	}
-	return filepath.Join(os.TempDir(), "codebase-memory-mcp")
+	return filepath.Join(os.TempDir(), "codebase-memory-mcp-neo4j")
 }
 
 func goos() string {
@@ -362,7 +362,7 @@ func download(dest string) error {
 		portable = "-portable"
 	}
 	archive := fmt.Sprintf(
-		"codebase-memory-mcp-%s-%s%s.%s",
+		"codebase-memory-mcp-neo4j-%s-%s%s.%s",
 		platform, arch, portable, ext,
 	)
 	base, loopback, err := downloadBase(os.Getenv("CBM_DOWNLOAD_URL"))
@@ -372,7 +372,7 @@ func download(dest string) error {
 	url := base + "/" + archive
 	checksumURL := base + "/checksums.txt"
 
-	fmt.Fprintf(os.Stderr, "codebase-memory-mcp: downloading v%s for %s/%s...\n", installVersion, platform, arch)
+	fmt.Fprintf(os.Stderr, "codebase-memory-mcp-neo4j: downloading v%s for %s/%s...\n", installVersion, platform, arch)
 
 	tmp, err := os.MkdirTemp("", "cbm-install-*")
 	if err != nil {
@@ -450,7 +450,7 @@ func download(dest string) error {
 // loopback authority, for local smoke tests.
 // installVersion is the release this wrapper installs: its own module version
 // when Go installed it as a tagged release (`go install
-// .../pkg/go/cmd/codebase-memory-mcp@v0.12.1`, or @latest, which resolves to
+// .../pkg/go/cmd/codebase-memory-mcp-neo4j@v0.12.1`, or @latest, which resolves to
 // the newest pkg/go/v* tag), else the version constant (a local build, or a
 // pseudo-version of an untagged commit).
 var installVersion = releaseVersionFrom(moduleVersion(), version)
@@ -2249,7 +2249,7 @@ func execBinaryWithRuntimeLockAndRunner(
 		if cleanupErr := runtimeMutationSnapshotCleanup(snapshotDirectory); cleanupErr != nil {
 			fmt.Fprintf(
 				os.Stderr,
-				"codebase-memory-mcp: warning: private mutation snapshot cleanup failed: %v\n",
+				"codebase-memory-mcp-neo4j: warning: private mutation snapshot cleanup failed: %v\n",
 				cleanupErr,
 			)
 		}

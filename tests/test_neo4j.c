@@ -19,6 +19,7 @@
 #include "mcp/mcp.h"
 #include "store/store.h"
 
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1845,6 +1846,550 @@ TEST(neo4j_http_dead_server_fails_fast) {
 #endif
 }
 
+/* ── Delta sync ─────────────────────────────────────────────────── */
+
+TEST(neo4j_sync_stats_summaries) {
+    cbm_neo4j_sync_stats_t st;
+    memset(&st, 0, sizeof(st));
+    char out[512];
+    st.mode = CBM_NEO4J_SYNC_DELTA;
+    st.nodes_added = 1;
+    st.nodes_changed = 4;
+    st.nodes_removed = 1;
+    st.edges_added = 2;
+    st.edges_changed = 2;
+    st.edges_removed = 2;
+    st.nodes_total = 10;
+    st.edges_total = 20;
+    ASSERT_EQ(cbm_neo4j_sync_stats_format(&st, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "delta: nodes +1 ~4 -1, edges +2 ~2 -2 (graph: 10 nodes, 20 edges)");
+    memset(&st, 0, sizeof(st));
+    st.mode = CBM_NEO4J_SYNC_FULL;
+    st.nodes_total = 3;
+    st.edges_total = 5;
+    snprintf(st.detail, sizeof(st.detail), "first sync");
+    ASSERT_EQ(cbm_neo4j_sync_stats_format(&st, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "full: 3 nodes, 5 edges (first sync)");
+    st.mode = CBM_NEO4J_SYNC_SKIPPED;
+    ASSERT_EQ(cbm_neo4j_sync_stats_format(&st, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "unchanged: Neo4j already holds this generation");
+
+    /* Removing the marker also drops the delta record. */
+    char *dir = th_mktempdir("cbm_n4_state");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    char state[600];
+    snprintf(db, sizeof(db), "%s/p.db", dir);
+    ASSERT_EQ(cbm_neo4j_state_path(db, state, sizeof(state)), 0);
+    ASSERT_NOT_NULL(strstr(state, "p.db.neo4j-state.db"));
+    ASSERT_EQ(th_write_file(state, "x"), 0);
+    ASSERT_EQ(cbm_neo4j_sidecar_remove(db), 0);
+    FILE *f = fopen(state, "rb");
+    ASSERT_NULL(f);
+    th_rmtree(dir);
+    PASS();
+}
+
+static int64_t dnode(cbm_store_t *s, const char *project, const char *label, const char *name,
+                     const char *props) {
+    char qn[128];
+    snprintf(qn, sizeof(qn), "%s.%s", project, name);
+    cbm_node_t n = {.project = project,
+                    .label = label,
+                    .name = name,
+                    .qualified_name = qn,
+                    .file_path = "d.c",
+                    .start_line = 1,
+                    .end_line = 9,
+                    .properties_json = props};
+    return cbm_store_upsert_node(s, &n);
+}
+
+/* Helpers return 0 on success, 1 on failure (like a TEST body). */
+static int dedge(cbm_store_t *s, const char *project, int64_t a, int64_t b, const char *type,
+                 const char *props) {
+    cbm_edge_t e = {
+        .project = project, .source_id = a, .target_id = b, .type = type, .properties_json = props};
+    ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    return 0;
+}
+
+static int dsql(cbm_store_t *s, const char *sql) {
+    char *msg = NULL;
+    int rc = sqlite3_exec(cbm_store_get_db(s), sql, NULL, NULL, &msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "dsql(%s): %s\n", sql, msg ? msg : "?");
+    }
+    sqlite3_free(msg);
+    ASSERT_EQ(rc, SQLITE_OK);
+    return 0;
+}
+
+/* One Neo4j statement's rows serialized as JSON (malloc'd), or NULL. */
+static char *dquery(cbm_neo4j_t *c, const char *cypher, const char *db) {
+    cbm_neo4j_batch_t b;
+    if (cbm_neo4j_batch_init(&b) != 0) {
+        return NULL;
+    }
+    yyjson_mut_val *p = cbm_neo4j_batch_add(&b, cypher);
+    yyjson_mut_obj_add_strcpy(b.doc, p, "db", db);
+    cbm_neo4j_result_t r;
+    int rc = cbm_neo4j_batch_run(c, &b, &r);
+    cbm_neo4j_batch_free(&b);
+    if (rc != 0) {
+        fprintf(stderr, "dquery: %s\n", cbm_neo4j_error(c));
+        return NULL;
+    }
+    size_t len = 0;
+    char *out = yyjson_val_write(cbm_neo4j_result_data(&r, 0), 0, &len);
+    cbm_neo4j_result_free(&r);
+    return out;
+}
+
+/* First column of the first row as an integer (-1 when absent). */
+static int64_t dint(cbm_neo4j_t *c, const char *cypher, const char *db) {
+    cbm_neo4j_batch_t b;
+    if (cbm_neo4j_batch_init(&b) != 0) {
+        return -1;
+    }
+    yyjson_mut_val *p = cbm_neo4j_batch_add(&b, cypher);
+    yyjson_mut_obj_add_strcpy(b.doc, p, "db", db);
+    cbm_neo4j_result_t r;
+    int rc = cbm_neo4j_batch_run(c, &b, &r);
+    cbm_neo4j_batch_free(&b);
+    if (rc != 0) {
+        return -1;
+    }
+    int64_t v = cbm_neo4j_val_int(
+        cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0)), 0), -1);
+    cbm_neo4j_result_free(&r);
+    return v;
+}
+
+/* The published graph of db, canonical: every node (sorted labels, sorted
+ * properties) and edge (type, endpoints, sorted properties) by id. `gen` is
+ * left out: a full upload moves the graph to a new number, a delta does not. */
+static char *ddump(cbm_neo4j_t *c, const char *db) {
+    char *nodes = dquery(c,
+                         "MATCH (p:CbmProject {name: $db}) "
+                         "MATCH (n:CbmNode {db: $db, gen: p.gen}) "
+                         "CALL { WITH n UNWIND labels(n) AS l WITH l ORDER BY l "
+                         "RETURN collect(l) AS ls } "
+                         "CALL { WITH n UNWIND [k IN keys(n) WHERE k <> 'gen'] AS k "
+                         "WITH n, k ORDER BY k RETURN collect([k, n[k]]) AS kv } "
+                         "RETURN n.id, ls, kv ORDER BY n.id",
+                         db);
+    char *edges = dquery(c,
+                         "MATCH (p:CbmProject {name: $db}) "
+                         "MATCH (a:CbmNode {db: $db, gen: p.gen})-[e]->"
+                         "(b:CbmNode {db: $db, gen: p.gen}) "
+                         "CALL { WITH e UNWIND keys(e) AS k WITH e, k ORDER BY k "
+                         "RETURN collect([k, e[k]]) AS kv } "
+                         "RETURN e.id, type(e), a.id, b.id, kv ORDER BY e.id",
+                         db);
+    char *proj = dquery(c,
+                        "MATCH (p:CbmProject {name: $db}) "
+                        "RETURN p.generation, p.node_count, p.edge_count, p.sync_format",
+                        db);
+    char *out = NULL;
+    if (nodes && edges && proj) {
+        size_t n = strlen(nodes) + strlen(edges) + strlen(proj) + 16;
+        out = malloc(n);
+        if (out) {
+            snprintf(out, n, "%s\n%s\n%s", nodes, edges, proj);
+        }
+    }
+    free(nodes);
+    free(edges);
+    free(proj);
+    return out;
+}
+
+/* elementId of the node with SQLite id `id` in db's published graph. */
+static char *delement(cbm_neo4j_t *c, const char *db, int64_t id) {
+    char cypher[256];
+    snprintf(cypher, sizeof(cypher),
+             "MATCH (p:CbmProject {name: $db}) MATCH (n:CbmNode {db: $db, gen: p.gen, id: %lld}) "
+             "RETURN elementId(n)",
+             (long long)id);
+    return dquery(c, cypher, db);
+}
+
+static int64_t dcount_local(const char *db, const char *project) {
+    cbm_store_t *s = cbm_store_open_path_query(db);
+    int64_t n = s ? cbm_store_count_nodes(s, project) : -1;
+    cbm_store_close(s);
+    return n;
+}
+
+/* Node count served from Neo4j through a normal attach (-1 when refused). */
+static int64_t dcount_remote(const char *db, const char *project) {
+    char err[512];
+    cbm_store_t *s = cbm_store_open_path_query(db);
+    if (!s) {
+        return -1;
+    }
+    int64_t n = -1;
+    if (cbm_neo4j_store_attach(s, db, project, err, sizeof(err)) == CBM_NEO4J_ATTACHED) {
+        n = cbm_store_count_nodes(s, project);
+    } else {
+        fprintf(stderr, "attach %s: %s\n", project, err);
+    }
+    cbm_store_close(s);
+    return n;
+}
+
+/* A re-index sends exactly the changed rows, in place: the graph it leaves is
+ * identical to a fresh full upload of the same SQLite generation, and nodes
+ * it did not touch keep their Neo4j identity (they were not re-written). */
+TEST(neo4j_live_delta_matches_full) {
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
+    ASSERT_TRUE(uri && uri[0]);
+    clear_neo4j_env();
+    cbm_unsetenv("CBM_NEO4J_DELTA_MAX_ROWS");
+    const char *P = "dlt";
+    char *dir = th_mktempdir("cbm_n4_delta");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/dlt.db", dir);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, P, dir);
+    int64_t f1 = dnode(s, P, "Function", "f1", "{\"complexity\":1,\"tags\":[\"x\"]}");
+    int64_t f2 = dnode(s, P, "Function", "f2", "{\"complexity\":2}");
+    int64_t f3 = dnode(s, P, "Function", "f3", "{}");
+    int64_t c1 = dnode(s, P, "Class", "c1", "{\"importance\":0.5}");
+    int64_t w1 = dnode(s, P, "Weird Label", "w1", "{}");
+    int64_t m1 = dnode(s, P, "Method", "m1", "{\"nested\":{\"a\":1}}");
+    ASSERT_EQ(dedge(s, P, f1, f2, "CALLS", "{}"), 0);
+    ASSERT_EQ(dedge(s, P, f2, f3, "CALLS", "{\"line\":3}"), 0);
+    ASSERT_EQ(dedge(s, P, f3, c1, "USAGE", "{}"), 0);
+    ASSERT_EQ(dedge(s, P, c1, w1, "HTTP-CALLS", "{\"url_path\":\"/a\"}"), 0);
+    ASSERT_EQ(dedge(s, P, w1, m1, "CALLS", "{}"), 0);
+    ASSERT_EQ(dedge(s, P, m1, f1, "USAGE", "{}"), 0);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+
+    cbm_neo4j_config_t cfg;
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_config_resolve(uri, NULL, pw, NULL, &cfg, err, sizeof(err)), 0);
+    cbm_neo4j_t *conn = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(conn);
+    (void)cbm_neo4j_drop_project(conn, P, err, sizeof(err));
+
+    /* First sync: nothing recorded yet, so everything is uploaded. */
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, &cfg, false, err, sizeof(err)), 0);
+    cbm_neo4j_sync_stats_t st;
+    cbm_neo4j_last_sync_stats(&st);
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_FULL);
+    ASSERT_NOT_NULL(strstr(st.detail, "first sync"));
+    ASSERT_EQ(st.nodes_total, 6);
+    ASSERT_EQ(st.edges_total, 6);
+    char *eid_f1 = delement(conn, P, f1);
+    char *eid_f2 = delement(conn, P, f2);
+    ASSERT_NOT_NULL(eid_f1);
+    ASSERT_NOT_NULL(eid_f2);
+
+    /* Every kind of change a re-index makes. */
+    int64_t n1 = dnode(s, P, "Function", "n1", "{}"); /* node added */
+    ASSERT_EQ(dedge(s, P, n1, f1, "CALLS", "{}"), 0); /* edge added */
+    /* node removed, and its 2 edges with it */
+    ASSERT_EQ(dsql(s, "DELETE FROM nodes WHERE name = 'f3'"), 0);
+    ASSERT_EQ(dsql(s, "UPDATE nodes SET properties = '{\"complexity\":7}' WHERE name = 'f2'"), 0);
+    ASSERT_EQ(dsql(s, "UPDATE nodes SET label = 'Interface' WHERE name = 'c1'"), 0);
+    ASSERT_EQ(dsql(s, "UPDATE nodes SET label = 'Function' WHERE name = 'w1'"), 0);
+    ASSERT_EQ(dsql(s, "UPDATE nodes SET label = 'Odd Label' WHERE name = 'm1'"), 0);
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "UPDATE edges SET properties = '{\"weight\":2}' WHERE source_id = %lld",
+             (long long)w1);
+    ASSERT_EQ(dsql(s, sql), 0); /* edge properties changed */
+    snprintf(sql, sizeof(sql), "UPDATE edges SET target_id = %lld WHERE source_id = %lld",
+             (long long)f2, (long long)m1);
+    ASSERT_EQ(dsql(s, sql), 0);                            /* edge moved to another node */
+    ASSERT_EQ(dedge(s, P, f1, w1, "HTTP-CALLS", "{}"), 0); /* odd type added */
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, NULL, false, err, sizeof(err)), 0);
+    cbm_neo4j_last_sync_stats(&st);
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_DELTA);
+    ASSERT_EQ(st.nodes_added, 1);
+    ASSERT_EQ(st.nodes_changed, 4);
+    ASSERT_EQ(st.nodes_removed, 1);
+    ASSERT_EQ(st.edges_added, 2);
+    ASSERT_EQ(st.edges_changed, 2);
+    ASSERT_EQ(st.edges_removed, 2);
+    ASSERT_EQ(st.nodes_total, 6);
+    ASSERT_EQ(st.edges_total, 6);
+    char last[512];
+    ASSERT_EQ(cbm_neo4j_sidecar_field(db, "last_sync", last, sizeof(last)), 0);
+    ASSERT_NOT_NULL(strstr(last, "delta: nodes +1 ~4 -1, edges +2 ~2 -2"));
+
+    /* Untouched and changed-in-place nodes kept their Neo4j identity. */
+    char *eid_f1_after = delement(conn, P, f1);
+    char *eid_f2_after = delement(conn, P, f2);
+    ASSERT_NOT_NULL(eid_f1_after);
+    ASSERT_NOT_NULL(eid_f2_after);
+    ASSERT_STR_EQ(eid_f1_after, eid_f1);
+    ASSERT_STR_EQ(eid_f2_after, eid_f2);
+    free(eid_f1_after);
+    free(eid_f2_after);
+    ASSERT_EQ(dcount_remote(db, P), dcount_local(db, P));
+
+    /* The same generation uploaded in full gives the identical graph. */
+    char *after_delta = ddump(conn, P);
+    ASSERT_NOT_NULL(after_delta);
+    cbm_setenv("CBM_NEO4J_DELTA_MAX_ROWS", "0", 1);
+    char done[128];
+    ASSERT_EQ(cbm_neo4j_sync_db(conn, db, P, done, sizeof(done), err, sizeof(err)), 0);
+    cbm_neo4j_last_sync_stats(&st);
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_FULL);
+    ASSERT_NOT_NULL(strstr(st.detail, "disabled"));
+    cbm_unsetenv("CBM_NEO4J_DELTA_MAX_ROWS");
+    char *after_full = ddump(conn, P);
+    ASSERT_NOT_NULL(after_full);
+    ASSERT_STR_EQ(after_delta, after_full);
+    free(after_delta);
+    free(after_full);
+
+    /* The full upload rewrote the record: the next re-index is a delta again,
+     * and an unchanged one sends nothing. */
+    ASSERT_EQ(dsql(s, "UPDATE nodes SET properties = '{\"complexity\":8}' WHERE name = 'f2'"), 0);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, NULL, false, err, sizeof(err)), 0);
+    cbm_neo4j_last_sync_stats(&st);
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_DELTA);
+    ASSERT_EQ(st.nodes_changed, 1);
+    ASSERT_EQ(st.nodes_added + st.nodes_removed + st.edges_added + st.edges_changed +
+                  st.edges_removed,
+              0);
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, NULL, false, err, sizeof(err)), 0);
+    cbm_neo4j_last_sync_stats(&st);
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_SKIPPED);
+    ASSERT_EQ(dcount_remote(db, P), dcount_local(db, P));
+
+    cbm_store_close(s);
+    free(eid_f1);
+    free(eid_f2);
+    ASSERT_EQ(cbm_neo4j_drop_project(conn, P, err, sizeof(err)), 0);
+    cbm_neo4j_close(conn);
+    cbm_neo4j_config_wipe(&cfg);
+    th_rmtree(dir);
+    PASS();
+}
+
+static int dbump(cbm_store_t *s, const char *what) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "UPDATE nodes SET properties = '{\"v\":\"%s\"}' WHERE name = 'a'",
+             what);
+    ASSERT_EQ(dsql(s, sql), 0);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    return 0;
+}
+
+static int dexpect_full(const char *db, const char *P, const char *why) {
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, NULL, false, err, sizeof(err)), 0);
+    cbm_neo4j_sync_stats_t st;
+    cbm_neo4j_last_sync_stats(&st);
+    if (st.mode != CBM_NEO4J_SYNC_FULL || !strstr(st.detail, why)) {
+        fprintf(stderr, "expected a full sync because '%s', got mode %d (%s)\n", why, st.mode,
+                st.detail);
+    }
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_FULL);
+    ASSERT_NOT_NULL(strstr(st.detail, why));
+    ASSERT_EQ(dcount_remote(db, P), dcount_local(db, P));
+    return 0;
+}
+
+static int dexpect_delta(const char *db, const char *P) {
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, NULL, false, err, sizeof(err)), 0);
+    cbm_neo4j_sync_stats_t st;
+    cbm_neo4j_last_sync_stats(&st);
+    if (st.mode != CBM_NEO4J_SYNC_DELTA) {
+        fprintf(stderr, "expected a delta sync, got mode %d (%s)\n", st.mode, st.detail);
+    }
+    ASSERT_EQ(st.mode, CBM_NEO4J_SYNC_DELTA);
+    ASSERT_EQ(dcount_remote(db, P), dcount_local(db, P));
+    return 0;
+}
+
+static int dbuild(const char *db, const char *P, const char *dir) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, P, dir);
+    int64_t a = dnode(s, P, "Function", "a", "{}");
+    int64_t b = dnode(s, P, "Function", "b", "{}");
+    int64_t c = dnode(s, P, "Class", "c", "{}");
+    ASSERT_EQ(dedge(s, P, a, b, "CALLS", "{}"), 0);
+    ASSERT_EQ(dedge(s, P, b, c, "USAGE", "{}"), 0);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    cbm_store_close(s);
+    return 0;
+}
+
+/* The same graph as dbuild plus node d, written in another order, so every id
+ * differs from dbuild's. */
+static int dbuild_renumbered(const char *db, const char *P, const char *dir) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, P, dir);
+    int64_t d = dnode(s, P, "Method", "d", "{}");
+    int64_t c = dnode(s, P, "Class", "c", "{}");
+    int64_t b = dnode(s, P, "Function", "b", "{}");
+    int64_t a = dnode(s, P, "Function", "a", "{\"v\":\"r\"}");
+    ASSERT_EQ(dedge(s, P, b, c, "USAGE", "{}"), 0);
+    ASSERT_EQ(dedge(s, P, d, a, "CALLS", "{}"), 0);
+    ASSERT_EQ(dedge(s, P, a, b, "CALLS", "{}"), 0);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    cbm_store_close(s);
+    return 0;
+}
+
+/* Delete a project database file and its WAL sidecars (the delta record and
+ * marker stay, as when the indexer rewrites the database). */
+static int dremove_db(const char *db) {
+    char side[600];
+    snprintf(side, sizeof(side), "%s-wal", db);
+    (void)th_unlink_force(side);
+    snprintf(side, sizeof(side), "%s-shm", db);
+    (void)th_unlink_force(side);
+    ASSERT_EQ(th_unlink_force(db), 0);
+    return 0;
+}
+
+typedef struct {
+    cbm_neo4j_t *conn;
+    const char *project;
+    int calls;
+} dhook_ctx_t;
+
+/* A concurrent writer: moves the published counts under the delta's feet. */
+static void dhook_move_graph(void *ctx) {
+    dhook_ctx_t *h = ctx;
+    h->calls++;
+    char *r = dquery(h->conn, "MATCH (p:CbmProject {name: $db}) SET p.edge_count = -5 RETURN 1",
+                     h->project);
+    free(r);
+}
+
+/* Every reason the record cannot be trusted ends in a correct full upload,
+ * never in a delta applied to the wrong graph. */
+TEST(neo4j_live_delta_falls_back_safely) {
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
+    ASSERT_TRUE(uri && uri[0]);
+    clear_neo4j_env();
+    cbm_unsetenv("CBM_NEO4J_DELTA_MAX_ROWS");
+    const char *P = "dfb";
+    char *dir = th_mktempdir("cbm_n4_dfb");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    char state[600];
+    snprintf(db, sizeof(db), "%s/dfb.db", dir);
+    ASSERT_EQ(cbm_neo4j_state_path(db, state, sizeof(state)), 0);
+    ASSERT_EQ(dbuild(db, P, dir), 0);
+    cbm_neo4j_config_t cfg;
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_config_resolve(uri, NULL, pw, NULL, &cfg, err, sizeof(err)), 0);
+    cbm_neo4j_t *conn = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(conn);
+    (void)cbm_neo4j_drop_project(conn, P, err, sizeof(err));
+    ASSERT_EQ(cbm_neo4j_after_publish(db, P, &cfg, false, err, sizeof(err)), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_EQ(dbump(s, "1"), 0);
+    ASSERT_EQ(dexpect_delta(db, P), 0);
+
+    /* Someone changed the graph in Neo4j behind the record's back. */
+    free(dquery(conn, "MATCH (p:CbmProject {name: $db}) SET p.node_count = 999 RETURN 1", P));
+    ASSERT_EQ(dbump(s, "2"), 0);
+    ASSERT_EQ(dexpect_full(db, P, "differs"), 0);
+    ASSERT_EQ(dbump(s, "3"), 0);
+    ASSERT_EQ(dexpect_delta(db, P), 0);
+
+    /* The graph was deleted from Neo4j. */
+    ASSERT_EQ(cbm_neo4j_drop_project(conn, P, err, sizeof(err)), 0);
+    ASSERT_EQ(dbump(s, "4"), 0);
+    ASSERT_EQ(dexpect_full(db, P, "differs"), 0);
+
+    /* The change is larger than one transaction may carry. */
+    cbm_setenv("CBM_NEO4J_DELTA_MAX_ROWS", "1", 1);
+    ASSERT_EQ(dsql(s, "UPDATE nodes SET properties = '{\"v\":\"5\"}'"), 0);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    ASSERT_EQ(dexpect_full(db, P, "too large"), 0);
+    cbm_unsetenv("CBM_NEO4J_DELTA_MAX_ROWS");
+
+    /* The record was deleted, or is not a record at all. */
+    ASSERT_EQ(th_unlink_force(state), 0);
+    ASSERT_EQ(dbump(s, "6"), 0);
+    ASSERT_EQ(dexpect_full(db, P, "first sync"), 0);
+    ASSERT_EQ(th_write_file(state, "not a database"), 0);
+    ASSERT_EQ(dbump(s, "7"), 0);
+    ASSERT_EQ(dexpect_full(db, P, "unreadable"), 0);
+    ASSERT_EQ(dbump(s, "8"), 0);
+    ASSERT_EQ(dexpect_delta(db, P), 0);
+
+    /* A concurrent writer moves the graph between the delta's check and its
+     * transaction: the in-transaction guard refuses it, nothing of it is
+     * applied, and a full upload repairs the graph. */
+    dhook_ctx_t h = {.conn = conn, .project = P, .calls = 0};
+    cbm_neo4j_test_set_delta_hook(dhook_move_graph, &h);
+    ASSERT_EQ(dbump(s, "9"), 0);
+    ASSERT_EQ(dexpect_full(db, P, "rejected"), 0);
+    cbm_neo4j_test_set_delta_hook(NULL, NULL);
+    ASSERT_EQ(h.calls, 1);
+    ASSERT_EQ(dint(conn, "MATCH (p:CbmProject {name: $db}) RETURN p.edge_count", P), 2);
+
+    /* A re-index writes a brand-new database file (new db_uid) in which the
+     * unchanged rows keep their ids: still a delta, sending only the rows that
+     * differ (a, b and c lose the "v" property the steps above gave them; the
+     * edges are unchanged). */
+    cbm_store_close(s);
+    ASSERT_EQ(dremove_db(db), 0);
+    ASSERT_EQ(dbuild(db, P, dir), 0);
+    ASSERT_EQ(dexpect_delta(db, P), 0);
+    cbm_neo4j_sync_stats_t st;
+    cbm_neo4j_last_sync_stats(&st);
+    ASSERT_EQ(st.nodes_changed, 3);
+    ASSERT_EQ(st.nodes_added + st.nodes_removed + st.edges_added + st.edges_changed +
+                  st.edges_removed,
+              0);
+    s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(dbump(s, "10"), 0);
+    ASSERT_EQ(dexpect_delta(db, P), 0);
+
+    /* A rebuild that renumbers every id (rows written in another order, one
+     * more node): the delta still ends exactly where a full upload does. */
+    cbm_store_close(s);
+    ASSERT_EQ(dremove_db(db), 0);
+    ASSERT_EQ(dbuild_renumbered(db, P, dir), 0);
+    ASSERT_EQ(dexpect_delta(db, P), 0);
+    char *after_delta = ddump(conn, P);
+    ASSERT_NOT_NULL(after_delta);
+    cbm_setenv("CBM_NEO4J_DELTA_MAX_ROWS", "0", 1);
+    char done[128];
+    ASSERT_EQ(cbm_neo4j_sync_db(conn, db, P, done, sizeof(done), err, sizeof(err)), 0);
+    cbm_unsetenv("CBM_NEO4J_DELTA_MAX_ROWS");
+    char *after_full = ddump(conn, P);
+    ASSERT_NOT_NULL(after_full);
+    ASSERT_STR_EQ(after_delta, after_full);
+    free(after_delta);
+    free(after_full);
+    s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+
+    cbm_store_close(s);
+    ASSERT_EQ(cbm_neo4j_drop_project(conn, P, err, sizeof(err)), 0);
+    cbm_neo4j_close(conn);
+    cbm_neo4j_config_wipe(&cfg);
+    th_rmtree(dir);
+    PASS();
+}
+
 SUITE(neo4j) {
     RUN_TEST(neo4j_url_defaults);
     RUN_TEST(neo4j_url_port_path_ipv6);
@@ -1870,8 +2415,11 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_served_by_is_named_in_replies);
     RUN_TEST(neo4j_scope_query_scopes_every_node_pattern);
     RUN_TEST(neo4j_http_dead_server_fails_fast);
+    RUN_TEST(neo4j_sync_stats_summaries);
     if (live_neo4j_configured()) {
         RUN_TEST(neo4j_live_sync_and_read);
+        RUN_TEST(neo4j_live_delta_matches_full);
+        RUN_TEST(neo4j_live_delta_falls_back_safely);
         RUN_TEST(neo4j_live_list_files_matches_local);
         RUN_TEST(neo4j_live_large_file_list_matches_local);
         RUN_TEST(neo4j_live_engine_reads_match_local);

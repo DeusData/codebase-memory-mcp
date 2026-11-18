@@ -7,7 +7,7 @@ requires = ["hatchling==1.28.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "codebase-memory-mcp"
+name = "codebase-memory-mcp-neo4j"
 version = "0.12.1"
 description = "Fast code intelligence for AI coding agents — installs a verified native runtime set"
 readme = "README.md"
@@ -28,12 +28,12 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/DeusData/codebase-memory-mcp"
-Repository = "https://github.com/DeusData/codebase-memory-mcp"
-Issues = "https://github.com/DeusData/codebase-memory-mcp/issues"
+Homepage = "https://github.com/haiderRizvii/codebase-memory-mcp"
+Repository = "https://github.com/haiderRizvii/codebase-memory-mcp"
+Issues = "https://github.com/haiderRizvii/codebase-memory-mcp/issues"
 
 [project.scripts]
-codebase-memory-mcp = "codebase_memory_mcp:main"
+codebase-memory-mcp-neo4j = "codebase_memory_mcp_neo4j:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/codebase_memory_mcp"]
+packages = ["src/codebase_memory_mcp_neo4j"]

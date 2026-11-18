@@ -19,16 +19,16 @@ static const direct_dialect_expectation_t direct_dialects[] = {
     {CBM_GRAPH_DIALECT_CODEX, "sandbox_mode = \"read-only\"", "read", "grep"},
     {CBM_GRAPH_DIALECT_GEMINI, "kind: local", "  - read_file\n", "  - grep_search\n"},
     {CBM_GRAPH_DIALECT_QWEN, "approvalMode: plan", "  - read_file\n", "  - grep_search\n"},
-    {CBM_GRAPH_DIALECT_COPILOT, "codebase-memory-mcp/check_index_coverage", "  - read\n",
+    {CBM_GRAPH_DIALECT_COPILOT, "codebase-memory-neo4j/check_index_coverage", "  - read\n",
      "source read/grep fallback"},
     {CBM_GRAPH_DIALECT_OPENCODE, "  \"*\": deny", "  read: allow", "  grep: allow"},
     {CBM_GRAPH_DIALECT_KILO, "mode: subagent", "  read: allow", "  grep: allow"},
     {CBM_GRAPH_DIALECT_KIRO, "\"includeMcpJson\": false", "\"read\"", "\"grep\""},
-    {CBM_GRAPH_DIALECT_JUNIE, "mcpServers: [\"codebase-memory-", "\"Read\"", "\"Grep\""},
-    {CBM_GRAPH_DIALECT_QODER, "mcp__codebase-memory-mcp__check_index_coverage",
-     "tools: Read,Grep,Glob,mcp__codebase-memory-mcp__", "Read,Grep"},
+    {CBM_GRAPH_DIALECT_JUNIE, "mcpServers: [\"codebase-memory-neo4j-", "\"Read\"", "\"Grep\""},
+    {CBM_GRAPH_DIALECT_QODER, "mcp__codebase-memory-neo4j__check_index_coverage",
+     "tools: Read,Grep,Glob,mcp__codebase-memory-neo4j__", "Read,Grep"},
     {CBM_GRAPH_DIALECT_CODEBUDDY, "permissionMode: plan", "tools: Read,Grep,Glob,", "Read,Grep"},
-    {CBM_GRAPH_DIALECT_FACTORY, "mcp__codebase-memory-mcp__check_index_coverage",
+    {CBM_GRAPH_DIALECT_FACTORY, "mcp__codebase-memory-neo4j__check_index_coverage",
      "tools: [\"Read\", \"LS\", \"Grep\", \"Glob\"", "source read/grep fallback"},
     {CBM_GRAPH_DIALECT_VIBE, "agent_type = \"subagent\"", "\"read_file\"", "\"grep_search\""},
     {CBM_GRAPH_DIALECT_OMP, "read-summarize: false", "  - read\n", "  - grep\n"},
@@ -58,9 +58,9 @@ static int profile_has_mutator(const char *profile) {
 }
 
 TEST(agent_profiles_stable_tier_identity) {
-    ASSERT_STR_EQ(cbm_graph_tier_slug(CBM_GRAPH_TIER_SCOUT), "codebase-memory-scout");
-    ASSERT_STR_EQ(cbm_graph_tier_slug(CBM_GRAPH_TIER_VERIFY), "codebase-memory");
-    ASSERT_STR_EQ(cbm_graph_tier_slug(CBM_GRAPH_TIER_AUDIT), "codebase-memory-auditor");
+    ASSERT_STR_EQ(cbm_graph_tier_slug(CBM_GRAPH_TIER_SCOUT), "codebase-memory-neo4j-scout");
+    ASSERT_STR_EQ(cbm_graph_tier_slug(CBM_GRAPH_TIER_VERIFY), "codebase-memory-neo4j");
+    ASSERT_STR_EQ(cbm_graph_tier_slug(CBM_GRAPH_TIER_AUDIT), "codebase-memory-neo4j-auditor");
     ASSERT_STR_EQ(cbm_graph_tier_display_name(CBM_GRAPH_TIER_SCOUT), "Codebase Memory Scout");
     ASSERT_STR_EQ(cbm_graph_tier_display_name(CBM_GRAPH_TIER_VERIFY), "Codebase Memory Verify");
     ASSERT_STR_EQ(cbm_graph_tier_display_name(CBM_GRAPH_TIER_AUDIT), "Codebase Memory Auditor");
@@ -90,7 +90,7 @@ TEST(agent_profiles_direct_dialects_are_coverage_aware_and_read_only) {
             if (!profile) {
                 FAIL("every documented direct dialect must render all three tiers");
             }
-            int valid = strstr(profile, "codebase-memory") != NULL &&
+            int valid = strstr(profile, "codebase-memory-neo4j") != NULL &&
                         strstr(profile, "check_index_coverage") != NULL &&
                         strstr(profile, expectation->syntax_fragment) != NULL &&
                         strstr(profile, expectation->read_fragment) != NULL &&
@@ -115,17 +115,17 @@ TEST(agent_profiles_tiers_encode_distinct_evidence_budgets) {
                                            CBM_GRAPH_ACCESS_DIRECT, NULL);
     int valid = scout && verify && audit && strstr(scout, "3-4 narrow graph calls") &&
                 strstr(scout, "positive, provisional") && strstr(scout, "all/none claims") &&
-                !strstr(scout, "mcp__codebase-memory-mcp__query_graph") &&
-                !strstr(scout, "mcp__codebase-memory-mcp__detect_changes") &&
+                !strstr(scout, "mcp__codebase-memory-neo4j__query_graph") &&
+                !strstr(scout, "mcp__codebase-memory-neo4j__detect_changes") &&
                 strstr(verify, "default tier") && strstr(verify, "task-directed evidence") &&
                 strstr(verify, "scope coverage before negative claims") &&
-                strstr(verify, "mcp__codebase-memory-mcp__query_graph") &&
-                strstr(verify, "mcp__codebase-memory-mcp__detect_changes") &&
+                strstr(verify, "mcp__codebase-memory-neo4j__query_graph") &&
+                strstr(verify, "mcp__codebase-memory-neo4j__detect_changes") &&
                 strstr(audit, "bounded scope") && strstr(audit, "current graph generation") &&
                 strstr(audit, "complete relevant pagination") && strstr(audit, "scope coverage") &&
                 strstr(audit, "source fallback") &&
-                strstr(audit, "mcp__codebase-memory-mcp__query_graph") &&
-                strstr(audit, "mcp__codebase-memory-mcp__detect_changes");
+                strstr(audit, "mcp__codebase-memory-neo4j__query_graph") &&
+                strstr(audit, "mcp__codebase-memory-neo4j__detect_changes");
     free(scout);
     free(verify);
     free(audit);
@@ -146,10 +146,10 @@ TEST(agent_profiles_handoff_requires_parent_evidence_without_child_mcp) {
                         strstr(profile, "coverage evidence") &&
                         strstr(profile, "must not call or claim access to MCP") &&
                         !strstr(profile, "mcpServers") &&
-                        !strstr(profile, "mcp__codebase-memory-mcp__") &&
-                        !strstr(profile, "mcp_codebase-memory-mcp_") &&
-                        !strstr(profile, "@codebase-memory-mcp/") &&
-                        !strstr(profile, "codebase-memory-mcp/");
+                        !strstr(profile, "mcp__codebase-memory-neo4j__") &&
+                        !strstr(profile, "mcp_codebase-memory-neo4j_") &&
+                        !strstr(profile, "@codebase-memory-mcp-neo4j/") &&
+                        !strstr(profile, "codebase-memory-mcp-neo4j/");
             free(profile);
             if (!valid) {
                 FAIL("handoff profiles must require parent coverage and expose no child MCP");
@@ -181,13 +181,13 @@ TEST(agent_profiles_server_level_dialects_hard_enforce_read_only_tools) {
     ASSERT_NOT_NULL(junie);
     ASSERT_NOT_NULL(qoder);
     ASSERT_NOT_NULL(factory);
-    ASSERT(strstr(junie_scout, "mcpServers: [\"codebase-memory-scout\"]") != NULL);
-    ASSERT(strstr(junie, "mcpServers: [\"codebase-memory-analysis\"]") != NULL);
+    ASSERT(strstr(junie_scout, "mcpServers: [\"codebase-memory-neo4j-scout\"]") != NULL);
+    ASSERT(strstr(junie, "mcpServers: [\"codebase-memory-neo4j-analysis\"]") != NULL);
     ASSERT(strstr(junie, "hard-enforces the analysis tool profile") != NULL);
-    ASSERT(strstr(qoder, "mcp__codebase-memory-mcp__check_index_coverage") != NULL);
-    ASSERT(strstr(factory, "mcp__codebase-memory-mcp__check_index_coverage") != NULL);
+    ASSERT(strstr(qoder, "mcp__codebase-memory-neo4j__check_index_coverage") != NULL);
+    ASSERT(strstr(factory, "mcp__codebase-memory-neo4j__check_index_coverage") != NULL);
     ASSERT(strstr(qoder, "mcpServers:") != NULL);
-    ASSERT(strstr(qoder, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(qoder, "codebase-memory-neo4j") != NULL);
     ASSERT(strstr(factory, "mcpServers") == NULL);
     ASSERT(strstr(junie, "instruction-enforced") == NULL);
     ASSERT(strstr(qoder, "instruction-enforced") == NULL);
@@ -210,7 +210,7 @@ TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path) {
     yyjson_doc *doc = yyjson_read(profile, strlen(profile), 0);
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     yyjson_val *servers = root ? yyjson_obj_get(root, "mcpServers") : NULL;
-    yyjson_val *server = servers ? yyjson_obj_get(servers, "codebase-memory-mcp") : NULL;
+    yyjson_val *server = servers ? yyjson_obj_get(servers, "codebase-memory-neo4j") : NULL;
     yyjson_val *command = server ? yyjson_obj_get(server, "command") : NULL;
     yyjson_val *args = server ? yyjson_obj_get(server, "args") : NULL;
     yyjson_val *profile_flag = args && yyjson_is_arr(args) ? yyjson_arr_get(args, 0U) : NULL;
@@ -223,7 +223,7 @@ TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path) {
                 yyjson_is_str(profile_name) &&
                 strcmp(yyjson_get_str(profile_name), "analysis") == 0 && tools &&
                 yyjson_is_arr(tools) &&
-                strstr(profile, "@codebase-memory-mcp/check_index_coverage") != NULL;
+                strstr(profile, "@codebase-memory-neo4j/check_index_coverage") != NULL;
     yyjson_doc_free(doc);
     free(profile);
     ASSERT_TRUE(valid);
@@ -231,18 +231,18 @@ TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path) {
 }
 
 TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path) {
-    const char *binary = "C:\\cbm bin\\codebase-memory-mcp.exe";
+    const char *binary = "C:\\cbm bin\\codebase-memory-mcp-neo4j.exe";
     char *scout = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_SCOUT,
                                            CBM_GRAPH_ACCESS_DIRECT, binary);
     char *verify = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_VERIFY,
                                             CBM_GRAPH_ACCESS_DIRECT, binary);
     ASSERT_NOT_NULL(scout);
     ASSERT_NOT_NULL(verify);
-    int valid = strstr(scout, "[mcp_servers.codebase-memory-mcp]\n"
-                              "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp.exe\"\n"
+    int valid = strstr(scout, "[mcp_servers.codebase-memory-neo4j]\n"
+                              "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp-neo4j.exe\"\n"
                               "args = [\"--tool-profile=scout\"]\n"
                               "enabled_tools = [") != NULL &&
-                strstr(verify, "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp.exe\"\n"
+                strstr(verify, "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp-neo4j.exe\"\n"
                                "args = [\"--tool-profile=analysis\"]\n") != NULL;
     free(scout);
     free(verify);
@@ -258,7 +258,7 @@ TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path) {
     free(handoff);
     char *rc1 = cbm_render_graph_profile_codex_rc1(CBM_GRAPH_TIER_VERIFY);
     ASSERT_NOT_NULL(rc1);
-    ASSERT_TRUE(strstr(rc1, "[mcp_servers.codebase-memory-mcp]\nenabled_tools = [") != NULL);
+    ASSERT_TRUE(strstr(rc1, "[mcp_servers.codebase-memory-neo4j]\nenabled_tools = [") != NULL);
     ASSERT_TRUE(strstr(rc1, "command = ") == NULL);
     free(rc1);
     PASS();
@@ -298,16 +298,16 @@ TEST(agent_profiles_grok_uses_dispatcher_ids_and_named_inheritance) {
         int direct_ok =
             direct && strstr(direct, name_line) &&
             strstr(direct, "tools: read_file, grep, list_dir, search_tool, use_tool\n") &&
-            strstr(direct, "mcpInheritance:\n  named:\n    - codebase-memory-mcp\n---\n") &&
-            strstr(direct, "codebase-memory-mcp__search_graph") &&
-            strstr(direct, "codebase-memory-mcp__check_index_coverage") &&
-            !strstr(direct, "codebase-memory-mcp__*") && !profile_has_mutator(direct) &&
+            strstr(direct, "mcpInheritance:\n  named:\n    - codebase-memory-neo4j\n---\n") &&
+            strstr(direct, "codebase-memory-neo4j__search_graph") &&
+            strstr(direct, "codebase-memory-neo4j__check_index_coverage") &&
+            !strstr(direct, "codebase-memory-neo4j__*") && !profile_has_mutator(direct) &&
             (tier != (int)CBM_GRAPH_TIER_SCOUT) ==
-                (strstr(direct, "codebase-memory-mcp__query_graph") != NULL);
+                (strstr(direct, "codebase-memory-neo4j__query_graph") != NULL);
         int handoff_ok = handoff && strstr(handoff, name_line) &&
                          strstr(handoff, "tools: read_file, grep, list_dir\n") &&
                          strstr(handoff, "mcpInheritance: none\n---\n") &&
-                         !strstr(handoff, "use_tool") && !strstr(handoff, "codebase-memory-mcp__");
+                         !strstr(handoff, "use_tool") && !strstr(handoff, "codebase-memory-neo4j__");
         free(direct);
         free(handoff);
         if (!direct_ok || !handoff_ok) {
@@ -344,18 +344,18 @@ TEST(agent_profiles_omp_direct_has_prefixed_tools_and_handoff_excludes_mcp) {
     char *direct = cbm_render_graph_profile(CBM_GRAPH_DIALECT_OMP, CBM_GRAPH_TIER_VERIFY,
                                             CBM_GRAPH_ACCESS_DIRECT, NULL);
     ASSERT_NOT_NULL(direct);
-    ASSERT_NOT_NULL(strstr(direct, "mcp__codebase_memory_mcp_check_index_coverage"));
-    ASSERT_NOT_NULL(strstr(direct, "mcp__codebase_memory_mcp_search_graph"));
+    ASSERT_NOT_NULL(strstr(direct, "mcp__codebase_memory_neo4j_check_index_coverage"));
+    ASSERT_NOT_NULL(strstr(direct, "mcp__codebase_memory_neo4j_search_graph"));
     ASSERT_NOT_NULL(strstr(direct, "read-summarize: false"));
-    ASSERT_NOT_NULL(strstr(direct, "autoloadSkills: [codebase-memory]"));
-    ASSERT_NULL(strstr(direct, "mcp__codebase-memory-mcp__"));
+    ASSERT_NOT_NULL(strstr(direct, "autoloadSkills: [codebase-memory-neo4j]"));
+    ASSERT_NULL(strstr(direct, "mcp__codebase-memory-neo4j__"));
     ASSERT(!profile_has_mutator(direct));
     free(direct);
     char *handoff = cbm_render_graph_profile(CBM_GRAPH_DIALECT_OMP, CBM_GRAPH_TIER_VERIFY,
                                              CBM_GRAPH_ACCESS_HANDOFF, NULL);
     ASSERT_NOT_NULL(handoff);
-    ASSERT_NULL(strstr(handoff, "mcp__codebase_memory_mcp_"));
-    ASSERT_NULL(strstr(handoff, "mcp__codebase-memory-mcp__"));
+    ASSERT_NULL(strstr(handoff, "mcp__codebase_memory_neo4j_"));
+    ASSERT_NULL(strstr(handoff, "mcp__codebase-memory-neo4j__"));
     free(handoff);
     PASS();
 }
@@ -371,8 +371,8 @@ TEST(agent_profiles_opencode_allows_tool_search_and_subagent_permissions) {
     ASSERT_NOT_NULL(strstr(direct, "  glob: allow\n"));
     ASSERT_NOT_NULL(strstr(direct, "  tool_search: allow\n"));
     ASSERT_NOT_NULL(strstr(direct, "  tool_search_regex: allow\n"));
-    ASSERT_NOT_NULL(strstr(direct, "  \"codebase-memory-mcp_search_graph\": allow\n"));
-    ASSERT_NOT_NULL(strstr(direct, "  \"codebase-memory-mcp_check_index_coverage\": allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  \"codebase-memory-neo4j_search_graph\": allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  \"codebase-memory-neo4j_check_index_coverage\": allow\n"));
     ASSERT_NULL(strstr(direct, "delete_project"));
     free(direct);
     PASS();

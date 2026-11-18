@@ -709,8 +709,8 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
      * regardless of -C. Paths stay repository-relative either way, which is
      * what repo_cdup is for.
      *
-     * `:(exclude).codebase-memory` drops the indexer's OWN output. After every
-     * publish the pipeline re-exports <root>/.codebase-memory/ whenever an
+     * `:(exclude).codebase-memory-neo4j` drops the indexer's OWN output. After every
+     * publish the pipeline re-exports <root>/.codebase-memory-neo4j/ whenever an
      * artifact already lives there (once persisted, or committed by the team
      * and checked out into every worktree). Folding that write into the
      * signature made each successful reindex look like a NEW dirty state on
@@ -899,7 +899,7 @@ static int tree_entry_cmp(const void *a, const void *b) {
  * and .cbmignore), folding each (relative path, size, mtime) in path order so
  * readdir order cannot change the value. Adding, deleting, renaming or editing
  * an indexable file yields a new signature; touching anything discovery skips
- * does not. That includes everything cbm writes itself: the .codebase-memory
+ * does not. That includes everything cbm writes itself: the .codebase-memory-neo4j
  * artifact directory is a built-in skip and the cache directory is pruned by
  * absolute path, so a successful reindex can never look like a new change
  * (the runaway history in init_baseline and #1953). Never returns 0 in

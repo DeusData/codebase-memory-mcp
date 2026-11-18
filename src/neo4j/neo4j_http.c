@@ -58,7 +58,7 @@ enum { N4_STALL_NONE = 0, N4_STALL_DEAD, N4_STALL_LIMIT, N4_STALL_TOO_LARGE };
 
 struct cbm_neo4j_http {
     cbm_neo4j_url_t url;
-    char *auth_header; /* "Basic xxx" or NULL */
+    char *auth_header;   /* "Basic xxx" or NULL */
     char *extra_headers; /* "Name: value\r\n..." added to every request, or NULL */
     cbm_n4_sock_t sock;
     int max_wait_ms; /* longest silence on a live server; 0 = N4_IO_TIMEOUT_MS */
@@ -105,7 +105,8 @@ int cbm_neo4j_url_parse(const char *url, cbm_neo4j_url_t *out, char *err, size_t
         out->port = N4_DEFAULT_HTTPS_PORT;
     } else if (n4_has_prefix_ci(url, "bolt") || n4_has_prefix_ci(url, "neo4j")) {
         n4_err(err, err_sz,
-               "unsupported graph_db scheme in '%s': codebase-memory-mcp talks to Neo4j over its "
+               "unsupported graph_db scheme in '%s': codebase-memory-mcp-neo4j talks to Neo4j over "
+               "its "
                "HTTP API; use http://<host>:7474 (or https://<host>:7473) instead of bolt/neo4j",
                url);
         return -1;
@@ -346,8 +347,8 @@ static void n4_io_err(const cbm_neo4j_http_t *h, char *err, size_t err_sz, const
                        N4_STALL_TICK_MS / 1000, h->url.host, h->url.port);
         n4_err(err, err_sz, "%s", buf);
     } else if (h->stall == N4_STALL_TOO_LARGE) {
-        n4_err(err, err_sz,
-               "Neo4j response exceeded 1 GiB%s — add LIMIT or narrow the query", NULL);
+        n4_err(err, err_sz, "Neo4j response exceeded 1 GiB%s — add LIMIT or narrow the query",
+               NULL);
     } else if (h->stall == N4_STALL_LIMIT) {
         (void)snprintf(buf, sizeof(buf),
                        "no reply from Neo4j within %d s (the server is up, but did not answer "
@@ -823,7 +824,7 @@ static int n4_winhttp_post(cbm_neo4j_http_t *h, const char *full_path, const cha
                            size_t body_len, int *status, char **resp, size_t *resp_len, char *err,
                            size_t err_sz) {
     if (!h->session) {
-        h->session = WinHttpOpen(L"codebase-memory-mcp", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        h->session = WinHttpOpen(L"codebase-memory-mcp-neo4j", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!h->session) {
             n4_err(err, err_sz, "WinHttpOpen failed%s", NULL);
@@ -855,8 +856,7 @@ static int n4_winhttp_post(cbm_neo4j_http_t *h, const char *full_path, const cha
     }
     DWORD recv_ms = (DWORD)(h->max_wait_ms > 0 ? h->max_wait_ms : N4_IO_TIMEOUT_MS);
     (void)WinHttpSetOption(req, WINHTTP_OPTION_RECEIVE_TIMEOUT, &recv_ms, sizeof(recv_ms));
-    (void)WinHttpSetOption(req, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &recv_ms,
-                           sizeof(recv_ms));
+    (void)WinHttpSetOption(req, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &recv_ms, sizeof(recv_ms));
     char hdrs[1024];
     (void)snprintf(hdrs, sizeof(hdrs),
                    "Content-Type: application/json\r\nAccept: application/json\r\n%s%s%s%s",
@@ -986,19 +986,19 @@ int cbm_neo4j_http_post(cbm_neo4j_http_t *h, const char *path, const char *body,
     if (!req) {
         return -1;
     }
-    int req_len = snprintf(req, req_cap,
-                           "POST %s HTTP/1.1\r\n"
-                           "Host: %s:%d\r\n"
-                           "Content-Type: application/json\r\n"
-                           "Accept: application/json;charset=UTF-8\r\n"
-                           "Content-Length: %zu\r\n"
-                           "Connection: keep-alive\r\n"
-                           "%s%s%s%s"
-                           "\r\n",
-                           full_path, h->url.host, h->url.port, body_len,
-                           h->auth_header ? "Authorization: " : "",
-                           h->auth_header ? h->auth_header : "", h->auth_header ? "\r\n" : "",
-                           h->extra_headers ? h->extra_headers : "");
+    int req_len =
+        snprintf(req, req_cap,
+                 "POST %s HTTP/1.1\r\n"
+                 "Host: %s:%d\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Accept: application/json;charset=UTF-8\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: keep-alive\r\n"
+                 "%s%s%s%s"
+                 "\r\n",
+                 full_path, h->url.host, h->url.port, body_len,
+                 h->auth_header ? "Authorization: " : "", h->auth_header ? h->auth_header : "",
+                 h->auth_header ? "\r\n" : "", h->extra_headers ? h->extra_headers : "");
     if (req_len < 0 || (size_t)req_len >= req_cap) {
         free(req);
         return -1;

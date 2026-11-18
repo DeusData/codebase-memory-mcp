@@ -86,7 +86,7 @@ report_section() {
 # "  %-55s" and flushes BEFORE the test body, then "PASS\n" after it.
 running() { printf '  %-55s' "$1"; }
 passed() { printf '  %-55sPASS\n' "$1"; }
-banner() { printf '\n  codebase-memory-mcp  C test suite\n\n=== %s ===\n' "$1"; }
+banner() { printf '\n  codebase-memory-mcp-neo4j  C test suite\n\n=== %s ===\n' "$1"; }
 RULE="────────────────────────────────────────────"
 totals() { printf '\n%s\n  %s\n%s\n\n' "$RULE" "$1" "$RULE"; }
 

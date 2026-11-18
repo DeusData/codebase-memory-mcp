@@ -5,8 +5,8 @@
  * committed). Layout under its directory:
  *
  *   receipt.json                    this module; the bundle's authority
- *   .codebase-memory/graph.db.zst   the commit's frozen graph (artifact.h)
- *   .codebase-memory/artifact.json
+ *   .codebase-memory-neo4j/graph.db.zst   the commit's frozen graph (artifact.h)
+ *   .codebase-memory-neo4j/artifact.json
  *   coverage/functions.tsv          optional coverage map, format 1
  *   coverage/tests.tsv
  *   coverage/meta.json

@@ -47,7 +47,7 @@
  *   We construct the scenario directly at the store API level (no full index
  *   needed -- the integrity check runs before any graph data is consulted):
  *
- *   1. Set CBM_CACHE_DIR to a temp directory so the DB lands in a controlled
+ *   1. Set CBM_NEO4J_CACHE_DIR to a temp directory so the DB lands in a controlled
  *      location and does not pollute the real cache.
  *   2. Create the DB via cbm_store_open_path() (creates schema + tables).
  *   3. Insert one projects row with root_path = "826" -- the exact numeric
@@ -201,15 +201,15 @@ static void cleanup_backup_artifacts(const char *cache_dir) {
  * ─────────────────────────────────────────────────────────────────── */
 
 TEST(repro_issue557_corrupt_db_not_silently_deleted) {
-    /* ── Step 1: redirect CBM_CACHE_DIR to a temp dir ─────────────────
+    /* ── Step 1: redirect CBM_NEO4J_CACHE_DIR to a temp dir ─────────────────
      *
-     * cbm_resolve_cache_dir() checks the CBM_CACHE_DIR env var first.
+     * cbm_resolve_cache_dir() checks the CBM_NEO4J_CACHE_DIR env var first.
      * Pointing it at a fresh temp dir ensures:
      *   - the test DB is isolated from the user's real cache
      *   - we know the exact db_path before the MCP call
      *
      * The static buffer in cbm_resolve_cache_dir() is updated on the
-     * next call because it re-reads CBM_CACHE_DIR each time.  We must
+     * next call because it re-reads CBM_NEO4J_CACHE_DIR each time.  We must
      * also call cbm_mkdir on the directory before opening the store.
      */
     char tmp_cache[512];
@@ -223,10 +223,10 @@ TEST(repro_issue557_corrupt_db_not_silently_deleted) {
      * return tmp_cache.  setenv is POSIX; Windows uses _putenv_s. */
 #if defined(_WIN32)
     char ev[600];
-    snprintf(ev, sizeof(ev), "CBM_CACHE_DIR=%s", tmp_cache);
+    snprintf(ev, sizeof(ev), "CBM_NEO4J_CACHE_DIR=%s", tmp_cache);
     _putenv(ev);
 #else
-    setenv("CBM_CACHE_DIR", tmp_cache, 1 /* overwrite */);
+    setenv("CBM_NEO4J_CACHE_DIR", tmp_cache, 1 /* overwrite */);
 #endif
 
     /* ── Step 2: build the DB path we will inspect ────────────────────
@@ -351,9 +351,9 @@ TEST(repro_issue557_corrupt_db_not_silently_deleted) {
     rmdir(tmp_cache);
 
 #if defined(_WIN32)
-    _putenv("CBM_CACHE_DIR=");
+    _putenv("CBM_NEO4J_CACHE_DIR=");
 #else
-    unsetenv("CBM_CACHE_DIR");
+    unsetenv("CBM_NEO4J_CACHE_DIR");
 #endif
 
     /*

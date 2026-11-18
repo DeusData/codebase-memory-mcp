@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-impact-select.sh — the PR selection with the team artifact: what
-# `codebase-memory-mcp test-impact select` runs for this change.
+# `codebase-memory-mcp-neo4j test-impact select` runs for this change.
 #
 # Shadow (default): REPORT-ONLY; pr.yml's test-impact-shadow job runs it
 # continue-on-error and ci-ok does not need it.
@@ -42,10 +42,10 @@ done
 
 mkdir -p "$OUT"
 WORK="$(mktemp -d)"
-CBM_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)" # sun_path must fit
-export CBM_RUNTIME_DIR
-trap 'rm -rf "$WORK" "$CBM_RUNTIME_DIR"' EXIT
-export CBM_CACHE_DIR="$WORK/cache"
+CBM_NEO4J_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)" # sun_path must fit
+export CBM_NEO4J_RUNTIME_DIR
+trap 'rm -rf "$WORK" "$CBM_NEO4J_RUNTIME_DIR"' EXIT
+export CBM_NEO4J_CACHE_DIR="$WORK/cache"
 mkdir -p "$WORK/engine" && chmod 700 "$WORK/engine"
 base="$(git -C "$ROOT" rev-parse "$BASE")"
 

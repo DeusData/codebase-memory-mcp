@@ -54,7 +54,7 @@ Config/markup languages (HTML, CSS, SCSS, YAML, TOML, HCL, SQL, Dockerfile) run 
 | 18 | Python | django/django | 49,398 | 196,022 | 10.5/12 | 87% | 2 |
 | 19 | TypeScript | nestjs/nest | 9,063 | 15,772 | 10.5/12 | 87% | 2 |
 | 20 | TSX | shadcn-ui/ui | 29,755 | 41,883 | 10.5/12 | 87% | 2 |
-| 21 | Go | codebase-memory-mcp (self) | 2,259 | 6,561 | 10.5/12 | 87% | 2 |
+| 21 | Go | codebase-memory-mcp-neo4j (self) | 2,259 | 6,561 | 10.5/12 | 87% | 2 |
 | 22 | Rust | BurntSushi/ripgrep | 4,118 | 6,971 | 10.5/12 | 87% | 2 |
 | 23 | Java | spring-projects/spring-petclinic | 660 | 1,080 | 10.5/12 | 87% | 2 |
 | 24 | R | tidyverse/dplyr | 1,618 | 2,409 | 10.5/12 | 87% | 2 |
@@ -172,9 +172,9 @@ Config/markup languages (HTML, CSS, SCSS, YAML, TOML, HCL, SQL, Dockerfile) run 
 
 **Score: 10.5/12 (87%)**
 
-### Go (codebase-memory-mcp)
+### Go (codebase-memory-mcp-neo4j)
 
-**Project**: `codebase-memory-mcp` | **Repo**: self
+**Project**: `codebase-memory-mcp-neo4j` | **Repo**: self
 **Nodes**: 2,259 | **Edges**: 6,561
 
 | Q# | Question | Grade | Attempts | Approach | Notes |

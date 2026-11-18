@@ -80,19 +80,19 @@ jobs:
         if: ${{ inputs.use_release_artifacts }}
         run: |
           mkdir -p "$RUNNER_TEMP/cbm-selected-artifact"
-          tar -xzf "$RUNNER_TEMP/cbm-selected-container/codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
-            -C "$RUNNER_TEMP/cbm-selected-artifact" codebase-memory-mcp
-          chmod +x "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp"
-          "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp" --version
+          tar -xzf "$RUNNER_TEMP/cbm-selected-container/codebase-memory-mcp-neo4j-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
+            -C "$RUNNER_TEMP/cbm-selected-artifact" codebase-memory-mcp-neo4j
+          chmod +x "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp-neo4j"
+          "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp-neo4j" --version
       # The soak SEQUENCE and its guards live in the ONE canonical entry
       # scripts/soak-legs.sh — never in workflow YAML. Leg selection is a
       # workflow input so a long #581-only run needs no separate workflow.
       - name: Soak legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
         env:
-          SELECTED_BINARY: ${{ runner.temp }}/cbm-selected-artifact/codebase-memory-mcp
+          SELECTED_BINARY: ${{ runner.temp }}/cbm-selected-artifact/codebase-memory-mcp-neo4j
           USE_RELEASE_ARTIFACTS: ${{ inputs.use_release_artifacts }}
         run: |
-          binary=build/c/codebase-memory-mcp
+          binary=build/c/codebase-memory-mcp-neo4j
           test "$USE_RELEASE_ARTIFACTS" != true || binary="$SELECTED_BINARY"
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" "$binary" ${{ inputs.duration_minutes }}
       - name: Upload metrics
@@ -156,9 +156,9 @@ jobs:
         run: |
           ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-selected-artifact"
           mkdir -p "$ARTIFACT_DIR"
-          unzip -q "$(cygpath -u "$RUNNER_TEMP")/cbm-selected-container/codebase-memory-mcp-windows-amd64.zip" \
-            codebase-memory-mcp.exe -d "$ARTIFACT_DIR"
-          "$ARTIFACT_DIR/codebase-memory-mcp.exe" --version
+          unzip -q "$(cygpath -u "$RUNNER_TEMP")/cbm-selected-container/codebase-memory-mcp-neo4j-windows-amd64.zip" \
+            codebase-memory-mcp-neo4j.exe -d "$ARTIFACT_DIR"
+          "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe" --version
       # Both release-gating legs via the ONE canonical soak entry; only the
       # protected-TEMP provisioning is venue text. soak-legs.sh resolves .exe.
       - name: Soak legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
@@ -167,9 +167,9 @@ jobs:
           export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
           export TMP="$TEMP"
           export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
-          binary=build/c/codebase-memory-mcp
+          binary=build/c/codebase-memory-mcp-neo4j
           if [ "${{ inputs.use_release_artifacts }}" = true ]; then
-            binary="$(cygpath -u "$RUNNER_TEMP")/cbm-selected-artifact/codebase-memory-mcp.exe"
+            binary="$(cygpath -u "$RUNNER_TEMP")/cbm-selected-artifact/codebase-memory-mcp-neo4j.exe"
           fi
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" "$binary" ${{ inputs.duration_minutes }}
       - name: Upload metrics
@@ -234,9 +234,9 @@ jobs:
         run: |
           ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-selected-artifact"
           mkdir -p "$ARTIFACT_DIR"
-          unzip -q "$(cygpath -u "$RUNNER_TEMP")/cbm-selected-container/codebase-memory-mcp-windows-arm64.zip" \
-            codebase-memory-mcp.exe -d "$ARTIFACT_DIR"
-          "$ARTIFACT_DIR/codebase-memory-mcp.exe" --version
+          unzip -q "$(cygpath -u "$RUNNER_TEMP")/cbm-selected-container/codebase-memory-mcp-neo4j-windows-arm64.zip" \
+            codebase-memory-mcp-neo4j.exe -d "$ARTIFACT_DIR"
+          "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe" --version
       # Both release-gating legs via the ONE canonical soak entry; only the
       # protected-TEMP provisioning is venue text. soak-legs.sh resolves .exe.
       - name: Soak legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
@@ -245,9 +245,9 @@ jobs:
           export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
           export TMP="$TEMP"
           export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
-          binary=build/c/codebase-memory-mcp
+          binary=build/c/codebase-memory-mcp-neo4j
           if [ "${{ inputs.use_release_artifacts }}" = true ]; then
-            binary="$(cygpath -u "$RUNNER_TEMP")/cbm-selected-artifact/codebase-memory-mcp.exe"
+            binary="$(cygpath -u "$RUNNER_TEMP")/cbm-selected-artifact/codebase-memory-mcp-neo4j.exe"
           fi
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" "$binary" ${{ inputs.duration_minutes }}
       - name: Upload metrics
@@ -292,14 +292,14 @@ jobs:
       - name: Extract selected portable executable
         run: |
           mkdir -p "$RUNNER_TEMP/cbm-selected-artifact"
-          tar -xzf "$RUNNER_TEMP/cbm-selected-container/codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz" \
-            -C "$RUNNER_TEMP/cbm-selected-artifact" codebase-memory-mcp
-          chmod +x "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp"
-          "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp" --version
+          tar -xzf "$RUNNER_TEMP/cbm-selected-container/codebase-memory-mcp-neo4j-linux-${{ matrix.arch }}-portable.tar.gz" \
+            -C "$RUNNER_TEMP/cbm-selected-artifact" codebase-memory-mcp-neo4j
+          chmod +x "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp-neo4j"
+          "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp-neo4j" --version
       - name: Soak selected portable legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
         run: |
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" \
-            "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp" \
+            "$RUNNER_TEMP/cbm-selected-artifact/codebase-memory-mcp-neo4j" \
             ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
@@ -367,7 +367,7 @@ jobs:
         # Single-leg variant of the canonical soak entry: the ASan build is too
         # slow for the two-leg sequence; leg selection is a documented flag, not
         # a divergent inline procedure.
-        run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15
+        run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp-neo4j 15
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -407,7 +407,7 @@ jobs:
         env:
           ASAN_OPTIONS: "detect_leaks=0:halt_on_error=0:log_path=soak-results/asan"
         # Single-leg variant of the canonical soak entry (see the unix ASan job).
-        run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15
+        run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp-neo4j 15
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

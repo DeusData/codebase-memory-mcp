@@ -2123,7 +2123,7 @@ static void *runtime_connection_worker(void *opaque) {
      *     ALREADY proved semantic version, build fingerprint, protocol/store/
      *     feature ABI and cache root in the HELLO exchange above — rejecting on
      *     top of that traded a real compatibility proof for an unavailable one,
-     *     and made `npx codebase-memory-mcp` unusable with the daemon. Admit,
+     *     and made `npx codebase-memory-mcp-neo4j` unusable with the daemon. Admit,
      *     and say so out loud so the weaker check is never invisible. */
     if (!peer_image_verified && !peer_image_fingerprinted) {
         cbm_log_warn("daemon.client_image_unverifiable_admitted", "reason", "image_unverifiable",
@@ -3046,16 +3046,17 @@ bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active
     out[0] = '\0';
     static const char install_hint[] =
         "Usually another editor or agent session (for example Codex or Claude Code) "
-        "launched a different codebase-memory-mcp install: close it, or point every client "
-        "at one binary (compare `which -a codebase-memory-mcp` with each client's MCP "
+        "launched a different codebase-memory-mcp-neo4j install: close it, or point every client "
+        "at one binary (compare `which -a codebase-memory-mcp-neo4j` with each client's MCP "
         "config).";
     int written;
     if (!active) {
-        written = snprintf(out, out_size,
-                           "Run `codebase-memory-mcp daemon status` to see the active daemon and "
-                           "the sessions using it. %s `codebase-memory-mcp daemon stop` retires "
-                           "the daemon once no session uses it.",
-                           install_hint);
+        written =
+            snprintf(out, out_size,
+                     "Run `codebase-memory-mcp-neo4j daemon status` to see the active daemon and "
+                     "the sessions using it. %s `codebase-memory-mcp-neo4j daemon stop` retires "
+                     "the daemon once no session uses it.",
+                     install_hint);
     } else {
         char sessions[160];
         if (!remedy_sessions_format(active, sessions, sizeof(sessions))) {
@@ -3063,12 +3064,13 @@ bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active
         }
         const char *lifetime =
             active->permanent ? "permanent" : "session-managed, exits when its last session closes";
-        written = snprintf(out, out_size,
-                           "Active daemon: pid %lu, version %s, %s%s%s. %s "
-                           "`codebase-memory-mcp daemon stop` retires the daemon once no session "
-                           "uses it.",
-                           (unsigned long)active->daemon_pid, active->semantic_version, lifetime,
-                           active->stopping ? ", already stopping" : "", sessions, install_hint);
+        written =
+            snprintf(out, out_size,
+                     "Active daemon: pid %lu, version %s, %s%s%s. %s "
+                     "`codebase-memory-mcp-neo4j daemon stop` retires the daemon once no session "
+                     "uses it.",
+                     (unsigned long)active->daemon_pid, active->semantic_version, lifetime,
+                     active->stopping ? ", already stopping" : "", sessions, install_hint);
     }
     if (written < 0 || (size_t)written >= out_size) {
         out[0] = '\0';

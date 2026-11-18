@@ -1,7 +1,7 @@
 /*
  * cli.h — CLI subcommand handlers for install, uninstall, update, version.
  *
- * Port of Go cmd/codebase-memory-mcp/ install/update/config logic.
+ * Port of Go cmd/codebase-memory-mcp-neo4j/ install/update/config logic.
  *
  * Functions accept explicit paths (home_dir, binary_path) rather than
  * reading HOME internally, making them testable with temp directories.
@@ -29,14 +29,15 @@ const char *cbm_cli_get_version(void);
 
 /* Top-level `cli --help` text printed by run_cli() in src/main.c.
  * Documents tool-level --format without adding a session-wide flag (#2102). */
-#define CBM_CLI_USAGE                                                                         \
-    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
-    "[json_args]\n"                                                                           \
-    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
-    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
-    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
-    "  --json      Print the raw MCP result envelope\n"                                       \
-    "  Tools that accept format support --format tree|json (default: tree).\n"                \
+#define CBM_CLI_USAGE                                                                     \
+    "Usage: codebase-memory-mcp-neo4j cli [--quiet] [--progress] [--verbose] [--json] "   \
+    "<tool_name> "                                                                        \
+    "[json_args]\n"                                                                       \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n" \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n"              \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"          \
+    "  --json      Print the raw MCP result envelope\n"                                   \
+    "  Tools that accept format support --format tree|json (default: tree).\n"            \
     "  --format json prints payload JSON; outer --json prints the full MCP envelope.\n"
 
 /* Convert `--flag value` / `--flag=value` / bare-boolean `--flag` arguments for
@@ -127,7 +128,7 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 
 /* Skill name/content pair. */
 typedef struct {
-    const char *name;    /* e.g. "codebase-memory" */
+    const char *name;    /* e.g. "codebase-memory-neo4j" */
     const char *content; /* full SKILL.md content */
 } cbm_skill_t;
 
@@ -150,7 +151,7 @@ bool cbm_remove_old_monolithic_skill(const char *skills_dir, bool dry_run);
 /* ── Editor MCP config management ─────────────────────────────── */
 
 /* Install MCP server entry in Cursor/Windsurf/Gemini JSON config.
- * Format: { "mcpServers": { "codebase-memory-mcp": { "command": binary_path } } }
+ * Format: { "mcpServers": { "codebase-memory-neo4j": { "command": binary_path } } }
  * Preserves existing entries. Returns 0 on success. */
 int cbm_install_editor_mcp(const char *binary_path, const char *config_path);
 
@@ -160,7 +161,7 @@ int cbm_remove_editor_mcp(const char *config_path);
 int cbm_remove_editor_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Install MCP server entry in OpenClaw JSON config.
- * Format: { "mcp": { "servers": { "codebase-memory-mcp":
+ * Format: { "mcp": { "servers": { "codebase-memory-neo4j":
  * { "enabled": true, "command": binary_path, "args": [] } } } }
  * Preserves existing entries. Returns 0 on success. */
 int cbm_install_openclaw_mcp(const char *binary_path, const char *config_path);
@@ -171,7 +172,7 @@ int cbm_remove_openclaw_mcp(const char *config_path);
 int cbm_remove_openclaw_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Install MCP server entry in VS Code JSON config.
- * Format: { "servers": { "codebase-memory-mcp": { "type": "stdio", "command": binary_path } } }
+ * Format: { "servers": { "codebase-memory-neo4j": { "type": "stdio", "command": binary_path } } }
  * Returns 0 on success. */
 int cbm_install_vscode_mcp(const char *binary_path, const char *config_path);
 
@@ -181,7 +182,7 @@ int cbm_remove_vscode_mcp(const char *config_path);
 int cbm_remove_vscode_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Install MCP server entry in Zed settings.json.
- * Format: { "context_servers": { "codebase-memory-mcp": { "command": path, "args": [] } } }
+ * Format: { "context_servers": { "codebase-memory-neo4j": { "command": path, "args": [] } } }
  * Returns 0 on success. */
 int cbm_install_zed_mcp(const char *binary_path, const char *config_path);
 
@@ -326,13 +327,13 @@ int cbm_remove_junie_mcp_owned(const char *binary_path, const char *config_path)
 
 /* ── Instructions file upsert ─────────────────────────────────── */
 
-/* Upsert a codebase-memory-mcp instruction section in a markdown file.
- * Uses <!-- codebase-memory-mcp:start --> / <!-- codebase-memory-mcp:end --> markers.
+/* Upsert a codebase-memory-mcp-neo4j instruction section in a markdown file.
+ * Uses <!-- codebase-memory-mcp-neo4j:start --> / <!-- codebase-memory-mcp-neo4j:end --> markers.
  * If markers exist, replaces content between them. Otherwise appends.
  * If file doesn't exist, creates it. Returns 0 on success. */
 int cbm_upsert_instructions(const char *path, const char *content);
 
-/* Remove the codebase-memory-mcp instruction section from a markdown file.
+/* Remove the codebase-memory-mcp-neo4j instruction section from a markdown file.
  * Returns 0 on success, 1 if not found. */
 int cbm_remove_instructions(const char *path);
 
@@ -405,12 +406,12 @@ const char *cbm_get_codex_instructions(void);
  * release artifacts rather than present-but-unreachable. */
 #ifdef CBM_CLI_ENABLE_TEST_API
 
-/* Extract a binary named "codebase-memory-mcp*" from a tar.gz buffer.
+/* Extract a binary named "codebase-memory-mcp-neo4j*" from a tar.gz buffer.
  * Returns malloc'd binary content and sets *out_len.
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data_len, int *out_len);
 
-/* Extract the codebase-memory-mcp binary from a zip archive in memory.
+/* Extract the codebase-memory-mcp-neo4j binary from a zip archive in memory.
  * Returns malloc'd binary content and sets *out_len.
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
@@ -419,7 +420,7 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
 
 /* ── Index management ─────────────────────────────────────────── */
 
-/* List .db files in the cache directory (~/.cache/codebase-memory-mcp/).
+/* List .db files in the cache directory (~/.cache/codebase-memory-mcp-neo4j/).
  * Prints each file path to stdout. Returns count of .db files found. */
 int cbm_list_indexes(const char *home_dir);
 

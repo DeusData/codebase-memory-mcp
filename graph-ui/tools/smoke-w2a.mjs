@@ -43,7 +43,7 @@ import {
 import { startStaticProxy } from './lib/static-proxy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE_SMALL = join(ROOT, 'fixtures', 'atlas-sample');
 const FIXTURE_LARGE = join(ROOT, 'fixtures', 'atlas-sample-large');
@@ -260,7 +260,7 @@ async function main() {
          * tools/smoke-w4b.mjs und tools/smoke-w6-full.mjs.
          */
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w2a-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         log('isoliertes HOME:', home);
         log('Rendezvous:', runtimeDir);
         const indexedSmall = await indexRepository(BINARY, {

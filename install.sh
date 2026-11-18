@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install.sh — One-line installer for codebase-memory-mcp.
+# install.sh — One-line installer for codebase-memory-mcp-neo4j.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/install.sh | bash
@@ -151,10 +151,10 @@ detect_arch() {
 OS=$(detect_os)
 ARCH=$(detect_arch)
 
-echo "codebase-memory-mcp installer"
+echo "codebase-memory-mcp-neo4j installer"
 echo "  os:      $OS"
 echo "  arch:    $ARCH"
-echo "  target:  $INSTALL_DIR/codebase-memory-mcp"
+echo "  target:  $INSTALL_DIR/codebase-memory-mcp-neo4j"
 echo ""
 
 # Build download URL
@@ -170,7 +170,7 @@ fi
 PORTABLE=""
 [ "$OS" = "linux" ] && PORTABLE="-portable"
 
-ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.${EXT}"
+ARCHIVE="codebase-memory-mcp-neo4j-${OS}-${ARCH}${PORTABLE}.${EXT}"
 
 URL="${CBM_DOWNLOAD_URL}/${ARCHIVE}"
 
@@ -246,10 +246,10 @@ echo "Checksum verified."
 # release assets use the same four-member root layout; anything outside that
 # closed set is a release-integrity failure, not a sidecar to ignore.
 if [ "$OS" = "windows" ]; then
-    ARCHIVE_BINARY="codebase-memory-mcp.exe"
+    ARCHIVE_BINARY="codebase-memory-mcp-neo4j.exe"
     ARCHIVE_INSTALLER="install.ps1"
 else
-    ARCHIVE_BINARY="codebase-memory-mcp"
+    ARCHIVE_BINARY="codebase-memory-mcp-neo4j"
     ARCHIVE_INSTALLER="install.sh"
 fi
 ARCHIVE_MEMBERS_FILE="$DLDIR/archive-members.txt"
@@ -334,7 +334,7 @@ if ! CANDIDATE_VERSION=$("$DLBIN" --version 2>&1); then
 fi
 echo "Verified candidate: $CANDIDATE_VERSION"
 
-DEST="$INSTALL_DIR/codebase-memory-mcp"
+DEST="$INSTALL_DIR/codebase-memory-mcp-neo4j"
 INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
 if [ "$CLIENTS_SET" = true ]; then
     INSTALL_ARGS+=("--clients=$CLIENTS")
@@ -359,11 +359,11 @@ fi
 # working install, and `update` falls back to explaining where to find it.
 DL_INSTALLER="$DLDIR/install.sh"
 if [ -f "$DL_INSTALLER" ]; then
-    INSTALLER_TMP="$INSTALL_DIR/.install.sh.$$"
+    INSTALLER_TMP="$INSTALL_DIR/.install-neo4j.sh.$$"
     if cp "$DL_INSTALLER" "$INSTALLER_TMP" 2>/dev/null &&
         chmod 755 "$INSTALLER_TMP" 2>/dev/null &&
-        mv -f "$INSTALLER_TMP" "$INSTALL_DIR/install.sh" 2>/dev/null; then
-        echo "Installed updater -> $INSTALL_DIR/install.sh"
+        mv -f "$INSTALLER_TMP" "$INSTALL_DIR/install-neo4j.sh" 2>/dev/null; then
+        echo "Installed updater -> $INSTALL_DIR/install-neo4j.sh"
     else
         rm -f "$INSTALLER_TMP" 2>/dev/null || true
         echo "note: could not place install.sh in $INSTALL_DIR (update will explain where to find it)"
@@ -396,7 +396,7 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
 fi
 
 echo ""
-echo "Done! Restart your coding agent to start using codebase-memory-mcp."
+echo "Done! Restart your coding agent to start using codebase-memory-mcp-neo4j."
 
 } # end main()
 

@@ -297,7 +297,7 @@ TEST(pattern_dts_full) {
 
 /* ── File discovery (integration) — cross-platform via test_helpers.h ── */
 
-/* A custom CBM_CACHE_DIR may legitimately sit inside a repository — tests do it
+/* A custom CBM_NEO4J_CACHE_DIR may legitimately sit inside a repository — tests do it
  * routinely. Walking into it would pull every other project's graph database into
  * this project's file list, so the walk prunes it by absolute path. */
 TEST(discover_prunes_the_cache_tree) {
@@ -308,11 +308,11 @@ TEST(discover_prunes_the_cache_tree) {
     /* Source-looking files inside the cache must not be discovered. */
     th_write_file(TH_PATH(base, "cache/other_project/leaked.go"), "package leaked\n");
 
-    const char *saved = getenv("CBM_CACHE_DIR");
+    const char *saved = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
     char cache_dir[1024];
     snprintf(cache_dir, sizeof(cache_dir), "%s/cache", base);
-    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", cache_dir, 1);
 
     cbm_discover_opts_t opts = {0};
     cbm_file_info_t *files = NULL;
@@ -320,10 +320,10 @@ TEST(discover_prunes_the_cache_tree) {
     int rc = cbm_discover(base, &opts, &files, &count);
 
     if (saved_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_copy, 1);
         free(saved_copy);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
 
     ASSERT_EQ(rc, 0);

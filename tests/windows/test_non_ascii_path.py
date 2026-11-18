@@ -1,7 +1,7 @@
 """GREEN regression guard — non-ASCII runtime and repo paths work on Windows.
 
 Guards the fix for issue #636 / #357 (landed on main via #700) at the product
-surface (real codebase-memory-mcp process, real SQLite DB, real stdio). Two
+surface (real codebase-memory-mcp-neo4j process, real SQLite DB, real stdio). Two
 byte-identical polyglot fixtures (TypeScript + Go, #1959) are indexed: one under
 an ASCII parent path, one under a non-ASCII parent path. The invariant under test:
 
@@ -24,7 +24,7 @@ Exit code: 0 == invariant holds (green), 1 == invariant violated (regression),
 2 == environment/setup error.
 
 Usage:
-    python test_non_ascii_path.py <path-to-codebase-memory-mcp[.exe]>
+    python test_non_ascii_path.py <path-to-codebase-memory-mcp-neo4j[.exe]>
 """
 import json
 import os
@@ -192,7 +192,7 @@ def verify_relocated_runtime(binary, work):
     env["XDG_CONFIG_HOME"] = os.path.join(work, "runtime_xdg_config")
     env["XDG_CACHE_HOME"] = os.path.join(work, "runtime_xdg_cache")
     env["XDG_DATA_HOME"] = os.path.join(work, "runtime_xdg_data")
-    env["CBM_CACHE_DIR"] = os.path.join(work, "runtime_cache")
+    env["CBM_NEO4J_CACHE_DIR"] = os.path.join(work, "runtime_cache")
     for inherited_config in (
             "CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME",
             "CRUSH_GLOBAL_CONFIG", "OPENCLAW_CONFIG_PATH", "OPENCLAW_HOME",
@@ -202,7 +202,7 @@ def verify_relocated_runtime(binary, work):
     for directory in (
             env["HOME"], env["APPDATA"], env["LOCALAPPDATA"],
             env["XDG_CONFIG_HOME"], env["XDG_CACHE_HOME"],
-            env["XDG_DATA_HOME"], env["CBM_CACHE_DIR"]):
+            env["XDG_DATA_HOME"], env["CBM_NEO4J_CACHE_DIR"]):
         os.makedirs(directory, exist_ok=True)
 
     def stop_runtime_daemon():
@@ -233,7 +233,7 @@ def verify_relocated_runtime(binary, work):
         *("segment_%02d_%s" % (i, "x" * 32) for i in range(7)),
         "bin",
     )
-    installed = os.path.join(target, "codebase-memory-mcp.exe")
+    installed = os.path.join(target, "codebase-memory-mcp-neo4j.exe")
     if len(os.path.abspath(installed)) <= 260:
         return fail("setup: intended long install path is only %d characters" % len(
             os.path.abspath(installed)))
@@ -516,7 +516,7 @@ def main():
                     # CLI entrypoint prints them. Same repo, third fresh cache.
                     cli_cache = os.path.join(work, "c3_" + key)
                     cli_env = os.environ.copy()
-                    cli_env["CBM_CACHE_DIR"] = cli_cache
+                    cli_env["CBM_NEO4J_CACHE_DIR"] = cli_cache
                     # CBM_PROFILE keeps the supervisor from unlinking the worker
                     # log on a clean exit (index.supervisor.profile_log), which
                     # is the only record of the pipeline's own diagnostics.

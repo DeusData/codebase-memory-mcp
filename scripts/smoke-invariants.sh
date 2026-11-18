@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # smoke-invariants.sh — "the shipped PROD binary does not fail" invariant battery.
 #
-# A comprehensive, fast, portable smoke battery for the codebase-memory-mcp
+# A comprehensive, fast, portable smoke battery for the codebase-memory-mcp-neo4j
 # binary. Every invariant prints `PASS: <name>` or `FAIL: <name>: <reason>` and
 # accumulates failures. Exit 0 iff ALL invariants pass, 1 if ANY fails.
 #
@@ -13,7 +13,7 @@
 # Designed to run IDENTICALLY on Linux / macOS / Windows(msys2 CLANG64).
 #
 # Usage:
-#   scripts/smoke-invariants.sh <binary>        # e.g. build/c/codebase-memory-mcp(.exe)
+#   scripts/smoke-invariants.sh <binary>        # e.g. build/c/codebase-memory-mcp-neo4j(.exe)
 #
 # Portability notes:
 #   * set -u (NOT -e): we want every invariant to run even if one fails.
@@ -219,7 +219,7 @@ inv_help() {
         fail "help" "--help exited $RB_RC (want 0)"
         return
     fi
-    if printf '%s' "$RB_OUT" | grep -qiE 'usage|codebase-memory-mcp'; then
+    if printf '%s' "$RB_OUT" | grep -qiE 'usage|codebase-memory-mcp-neo4j'; then
         pass "help"
     else
         fail "help" "no usage text in --help output"

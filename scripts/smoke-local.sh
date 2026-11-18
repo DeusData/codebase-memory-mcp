@@ -5,7 +5,7 @@ set -euo pipefail
 # plain `scripts/smoke-test.sh <binary>` skips without an artifact fixture.
 #
 # Usage: scripts/smoke-local.sh <binary> [ui]
-#   <binary>  product binary to smoke (e.g. build/c/codebase-memory-mcp)
+#   <binary>  product binary to smoke (e.g. build/c/codebase-memory-mcp-neo4j)
 #   ui        optional: mirror the -ui variant asset naming
 
 usage() {
@@ -20,7 +20,7 @@ update E2E) inside a disposable HOME/XDG/TMPDIR sandbox with every agent-config
 destination override neutralized.
 
 Arguments:
-  <binary>     Product binary to smoke (e.g. build/c/codebase-memory-mcp).
+  <binary>     Product binary to smoke (e.g. build/c/codebase-memory-mcp-neo4j).
 
 Environment:
   SMOKE_REQUIRE_UI=1   Phase 15's "no embedded assets" SKIP becomes a FAILURE.
@@ -120,7 +120,7 @@ trap cleanup EXIT
 
 mkdir -p "$FIXTURE_DIR" "$SMOKE_TEMP_DIR" "$SMOKE_HOME" "$SMOKE_XDG_CONFIG" \
     "$SMOKE_APPDATA" "$SMOKE_LOCALAPPDATA"
-cp "$BINARY" "$FIXTURE_DIR/codebase-memory-mcp"
+cp "$BINARY" "$FIXTURE_DIR/codebase-memory-mcp-neo4j"
 if [ -n "$ARTIFACT_DIR" ]; then
     cp "$ARTIFACT_DIR/LICENSE" \
         "$ARTIFACT_DIR/install.sh" "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
@@ -132,15 +132,15 @@ fi
 # Member set and ORDER mirror scripts/package-release.sh (the Windows
 # single-binary contract locks that order); a fixture with a different inventory
 # would smoke a release layout we never ship.
-EXPECTED_ARTIFACT="codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
+EXPECTED_ARTIFACT="codebase-memory-mcp-neo4j-${OS}-${ARCH}.tar.gz"
 tar -czf "$FIXTURE_DIR/$EXPECTED_ARTIFACT" -C "$FIXTURE_DIR" \
-    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+    codebase-memory-mcp-neo4j LICENSE install.sh THIRD_PARTY_NOTICES.md
 
 # Linux install/update resolves the portable release asset even when this local
 # smoke started from the dynamic production binary.
 if [ "$OS" = "linux" ]; then
     cp "$FIXTURE_DIR/$EXPECTED_ARTIFACT" \
-        "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz"
+        "$FIXTURE_DIR/codebase-memory-mcp-neo4j-${OS}-${ARCH}-portable.tar.gz"
 fi
 (cd "$FIXTURE_DIR" && { sha256sum *.tar.gz > checksums.txt 2>/dev/null ||
     shasum -a 256 *.tar.gz > checksums.txt; })
@@ -213,7 +213,7 @@ env \
     TEMP="$SMOKE_TEMP_DIR" \
     TMP="$SMOKE_TEMP_DIR" \
     SHELL="/bin/sh" \
-    CBM_CACHE_DIR="$WORK_DIR/cache" \
+    CBM_NEO4J_CACHE_DIR="$WORK_DIR/cache" \
     SMOKE_TEMP_ROOT="$SMOKE_TEMP_DIR" \
     SMOKE_DOWNLOAD_URL="http://127.0.0.1:$PORT" \
     SMOKE_UPDATE_FIXTURE_DIR="$FIXTURE_DIR" \

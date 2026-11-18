@@ -1,12 +1,16 @@
-# codebase-memory-mcp: local code intelligence for AI agents via MCP
+# codebase-memory-mcp-neo4j: local code intelligence for AI agents via MCP
 
 > **Fork notice.** This is [haiderRizvii/codebase-memory-mcp](https://github.com/haiderRizvii/codebase-memory-mcp), a fork of
 > [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) that adds a
 > [Neo4j graph backend](#neo4j-graph-backend) and [Docker-based graph builds](docker/graph/README.md).
-> The install commands below install **this fork**, and `codebase-memory-mcp update` keeps
+> The install commands below install **this fork**, and `codebase-memory-mcp-neo4j update` keeps
 > updating from it. Releases are built by `.github/workflows/fork-release.yml`; unlike
 > upstream releases they are not VirusTotal-scanned unless that workflow's `virustotal`
 > option is used. The badges below describe the upstream project.
+
+The fork installs as **`codebase-memory-mcp-neo4j`**, with MCP ID
+**`codebase-memory-neo4j`**, so upstream can remain installed. See
+[coexistence, migration, and release requirements](docs/FORK_COEXISTENCE.md).
 
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -24,7 +28,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
 [![Join the community on Discord](https://img.shields.io/badge/Discord-Join_the_community-5865F2?logo=discord&logoColor=white)](https://discord.gg/KguGXxg2X)
 
-**Understand your repository, from source code to the systems around it.** codebase-memory-mcp is an MCP server that connects code, documentation, configuration, and infrastructure in a persistent local knowledge graph. Use it to find an unfamiliar feature, follow a call across services, trace a deployment back to its source, or assess which parts of a project a change could affect.
+**Understand your repository, from source code to the systems around it.** codebase-memory-mcp-neo4j is an MCP server that connects code, documentation, configuration, and infrastructure in a persistent local knowledge graph. Use it to find an unfamiliar feature, follow a call across services, trace a deployment back to its source, or assess which parts of a project a change could affect.
 
 Give your coding agent structural context through [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), or query the graph directly from the CLI. **The MCP server is the core of the project.** Its optional visual companion, **CBM Lens, is in open beta (v0.0.1)**, with a source reader, architecture maps, the Galaxy graph, coverage diagnostics, architecture decisions, and local code chat.
 
@@ -63,7 +67,7 @@ The native C backend exposes **17 MCP tools**, parses [languages and file format
 
 The high-resolution GIFs show CBM Lens Beta on 20 October 2026; the still images were captured on 12–13 October. All show public source from this repository. See [capture details](docs/images/README.md) for each capture's build, indexed scope and recording setup.
 
-## Why codebase-memory-mcp
+## Why codebase-memory-mcp-neo4j
 
 - **Find the right code with context**: combine symbol, text, and semantic search with callers, dependencies, source snippets, and file outlines. Targeted queries and compact, paged results can reduce token use and repeated file reads; see [Performance](#performance) for scoped measurements.
 - **Connect documentation to implementation**: index document sections, PDF text pages, architecture decisions, and supported references into code. Find the explanation alongside the symbol.
@@ -81,7 +85,7 @@ The high-resolution GIFs show CBM Lens Beta on 20 October 2026; the still images
 curl -fsSL https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/install.sh | bash
 ```
 
-The standard native release includes CBM Lens. Start it after installation with `codebase-memory-mcp daemon start --open --port=9749`. The [Nix packages](#nix-flake) and [source builds](#build-from-source) also offer builds without the UI.
+The standard native release includes CBM Lens. Start it after installation with `codebase-memory-mcp-neo4j daemon start --open --port=9750`. The [Nix packages](#nix-flake) and [source builds](#build-from-source) also offer builds without the UI.
 
 **Windows** (PowerShell):
 ```powershell
@@ -117,19 +121,19 @@ Restart your coding agent. Say **"Index this project"**: done.
 <summary>Manual install</summary>
 
 1. **Download** the archive for your platform from the [latest release](https://github.com/haiderRizvii/codebase-memory-mcp/releases/latest):
-   - `codebase-memory-mcp-<os>-<arch>.tar.gz` (macOS/Linux) or `.zip` (Windows)
+   - `codebase-memory-mcp-neo4j-<os>-<arch>.tar.gz` (macOS/Linux) or `.zip` (Windows)
 
 2. **Extract and install** (each archive includes `install.sh` or `install.ps1`):
 
    macOS / Linux:
    ```bash
-   tar xzf codebase-memory-mcp-*.tar.gz
+   tar xzf codebase-memory-mcp-neo4j-*.tar.gz
    ./install.sh
    ```
 
    Windows (PowerShell):
    ```powershell
-   Expand-Archive codebase-memory-mcp-windows-amd64.zip -DestinationPath .
+   Expand-Archive codebase-memory-mcp-neo4j-windows-amd64.zip -DestinationPath .
    Unblock-File .\install.ps1
    .\install.ps1
    ```
@@ -157,19 +161,19 @@ Hook augmentation is context-only and fail-open: it does not replace or block th
 
 CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and a session-managed daemon stops after the final session. A daemon started with `daemon start` remains running until stopped. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
 
-The detached daemon does not depend on an MCP frontend's stderr. It keeps owner-only durable records under the canonical `${CBM_CACHE_DIR}/logs` directory (default `~/.cache/codebase-memory-mcp/logs`):
+The detached daemon does not depend on an MCP frontend's stderr. It keeps owner-only durable records under the canonical `${CBM_NEO4J_CACHE_DIR}/logs` directory (default `~/.cache/codebase-memory-mcp-neo4j/logs`):
 
 | File | Contents |
 |------|----------|
-| `cbm-daemon.log` | Daemon lifecycle, watcher/indexing, UI, resource, and error events. |
+| `cbm-neo4j-daemon.log` | Daemon lifecycle, watcher/indexing, UI, resource, and error events. |
 | `daemon-conflicts.ndjson` | Exact-build, coordination-ABI, and cache-root admission conflicts. |
 | `activation-events.ndjson` | Install/update/uninstall activation progress and outcomes. |
 
 Thin frontends still write immediate startup and session-specific errors to their own stderr; MCP JSON-RPC stdout remains clean.
 
-All active CBM processes must run the exact same version, executable build, coordination ABI, and canonical cache root. Equivalent `CBM_CACHE_DIR` aliases resolve to the same root; a genuinely different root is rejected while any CBM process is active. MCP servers, hooks, one-shot CLI commands, temporary index workers, and the daemon share a crash-safe OS admission barrier; starting an ordinary conflicting process fails before doing work and records an explicit conflict in `${CBM_CACHE_DIR}/logs/daemon-conflicts.ndjson`.
+All active CBM processes must run the exact same version, executable build, coordination ABI, and canonical cache root. Equivalent `CBM_NEO4J_CACHE_DIR` aliases resolve to the same root; a genuinely different root is rejected while any CBM process is active. MCP servers, hooks, one-shot CLI commands, temporary index workers, and the daemon share a crash-safe OS admission barrier; starting an ordinary conflicting process fails before doing work and records an explicit conflict in `${CBM_NEO4J_CACHE_DIR}/logs/daemon-conflicts.ndjson`.
 
-The native `install` and `uninstall` commands are the deliberate exception to that conflict rule. For installation, download, verification, and private same-filesystem staging finish before activation so a bad candidate never disrupts active work. The native `update` command prints the installer command that performs the update. Activation then publishes account-wide maintenance intent, asks the daemon and every temporary local operation to cancel, and waits to a finite deadline for all coordinated CBM processes to exit. It holds the admission and lifetime barriers exclusively while changing the active binary, configuration, PATH, or indexes. New CBM work cannot enter during this window. Activation progress and results are recorded in `${CBM_CACHE_DIR}/logs/activation-events.ndjson`, and a successful command tells you to restart open coding-agent sessions so they launch the activated build.
+The native `install` and `uninstall` commands are the deliberate exception to that conflict rule. For installation, download, verification, and private same-filesystem staging finish before activation so a bad candidate never disrupts active work. The native `update` command prints the installer command that performs the update. Activation then publishes account-wide maintenance intent, asks the daemon and every temporary local operation to cancel, and waits to a finite deadline for all coordinated CBM processes to exit. It holds the admission and lifetime barriers exclusively while changing the active binary, configuration, PATH, or indexes. New CBM work cannot enter during this window. Activation progress and results are recorded in `${CBM_NEO4J_CACHE_DIR}/logs/activation-events.ndjson`, and a successful command tells you to restart open coding-agent sessions so they launch the activated build.
 
 Package-manager setup (npm, PyPI, or Go) verifies and caches the native executable for that package. It does not replace the active native installation and therefore does not stop running CBM sessions. When that cached binary is executed, it still enters the same exact-build admission barrier. The shell and PowerShell installers invoke the verified candidate's native `install` command, so they do receive the full account-wide activation guarantee.
 
@@ -180,10 +184,10 @@ The ordinary `cli` mode runs one command locally, but it is not disconnected fro
 **CBM Lens is an optional visual companion to the MCP server, currently in open beta (v0.0.1).** Standard native releases include its browser interface, so you can launch Lens directly after installation; UI-enabled source builds include it too. It builds on [CodeAtlasWeb](graph-ui/README.md) by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) (design and tracking in #1964). Lens is served on loopback. Browser AI downloads its optional model only after you enable it; inference stays on-device. Each panel names where its facts come from, and what the index did not record is shown as a gap. Start the local server:
 
 ```bash
-codebase-memory-mcp daemon start --open --port=9749
+codebase-memory-mcp-neo4j daemon start --open --port=9750
 ```
 
-The browser opens at `http://127.0.0.1:9749`. A permanent daemon keeps the UI available after the command exits. Use `daemon status` to inspect it and `daemon stop` when you are finished. For an MCP session, `--ui=true --port=9749` enables the same shared UI. Active clients must use the same executable build and cache directory.
+The browser opens at `http://127.0.0.1:9750`. A permanent daemon keeps the UI available after the command exits. Use `daemon status` to inspect it and `daemon stop` when you are finished. For an MCP session, `--ui=true --port=9750` enables the same shared UI. Active clients must use the same executable build and cache directory.
 
 **Open your first repository**
 
@@ -251,14 +255,14 @@ Activity comes from explicitly configured tool hooks. The bundled adapter suppor
 
 </details>
 
-For troubleshooting, open System logs. Frontend errors and failed requests are recorded locally. `GET /api/ui-log` reads frontend entries from the daemon's SQLite journal; `${CBM_CACHE_DIR}/logs/ui.log` is also retained as a rotating JSONL export. See the [frontend README](graph-ui/README.md) for log scope, model setup, and development details.
+For troubleshooting, open System logs. Frontend errors and failed requests are recorded locally. `GET /api/ui-log` reads frontend entries from the daemon's SQLite journal; `${CBM_NEO4J_CACHE_DIR}/logs/ui.log` is also retained as a rotating JSONL export. See the [frontend README](graph-ui/README.md) for log scope, model setup, and development details.
 
 ### Auto-Index
 
 Enable automatic indexing on MCP session start:
 
 ```bash
-codebase-memory-mcp config set auto_index true
+codebase-memory-mcp-neo4j config set auto_index true
 ```
 
 `auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched through `auto_watch` (on by default), subject to its global setting and session ownership.
@@ -267,13 +271,13 @@ Each initialized, long-lived MCP session can register its root project when it c
 
 Watcher registration is controlled globally by `auto_watch` (default `true`). On the next refresh or registration request, `true` allows MCP sessions to register their root on connect and their successful `index_repository` targets; `false` removes all watches. CLI indexing and failed MCP indexes do not add watches.
 
-To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which takes effect on the next refresh or registration request, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
+To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which takes effect on the next refresh or registration request, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp-neo4j daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
 The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
 ### Keeping Up to Date
 
-**Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
+**Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp-neo4j update` validates your flags and then prints the exact command to run:
 
 ```bash
 # macOS / Linux
@@ -291,22 +295,22 @@ Why it works this way. On Windows it is a hard requirement; a running executable
 
 If PowerShell refuses to run the script because the file came from the internet, `Unblock-File` it first.
 
-Installed through **npm or pip**? Update with your package manager on every platform (`npm install -g codebase-memory-mcp@latest` / `pip install -U codebase-memory-mcp`).
+Installed through **npm or pip**? Update with your package manager on every platform (`npm install -g codebase-memory-mcp-neo4j@latest` / `pip install -U codebase-memory-mcp-neo4j`).
 
 ### Uninstall
 
 ```bash
-codebase-memory-mcp uninstall
+codebase-memory-mcp-neo4j uninstall
 ```
 
 Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and **kept by default**. `-y`/`--yes`, `-n`/`--no`, and noninteractive input keep them unless `--delete-indexes` is explicitly given. An interactive terminal without that flag is asked separately; the default answer is to keep them.
 
 ```bash
-codebase-memory-mcp uninstall -y --delete-indexes   # also delete every project index
-codebase-memory-mcp uninstall --dry-run --delete-indexes   # preview; change nothing
+codebase-memory-mcp-neo4j uninstall -y --delete-indexes   # also delete every project index
+codebase-memory-mcp-neo4j uninstall --dry-run --delete-indexes   # preview; change nothing
 ```
 
-`--delete-indexes` is explicit consent and takes precedence over `--no`; `--dry-run` always preserves the files. When indexes are kept, uninstall prints their cache directory (`${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}`) and how to remove them.
+`--delete-indexes` is explicit consent and takes precedence over `--no`; `--dry-run` always preserves the files. When indexes are kept, uninstall prints their cache directory (`${CBM_NEO4J_CACHE_DIR:-~/.cache/codebase-memory-mcp-neo4j}`) and how to remove them.
 
 The install script placed beside the binary is **reported, not deleted**: uninstall prints its path and the `rm` command for it. It is left alone on purpose: it may be your own copy, a symlink into a checkout, or managed by a package manager, and an uninstaller should not delete a file it cannot prove it owns.
 
@@ -369,7 +373,7 @@ Use the graph to explain which tests a change reaches, and use that evidence to 
 | **CI job selection** | Chooses jobs from the changed-file list. | Repository-specific path and job rules; this repository's selector is an example. |
 | **Test selection** | Combines static reachability, changed tests, and admitted per-test coverage to select suites or tests. | A supported C/C++ test harness, configuration, a coverage map, and a runner that accepts named selections. |
 
-`codebase-memory-mcp test-impact select` produces a selection with reasons; `test-impact publish` produces the graph-and-coverage bundle used as its baseline. For agent-assisted investigation, `detect_changes` with `scope: "tests"` exposes test impact through MCP.
+`codebase-memory-mcp-neo4j test-impact select` produces a selection with reasons; `test-impact publish` produces the graph-and-coverage bundle used as its baseline. For agent-assisted investigation, `detect_changes` with `scope: "tests"` exposes test impact through MCP.
 
 **Narrowing currently supports C/C++ family code with this repository's test conventions or declared equivalents.** It is not general test selection for every language CBM indexes. Missing, stale, incompatible, or incomplete evidence broadens the selection or returns `run_all`; static reachability without admitted coverage never omits a suite. Begin with report-only shadow mode and validate your harness before enabling gating.
 
@@ -409,10 +413,10 @@ In this repository, test narrowing is wired to the Linux x86_64 test leg when `T
 - **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
 
 ### Distribution & operation
-- **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp-neo4j/`
 - **Auto-sync**: Background watcher detects file changes in projects registered by active MCP sessions, including successful explicit `index_repository` targets, and re-indexes them automatically.
 - **Route nodes**: REST endpoints are first-class graph entities
-- **CLI mode**: `codebase-memory-mcp cli search_graph --project my-project --name-pattern ".*Handler.*"`
+- **CLI mode**: `codebase-memory-mcp-neo4j cli search_graph --project my-project --name-pattern ".*Handler.*"`
 - **Available on**: npm, PyPI, Homebrew, Scoop, AUR, `go install`
 
 ### Indexing modes
@@ -428,21 +432,21 @@ In this repository, test narrowing is wired to the Linux x86_64 test leg when `T
 
 Share a compressed graph snapshot so teammates can reuse an indexed baseline.
 
-`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. The artifact is opt-in: `index_repository` writes it only with `persistence: true` (the default is `false`), and once it exists later indexes refresh it. Local indexes persist regardless. When a teammate indexes a clone with an existing artifact, CBM imports that baseline and applies their local changes incrementally.
+`.codebase-memory-neo4j/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. The artifact is opt-in: `index_repository` writes it only with `persistence: true` (the default is `false`), and once it exists later indexes refresh it. Local indexes persist regardless. When a teammate indexes a clone with an existing artifact, CBM imports that baseline and applies their local changes incrementally.
 
 - **Format**: SQLite database, indexes stripped, `VACUUM INTO` compacted, then zstd 1.5.7 compressed (8 to 13:1 ratio typical)
 - **Two tiers**:
   - **Best** (`zstd -9` + index strip + `VACUUM INTO`); written by `index_repository` with `persistence: true`
   - **Fast** (`zstd -3`); refreshes an existing artifact on every other index, including the watcher's low-latency incremental updates
 - **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing, reusing the shared baseline where possible
-- **Merge policy**: the first export creates `.codebase-memory/.gitattributes` with `merge=ours`. Check your repository's Git merge-driver setup before relying on it for concurrent artifact updates.
+- **Merge policy**: the first export creates `.codebase-memory-neo4j/.gitattributes` with `merge=ours`. Check your repository's Git merge-driver setup before relying on it for concurrent artifact updates.
 - **Commit it deliberately**: the artifact is rewritten on every index, including the watcher's Fast tier, and git stores each rewrite as a full new blob. Committing every refresh is what turns a 20 MB file into gigabytes of history; one team reached ~6 GB across ~350 commits of this single path. Pick a cadence (a release, a milestone, a nightly job) rather than committing every save.
-- **Git LFS, if it must move on every commit**: track it from the **repo-root** `.gitattributes` and leave the auto-created `.codebase-memory/.gitattributes` in place; the nearer file goes on supplying `merge=ours`, and only `filter` comes from the root:
+- **Git LFS, if it must move on every commit**: track it from the **repo-root** `.gitattributes` and leave the auto-created `.codebase-memory-neo4j/.gitattributes` in place; the nearer file goes on supplying `merge=ours`, and only `filter` comes from the root:
   ```gitattributes
-  .codebase-memory/graph.db.zst filter=lfs diff=lfs merge=lfs -text
+  .codebase-memory-neo4j/graph.db.zst filter=lfs diff=lfs merge=lfs -text
   ```
   Track only the `.zst`; `artifact.json` is small and carries the schema version. The attribute applies to future commits only. Removing existing blobs requires a separate history migration. Two costs to weigh before adopting it: GitHub meters LFS storage and bandwidth, and its objects cannot be pruned without contacting support; and every teammate needs `git lfs install`; without it their checkout leaves a pointer file where the artifact should be, the integrity-checked import refuses it, and they fall back to a full reindex.
-- **Optional**: shared export is opt-in, and Git commits remain your choice. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
+- **Optional**: shared export is opt-in, and Git commits remain your choice. Add `.codebase-memory-neo4j/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
 The artifact provides a shared baseline while each developer keeps a local query database.
 
@@ -451,7 +455,7 @@ The artifact provides a shared baseline while each developer keeps a local query
 Store a project's graph in Neo4j and have the graph tools read it from there.
 
 ```bash
-codebase-memory-mcp cli index_repository --repo-path /path/to/repo \
+codebase-memory-mcp-neo4j cli index_repository --repo-path /path/to/repo \
   --graph-db http://neo4j-host:7474 --graph-user neo4j --graph-password '***' \
   [--graph-database neo4j]
 ```
@@ -479,6 +483,9 @@ codebase-memory-mcp cli index_repository --repo-path /path/to/repo \
   If Neo4j cannot serve the project, graph tools return an error (`graph_backend.status: unavailable`, with the reason) instead of answering from the local copy. `index_status`, `list_projects`, `index_repository` and `delete_project` keep working, so the cause can be seen and fixed.
 
   The daemon log (`<cache>/logs/cbm-daemon.log`) records the same per call (`graph.backend tool=… served_by=… remote_queries=N`). With `CBM_LOG_LEVEL=debug` it also logs each Cypher round trip (`neo4j.query`).
+- **Delta sync**: a re-index sends Neo4j only the nodes and edges that changed since the last sync (added, changed or removed), in place and in **one Neo4j transaction**, so readers see either the old graph or the new one. Nodes that did not change are not rewritten. The local record `<cache>/<project>.db.neo4j-state.db` (one id and row hash per node and edge, about 30–40 bytes per row) says what Neo4j holds. Rows are compared by id and full content, so it works across re-indexes that rewrite the SQLite file (they keep the ids of unchanged rows). How much a delta saves depends on the change: editing existing files keeps every other row's id, so only the changed rows are sent (measured: 2–9 rows for a method edit or rename in a 1,750-row graph). Adding or removing a file currently makes the indexer renumber ids, so that re-index sends most of the graph, or, past the limit below, falls back to a full upload. The delta is used only when that record provably matches Neo4j: Neo4j's `CbmProject` still carries the generation, graph number and counts the record was written for. That check runs again inside the delta's transaction, so a concurrent change makes the delta roll back. Otherwise the sync is a full upload, which rewrites the record. This happens on the first sync, after the graph was changed or deleted in Neo4j, or when the change exceeds `CBM_NEO4J_DELTA_MAX_ROWS` rows (default 50000; `0` turns the delta off) or 32 MB. `index_status` shows what the last sync did in `graph_backend.last_sync`, for example `delta: nodes +3 ~12 -1, edges +9 ~0 -4 (graph: …)` or `full: … (reason)`. Deleting the record is safe: the next sync is then full.
+- **Consistency**: a full sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. There is no fallback: if Neo4j is down, rejects the login, or holds an older generation (a failed sync), graph reads fail with the reason, and an index run that cannot sync to Neo4j fails too, including a plain re-index or the watcher's auto-refresh of a Neo4j-backed project. `index_status` reports `graph_backend.status` as `serving` or `unavailable` with the reason, plus `in_sync` and `last_sync_error`.
+  The daemon log (`<cache>/logs/cbm-neo4j-daemon.log`) records the same per call (`graph.backend tool=… served_by=… remote_queries=N`). With `CBM_LOG_LEVEL=debug` it also logs each Cypher round trip (`neo4j.query`).
 - **Consistency**: each sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. There is no fallback: if Neo4j is down, rejects the login, or holds an older generation (a failed sync), graph reads fail with the reason, and an index run that cannot sync to Neo4j fails too, including a plain re-index or the watcher's auto-refresh of a Neo4j-backed project. `index_status` reports `graph_backend.status` as `serving` or `unavailable` with the reason, plus `in_sync` and `last_sync_error`.
 - **Login safety**: an indexed project first uses the login it was last synced with, then `NEO4J_PASSWORD`. After Neo4j rejects a login, the same credentials are not retried for 60 s, because every rejected attempt counts toward Neo4j's lockout, which would then refuse the correct password too.
 - **Renamed databases**: a project's database found under another file name still uses Neo4j. Its marker is also looked up by project name.
@@ -491,14 +498,14 @@ codebase-memory-mcp cli index_repository --repo-path /path/to/repo \
 
 ## How It Works
 
-codebase-memory-mcp is a **structural analysis backend**: it builds and queries the knowledge graph. The backend does not require a generative model. It relies on your MCP client (Claude Code, or any MCP-compatible agent) to be the intelligence layer.
+codebase-memory-mcp-neo4j is a **structural analysis backend**: it builds and queries the knowledge graph. The backend does not require a generative model. It relies on your MCP client (Claude Code, or any MCP-compatible agent) to be the intelligence layer.
 
 ```
 You: "what calls ProcessOrder?"
 
 Agent calls: trace_path(function_name="ProcessOrder", direction="inbound")
 
-codebase-memory-mcp: executes graph query, returns structured results
+codebase-memory-mcp-neo4j: executes graph query, returns structured results
 
 Agent: presents the call chain in plain English
 ```
@@ -527,11 +534,11 @@ Explore the [measurement guide](docs/MEASURING_SAVINGS.md) to evaluate quality, 
 
 ## Troubleshooting & Diagnostics
 
-codebase-memory-mcp **indexes and queries locally and collects no telemetry**. When you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no diagnostic data unless you choose to send it.** Here is how to capture it yourself.
+codebase-memory-mcp-neo4j **indexes and queries locally and collects no telemetry**. When you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no diagnostic data unless you choose to send it.** Here is how to capture it yourself.
 
 ### Capture a diagnostics log
 
-Set `CBM_DIAGNOSTICS=1` before the first daemon-backed MCP session starts, then reproduce the problem (let it run as long as it takes; a slow leak needs time to show in the trend). The shared daemon captures this setting from the session that starts it. If it is already running, close all daemon-backed sessions so it exits before changing the setting. The daemon creates a fresh owner-private `cbm-diagnostics-<pid>-<random>` directory below the system temp directory (`$TMPDIR` or `/tmp` on macOS/Linux, `%TEMP%` on Windows). The exact paths are recorded by the `diagnostics.start` event in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`:
+Set `CBM_DIAGNOSTICS=1` before the first daemon-backed MCP session starts, then reproduce the problem (let it run as long as it takes; a slow leak needs time to show in the trend). The shared daemon captures this setting from the session that starts it. If it is already running, close all daemon-backed sessions so it exits before changing the setting. The daemon creates a fresh owner-private `cbm-diagnostics-<pid>-<random>` directory below the system temp directory (`$TMPDIR` or `/tmp` on macOS/Linux, `%TEMP%` on Windows). The exact paths are recorded by the `diagnostics.start` event in `${CBM_NEO4J_CACHE_DIR}/logs/cbm-neo4j-daemon.log`:
 
 | File | What it is |
 |------|------------|
@@ -550,11 +557,11 @@ When you open a memory/performance issue, **attach the `.ndjson` trajectory**: i
 
 | Platform | Archive |
 |----------|---------|
-| macOS (Apple Silicon) | `codebase-memory-mcp-darwin-arm64.tar.gz` |
-| macOS (Intel) | `codebase-memory-mcp-darwin-amd64.tar.gz` |
-| Linux (x86_64) | `codebase-memory-mcp-linux-amd64.tar.gz` |
-| Linux (ARM64) | `codebase-memory-mcp-linux-arm64.tar.gz` |
-| Windows (x86_64) | `codebase-memory-mcp-windows-amd64.zip` |
+| macOS (Apple Silicon) | `codebase-memory-mcp-neo4j-darwin-arm64.tar.gz` |
+| macOS (Intel) | `codebase-memory-mcp-neo4j-darwin-amd64.tar.gz` |
+| Linux (x86_64) | `codebase-memory-mcp-neo4j-linux-amd64.tar.gz` |
+| Linux (ARM64) | `codebase-memory-mcp-neo4j-linux-arm64.tar.gz` |
+| Windows (x86_64) | `codebase-memory-mcp-neo4j-windows-amd64.zip` |
 
 Every release includes `checksums.txt` with SHA-256 hashes. The executable is self-contained; no adjacent data file is required. Linux `-portable` archives contain the fully static builds; ordinary platform archives use their native system ABI.
 
@@ -582,14 +589,14 @@ irm https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/scri
 ### AUR (Arch Linux)
 
 ```bash
-yay -S codebase-memory-mcp-bin
+yay -S codebase-memory-mcp-neo4j-bin
 ```
 
 ```bash
-paru -S codebase-memory-mcp-bin
+paru -S codebase-memory-mcp-neo4j-bin
 ```
 
-The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org/packages/codebase-memory-mcp-bin
+The `codebase-memory-mcp-neo4j-bin` package is available at: https://aur.archlinux.org/packages/codebase-memory-mcp-neo4j-bin
 
 ### Nix (flake)
 
@@ -597,8 +604,8 @@ The flake exposes two server packages plus the standalone frontend:
 
 | Package | Contents |
 |---------|----------|
-| `default` (`codebase-memory-mcp`) | Standard server, no UI |
-| `codebase-memory-mcp-ui` | Server with CBM Lens embedded (`--ui=true` works) |
+| `default` (`codebase-memory-mcp-neo4j`) | Standard server, no UI |
+| `codebase-memory-mcp-neo4j-ui` | Server with CBM Lens embedded (`--ui=true` works) |
 | `graph-ui` | Just the built CBM Lens assets (`dist/`) |
 
 Run directly without installing:
@@ -608,20 +615,20 @@ Run directly without installing:
 nix run github:DeusData/codebase-memory-mcp
 
 # Server with CBM Lens embedded
-nix run github:DeusData/codebase-memory-mcp#codebase-memory-mcp-ui -- --ui=true --port=9749
-# then open http://127.0.0.1:9749
+nix run github:DeusData/codebase-memory-mcp#codebase-memory-mcp-neo4j-ui -- --ui=true --port=9750
+# then open http://127.0.0.1:9750
 ```
 
-Or build a binary into `./result/bin/codebase-memory-mcp`:
+Or build a binary into `./result/bin/codebase-memory-mcp-neo4j`:
 
 ```bash
 nix build github:DeusData/codebase-memory-mcp                          # standard
-nix build github:DeusData/codebase-memory-mcp#codebase-memory-mcp-ui   # with UI
+nix build github:DeusData/codebase-memory-mcp#codebase-memory-mcp-neo4j-ui   # with UI
 ```
 
-Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-memory-mcp-ui -- --ui=true`, or drop into a shell that puts the binary on `PATH` with `nix shell .#codebase-memory-mcp-ui`.
+Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-memory-mcp-neo4j-ui -- --ui=true`, or drop into a shell that puts the binary on `PATH` with `nix shell .#codebase-memory-mcp-neo4j-ui`.
 
-> **Note:** launched by hand (not from an MCP client) the server exits as soon as `stdin` closes; that's normal MCP behaviour. Keep `stdin` open while testing the UI, e.g. `sleep infinity | codebase-memory-mcp --ui=true --port=9749`. The `codebase-memory-mcp-ui` package embeds the UI at build time; `nix run`'ing the standard `default` package with `--ui=true` will refuse to start the HTTP server.
+> **Note:** launched by hand (not from an MCP client) the server exits as soon as `stdin` closes; that's normal MCP behaviour. Keep `stdin` open while testing the UI, e.g. `sleep infinity | codebase-memory-mcp-neo4j --ui=true --port=9750`. The `codebase-memory-mcp-neo4j-ui` package embeds the UI at build time; `nix run`'ing the standard `default` package with `--ui=true` will refuse to start the HTTP server.
 
 ### Install via Claude Code
 
@@ -649,7 +656,7 @@ git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh --with-ui          # the shipped composition (CBM Lens embedded, needs Node.js)
 scripts/build.sh                    # without the UI (development only)
-# Binary at: build/c/codebase-memory-mcp   (codebase-memory-mcp.exe on Windows)
+# Binary at: build/c/codebase-memory-mcp-neo4j   (codebase-memory-mcp-neo4j.exe on Windows)
 ```
 
 The `--with-ui` build embeds CBM Lens and the agent integration templates into the native executable. You do not need Node.js to run that executable. Optional browser model weights are downloaded separately after opt-in.
@@ -684,7 +691,7 @@ npm run build
 npm run dev
 ```
 
-The dev server listens on port 5173 and proxies `/api` and `/rpc` to port 9749. Start the matching CBM backend first.
+The dev server listens on port 5173 and proxies `/api` and `/rpc` to port 9750. Start the matching CBM backend first.
 
 Package wrappers have their own test commands: `go test ./...` in `pkg/go`, `npm test` in `pkg/npm`, and `python3 -m unittest discover -s tests -p 'test_*.py'` in `pkg/pypi`. The Go wrapper requires Go 1.26.1 or newer.
 
@@ -708,15 +715,15 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "codebase-memory-mcp": {
-      "command": "/path/to/codebase-memory-mcp",
+    "codebase-memory-neo4j": {
+      "command": "/path/to/codebase-memory-mcp-neo4j",
       "args": []
     }
   }
 }
 ```
 
-Restart your agent. Verify with `/mcp`; you should see `codebase-memory-mcp` with 17 tools.
+Restart your agent. Verify with `/mcp`; you should see `codebase-memory-mcp-neo4j` with 17 tools.
 
 </details>
 
@@ -761,21 +768,21 @@ overwrite user-modified agents.
 | Kiro | Detected | `$KIRO_HOME/settings/mcp.json` | Steering, skill, three JSON agents with isolated Scout/Analysis-profile MCP and explicit graph-tool selectors (`includeMcpJson: false`) |
 | Junie | Detected | `.junie/mcp/mcp.json` | Skill + three graph subagents for EAP-capable builds; Scout and Analysis server aliases hard-limit the tier tool surfaces; no ineffective EAP `SessionStart` hook |
 | Hermes | Detected | `$HERMES_HOME/config.yaml` | Skill + fail-open `pre_llm_call` context augmentation |
-| OpenHands | Detected | `.openhands/mcp.json` | Shared `.agents/skills/codebase-memory/SKILL.md` |
+| OpenHands | Detected | `.openhands/mcp.json` | Shared `.agents/skills/codebase-memory-neo4j/SKILL.md` |
 | Cline | Detected | `~/.cline/mcp.json` + `${CLINE_DATA_DIR:-~/.cline/data}/settings/cline_mcp_settings.json` | Rule + skill; automatic file hooks withheld because they auto-activate and their output is not reliably consumed; child agents cannot use MCP |
-| Warp | Detected, skill only | UI, Warp Drive, or per invocation (manual) | Shared `~/.agents/skills/codebase-memory/SKILL.md` |
+| Warp | Detected, skill only | UI, Warp Drive, or per invocation (manual) | Shared `~/.agents/skills/codebase-memory-neo4j/SKILL.md` |
 | Qwen Code | Detected | `.qwen/settings.json` | `QWEN.md`, skill, three explicit read/graph-tool agents; `SessionStart`, `SubagentStart`, and post-`ReadFile` coverage |
 | GitHub Copilot CLI | Detected | `$COPILOT_HOME/mcp-config.json` | Instructions, skill, three read-only agents; `sessionStart` + `subagentStart` |
 | Factory Droid | Detected | `.factory/mcp.json` | `AGENTS.md`, skill, three droids with exact per-tier graph-tool lists (without additive whole-server exposure); `SessionStart` + post-`Read` coverage on macOS/Linux, withheld on Windows |
 | Crush | Detected | `.config/crush/crush.json` | Managed context path with explicit parent-to-child handoff |
 | Goose | Detected | `.config/goose/config.yaml` | `.goosehints` |
 | Mistral Vibe | Detected | `$VIBE_HOME/config.toml` | `AGENTS.md`, skill, and three matched agent/prompt pairs with explicit read-only graph-tool allowlists |
-| Grok Build | Detected | `$GROK_HOME/config.toml` | Owned `rules/codebase-memory.md`, skill, three graph agents with named-server `mcpInheritance` and exact `server__tool` dispatcher ids; context hooks withheld because its passive hook events discard stdout |
+| Grok Build | Detected | `$GROK_HOME/config.toml` | Owned `rules/codebase-memory-neo4j.md`, skill, three graph agents with named-server `mcpInheritance` and exact `server__tool` dispatcher ids; context hooks withheld because its passive hook events discard stdout |
 | Qoder CLI | Detected | `~/.qoder/settings.json` | Skill, three directly MCP-attached agents with named-server scoping and exact per-tier graph-tool lists; `SessionStart`, `SubagentStart`, and post-`Read` coverage, including documented PowerShell execution on Windows |
 | Kimi Code CLI | Detected | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code`) | Same-root `AGENTS.md` + skill; fail-open `UserPromptSubmit` hook in `config.toml` |
 | GitLab Duo CLI | Detected | `$GLAB_CONFIG_DIR/duo/mcp.json` or platform fallback | Fail-open user `SessionStart` on macOS/Linux; hook withheld on Windows; no experimental global skill enablement |
 | Rovo Dev CLI | Detected | configured override or `~/.rovodev/mcp.json` | Global `AGENTS.md`, skill + three read-only handoff subagents; no undocumented hook |
-| Amp | Detected | `~/.config/agents/skills/codebase-memory/mcp.json` | Colocated skill + `~/.config/amp/AGENTS.md`; no plugin |
+| Amp | Detected | `~/.config/agents/skills/codebase-memory-neo4j/mcp.json` | Colocated skill + `~/.config/amp/AGENTS.md`; no plugin |
 | Devin CLI / Local | Detected | `~/.config/devin/config.json` (platform app-data path on Windows) | Same-root `AGENTS.md` + skill; macOS/Linux `UserPromptSubmit` + `PostCompaction`, and `SessionStart` only when Claude does not already provide it; hooks withheld on Windows |
 | Tabnine | Detected | `~/.tabnine/mcp_servers.json` | MCP only; no experimental/YOLO setting |
 | Continue / cn | Conditional | Existing `~/.continue/config.yaml` or `$CBM_CONTINUE_CONFIG_PATH` | MCP only |
@@ -792,7 +799,7 @@ overwrite user-modified agents.
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
 
 For Codex, install keeps only a tiny managed activation pointer in global
-`$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory` skill.
+`$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory-neo4j` skill.
 Fresh installs create the pointer, upgrades replace the legacy full managed block while preserving
 all user-owned bytes, and uninstall removes only the managed pointer.
 
@@ -862,13 +869,13 @@ documents neither a suitable hook nor a custom-agent surface. Those surfaces are
 not approximated with invented augmentation. Kimi plugins, Amp plugins, and
 GitLab experimental global skills remain opt-in.
 
-OpenClaw reinjects the `Codebase Knowledge Graph (codebase-memory-mcp)` AGENTS
+OpenClaw reinjects the `Codebase Knowledge Graph (codebase-memory-mcp-neo4j)` AGENTS
 section after compaction and places the same guidance in `TOOLS.md`, the bootstrap
 files inherited by its subagents. Automatic augmentation covers the active/default
 workspace. Separate `agents.list[].workspace` directories require making that
 workspace active for installation or copying the managed block there.
 
-The installed Claude shim is named `cbm-code-discovery-gate` for backward
+The installed Claude shim is named `cbm-neo4j-code-discovery-gate` for backward
 compatibility; despite the legacy name, it never gates or blocks.
 
 ### Manual or UI-managed integrations
@@ -900,20 +907,20 @@ Every response is standard UTF-8. Identifiers, paths, and raw search previews pr
 Use `cli <tool> --help` to see the flags generated from that tool's input schema:
 
 ```bash
-codebase-memory-mcp cli index_repository --repo-path /path/to/repo
-codebase-memory-mcp cli list_projects
+codebase-memory-mcp-neo4j cli index_repository --repo-path /path/to/repo
+codebase-memory-mcp-neo4j cli list_projects
 
 # Use the "name" returned by list_projects as the project value.
-codebase-memory-mcp cli search_graph --project my-project --name-pattern '.*Handler.*' --label Function
-codebase-memory-mcp cli trace_path --project my-project --function-name Search --direction both
-codebase-memory-mcp cli query_graph --project my-project --query 'MATCH (f:Function) RETURN f.name LIMIT 5'
+codebase-memory-mcp-neo4j cli search_graph --project my-project --name-pattern '.*Handler.*' --label Function
+codebase-memory-mcp-neo4j cli trace_path --project my-project --function-name Search --direction both
+codebase-memory-mcp-neo4j cli query_graph --project my-project --query 'MATCH (f:Function) RETURN f.name LIMIT 5'
 
 # Force human-readable progress without contaminating stdout.
-codebase-memory-mcp cli --progress index_repository --repo-path /path/to/repo
+codebase-memory-mcp-neo4j cli --progress index_repository --repo-path /path/to/repo
 # Suppress automatic terminal progress and non-error diagnostics.
-codebase-memory-mcp cli --quiet list_projects --format json
-codebase-memory-mcp cli search_graph --project my-project --label Function --format json
-codebase-memory-mcp cli list_projects --format json --detail stats | jq '.projects[].name'
+codebase-memory-mcp-neo4j cli --quiet list_projects --format json
+codebase-memory-mcp-neo4j cli search_graph --project my-project --label Function --format json
+codebase-memory-mcp-neo4j cli list_projects --format json --detail stats | jq '.projects[].name'
 ```
 
 Tools requiring arguments accept JSON piped on stdin. Tools with only optional arguments, such as `list_projects`, accept flags, `--args-file`, or redirected JSON files without waiting on an inherited pipe. Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
@@ -946,12 +953,12 @@ mode instead:
    `cancelled`. Pass the same `repo_path` (and `name`, if the index call used one).
 
 `async` and `status` are exclusive; `async` does not apply to `cross-repo-intelligence`. Both
-need the daemon-backed server (the default `codebase-memory-mcp` entry point). A temporary
-daemon (started on demand rather than by `codebase-memory-mcp daemon start`) stops, and
+need the daemon-backed server (the default `codebase-memory-mcp-neo4j` entry point). A temporary
+daemon (started on demand rather than by `codebase-memory-mcp-neo4j daemon start`) stops, and
 cancels its jobs, when its last client disconnects. A connected MCP session keeps it alive, so
-async from your editor works. A one-shot `codebase-memory-mcp cli index_repository --async`
+async from your editor works. A one-shot `codebase-memory-mcp-neo4j cli index_repository --async`
 that is the daemon's only client is refused with a clear error, because the job would die the
-moment the command exits: run `codebase-memory-mcp daemon start` first, keep an MCP session
+moment the command exits: run `codebase-memory-mcp-neo4j daemon start` first, keep an MCP session
 open, or call without `--async`. `status` works everywhere. When a synchronous call was cut
 short, the next
 `index_repository` or `status` call for that project carries a `notice` suggesting the async
@@ -1015,16 +1022,16 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 ## Configuration
 
 ```bash
-codebase-memory-mcp config list                          # show all settings
-codebase-memory-mcp config set auto_index true           # auto-index on session start
-codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
-codebase-memory-mcp config set auto_watch false          # remove/disable all background watches (default: true)
-codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
-codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
-codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
-codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
-codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
-codebase-memory-mcp config reset auto_index              # reset to default
+codebase-memory-mcp-neo4j config list                          # show all settings
+codebase-memory-mcp-neo4j config set auto_index true           # auto-index on session start
+codebase-memory-mcp-neo4j config set auto_index_limit 50000    # max files for auto-index
+codebase-memory-mcp-neo4j config set auto_watch false          # remove/disable all background watches (default: true)
+codebase-memory-mcp-neo4j config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
+codebase-memory-mcp-neo4j config set watcher_enabled false     # stop the watcher thread entirely (default: true)
+codebase-memory-mcp-neo4j config set watch_non_git true        # also poll non-git project roots (default: false)
+codebase-memory-mcp-neo4j config set index_max_files 250000    # optional per-index source-file limit
+codebase-memory-mcp-neo4j config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp-neo4j config reset auto_index              # reset to default
 ```
 
 The two `index_max_*` settings default to `off`. Exceeding one fails the complete
@@ -1036,20 +1043,20 @@ is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction; but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
-| `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. One account can use only one canonical cache root at a time; close active CBM sessions/commands before switching it. |
+| `CBM_NEO4J_CACHE_DIR` | `~/.cache/codebase-memory-mcp-neo4j` | Override the database storage directory. All project indexes and config are stored here. One account can use only one canonical cache root at a time; close active CBM sessions/commands before switching it. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable the shared daemon's periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. Exact paths are logged by `diagnostics.start`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
-| `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none`; or their numeric equivalents `0` to `4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
+| `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none`; or their numeric equivalents `0` to `4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_NEO4J_CACHE_DIR}/logs/cbm-neo4j-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1 to 256; invalid values are ignored with a warning. |
 | `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the derived default (`ram_fraction × total_RAM`, adjusted for available memory and daemon worker caps). Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
 | `NEO4J_USER` / `NEO4J_PASSWORD` / `NEO4J_DATABASE` | `neo4j` / *(unset)* / `neo4j` | Fallback credentials for the [Neo4j graph backend](#neo4j-graph-backend) when `index_repository` is called without `graph_user` / `graph_password` / `graph_database`. `NEO4J_PASSWORD` is also what lets a restarted daemon read a Neo4j-backed project. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0 to 1; set `0` to disable. Invalid values are ignored with a warning. |
 
-Environment used by daemon-owned components (such as diagnostics, daemon logging, and process-wide indexing resource limits) is captured from the first daemon-backed session that starts the daemon. Later sessions join that process and cannot replace those values. To change them, close all daemon-backed sessions, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running. Its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon; joining an already-running daemon, it inherits that daemon's already-captured values instead.
+Environment used by daemon-owned components (such as diagnostics, daemon logging, and process-wide indexing resource limits) is captured from the first daemon-backed session that starts the daemon. Later sessions join that process and cannot replace those values. To change them, close all daemon-backed sessions, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_NEO4J_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running. Its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon; joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
 ```bash
 # Store indexes in a custom directory
-export CBM_CACHE_DIR=~/my-projects/cbm-data
+export CBM_NEO4J_CACHE_DIR=~/my-projects/cbm-data
 ```
 
 ## Custom File Extensions
@@ -1066,7 +1073,7 @@ Need the full config-file reference? See [docs/CONFIGURATION.md](docs/CONFIGURAT
 
 **Global** (applies to all projects):
 ```json
-// ~/.config/codebase-memory-mcp/config.json  (or $XDG_CONFIG_HOME/...)
+// ~/.config/codebase-memory-mcp-neo4j/config.json  (or $XDG_CONFIG_HOME/...)
 {"extra_extensions": {".twig": "html", ".phtml": "php"}}
 ```
 
@@ -1078,7 +1085,7 @@ Project config overrides global for conflicting extensions. An entry whose langu
 
 ## Persistence
 
-SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
+SQLite databases stored at `~/.cache/codebase-memory-mcp-neo4j/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp-neo4j/`.
 
 ## Troubleshooting
 
@@ -1090,8 +1097,8 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 | `trace_path` returns 0 results | Use `search_graph(name_pattern=".*PartialName.*")` first to find the exact name. |
 | Queries return wrong project results | Add `project="name"` parameter. Use `list_projects` to see names. |
 | Binary not found after install | Add to PATH: `export PATH="$HOME/.local/bin:$PATH"` |
-| UI not loading | Ensure you ran `--ui=true`. Check `http://localhost:9749`. |
-| CBM Lens shows "server unreachable" or "Architecture is not available yet." | Check that `?project=` names an indexed project exactly; pick it from the project menu, or see `list_projects`. Then look at **System**, tab **Logs**, or `${CBM_CACHE_DIR}/logs/ui.log`. |
+| UI not loading | Ensure you ran `--ui=true`. Check `http://localhost:9750`. |
+| CBM Lens shows "server unreachable" or "Architecture is not available yet." | Check that `?project=` names an indexed project exactly; pick it from the project menu, or see `list_projects`. Then look at **System**, tab **Logs**, or `${CBM_NEO4J_CACHE_DIR}/logs/ui.log`. |
 
 ## Hybrid LSP
 
@@ -1099,7 +1106,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 
 Tree-sitter alone gives a syntactic AST. That handles naming, structure, and call sites well, but it can't tell you that `user.profile.display_name()` resolves to `Profile.display_name` declared three modules away; tree-sitter doesn't track imports, generics, inheritance, or stdlib types.
 
-codebase-memory-mcp ships a **lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers** (tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, rust-analyzer), embedded directly into the native executable. No language server process, no per-project setup, no API key. We call this layer **Hybrid LSP**: it runs alongside tree-sitter on every parse and refines invocation resolution (`CALLS` / `RESOLVED_CALLS`) and callable-value resolution (`CALL_REFERENCE`, with ambiguous values retained as `USAGE`) using type information, so the resulting graph mirrors what an IDE "Go to Definition" would resolve.
+codebase-memory-mcp-neo4j ships a **lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers** (tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, rust-analyzer), embedded directly into the native executable. No language server process, no per-project setup, no API key. We call this layer **Hybrid LSP**: it runs alongside tree-sitter on every parse and refines invocation resolution (`CALLS` / `RESOLVED_CALLS`) and callable-value resolution (`CALL_REFERENCE`, with ambiguous values retained as `USAGE`) using type information, so the resulting graph mirrors what an IDE "Go to Definition" would resolve.
 
 **Languages with full Hybrid LSP:**
 

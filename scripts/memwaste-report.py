@@ -16,7 +16,7 @@ binary that produced them, and prints:
   4. CPU work — byte work, I/O, contention, pool imbalance, repeated work.
 
 Usage:
-    memwaste-report.py DUMP.jsonl --binary build/memwaste/codebase-memory-mcp
+    memwaste-report.py DUMP.jsonl --binary build/memwaste/codebase-memory-mcp-neo4j
     memwaste-report.py DUMP.jsonl --binary ... --sort never_written --top 30
     memwaste-report.py DUMP.jsonl --binary ... --json   (for the ratchet)
 """

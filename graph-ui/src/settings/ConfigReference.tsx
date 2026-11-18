@@ -6,10 +6,10 @@ const EXTERNAL_INPUTS = [
         ['.gitignore · .git/info/exclude · Git global excludes', 'Git-owned exclusion rules also affect discovery.'],
     ] },
     { title: 'Global language mappings', timing: 'Next index', description: 'This file is separate from the daemon UI configuration.', items: [
-        ['$XDG_CONFIG_HOME/codebase-memory-mcp/config.json', 'extra_extensions; falls back to ~/.config/codebase-memory-mcp/config.json on Unix, or %APPDATA%/codebase-memory-mcp/config.json on Windows.'],
+        ['$XDG_CONFIG_HOME/codebase-memory-mcp-neo4j/config.json', 'extra_extensions; falls back to ~/.config/codebase-memory-mcp-neo4j/config.json on Unix, or %APPDATA%/codebase-memory-mcp-neo4j/config.json on Windows.'],
     ] },
     { title: 'Launch & access', timing: 'Launch or explicit authorization', description: 'Process locations and access grants cannot be safely changed from the configuration they locate or protect.', items: [
-        ['CBM_CACHE_DIR · CBM_RUNTIME_DIR', 'Choose the index/configuration store and daemon coordination directory before starting CBM.'],
+        ['CBM_NEO4J_CACHE_DIR · CBM_NEO4J_RUNTIME_DIR', 'Choose the index/configuration store and daemon coordination directory before starting CBM.'],
         ['--tool-profile=analysis|scout', 'Restricts the tools available to an MCP session.'],
         ['allow-root · .cbmpathwhitelist · approved_manifests', 'Explicit workspace and manifest authorizations, not ordinary settings.'],
         ['cli --quiet · --progress · --verbose · --json', 'Presentation choices for one command.'],

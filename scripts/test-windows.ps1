@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Run the native-Windows product-surface test suite for codebase-memory-mcp.
+    Run the native-Windows product-surface test suite for codebase-memory-mcp-neo4j.
 
 .DESCRIPTION
     Builds the product binary if it is not already present, stages it under its
@@ -59,7 +59,7 @@
 .EXAMPLE
     pwsh -File scripts/test-windows.ps1
 .EXAMPLE
-    pwsh -File scripts/test-windows.ps1 -GuardsOnly -Binary build\c\codebase-memory-mcp.exe
+    pwsh -File scripts/test-windows.ps1 -GuardsOnly -Binary build\c\codebase-memory-mcp-neo4j.exe
 #>
 [CmdletBinding()]
 param(
@@ -88,7 +88,7 @@ if (-not $tmp) { $tmp = "$env:USERPROFILE\AppData\Local\Temp" }
 function Resolve-Binary {
     param([string]$Explicit)
     if ($Explicit) { return (Resolve-Path $Explicit).Path }
-    $built = Join-Path $repoRoot "build\c\codebase-memory-mcp.exe"
+    $built = Join-Path $repoRoot "build\c\codebase-memory-mcp-neo4j.exe"
     if (Test-Path $built) { return $built }
     Write-Host "Building $Target via Makefile.cbm ..." -ForegroundColor Cyan
     & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
@@ -132,7 +132,7 @@ try {
 
     $guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $guardBundle | Out-Null
-    $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
+    $guardBin = Join-Path $guardBundle "codebase-memory-mcp-neo4j.exe"
     Copy-Item -LiteralPath $bin -Destination $guardBin
 
     # Ownership is never inherited on Windows: descendants created under the

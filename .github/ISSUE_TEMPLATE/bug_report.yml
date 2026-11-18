@@ -17,8 +17,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `codebase-memory-mcp --version`
-      placeholder: codebase-memory-mcp 0.8.1
+      description: Output of `codebase-memory-mcp-neo4j --version`
+      placeholder: codebase-memory-mcp-neo4j 0.8.1
     validations:
       required: true
 
@@ -79,7 +79,7 @@ body:
            public repo + commit + file path (e.g. `colinhacks/zod@a1b2c3d,
            packages/zod/src/v4/core/parse.ts`).
         2. The exact command or MCP tool call, including JSON arguments
-           (e.g. `codebase-memory-mcp cli search_graph '{"project":"...",
+           (e.g. `codebase-memory-mcp-neo4j cli search_graph '{"project":"...",
            "name_pattern":"..."}'`).
         3. What the output was vs. what it should have been.
       placeholder: |
@@ -88,7 +88,7 @@ body:
            ```ts
            interface Model<T> { create(doc: Partial<T>): Promise<T>; }
            ```
-        2. Command: codebase-memory-mcp cli index_repository '{"repo_path":"/tmp/zod"}'
+        2. Command: codebase-memory-mcp-neo4j cli index_repository '{"repo_path":"/tmp/zod"}'
         3. Result: ... / Expected: ...
     validations:
       required: true

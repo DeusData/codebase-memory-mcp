@@ -144,7 +144,7 @@ if ! grep -Fq 'scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= BUILD_D
     <<<"$guards_block" ||
     ! grep -Fq 'powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\test-windows.ps1' \
     <<<"$guards_block" ||
-    ! grep -Fq -- '-GuardsOnly -Binary build\\guards\\codebase-memory-mcp.exe' <<<"$guards_block"; then
+    ! grep -Fq -- '-GuardsOnly -Binary build\\guards\\codebase-memory-mcp-neo4j.exe' <<<"$guards_block"; then
     echo "FAIL: Windows VM guards must delegate to the maintained native-Windows driver" >&2
     exit 1
 fi

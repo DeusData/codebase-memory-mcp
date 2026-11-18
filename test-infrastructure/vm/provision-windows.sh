@@ -114,6 +114,6 @@ step "5/6 build: native ARM64 binary + test-runner (no ASan on arm64)"
 vm "clangarm64" "cd /c/cbm && make -j${JOBS} -f Makefile.cbm CC=clang CXX=clang++ SANITIZE= cbm build/c/test-runner > /tmp/provision-build.log 2>&1 && echo BUILD_OK || (echo BUILD_FAIL; tail -15 /tmp/provision-build.log; exit 1)"
 
 step "6/6 smoke: binary + test-runner start"
-vm "clangarm64" "cd /c/cbm && ./build/c/codebase-memory-mcp.exe --version && ./build/c/test-runner --list-suites | head -3"
+vm "clangarm64" "cd /c/cbm && ./build/c/codebase-memory-mcp-neo4j.exe --version && ./build/c/test-runner --list-suites | head -3"
 
 printf '\n\033[1mPROVISION COMPLETE\033[0m — daily driving: test-infrastructure/vm/win.sh\n'

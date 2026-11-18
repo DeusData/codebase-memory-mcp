@@ -1,6 +1,6 @@
 """Minimal MCP stdio client for the Windows red-test suite.
 
-Drives a real codebase-memory-mcp(.exe) over a line-delimited JSON-RPC stdio
+Drives a real codebase-memory-mcp-neo4j(.exe) over a line-delimited JSON-RPC stdio
 pipe. The pipe carries UTF-8 bytes, so a non-ASCII repo_path reaches the server
 without passing through the Windows ANSI command-line code page (which mangles
 argv for a binary whose main() is not wmain/GetCommandLineW). This isolates the
@@ -27,7 +27,7 @@ class McpServer:
         self._stderr = []
         env = dict(os.environ)
         if cache_dir:
-            env["CBM_CACHE_DIR"] = cache_dir  # isolate the graph DB location
+            env["CBM_NEO4J_CACHE_DIR"] = cache_dir  # isolate the graph DB location
         if extra_env:
             env.update(extra_env)
         self.env = env

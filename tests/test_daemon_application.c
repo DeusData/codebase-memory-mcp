@@ -374,9 +374,9 @@ TEST(daemon_application_ui_config_updates_are_masked_and_serialized) {
     char cache[APP_TEST_PATH_CAP];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-ui-config-XXXXXX", cbm_tmpdir());
     bool cache_ok = cbm_mkdtemp(cache) != NULL;
-    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
-    bool env_ok = cache_ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
-    cbm_ui_config_t initial = {.ui_enabled = false, .ui_port = 9749};
+    char *old_cache = getenv("CBM_NEO4J_CACHE_DIR") ? strdup(getenv("CBM_NEO4J_CACHE_DIR")) : NULL;
+    bool env_ok = cache_ok && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
+    cbm_ui_config_t initial = {.ui_enabled = false, .ui_port = 9750};
     bool initial_saved = env_ok && cbm_ui_config_save(&initial);
 
     cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
@@ -424,9 +424,9 @@ TEST(daemon_application_ui_config_updates_are_masked_and_serialized) {
     cbm_daemon_application_free(application);
     free(context);
     if (old_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", old_cache, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(old_cache);
     (void)th_rmtree(cache);
@@ -450,9 +450,9 @@ TEST(daemon_application_ui_config_rejects_noncanonical_frames) {
     char cache[APP_TEST_PATH_CAP];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-ui-frame-XXXXXX", cbm_tmpdir());
     bool cache_ok = cbm_mkdtemp(cache) != NULL;
-    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
-    bool env_ok = cache_ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
-    cbm_ui_config_t initial = {.ui_enabled = false, .ui_port = 9749};
+    char *old_cache = getenv("CBM_NEO4J_CACHE_DIR") ? strdup(getenv("CBM_NEO4J_CACHE_DIR")) : NULL;
+    bool env_ok = cache_ok && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
+    cbm_ui_config_t initial = {.ui_enabled = false, .ui_port = 9750};
     bool initial_saved = env_ok && cbm_ui_config_save(&initial);
 
     cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
@@ -482,7 +482,7 @@ TEST(daemon_application_ui_config_rejects_noncanonical_frames) {
     cbm_daemon_runtime_application_status_t invalid_port = app_test_ui_config_request(
         &callbacks, session, CBM_DAEMON_APPLICATION_UI_CONFIG_PORT, 0, 65536, 7);
     cbm_daemon_runtime_application_status_t nonzero_unused = app_test_ui_config_request(
-        &callbacks, session, CBM_DAEMON_APPLICATION_UI_CONFIG_ENABLED, 1, 9749, 7);
+        &callbacks, session, CBM_DAEMON_APPLICATION_UI_CONFIG_ENABLED, 1, 9750, 7);
 
     cbm_ui_config_t unchanged = {0};
     cbm_ui_config_load(&unchanged);
@@ -493,9 +493,9 @@ TEST(daemon_application_ui_config_rejects_noncanonical_frames) {
     cbm_daemon_application_free(application);
     free(context);
     if (old_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", old_cache, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(old_cache);
     (void)th_rmtree(cache);
@@ -513,7 +513,7 @@ TEST(daemon_application_ui_config_rejects_noncanonical_frames) {
     ASSERT_EQ(invalid_port, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
     ASSERT_EQ(nonzero_unused, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
     ASSERT_FALSE(unchanged.ui_enabled);
-    ASSERT_EQ(unchanged.ui_port, 9749);
+    ASSERT_EQ(unchanged.ui_port, 9750);
     ASSERT_TRUE(stopped);
     PASS();
 }
@@ -838,7 +838,7 @@ static int app_test_git(const char *root, const char *operation, const char *arg
  * full-surface MCP server, subscribed that session to the shared watcher, and
  * still accepted raw UI mutations. */
 TEST(daemon_application_restricted_profile_owns_no_background_surfaces) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     char root[APP_TEST_PATH_CAP];
@@ -847,8 +847,8 @@ TEST(daemon_application_restricted_profile_owns_no_background_surfaces) {
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-profile-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
     bool env_ok =
-        dirs_ok && (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
-    cbm_ui_config_t initial_ui = {.ui_enabled = false, .ui_port = 9749};
+        dirs_ok && (!had_cache || saved_cache) && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
+    cbm_ui_config_t initial_ui = {.ui_enabled = false, .ui_port = 9750};
     bool ui_ready = env_ok && cbm_ui_config_save(&initial_ui);
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
@@ -932,9 +932,9 @@ TEST(daemon_application_restricted_profile_owns_no_background_surfaces) {
     (void)cbm_unlink(db_path);
     (void)cbm_rmdir(root);
     if (had_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
     (void)th_rmtree(cache);
@@ -1018,7 +1018,7 @@ TEST(daemon_application_hook_context_preserves_event_and_dialect) {
 }
 
 TEST(daemon_application_reference_counts_one_shared_watch) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool saved_cache_ok = !had_cache || saved_cache;
@@ -1027,7 +1027,7 @@ TEST(daemon_application_reference_counts_one_shared_watch) {
     snprintf(root, sizeof(root), "%s/cbm-app-watch-root-XXXXXX", cbm_tmpdir());
     snprintf(cache, sizeof(cache), "%s/cbm-app-watch-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool env_ok = saved_cache_ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool env_ok = saved_cache_ok && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
     FILE *db = NULL;
@@ -1087,9 +1087,9 @@ TEST(daemon_application_reference_counts_one_shared_watch) {
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -1158,7 +1158,7 @@ static char *app_test_index_status(const cbm_daemon_runtime_application_callback
 }
 
 TEST(daemon_application_index_status_reports_watch_issue2167) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     char root[APP_TEST_PATH_CAP];
@@ -1169,7 +1169,7 @@ TEST(daemon_application_index_status_reports_watch_issue2167) {
     snprintf(cache, sizeof(cache), "%s/cbm-app-status-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok =
         cbm_mkdtemp(root) != NULL && cbm_mkdtemp(other_root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char *other_project = dirs_ok ? cbm_project_name_from_path(other_root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
@@ -1233,9 +1233,9 @@ TEST(daemon_application_index_status_reports_watch_issue2167) {
     (void)cbm_rmdir(other_root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -1250,7 +1250,7 @@ TEST(daemon_application_index_status_reports_watch_issue2167) {
 /* #2167: watcher_enabled=false leaves the daemon without a watcher; the
  * session's own project must then say so rather than look watched. */
 TEST(daemon_application_index_status_watcher_disabled_issue2167) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     char root[APP_TEST_PATH_CAP];
@@ -1258,7 +1258,7 @@ TEST(daemon_application_index_status_watcher_disabled_issue2167) {
     snprintf(root, sizeof(root), "%s/cbm-app-nowatch-root-XXXXXX", cbm_tmpdir());
     snprintf(cache, sizeof(cache), "%s/cbm-app-nowatch-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
     bool seeded =
@@ -1290,9 +1290,9 @@ TEST(daemon_application_index_status_watcher_disabled_issue2167) {
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -1306,7 +1306,7 @@ TEST(daemon_application_index_status_watcher_disabled_issue2167) {
  * reports strategy "tree". "none" stays reserved for a registered root that is
  * never polled (a plain directory without the opt-in). */
 TEST(daemon_application_index_status_reports_tree_strategy_issue2167) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     char root[APP_TEST_PATH_CAP];
@@ -1314,7 +1314,7 @@ TEST(daemon_application_index_status_reports_tree_strategy_issue2167) {
     snprintf(root, sizeof(root), "%s/cbm-app-tree-root-XXXXXX", cbm_tmpdir());
     snprintf(cache, sizeof(cache), "%s/cbm-app-tree-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
     bool seeded =
@@ -1373,9 +1373,9 @@ TEST(daemon_application_index_status_reports_tree_strategy_issue2167) {
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -1387,7 +1387,7 @@ TEST(daemon_application_index_status_reports_tree_strategy_issue2167) {
 }
 
 TEST(daemon_application_free_releases_live_watch_once) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     const char *old_grace = getenv("CBM_WATCHER_PRUNE_GRACE_S");
@@ -1403,7 +1403,7 @@ TEST(daemon_application_free_releases_live_watch_once) {
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(survivor_root) != NULL &&
                    cbm_mkdtemp(cache) != NULL;
     bool env_ok = (!had_cache || saved_cache) && (!had_grace || saved_grace) &&
-                  cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                  cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0 &&
                   cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char *survivor_project = dirs_ok ? cbm_project_name_from_path(survivor_root) : NULL;
@@ -1480,9 +1480,9 @@ TEST(daemon_application_free_releases_live_watch_once) {
     (void)cbm_rmdir(survivor_root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     if (saved_grace) {
         (void)cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_grace, 1);
@@ -1502,7 +1502,7 @@ TEST(daemon_application_free_releases_live_watch_once) {
 }
 
 TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     const char *old_grace = getenv("CBM_WATCHER_PRUNE_GRACE_S");
@@ -1514,7 +1514,7 @@ TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
     snprintf(cache, sizeof(cache), "%s/cbm-app-prune-watch-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
     bool env_ok = (!had_cache || saved_cache) && (!had_grace || saved_grace) &&
-                  cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                  cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0 &&
                   cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
@@ -1609,9 +1609,9 @@ TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     if (saved_grace) {
         (void)cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_grace, 1);
@@ -2008,7 +2008,7 @@ static bool app_watch_race_fixture_init_with_auto_watch(app_watch_race_fixture_t
                                                         bool auto_watch) {
     memset(fixture, 0, sizeof(*fixture));
     app_fake_worker_context_init(&fixture->fake);
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     fixture->had_cache = old_cache != NULL;
     fixture->saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool saved_cache_ok = !fixture->had_cache || fixture->saved_cache;
@@ -2017,7 +2017,7 @@ static bool app_watch_race_fixture_init_with_auto_watch(app_watch_race_fixture_t
     (void)snprintf(fixture->cache, sizeof(fixture->cache), "%s/cbm-app-watch-race-cache-XXXXXX",
                    cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(fixture->root) != NULL && cbm_mkdtemp(fixture->cache) != NULL;
-    bool env_ok = saved_cache_ok && cbm_setenv("CBM_CACHE_DIR", fixture->cache, 1) == 0;
+    bool env_ok = saved_cache_ok && cbm_setenv("CBM_NEO4J_CACHE_DIR", fixture->cache, 1) == 0;
     fixture->project = dirs_ok ? cbm_project_name_from_path(fixture->root) : NULL;
     if (fixture->project) {
         (void)snprintf(fixture->db_path, sizeof(fixture->db_path), "%s/%s.db", fixture->cache,
@@ -2139,8 +2139,8 @@ static bool app_watch_race_fixture_finish(app_watch_race_fixture_t *fixture) {
     (void)th_rmtree(fixture->root);
     (void)th_rmtree(fixture->cache);
     bool restored = fixture->saved_cache
-                        ? cbm_setenv("CBM_CACHE_DIR", fixture->saved_cache, 1) == 0
-                        : (!fixture->had_cache && cbm_unsetenv("CBM_CACHE_DIR") == 0);
+                        ? cbm_setenv("CBM_NEO4J_CACHE_DIR", fixture->saved_cache, 1) == 0
+                        : (!fixture->had_cache && cbm_unsetenv("CBM_NEO4J_CACHE_DIR") == 0);
     free(fixture->saved_cache);
     fixture->saved_cache = NULL;
     return stopped && restored;
@@ -2206,14 +2206,14 @@ static bool app_env_backup_restore(app_env_backup_t *backup) {
  * the MCP tool path. Keep that path UTF-8-safe as well. */
 TEST(daemon_application_ui_index_accepts_non_ascii_directory) {
     app_env_backup_t cache_environment;
-    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_NEO4J_CACHE_DIR");
     char root[APP_TEST_PATH_CAP];
     char cache[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root),
                    "%s/cbm-app-ui-index-\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-ui-index-cache-XXXXXX", cbm_tmpdir());
     bool dirs_created = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool cache_set = cache_saved && dirs_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool cache_set = cache_saved && dirs_created && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
 
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -2422,7 +2422,7 @@ static bool app_wait_for_update_notice(const cbm_daemon_runtime_application_call
  * one physical worker but retain one subscription per live session. */
 TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     app_env_backup_t cache_environment;
-    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_NEO4J_CACHE_DIR");
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, false);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -2431,7 +2431,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     (void)snprintf(root, sizeof(root), "%s/cbm-app-auto-index-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-index-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
     bool config_ready = stored_config &&
                         cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
@@ -2562,7 +2562,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
 TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls) {
     app_env_backup_t cache_environment;
     app_env_backup_t home_environment;
-    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
+    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_NEO4J_CACHE_DIR") &&
                               app_env_backup_capture(&home_environment, "HOME");
     char sensitive_raw[APP_TEST_PATH_CAP];
     char ordinary_raw[APP_TEST_PATH_CAP];
@@ -2588,7 +2588,7 @@ TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls)
     bool files_ok = canonical && app_test_create_empty_file(sensitive_source) &&
                     app_test_create_empty_file(ordinary_source);
     bool environments_set = environments_saved && files_ok &&
-                            cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                            cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0 &&
                             cbm_setenv("HOME", sensitive, 1) == 0;
     cbm_config_t *stored_config = environments_set ? cbm_config_open(cache) : NULL;
     bool config_ready = stored_config &&
@@ -2698,7 +2698,7 @@ TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls)
 TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
     app_env_backup_t cache_environment;
     app_env_backup_t home_environment;
-    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
+    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_NEO4J_CACHE_DIR") &&
                               app_env_backup_capture(&home_environment, "HOME");
     char sensitive_raw[APP_TEST_PATH_CAP];
     char ordinary_raw[APP_TEST_PATH_CAP];
@@ -2718,7 +2718,7 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
                      cbm_canonical_path(ordinary_raw, ordinary, sizeof(ordinary)) &&
                      cbm_canonical_path(cache_raw, cache, sizeof(cache));
     bool environments_set = environments_saved && canonical &&
-                            cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                            cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0 &&
                             cbm_setenv("HOME", sensitive, 1) == 0;
     cbm_config_t *stored_config = environments_set ? cbm_config_open(cache) : NULL;
     bool config_ready = stored_config &&
@@ -2934,14 +2934,14 @@ TEST(daemon_application_programmatic_index_forwards_set_doc_candidates) {
 }
 TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     app_env_backup_t cache_environment;
-    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_NEO4J_CACHE_DIR");
     char root[APP_TEST_PATH_CAP];
     char cache[APP_TEST_PATH_CAP];
     char tracked[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-auto-limit-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-limit-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     (void)snprintf(tracked, sizeof(tracked), "%s/tracked.c", root);
     bool git_ready = dirs_ok && app_test_create_empty_file(tracked) &&
                      app_test_git(root, "init", "-q", NULL) == 0 &&
@@ -3063,7 +3063,7 @@ TEST(daemon_application_auto_index_file_count_supports_non_git_roots) {
 
 TEST(daemon_application_auto_index_retries_transient_busy_admission) {
     app_env_backup_t cache_environment;
-    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_NEO4J_CACHE_DIR");
     char occupied_root[APP_TEST_PATH_CAP];
     char auto_root[APP_TEST_PATH_CAP];
     char cache[APP_TEST_PATH_CAP];
@@ -3074,7 +3074,7 @@ TEST(daemon_application_auto_index_retries_transient_busy_admission) {
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-busy-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(occupied_root) != NULL && cbm_mkdtemp(auto_root) != NULL &&
                    cbm_mkdtemp(cache) != NULL;
-    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
     bool config_ready = stored_config &&
                         cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
@@ -4199,7 +4199,7 @@ TEST(daemon_application_cancel_before_worker_start_skips_worker) {
 }
 
 TEST(daemon_application_cancel_drops_watch_before_inflight_request_returns) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool saved_cache_ok = !had_cache || saved_cache;
@@ -4208,7 +4208,7 @@ TEST(daemon_application_cancel_drops_watch_before_inflight_request_returns) {
     (void)snprintf(root, sizeof(root), "%s/cbm-app-cancel-watch-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-cancel-watch-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool env_ok = saved_cache_ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool env_ok = saved_cache_ok && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
     if (project) {
@@ -4309,9 +4309,9 @@ TEST(daemon_application_cancel_drops_watch_before_inflight_request_returns) {
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -5258,7 +5258,7 @@ TEST(daemon_application_async_index_drops_watch_interest_on_requester_disconnect
 }
 
 TEST(daemon_application_serializes_adr_mutation_with_index_job) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     app_fake_worker_context_t fake;
@@ -5279,7 +5279,7 @@ TEST(daemon_application_serializes_adr_mutation_with_index_job) {
     snprintf(cache, sizeof(cache), "%s/cbm-app-mutation-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
     bool env_ok =
-        dirs_ok && (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+        dirs_ok && (!had_cache || saved_cache) && cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
     char *project = env_ok ? cbm_project_name_from_path(root) : NULL;
     char db_path[APP_TEST_PATH_CAP] = {0};
     cbm_store_t *seed = NULL;
@@ -5400,9 +5400,9 @@ TEST(daemon_application_serializes_adr_mutation_with_index_job) {
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -6058,7 +6058,7 @@ TEST(daemon_application_recovers_with_unique_per_job_quarantine_files) {
     const char *old_restarts = getenv("CBM_INDEX_MAX_RESTARTS");
     char *saved_restarts = old_restarts ? cbm_strdup(old_restarts) : NULL;
     bool saved_ok = !old_restarts || saved_restarts;
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     bool had_cache = old_cache != NULL;
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool saved_cache_ok = !had_cache || saved_cache;
@@ -6091,7 +6091,7 @@ TEST(daemon_application_recovers_with_unique_per_job_quarantine_files) {
     bool cache_ok = cbm_mkdtemp(cache) != NULL;
     bool env_ok = saved_ok && saved_cache_ok && cache_ok &&
                   cbm_setenv("CBM_INDEX_MAX_RESTARTS", "3", 1) == 0 &&
-                  cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+                  cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1) == 0;
 
     int first = application && root_ok && env_ok
                     ? cbm_daemon_application_index(application, "recovery-one", root)
@@ -6112,9 +6112,9 @@ TEST(daemon_application_recovers_with_unique_per_job_quarantine_files) {
     }
     free(saved_restarts);
     if (saved_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache, 1);
     } else if (!had_cache) {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
+        (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_cache);
 
@@ -7380,7 +7380,7 @@ typedef struct {
 
 static bool app_owner_fixture_init(app_owner_fixture_t *owner, const char *label) {
     memset(owner, 0, sizeof(*owner));
-    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_cache = getenv("CBM_NEO4J_CACHE_DIR");
     owner->had_cache = old_cache != NULL;
     owner->saved_cache = old_cache ? strdup(old_cache) : NULL;
     (void)snprintf(owner->cache, sizeof(owner->cache), "%s/cbm-app-owner-cache-XXXXXX",
@@ -7389,7 +7389,7 @@ static bool app_owner_fixture_init(app_owner_fixture_t *owner, const char *label
         owner->cache[0] = '\0';
         return false;
     }
-    owner->cache_set = cbm_setenv("CBM_CACHE_DIR", owner->cache, 1) == 0;
+    owner->cache_set = cbm_setenv("CBM_NEO4J_CACHE_DIR", owner->cache, 1) == 0;
     if (!owner->cache_set || !app_async_fixture_init(&owner->fixture, label, true) ||
         !cbm_canonical_path(owner->fixture.root, owner->canonical_root,
                             sizeof(owner->canonical_root))) {
@@ -7444,9 +7444,9 @@ static bool app_owner_fixture_finish(app_owner_fixture_t *owner) {
     bool stopped = app_async_fixture_finish(&owner->fixture);
     if (owner->cache_set) {
         if (owner->had_cache) {
-            (void)cbm_setenv("CBM_CACHE_DIR", owner->saved_cache, 1);
+            (void)cbm_setenv("CBM_NEO4J_CACHE_DIR", owner->saved_cache, 1);
         } else {
-            (void)cbm_unsetenv("CBM_CACHE_DIR");
+            (void)cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
         }
     }
     free(owner->saved_cache);

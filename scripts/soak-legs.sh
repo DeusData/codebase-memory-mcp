@@ -42,8 +42,8 @@ Environment:
   RESULTS_DIR is owned by this script (per-leg); do not pre-set it.
 
 Examples:
-  scripts/soak-legs.sh build/c/codebase-memory-mcp 10          # both legs, 10m each
-  scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15   # ASan-style
+  scripts/soak-legs.sh build/c/codebase-memory-mcp-neo4j 10          # both legs, 10m each
+  scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp-neo4j 15   # ASan-style
 EOF
 }
 
@@ -69,7 +69,7 @@ esac
 # same plain path and carries no per-platform binary-name logic of its own.
 # Resolve whenever the .exe EXISTS, not only when the plain name fails -x:
 # msys resolves the suffix-less name transparently (it IS -x), but soak-test
-# keys its native-Windows handling — cygpath'd CBM_CACHE_DIR, coproc stdio —
+# keys its native-Windows handling — cygpath'd CBM_NEO4J_CACHE_DIR, coproc stdio —
 # off the literal .exe suffix. A suffix-less native binary therefore received
 # a POSIX-form cache path, mis-rooting the daemon logs and silently disabling
 # diagnostics (both hosted-runner Windows soak legs; reproduced on the VM's

@@ -5,7 +5,7 @@
  * FakeTransport aufgezeichnete CLI-Antworten, hier spielt ein fetch
  * aufgezeichnete /rpc-Antworten. Der Unterschied ist der Punkt des Zyklus.
  * Die Texte unten sind woertlich das, was
- * cbm/build/c/codebase-memory-mcp am 2026-08-28 auf POST /rpc geantwortet hat,
+ * cbm/build/c/codebase-memory-mcp-neo4j am 2026-08-28 auf POST /rpc geantwortet hat,
  * indiziert war fixtures/atlas-sample als Projekt `codeatlasweb-probe`.
  *
  * Woertlich heisst woertlich: der Kopf hat zwei Leerzeichen vor "(cols:",

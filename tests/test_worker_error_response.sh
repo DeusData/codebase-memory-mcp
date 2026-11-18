@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Linux containers use build/linux-arm64 / build/linux-amd64). Honour the binary
 # the caller built, exactly as test_parent_watchdog.sh and test_worker_watchdog.sh
 # do; the build/c default keeps a bare manual invocation working.
-BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp-neo4j}"
 if [[ ! -x "${BINARY}" && -x "${BINARY}.exe" ]]; then
   BINARY="${BINARY}.exe"
 fi
@@ -40,7 +40,7 @@ source "${ROOT}/scripts/test-runtime.sh"
 cbm_test_runtime_init
 tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 cleanup() {
-  CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+  CBM_NEO4J_CACHE_DIR="${tmpdir}/cache-supervisor" \
     "${BINARY}" daemon stop >/dev/null 2>&1 || true
   cbm_test_runtime_cleanup "${BINARY}"
 }
@@ -50,7 +50,7 @@ missing="${tmpdir}/repository-does-not-exist"
 response="${tmpdir}/worker.response"
 args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\",$(cbm_test_index_worker_policy_json)}"
 
-if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
+if ! CBM_NEO4J_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \
   --index-worker-build "${BUILD_FINGERPRINT}" \
   index_repository "${args}" \
@@ -67,7 +67,7 @@ if [[ ! -s "${response}" ]] || ! grep -q 'Pipeline failed' "${response}"; then
 fi
 
 set +e
-CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+CBM_NEO4J_CACHE_DIR="${tmpdir}/cache-supervisor" \
   "${BINARY}" cli index_repository --repo-path "${missing}" --mode fast \
   >"${tmpdir}/supervisor.out" 2>"${tmpdir}/supervisor.err"
 cli_rc=$?

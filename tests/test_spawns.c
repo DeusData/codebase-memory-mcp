@@ -204,12 +204,12 @@ static bool sp_index(sp_proj_t *p, const sp_file_t *files, int count, int pad) {
         return false;
     }
     char cache[700];
-    const char *configured = getenv("CBM_CACHE_DIR");
+    const char *configured = getenv("CBM_NEO4J_CACHE_DIR");
     const char *home = getenv("HOME");
     if (configured && configured[0]) {
         snprintf(cache, sizeof(cache), "%s", configured);
     } else {
-        snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home ? home : "/tmp");
+        snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp-neo4j", home ? home : "/tmp");
     }
     cbm_mkdir_p(cache, 0755);
     snprintf(p->dbpath, sizeof(p->dbpath), "%s/%s.db", cache, p->project);

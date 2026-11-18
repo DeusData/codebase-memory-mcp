@@ -4,7 +4,7 @@
  *
  * Was hier bewiesen wird, ist genau das, was Unit-Tests nicht beweisen
  * koennen: dass CbmRpcProvider, rpc-client, der Parser und der IR-Builder
- * zusammen an einem laufenden cbm/build/c/codebase-memory-mcp dieselben
+ * zusammen an einem laufenden cbm/build/c/codebase-memory-mcp-neo4j dieselben
  * Fakten herausholen, die das Fixture wirklich hergibt. Gemockt ist hier
  * nichts. Der Provider bekommt einen base-Ursprung und Node-18-fetch, sonst
  * ist es dieselbe Klasse, die spaeter im Browser laeuft.
@@ -41,7 +41,7 @@ import {
 } from './lib/cbm-server.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w1b';
 const SERVICE_FILE = 'src/services/userService.ts';

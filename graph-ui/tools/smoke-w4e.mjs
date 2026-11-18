@@ -48,7 +48,7 @@
  * und einmal mit `?codeatlasClosureCap=3`, wo er stehen und seine Zahlen nennen
  * muss. Dieselbe Beweisform wie in smoke-w4a.
  *
- * **CBM_RUNTIME_DIR wird gesetzt.** Der Daemon des Servers und jede CLI
+ * **CBM_NEO4J_RUNTIME_DIR wird gesetzt.** Der Daemon des Servers und jede CLI
  * verabreden sich in einem Rendezvous-Verzeichnis, das per Konto und nicht per
  * HOME gilt: laeuft irgendwo sonst auf der Maschine eine CBM-Instanz mit einem
  * anderen Cache-Verzeichnis, lehnt jede CLI dieses Laufs ab, und der Lauf waere
@@ -73,7 +73,7 @@ import {
 import { startStaticProxy } from './lib/static-proxy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w4e';
@@ -396,7 +396,7 @@ async function main() {
         // ---------------------------------------------- 2. HOME, Rendezvous
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-w4e-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w4e-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         log('isoliertes HOME:', home);
         log('Rendezvous:', runtimeDir);
 

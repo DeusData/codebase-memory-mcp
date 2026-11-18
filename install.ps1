@@ -1,4 +1,4 @@
-# install.ps1 - One-line installer for codebase-memory-mcp (Windows).
+# install.ps1 - One-line installer for codebase-memory-mcp-neo4j (Windows).
 #
 # Usage: see README.md for install instructions.
 #
@@ -26,8 +26,8 @@ if ([Environment]::OSVersion.Version.Build -ge 20348 -and
 Add-Type -AssemblyName System.Net.Http
 
 $Repo = "haiderRizvii/codebase-memory-mcp"
-$InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
-$BinName = "codebase-memory-mcp.exe"
+$InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp-neo4j"
+$BinName = "codebase-memory-mcp-neo4j.exe"
 $WindowsArchiveNames = @(
     $BinName,
     "LICENSE",
@@ -129,7 +129,7 @@ if ($env:CBM_ARCH) {
     }
 }
 
-Write-Host "codebase-memory-mcp installer (Windows)"
+Write-Host "codebase-memory-mcp-neo4j installer (Windows)"
 Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
@@ -186,7 +186,7 @@ function New-CbmExclusiveTempDirectory {
 }
 
 # Build download URL
-$Archive = "codebase-memory-mcp-windows-$Arch.zip"
+$Archive = "codebase-memory-mcp-neo4j-windows-$Arch.zip"
 $Url = "$BaseUrl/$Archive"
 
 # Download
@@ -412,7 +412,7 @@ if (Test-Path -LiteralPath $Dest -PathType Leaf) {
     }
     if (-not $renamed) {
         Write-Host "error: could not retire the existing $BinName - close all running" -ForegroundColor Red
-        Write-Host "       codebase-memory-mcp sessions and coding agents, then re-run." -ForegroundColor Red
+        Write-Host "       codebase-memory-mcp-neo4j sessions and coding agents, then re-run." -ForegroundColor Red
         Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
         exit 1
     }
@@ -442,7 +442,7 @@ if ($LASTEXITCODE -ne 0) {
 # Best effort: a failure here still leaves a working install.
 $DownloadedInstaller = Join-Path $TmpDir "install.ps1"
 if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
-    $InstallerDest = Join-Path $InstallDir "install.ps1"
+    $InstallerDest = Join-Path $InstallDir "install-neo4j.ps1"
     # Reserved inside the try: failing to reserve a sibling is a best-effort
     # miss like any other step here, not a reason to abort a finished install.
     $InstallerTmp = $null
@@ -494,4 +494,4 @@ if ($SkipConfig) {
 Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 
 Write-Host ""
-Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp."
+Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp-neo4j."

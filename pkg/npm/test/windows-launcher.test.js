@@ -68,10 +68,10 @@ test('Windows npm shim probes and executes the cached launcher', () => {
   assert.equal(observed.exitCode, 0);
   assert.equal(observed.calls.length, 2);
   for (const call of observed.calls) {
-    assert.equal(path.basename(call.executable), 'codebase-memory-mcp.exe');
+    assert.equal(path.basename(call.executable), 'codebase-memory-mcp-neo4j.exe');
     assert.notEqual(
       path.basename(call.executable),
-      'codebase-memory-mcp.payload.exe',
+      'codebase-memory-mcp-neo4j.payload.exe',
     );
   }
   assert.deepEqual(Array.from(observed.calls[1].args), ['--version']);
@@ -82,8 +82,8 @@ test('Windows npm shim keeps package-manager guidance after launcher refusal', (
   const observed = runShim('win32', ['update'], 1);
 
   assert.equal(observed.exitCode, 1);
-  assert.equal(path.basename(observed.calls[1].executable), 'codebase-memory-mcp.exe');
-  assert.match(observed.stderr, /npm install codebase-memory-mcp@latest/);
+  assert.equal(path.basename(observed.calls[1].executable), 'codebase-memory-mcp-neo4j.exe');
+  assert.match(observed.stderr, /npm install codebase-memory-mcp-neo4j@latest/);
   assert.match(observed.stderr, /install --yes/);
 });
 
@@ -92,7 +92,7 @@ test('non-Windows npm shim keeps its native payload execution path', () => {
 
   assert.equal(observed.exitCode, 0);
   assert.equal(observed.calls.length, 1);
-  assert.equal(path.basename(observed.calls[0].executable), 'codebase-memory-mcp');
+  assert.equal(path.basename(observed.calls[0].executable), 'codebase-memory-mcp-neo4j');
 });
 
 test('PowerShell install mutation runs through the downloaded binary', () => {

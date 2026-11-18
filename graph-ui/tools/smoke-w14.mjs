@@ -20,7 +20,7 @@ import { READABILITY_EXCLUSIONS, measureReadability } from './lib/readability.mj
 import { startStaticProxy } from './lib/static-proxy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w14';
@@ -395,7 +395,7 @@ async function main() {
         }
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-w14-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w14-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         await indexRepository(BINARY, { home, repoPath: FIXTURE, project: PROJECT });
         serverPort = await findFreePort(MIN_PORT);
         const started = await startServer(BINARY, { home, port: serverPort, log: [] });

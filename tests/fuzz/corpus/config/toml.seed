@@ -1,6 +1,6 @@
 t[mcp_servers.other]
 command = "other"
 
-# BEGIN codebase-memory
+# BEGIN codebase-memory-neo4j
 old = true
-# END codebase-memory
+# END codebase-memory-neo4j

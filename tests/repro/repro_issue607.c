@@ -116,7 +116,7 @@ static void repro607_cleanup(const char *tmp_cache, const char *db_path) {
  * MUST keep their indexed graph intact.
  * ─────────────────────────────────────────────────────────────────── */
 TEST(repro_issue607_reinstall_preserves_index) {
-    /* Redirect CBM_CACHE_DIR to a fresh temp dir so the real user cache is
+    /* Redirect CBM_NEO4J_CACHE_DIR to a fresh temp dir so the real user cache is
      * never touched and count_db_indexes()/cbm_list_indexes() see only the
      * DB we create here. */
     char tmp_cache[512];
@@ -127,10 +127,10 @@ TEST(repro_issue607_reinstall_preserves_index) {
 
 #if defined(_WIN32)
     char ev[600];
-    snprintf(ev, sizeof(ev), "CBM_CACHE_DIR=%s", tmp_cache);
+    snprintf(ev, sizeof(ev), "CBM_NEO4J_CACHE_DIR=%s", tmp_cache);
     _putenv(ev);
 #else
-    setenv("CBM_CACHE_DIR", tmp_cache, 1 /* overwrite */);
+    setenv("CBM_NEO4J_CACHE_DIR", tmp_cache, 1 /* overwrite */);
 #endif
 
     char db_path[700];
@@ -162,9 +162,9 @@ TEST(repro_issue607_reinstall_preserves_index) {
     repro607_cleanup(tmp_cache, db_path);
 
 #if defined(_WIN32)
-    _putenv("CBM_CACHE_DIR=");
+    _putenv("CBM_NEO4J_CACHE_DIR=");
 #else
-    unsetenv("CBM_CACHE_DIR");
+    unsetenv("CBM_NEO4J_CACHE_DIR");
 #endif
 
     ASSERT_TRUE(proceeded);
@@ -188,10 +188,10 @@ TEST(repro_issue607_reset_indexes_deletes) {
 
 #if defined(_WIN32)
     char ev[600];
-    snprintf(ev, sizeof(ev), "CBM_CACHE_DIR=%s", tmp_cache);
+    snprintf(ev, sizeof(ev), "CBM_NEO4J_CACHE_DIR=%s", tmp_cache);
     _putenv(ev);
 #else
-    setenv("CBM_CACHE_DIR", tmp_cache, 1 /* overwrite */);
+    setenv("CBM_NEO4J_CACHE_DIR", tmp_cache, 1 /* overwrite */);
 #endif
 
     char db_path[700];
@@ -217,9 +217,9 @@ TEST(repro_issue607_reset_indexes_deletes) {
     repro607_cleanup(tmp_cache, db_path);
 
 #if defined(_WIN32)
-    _putenv("CBM_CACHE_DIR=");
+    _putenv("CBM_NEO4J_CACHE_DIR=");
 #else
-    unsetenv("CBM_CACHE_DIR");
+    unsetenv("CBM_NEO4J_CACHE_DIR");
 #endif
 
     ASSERT_TRUE(proceeded);       /* user confirmed → proceed */

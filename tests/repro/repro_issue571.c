@@ -3,7 +3,7 @@
  *
  * BUG: "Project name strips non-ASCII (CJK) characters from path,
  *       resulting in truncated/unrecognizable names"
- *   https://github.com/DeusData/codebase-memory-mcp/issues/571
+ *   https://github.com/haiderRizvii/codebase-memory-mcp/issues/571
  *
  * ROOT CAUSE (src/pipeline/fqn.c, cbm_project_name_from_path, lines ~341-348):
  *

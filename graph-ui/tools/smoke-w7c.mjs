@@ -39,7 +39,7 @@
  * ## Ablauf
  *
  *   1. `npm run build`
- *   2. isoliertes HOME, eigenes Rendezvous-Verzeichnis (CBM_RUNTIME_DIR)
+ *   2. isoliertes HOME, eigenes Rendezvous-Verzeichnis (CBM_NEO4J_RUNTIME_DIR)
  *   3. fixtures/atlas-sample indizieren (nur gelesen)
  *   4. C-Server auf einem freien Port >= 4420, dist/ auf einem zweiten
  *   5. eigener llama-server auf einem dritten, mit dem Klasse-A-Sieger
@@ -83,7 +83,7 @@ import {
 import { startStaticProxy } from './lib/static-proxy.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const PROJECT = 'codeatlasweb-w7c';
@@ -489,7 +489,7 @@ async function main() {
         // ---------------------------------------------- 2. HOME, Rendezvous
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-w7c-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w7c-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         log('isoliertes HOME:', home);
 
         // -------------------------------------------------------- 3. Projekt

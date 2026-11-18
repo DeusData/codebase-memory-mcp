@@ -24,8 +24,8 @@
 /* Marker lines delimiting the generated region inside a client's extension
  * module. A file carrying these is ours to rewrite; one without them is the
  * user's and is left alone. Kept in the comment syntax shared by JS and TS. */
-#define CBM_ADAPTER_MARKER_START "// codebase-memory-mcp:start"
-#define CBM_ADAPTER_MARKER_END "// codebase-memory-mcp:end"
+#define CBM_ADAPTER_MARKER_START "// codebase-memory-mcp-neo4j:start"
+#define CBM_ADAPTER_MARKER_END "// codebase-memory-mcp-neo4j:end"
 
 /* Emit a pi extension registering every tool in the MCP registry.
  *

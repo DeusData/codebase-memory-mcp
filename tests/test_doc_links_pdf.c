@@ -1236,10 +1236,10 @@ TEST(pdf_snippet_is_page_text) {
     cbm_mkdir_p(cache, 0700);
     char *project = cbm_project_name_from_path(repo);
     ASSERT_NOT_NULL(project);
-    const char *saved = getenv("CBM_CACHE_DIR");
+    const char *saved = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
     snprintf(db, sizeof(db), "%s/%s.db", cache, project);
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", cache, 1);
     ASSERT_EQ(dm_index(repo, db, NULL), 0);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -1256,9 +1256,9 @@ TEST(pdf_snippet_is_page_text) {
     free(resp);
     cbm_mcp_server_free(srv);
     if (saved_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_copy, 1);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     free(saved_copy);
     free(project);

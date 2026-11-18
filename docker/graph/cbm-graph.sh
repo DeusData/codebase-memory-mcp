@@ -17,6 +17,7 @@
 #   NEO4J_PASSWORD     required
 #   NEO4J_DATABASE     default neo4j
 set -euo pipefail
+umask 077
 
 die() { echo "cbm-graph: $*" >&2; exit 2; }
 
@@ -87,20 +88,20 @@ fi
 # ── Index ────────────────────────────────────────────────────────────
 if [ "${CBM_FRESH:-0}" = 1 ]; then
     echo "== fresh: dropping previous graph of $NAME"
-    codebase-memory-mcp cli delete_project --project "$NAME" || true
+    codebase-memory-mcp-neo4j cli delete_project --project "$NAME" || true
 fi
 
 echo "== indexing $NAME into $NEO4J_URI (database $NEO4J_DATABASE)"
-OUT=$(codebase-memory-mcp cli index_repository --repo-path "$REPO" --name "$NAME" \
-      --graph-db "$NEO4J_URI" --graph-user "$NEO4J_USER" --graph-database "$NEO4J_DATABASE" 2>&1) || true
-STATUS=$(printf '%s' "$OUT" | grep -o '"status":"[^"]*"' | tail -1 | cut -d'"' -f4)
+OUT=$(codebase-memory-mcp-neo4j cli --json index_repository --repo-path "$REPO" --name "$NAME" \
+      --graph-db "$NEO4J_URI" --graph-user "$NEO4J_USER" --graph-database "$NEO4J_DATABASE") || true
+STATUS=$(printf '%s' "$OUT" | jq -er '.structuredContent.status // empty' 2>/dev/null || true)
 if [ "$STATUS" != "indexed" ] && [ "$STATUS" != "degraded" ]; then
     printf '%s\n' "$OUT" >&2
     die "indexing failed (status: ${STATUS:-unknown})"
 fi
 
 echo "== done: $STATUS"
-codebase-memory-mcp cli index_status --project "$NAME" 2>&1 |
+codebase-memory-mcp-neo4j cli index_status --project "$NAME" 2>&1 |
     awk '/^[a-z_]+:/ { in_gb = ($1 == "graph_backend:") }
          /^(project|nodes|edges|status|indexed_at):/ || in_gb' | head -14
 cat <<EOF

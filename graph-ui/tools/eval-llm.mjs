@@ -102,7 +102,7 @@ import { EVAL_BOUNDS, boundViolations } from './lib/eval-bounds.mjs';
 import { EVAL_PORT_FLOOR, llamaProps, startLlama, stopLlama } from './lib/llama.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const QUESTIONS = join(ROOT, 'eval', 'questions.json');
 const OUT_DIR = join(ROOT, 'verification', 'w5');
@@ -248,7 +248,7 @@ async function main() {
         // ------------------------------------------------- HOME und Index --
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-w5b-eval-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w5b-eval-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         const indexed = await indexRepository(BINARY, { home, repoPath: FIXTURE, project: PROJECT });
         extras.indexed = { nodes: indexed.nodes, edges: indexed.edges };
         log(`indiziert: ${PROJECT} (${indexed.nodes} Knoten, ${indexed.edges} Kanten)`);

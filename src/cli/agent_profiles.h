@@ -1,5 +1,5 @@
 /*
- * agent_profiles.h — Canonical tiered codebase-memory agent profiles.
+ * agent_profiles.h — Canonical tiered codebase-memory-neo4j agent profiles.
  */
 #ifndef CBM_CLI_AGENT_PROFILES_H
 #define CBM_CLI_AGENT_PROFILES_H
@@ -46,7 +46,7 @@ typedef enum {
     CBM_GRAPH_DIALECT_COUNT
 } cbm_graph_profile_dialect_t;
 
-/* Stable profile identifier. VERIFY intentionally retains "codebase-memory". */
+/* Stable profile identifier. VERIFY intentionally retains "codebase-memory-neo4j". */
 const char *cbm_graph_tier_slug(cbm_graph_tier_t tier);
 const char *cbm_graph_tier_display_name(cbm_graph_tier_t tier);
 bool cbm_graph_dialect_direct_capable(cbm_graph_profile_dialect_t dialect);

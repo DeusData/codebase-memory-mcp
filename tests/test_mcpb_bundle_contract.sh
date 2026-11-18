@@ -33,10 +33,10 @@ BUILD_DIR="$FIX/build"
 mkdir -p "$BUILD_DIR"
 cat >"$FIX/stub.c" <<'EOF'
 #include <stdio.h>
-static const char keep[] = "codebase-memory-mcp OMIT_LOAD_EXTENSION";
+static const char keep[] = "codebase-memory-mcp-neo4j OMIT_LOAD_EXTENSION";
 int main(void) { puts(keep); return 0; }
 EOF
-SELECTED="$BUILD_DIR/codebase-memory-mcp"
+SELECTED="$BUILD_DIR/codebase-memory-mcp-neo4j"
 case "$(uname -s)" in
 MINGW* | MSYS* | CYGWIN*) SELECTED="${SELECTED}.exe" ;;
 esac
@@ -106,13 +106,13 @@ if bash "$ROOT/scripts/package-release.sh" linux arm64 \
     echo "package-release accepted an incorrect selected-binary hash" >&2
     exit 1
 fi
-if find "$FIX/hash-mismatch" -type f -name 'codebase-memory-mcp-*' | grep -q .; then
+if find "$FIX/hash-mismatch" -type f -name 'codebase-memory-mcp-neo4j-*' | grep -q .; then
     echo "hash mismatch left a release container behind" >&2
     exit 1
 fi
 
 echo "--- existing release containers are never overwritten"
-PLAIN_ARCHIVE="$FIX/plainlinux/codebase-memory-mcp-linux-amd64.tar.gz"
+PLAIN_ARCHIVE="$FIX/plainlinux/codebase-memory-mcp-neo4j-linux-amd64.tar.gz"
 BEFORE_ARCHIVE_SHA="$(python3 - "$PLAIN_ARCHIVE" <<'PY'
 import hashlib
 import pathlib
@@ -189,25 +189,25 @@ def check_bundle(path, *, binary, platform, version):
         fail(f"{path.name}: compatibility.platforms {platforms!r} != {[platform]!r}")
 
 
-check_bundle(fix / "darwin" / "codebase-memory-mcp-darwin-arm64.mcpb",
-             binary="server/codebase-memory-mcp", platform="darwin",
+check_bundle(fix / "darwin" / "codebase-memory-mcp-neo4j-darwin-arm64.mcpb",
+             binary="server/codebase-memory-mcp-neo4j", platform="darwin",
              version="0.0.0-contract")
-check_bundle(fix / "windows" / "codebase-memory-mcp-windows-amd64.mcpb",
-             binary="server/codebase-memory-mcp.exe", platform="win32",
+check_bundle(fix / "windows" / "codebase-memory-mcp-neo4j-windows-amd64.mcpb",
+             binary="server/codebase-memory-mcp-neo4j.exe", platform="win32",
              version="0.0.0-contract")
-check_bundle(fix / "portable" / "codebase-memory-mcp-linux-amd64-portable.mcpb",
-             binary="server/codebase-memory-mcp", platform="linux",
+check_bundle(fix / "portable" / "codebase-memory-mcp-neo4j-linux-amd64-portable.mcpb",
+             binary="server/codebase-memory-mcp-neo4j", platform="linux",
              version="0.0.0-contract")
 
 # Without VERSION the manifest must say so loudly, not invent a release.
-check_bundle(fix / "unversioned" / "codebase-memory-mcp-darwin-arm64.mcpb",
-             binary="server/codebase-memory-mcp", platform="darwin",
+check_bundle(fix / "unversioned" / "codebase-memory-mcp-neo4j-darwin-arm64.mcpb",
+             binary="server/codebase-memory-mcp-neo4j", platform="darwin",
              version="0.0.0-dev")
 
 # Eligibility is a fence, not a default: the glibc-dynamic linux build gets
 # an archive but NO bundle.
 plain = fix / "plainlinux"
-if not (plain / "codebase-memory-mcp-linux-amd64.tar.gz").is_file():
+if not (plain / "codebase-memory-mcp-neo4j-linux-amd64.tar.gz").is_file():
     fail("plain linux target must still produce its tar.gz")
 mcpbs = list(plain.glob("*.mcpb"))
 if mcpbs:
@@ -231,14 +231,14 @@ def check_archive(path, binary):
         fail(f"{path.name}: archive did not preserve the supplied notices file")
 
 
-check_archive(fix / "darwin" / "codebase-memory-mcp-darwin-arm64.tar.gz",
-              "codebase-memory-mcp")
-check_archive(fix / "windows" / "codebase-memory-mcp-windows-amd64.zip",
-              "codebase-memory-mcp.exe")
-check_archive(fix / "portable" / "codebase-memory-mcp-linux-amd64-portable.tar.gz",
-              "codebase-memory-mcp")
-check_archive(fix / "plainlinux" / "codebase-memory-mcp-linux-amd64.tar.gz",
-              "codebase-memory-mcp")
+check_archive(fix / "darwin" / "codebase-memory-mcp-neo4j-darwin-arm64.tar.gz",
+              "codebase-memory-mcp-neo4j")
+check_archive(fix / "windows" / "codebase-memory-mcp-neo4j-windows-amd64.zip",
+              "codebase-memory-mcp-neo4j.exe")
+check_archive(fix / "portable" / "codebase-memory-mcp-neo4j-linux-amd64-portable.tar.gz",
+              "codebase-memory-mcp-neo4j")
+check_archive(fix / "plainlinux" / "codebase-memory-mcp-neo4j-linux-amd64.tar.gz",
+              "codebase-memory-mcp-neo4j")
 
 if pathlib.Path(sys.argv[2]).read_bytes() != selected:
     fail("package-release mutated the caller-owned selected binary")

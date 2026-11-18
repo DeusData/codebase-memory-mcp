@@ -12,14 +12,14 @@ const os = require('os');
 const { execFileSync, spawn } = require('child_process');
 const { pipeline } = require('stream');
 
-const REPO = 'DeusData/codebase-memory-mcp';
+const REPO = 'haiderRizvii/codebase-memory-mcp';
 const VERSION = require('./package.json').version;
 const BIN_DIR = path.join(__dirname, 'bin');
 const MAX_REDIRECTS = 5;
 const DOWNLOAD_HOP_TIMEOUT_MS = 120_000;
 const CANDIDATE_TIMEOUT_MS = 15_000;
 // Entry-count guard for the zip namespace check. Keep in sync with the Go
-// wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the PyPI wrapper.
+// wrapper (pkg/go/cmd/codebase-memory-mcp-neo4j/main.go) and the PyPI wrapper.
 const MAX_ARCHIVE_MEMBERS = 64;
 const DEFAULT_DOWNLOAD_BASE = `https://github.com/${REPO}/releases/download/v${VERSION}`;
 // install.sh's loopback pattern: plain HTTP only to an exact loopback
@@ -28,9 +28,9 @@ const LOOPBACK_HTTP_URL = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 // Bytes of tar's own diagnostics kept for the failure message.
 const MAX_TAR_STDERR_CHARS = 4096;
-const WINDOWS_BINARY_NAME = 'codebase-memory-mcp.exe';
+const WINDOWS_BINARY_NAME = 'codebase-memory-mcp-neo4j.exe';
 const UNIX_ARCHIVE_NAMES = [
-  'codebase-memory-mcp',
+  'codebase-memory-mcp-neo4j',
   'LICENSE',
   'install.sh',
   'THIRD_PARTY_NOTICES.md',
@@ -41,7 +41,7 @@ const WINDOWS_ARCHIVE_NAMES = [
   'install.ps1',
   'THIRD_PARTY_NOTICES.md',
 ];
-const WINDOWS_PAIR_LOCK_NAME = '.codebase-memory-mcp-pair.lock';
+const WINDOWS_PAIR_LOCK_NAME = '.codebase-memory-mcp-neo4j-pair.lock';
 const WINDOWS_PAIR_LOCK_WAIT_MS = 45_000;
 const WINDOWS_PAIR_OWNERLESS_STALE_MS = 30_000;
 const WINDOWS_PAIR_LOCK_POLL_MS = 25;
@@ -701,7 +701,7 @@ async function verifyChecksum(archivePath, archiveName, source) {
         `Checksum mismatch for ${archiveName}:\n  expected: ${expected}\n  actual:   ${actual}`,
       );
     }
-    process.stdout.write('codebase-memory-mcp: checksum verified.\n');
+    process.stdout.write('codebase-memory-mcp-neo4j: checksum verified.\n');
   } finally {
     try { fs.unlinkSync(tmpChecksums); } catch (_) { /* ignore */ }
   }
@@ -715,7 +715,7 @@ async function main() {
   // per platform, entered directly.
   const binName = platform === 'windows'
     ? WINDOWS_BINARY_NAME
-    : 'codebase-memory-mcp';
+    : 'codebase-memory-mcp-neo4j';
   const binPath = path.join(BIN_DIR, binName);
   const cacheNames = platform === 'windows'
     ? [WINDOWS_BINARY_NAME]
@@ -749,10 +749,10 @@ async function main() {
   // No UI/standard split since v0.10.0: one archive per platform, graph UI
   // always embedded. The old CBM_VARIANT=ui opt-in pointed at ui-* archives
   // that no longer exist, so honoring it could only 404 (#1538).
-  const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
+  const archive = `codebase-memory-mcp-neo4j-${platform}-${arch}${variant}.${ext}`;
   const url = `${source.base}/${archive}`;
 
-  process.stdout.write(`codebase-memory-mcp: downloading v${VERSION} for ${platform}/${arch}...\n`);
+  process.stdout.write(`codebase-memory-mcp-neo4j: downloading v${VERSION} for ${platform}/${arch}...\n`);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-install-'));
   const tmpArchive = path.join(tmpDir, `cbm.${ext}`);
@@ -816,14 +816,14 @@ async function main() {
       }
     }
 
-    process.stdout.write('codebase-memory-mcp: ready.\n');
+    process.stdout.write('codebase-memory-mcp-neo4j: ready.\n');
     if (platform === 'windows') {
       process.stdout.write(
-        'Windows package cache is portable. Run "codebase-memory-mcp install --yes" ' +
-        'to create the managed launcher (use "npx codebase-memory-mcp install --yes" ' +
+        'Windows package cache is portable. Run "codebase-memory-mcp-neo4j install --yes" ' +
+        'to create the managed launcher (use "npx codebase-memory-mcp-neo4j install --yes" ' +
         'for a local npm install). Package updates/removal remain ' +
-        '"npm install codebase-memory-mcp@latest" and ' +
-        '"npm uninstall codebase-memory-mcp" (add -g for a global install).\n',
+        '"npm install codebase-memory-mcp-neo4j@latest" and ' +
+        '"npm uninstall codebase-memory-mcp-neo4j" (add -g for a global install).\n',
       );
     }
   } finally {
@@ -833,7 +833,7 @@ async function main() {
 
 if (require.main === module || module.parent == null) {
   main().catch((err) => {
-    process.stderr.write(`\ncodebase-memory-mcp: install failed — ${err.message}\n`);
+    process.stderr.write(`\ncodebase-memory-mcp-neo4j: install failed — ${err.message}\n`);
     process.stderr.write(`You can install manually: https://github.com/${REPO}#installation\n`);
     process.exit(1);
   });

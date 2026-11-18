@@ -26,26 +26,26 @@
 #define CTE_PATH_CAP 1024
 #define CTE_FILE_CAP 16384
 
-static const char *CTE_BEGIN = "# BEGIN codebase-memory-mcp";
-static const char *CTE_END = "# END codebase-memory-mcp";
+static const char *CTE_BEGIN = "# BEGIN codebase-memory-mcp-neo4j";
+static const char *CTE_END = "# END codebase-memory-mcp-neo4j";
 static const char *CTE_TABLE = "mcp_servers";
 static const char *CTE_KEY = "name";
-static const char *CTE_IDENTITY = "codebase-memory-mcp";
-static const char *CTE_BODY = "name = \"codebase-memory-mcp\"\n"
-                              "command = \"codebase-memory-mcp\"\n";
-static const char *CTE_CODEX_BEGIN = "# >>> codebase-memory-mcp SessionStart >>>";
-static const char *CTE_CODEX_END = "# <<< codebase-memory-mcp SessionStart <<<";
-static const char *CTE_CODEX_COMMAND = "codebase-memory-mcp hook-augment";
+static const char *CTE_IDENTITY = "codebase-memory-neo4j";
+static const char *CTE_BODY = "name = \"codebase-memory-neo4j\"\n"
+                              "command = \"codebase-memory-mcp-neo4j\"\n";
+static const char *CTE_CODEX_BEGIN = "# >>> codebase-memory-mcp-neo4j SessionStart >>>";
+static const char *CTE_CODEX_END = "# <<< codebase-memory-mcp-neo4j SessionStart <<<";
+static const char *CTE_CODEX_COMMAND = "codebase-memory-mcp-neo4j hook-augment";
 static const char *CTE_CODEX_BLOCK =
     "[[hooks.SessionStart]]\n"
     "matcher = \"startup|resume|clear|compact\"\n\n"
     "[[hooks.SessionStart.hooks]]\n"
-    "type = \"command\"\ncommand = \"/opt/codebase-memory-mcp hook-augment\"\n"
-    "command_windows = \"& C:\\\\bin\\\\codebase-memory-mcp.exe hook-augment\"\ntimeout = 5\n\n"
+    "type = \"command\"\ncommand = \"/opt/codebase-memory-mcp-neo4j hook-augment\"\n"
+    "command_windows = \"& C:\\\\bin\\\\codebase-memory-mcp-neo4j.exe hook-augment\"\ntimeout = 5\n\n"
     "[[hooks.SubagentStart]]\nmatcher = \"*\"\n\n"
     "[[hooks.SubagentStart.hooks]]\n"
-    "type = \"command\"\ncommand = \"/opt/codebase-memory-mcp hook-augment\"\n"
-    "command_windows = \"& C:\\\\bin\\\\codebase-memory-mcp.exe hook-augment\"\ntimeout = 5\n";
+    "type = \"command\"\ncommand = \"/opt/codebase-memory-mcp-neo4j hook-augment\"\n"
+    "command_windows = \"& C:\\\\bin\\\\codebase-memory-mcp-neo4j.exe hook-augment\"\ntimeout = 5\n";
 
 static int cte_codex_edit(const char *path, cbm_toml_codex_hook_action_t action, int check_only) {
     return cbm_toml_reconcile_codex_hooks(path, CTE_CODEX_BEGIN, CTE_CODEX_END, CTE_CODEX_COMMAND,
@@ -418,12 +418,12 @@ TEST(config_toml_managed_markers_ignore_multiline_strings) {
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
     const char *original = "basic = \"\"\"\n"
-                           "# BEGIN codebase-memory-mcp\n"
-                           "# END codebase-memory-mcp\n"
+                           "# BEGIN codebase-memory-mcp-neo4j\n"
+                           "# END codebase-memory-mcp-neo4j\n"
                            "\"\"\"\n"
                            "literal = '''\n"
-                           "# BEGIN codebase-memory-mcp\n"
-                           "# END codebase-memory-mcp\n"
+                           "# BEGIN codebase-memory-mcp-neo4j\n"
+                           "# END codebase-memory-mcp-neo4j\n"
                            "'''\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, original), 0);
@@ -446,12 +446,12 @@ TEST(config_toml_managed_rejects_marker_in_block_and_unclosed_multiline) {
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "keep = true\n"), 0);
     ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END,
-                                            "value = true\n# END codebase-memory-mcp\n"),
+                                            "value = true\n# END codebase-memory-mcp-neo4j\n"),
               -1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "keep = true\n");
 
-    const char *unclosed = "description = \"\"\"\n# BEGIN codebase-memory-mcp\n";
+    const char *unclosed = "description = \"\"\"\n# BEGIN codebase-memory-mcp-neo4j\n";
     ASSERT_EQ(th_write_file(path, unclosed), 0);
     ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned = true\n"), -1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
@@ -463,14 +463,14 @@ TEST(config_toml_managed_rejects_marker_in_block_and_unclosed_multiline) {
 TEST(config_toml_codex_semantic_conflicts_fail_closed) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
-    const char *codex_block = "[mcp_servers.codebase-memory-mcp]\ncommand = \"new\"\n";
+    const char *codex_block = "[mcp_servers.codebase-memory-neo4j]\ncommand = \"new\"\n";
     static const char *conflicts[] = {
-        "[mcp_servers.\"codebase-memory-mcp\"]\ncommand = \"old\"\n",
-        "[\"mcp_servers\".'codebase-memory-mcp']\ncommand = \"old\"\n",
-        "mcp_servers.\"codebase-memory-mcp\".command = \"old\"\n",
-        "[mcp_servers]\n\"codebase-memory-mcp\".command = \"old\"\n",
-        ("[mcp_servers.codebase-memory-mcp]\ncommand = \"one\"\n"
-         "[mcp_servers.\"codebase-memory-mcp\"]\ncommand = \"two\"\n"),
+        "[mcp_servers.\"codebase-memory-neo4j\"]\ncommand = \"old\"\n",
+        "[\"mcp_servers\".'codebase-memory-neo4j']\ncommand = \"old\"\n",
+        "mcp_servers.\"codebase-memory-neo4j\".command = \"old\"\n",
+        "[mcp_servers]\n\"codebase-memory-neo4j\".command = \"old\"\n",
+        ("[mcp_servers.codebase-memory-neo4j]\ncommand = \"one\"\n"
+         "[mcp_servers.\"codebase-memory-neo4j\"]\ncommand = \"two\"\n"),
     };
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     for (size_t i = 0; i < sizeof(conflicts) / sizeof(conflicts[0]); ++i) {
@@ -488,12 +488,12 @@ TEST(config_toml_vibe_body_validation_fail_closed) {
     static const char *invalid_bodies[] = {
         "command = \"missing identity\"\n",
         "name = \"wrong\"\ncommand = \"x\"\n",
-        "name = \"codebase-memory-mcp\"\nname = \"codebase-memory-mcp\"\n",
-        "name = \"codebase-memory-mcp\"\n[evil]\npwned = true\n",
-        "name = \"codebase-memory-mcp\"\n[[evil]]\npwned = true\n",
-        "name = \"codebase-memory-mcp\"\ncommand.value = \"x\"\n",
-        "name = \"codebase-memory-mcp\"\ndescription = \"\"\"ambiguous\"\"\"\n",
-        "name = \"codebase-memory-mcp\"\nthis is not an assignment\n",
+        "name = \"codebase-memory-neo4j\"\nname = \"codebase-memory-neo4j\"\n",
+        "name = \"codebase-memory-neo4j\"\n[evil]\npwned = true\n",
+        "name = \"codebase-memory-neo4j\"\n[[evil]]\npwned = true\n",
+        "name = \"codebase-memory-neo4j\"\ncommand.value = \"x\"\n",
+        "name = \"codebase-memory-neo4j\"\ndescription = \"\"\"ambiguous\"\"\"\n",
+        "name = \"codebase-memory-neo4j\"\nthis is not an assignment\n",
     };
     for (size_t i = 0; i < sizeof(invalid_bodies) / sizeof(invalid_bodies[0]); ++i) {
         ASSERT(cte_assert_unchanged_after_vibe_upsert(path, original, invalid_bodies[i]));
@@ -508,14 +508,14 @@ TEST(config_toml_target_table_rejects_significant_nonassignments_byte_identicall
     char actual[CTE_FILE_CAP];
     static const char *malformed[] = {
         "[[mcp_servers]]\n"
-        "name = \"codebase-memory-mcp\"\n"
+        "name = \"codebase-memory-neo4j\"\n"
         "this is not an assignment\n"
         "command = \"winner\"\n",
         "[[mcp_servers]]\n"
-        "name = \"codebase-memory-mcp\"\n"
+        "name = \"codebase-memory-neo4j\"\n"
         "command \"missing equals\"\n",
         "[[mcp_servers]]\n"
-        "name = \"codebase-memory-mcp\"\n"
+        "name = \"codebase-memory-neo4j\"\n"
         "@invalid\n",
     };
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
@@ -532,14 +532,14 @@ TEST(config_toml_target_table_rejects_significant_nonassignments_byte_identicall
         ASSERT_STR_EQ(actual, malformed[i]);
     }
 
-    const char *malformed_regular = "[mcp_servers.codebase-memory-mcp]\n"
+    const char *malformed_regular = "[mcp_servers.codebase-memory-neo4j]\n"
                                     "command = \"winner\"\n"
                                     "this is not an assignment\n"
                                     "[unrelated]\n"
                                     "keep = true\n";
     ASSERT_EQ(th_write_file(path, malformed_regular), 0);
     ASSERT_EQ(
-        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-neo4j", CTE_BEGIN, CTE_END),
         -1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, malformed_regular);
@@ -552,14 +552,14 @@ TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation) {
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
     const char *foreign = "theme = \"dark\"\n"
-                          "[mcp_servers.codebase-memory-mcp]\n"
+                          "[mcp_servers.codebase-memory-neo4j]\n"
                           "command = \"/opt/user-tool\"\n"
                           "args = []\n"
                           "user_field = true\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, foreign), 0);
     ASSERT_EQ(
-        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-neo4j", CTE_BEGIN, CTE_END),
         1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, foreign);
@@ -576,25 +576,25 @@ TEST(config_toml_legacy_remove_adopts_owned_env_vars_only) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "theme = \"dark\"\n"
-                                  "[mcp_servers.codebase-memory-mcp]\n"
-                                  "command = 'C:\\cbm\\codebase-memory-mcp.exe'\n"
-                                  "env_vars = [\"CBM_CACHE_DIR\"]\n"
+                                  "[mcp_servers.codebase-memory-neo4j]\n"
+                                  "command = 'C:\\cbm\\codebase-memory-mcp-neo4j.exe'\n"
+                                  "env_vars = [\"CBM_NEO4J_CACHE_DIR\"]\n"
                                   "\n"
                                   "[tui]\n"
                                   "keep = true\n"),
               0);
     ASSERT_EQ(
-        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-neo4j", CTE_BEGIN, CTE_END),
         0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "theme = \"dark\"\n[tui]\nkeep = true\n");
 
-    const char *foreign = "[mcp_servers.codebase-memory-mcp]\n"
-                          "command = \"/opt/codebase-memory-mcp\"\n"
-                          "env_vars = [\"CBM_CACHE_DIR\", \"HOME\"]\n";
+    const char *foreign = "[mcp_servers.codebase-memory-neo4j]\n"
+                          "command = \"/opt/codebase-memory-mcp-neo4j\"\n"
+                          "env_vars = [\"CBM_NEO4J_CACHE_DIR\", \"HOME\"]\n";
     ASSERT_EQ(th_write_file(path, foreign), 0);
     ASSERT_EQ(
-        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-neo4j", CTE_BEGIN, CTE_END),
         1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, foreign);
@@ -627,7 +627,7 @@ TEST(config_toml_vibe_remove_includes_descendant_tables) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\"\n"
+                                  "name = \"codebase-memory-neo4j\"\n"
                                   "command = \"owned\"\n"
                                   "[mcp_servers.environment]\n"
                                   "TOKEN = \"owned\"\n"
@@ -650,12 +650,12 @@ TEST(config_toml_vibe_reinstall_preserves_user_fields_and_descendants) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
-    const char *desired = "name = \"codebase-memory-mcp\"\n"
+    const char *desired = "name = \"codebase-memory-neo4j\"\n"
                           "transport = \"stdio\"\n"
                           "command = \"new\"\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\" # identity comment\n"
+                                  "name = \"codebase-memory-neo4j\" # identity comment\n"
                                   "command = \"old\"\n"
                                   "timeout = 45 # user field\n"
                                   "args = [\"--user\"]\n"
@@ -686,7 +686,7 @@ TEST(config_toml_preserves_bom_crlf_and_handles_no_final_newline) {
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT(memcmp(actual, "\xEF\xBB\xBF", 3U) == 0);
     ASSERT_NOT_NULL(strstr(actual, "keep = true\r\n"));
-    ASSERT_NOT_NULL(strstr(actual, "# BEGIN codebase-memory-mcp\r\nowned = true\r\n"));
+    ASSERT_NOT_NULL(strstr(actual, "# BEGIN codebase-memory-mcp-neo4j\r\nowned = true\r\n"));
     ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned = true\n"), 0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_EQ(cte_occurrences(actual, CTE_BEGIN), 1);
@@ -694,9 +694,9 @@ TEST(config_toml_preserves_bom_crlf_and_handles_no_final_newline) {
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "\xEF\xBB\xBFkeep = true\r\n");
 
-    ASSERT_EQ(th_write_file(path, "\xEF\xBB\xBF# BEGIN codebase-memory-mcp\r\n"
+    ASSERT_EQ(th_write_file(path, "\xEF\xBB\xBF# BEGIN codebase-memory-mcp-neo4j\r\n"
                                   "old = true\r\n"
-                                  "# END codebase-memory-mcp\r\n"),
+                                  "# END codebase-memory-mcp-neo4j\r\n"),
               0);
     ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "new = true\n"), 0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
@@ -708,14 +708,14 @@ TEST(config_toml_preserves_bom_crlf_and_handles_no_final_newline) {
     ASSERT_STR_EQ(actual, "\xEF\xBB\xBF");
 
     ASSERT_EQ(th_write_file(path, "\xEF\xBB\xBF[[\"mcp_servers\"]]\r\n"
-                                  "name = \"codebase-memory-mcp\"\r\n"
+                                  "name = \"codebase-memory-neo4j\"\r\n"
                                   "command = \"old\""),
               0);
     ASSERT_EQ(cbm_toml_upsert_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY, CTE_BODY),
               0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT(memcmp(actual, "\xEF\xBB\xBF", 3U) == 0);
-    ASSERT_NOT_NULL(strstr(actual, "command = \"codebase-memory-mcp\"\r\n"));
+    ASSERT_NOT_NULL(strstr(actual, "command = \"codebase-memory-mcp-neo4j\"\r\n"));
 
     ASSERT_EQ(th_write_file(path, "keep = true"), 0);
     ASSERT_EQ(cbm_toml_upsert_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY, CTE_BODY),
@@ -777,9 +777,9 @@ TEST(config_toml_managed_fresh_missing_file) {
 
     ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "enabled = true\n"), 0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
-    ASSERT_STR_EQ(actual, "# BEGIN codebase-memory-mcp\n"
+    ASSERT_STR_EQ(actual, "# BEGIN codebase-memory-mcp-neo4j\n"
                           "enabled = true\n"
-                          "# END codebase-memory-mcp\n");
+                          "# END codebase-memory-mcp-neo4j\n");
     th_cleanup(dir);
     PASS();
 }
@@ -790,18 +790,18 @@ TEST(config_toml_managed_replace_preserves_unrelated) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "title = \"keep\"\n"
-                                  "# BEGIN codebase-memory-mcp\n"
+                                  "# BEGIN codebase-memory-mcp-neo4j\n"
                                   "old = true\n"
-                                  "# END codebase-memory-mcp\n"
+                                  "# END codebase-memory-mcp-neo4j\n"
                                   "tail = \"keep\"\n"),
               0);
 
     ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "new = \"value\""), 0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "title = \"keep\"\n"
-                          "# BEGIN codebase-memory-mcp\n"
+                          "# BEGIN codebase-memory-mcp-neo4j\n"
                           "new = \"value\"\n"
-                          "# END codebase-memory-mcp\n"
+                          "# END codebase-memory-mcp-neo4j\n"
                           "tail = \"keep\"\n");
     th_cleanup(dir);
     PASS();
@@ -813,9 +813,9 @@ TEST(config_toml_managed_remove) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "before = true\n"
-                                  "# BEGIN codebase-memory-mcp\n"
+                                  "# BEGIN codebase-memory-mcp-neo4j\n"
                                   "owned = true\n"
-                                  "# END codebase-memory-mcp\n"
+                                  "# END codebase-memory-mcp-neo4j\n"
                                   "after = true\n"),
               0);
 
@@ -850,7 +850,7 @@ TEST(config_toml_managed_unbalanced_duplicate_fail_closed) {
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
     const char *unbalanced = "keep = true\n"
-                             "# BEGIN codebase-memory-mcp\n"
+                             "# BEGIN codebase-memory-mcp-neo4j\n"
                              "owned = true\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, unbalanced), 0);
@@ -858,12 +858,12 @@ TEST(config_toml_managed_unbalanced_duplicate_fail_closed) {
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, unbalanced);
 
-    const char *duplicate = "# BEGIN codebase-memory-mcp\n"
+    const char *duplicate = "# BEGIN codebase-memory-mcp-neo4j\n"
                             "one = true\n"
-                            "# END codebase-memory-mcp\n"
-                            "# BEGIN codebase-memory-mcp\n"
+                            "# END codebase-memory-mcp-neo4j\n"
+                            "# BEGIN codebase-memory-mcp-neo4j\n"
                             "two = true\n"
-                            "# END codebase-memory-mcp\n";
+                            "# END codebase-memory-mcp-neo4j\n";
     ASSERT_EQ(th_write_file(path, duplicate), 0);
     ASSERT_EQ(cbm_toml_remove_managed_block(path, CTE_BEGIN, CTE_END), -1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
@@ -878,20 +878,20 @@ TEST(config_toml_managed_unbalanced_duplicate_fail_closed) {
  * and the marketplaces ended up inside the markers. The next install rewrote
  * the whole region and deleted them, together with a key the user had added
  * to our own table. */
-static const char *CTE_MCP_BEGIN = "# >>> codebase-memory-mcp MCP >>>";
-static const char *CTE_MCP_END = "# <<< codebase-memory-mcp MCP <<<";
-static const char *CTE_MCP_DECLARATION = "[mcp_servers.codebase-memory-mcp]\n";
-#define CTE_MCP_BEGIN_LINE "# >>> codebase-memory-mcp MCP >>>\n"
-#define CTE_MCP_END_LINE "# <<< codebase-memory-mcp MCP <<<\n"
+static const char *CTE_MCP_BEGIN = "# >>> codebase-memory-mcp-neo4j MCP >>>";
+static const char *CTE_MCP_END = "# <<< codebase-memory-mcp-neo4j MCP <<<";
+static const char *CTE_MCP_DECLARATION = "[mcp_servers.codebase-memory-neo4j]\n";
+#define CTE_MCP_BEGIN_LINE "# >>> codebase-memory-mcp-neo4j MCP >>>\n"
+#define CTE_MCP_END_LINE "# <<< codebase-memory-mcp-neo4j MCP <<<\n"
 #define CTE_MCP_PREFIX                                                        \
     "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n" \
     "args = [\"serve\", \"--mcp\"]\n"
 /* The 0.10.4 shape of our block: no env_vars yet. */
 #define CTE_MCP_OLD_TABLE \
-    "[mcp_servers.codebase-memory-mcp]\ncommand = \"/old/codebase-memory-mcp\"\nargs = []\n"
+    "[mcp_servers.codebase-memory-neo4j]\ncommand = \"/old/codebase-memory-mcp-neo4j\"\nargs = []\n"
 #define CTE_MCP_NEW_TABLE                                                                    \
-    "[mcp_servers.codebase-memory-mcp]\ncommand = \"/new/codebase-memory-mcp\"\nargs = []\n" \
-    "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+    "[mcp_servers.codebase-memory-neo4j]\ncommand = \"/new/codebase-memory-mcp-neo4j\"\nargs = []\n" \
+    "env_vars = [\"CBM_NEO4J_CACHE_DIR\", \"CBM_NEO4J_RUNTIME_DIR\"]\n"
 #define CTE_MCP_USER_LINES "# raised for a 1.5 GB index\nstartup_timeout_sec = 90\n"
 #define CTE_MCP_FOREIGN                                                                    \
     "[mcp_servers.node_repl]\nargs = []\n"                                                 \
@@ -907,7 +907,7 @@ static const char *CTE_MCP_DECLARATION = "[mcp_servers.codebase-memory-mcp]\n";
 #define CTE_MCP_LEAD_AND_CHILD                                             \
     CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE                                      \
         "# pinned by hand\n" CTE_MCP_OLD_TABLE                             \
-        "\n[mcp_servers.codebase-memory-mcp.env]\nRUST_LOG = \"warn\"\n\n" \
+        "\n[mcp_servers.codebase-memory-neo4j.env]\nRUST_LOG = \"warn\"\n\n" \
         "[notice]\nhide_full_access_warning = true\n" CTE_MCP_END_LINE     \
         "\n[profiles.fast]\nmodel = \"o4-mini\"\n"
 
@@ -969,7 +969,7 @@ TEST(config_toml_managed_keeps_lead_and_owned_subtable_issue2228) {
     char actual[CTE_FILE_CAP];
     const char *expected = CTE_MCP_PREFIX
         "# pinned by hand\n" CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE
-        "[mcp_servers.codebase-memory-mcp.env]\nRUST_LOG = \"warn\"\n\n" CTE_MCP_END_LINE
+        "[mcp_servers.codebase-memory-neo4j.env]\nRUST_LOG = \"warn\"\n\n" CTE_MCP_END_LINE
         "[notice]\nhide_full_access_warning = true\n"
         "\n[profiles.fast]\nmodel = \"o4-mini\"\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
@@ -994,16 +994,16 @@ TEST(config_toml_managed_ambiguous_foreign_content_fails_closed_issue2228) {
     char path[CTE_PATH_CAP];
     const char *hook = "[[hooks]]\nevent = \"UserPromptSubmit\"\n"
                        "command = \"cbm hook-augment --dialect kimi\"\ntimeout = 5\n";
-    const char *extra_element = "# BEGIN codebase-memory-mcp\n"
+    const char *extra_element = "# BEGIN codebase-memory-mcp-neo4j\n"
                                 "[[hooks]]\nevent = \"UserPromptSubmit\"\n"
                                 "command = \"cbm hook-augment --dialect kimi\"\ntimeout = 5\n\n"
                                 "[[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done\"\n"
-                                "# END codebase-memory-mcp\n";
-    const char *rescoped_tail = "# BEGIN codebase-memory-mcp\n"
+                                "# END codebase-memory-mcp-neo4j\n";
+    const char *rescoped_tail = "# BEGIN codebase-memory-mcp-neo4j\n"
                                 "[notice]\nhide_full_access_warning = true\n\n"
                                 "[[hooks]]\nevent = \"UserPromptSubmit\"\n"
                                 "command = \"cbm hook-augment --dialect kimi\"\ntimeout = 5\n"
-                                "# END codebase-memory-mcp\n"
+                                "# END codebase-memory-mcp-neo4j\n"
                                 "matcher = \"user\"\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT(cte_assert_unchanged_after_managed_upsert(path, extra_element, hook));
@@ -1018,10 +1018,10 @@ TEST(config_toml_managed_remove_owned_keeps_foreign_content_issue2228) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
-    const char *extra_element = "keep = true\n# BEGIN codebase-memory-mcp\n"
+    const char *extra_element = "keep = true\n# BEGIN codebase-memory-mcp-neo4j\n"
                                 "[[hooks]]\nevent = \"UserPromptSubmit\"\n\n"
                                 "[[hooks]]\nevent = \"Stop\"\n"
-                                "# END codebase-memory-mcp\n";
+                                "# END codebase-memory-mcp-neo4j\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, CTE_MCP_ISSUE2228), 0);
     ASSERT_EQ(
@@ -1070,8 +1070,8 @@ TEST(config_toml_vibe_insert_among_other_tables) {
                           "name = \"other-server\"\n"
                           "command = \"other\"\n\n"
                           "[[mcp_servers]]\n"
-                          "name = \"codebase-memory-mcp\"\n"
-                          "command = \"codebase-memory-mcp\"\n");
+                          "name = \"codebase-memory-neo4j\"\n"
+                          "command = \"codebase-memory-mcp-neo4j\"\n");
     th_cleanup(dir);
     PASS();
 }
@@ -1080,7 +1080,7 @@ TEST(config_toml_vibe_replace_target_preserves_comments_tables) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
-    const char *replacement = "name = \"codebase-memory-mcp\"\n"
+    const char *replacement = "name = \"codebase-memory-neo4j\"\n"
                               "command = \"/new/path\"\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "# keep top\n"
@@ -1089,7 +1089,7 @@ TEST(config_toml_vibe_replace_target_preserves_comments_tables) {
                                   "command = \"other\"\n\n"
                                   "# keep target preface\n"
                                   "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\" # owned\n"
+                                  "name = \"codebase-memory-neo4j\" # owned\n"
                                   "command = \"old\"\n"
                                   "args = [\"--old\"]\n\n"
                                   "# keep after target\n"
@@ -1116,14 +1116,14 @@ TEST(config_toml_vibe_owned_table_installs_idempotently_and_removes_exact_state)
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
-    const char *canonical = "name = \"codebase-memory-mcp\"\n"
+    const char *canonical = "name = \"codebase-memory-neo4j\"\n"
                             "transport = \"stdio\"\n"
-                            "command = \"/opt/codebase-memory-mcp\"\n"
+                            "command = \"/opt/codebase-memory-mcp-neo4j\"\n"
                             "args = []\n";
     const char *installed = "[[mcp_servers]]\n"
-                            "name = \"codebase-memory-mcp\"\n"
+                            "name = \"codebase-memory-neo4j\"\n"
                             "transport = \"stdio\"\n"
-                            "command = \"/opt/codebase-memory-mcp\"\n"
+                            "command = \"/opt/codebase-memory-mcp-neo4j\"\n"
                             "args = []\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
 
@@ -1152,21 +1152,21 @@ TEST(config_toml_vibe_owned_table_preserves_foreign_same_name_state) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
-    const char *canonical = "name = \"codebase-memory-mcp\"\n"
+    const char *canonical = "name = \"codebase-memory-neo4j\"\n"
                             "transport = \"stdio\"\n"
-                            "command = \"/opt/codebase-memory-mcp\"\n"
+                            "command = \"/opt/codebase-memory-mcp-neo4j\"\n"
                             "args = []\n";
     const char *foreign_cases[] = {
         "# user-owned Vibe server\n"
         "[[mcp_servers]]\n"
-        "name = \"codebase-memory-mcp\"\n"
+        "name = \"codebase-memory-neo4j\"\n"
         "transport = \"stdio\"\n"
         "command = \"/opt/user-owned-mcp\"\n"
         "args = [\"--custom\"]\n",
         "[[mcp_servers]]\n"
-        "name = \"codebase-memory-mcp\"\n"
+        "name = \"codebase-memory-neo4j\"\n"
         "transport = \"stdio\"\n"
-        "command = \"/opt/codebase-memory-mcp\"\n"
+        "command = \"/opt/codebase-memory-mcp-neo4j\"\n"
         "args = []\n"
         "startup_timeout_sec = 45\n",
     };
@@ -1196,7 +1196,7 @@ TEST(config_toml_vibe_remove_first_target) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\"\n"
+                                  "name = \"codebase-memory-neo4j\"\n"
                                   "command = \"owned\"\n\n"
                                   "[[mcp_servers]]\n"
                                   "name = \"other\"\n"
@@ -1219,7 +1219,7 @@ TEST(config_toml_vibe_remove_middle_target) {
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
                                   "name = \"first\"\n\n"
                                   "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\"\n"
+                                  "name = \"codebase-memory-neo4j\"\n"
                                   "command = \"owned\"\n\n"
                                   "[[mcp_servers]]\n"
                                   "name = \"last\"\n"),
@@ -1242,7 +1242,7 @@ TEST(config_toml_vibe_remove_last_target) {
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
                                   "name = \"other\"\n\n"
                                   "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\"\n"),
+                                  "name = \"codebase-memory-neo4j\"\n"),
               0);
     ASSERT_EQ(cbm_toml_remove_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY), 0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
@@ -1259,7 +1259,7 @@ TEST(config_toml_vibe_remove_only_target) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-mcp\"\n"
+                                  "name = \"codebase-memory-neo4j\"\n"
                                   "command = \"owned\"\n"),
               0);
     ASSERT_EQ(cbm_toml_remove_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY), 0);
@@ -1275,7 +1275,7 @@ TEST(config_toml_vibe_literal_and_basic_identity) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
-                                  "name = 'codebase-memory-mcp' # literal\n"
+                                  "name = 'codebase-memory-neo4j' # literal\n"
                                   "command = 'owned'\n"),
               0);
     ASSERT_EQ(cbm_toml_remove_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY), 0);
@@ -1283,15 +1283,15 @@ TEST(config_toml_vibe_literal_and_basic_identity) {
     ASSERT_STR_EQ(actual, "");
 
     ASSERT_EQ(th_write_file(path, "[[mcp_servers]]\n"
-                                  "name = \"codebase-memory-\\u006dcp\" # basic\n"
+                                  "name = \"codebase-memory-\\u006eeo4j\" # basic\n"
                                   "command = \"old\"\n"),
               0);
     ASSERT_EQ(cbm_toml_upsert_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY, CTE_BODY),
               0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "[[mcp_servers]]\n"
-                          "name = \"codebase-memory-mcp\"\n"
-                          "command = \"codebase-memory-mcp\"\n");
+                          "name = \"codebase-memory-neo4j\"\n"
+                          "command = \"codebase-memory-mcp-neo4j\"\n");
     th_cleanup(dir);
     PASS();
 }
@@ -1302,10 +1302,10 @@ TEST(config_toml_vibe_duplicate_target_fail_closed) {
     char actual[CTE_FILE_CAP];
     const char *duplicate = "# preserve exactly\n"
                             "[[mcp_servers]]\n"
-                            "name = \"codebase-memory-mcp\"\n"
+                            "name = \"codebase-memory-neo4j\"\n"
                             "command = \"first\"\n\n"
                             "[[mcp_servers]]\n"
-                            "name = 'codebase-memory-mcp'\n"
+                            "name = 'codebase-memory-neo4j'\n"
                             "command = 'second'\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, duplicate), 0);
@@ -1331,7 +1331,7 @@ TEST(config_toml_vibe_ambiguous_target_fail_closed) {
 
     const char *multiline = "[[mcp_servers]]\n"
                             "description = \"\"\"\n"
-                            "name = \"codebase-memory-mcp\"\n"
+                            "name = \"codebase-memory-neo4j\"\n"
                             "\"\"\"\n"
                             "name = \"other\"\n";
     ASSERT_EQ(th_write_file(path, multiline), 0);
@@ -1340,7 +1340,7 @@ TEST(config_toml_vibe_ambiguous_target_fail_closed) {
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_NOT_NULL(strstr(actual, "description = \"\"\""));
     ASSERT_NOT_NULL(strstr(actual, "name = \"other\""));
-    ASSERT_NOT_NULL(strstr(actual, "name = \"codebase-memory-mcp\""));
+    ASSERT_NOT_NULL(strstr(actual, "name = \"codebase-memory-neo4j\""));
     th_cleanup(dir);
     PASS();
 }
@@ -1361,10 +1361,10 @@ TEST(config_toml_codex_reconciles_minimal_owned_forms) {
     static const char *fixtures[] = {
         "[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = "
         "[{ type = \"command\", command = 'echo \"Code discovery: prefer "
-        "codebase-memory-mcp\"' }] }]\n",
+        "codebase-memory-mcp-neo4j\"' }] }]\n",
         "\"hooks\" . 'SessionStart' = [ {matcher='startup|resume|clear|compact', "
-        "hooks=[{type='command', command='/opt/codebase-memory-mcp hook-augment', "
-        "command_windows='& C:\\\\bin\\\\codebase-memory-mcp.exe hook-augment',timeout=5}]} ]\n",
+        "hooks=[{type='command', command='/opt/codebase-memory-mcp-neo4j hook-augment', "
+        "command_windows='& C:\\\\bin\\\\codebase-memory-mcp-neo4j.exe hook-augment',timeout=5}]} ]\n",
     };
     for (size_t i = 0U; i < sizeof(fixtures) / sizeof(fixtures[0]); ++i) {
         ASSERT_EQ(th_write_file(path, fixtures[i]), 0);
@@ -1408,25 +1408,25 @@ TEST(config_toml_codex_reconciles_minimal_owned_forms) {
  * v0.10.2 release, with the release's POSIX and PowerShell command builders. */
 TEST(config_toml_codex_accepts_v0102_managed_windows_crlf) {
     static const char *command =
-        "'C:\\Users\\Example\\AppData\\Local\\Programs\\codebase-memory-mcp\\"
-        "codebase-memory-mcp.exe' hook-augment";
+        "'C:\\Users\\Example\\AppData\\Local\\Programs\\codebase-memory-mcp-neo4j\\"
+        "codebase-memory-mcp-neo4j.exe' hook-augment";
     static const char *command_windows =
-        "& 'C:\\Users\\Example\\AppData\\Local\\Programs\\codebase-memory-mcp\\"
-        "codebase-memory-mcp.exe' hook-augment";
+        "& 'C:\\Users\\Example\\AppData\\Local\\Programs\\codebase-memory-mcp-neo4j\\"
+        "codebase-memory-mcp-neo4j.exe' hook-augment";
     static const char *original =
         "\xEF\xBB\xBF[mcp_servers.other]\r\n"
         "command = \"other\"\r\n"
         "keep = true\r\n"
-        "# >>> codebase-memory-mcp SessionStart >>>\r\n"
+        "# >>> codebase-memory-mcp-neo4j SessionStart >>>\r\n"
         "[[hooks.SessionStart]]\r\n"
         "matcher = \"startup|resume|clear|compact\"\r\n"
         "\r\n"
         "[[hooks.SessionStart.hooks]]\r\n"
         "type = \"command\"\r\n"
         "command = \"'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
-        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "codebase-memory-mcp-neo4j\\\\codebase-memory-mcp-neo4j.exe' hook-augment\"\r\n"
         "command_windows = \"& 'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
-        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "codebase-memory-mcp-neo4j\\\\codebase-memory-mcp-neo4j.exe' hook-augment\"\r\n"
         "timeout = 5\r\n"
         "\r\n"
         "[[hooks.SubagentStart]]\r\n"
@@ -1435,11 +1435,11 @@ TEST(config_toml_codex_accepts_v0102_managed_windows_crlf) {
         "[[hooks.SubagentStart.hooks]]\r\n"
         "type = \"command\"\r\n"
         "command = \"'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
-        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "codebase-memory-mcp-neo4j\\\\codebase-memory-mcp-neo4j.exe' hook-augment\"\r\n"
         "command_windows = \"& 'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
-        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "codebase-memory-mcp-neo4j\\\\codebase-memory-mcp-neo4j.exe' hook-augment\"\r\n"
         "timeout = 5\r\n"
-        "# <<< codebase-memory-mcp SessionStart <<<\r\n";
+        "# <<< codebase-memory-mcp-neo4j SessionStart <<<\r\n";
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
     char before[CTE_FILE_CAP];
@@ -1496,7 +1496,7 @@ TEST(config_toml_codex_accepts_v0102_managed_windows_crlf) {
 
     static const char *owned_line =
         "command = \"'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
-        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n";
+        "codebase-memory-mcp-neo4j\\\\codebase-memory-mcp-neo4j.exe' hook-augment\"\r\n";
     ASSERT_EQ(cte_replace_once(original, owned_line, "command = \"foreign\"\r\n", invalid[0],
                                sizeof(invalid[0])),
               0);
@@ -1530,15 +1530,15 @@ TEST(config_toml_codex_rejects_ambiguous_inline_byte_identically) {
     char actual[CTE_FILE_CAP];
     static const char *invalid[] = {
         ("[hooks]\nSessionStart = [{matcher='startup|resume|clear|compact',hooks=[{type="
-         "'command',command='codebase-memory-mcp hook-augment',command_windows="
-         "'codebase-memory-mcp hook-augment',timeout=5},{type='command',command='foreign'}]}]\n"),
+         "'command',command='codebase-memory-mcp-neo4j hook-augment',command_windows="
+         "'codebase-memory-mcp-neo4j hook-augment',timeout=5},{type='command',command='foreign'}]}]\n"),
         ("[hooks]\nSessionStart = [{matcher='startup|resume|clear|compact',hooks=[{type="
-         "'command',command='codebase-memory-mcp hook-augment',command_windows="
-         "'codebase-memory-mcp hook-augment',timeout=5,owner='user'}]}]\n"),
+         "'command',command='codebase-memory-mcp-neo4j hook-augment',command_windows="
+         "'codebase-memory-mcp-neo4j hook-augment',timeout=5,owner='user'}]}]\n"),
         "[hooks]\nSessionStart=[]\nSessionStart=[]\n",
         "[hooks]\nSessionStart = [\n { matcher = 'startup|resume|clear|compact' }\n]\n",
         ("[hooks]\nSessionStart = [{matcher='startup|resume|clear|compact',hooks=[{type="
-         "'command',command='echo \"Code discovery: prefer codebase-memory-mcp\"'}]}] # keep\n"),
+         "'command',command='echo \"Code discovery: prefer codebase-memory-mcp-neo4j\"'}]}] # keep\n"),
         "[hooks]\nSessionStart = [{ matcher = 'startup|resume|clear|compact'\n",
     };
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
@@ -1566,7 +1566,7 @@ TEST(config_toml_codex_reports_stable_failure_reasons) {
         {
             .content =
                 "[hooks]\nSessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = ["
-                "{ type = 'command', command = 'codebase-memory-mcp hook-augment' }, "
+                "{ type = 'command', command = 'codebase-memory-mcp-neo4j hook-augment' }, "
                 "{ type = 'command', command = 'foreign' }] }]\n",
             .expected = CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP,
             .name = "ambiguous_hook_ownership",
@@ -1575,10 +1575,10 @@ TEST(config_toml_codex_reports_stable_failure_reasons) {
             .content =
                 "[hooks]\n"
                 "SessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = [{ type = "
-                "'command', command = 'echo \"Code discovery: prefer codebase-memory-mcp\"' }] "
+                "'command', command = 'echo \"Code discovery: prefer codebase-memory-mcp-neo4j\"' }] "
                 "}]\n"
                 "SessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = [{ type = "
-                "'command', command = 'echo \"Code discovery: prefer codebase-memory-mcp\"' }] "
+                "'command', command = 'echo \"Code discovery: prefer codebase-memory-mcp-neo4j\"' }] "
                 "}]\n",
             .expected = CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS,
             .name = "conflicting_hook_representations",
@@ -1613,9 +1613,9 @@ TEST(config_toml_codex_reports_stable_failure_reasons) {
  * The hook block must accept exactly what those writers emit, read it back as
  * owned, and still refuse an unquoted word that the shell would split. */
 TEST(config_toml_codex_accepts_quoted_binary_path_with_spaces) {
-    static const char command[] = "'/Users/First Last/.local/bin/codebase-memory-mcp' hook-augment";
+    static const char command[] = "'/Users/First Last/.local/bin/codebase-memory-mcp-neo4j' hook-augment";
     static const char command_windows[] = "& 'C:/Users/First Last/AppData/Local/Programs/"
-                                          "codebase-memory-mcp/codebase-memory-mcp.exe' "
+                                          "codebase-memory-mcp-neo4j/codebase-memory-mcp-neo4j.exe' "
                                           "hook-augment";
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
@@ -1633,7 +1633,7 @@ TEST(config_toml_codex_accepts_quoted_binary_path_with_spaces) {
                                                CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
               0);
     ASSERT_EQ(cte_read(path, first, sizeof(first)), 0);
-    ASSERT(strstr(first, "First Last/.local/bin/codebase-memory-mcp' hook-augment") != NULL);
+    ASSERT(strstr(first, "First Last/.local/bin/codebase-memory-mcp-neo4j' hook-augment") != NULL);
 
     /* The written block is recognised as ours: a second upsert is a no-op. */
     ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
@@ -1649,7 +1649,7 @@ TEST(config_toml_codex_accepts_quoted_binary_path_with_spaces) {
 
     /* Unquoted, the space splits the executable word: still refused. */
     ASSERT_EQ(cte_codex_edit_commands_detailed(
-                  path, "/Users/First Last/.local/bin/codebase-memory-mcp hook-augment",
+                  path, "/Users/First Last/.local/bin/codebase-memory-mcp-neo4j hook-augment",
                   command_windows, CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure),
               -1);
     ASSERT_STR_EQ(cbm_toml_codex_hook_failure_name(failure), "command_render");
@@ -1670,7 +1670,7 @@ TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot) {
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_EQ((unsigned char)actual[0], 0xEFU);
     ASSERT_NOT_NULL(strstr(actual, "command = \"foreign\""));
-    ASSERT_NOT_NULL(strstr(actual, "\r\n# >>> codebase-memory-mcp SessionStart >>>\r\n"));
+    ASSERT_NOT_NULL(strstr(actual, "\r\n# >>> codebase-memory-mcp-neo4j SessionStart >>>\r\n"));
     for (const char *cursor = actual; *cursor; ++cursor) {
         if (*cursor == '\n') {
             ASSERT(cursor > actual && cursor[-1] == '\r');
@@ -1698,11 +1698,11 @@ TEST(config_toml_remove_self_heals_orphan_closing_marker_issue1558) {
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
     ASSERT_EQ(th_write_file(path, "user_key = true\n"
-                                  "# <<< codebase-memory-mcp SessionStart <<<\n"
+                                  "# <<< codebase-memory-mcp-neo4j SessionStart <<<\n"
                                   "other_key = 1\n"),
               0);
-    ASSERT_EQ(cbm_toml_remove_managed_block(path, "# >>> codebase-memory-mcp SessionStart >>>",
-                                            "# <<< codebase-memory-mcp SessionStart <<<"),
+    ASSERT_EQ(cbm_toml_remove_managed_block(path, "# >>> codebase-memory-mcp-neo4j SessionStart >>>",
+                                            "# <<< codebase-memory-mcp-neo4j SessionStart <<<"),
               0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     /* The stray marker is gone; the user's own content is untouched. */
@@ -1717,11 +1717,11 @@ TEST(config_toml_remove_self_heals_orphan_opening_marker_issue1558) {
     char path[CTE_PATH_CAP];
     char actual[CTE_FILE_CAP];
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
-    ASSERT_EQ(th_write_file(path, "# >>> codebase-memory-mcp SessionStart >>>\n"
+    ASSERT_EQ(th_write_file(path, "# >>> codebase-memory-mcp-neo4j SessionStart >>>\n"
                                   "keep = true\n"),
               0);
-    ASSERT_EQ(cbm_toml_remove_managed_block(path, "# >>> codebase-memory-mcp SessionStart >>>",
-                                            "# <<< codebase-memory-mcp SessionStart <<<"),
+    ASSERT_EQ(cbm_toml_remove_managed_block(path, "# >>> codebase-memory-mcp-neo4j SessionStart >>>",
+                                            "# <<< codebase-memory-mcp-neo4j SessionStart <<<"),
               0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "keep = true\n");

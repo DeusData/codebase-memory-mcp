@@ -766,7 +766,7 @@ TEST(repro_grammar_build_kustomize) {
  */
 TEST(repro_grammar_build_gomod) {
     static const char src[] =
-        "module github.com/DeusData/codebase-memory-mcp\n"
+        "module github.com/haiderRizvii/codebase-memory-mcp\n"
         "\n"
         "go 1.22\n"
         "\n"
@@ -780,7 +780,7 @@ TEST(repro_grammar_build_gomod) {
         "    github.com/google/uuid v1.6.0\n"
         "    github.com/stretchr/testify v1.9.0\n"
         ")\n";
-    static const char bad[] = "module github.com/DeusData/codebase-memory-mcp\nrequire (";
+    static const char bad[] = "module github.com/haiderRizvii/codebase-memory-mcp\nrequire (";
     if (build_struct_battery("GoMod", src, CBM_LANG_GOMOD, "go.mod",
                              "Variable", NULL) != 0)
         return 1;
@@ -971,11 +971,11 @@ TEST(repro_grammar_build_bitbake) {
     return -1; /* skip — not counted as pass or fail */
     static const char src[] =
         "DESCRIPTION = \"CBM MCP server component\"\n"
-        "HOMEPAGE    = \"https://github.com/DeusData/codebase-memory-mcp\"\n"
+        "HOMEPAGE    = \"https://github.com/haiderRizvii/codebase-memory-mcp\"\n"
         "LICENSE     = \"MIT\"\n"
         "PV          = \"0.8.1\"\n"
         "\n"
-        "SRC_URI = \"git://github.com/DeusData/codebase-memory-mcp.git;protocol=https\"\n"
+        "SRC_URI = \"git://github.com/haiderRizvii/codebase-memory-mcp.git;protocol=https\"\n"
         "\n"
         "do_fetch() {\n"
         "    git clone ${SRC_URI} ${S}\n"

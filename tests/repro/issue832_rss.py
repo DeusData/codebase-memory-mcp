@@ -11,7 +11,7 @@ the PROD binary, which links mimalloc as the global allocator (Makefile.cbm:
 MI_OVERRIDE=1). The C test-runner and the C repro-runner are built CRT+ASan
 (MI_OVERRIDE=0), so mimalloc is inert there and cbm_mem_rss() falls back to
 os_rss() -- a C test would be VACUOUS. Hence this drives the real
-`build/c/codebase-memory-mcp` server over stdio and samples its RSS from `ps`.
+`build/c/codebase-memory-mcp-neo4j` server over stdio and samples its RSS from `ps`.
 
 WHAT IT SHOWS
 -------------
@@ -37,7 +37,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BINARY = os.path.join(ROOT, "build", "c", "codebase-memory-mcp")
+BINARY = os.path.join(ROOT, "build", "c", "codebase-memory-mcp-neo4j")
 CYCLES = 10
 NUM_FILES = 120  # enough files to fan out across worker threads (abandoned heaps)
 
@@ -58,7 +58,7 @@ def make_fixture(d):
 
 def run_series(repo, cache, supervised):
     env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = cache
+    env["CBM_NEO4J_CACHE_DIR"] = cache
     if supervised:
         env.pop("CBM_INDEX_SUPERVISOR", None)
     else:

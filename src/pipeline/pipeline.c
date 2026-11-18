@@ -201,7 +201,7 @@ struct cbm_pipeline {
     cbm_index_mode_t mode;
     atomic_int cancelled_storage;
     atomic_int *cancelled;
-    bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    bool persistence; /* write .codebase-memory-neo4j/graph.db.zst after indexing */
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
 

@@ -2,10 +2,10 @@
 //
 // Issue: #581 -- "Memory leak: process grows to 50+ GB virtual memory over
 //               hours/days, crashes Windows"
-//   https://github.com/DeusData/codebase-memory-mcp/issues/581
+//   https://github.com/haiderRizvii/codebase-memory-mcp/issues/581
 //
 // OBSERVED BEHAVIOUR:
-//   codebase-memory-mcp in stdio MCP server mode grows from ~12 MB working
+//   codebase-memory-mcp-neo4j in stdio MCP server mode grows from ~12 MB working
 //   set to 50-107 GB virtual memory over 12-48 hours while the agent issues
 //   repeated queries (search_graph, query_graph, get_architecture, etc.).
 //   The reporter confirmed auto_index=false, so indexing is NOT the growth

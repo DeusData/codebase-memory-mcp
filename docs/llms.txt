@@ -1,4 +1,4 @@
-# codebase-memory-mcp
+# codebase-memory-mcp-neo4j
 
 > Codebase Memory is an open-source local MCP server for AI coding agents. It connects code, documentation, configuration, and infrastructure in a persistent knowledge graph, with 17 MCP tools and native CLI access. Search for a feature, follow callers and dependencies, trace services and deployments, and inspect change impact. Indexing, graph queries, and semantic embeddings run locally without a hosted service or API key. CBM Lens is the optional visual companion, currently in open beta (v0.0.1); its optional browser model supports on-device code chat after an opt-in download.
 
@@ -31,7 +31,7 @@ Graph evidence depends on index generation, freshness, and exact path/scope cove
 
 ## Links
 
-- Homepage: https://deusdata.github.io/codebase-memory-mcp/
+- Homepage: https://github.com/haiderRizvii/codebase-memory-mcp
 - Source and feature reference: https://github.com/DeusData/codebase-memory-mcp
 - Latest release: https://github.com/DeusData/codebase-memory-mcp/releases/latest
 - Quick start and installation: https://github.com/DeusData/codebase-memory-mcp#quick-start
@@ -42,7 +42,7 @@ Graph evidence depends on index generation, freshness, and exact path/scope cove
 - Smart CI guide: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/SMART_CI.md
 - Configuration: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/CONFIGURATION.md
 - MCP tools: https://github.com/DeusData/codebase-memory-mcp#mcp-tools
-- Token savings and evidence: https://deusdata.github.io/codebase-memory-mcp/#token-savings
+- Token savings and evidence: https://github.com/haiderRizvii/codebase-memory-mcp#token-savings
 - Performance and research: https://github.com/DeusData/codebase-memory-mcp#performance
 - Benchmark report: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
 - Research paper: https://arxiv.org/abs/2603.27277

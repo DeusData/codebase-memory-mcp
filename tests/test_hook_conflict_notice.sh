@@ -24,7 +24,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp-neo4j}"
 if [[ ! -x "${BINARY}" && -x "${BINARY}.exe" ]]; then
   BINARY="${BINARY}.exe"
 fi
@@ -49,12 +49,12 @@ source "${ROOT}/scripts/test-runtime.sh"
 cbm_test_runtime_init
 tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 cleanup() {
-  CBM_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon stop >/dev/null 2>&1 || true
+  CBM_NEO4J_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon stop >/dev/null 2>&1 || true
   cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 
-if ! CBM_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon start >"${tmpdir}/daemon-start.log" 2>&1; then
+if ! CBM_NEO4J_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon start >"${tmpdir}/daemon-start.log" 2>&1; then
   echo "daemon start failed on this host - cannot exercise the conflict path" >&2
   cat "${tmpdir}/daemon-start.log" >&2
   exit 2
@@ -76,7 +76,7 @@ out=""
 for _attempt in $(seq 1 40); do
   rm -f "${tmpdir}/cache/.hook-daemon-absent-notice"
   set +e
-  out="$(printf '%s' "${payload}" | CBM_CACHE_DIR="${tmpdir}/cache" \
+  out="$(printf '%s' "${payload}" | CBM_NEO4J_CACHE_DIR="${tmpdir}/cache" \
     CBM_TEST_HOOK_CLIENT_BUILD="${forced_build}" \
     "${BINARY}" hook-augment 2>"${tmpdir}/probe.err")"
   rc=$?
@@ -104,7 +104,7 @@ if ! grep -q "conflicting CBM process" "${tmpdir}/probe.err"; then
   echo "--- diagnosis ---" >&2
   echo "forced_build=${forced_build} (len ${#forced_build})" >&2
   echo "seam present in binary: yes (asserted above)" >&2
-  CBM_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon status >&2 2>&1 || true
+  CBM_NEO4J_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon status >&2 2>&1 || true
   exit 2
 fi
 if ! printf '%s' "${out}" | grep -q "systemMessage"; then

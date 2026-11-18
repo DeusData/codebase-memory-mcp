@@ -74,7 +74,7 @@ jobs:
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
+        run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp-neo4j --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
       - name: Upload the selection
         if: ${{ steps.select.outputs.selection == 'narrowed' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -247,7 +247,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           scripts/build.sh CC=gcc CXX=g++
-          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
+          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp-neo4j"
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -257,8 +257,8 @@ jobs:
         if: matrix.os == 'macos-14'
         run: |
           scripts/build.sh CC=cc CXX=c++
-          codesign --sign - --force build/c/codebase-memory-mcp
-          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
+          codesign --sign - --force build/c/codebase-memory-mcp-neo4j
+          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp-neo4j"
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -322,9 +322,9 @@ jobs:
           sudo apt-get update && sudo apt-get install -y zlib1g-dev
           scripts/build.sh CC=gcc CXX=g++
           mkdir -p "$RUNNER_TEMP/cbm-bin"
-          cp build/c/codebase-memory-mcp "$RUNNER_TEMP/cbm-bin/"
+          cp build/c/codebase-memory-mcp-neo4j "$RUNNER_TEMP/cbm-bin/"
       - name: Predict the impacted suites
-        run: scripts/ci/test-impact-shadow.sh --binary "$RUNNER_TEMP/cbm-bin/codebase-memory-mcp" --out "$RUNNER_TEMP/test-impact"
+        run: scripts/ci/test-impact-shadow.sh --binary "$RUNNER_TEMP/cbm-bin/codebase-memory-mcp-neo4j" --out "$RUNNER_TEMP/test-impact"
       # The engine (test-impact select) is this checkout's own code: the
       # released binary predates it, so the checkout is built either way.
       - name: Build this checkout's engine
@@ -335,7 +335,7 @@ jobs:
       - name: Select with the team artifact (engine shadow)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact"
+        run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp-neo4j --out "$RUNNER_TEMP/test-impact"
       - name: Upload the prediction
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

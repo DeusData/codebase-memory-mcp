@@ -103,7 +103,7 @@ write_manifest() { # one|two
     echo "# associations=$associations"
     echo "# scan_objects=$count"
     printf 'association_type\tarchive\tarchive_sha256\tvariant\tkind\tmember\tasset_path\tmime\tscan_path\tobject_sha256\tsize\n'
-    printf 'member\tprobe.tar.gz\t%s\tstandard\tbinary\tcodebase-memory-mcp\t\t\tobjects/probe\t%s\t%s\n' "$ARCHIVE_SHA" "$PROBE_SHA" "$PROBE_SIZE"
+    printf 'member\tprobe.tar.gz\t%s\tstandard\tbinary\tcodebase-memory-mcp-neo4j\t\t\tobjects/probe\t%s\t%s\n' "$ARCHIVE_SHA" "$PROBE_SHA" "$PROBE_SIZE"
     printf 'member\tprobe.tar.gz\t%s\tstandard\truntime\tLICENSE\t\t\tobjects/probe\t%s\t%s\n' "$ARCHIVE_SHA" "$PROBE_SHA" "$PROBE_SIZE"
     if [ "$1" = "two" ]; then
       printf 'member\tprobe2.zip\t%s\tstandard\truntime\tREADME.md\t\t\tobjects/probe2\t%s\t%s\n' "$ARCHIVE2_SHA" "$PROBE2_SHA" "$PROBE2_SIZE"

@@ -189,8 +189,8 @@ describe('readLogs and readProcesses', () => {
             self_user_cpu_s: 1.2,
             self_sys_cpu_s: 0.3,
             processes: [
-                { pid: 42, cpu: 0.5, rss_mb: 120.5, elapsed: '01:02:03', command: 'codebase-memory-mcp', is_self: true },
-                { pid: 43, cpu: 12.0, rss_mb: 900.0, elapsed: '00:00:10', command: 'codebase-memory-mcp', is_self: false },
+                { pid: 42, cpu: 0.5, rss_mb: 120.5, elapsed: '01:02:03', command: 'codebase-memory-mcp-neo4j', is_self: true },
+                { pid: 43, cpu: 12.0, rss_mb: 900.0, elapsed: '00:00:10', command: 'codebase-memory-mcp-neo4j', is_self: false },
             ],
         });
         expect(report.selfPid).toBe(42);

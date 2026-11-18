@@ -37,8 +37,8 @@ case "$MODE" in incremental | full) ;; *) exit 2 ;; esac
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 # A private daemon rendezvous: the socket path must fit sun_path.
-export CBM_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)"
-export CBM_CACHE_DIR="$WORK/cache"
+export CBM_NEO4J_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)"
+export CBM_NEO4J_CACHE_DIR="$WORK/cache"
 mkdir -p "$WORK/engine" && chmod 700 "$WORK/engine"
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 PREVIOUS=""

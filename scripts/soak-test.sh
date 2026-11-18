@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# soak-test.sh — Endurance test for codebase-memory-mcp.
+# soak-test.sh — Endurance test for codebase-memory-mcp-neo4j.
 #
 # Runs compressed workload cycles: queries, file mutations, reindexes, idle periods.
 # Reads the randomized diagnostics path emitted by the daemon (requires
@@ -77,7 +77,7 @@ SOAK_MAX_QUERY_LATENCY_S=60
 SOAK_CALL_READ_TIMEOUT_S=$((SOAK_MAX_QUERY_LATENCY_S + 30))
 
 # Every product process below must reach a daemon rendezvous this run owns.
-# Only CBM_RUNTIME_DIR moves that rendezvous — a private CBM_CACHE_DIR alone
+# Only CBM_NEO4J_RUNTIME_DIR moves that rendezvous — a private CBM_NEO4J_CACHE_DIR alone
 # still shares the operator's account daemon (#1691, #1696).
 # shellcheck source=test-runtime.sh
 source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
@@ -151,8 +151,8 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
         rm -rf -- "$SOAK_WIN_ROOT"
         exit 1
     fi
-    cp "$BINARY" "$SOAK_WIN_ROOT/codebase-memory-mcp.exe"
-    BINARY="$SOAK_WIN_ROOT/codebase-memory-mcp.exe"
+    cp "$BINARY" "$SOAK_WIN_ROOT/codebase-memory-mcp-neo4j.exe"
+    BINARY="$SOAK_WIN_ROOT/codebase-memory-mcp-neo4j.exe"
     SOAK_CACHE_DIR_HOST="$SOAK_WIN_ROOT/cache"
     mkdir -p "$SOAK_CACHE_DIR_HOST"
     SOAK_WIN_ROOT_W="$(cygpath -w "$SOAK_WIN_ROOT")"
@@ -172,7 +172,7 @@ if [[ "$BINARY" == *.exe ]] && command -v winepath >/dev/null 2>&1; then
 elif [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1; then
     SOAK_CACHE_DIR_VALUE=$(cygpath -w "$SOAK_CACHE_DIR_HOST")
 fi
-DAEMON_LOG="$SOAK_CACHE_DIR_HOST/logs/cbm-daemon.log"
+DAEMON_LOG="$SOAK_CACHE_DIR_HOST/logs/cbm-neo4j-daemon.log"
 DIAG_FILE=""
 
 METRICS_CSV="$RESULTS_DIR/metrics.csv"
@@ -222,7 +222,7 @@ soak_cleanup() {
     [ -z "${SERVER_IN:-}" ] || rm -f -- "$SERVER_IN"
     [ -z "${SERVER_OUT:-}" ] || rm -f -- "$SERVER_OUT"
     if [ -f "$DAEMON_LOG" ]; then
-        cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-daemon.log" 2>/dev/null || true
+        cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-neo4j-daemon.log" 2>/dev/null || true
     fi
     rm -rf -- "$SOAK_PROJECT"
     # The helper stops this run's private daemon before removing its root and
@@ -245,13 +245,13 @@ start_mcp_server() {
         unset CBM_SOAK_SERVER CBM_SOAK_SERVER_PID || true
         if [ "$stderr_mode" = "append" ]; then
             eval 'coproc CBM_SOAK_SERVER {
-                export CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE"
+                export CBM_NEO4J_CACHE_DIR="$SOAK_CACHE_DIR_VALUE"
                 export CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text
                 exec "$BINARY" 2>>"$RESULTS_DIR/server-stderr.log"
             }'
         else
             eval 'coproc CBM_SOAK_SERVER {
-                export CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE"
+                export CBM_NEO4J_CACHE_DIR="$SOAK_CACHE_DIR_VALUE"
                 export CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text
                 exec "$BINARY" 2>"$RESULTS_DIR/server-stderr.log"
             }'
@@ -270,11 +270,11 @@ start_mcp_server() {
     fi
 
     if [ "$stderr_mode" = "append" ]; then
-        CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info \
+        CBM_NEO4J_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info \
             CBM_LOG_FORMAT=text "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" \
             2>>"$RESULTS_DIR/server-stderr.log" &
     else
-        CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info \
+        CBM_NEO4J_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info \
             CBM_LOG_FORMAT=text "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" \
             2>"$RESULTS_DIR/server-stderr.log" &
     fi
@@ -794,7 +794,7 @@ CHURN_CYCLES=${SOAK_CLI_CHURN_CYCLES:-40}
 CHURN_FAILS=0
 churn_index=0
 while [ "$churn_index" -lt "$CHURN_CYCLES" ]; do
-    if ! CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" "$BINARY" cli list_projects '{}' \
+    if ! CBM_NEO4J_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" "$BINARY" cli list_projects '{}' \
         >/dev/null 2>>"$RESULTS_DIR/cli-churn-stderr.log"; then
         CHURN_FAILS=$((CHURN_FAILS + 1))
     fi

@@ -113,10 +113,10 @@ jobs:
           ls -la
           for target in linux-amd64 linux-arm64 linux-amd64-portable linux-arm64-portable \
                         darwin-amd64 darwin-arm64; do
-            test -f "codebase-memory-mcp-$target.tar.gz" || { echo "::error::missing $target archive"; exit 1; }
+            test -f "codebase-memory-mcp-neo4j-$target.tar.gz" || { echo "::error::missing $target archive"; exit 1; }
           done
           for target in windows-amd64 windows-arm64; do
-            test -f "codebase-memory-mcp-$target.zip" || { echo "::error::missing $target archive"; exit 1; }
+            test -f "codebase-memory-mcp-neo4j-$target.zip" || { echo "::error::missing $target archive"; exit 1; }
           done
 
       # install.sh / install.ps1 refuse any archive whose SHA-256 is not listed

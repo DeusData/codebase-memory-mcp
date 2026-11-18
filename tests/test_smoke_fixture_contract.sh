@@ -188,16 +188,16 @@ require(
 )
 # One composition ships, so there is one archive name and no variant alias.
 require(
-    "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local
+    "codebase-memory-mcp-neo4j-${OS}-${ARCH}.tar.gz" in smoke_local
     and "${SUFFIX}" not in smoke_local,
     "smoke-local.sh must create the single canonical archive with no variant alias",
 )
 require(
-    "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
+    "codebase-memory-mcp-neo4j-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
     "smoke-local.sh must create the Linux portable update alias",
 )
 require(
-    'CBM_CACHE_DIR="$WORK_DIR/cache"' in smoke_local
+    'CBM_NEO4J_CACHE_DIR="$WORK_DIR/cache"' in smoke_local
     and 'SMOKE_TEMP_ROOT="$SMOKE_TEMP_DIR"' in smoke_local,
     "smoke-local.sh must isolate daemon/cache and temporary state from live user sessions",
 )
@@ -216,14 +216,14 @@ require(
 # binary, like every other platform), then runs the full smoke from a protected
 # profile-rooted directory/cache.
 for name in (
-    "codebase-memory-mcp.exe",
+    "codebase-memory-mcp-neo4j.exe",
     "LICENSE",
     "install.ps1",
     "THIRD_PARTY_NOTICES.md",
 ):
     require(name in vm_smoke, f"vm-smoke.sh archive must include {name}")
 require(
-    "codebase-memory-mcp.payload.exe" not in vm_smoke,
+    "codebase-memory-mcp-neo4j.payload.exe" not in vm_smoke,
     "vm-smoke.sh must not stage a Windows launcher/payload pair",
 )
 require("checksums.txt" in vm_smoke, "vm-smoke.sh must generate checksums.txt")
@@ -236,7 +236,7 @@ require(
 require(
     "PROFILE_ROOT=" in vm_smoke
     and 'SMOKE_TEMP_ROOT="$SMOKE_DIR"' in vm_smoke
-    and 'CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")"' in vm_smoke,
+    and 'CBM_NEO4J_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")"' in vm_smoke,
     "vm-smoke.sh must isolate smoke temp/cache below the protected user profile",
 )
 require(
@@ -305,19 +305,19 @@ for service in ("smoke-windows:",):
     )
     section = match.group("body") if match else ""
     require(
-        "codebase-memory-mcp-launcher" not in section
-        and "codebase-memory-mcp.payload.exe" not in section.replace(
-            "test ! -e build/win-cross/codebase-memory-mcp.payload.exe", ""
+        "codebase-memory-mcp-neo4j-launcher" not in section
+        and "codebase-memory-mcp-neo4j.payload.exe" not in section.replace(
+            "test ! -e build/win-cross/codebase-memory-mcp-neo4j.payload.exe", ""
         ),
         f"docker-compose {service[:-1]} must build ONE Windows binary, not a launcher/payload pair",
     )
     require(
-        "test ! -e build/win-cross/codebase-memory-mcp.payload.exe" in section,
+        "test ! -e build/win-cross/codebase-memory-mcp-neo4j.payload.exe" in section,
         f"docker-compose {service[:-1]} must assert no payload sibling is produced",
     )
 require(
-    "wine64 ./build/win-cross/codebase-memory-mcp.exe --version" in compose
-    and "wine64 cmd /c build/win-cross/codebase-memory-mcp.exe --version" in compose,
+    "wine64 ./build/win-cross/codebase-memory-mcp-neo4j.exe --version" in compose
+    and "wine64 cmd /c build/win-cross/codebase-memory-mcp-neo4j.exe --version" in compose,
     "docker-compose Windows cross-smoke must execute the single binary through Wine and through a "
     "Wine Windows parent",
 )
@@ -411,7 +411,7 @@ require(
 # command and touches nothing. Phase 14 now drives from the installed binary
 # everywhere, and 14a asserts the binary is byte-identical afterwards.
 require(
-    'UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp"' in smoke_test
+    'UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp-neo4j"' in smoke_test
     and 'STALE_CMD="$UPDATE_DRIVER"' in smoke_test,
     "Phase 14 must drive update from the installed binary on every platform",
 )
@@ -452,11 +452,11 @@ if sys.platform != "win32":
             arch_name = "amd64"
         portable = "-portable" if os_name == "linux" else ""
         archive_name = (
-            f"codebase-memory-mcp-{os_name}-{arch_name}{portable}.tar.gz"
+            f"codebase-memory-mcp-neo4j-{os_name}-{arch_name}{portable}.tar.gz"
         )
         archive = fixture / archive_name
 
-        candidate = payload / "codebase-memory-mcp"
+        candidate = payload / "codebase-memory-mcp-neo4j"
         candidate.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
@@ -467,7 +467,7 @@ if sys.platform != "win32":
             "for arg in \"$@\"; do case \"$arg\" in --dir=*) target=${arg#--dir=} ;; esac; done\n"
             "[ -n \"$target\" ] || exit 65\n"
             "mkdir -p \"$target\"\n"
-            "cp \"$0\" \"$target/codebase-memory-mcp\"\n",
+            "cp \"$0\" \"$target/codebase-memory-mcp-neo4j\"\n",
             encoding="utf-8",
         )
         candidate.chmod(0o755)
@@ -478,7 +478,7 @@ if sys.platform != "win32":
         )
         with tarfile.open(archive, "w:gz") as bundle:
             for name in (
-                "codebase-memory-mcp",
+                "codebase-memory-mcp-neo4j",
                 "LICENSE",
                 "install.sh",
                 "THIRD_PARTY_NOTICES.md",

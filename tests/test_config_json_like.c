@@ -800,7 +800,7 @@ TEST(config_json_like_preserves_jsonc_comments) {
                            "}\n";
     ASSERT_EQ(jl_write(fixture.path, original), 0);
     const char *path[] = {"mcpServers"};
-    ASSERT_EQ(cbm_json_like_upsert_entry(fixture.path, path, 1U, "codebase-memory",
+    ASSERT_EQ(cbm_json_like_upsert_entry(fixture.path, path, 1U, "codebase-memory-neo4j",
                                          "{\"command\":\"cbm\"}"),
               0);
     char *content = jl_read(fixture.path);
@@ -809,7 +809,7 @@ TEST(config_json_like_preserves_jsonc_comments) {
     ASSERT(strstr(content, "/* retained server */") != NULL);
     ASSERT(strstr(content, "\"theme\": \"dark\"") != NULL);
     ASSERT(strstr(content, "\"other\": {\"command\": \"other\"}") != NULL);
-    ASSERT(strstr(content, "\"codebase-memory\": {\"command\":\"cbm\"}") != NULL);
+    ASSERT(strstr(content, "\"codebase-memory-neo4j\": {\"command\":\"cbm\"}") != NULL);
     free(content);
     jl_fixture_close(&fixture);
     PASS();
@@ -822,20 +822,20 @@ TEST(config_json_like_openclaw_json5_nested_servers) {
         "{ theme: 'dark', mcp: { servers: { other: { command: 'other' }, }, }, }";
     ASSERT_EQ(jl_write(fixture.path, original), 0);
     const char *path[] = {"mcp", "servers"};
-    ASSERT_EQ(cbm_json_like_upsert_entry(fixture.path, path, 2U, "codebase-memory",
+    ASSERT_EQ(cbm_json_like_upsert_entry(fixture.path, path, 2U, "codebase-memory-neo4j",
                                          "{\"command\":\"cbm\",\"args\":[]}"),
               0);
     char *content = jl_read(fixture.path);
     ASSERT_NOT_NULL(content);
     ASSERT(strstr(content, "theme: 'dark'") != NULL);
     ASSERT(strstr(content, "other: { command: 'other' }") != NULL);
-    ASSERT(strstr(content, "\"codebase-memory\"") != NULL);
+    ASSERT(strstr(content, "\"codebase-memory-neo4j\"") != NULL);
     free(content);
 
-    ASSERT_EQ(cbm_json_like_remove_entry(fixture.path, path, 2U, "codebase-memory"), 0);
+    ASSERT_EQ(cbm_json_like_remove_entry(fixture.path, path, 2U, "codebase-memory-neo4j"), 0);
     content = jl_read(fixture.path);
     ASSERT_NOT_NULL(content);
-    ASSERT(strstr(content, "codebase-memory") == NULL);
+    ASSERT(strstr(content, "codebase-memory-neo4j") == NULL);
     ASSERT(strstr(content, "theme: 'dark'") != NULL);
     ASSERT(strstr(content, "other: { command: 'other' }") != NULL);
     free(content);
@@ -848,7 +848,7 @@ TEST(config_json_like_creates_missing_nested_path) {
     ASSERT_EQ(jl_fixture_open(&fixture), 0);
     ASSERT_EQ(jl_write(fixture.path, "{\n  \"theme\": \"dark\"\n}\n"), 0);
     const char *path[] = {"mcp", "servers"};
-    ASSERT_EQ(cbm_json_like_upsert_entry(fixture.path, path, 2U, "codebase-memory",
+    ASSERT_EQ(cbm_json_like_upsert_entry(fixture.path, path, 2U, "codebase-memory-neo4j",
                                          "{\"command\":\"cbm\"}"),
               0);
     char *content = jl_read(fixture.path);
@@ -856,7 +856,7 @@ TEST(config_json_like_creates_missing_nested_path) {
     ASSERT(strstr(content, "\"theme\": \"dark\"") != NULL);
     ASSERT(strstr(content, "\"mcp\": {") != NULL);
     ASSERT(strstr(content, "\"servers\": {") != NULL);
-    ASSERT(strstr(content, "\"codebase-memory\": {\"command\":\"cbm\"}") != NULL);
+    ASSERT(strstr(content, "\"codebase-memory-neo4j\": {\"command\":\"cbm\"}") != NULL);
     free(content);
     jl_fixture_close(&fixture);
     PASS();
@@ -1020,7 +1020,7 @@ TEST(config_json_like_top_level_array_unique_string) {
                            "    // keep this user comment\n"
                            "  ],\n"
                            "}\n";
-    const char *owned = "~/.config/kilo/rules/codebase-memory-mcp.md";
+    const char *owned = "~/.config/kilo/rules/codebase-memory-mcp-neo4j.md";
     ASSERT_EQ(jl_write(fixture.path, original), 0);
     ASSERT_EQ(cbm_json_like_add_unique_string(fixture.path, "instructions", owned), 0);
     char *first = jl_read(fixture.path);
@@ -1061,25 +1061,25 @@ TEST(config_json_like_array_add_replaces_null_value_issue1826) {
                            "}\n";
     ASSERT_EQ(jl_write(fixture.path, original), 0);
     ASSERT_EQ(
-        cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp"), 0);
+        cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp-neo4j"), 0);
     char *first = jl_read(fixture.path);
     ASSERT_NOT_NULL(first);
     ASSERT_STR_EQ(first,
                   "{\n"
                   "  \"name\": \"default\",\n"
-                  "  \"mcp_server_refs\": [\"codebase-memory-mcp\"], // keep this user comment\n"
+                  "  \"mcp_server_refs\": [\"codebase-memory-mcp-neo4j\"], // keep this user comment\n"
                   "  \"tools\": [\"bash\"]\n"
                   "}\n");
 
     ASSERT_EQ(
-        cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp"), 0);
+        cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp-neo4j"), 0);
     char *second = jl_read(fixture.path);
     ASSERT_NOT_NULL(second);
     ASSERT_STR_EQ(second, first);
     free(first);
     free(second);
 
-    ASSERT_EQ(cbm_json_like_remove_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp"),
+    ASSERT_EQ(cbm_json_like_remove_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp-neo4j"),
               0);
     char *removed = jl_read(fixture.path);
     ASSERT_NOT_NULL(removed);
@@ -1111,7 +1111,7 @@ static int jl_match_openhands_entry(const char *document,
                                     char **captured) {
     static const char *const path[] = {"mcp_config"};
     return cbm_json_like_match_object_entry(document, strlen(document), path, 1U,
-                                            "codebase-memory-mcp", fields, field_count, captured);
+                                            "codebase-memory-neo4j", fields, field_count, captured);
 }
 
 TEST(config_json_like_match_object_entry_literal_shape_issue1826) {
@@ -1130,7 +1130,7 @@ TEST(config_json_like_match_object_entry_literal_shape_issue1826) {
          .flags = CBM_JSON_LIKE_FIELD_REQUIRED},
     };
     char *captured = NULL;
-    const char *ours = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+    const char *ours = "{\"mcp_config\": {\"codebase-memory-neo4j\": {\"transport\": \"stdio\", "
                        "\"command\": \"/x/cbm\", \"enabled\": true}}}\n";
     ASSERT_EQ(jl_match_openhands_entry(ours, fields, 3U, &captured), CBM_JSON_LIKE_OBJECT_MATCH);
     ASSERT_NOT_NULL(captured);
@@ -1138,24 +1138,24 @@ TEST(config_json_like_match_object_entry_literal_shape_issue1826) {
     free(captured);
 
     /* Trivia around the token is not part of the value. */
-    const char *spaced = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+    const char *spaced = "{\"mcp_config\": {\"codebase-memory-neo4j\": {\"transport\": \"stdio\", "
                          "\"command\": \"/x/cbm\", \"enabled\" :  true /* on */ }}}\n";
     ASSERT_EQ(jl_match_openhands_entry(spaced, fields, 3U, &captured), CBM_JSON_LIKE_OBJECT_MATCH);
     free(captured);
 
-    const char *disabled = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+    const char *disabled = "{\"mcp_config\": {\"codebase-memory-neo4j\": {\"transport\": \"stdio\", "
                            "\"command\": \"/x/cbm\", \"enabled\": false}}}\n";
     ASSERT_EQ(jl_match_openhands_entry(disabled, fields, 3U, &captured),
               CBM_JSON_LIKE_OBJECT_MISMATCH);
     ASSERT_NULL(captured);
 
-    const char *quoted = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+    const char *quoted = "{\"mcp_config\": {\"codebase-memory-neo4j\": {\"transport\": \"stdio\", "
                          "\"command\": \"/x/cbm\", \"enabled\": \"true\"}}}\n";
     ASSERT_EQ(jl_match_openhands_entry(quoted, fields, 3U, &captured),
               CBM_JSON_LIKE_OBJECT_MISMATCH);
     ASSERT_NULL(captured);
 
-    const char *missing = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+    const char *missing = "{\"mcp_config\": {\"codebase-memory-neo4j\": {\"transport\": \"stdio\", "
                           "\"command\": \"/x/cbm\"}}}\n";
     ASSERT_EQ(jl_match_openhands_entry(missing, fields, 3U, &captured),
               CBM_JSON_LIKE_OBJECT_MISMATCH);
@@ -1185,7 +1185,7 @@ TEST(config_json_like_match_object_entry_literal_shape_issue1826) {
  * original bytes exactly — no stray space before the closing bracket. */
 static bool jl_round_trips(jl_fixture_t *fixture, const char *original, const char *expected) {
     if (jl_write(fixture->path, original) != 0 ||
-        cbm_json_like_add_unique_string(fixture->path, "mcp_server_refs", "codebase-memory-mcp") !=
+        cbm_json_like_add_unique_string(fixture->path, "mcp_server_refs", "codebase-memory-mcp-neo4j") !=
             0) {
         return false;
     }
@@ -1193,7 +1193,7 @@ static bool jl_round_trips(jl_fixture_t *fixture, const char *original, const ch
     bool ok = added && strcmp(added, expected) == 0;
     free(added);
     if (!ok ||
-        cbm_json_like_remove_string(fixture->path, "mcp_server_refs", "codebase-memory-mcp") != 0) {
+        cbm_json_like_remove_string(fixture->path, "mcp_server_refs", "codebase-memory-mcp-neo4j") != 0) {
         return false;
     }
     char *restored = jl_read(fixture->path);
@@ -1207,12 +1207,12 @@ TEST(config_json_like_single_line_array_round_trips_byte_for_byte_issue1826) {
     ASSERT_EQ(jl_fixture_open(&fixture), 0);
     ASSERT_TRUE(jl_round_trips(
         &fixture, "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\"]}\n",
-        "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\", \"codebase-memory-mcp\"]}\n"));
+        "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\", \"codebase-memory-mcp-neo4j\"]}\n"));
     ASSERT_TRUE(
         jl_round_trips(&fixture, "{ \"mcp_server_refs\": [ \"other-mcp\" ] }\n",
-                       "{ \"mcp_server_refs\": [ \"other-mcp\", \"codebase-memory-mcp\" ] }\n"));
+                       "{ \"mcp_server_refs\": [ \"other-mcp\", \"codebase-memory-mcp-neo4j\" ] }\n"));
     ASSERT_TRUE(jl_round_trips(&fixture, "{\"mcp_server_refs\": [ ]}\n",
-                               "{\"mcp_server_refs\": [ \"codebase-memory-mcp\" ]}\n"));
+                               "{\"mcp_server_refs\": [ \"codebase-memory-mcp-neo4j\" ]}\n"));
     jl_fixture_close(&fixture);
     PASS();
 }

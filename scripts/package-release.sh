@@ -36,8 +36,8 @@ Targets are the eight existing release products:
   windows/{amd64,arm64}
 
 Archive contents — one executable, no sidecars:
-  unix:    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md (.tar.gz)
-  windows: codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md (.zip)
+  unix:    codebase-memory-mcp-neo4j LICENSE install.sh THIRD_PARTY_NOTICES.md (.tar.gz)
+  windows: codebase-memory-mcp-neo4j.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md (.zip)
 
 MCPB bundle (.mcpb): every darwin/windows target and static linux target.
 The executable member in every produced container is verified against
@@ -129,7 +129,7 @@ if [ -n "$THIRD_PARTY_NOTICES" ]; then
     THIRD_PARTY_NOTICES="$(cd "$(dirname "$THIRD_PARTY_NOTICES")" && pwd -P)/$(basename "$THIRD_PARTY_NOTICES")"
 fi
 OUT_DIR="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)"
-NAME="codebase-memory-mcp-${GOOS}-${GOARCH}"
+NAME="codebase-memory-mcp-neo4j-${GOOS}-${GOARCH}"
 
 sha256_file() {
     python3 - "$1" <<'PY'
@@ -189,11 +189,11 @@ PY
 assert_expected_hash "$SELECTED_BINARY" "selected binary" || exit 2
 
 if [ "$GOOS" = "windows" ]; then
-    STAGED_BINARY_NAME="codebase-memory-mcp.exe"
+    STAGED_BINARY_NAME="codebase-memory-mcp-neo4j.exe"
     INSTALLER="install.ps1"
     ARCHIVE_OUT="$OUT_DIR/$NAME.zip"
 else
-    STAGED_BINARY_NAME="codebase-memory-mcp"
+    STAGED_BINARY_NAME="codebase-memory-mcp-neo4j"
     INSTALLER="install.sh"
     ARCHIVE_OUT="$OUT_DIR/$NAME.tar.gz"
 fi
@@ -251,7 +251,7 @@ if [ "$GOOS" = "windows" ]; then
     (
         cd "$PACK_DIR"
         zip -q -X "$ARCHIVE_TMP" \
-            codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+            codebase-memory-mcp-neo4j.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
     )
     mkdir "$VERIFY_DIR/archive"
     extract_zip_member "$ARCHIVE_TMP" "$STAGED_BINARY_NAME" \
@@ -260,7 +260,7 @@ else
     # BSD tar otherwise materializes macOS extended attributes as hidden
     # AppleDouble `._*` members, violating the exact four-file inventory.
     COPYFILE_DISABLE=1 tar -czf "$ARCHIVE_TMP" -C "$PACK_DIR" \
-        codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+        codebase-memory-mcp-neo4j LICENSE install.sh THIRD_PARTY_NOTICES.md
     mkdir "$VERIFY_DIR/archive"
     tar -xzf "$ARCHIVE_TMP" -C "$VERIFY_DIR/archive" "$STAGED_BINARY_NAME"
 fi
@@ -290,13 +290,13 @@ build_mcpb_bundle() {
     cat >"$stage/manifest.json" <<EOF
 {
   "manifest_version": "0.3",
-  "name": "codebase-memory-mcp",
+  "name": "codebase-memory-neo4j",
   "display_name": "Codebase Memory",
   "version": "$mcpb_version",
   "description": "Local code intelligence connecting code, docs and infrastructure for developers and AI agents.",
   "author": { "name": "DeusData", "url": "https://github.com/DeusData" },
-  "repository": { "type": "git", "url": "https://github.com/DeusData/codebase-memory-mcp" },
-  "homepage": "https://deusdata.github.io/codebase-memory-mcp/",
+  "repository": { "type": "git", "url": "https://github.com/haiderRizvii/codebase-memory-mcp" },
+  "homepage": "https://github.com/haiderRizvii/codebase-memory-mcp",
   "license": "MIT",
   "server": {
     "type": "binary",

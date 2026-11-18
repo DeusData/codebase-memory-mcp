@@ -638,7 +638,7 @@ static const char *version_cohort_conflict_kind(const cbm_daemon_conflict_t *con
 /* A mismatched live holder is not necessarily a peer that will stay: an
  * internal daemon keeps its lifetime SH lock for the few hundred milliseconds
  * between its last client leaving and its teardown finishing, and a CLI under
- * another CBM_CACHE_DIR arriving inside that window used to be refused with a
+ * another CBM_NEO4J_CACHE_DIR arriving inside that window used to be refused with a
  * cache-root conflict although nothing was running any more (#2046; the
  * refusal was masked only by the local CLI's own slow startup). host.c already
  * waits out the same handoff for the daemon claim marker. Admission therefore

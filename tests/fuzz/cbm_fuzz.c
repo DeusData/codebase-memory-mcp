@@ -146,20 +146,20 @@ static void fuzz_config(const uint8_t *data, size_t size) {
     }
     switch (data[0]) {
     case 't':
-        (void)cbm_toml_upsert_managed_block(path, "# BEGIN codebase-memory",
-                                            "# END codebase-memory", "owned = true\n");
-        (void)cbm_toml_remove_managed_block(path, "# BEGIN codebase-memory",
-                                            "# END codebase-memory");
+        (void)cbm_toml_upsert_managed_block(path, "# BEGIN codebase-memory-neo4j",
+                                            "# END codebase-memory-neo4j", "owned = true\n");
+        (void)cbm_toml_remove_managed_block(path, "# BEGIN codebase-memory-neo4j",
+                                            "# END codebase-memory-neo4j");
         break;
     case 'y':
-        (void)cbm_yaml_upsert_mapping_entry(path, "mcp_servers", "codebase-memory",
-                                            "    command: codebase-memory-mcp\n");
-        (void)cbm_yaml_remove_mapping_entry(path, "mcp_servers", "codebase-memory");
+        (void)cbm_yaml_upsert_mapping_entry(path, "mcp_servers", "codebase-memory-neo4j",
+                                            "    command: codebase-memory-mcp-neo4j\n");
+        (void)cbm_yaml_remove_mapping_entry(path, "mcp_servers", "codebase-memory-neo4j");
         break;
     default: {
         const char *object_path[] = {"mcpServers"};
-        (void)cbm_json_like_upsert_entry(path, object_path, FUZZ_JSON_PATH_LEN, "codebase-memory",
-                                         "{\"command\":\"codebase-memory-mcp\"}");
+        (void)cbm_json_like_upsert_entry(path, object_path, FUZZ_JSON_PATH_LEN, "codebase-memory-neo4j",
+                                         "{\"command\":\"codebase-memory-mcp-neo4j\"}");
         char *content = NULL;
         size_t length = 0;
         if (cbm_json_like_read_document(path, &content, &length) == 0) {

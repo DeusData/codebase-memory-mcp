@@ -3,7 +3,7 @@
 Smart CI runs, for each pull request, only the CI jobs and tests that the
 change can reach. This page explains how this repository does it and how
 another repository on GitHub Actions could do the same with the released
-`codebase-memory-mcp` binary.
+`codebase-memory-mcp-neo4j` binary.
 
 Status: experimental. Every answer carries `"experimental": true`. The
 selection narrows real test runs only while the repository variable
@@ -42,7 +42,7 @@ changed files ──► Layer 1: lane selector ──► which CI jobs run
                                    │
                                    ▼  (the Linux x86_64 test leg only, in this repo)
 merge base + PR ─► Layer 2: test-impact engine ─► which suites / tests run
-                  (codebase-memory-mcp test-impact select
+                  (codebase-memory-mcp-neo4j test-impact select
                    + team-artifact bundle from main)
 ```
 
@@ -83,12 +83,12 @@ reports `run_all`. Static reachability alone never omits a suite.
 
    ```bash
    CBM_VERSION=vX.Y.Z   # a release that contains the features you use (see below)
-   asset=codebase-memory-mcp-linux-amd64.tar.gz
+   asset=codebase-memory-mcp-neo4j-linux-amd64.tar.gz
    gh release download "$CBM_VERSION" --repo DeusData/codebase-memory-mcp \
      --pattern "$asset" --pattern checksums.txt --dir "$RUNNER_TEMP/cbm"
    (cd "$RUNNER_TEMP/cbm" && grep " $asset\$" checksums.txt | sha256sum -c - &&
-     tar -xzf "$asset" codebase-memory-mcp)
-   "$RUNNER_TEMP/cbm/codebase-memory-mcp" --version
+     tar -xzf "$asset" codebase-memory-mcp-neo4j)
+   "$RUNNER_TEMP/cbm/codebase-memory-mcp-neo4j" --version
    ```
 
    For a quick start, `install.sh` installs the latest release with the same
@@ -159,7 +159,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install codebase-memory-mcp
+      - name: Install codebase-memory-mcp-neo4j
         run: <the pinned install from Prerequisites>
       - name: Per-test coverage map            # YOURS: format 1, see coverage-map.py
         run: |
@@ -167,10 +167,10 @@ jobs:
           ./ci/coverage-map.sh --out "$RUNNER_TEMP/coverage"
       - name: Publish the bundle
         run: |
-          export CBM_CACHE_DIR="$RUNNER_TEMP/ti-cache"
-          export CBM_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)"   # short: sun_path
+          export CBM_NEO4J_CACHE_DIR="$RUNNER_TEMP/ti-cache"
+          export CBM_NEO4J_RUNTIME_DIR="$(mktemp -d /tmp/cbm-rt.XXXXXX)"   # short: sun_path
           mkdir -p "$RUNNER_TEMP/ti-work" && chmod 700 "$RUNNER_TEMP/ti-work"
-          "$RUNNER_TEMP/cbm/codebase-memory-mcp" test-impact publish \
+          "$RUNNER_TEMP/cbm/codebase-memory-mcp-neo4j" test-impact publish \
             --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/bundle" \
             --work "$RUNNER_TEMP/ti-work" --coverage "$RUNNER_TEMP/coverage" \
             --observed-at "$OBSERVED" --platform linux-x86_64-clang21
@@ -178,7 +178,7 @@ jobs:
         with:
           name: test-impact-${{ github.sha }}
           path: ${{ runner.temp }}/bundle
-          include-hidden-files: true    # the graph lives in .codebase-memory/
+          include-hidden-files: true    # the graph lives in .codebase-memory-neo4j/
           retention-days: 30
           if-no-files-found: error
 ```
@@ -211,12 +211,12 @@ than that.
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install codebase-memory-mcp
+      - name: Install codebase-memory-mcp-neo4j
         run: <the pinned install from Prerequisites>
       - name: Select with the team artifact (shadow)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/test-impact-select.sh --binary "$RUNNER_TEMP/cbm/codebase-memory-mcp" --out "$RUNNER_TEMP/test-impact"
+        run: scripts/ci/test-impact-select.sh --binary "$RUNNER_TEMP/cbm/codebase-memory-mcp-neo4j" --out "$RUNNER_TEMP/test-impact"
       - uses: actions/upload-artifact@<pinned-sha>
         if: ${{ always() }}
         with:
@@ -263,12 +263,12 @@ everything (`builtin:test-impact-config`).
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install codebase-memory-mcp
+      - name: Install codebase-memory-mcp-neo4j
         run: <the pinned install from Prerequisites>
       - id: select
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/test-impact-select.sh --binary "$RUNNER_TEMP/cbm/codebase-memory-mcp" --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
+        run: scripts/ci/test-impact-select.sh --binary "$RUNNER_TEMP/cbm/codebase-memory-mcp-neo4j" --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
       - if: ${{ steps.select.outputs.selection == 'narrowed' }}
         uses: actions/upload-artifact@<pinned-sha>
         with:

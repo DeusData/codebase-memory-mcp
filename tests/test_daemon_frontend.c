@@ -98,22 +98,22 @@ static cbm_daemon_runtime_application_status_t frontend_idle_request(
     return CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
-static void frontend_idle_request_cancel(
-    void *context, cbm_daemon_runtime_application_session_t *session,
-    cbm_daemon_runtime_application_token_t request_token) {
+static void frontend_idle_request_cancel(void *context,
+                                         cbm_daemon_runtime_application_session_t *session,
+                                         cbm_daemon_runtime_application_token_t request_token) {
     (void)context;
     (void)session;
     (void)request_token;
 }
 
-static void frontend_idle_session_cancel(
-    void *context, cbm_daemon_runtime_application_session_t *session) {
+static void frontend_idle_session_cancel(void *context,
+                                         cbm_daemon_runtime_application_session_t *session) {
     (void)context;
     (void)session;
 }
 
-static void frontend_idle_session_close(
-    void *context, cbm_daemon_runtime_application_session_t *session) {
+static void frontend_idle_session_close(void *context,
+                                        cbm_daemon_runtime_application_session_t *session) {
     (void)context;
     (void)session;
 }
@@ -127,8 +127,7 @@ static uint64_t frontend_test_process_id(void) {
 }
 
 static bool frontend_idle_fixture_start(frontend_idle_fixture_t *fixture) {
-    static const char cache[] =
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    static const char cache[] = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     memset(fixture, 0, sizeof(*fixture));
     if (!frontend_maintenance_fixture_start(&fixture->maintenance, "idle-observer")) {
         return false;
@@ -170,8 +169,8 @@ static bool frontend_idle_fixture_start(frontend_idle_fixture_t *fixture) {
     fixture->service = cbm_daemon_runtime_service_start(&config);
     cbm_daemon_runtime_connect_result_t connect_result = {0};
     fixture->client = fixture->service
-                          ? cbm_daemon_runtime_client_connect(fixture->maintenance.endpoint, &identity,
-                                                              30000, &connect_result)
+                          ? cbm_daemon_runtime_client_connect(fixture->maintenance.endpoint,
+                                                              &identity, 30000, &connect_result)
                           : NULL;
     return fixture->client && connect_result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
 }
@@ -212,8 +211,7 @@ static int frontend_test_close_fd(int fd) {
 
 static void *frontend_idle_run(void *opaque) {
     frontend_idle_run_t *run = opaque;
-    run->result =
-        cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output);
+    run->result = cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output);
     return NULL;
 }
 #endif
@@ -610,10 +608,16 @@ static int frontend_eof_child_run(const char *parent, bool overflow) {
     } else {
         result_matches_contract = result == 0 && session_cancelled;
     }
-    return result_matches_contract && joined && writer_ok && request_started && streams_closed &&
-                   fixture_closed
-               ? 0
-               : 73;
+    bool passed = result_matches_contract && joined && writer_ok && request_started &&
+                  streams_closed && fixture_closed;
+    if (!passed) {
+        fprintf(stderr,
+                "EOF contract: overflow=%d result=%d cancelled=%d requests=%d "
+                "joined=%d writer=%d started=%d streams=%d fixture=%d\n",
+                overflow, result, session_cancelled, requests_observed, joined, writer_ok,
+                request_started, streams_closed, fixture_closed);
+    }
+    return passed ? 0 : 73;
 }
 
 static bool frontend_eof_run_isolated(const char *tag, bool overflow) {

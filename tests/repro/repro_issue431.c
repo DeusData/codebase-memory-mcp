@@ -124,7 +124,7 @@ TEST(repro_issue431_vscode_profile_inherits_mcp_json) {
 
     /* --- Run the install plan oracle (dry-run, no mutations) --- */
     char *plan_json =
-        cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+        cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp-neo4j");
     ASSERT_NOT_NULL(plan_json);
 
     /* Sanity: the plan must mention vscode at all */

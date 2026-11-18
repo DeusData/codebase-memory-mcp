@@ -1047,7 +1047,8 @@ static void application_tmp_unlock(void) {
 
 static bool application_cache_dir(char out[APPLICATION_PATH_CAP]) {
     char configured[APPLICATION_PATH_CAP] = {0};
-    if (cbm_safe_getenv("CBM_CACHE_DIR", configured, sizeof(configured), NULL) && configured[0]) {
+    if (cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", configured, sizeof(configured), NULL) &&
+        configured[0]) {
         int written = snprintf(out, APPLICATION_PATH_CAP, "%s", configured);
         if (written <= 0 || written >= APPLICATION_PATH_CAP) {
             return false;
@@ -1062,7 +1063,7 @@ static bool application_cache_dir(char out[APPLICATION_PATH_CAP]) {
     if (!home[0]) {
         return false;
     }
-    int written = snprintf(out, APPLICATION_PATH_CAP, "%s/.cache/codebase-memory-mcp", home);
+    int written = snprintf(out, APPLICATION_PATH_CAP, "%s/.cache/codebase-memory-mcp-neo4j", home);
     if (written <= 0 || written >= APPLICATION_PATH_CAP) {
         return false;
     }
@@ -2359,9 +2360,9 @@ static void application_update_publish_terminal_locked(cbm_daemon_application_t 
     if (!application->update_cancel_requested && application_update_version_valid(latest_version) &&
         cbm_compare_versions(latest_version, cbm_cli_get_version()) > 0) {
         (void)snprintf(application->update_notice, sizeof(application->update_notice),
-                       "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
-                       "Enjoying codebase-memory-mcp? Please leave a star: "
-                       "https://github.com/DeusData/codebase-memory-mcp",
+                       "Update available: %s -> %s -- run: codebase-memory-mcp-neo4j update  |  "
+                       "Enjoying codebase-memory-mcp-neo4j? Please leave a star: "
+                       "https://github.com/haiderRizvii/codebase-memory-mcp",
                        cbm_cli_get_version(), latest_version);
         cbm_log_info("update.available", "current", cbm_cli_get_version(), "latest",
                      latest_version);
@@ -2966,10 +2967,10 @@ static bool application_async_host_missing(cbm_daemon_application_session_t *ses
  * cancelling, nor this session closing cancels the job: only daemon shutdown
  * (or the final live session of a non-permanent generation) does. Never
  * queues behind the physical job limit: a full daemon answers busy. */
-#define APPLICATION_ASYNC_NEEDS_HOST                                                              \
-    "async indexing needs a daemon that outlives this command: this one-shot call is the only "   \
-    "client of a temporary daemon, which stops (cancelling the job) when the command exits. Run " \
-    "`codebase-memory-mcp daemon start` (or keep an MCP session open), then retry; or call "      \
+#define APPLICATION_ASYNC_NEEDS_HOST                                                               \
+    "async indexing needs a daemon that outlives this command: this one-shot call is the only "    \
+    "client of a temporary daemon, which stops (cancelling the job) when the command exits. Run "  \
+    "`codebase-memory-mcp-neo4j daemon start` (or keep an MCP session open), then retry; or call " \
     "without async"
 
 static char *application_index_start_async(cbm_daemon_application_session_t *session,

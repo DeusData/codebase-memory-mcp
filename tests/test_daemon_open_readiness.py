@@ -17,7 +17,7 @@ Build the fixture with test seams so browser launching is recorded rather than
 performed and the two negative cases can use a short deterministic deadline:
 
     make -f Makefile.cbm cbm-with-ui TEST_SEAMS=1 BUILD_DIR=build/ui-open-test
-    python3 tests/test_daemon_open_readiness.py build/ui-open-test/codebase-memory-mcp
+    python3 tests/test_daemon_open_readiness.py build/ui-open-test/codebase-memory-mcp-neo4j
 
 Exit code: 0 == green, 1 == behavior regression, 2 == fixture/setup error.
 """
@@ -137,7 +137,7 @@ class OldMarkerResponder:
 
 def fixture_environment(work, cache, marker, timeout_ms):
     env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = cache
+    env["CBM_NEO4J_CACHE_DIR"] = cache
     env[OPEN_MARKER_ENV] = marker
     env[READY_TIMEOUT_ENV] = str(timeout_ms)
     runtime_parent = os.path.join(work, "runtime-" + os.path.basename(cache))

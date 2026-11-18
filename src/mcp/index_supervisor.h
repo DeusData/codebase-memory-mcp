@@ -113,7 +113,7 @@ cbm_index_worker_argv_status_t cbm_index_worker_parse_process_argv(
 const char *cbm_index_worker_argv_status_message(cbm_index_worker_argv_status_t status);
 
 /* Host marking (#845): the supervisor gate is OPT-IN per process. Only the real
- * codebase-memory-mcp binary calls this (first thing in main(), before any
+ * codebase-memory-mcp-neo4j binary calls this (first thing in main(), before any
  * subcommand dispatch, so MCP server + CLI + HTTP paths are all covered).
  * EMBEDDERS of cbm_mcp_handle_tool (test binaries, future library users) never
  * call it, so they index in-process by default. Without this gate the supervisor

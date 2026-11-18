@@ -3355,7 +3355,7 @@ static int yaml_remove_mapping_entry_locked(const char *file_path, const char *s
  *   stdio schema; early releases wrote V unquoted), OR the goose block
  *   `type/cmd/args/enabled` in order with an optional leading `name:` (the
  *   pre-#1675 block had no name). V may be plain or double-quoted; its
- *   basename must be codebase-memory-mcp[.exe]. Anything else stays FOREIGN
+ *   basename must be codebase-memory-mcp-neo4j[.exe]. Anything else stays FOREIGN
  *   (fail-closed). */
 static bool yaml_owned_value_is_our_binary(const char *v, size_t vlen) {
     if (vlen >= 2U && v[0] == '"' && v[vlen - 1U] == '"') {
@@ -3370,8 +3370,8 @@ static bool yaml_owned_value_is_our_binary(const char *v, size_t vlen) {
     }
     const char *name = v + base;
     size_t name_len = vlen - base;
-    static const char plain[] = "codebase-memory-mcp";
-    static const char exe[] = "codebase-memory-mcp.exe";
+    static const char plain[] = "codebase-memory-mcp-neo4j";
+    static const char exe[] = "codebase-memory-mcp-neo4j.exe";
     return (name_len == sizeof(plain) - 1U && memcmp(name, plain, name_len) == 0) ||
            (name_len == sizeof(exe) - 1U && memcmp(name, exe, name_len) == 0);
 }
@@ -3414,7 +3414,7 @@ static bool yaml_owned_entry_is_prior_shape(const char *data, size_t len, const 
     }
     /* Body lines: 4-space indent, known fields only. */
     static const char cmd_prefix[] = "    command: ";
-    static const char goose_name[] = "    name: codebase-memory-mcp";
+    static const char goose_name[] = "    name: codebase-memory-neo4j";
     static const char goose_type[] = "    type: stdio";
     static const char goose_cmd[] = "    cmd: ";
     static const char goose_args[] = "    args: []";

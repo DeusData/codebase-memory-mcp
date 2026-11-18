@@ -12,7 +12,7 @@ make -f Makefile.cbm -pn build/c/test-repro-runner >"$MAKE_DB"
 repro_target_line="$(grep '^build/c/test-repro-runner:' "$MAKE_DB" | head -1 || true)"
 test_target_line="$(grep '^build/c/test-runner:' "$MAKE_DB" | head -1 || true)"
 tsan_target_line="$(grep '^build/c/test-runner-tsan:' "$MAKE_DB" | head -1 || true)"
-production_target_line="$(grep '^build/c/codebase-memory-mcp:' "$MAKE_DB" | head -1 || true)"
+production_target_line="$(grep '^build/c/codebase-memory-mcp-neo4j:' "$MAKE_DB" | head -1 || true)"
 
 if [[ "$repro_target_line" != *'tests/repro/repro_harness.h'* ||
       "$repro_target_line" != *'tests/test_framework.h'* ||
@@ -37,7 +37,7 @@ for target_name in build/c/test-runner build/c/test-runner-tsan; do
 done
 missing_production_header=0
 for target_name in build/c/test-runner build/c/test-repro-runner build/c/test-runner-tsan \
-                   build/c/codebase-memory-mcp; do
+                   build/c/codebase-memory-mcp-neo4j; do
     case "$target_name" in
         build/c/test-runner) target_line="$test_target_line" ;;
         build/c/test-repro-runner) target_line="$repro_target_line" ;;

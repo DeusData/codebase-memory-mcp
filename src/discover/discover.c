@@ -61,7 +61,8 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Deploy */
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
-    ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+    ".codebase-memory", ".codebase-memory-neo4j", ".qdrant_code_embeddings", ".tmp", "vendor",
+    "vendored", NULL};
 
 /* Always-skip directories matched by relative-PATH suffix, not by basename:
  * generated build output whose last path component alone ("views") is far too
@@ -770,7 +771,7 @@ static void walk_cache_dir_snapshot(void) {
 }
 
 /* The cache directory holds every indexed project's graph database. When a custom
- * CBM_CACHE_DIR sits inside a repository — which happens in tests and is legal in
+ * CBM_NEO4J_CACHE_DIR sits inside a repository — which happens in tests and is legal in
  * production — walking into it would pull other projects' databases into this
  * project's file list. Prune it by absolute path.
  *

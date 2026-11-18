@@ -13,11 +13,11 @@
 #
 # Usage: scripts/ci/test-impact-shadow.sh --fetch-release DIR [--repo OWNER/REPO]
 #          Download the latest release's archive for this host + checksums.txt
-#          into DIR, verify the SHA-256, extract DIR/codebase-memory-mcp.
+#          into DIR, verify the SHA-256, extract DIR/codebase-memory-mcp-neo4j.
 #          Needs GH_TOKEN (read-only); $GH overrides the gh command.
 #        scripts/ci/test-impact-shadow.sh --binary PATH --out DIR [--base REV] [--depth N]
 #          Index this checkout into a throwaway cache (HOME, XDG dirs and
-#          CBM_CACHE_DIR under DIR/work, a private CBM_RUNTIME_DIR under /tmp:
+#          CBM_NEO4J_CACHE_DIR under DIR/work, a private CBM_NEO4J_RUNTIME_DIR under /tmp:
 #          the daemon's socket path must fit sun_path), run
 #          detect_changes against REV (default HEAD^1, the base side of a PR
 #          merge commit) at depth N (default 15), and let
@@ -31,7 +31,7 @@ set -euo pipefail
 usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; }
 
 FETCH_DIR=""
-REPO="${GITHUB_REPOSITORY:-DeusData/codebase-memory-mcp}"
+REPO="${GITHUB_REPOSITORY:-haiderRizvii/codebase-memory-mcp}"
 BINARY=""
 OUT=""
 BASE="HEAD^1"
@@ -77,10 +77,10 @@ sha256_check() { # file with "<sha>  <name>" lines, run in the archive's dir
 
 if [ -n "$FETCH_DIR" ]; then
     case "$(uname -s)/$(uname -m)" in
-    Linux/x86_64) asset=codebase-memory-mcp-linux-amd64.tar.gz ;;
-    Linux/aarch64 | Linux/arm64) asset=codebase-memory-mcp-linux-arm64.tar.gz ;;
-    Darwin/arm64) asset=codebase-memory-mcp-darwin-arm64.tar.gz ;;
-    Darwin/x86_64) asset=codebase-memory-mcp-darwin-amd64.tar.gz ;;
+    Linux/x86_64) asset=codebase-memory-mcp-neo4j-linux-amd64.tar.gz ;;
+    Linux/aarch64 | Linux/arm64) asset=codebase-memory-mcp-neo4j-linux-arm64.tar.gz ;;
+    Darwin/arm64) asset=codebase-memory-mcp-neo4j-darwin-arm64.tar.gz ;;
+    Darwin/x86_64) asset=codebase-memory-mcp-neo4j-darwin-amd64.tar.gz ;;
     *)
         echo "test-impact-shadow.sh: no release archive for $(uname -s)/$(uname -m)" >&2
         exit 1
@@ -93,8 +93,8 @@ if [ -n "$FETCH_DIR" ]; then
         --pattern checksums.txt --dir "$FETCH_DIR" --clobber
     grep " $asset\$" "$FETCH_DIR/checksums.txt" >"$FETCH_DIR/asset.sha256"
     (cd "$FETCH_DIR" && sha256_check asset.sha256)
-    tar -xzf "$FETCH_DIR/$asset" -C "$FETCH_DIR" codebase-memory-mcp
-    echo "release binary: $FETCH_DIR/codebase-memory-mcp ($asset, SHA-256 verified)"
+    tar -xzf "$FETCH_DIR/$asset" -C "$FETCH_DIR" codebase-memory-mcp-neo4j
+    echo "release binary: $FETCH_DIR/codebase-memory-mcp-neo4j ($asset, SHA-256 verified)"
     exit 0
 fi
 
@@ -115,7 +115,7 @@ OUT="$(cd "$OUT" && pwd)"
 WORK="$OUT/work"
 rm -rf "$WORK"
 mkdir -p "$WORK/home/.config" "$WORK/home/.cache" "$WORK/cache"
-# <runtime>/cbm-daemon-<uid>/cbm-<key>.sock adds ~42 bytes to this path, and
+# <runtime>/cbm-neo4j-daemon-<uid>/cbm-<key>.sock adds ~42 bytes to this path, and
 # sun_path holds 104 (macOS) / 108: a deep $OUT or $TMPDIR does not fit.
 RUNTIME=$(mktemp -d /tmp/cbm-rt.XXXXXX)
 trap 'rm -rf "$RUNTIME"' EXIT
@@ -128,8 +128,8 @@ bash "$ROOT/scripts/ci/select-lanes.sh" "$OUT/changed-files.txt" >"$OUT/selectio
 export HOME="$WORK/home"
 export XDG_CONFIG_HOME="$WORK/home/.config"
 export XDG_CACHE_HOME="$WORK/home/.cache"
-export CBM_CACHE_DIR="$WORK/cache"
-export CBM_RUNTIME_DIR="$RUNTIME"
+export CBM_NEO4J_CACHE_DIR="$WORK/cache"
+export CBM_NEO4J_RUNTIME_DIR="$RUNTIME"
 
 VERSION=$("$BINARY" --version 2>/dev/null | head -1 || true)
 DETECT_ARGS=()

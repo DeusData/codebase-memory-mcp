@@ -667,12 +667,12 @@ def create_local_update_release(release_dir, candidate):
         portable = "-portable"
     machine = platform.machine().lower()
     arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
-    asset_name = "codebase-memory-mcp-{}-{}{}.tar.gz".format(
+    asset_name = "codebase-memory-mcp-neo4j-{}-{}{}.tar.gz".format(
         os_name, arch, portable
     )
     archive = release_dir / asset_name
     with tarfile.open(archive, "w:gz") as stream:
-        stream.add(str(candidate), arcname="codebase-memory-mcp", recursive=False)
+        stream.add(str(candidate), arcname="codebase-memory-mcp-neo4j", recursive=False)
     digest = sha256_file(archive)
     (release_dir / "checksums.txt").write_text(
         "{}  {}\n".format(digest, asset_name), encoding="ascii"
@@ -700,12 +700,12 @@ def main():
         return 0
 
     root = Path(__file__).resolve().parent.parent
-    binary = Path(sys.argv[1] if len(sys.argv) > 1 else root / "build/c/codebase-memory-mcp")
+    binary = Path(sys.argv[1] if len(sys.argv) > 1 else root / "build/c/codebase-memory-mcp-neo4j")
     binary = binary.resolve()
     check(binary.is_file() and os.access(binary, os.X_OK), "missing executable: " + str(binary))
 
     runtime_parent = Path("/private/tmp" if sys.platform == "darwin" else "/tmp")
-    runtime_dir = runtime_parent / ("cbm-daemon-" + str(os.geteuid()))
+    runtime_dir = runtime_parent / ("cbm-neo4j-daemon-" + str(os.geteuid()))
     socket_path = runtime_dir / ("cbm-" + RENDEZVOUS_KEY + ".sock")
     startup_lock = runtime_dir / ("cbm-" + RENDEZVOUS_KEY + ".lock")
     lifetime_lock = runtime_dir / ("cbm-" + RENDEZVOUS_KEY + ".lifetime.lock")
@@ -738,7 +738,7 @@ def main():
         check(status == "free", "unsafe coordination lock {}: {}".format(path, status))
 
     clients = []
-    with tempfile.TemporaryDirectory(prefix="cbm-daemon-smoke-") as raw_tmpdir:
+    with tempfile.TemporaryDirectory(prefix="cbm-neo4j-daemon-smoke-") as raw_tmpdir:
         tmpdir = Path(raw_tmpdir)
         home = tmpdir / "home"
         cache = tmpdir / "cache"
@@ -766,12 +766,12 @@ def main():
         (success_repo / "tiny.py").write_text(
             "def daemon_index_smoke():\n    return 1\n", encoding="utf-8"
         )
-        target_binary = target_dir / "codebase-memory-mcp"
+        target_binary = target_dir / "codebase-memory-mcp-neo4j"
         target_binary.write_bytes(b"installed binary sentinel\n")
         index_path = cache / "smoke-project.db"
         index_path.write_bytes(b"index sentinel\n")
         descendant_pid_path = tmpdir / "worker-descendant.pid"
-        daemon_log = cache / "logs/cbm-daemon.log"
+        daemon_log = cache / "logs/cbm-neo4j-daemon.log"
         conflict_log = cache / "logs/daemon-conflicts.ndjson"
         activation_log = cache / "logs/activation-events.ndjson"
 
@@ -779,7 +779,7 @@ def main():
         env.update(
             {
                 "HOME": str(home),
-                "CBM_CACHE_DIR": str(cache_alias),
+                "CBM_NEO4J_CACHE_DIR": str(cache_alias),
                 "CBM_LOG_LEVEL": "info",
                 "CBM_LOG_FORMAT": "json",
                 "CBM_TEST_HANG_ON": "hang_me",
@@ -809,7 +809,7 @@ def main():
                 check=False,
             )
             check(version_result.returncode == 0, "--version failed: " + version_result.stderr)
-            version_prefix = "codebase-memory-mcp "
+            version_prefix = "codebase-memory-mcp-neo4j "
             check(version_result.stdout.startswith(version_prefix), "unexpected --version output")
             semantic_version = version_result.stdout.strip()[len(version_prefix) :]
 
@@ -856,7 +856,7 @@ def main():
             initialize_params = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "cbm-daemon-smoke", "version": "1"},
+                "clientInfo": {"name": "cbm-neo4j-daemon-smoke", "version": "1"},
             }
             c1.send(
                 {"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": initialize_params}
@@ -935,7 +935,7 @@ def main():
             # process configured with another root must fail before it joins
             # the daemon generation, while the active sessions remain healthy.
             mismatched_env = env.copy()
-            mismatched_env["CBM_CACHE_DIR"] = str(mismatched_cache)
+            mismatched_env["CBM_NEO4J_CACHE_DIR"] = str(mismatched_cache)
             mismatched_log = mismatched_cache / "logs/daemon-conflicts.ndjson"
             active_cache_fingerprint = hashlib.sha256(
                 str(cache.resolve()).encode("utf-8")
@@ -964,12 +964,12 @@ def main():
             )
             check(
                 mismatched_result.returncode != 0,
-                "mismatched CBM_CACHE_DIR unexpectedly joined the account daemon",
+                "mismatched CBM_NEO4J_CACHE_DIR unexpectedly joined the account daemon",
             )
             check(
                 "active account daemon uses a different cache directory"
                 in mismatched_result.stderr
-                and "CBM_CACHE_DIR" in mismatched_result.stderr,
+                and "CBM_NEO4J_CACHE_DIR" in mismatched_result.stderr,
                 "cache-root conflict did not emit visible remediation guidance: "
                 + repr(mismatched_result.stderr),
             )
@@ -1005,7 +1005,7 @@ def main():
             )
 
             # A process must keep using the canonical cache root it admitted,
-            # even if the original CBM_CACHE_DIR symlink is retargeted later.
+            # even if the original CBM_NEO4J_CACHE_DIR symlink is retargeted later.
             # Otherwise a daemon worker can silently move storage while the
             # cohort still advertises the old root fingerprint.
             cache_alias.unlink()
@@ -1132,7 +1132,7 @@ def main():
                 "future-generation stable-envelope conflict log",
             )
 
-            conflict_binary = tmpdir / "codebase-memory-mcp-conflict"
+            conflict_binary = tmpdir / "codebase-memory-mcp-neo4j-conflict"
             shutil.copy2(binary, conflict_binary)
             if sys.platform == "darwin":
                 # Current Apple linkers ad-hoc sign arm64 executables. Appending
@@ -1163,7 +1163,7 @@ def main():
                 # ELF permits trailing bytes, giving the fixture a different
                 # exact build fingerprint while preserving executability.
                 with conflict_binary.open("ab") as stream:
-                    stream.write(b"\x00cbm-daemon-smoke-conflicting-build")
+                    stream.write(b"\x00cbm-neo4j-daemon-smoke-conflicting-build")
             requested_fingerprint = sha256_file(conflict_binary)
             check(
                 active_fingerprint != requested_fingerprint,
@@ -1202,7 +1202,7 @@ def main():
                 "conflicting one-shot CLI unexpectedly ran beside the active daemon",
             )
             check(
-                "codebase-memory-mcp: " + expected_conflict
+                "codebase-memory-mcp-neo4j: " + expected_conflict
                 in conflict_cli_result.stderr,
                 "conflicting one-shot CLI did not emit the exact visible diagnostic: "
                 + repr(conflict_cli_result.stderr),
@@ -1919,7 +1919,7 @@ def main():
             )
             install_dir = tmpdir / "activation-install-bin"
             install_dir.mkdir(mode=0o700)
-            install_target = install_dir / "codebase-memory-mcp"
+            install_target = install_dir / "codebase-memory-mcp-neo4j"
             install_pid_path = tmpdir / "activation-install-worker-descendant.pid"
             install_lock_owner_path = tmpdir / "activation-install-worker-lock.pid"
             activation_local_env = env.copy()
@@ -2073,7 +2073,7 @@ def main():
             check(
                 installed_version.returncode == 0
                 and installed_version.stdout.strip()
-                == "codebase-memory-mcp " + semantic_version,
+                == "codebase-memory-mcp-neo4j " + semantic_version,
                 "different-build install target is not executable: "
                 + installed_version.stderr,
             )
@@ -2166,7 +2166,7 @@ def main():
             check(
                 updated_version.returncode == 0
                 and updated_version.stdout.strip()
-                == "codebase-memory-mcp " + semantic_version,
+                == "codebase-memory-mcp-neo4j " + semantic_version,
                 "updated target is not executable: " + updated_version.stderr,
             )
             updated_status = os.lstat(target_binary)

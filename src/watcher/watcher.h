@@ -66,7 +66,7 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
  * lists, .gitignore and .cbmignore rules), folded over each file's (relative
  * path, size, mtime). A changed signature triggers index_fn; the first poll
  * after baseline reindexes once, since nothing records which tree state the
- * index holds. Paths discovery skips — including cbm's own .codebase-memory
+ * index holds. Paths discovery skips — including cbm's own .codebase-memory-neo4j
  * artifact directory and cache directory — never change the signature.
  * Read at each project's baseline, so set it before registering projects. */
 void cbm_watcher_set_poll_non_git(cbm_watcher_t *w, bool enabled);

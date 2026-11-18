@@ -614,7 +614,8 @@ static void worker_result_init(cbm_index_worker_result_t *result) {
  * static buffer, which is unsuitable for concurrent daemon starts. */
 static bool worker_cache_dir(char out[INDEX_WORKER_PATH_CAP]) {
     char configured[INDEX_WORKER_PATH_CAP] = {0};
-    if (cbm_safe_getenv("CBM_CACHE_DIR", configured, sizeof(configured), NULL) && configured[0]) {
+    if (cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", configured, sizeof(configured), NULL) &&
+        configured[0]) {
         int written = snprintf(out, INDEX_WORKER_PATH_CAP, "%s", configured);
         if (written <= 0 || written >= INDEX_WORKER_PATH_CAP) {
             return false;
@@ -629,7 +630,7 @@ static bool worker_cache_dir(char out[INDEX_WORKER_PATH_CAP]) {
     if (!home[0]) {
         return false;
     }
-    int written = snprintf(out, INDEX_WORKER_PATH_CAP, "%s/.cache/codebase-memory-mcp", home);
+    int written = snprintf(out, INDEX_WORKER_PATH_CAP, "%s/.cache/codebase-memory-mcp-neo4j", home);
     if (written <= 0 || written >= INDEX_WORKER_PATH_CAP) {
         return false;
     }

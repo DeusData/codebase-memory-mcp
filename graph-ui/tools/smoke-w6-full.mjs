@@ -84,7 +84,7 @@ import {
 const execFileAsync = promisify(execFile);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp');
+const BINARY = join(ROOT, 'cbm', 'build', 'c', 'codebase-memory-mcp-neo4j');
 const DIST = join(ROOT, 'dist');
 const FIXTURE = join(ROOT, 'fixtures', 'atlas-sample');
 const FIXTURE_LARGE = join(ROOT, 'fixtures', 'atlas-sample-large');
@@ -342,7 +342,7 @@ async function main() {
         // ---------------------------------------------- 2. HOME, Rendezvous
         home = await mkdtemp(join(tmpdir(), 'codeatlasweb-w6-home-'));
         runtimeDir = await mkdtemp('/private/tmp/codeatlasweb-w6-run-');
-        process.env.CBM_RUNTIME_DIR = runtimeDir;
+        process.env.CBM_NEO4J_RUNTIME_DIR = runtimeDir;
         workspace = await mkdtemp(join(tmpdir(), 'codeatlasweb-w6-fixture-'));
         log('isoliertes HOME:', home);
         log('Rendezvous:', runtimeDir);

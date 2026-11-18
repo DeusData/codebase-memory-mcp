@@ -144,7 +144,7 @@ char *cbm_atlas_handout_html(cbm_store_t *store, const char *project) {
     hd_put(&b, "</h1>\n<p class=\"muted\">A handout for newcomers, generated from the code "
                "graph. Every number below is computed from indexed structure — no summaries "
                "were written by a model. Verify anything with the "
-               "<code>codebase-memory-mcp</code> tools.</p>\n");
+               "<code>codebase-memory-mcp-neo4j</code> tools.</p>\n");
 
     long long total_nodes = 0, unmapped = 0;
     yyjson_val *regions_arr = NULL;

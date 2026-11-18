@@ -30,7 +30,7 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 # The profiled process must reach a daemon rendezvous and cache this run owns:
-# only CBM_RUNTIME_DIR moves the rendezvous, so a private CBM_CACHE_DIR alone
+# only CBM_NEO4J_RUNTIME_DIR moves the rendezvous, so a private CBM_NEO4J_CACHE_DIR alone
 # joined the operator's account daemon (#1691, #1696). The helper also stops
 # that daemon before its cache is removed and leaves the root for diagnosis
 # when it will not stop.
@@ -81,8 +81,8 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
         echo "FAIL: could not stamp $WIN_ROOT_W" >&2
         exit 1
     fi
-    cp "$BINARY" "$WIN_ROOT/codebase-memory-mcp.exe"
-    BINARY="$WIN_ROOT/codebase-memory-mcp.exe"
+    cp "$BINARY" "$WIN_ROOT/codebase-memory-mcp-neo4j.exe"
+    BINARY="$WIN_ROOT/codebase-memory-mcp-neo4j.exe"
     WORK="$WIN_ROOT"
     MSYS2_ARG_CONV_EXCL='*' icacls "${WIN_ROOT_W}\\*" /reset /T /C /Q >/dev/null 2>&1 || true
 fi
@@ -130,10 +130,10 @@ echo "corpus: $(find "$CORPUS" -name '*.py' | wc -l | tr -d ' ') files"
 
 # The native Windows binary needs a native path here, under its stamped root;
 # an msys /c/... path is not one. Everywhere else the helper's owner-only cache
-# (already exported as CBM_CACHE_DIR) is the cache.
+# (already exported as CBM_NEO4J_CACHE_DIR) is the cache.
 if [ -n "${WIN_ROOT:-}" ]; then
     mkdir -p "$WORK/cache"
-    export CBM_CACHE_DIR="$(cygpath -w "$WORK/cache")"
+    export CBM_NEO4J_CACHE_DIR="$(cygpath -w "$WORK/cache")"
     CACHE_HOST="$WORK/cache"
 else
     CACHE_HOST="$CBM_TEST_CACHE_DIR_HOST"
@@ -148,7 +148,7 @@ export CBM_MEMWASTE_DUPES=0
 export CBM_MEM_CENSUS=1
 export CBM_LOG_LEVEL=info
 export CBM_LOG_FORMAT=text
-mkdir -p "$CBM_CACHE_DIR"
+mkdir -p "$CBM_NEO4J_CACHE_DIR"
 
 # Drive the MCP stdio path via the request/response driver (see its header for
 # why batching into a closed stdin does not work).
@@ -165,7 +165,7 @@ if command -v cygpath >/dev/null 2>&1 && ! command -v winepath >/dev/null 2>&1; 
 fi
 python3 "$(dirname "$0")/memlab-drive.py" "$DRIVE_BINARY" "$DRIVE_CORPUS" "$REQUESTS" --tool "${MEMLAB_TOOL:-search_graph}" --idle-seconds "${MEMLAB_IDLE:-0}" --stderr "$DRIVE_STDERR" > "$WORK/drive.out" 2>&1
 RC=$?
-# With CBM_CACHE_DIR set the process logs to its own file rather than stderr,
+# With CBM_NEO4J_CACHE_DIR set the process logs to its own file rather than stderr,
 # so fold that in or the census series is invisible.
 cat "$CACHE_HOST"/logs/*.log >> "$RUN_LOG" 2>/dev/null || true
 cat "$WORK/server-stderr.log" >> "$RUN_LOG" 2>/dev/null || true

@@ -19,7 +19,7 @@ cat > "$INSTALL_FIXTURE" <<'EOF'
 #!/usr/bin/env bash
 [[ "$1 $2" == "daemon status" ]] && exit 1
 if [[ "$1 $2" == "install -y" ]]; then
-    printf '%s\t%s\t%s\n' "$HOME" "$CBM_CACHE_DIR" "$CBM_RUNTIME_DIR" > "$CBM_TEST_INSTALL_ENV_PROBE"
+    printf '%s\t%s\t%s\n' "$HOME" "$CBM_NEO4J_CACHE_DIR" "$CBM_NEO4J_RUNTIME_DIR" > "$CBM_TEST_INSTALL_ENV_PROBE"
 fi
 exit 0
 EOF
@@ -29,12 +29,12 @@ CALLER_ROOT="$WORKDIR/caller-a"
 mkdir -p "$CALLER_ROOT/runtime" "$CALLER_ROOT/cache"
 touch "$CALLER_ROOT/sentinel"
 (
-    export CBM_RUNTIME_DIR="$CALLER_ROOT/runtime"
-    export CBM_CACHE_DIR="$CALLER_ROOT/cache"
+    export CBM_NEO4J_RUNTIME_DIR="$CALLER_ROOT/runtime"
+    export CBM_NEO4J_CACHE_DIR="$CALLER_ROOT/cache"
     source "$ROOT/scripts/test-runtime.sh"
     cbm_test_runtime_init
-    [[ "$CBM_RUNTIME_DIR" != "$CALLER_ROOT/runtime" ]] || fail "inherited runtime was reused"
-    [[ "$CBM_CACHE_DIR" != "$CALLER_ROOT/cache" ]] || fail "inherited cache was reused"
+    [[ "$CBM_NEO4J_RUNTIME_DIR" != "$CALLER_ROOT/runtime" ]] || fail "inherited runtime was reused"
+    [[ "$CBM_NEO4J_CACHE_DIR" != "$CALLER_ROOT/cache" ]] || fail "inherited cache was reused"
     private_root="$CBM_TEST_RUNTIME_ROOT"
     [[ -d "$private_root/runtime" && -d "$private_root/cache" ]] || fail "private directories missing"
     cbm_test_runtime_cleanup "$CONTROL"
@@ -75,8 +75,8 @@ set -e
 [[ ! -e "$WORKDIR/failure.marker" ]] || fail "fixture ran after runtime creation failed"
 mkdir "$WORKDIR/caller-home" "$WORKDIR/caller-cache" "$WORKDIR/caller-runtime"
 HOME="$WORKDIR/caller-home" \
-CBM_CACHE_DIR="$WORKDIR/caller-cache" \
-CBM_RUNTIME_DIR="$WORKDIR/caller-runtime" \
+CBM_NEO4J_CACHE_DIR="$WORKDIR/caller-cache" \
+CBM_NEO4J_RUNTIME_DIR="$WORKDIR/caller-runtime" \
 CBM_TEST_INSTALL_ENV_PROBE="$WORKDIR/install.env" \
     "$ROOT/scripts/security-install.sh" "$INSTALL_FIXTURE" > "$WORKDIR/install.out" 2>&1
 IFS=$'\t' read -r install_home install_cache install_runtime < "$WORKDIR/install.env"

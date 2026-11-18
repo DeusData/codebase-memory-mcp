@@ -1,7 +1,7 @@
 /*
  * config.h — Persistent UI configuration.
  *
- * Stores ui_enabled and ui_port in ~/.cache/codebase-memory-mcp/config.json.
+ * Stores ui_enabled and ui_port in ~/.cache/codebase-memory-mcp-neo4j/config.json.
  * Thread-safe: load/save are independent operations on the filesystem.
  */
 #ifndef CBM_UI_CONFIG_H
@@ -10,7 +10,7 @@
 #include <stdbool.h>
 
 /* Default values */
-#define CBM_UI_DEFAULT_PORT 9749
+#define CBM_UI_DEFAULT_PORT 9750
 #define CBM_UI_DEFAULT_ENABLED false
 
 typedef struct {

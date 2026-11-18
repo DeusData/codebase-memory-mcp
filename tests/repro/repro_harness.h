@@ -64,9 +64,9 @@ static inline cbm_store_t *rh_open_indexed(RProj *lp) {
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", lp->cachedir, lp->project);
     unlink(lp->dbpath);
 
-    const char *prior_cache_dir = getenv("CBM_CACHE_DIR");
+    const char *prior_cache_dir = getenv("CBM_NEO4J_CACHE_DIR");
     char *saved_cache_dir = prior_cache_dir ? cbm_strdup(prior_cache_dir) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
+    cbm_setenv("CBM_NEO4J_CACHE_DIR", lp->cachedir, 1);
 
     cbm_store_t *store = NULL;
     lp->srv = cbm_mcp_server_new(NULL);
@@ -82,10 +82,10 @@ static inline cbm_store_t *rh_open_indexed(RProj *lp) {
     }
 
     if (saved_cache_dir) {
-        cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
+        cbm_setenv("CBM_NEO4J_CACHE_DIR", saved_cache_dir, 1);
         free(saved_cache_dir);
     } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
+        cbm_unsetenv("CBM_NEO4J_CACHE_DIR");
     }
     return store;
 }

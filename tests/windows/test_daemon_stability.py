@@ -26,13 +26,13 @@ that guard the daemon's PRODUCT contract under stress and misuse:
 
 Every daemon this guard starts carries a kill-by-pid backstop so a stuck
 daemon can never hang the suite. Each section runs under its OWN cache
-directory AND its own ``CBM_RUNTIME_DIR``; the second one is what isolates it.
+directory AND its own ``CBM_NEO4J_RUNTIME_DIR``; the second one is what isolates it.
 Daemon coordination is NOT cache-scoped: the rendezvous key hashes a
 compile-time constant under a machine-global parent (the real
 ``CSIDL_LOCAL_APPDATA`` -- the ``LOCALAPPDATA`` variable is ignored), so
 without the override every section, every sibling guard on the runner and
 any interactive CBM use on the host share ONE daemon, and a daemon wedged in
-one place fails every check that comes after it. ``CBM_RUNTIME_DIR`` is the
+one place fails every check that comes after it. ``CBM_NEO4J_RUNTIME_DIR`` is the
 only relocation hook; the daemon inherits it from the client that spawns it,
 and the directory must exist before the binary runs because the endpoint
 code validates the parent and never creates it.
@@ -44,7 +44,7 @@ itself -- did not hold. The daemon's FULL output is printed either way, so the
 board shows why instead of a 300-character allocator preamble.
 
 Usage:
-    python test_daemon_stability.py <path-to-codebase-memory-mcp[.exe]>
+    python test_daemon_stability.py <path-to-codebase-memory-mcp-neo4j[.exe]>
 """
 import json
 import os
@@ -94,8 +94,8 @@ def section_dirs(work, name):
 
 def cli_env(cache):
     env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = cache
-    env["CBM_RUNTIME_DIR"] = runtime_for(cache)
+    env["CBM_NEO4J_CACHE_DIR"] = cache
+    env["CBM_NEO4J_RUNTIME_DIR"] = runtime_for(cache)
     return env
 
 
@@ -252,7 +252,7 @@ def section_start_status_port(binary, work):
 
 def daemon_log_contains(cache, needle):
     try:
-        with open(os.path.join(cache, "logs", "cbm-daemon.log"), "rb") as handle:
+        with open(os.path.join(cache, "logs", "cbm-neo4j-daemon.log"), "rb") as handle:
             return needle in handle.read()
     except OSError:
         return False

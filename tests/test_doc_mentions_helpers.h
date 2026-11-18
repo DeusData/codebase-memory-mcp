@@ -366,7 +366,7 @@ static inline char *dm_tool_text(const char *mcp_result) {
 
 /* index_status of the project as text, from a server of its own (nothing
  * cached from an earlier call). The project's database is looked up in
- * CBM_CACHE_DIR: point that at a private directory first. */
+ * CBM_NEO4J_CACHE_DIR: point that at a private directory first. */
 static inline char *dm_index_status(const char *project, bool full) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {

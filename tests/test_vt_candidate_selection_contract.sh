@@ -55,13 +55,13 @@ RESULT_FIELDS = (
     "microsoft_engine_version", "microsoft_engine_update", "virustotal_url",
 )
 ARCHIVES = tuple(
-    f"codebase-memory-mcp-{target}.tar.gz"
+    f"codebase-memory-mcp-neo4j-{target}.tar.gz"
     for target in TARGETS if not target.startswith("windows-")
 ) + tuple(
-    f"codebase-memory-mcp-{target}.zip"
+    f"codebase-memory-mcp-neo4j-{target}.zip"
     for target in TARGETS if target.startswith("windows-")
 ) + tuple(
-    f"codebase-memory-mcp-{target}.mcpb"
+    f"codebase-memory-mcp-neo4j-{target}.mcpb"
     for target in TARGETS
     if target.startswith(("darwin-", "windows-")) or target.endswith("-portable")
 )
@@ -106,7 +106,7 @@ def write_tsv(path: pathlib.Path, marker: str, metadata: dict[str, object],
 
 
 def candidate_bytes(target: str, variant: str) -> bytes:
-    linked = f"codebase-memory-mcp:{target}:same-linker-output\n".encode()
+    linked = f"codebase-memory-mcp-neo4j:{target}:same-linker-output\n".encode()
     suffix = {
         "unstripped": b"debug-and-local-symbols\n",
         "debug-stripped": b"local-symbols-only\n",
@@ -124,7 +124,7 @@ def make_artifacts(directory: pathlib.Path, *, reverse: bool = False) -> dict[tu
         rows = []
         source_hash = digest(candidate_bytes(target, "unstripped"))
         for variant in VARIANTS:
-            name = "codebase-memory-mcp.exe" if target.startswith("windows-") else "codebase-memory-mcp"
+            name = "codebase-memory-mcp-neo4j.exe" if target.startswith("windows-") else "codebase-memory-mcp-neo4j"
             data = candidate_bytes(target, variant)
             objects[target, variant] = data
             path = artifact / variant / name
@@ -218,8 +218,8 @@ def replace_candidate_with_symlink(path: pathlib.Path) -> None:
     binary.chmod(0o700)
     binary.unlink()
     target = provenances[1].parent / "unstripped" / (
-        "codebase-memory-mcp.exe" if "windows" in str(provenances[1])
-        else "codebase-memory-mcp"
+        "codebase-memory-mcp-neo4j.exe" if "windows" in str(provenances[1])
+        else "codebase-memory-mcp-neo4j"
     )
     binary.symlink_to(target)
 
@@ -321,7 +321,7 @@ for row in selections:
     require(row["decision"] == expected_decision,
             f"truth-table decision reason wrong for {target}: {row['decision']!r}")
     chosen = next(c for c in candidates if c["target"] == target and c["variant"] == expected[target])
-    path = selected / "selected" / target / ("codebase-memory-mcp.exe" if target.startswith("windows-") else "codebase-memory-mcp")
+    path = selected / "selected" / target / ("codebase-memory-mcp-neo4j.exe" if target.startswith("windows-") else "codebase-memory-mcp-neo4j")
     require(path.read_bytes() == candidate_data[target, expected[target]], f"wrong selected bytes for {target}")
     require(row["selected_sha256"] == chosen["sha256"], f"selection hash wrong for {target}")
 
@@ -382,10 +382,10 @@ for row in selections:
     target = row["target"]
     archive_for[target] = candidate_data[target, row["selected_variant"]]
 for name in ARCHIVES:
-    target = next(target for target in TARGETS if name.startswith(f"codebase-memory-mcp-{target}."))
+    target = next(target for target in TARGETS if name.startswith(f"codebase-memory-mcp-neo4j-{target}."))
     destination = archives / target / ("mcpb" if name.endswith(".mcpb") else "archive") / name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    binary_name = "codebase-memory-mcp.exe" if target.startswith("windows-") else "codebase-memory-mcp"
+    binary_name = "codebase-memory-mcp-neo4j.exe" if target.startswith("windows-") else "codebase-memory-mcp-neo4j"
     member = f"server/{binary_name}" if name.endswith(".mcpb") else binary_name
     if name.endswith((".zip", ".mcpb")):
         with zipfile.ZipFile(destination, "w") as handle:
@@ -420,21 +420,21 @@ expect_verify_failure("surplus", lambda path: (path / "surplus.zip").write_bytes
 
 
 def mutate_zip(path: pathlib.Path) -> None:
-    archive = next(path.rglob("codebase-memory-mcp-windows-amd64.zip"))
+    archive = next(path.rglob("codebase-memory-mcp-neo4j-windows-amd64.zip"))
     with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr("codebase-memory-mcp.exe", b"mutated-selected-binary")
+        handle.writestr("codebase-memory-mcp-neo4j.exe", b"mutated-selected-binary")
 
 
 expect_verify_failure("mutation", mutate_zip)
 
 
 def remove_unix_executable_mode(path: pathlib.Path) -> None:
-    archive = next(path.rglob("codebase-memory-mcp-darwin-arm64.mcpb"))
+    archive = next(path.rglob("codebase-memory-mcp-neo4j-darwin-arm64.mcpb"))
     with zipfile.ZipFile(archive, "r") as handle:
         entries = [(info, handle.read(info)) for info in handle.infolist()]
     with zipfile.ZipFile(archive, "w") as handle:
         for info, payload in entries:
-            if info.filename == "server/codebase-memory-mcp":
+            if info.filename == "server/codebase-memory-mcp-neo4j":
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | 0o644) << 16
             handle.writestr(info, payload)
@@ -444,10 +444,10 @@ expect_verify_failure("unix-executable-mode", remove_unix_executable_mode)
 
 
 def wrong_target(path: pathlib.Path) -> None:
-    archive = next(path.rglob("codebase-memory-mcp-linux-amd64.tar.gz"))
+    archive = next(path.rglob("codebase-memory-mcp-neo4j-linux-amd64.tar.gz"))
     with tarfile.open(archive, "w:gz") as handle:
         data = archive_for["linux-arm64"]
-        info = tarfile.TarInfo("codebase-memory-mcp")
+        info = tarfile.TarInfo("codebase-memory-mcp-neo4j")
         info.size = len(data)
         handle.addfile(info, io.BytesIO(data))
 

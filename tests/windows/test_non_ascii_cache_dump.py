@@ -9,7 +9,7 @@ fopen for the hand-rolled SQLite writer (internal/cbm/sqlite_writer.c), the
 one file-creating call on the dump chain without UTF-8→wide conversion.
 Fixed by routing it through cbm_fopen (same pattern as #700/#973).
 
-This guard indexes an ASCII repo into a NON-ASCII cache dir (CBM_CACHE_DIR is
+This guard indexes an ASCII repo into a NON-ASCII cache dir (CBM_NEO4J_CACHE_DIR is
 read before any USERPROFILE derivation, so it isolates the writer cleanly).
 GREEN is non-vacuous: the index must succeed AND a query_graph readback must
 count Function nodes > 0 — proving the DB was written to and reopened from
@@ -20,7 +20,7 @@ Passes on Linux/macOS either way (byte-transparent UTF-8 filesystems).
 Exit code: 0 == invariant holds, 1 == regression, 2 == setup error.
 
 Usage:
-    python test_non_ascii_cache_dump.py <path-to-codebase-memory-mcp[.exe]>
+    python test_non_ascii_cache_dump.py <path-to-codebase-memory-mcp-neo4j[.exe]>
 """
 import json
 import os

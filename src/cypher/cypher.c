@@ -3280,7 +3280,7 @@ static _Thread_local bool g_cypher_ordered_cut = false;
  * fails with this store error rather than answer from the rows read so far. */
 static _Thread_local char g_cypher_scan_error[CBM_SZ_512];
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
-static _Thread_local int64_t g_cypher_budget_ms = 0;               /* caller budget; 0 = default */
+static _Thread_local int64_t g_cypher_budget_ms = 0;             /* caller budget; 0 = default */
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 static _Thread_local cbm_cypher_test_clock_fn g_cypher_deadline_clock = NULL;
@@ -3310,8 +3310,8 @@ static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
     g_cypher_read_failed = false;
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
-                     : g_cypher_budget_ms > 0             ? g_cypher_budget_ms
-                                                          : CYPHER_DEADLINE_BUDGET_MS;
+                     : g_cypher_budget_ms > 0           ? g_cypher_budget_ms
+                                                        : CYPHER_DEADLINE_BUDGET_MS;
     g_cypher_deadline_ms = cypher_deadline_now() + (uint64_t)budget;
 }
 
@@ -3825,11 +3825,13 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         cbm_edge_t *edges = NULL;
         int edge_count = 0;
         if (is_inbound) {
-            cypher_edges_checked(cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count),
-                                 store, &edges, &edge_count);
+            cypher_edges_checked(
+                cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count), store, &edges,
+                &edge_count);
         } else {
-            cypher_edges_checked(cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count),
-                                 store, &edges, &edge_count);
+            cypher_edges_checked(
+                cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count), store, &edges,
+                &edge_count);
         }
         process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
                       new_bindings, new_count, new_cap, match_count);
@@ -3837,8 +3839,9 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         if (is_any) {
             edges = NULL;
             edge_count = 0;
-            cypher_edges_checked(cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count),
-                                 store, &edges, &edge_count);
+            cypher_edges_checked(
+                cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count), store, &edges,
+                &edge_count);
             process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
                           new_bindings, new_count, new_cap, match_count);
             cbm_store_free_edges(edges, edge_count);
@@ -3919,7 +3922,7 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
             }
             if (!is_variable_length && bi % CYPHER_PREFETCH_CHUNK == 0) {
                 int to = bi + CYPHER_PREFETCH_CHUNK < *bind_count ? bi + CYPHER_PREFETCH_CHUNK
-                                                                   : *bind_count;
+                                                                  : *bind_count;
                 prefetch_rel_edges(store, rel, *bindings, bi, to, *var_name, rel_inbound, rel_any);
                 if (cypher_deadline_exceeded()) {
                     break;
@@ -6011,8 +6014,8 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
             break;
         }
         if (bi % CYPHER_PREFETCH_CHUNK == 0) {
-            int to = bi + CYPHER_PREFETCH_CHUNK < *bind_count ? bi + CYPHER_PREFETCH_CHUNK
-                                                               : *bind_count;
+            int to =
+                bi + CYPHER_PREFETCH_CHUNK < *bind_count ? bi + CYPHER_PREFETCH_CHUNK : *bind_count;
             prefetch_rel_edges(store, rel, *bindings, bi, to, term_var, scan_targets, false);
             if (cypher_deadline_exceeded()) {
                 break;
@@ -6034,14 +6037,16 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                 int edge_count = 0;
                 int erc;
                 if (rel->type_count > 0) {
-                    erc = scan_targets ? cbm_store_find_edges_by_target_type(
-                                             store, term->id, rel->types[ti], &edges, &edge_count)
-                                       : cbm_store_find_edges_by_source_type(
-                                             store, term->id, rel->types[ti], &edges, &edge_count);
-                } else {
                     erc = scan_targets
-                              ? cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count)
-                              : cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
+                              ? cbm_store_find_edges_by_target_type(store, term->id, rel->types[ti],
+                                                                    &edges, &edge_count)
+                              : cbm_store_find_edges_by_source_type(store, term->id, rel->types[ti],
+                                                                    &edges, &edge_count);
+                } else {
+                    erc =
+                        scan_targets
+                            ? cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count)
+                            : cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
                 }
                 cypher_edges_checked(erc, store, &edges, &edge_count);
                 for (int ei = 0; ei < edge_count; ei++) {

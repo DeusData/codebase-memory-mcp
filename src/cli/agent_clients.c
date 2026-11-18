@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define AGENT_ENTRY_KEY "codebase-memory-mcp"
+#define AGENT_ENTRY_KEY "codebase-memory-neo4j"
 #define AGENT_MAX_CONFIG_BYTES (8U * 1024U * 1024U)
 #define AGENT_JSON_MAX_DEPTH 64U
 
@@ -481,7 +481,7 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
          * advertise XDG_CONFIG_HOME support. Keep its bundled skill MCP
          * next to SKILL.md under the documented global skill root. */
         return agent_join_path(path_out, path_out_size, options->home_dir,
-                               ".config/agents/skills/codebase-memory/mcp.json");
+                               ".config/agents/skills/codebase-memory-neo4j/mcp.json");
     case CBM_AGENT_CLIENT_DEVIN:
         if (options->is_windows && options->appdata_dir && options->appdata_dir[0]) {
             return agent_join_path(path_out, path_out_size, options->appdata_dir,
@@ -1320,7 +1320,7 @@ static int agent_continue_edit(const char *config_path, const char *binary_path,
         return CBM_AGENT_EDIT_ERROR;
     }
     int canonical_written = snprintf(canonical, canonical_size,
-                                     "  - name: codebase-memory-mcp%s    command: %s%s"
+                                     "  - name: codebase-memory-neo4j%s    command: %s%s"
                                      "    args: []%s",
                                      eol, quoted, eol, eol);
     free(quoted);

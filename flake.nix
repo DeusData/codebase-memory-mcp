@@ -1,5 +1,5 @@
 {
-  description = "codebase-memory-mcp — C11 MCP server for codebase indexing";
+  description = "codebase-memory-mcp-neo4j — C11 MCP server for codebase indexing";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -62,7 +62,7 @@
     {
       packages = forAllSystems (pkgs: rec {
         default = pkgs.stdenv.mkDerivation {
-          pname = "codebase-memory-mcp";
+          pname = "codebase-memory-mcp-neo4j";
           version = "0.12.1";
 
           src = ./.;
@@ -79,14 +79,14 @@
           '';
 
           installPhase = ''
-            install -Dm755 build/c/codebase-memory-mcp $out/bin/codebase-memory-mcp
+            install -Dm755 build/c/codebase-memory-mcp-neo4j $out/bin/codebase-memory-mcp-neo4j
           '';
 
           meta = {
             description = "MCP server that builds and queries a semantic graph of your codebase";
-            homepage = "https://github.com/DeusData/codebase-memory-mcp";
+            homepage = "https://github.com/haiderRizvii/codebase-memory-mcp";
             license = nixpkgs.lib.licenses.mit;
-            mainProgram = "codebase-memory-mcp";
+            mainProgram = "codebase-memory-mcp-neo4j";
             platforms = systems;
           };
         };
@@ -96,7 +96,7 @@
         # bump npmDepsHash whenever that lockfile changes:
         #   nix run nixpkgs#prefetch-npm-deps -- graph-ui/package-lock.json
         graph-ui = pkgs.buildNpmPackage {
-          pname = "codebase-memory-graph-ui";
+          pname = "codebase-memory-neo4j-graph-ui";
           version = "0.1.0";
 
           src = ./graph-ui;
@@ -115,8 +115,8 @@
         # so `--ui=true` starts the HTTP server. The frontend is built separately
         # by the graph-ui package above; here we drop its dist/ into place and run
         # the embed + link path (cbm-with-ui) — no network access needed.
-        codebase-memory-mcp-ui = default.overrideAttrs (old: {
-          pname = "codebase-memory-mcp-ui";
+        codebase-memory-mcp-neo4j-ui = default.overrideAttrs (old: {
+          pname = "codebase-memory-mcp-neo4j-ui";
 
           buildPhase = ''
             # cbm-with-ui depends on `embed`, which depends on `frontend`, which
@@ -137,7 +137,7 @@
           '';
 
           meta = old.meta // {
-            description = "codebase-memory-mcp with the embedded graph UI (--ui)";
+            description = "codebase-memory-mcp-neo4j with the embedded graph UI (--ui)";
           };
         });
       });

@@ -1,16 +1,16 @@
 {
-  "name": "codebase-memory-mcp",
+  "name": "codebase-memory-mcp-neo4j",
   "version": "0.12.1",
   "description": "Fast code intelligence for AI coding agents — installs a verified native runtime set",
-  "mcpName": "io.github.DeusData/codebase-memory-mcp",
+  "mcpName": "io.github.haiderRizvii/codebase-memory-neo4j",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DeusData/codebase-memory-mcp.git"
+    "url": "git+https://github.com/haiderRizvii/codebase-memory-mcp.git"
   },
-  "homepage": "https://github.com/DeusData/codebase-memory-mcp",
+  "homepage": "https://github.com/haiderRizvii/codebase-memory-mcp",
   "bugs": {
-    "url": "https://github.com/DeusData/codebase-memory-mcp/issues"
+    "url": "https://github.com/haiderRizvii/codebase-memory-mcp/issues"
   },
   "keywords": [
     "mcp",
@@ -23,7 +23,7 @@
     "tree-sitter"
   ],
   "bin": {
-    "codebase-memory-mcp": "./bin.js"
+    "codebase-memory-mcp-neo4j": "./bin.js"
   },
   "scripts": {
     "test": "node --test test/*.test.js",

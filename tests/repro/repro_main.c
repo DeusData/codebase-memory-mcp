@@ -153,7 +153,7 @@ int main(void) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     /* No reproduction needs the daemon rendezvous. Its default is the
      * developer's live daemon whatever HOME says, so a case that ever resolves
-     * an endpoint without an explicit parent or CBM_RUNTIME_DIR is refused
+     * an endpoint without an explicit parent or CBM_NEO4J_RUNTIME_DIR is refused
      * loudly instead of reaching it. */
     cbm_daemon_bootstrap_forbid_default_runtime_for_test(true);
 #endif

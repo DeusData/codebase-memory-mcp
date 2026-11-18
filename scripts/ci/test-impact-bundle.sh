@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-impact-bundle.sh — fetch the team artifact bundle of one main commit.
 #
-# The bundle (codebase-memory-mcp test-impact publish; src/mcp/test_impact_artifact.h)
+# The bundle (codebase-memory-mcp-neo4j test-impact publish; src/mcp/test_impact_artifact.h)
 # is published by .github/workflows/test-impact-artifact.yml as the Actions
 # artifact `test-impact-<sha>`. A selection may pass --artifact-verified ONLY
 # for a bundle this script fetched: it accepts nothing but a SUCCESSFUL run of
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 GH="${GH:-gh}"
-REPO="${GITHUB_REPOSITORY:-DeusData/codebase-memory-mcp}"
+REPO="${GITHUB_REPOSITORY:-haiderRizvii/codebase-memory-mcp}"
 WORKFLOW="test-impact-artifact.yml"
 
 usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }

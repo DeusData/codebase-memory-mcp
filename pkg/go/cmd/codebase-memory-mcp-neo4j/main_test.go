@@ -71,7 +71,7 @@ func TestWindowsUsesOneDirectBinary(t *testing.T) {
 	if got := executionPathForOS(binary, "windows"); got != binary {
 		t.Fatalf("Windows execution path = %q, want direct binary %q", got, binary)
 	}
-	if got := binaryNameForOS("windows"); got != "codebase-memory-mcp.exe" {
+	if got := binaryNameForOS("windows"); got != "codebase-memory-mcp-neo4j.exe" {
 		t.Fatalf("Windows binary name = %q", got)
 	}
 	source, err := os.ReadFile("main.go")
@@ -116,7 +116,7 @@ func TestWrapperUninstallNeverDefaultsToItsCacheBinary(t *testing.T) {
 	got := nativeArgs([]string{"uninstall", "--yes"})
 	wantBase := "bin"
 	if runtime.GOOS == "windows" {
-		wantBase = "codebase-memory-mcp"
+		wantBase = "codebase-memory-mcp-neo4j"
 	}
 	if len(got) != 4 || got[2] != "--dir" ||
 		filepath.Base(got[3]) != wantBase {
@@ -199,7 +199,7 @@ func TestTarArchiveRejectsMoreMembersThanTheLimit(t *testing.T) {
 func TestArchiveCopyAcceptsAMemberLargerThanTheFormerCap(t *testing.T) {
 	size := formerMemberCapBytes + 1024*1024
 	if err := copyArchiveMember(
-		io.Discard, io.LimitReader(zeroReader{}, size), "codebase-memory-mcp", size,
+		io.Discard, io.LimitReader(zeroReader{}, size), "codebase-memory-mcp-neo4j", size,
 	); err != nil {
 		t.Fatalf("copy of a %d-byte member error = %v", size, err)
 	}
@@ -214,7 +214,7 @@ func TestArchiveCopyRequiresTheDeclaredSize(t *testing.T) {
 }
 
 func TestDownloadBaseFollowsTheInstallShPolicy(t *testing.T) {
-	githubBase := "https://github.com/DeusData/codebase-memory-mcp/releases/download/v" + version
+	githubBase := "https://github.com/haiderRizvii/codebase-memory-mcp/releases/download/v" + version
 	if base, loopback, err := downloadBase(""); err != nil || base != githubBase || loopback {
 		t.Fatalf("unset override = (%q, %v, %v), want the GitHub base", base, loopback, err)
 	}
@@ -247,7 +247,7 @@ func TestDownloadBaseFollowsTheInstallShPolicy(t *testing.T) {
 		"HTTP://localhost/",
 		"file:///tmp/releases",
 		"ftp://localhost/releases",
-		"github.com/DeusData/codebase-memory-mcp",
+		"github.com/haiderRizvii/codebase-memory-mcp",
 	} {
 		_, _, err := downloadBase(override)
 		if err == nil || !strings.Contains(
@@ -376,7 +376,7 @@ func verifyTestBinary(path string) error {
 
 func TestMutationSnapshotReleasesCacheLockAndCleansAfterLaunchFailure(t *testing.T) {
 	directory := t.TempDir()
-	binary := "codebase-memory-mcp"
+	binary := "codebase-memory-mcp-neo4j"
 	executable := filepath.Join(directory, binary)
 	writeTestRuntimeSet(t, directory, binary, "cached")
 	var snapshotExecutable string
@@ -458,7 +458,7 @@ func TestMutationSnapshotEnvironmentIgnoresExternalAssetOverrides(t *testing.T) 
 
 func TestMutationSnapshotRejectsExplicitTargetOverlappingCache(t *testing.T) {
 	directory := t.TempDir()
-	executable := filepath.Join(directory, "codebase-memory-mcp")
+	executable := filepath.Join(directory, "codebase-memory-mcp-neo4j")
 	for _, args := range [][]string{
 		{"install", "--dir", directory},
 		{"uninstall", "--dir=" + directory},
@@ -484,7 +484,7 @@ func TestMutationSnapshotRejectsExplicitTargetOverlappingCache(t *testing.T) {
 
 func TestMutationSnapshotVerifierFailureNeverLaunches(t *testing.T) {
 	directory := t.TempDir()
-	binary := "codebase-memory-mcp"
+	binary := "codebase-memory-mcp-neo4j"
 	executable := filepath.Join(directory, binary)
 	writeTestRuntimeSet(t, directory, binary, "cached")
 	verifierCalls := 0
@@ -555,7 +555,7 @@ func TestMutationSnapshotCleanupFailurePreservesNativeResult(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			directory := t.TempDir()
-			binary := "codebase-memory-mcp"
+			binary := "codebase-memory-mcp-neo4j"
 			writeTestRuntimeSet(t, directory, binary, "cached")
 			result := execBinaryWithRuntimeLockAndRunner(
 				filepath.Join(directory, binary),
@@ -581,7 +581,7 @@ func TestConcurrentRuntimePublishersAreSerialized(t *testing.T) {
 	firstSource := filepath.Join(root, "source-first")
 	secondSource := filepath.Join(root, "source-second")
 	destination := filepath.Join(root, "destination")
-	binary := "codebase-memory-mcp"
+	binary := "codebase-memory-mcp-neo4j"
 	writeTestRuntimeSet(t, firstSource, binary, "first")
 	writeTestRuntimeSet(t, secondSource, binary, "second")
 
@@ -734,7 +734,7 @@ func TestKilledRuntimePublisherIsReconciledByLockedReadiness(t *testing.T) {
 			source := filepath.Join(root, "source")
 			destination := filepath.Join(root, "destination")
 			marker := filepath.Join(root, "crash-reached")
-			binary := "codebase-memory-mcp"
+			binary := "codebase-memory-mcp-neo4j"
 			writeTestRuntimeSet(t, source, binary, "candidate")
 			writeTestRuntimeSet(t, destination, binary, "old")
 			if err := os.WriteFile(
@@ -901,7 +901,7 @@ func TestRuntimePublicationCrashHelper(t *testing.T) {
 	destination := os.Getenv("CBM_TEST_RUNTIME_CRASH_DESTINATION")
 	marker := os.Getenv("CBM_TEST_RUNTIME_CRASH_MARKER")
 	crashPhase := os.Getenv("CBM_TEST_RUNTIME_CRASH_PHASE")
-	binary := "codebase-memory-mcp"
+	binary := "codebase-memory-mcp-neo4j"
 	reachCrashGate := func() error {
 		if err := os.WriteFile(marker, []byte("reached\n"), 0600); err != nil {
 			return err
@@ -947,7 +947,7 @@ func TestRuntimePublicationCrashHelper(t *testing.T) {
 
 func TestRuntimeReadinessRejectsMultiplyLinkedLeaves(t *testing.T) {
 	directory := t.TempDir()
-	binary := "codebase-memory-mcp"
+	binary := "codebase-memory-mcp-neo4j"
 	writeTestRuntimeSet(t, directory, binary, "linked")
 	if err := os.Link(
 		filepath.Join(directory, binary),
@@ -1205,7 +1205,7 @@ func TestWindowsLongRuntimePathPublishesAndBecomesReady(t *testing.T) {
 
 func TestOrphanReconciliationRejectsMultiplyLinkedBackupMembers(t *testing.T) {
 	directory := t.TempDir()
-	binary := "codebase-memory-mcp"
+	binary := "codebase-memory-mcp-neo4j"
 	backup := filepath.Join(
 		directory, runtimeBackupPrefix+strings.Repeat("a", 32),
 	)

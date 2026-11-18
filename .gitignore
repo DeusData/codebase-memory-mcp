@@ -96,4 +96,9 @@ soak-results-query-leak/
 
 # Local secrets for the docker/graph stack
 docker/graph/.env
-docker/graph/data/
+
+# Fork executable and persistent graph (upstream patterns are retained).
+/codebase-memory-mcp-neo4j
+/pkg/go/codebase-memory-mcp-neo4j
+/pkg/go/codebase-memory-mcp-neo4j.exe
+.codebase-memory-neo4j/

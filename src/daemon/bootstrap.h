@@ -16,8 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CBM_DAEMON_INTERNAL_ARG "--cbm-daemon-internal"
-#define CBM_DAEMON_PERMANENT_ARG "--cbm-daemon-permanent"
+#define CBM_DAEMON_INTERNAL_ARG "--cbm-neo4j-daemon-internal"
+#define CBM_DAEMON_PERMANENT_ARG "--cbm-neo4j-daemon-permanent"
 #define CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC 3U
 
 typedef enum {
@@ -47,7 +47,7 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Test runners only; no product binary arms it. Once armed, an endpoint
- * request that names no runtime parent while CBM_RUNTIME_DIR is unset (one
+ * request that names no runtime parent while CBM_NEO4J_RUNTIME_DIR is unset (one
  * that would resolve to the account-wide default rendezvous, where the
  * developer's live daemon listens) is refused with a diagnostic on stderr. */
 void cbm_daemon_bootstrap_forbid_default_runtime_for_test(bool forbid);
@@ -138,8 +138,8 @@ typedef void *cbm_daemon_bootstrap_cohort_t;
  * listener publication fails (a full /tmp, for instance) the client used to
  * respawn it for the whole startup deadline and then report "active or
  * starting". The host now appends one record per failed start to
- * <cache>/logs/cbm-daemon.start-failures.log -- the same owner-only log
- * directory as cbm-daemon.log, deliberately NOT the runtime directory: that
+ * <cache>/logs/cbm-neo4j-daemon.start-failures.log -- the same owner-only log
+ * directory as cbm-neo4j-daemon.log, deliberately NOT the runtime directory: that
  * one is exactly what a full /tmp cannot write, and a new artifact there
  * would entangle stale-generation cleanup. A waiting client reads the newest
  * record for its endpoint that is not older than its own spawn and fails

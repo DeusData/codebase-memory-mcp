@@ -5094,16 +5094,21 @@ static void k8s_link_chart_images(cbm_pipeline_ctx_t *ctx) {
         }
     }
     for (int i = 0; i < n; i++) {
-        bool marked = !v[i].literal && v[i].keys;
+        /* Literal image uses have no default-key JSON. Guard both its length
+         * and its serialization with the nullable pointer itself. */
+        const char *keys = v[i].literal ? NULL : v[i].keys;
         if (!v[i].literal && v[i].lost) {
             cbm_free(CBM_MEM_CLASS_OTHER, v[i].keys);
             continue; /* the mark is not whole: no edge rather than an unmarked one */
         }
-        size_t pn = (marked ? strlen(v[i].keys) : 0) + CBM_SZ_64;
+        size_t pn = CBM_SZ_64;
+        if (keys) {
+            pn += strlen(keys);
+        }
         char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, pn);
         if (props) {
             snprintf(props, pn, "{\"via\":\"chart\",\"ref\":\"image\"%s%s}",
-                     marked ? ",\"default_of\":" : "", marked ? v[i].keys : "");
+                     keys ? ",\"default_of\":" : "", keys ? keys : "");
             cbm_gbuf_insert_edge(ctx->gbuf, v[i].chart, v[i].img, "DEPLOYS", props);
             cbm_free(CBM_MEM_CLASS_OTHER, props);
         }

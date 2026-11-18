@@ -608,7 +608,7 @@ UI_SRCS = \
 #    two-level namespace, makes the binary's free == mi_free while system
 #    libraries keep allocating via the system allocator — pointers crossing that
 #    boundary hit "mimalloc: error: mi_free: invalid pointer". (Repro:
-#    `codebase-memory-mcp index <dir>` aborted on every run.)
+#    `codebase-memory-mcp-neo4j index <dir>` aborted on every run.)
 #  * Windows (MinGW, static CRT): the link-order trick fails (#424's allocator
 #    mismatch), so we define MI_MALLOC_OVERRIDE=1 to compile the static-CRT
 #    override added in mimalloc 3.3.0 (the _MSC_VER / _ACRTIMP /
@@ -698,7 +698,7 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 
 # Project headers, as prerequisites for the targets built in one compiler
 # invocation from sources (test-runner, test-repro-runner, test-runner-tsan,
-# codebase-memory-mcp, test-foundation). Those rules list only .c files, so
+# codebase-memory-mcp-neo4j, test-foundation). Those rules list only .c files, so
 # editing a header changed nothing make could see and the target was NOT
 # rebuilt — an incremental build then silently tested the OLD header value.
 # Found while revert-checking a constants.h change: the check passed because
@@ -1259,8 +1259,8 @@ test-tsan: $(BUILD_DIR)/test-runner-tsan
 # Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
 # an explicit Make invocation requires a clean rendezvous and fails rather than
 # silently skipping an occupied one. Deterministic C tests cover Windows IPC.
-test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
-	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
+test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp-neo4j
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp-neo4j
 
 # ── Production binary ────────────────────────────────────────────
 
@@ -1338,18 +1338,18 @@ build-config-check:
 $(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
 	@printf '%s\n' '$(BUILD_CONFIG_SIG)' > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; \
-	else mv -f $@.tmp $@; rm -f $(BUILD_DIR)/codebase-memory-mcp; \
+	else mv -f $@.tmp $@; rm -f $(BUILD_DIR)/codebase-memory-mcp-neo4j; \
 	echo "=== build config changed -> full rebuild: $(BUILD_CONFIG_SIG) ==="; fi
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config $(PROJECT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/codebase-memory-mcp-neo4j: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp
-	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
+cbm: $(BUILD_DIR)/codebase-memory-mcp-neo4j
+	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp-neo4j"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
@@ -1370,13 +1370,13 @@ embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
 cbm-with-ui: embed $(OBJS_VENDORED_PROD)
-	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
+	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp-neo4j \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(LDFLAGS)
-	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
+	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp-neo4j"
 
 clean-c: export BUILD_DIR := $(BUILD_DIR)
 clean-c:
@@ -1551,7 +1551,7 @@ test-lsan:
 # the working directory.
 # No C suite runs the product binary -- they re-exec the runner itself. The
 # shell process regressions do, and they find the instrumented one the way they
-# find any other: CBM_TEST_BINARY=build/cov/codebase-memory-mcp, with
+# find any other: CBM_TEST_BINARY=build/cov/codebase-memory-mcp-neo4j, with
 # LLVM_PROFILE_FILE set by whoever collects the profiles.
 COV_LLVM_BIN ?= /opt/homebrew/opt/llvm/bin
 COV_BUILD_DIR ?= build/cov
@@ -1560,7 +1560,7 @@ COV_MAKE = $(MAKE) -f Makefile.cbm CC=$(COV_LLVM_BIN)/clang CXX=$(COV_LLVM_BIN)/
 test-runner-cov:
 	$(COV_MAKE) $(COV_BUILD_DIR)/test-runner
 cbm-cov:
-	$(COV_MAKE) $(COV_BUILD_DIR)/codebase-memory-mcp TEST_SEAMS=1
+	$(COV_MAKE) $(COV_BUILD_DIR)/codebase-memory-mcp-neo4j TEST_SEAMS=1
 
 # Genuine LLVM write failures must fail the parent coverage run.
 test-coverage-flush: test-runner-cov
@@ -1676,10 +1676,10 @@ lint-mem-ci:
 security: cbm
 	@echo "=== Running security audit suite ==="
 	scripts/security-audit.sh
-	scripts/security-strings.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-strings.sh $(BUILD_DIR)/codebase-memory-mcp-neo4j
 	scripts/security-ui.sh
-	scripts/security-install.sh $(BUILD_DIR)/codebase-memory-mcp
-	scripts/security-network.sh $(BUILD_DIR)/codebase-memory-mcp
-	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
+	scripts/security-install.sh $(BUILD_DIR)/codebase-memory-mcp-neo4j
+	scripts/security-network.sh $(BUILD_DIR)/codebase-memory-mcp-neo4j
+	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp-neo4j
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="

@@ -78,7 +78,7 @@ for target in targets:
     source_sha = digest(f"{target}:linker-output")
     for variant in variants:
         sha = digest(f"{target}:{variant}")
-        name = "codebase-memory-mcp.exe" if target.startswith("windows-") else "codebase-memory-mcp"
+        name = "codebase-memory-mcp-neo4j.exe" if target.startswith("windows-") else "codebase-memory-mcp-neo4j"
         row = {
             "target": target, "variant": variant, "relative_path": f"{variant}/{name}",
             "source_sha256": source_sha, "pre_sign_sha256": sha, "sha256": sha,
@@ -122,7 +122,7 @@ for target in targets:
         decision = f"{chosen}-clean-after-{others}"
     row = {
         "target": target, "selected_variant": chosen,
-        "selected_path": f"selected/{target}/" + ("codebase-memory-mcp.exe" if target.startswith("windows-") else "codebase-memory-mcp"),
+        "selected_path": f"selected/{target}/" + ("codebase-memory-mcp-neo4j.exe" if target.startswith("windows-") else "codebase-memory-mcp-neo4j"),
         "selected_sha256": selected["sha256"], "selected_size": selected["size"],
         "decision": decision,
     }
@@ -182,7 +182,7 @@ run_notes() {
   (cd "$FIX" &&
     PATH="$FIX/bin:$PATH" \
       GH_TOKEN=stub VERSION=v1.0.0 \
-      GITHUB_REPOSITORY=DeusData/codebase-memory-mcp \
+      GITHUB_REPOSITORY=haiderRizvii/codebase-memory-mcp \
       VT_CANDIDATES=evidence/release-candidates.tsv \
       VT_RESULTS_PATH=evidence/virustotal-candidate-results.tsv \
       RELEASE_SELECTION=evidence/release-selection.tsv \

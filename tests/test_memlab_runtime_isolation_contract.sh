@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # scripts/memlab.sh starts the product over stdio to attribute retained memory
 # and then removes its work directory. It used to give the run a private
-# CBM_CACHE_DIR only, but only CBM_RUNTIME_DIR moves the daemon rendezvous
+# CBM_NEO4J_CACHE_DIR only, but only CBM_NEO4J_RUNTIME_DIR moves the daemon rendezvous
 # (docs/CONFIGURATION.md), so the profiled process joined the operator's
 # account daemon — refused with a cache-root conflict when one was live, or
 # left as the account daemon with its cache deleted underneath it otherwise.
@@ -42,7 +42,7 @@ SHIM_DIR="$WORKDIR/bin"
 mkdir -p "$SHIM_DIR"
 cat > "$SHIM_DIR/python3" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\t%s\n' "${CBM_CACHE_DIR-}" "${CBM_RUNTIME_DIR-}" >> "$CBM_MEMLAB_ENV_PROBE"
+printf '%s\t%s\n' "${CBM_NEO4J_CACHE_DIR-}" "${CBM_NEO4J_RUNTIME_DIR-}" >> "$CBM_MEMLAB_ENV_PROBE"
 echo "served=0 failed=0"
 exit 1
 EOF
@@ -60,8 +60,8 @@ mkdir -p "$CALLER_CACHE" "$CALLER_RUNTIME" "$WORKDIR/cwd"
 (
     cd "$WORKDIR/cwd"
     PATH="$SHIM_DIR:$PATH" \
-    CBM_CACHE_DIR="$CALLER_CACHE" \
-    CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+    CBM_NEO4J_CACHE_DIR="$CALLER_CACHE" \
+    CBM_NEO4J_RUNTIME_DIR="$CALLER_RUNTIME" \
     CBM_MEMLAB_ENV_PROBE="$ENV_LOG" \
         bash "$ROOT/scripts/memlab.sh" "$DUMMY_BINARY" 1 probe > "$WORKDIR/memlab.out" 2>&1 || true
 )
@@ -75,10 +75,10 @@ while IFS=$'\t' read -r child_cache_raw child_runtime_raw; do
     child_cache=$(normalize_path "$child_cache_raw")
     child_runtime=$(normalize_path "$child_runtime_raw")
     if [[ -z "$child_runtime" || "$child_runtime" == "$CALLER_RUNTIME_NORMALIZED" ]]; then
-        fail "memlab exposed the caller CBM_RUNTIME_DIR to the product"
+        fail "memlab exposed the caller CBM_NEO4J_RUNTIME_DIR to the product"
     fi
     if [[ -z "$child_cache" || "$child_cache" == "$CALLER_CACHE_NORMALIZED" ]]; then
-        fail "memlab exposed the caller CBM_CACHE_DIR to the product"
+        fail "memlab exposed the caller CBM_NEO4J_CACHE_DIR to the product"
     fi
     if [[ "${child_runtime%/*}" != "${child_cache%/*}" ||
           "${child_runtime##*/}" != "runtime" || "${child_cache##*/}" != "cache" ]]; then

@@ -126,7 +126,7 @@ case "$(uname -m)" in
 esac
 PORTABLE=""
 [ "$OS" = "linux" ] && PORTABLE="-portable"
-ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.tar.gz"
+ARCHIVE="codebase-memory-mcp-neo4j-${OS}-${ARCH}${PORTABLE}.tar.gz"
 
 for tool in python3 curl tar shasum; do
     command -v "$tool" >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 ||
@@ -153,7 +153,7 @@ mkdir -p "$FIXTURE/good" "$FIXTURE/bad" "$FIXTURE/none" "$STAGE" "$WORK/tmp" \
 # The fixture "binary": a stub that answers --version and performs the minimal
 # `install` the installer asks of the product (copy itself into --dir). It
 # records every invocation so the failure cases can prove it never ran.
-cat > "$STAGE/codebase-memory-mcp" <<'STUB'
+cat > "$STAGE/codebase-memory-mcp-neo4j" <<'STUB'
 #!/bin/sh
 set -eu
 if [ -n "${CBM_SETUP_STUB_TRACE:-}" ]; then
@@ -161,7 +161,7 @@ if [ -n "${CBM_SETUP_STUB_TRACE:-}" ]; then
 fi
 case "${1:-}" in
     --version)
-        echo "codebase-memory-mcp setup-contract-stub 0.0.0"
+        echo "codebase-memory-mcp-neo4j setup-contract-stub 0.0.0"
         ;;
     install)
         dir=""
@@ -170,8 +170,8 @@ case "${1:-}" in
         done
         [ -n "$dir" ] || { echo "stub: install needs --dir=" >&2; exit 2; }
         mkdir -p "$dir"
-        cp "$0" "$dir/codebase-memory-mcp"
-        chmod 755 "$dir/codebase-memory-mcp"
+        cp "$0" "$dir/codebase-memory-mcp-neo4j"
+        chmod 755 "$dir/codebase-memory-mcp-neo4j"
         ;;
     *)
         echo "stub: unexpected invocation: $*" >&2
@@ -179,14 +179,14 @@ case "${1:-}" in
         ;;
 esac
 STUB
-chmod 755 "$STAGE/codebase-memory-mcp"
+chmod 755 "$STAGE/codebase-memory-mcp-neo4j"
 cp "$ROOT/LICENSE" "$ROOT/install.sh" "$STAGE/"
 printf 'fixture notices\n' > "$STAGE/THIRD_PARTY_NOTICES.md"
 
 # Member set and order mirror scripts/package-release.sh; install.sh refuses
 # any other inventory.
 tar -czf "$STAGE/$ARCHIVE" -C "$STAGE" \
-    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+    codebase-memory-mcp-neo4j LICENSE install.sh THIRD_PARTY_NOTICES.md
 if command -v sha256sum >/dev/null 2>&1; then
     DIGEST=$(sha256sum "$STAGE/$ARCHIVE" | awk '{print $1}')
 else
@@ -245,7 +245,7 @@ run_setup() {
             HOME="$home" USERPROFILE="$home" \
             XDG_CONFIG_HOME="$home/.config" CLAUDE_CONFIG_DIR="$home/.claude" \
             TMPDIR="$WORK/tmp" TEMP="$WORK/tmp" TMP="$WORK/tmp" \
-            CBM_CACHE_DIR="$WORK/cache" CBM_RUNTIME_DIR="$WORK/runtime" \
+            CBM_NEO4J_CACHE_DIR="$WORK/cache" CBM_NEO4J_RUNTIME_DIR="$WORK/runtime" \
             CBM_DOWNLOAD_URL="http://127.0.0.1:$PORT/$variant" \
             CBM_SETUP_STUB_TRACE="$trace" \
             http_proxy=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1 \
@@ -257,7 +257,7 @@ run_setup() {
             HOME="$home" USERPROFILE="$home" \
             XDG_CONFIG_HOME="$home/.config" CLAUDE_CONFIG_DIR="$home/.claude" \
             TMPDIR="$WORK/tmp" TEMP="$WORK/tmp" TMP="$WORK/tmp" \
-            CBM_CACHE_DIR="$WORK/cache" CBM_RUNTIME_DIR="$WORK/runtime" \
+            CBM_NEO4J_CACHE_DIR="$WORK/cache" CBM_NEO4J_RUNTIME_DIR="$WORK/runtime" \
             CBM_DOWNLOAD_URL="http://127.0.0.1:$PORT/$variant" \
             CBM_SETUP_STUB_TRACE="$trace" \
             http_proxy=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1 \
@@ -275,13 +275,13 @@ show_log() {
 }
 
 assert_installed() {
-    local label="$1" installed="$RUN_HOME/.local/bin/codebase-memory-mcp"
+    local label="$1" installed="$RUN_HOME/.local/bin/codebase-memory-mcp-neo4j"
     if [ "$RUN_RC" -ne 0 ]; then
         show_log
         fail "$label: setup.sh exited $RUN_RC with a correct checksums.txt"
     fi
     [ -x "$installed" ] || { show_log; fail "$label: nothing installed at $installed"; }
-    cmp -s "$STAGE/codebase-memory-mcp" "$installed" ||
+    cmp -s "$STAGE/codebase-memory-mcp-neo4j" "$installed" ||
         { show_log; fail "$label: installed file is not the fixture stub"; }
     grep -q 'Checksum verified\.' "$RUN_LOG" ||
         { show_log; fail "$label: the installer's checksum verification did not run"; }

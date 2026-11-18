@@ -161,7 +161,7 @@ func platformCreatePrivateMutationRuntimeDirectory() (string, error) {
 			return "", err
 		}
 		directory := filepath.Join(
-			os.TempDir(), "codebase-memory-mcp-mutation-"+token,
+			os.TempDir(), "codebase-memory-mcp-neo4j-mutation-"+token,
 		)
 		extended, err := windowsExtendedPath(directory)
 		if err != nil {

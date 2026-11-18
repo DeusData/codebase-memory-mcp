@@ -109,9 +109,9 @@ jobs:
       - name: Extract release artifact
         run: |
           mkdir -p "$RUNNER_TEMP/cbm-artifact"
-          tar -xzf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+          tar -xzf codebase-memory-mcp-neo4j-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
             -C "$RUNNER_TEMP/cbm-artifact"
-          chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
 
       # ONE harness for every venue. This is the same wrapper local CI and PR CI
       # run, handed the DOWNLOADED artifact instead of a local build: it stages
@@ -121,7 +121,7 @@ jobs:
       # the wrapper (no env isolation, no user-PATH guard, fixed port).
       - name: Smoke test (shared wrapper)
         run: |
-          scripts/smoke-local.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          scripts/smoke-local.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
           SMOKE_REQUIRE_UI: "1"
@@ -129,7 +129,7 @@ jobs:
 
       - name: Security audits
         run: |
-          BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
           scripts/security-strings.sh "$BIN"
           scripts/security-install.sh "$BIN"
           scripts/security-network.sh "$BIN"
@@ -137,7 +137,7 @@ jobs:
       - name: MCP robustness test (selected linux-amd64 runtime)
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: |
-          BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
           scripts/security-fuzz.sh "$BIN"
           scripts/security-fuzz-random.sh "$BIN" 60
 
@@ -153,7 +153,7 @@ jobs:
           grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
             echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
           sudo freshclam --quiet
-          clamscan --no-summary "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          clamscan --no-summary "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
 
       - name: ClamAV scan (macOS)
         if: startsWith(matrix.os, 'macos')
@@ -166,7 +166,7 @@ jobs:
             echo "DatabaseMirror database.clamav.net" >> "$CLAMAV_ETC/freshclam.conf"
           fi
           freshclam --quiet --no-warnings 2>/dev/null || freshclam --quiet 2>/dev/null || echo "WARNING: freshclam update failed"
-          clamscan --no-summary "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          clamscan --no-summary "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
 
   smoke-windows:
     needs: setup-matrix
@@ -211,11 +211,11 @@ jobs:
           ARCH=${{ matrix.arch }}
           ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
           mkdir -p "$ARTIFACT_DIR"
-          unzip -o "codebase-memory-mcp-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
-          test -s "$ARTIFACT_DIR/codebase-memory-mcp.exe"
+          unzip -o "codebase-memory-mcp-neo4j-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
+          test -s "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe"
           # ONE executable per runtime set: a payload sibling would mean the
           # removed launcher split came back.
-          test ! -e "$ARTIFACT_DIR/codebase-memory-mcp.payload.exe"
+          test ! -e "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.payload.exe"
           # Pre-flight the image from a profile-rooted directory: the shared
           # runner workspace is deliberately not a valid install root.
           PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
@@ -224,8 +224,8 @@ jobs:
           # image's file busy for ~100ms (section teardown / first-touch AV),
           # and a temp dir on an ephemeral runner must never fail the job.
           trap 'rm -rf "$LAUNCH_DIR" 2>/dev/null || { sleep 2; rm -rf "$LAUNCH_DIR" 2>/dev/null || true; }' EXIT
-          cp "$ARTIFACT_DIR/codebase-memory-mcp.exe" "$LAUNCH_DIR/"
-          "$LAUNCH_DIR/codebase-memory-mcp.exe" --version
+          cp "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe" "$LAUNCH_DIR/"
+          "$LAUNCH_DIR/codebase-memory-mcp-neo4j.exe" --version
 
       # ONE harness for every venue: the same script win.sh smoke-install and
       # pr.yml run, handed the DOWNLOADED artifact instead of a local build. It
@@ -248,21 +248,21 @@ jobs:
         shell: msys2 {0}
         run: |
           ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
-          scripts/security-strings.sh "$ARTIFACT_DIR/codebase-memory-mcp.exe"
+          scripts/security-strings.sh "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe"
           PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
           SECURITY_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-security.XXXXXX")"
           # Best-effort cleanup with one retry (see the version preflight).
           trap 'rm -rf "$SECURITY_DIR" 2>/dev/null || { sleep 2; rm -rf "$SECURITY_DIR" 2>/dev/null || true; }' EXIT
-          cp "$ARTIFACT_DIR/codebase-memory-mcp.exe" "$SECURITY_DIR/"
+          cp "$ARTIFACT_DIR/codebase-memory-mcp-neo4j.exe" "$SECURITY_DIR/"
           TMPDIR="$SECURITY_DIR" \
-            scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"
+            scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp-neo4j.exe"
 
       - name: Windows Defender scan
         shell: pwsh
         run: |
           & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
           $artifactDir = Join-Path $env:RUNNER_TEMP "cbm-artifact"
-          foreach ($binary in @("codebase-memory-mcp.exe")) {
+          foreach ($binary in @("codebase-memory-mcp-neo4j.exe")) {
             $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File (Join-Path $artifactDir $binary) -DisableRemediation
             $code = $LASTEXITCODE
             Write-Host $result
@@ -308,9 +308,9 @@ jobs:
       - name: Extract release artifact
         run: |
           mkdir -p "$RUNNER_TEMP/cbm-artifact"
-          tar -xzf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
+          tar -xzf codebase-memory-mcp-neo4j-linux-${{ matrix.arch }}-portable.tar.gz \
             -C "$RUNNER_TEMP/cbm-artifact"
-          chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
 
       # Same wrapper as every other venue. This leg previously called
       # smoke-test.sh with no fixture server, which silently SKIPPED the
@@ -319,7 +319,7 @@ jobs:
       # exactly the phases it most needs to run.
       - name: Smoke test (shared wrapper)
         run: |
-          scripts/smoke-local.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          scripts/smoke-local.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
           SMOKE_REQUIRE_UI: "1"
@@ -330,11 +330,11 @@ jobs:
       # in debian:bullseye (glibc 2.31) — the standard dynamic binary would fail
       # here with `GLIBC_2.38 not found`.
       - name: Old-glibc compatibility
-        run: scripts/ci/check-glibc-compat.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+        run: scripts/ci/check-glibc-compat.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
 
       - name: Security audits
         run: |
-          BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
+          BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp-neo4j"
           scripts/security-strings.sh "$BIN"
           scripts/security-install.sh "$BIN"
           scripts/security-network.sh "$BIN"
@@ -364,7 +364,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew tap deusdata/codebase-memory-mcp "$GITHUB_WORKSPACE"
-          brew trust deusdata/codebase-memory-mcp
-          brew install codebase-memory-mcp
-          codebase-memory-mcp --version
+          brew tap deusdata/codebase-memory-mcp-neo4j "$GITHUB_WORKSPACE"
+          brew trust deusdata/codebase-memory-mcp-neo4j
+          brew install codebase-memory-mcp-neo4j
+          codebase-memory-mcp-neo4j --version
