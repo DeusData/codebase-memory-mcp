@@ -245,6 +245,23 @@ assert_test_runner_build_config() {
 
 print_env "test.sh" --cpu
 
+# TEMPORARY sha256 diagnostic (drop before merge): every full-file fingerprint
+# the test runner computes appends one "CBM-SHA256-DIAG" line to this file
+# (backend, bytes, read vs compute ms, CPU facts; the daemon_bootstrap suite adds
+# one selected-vs-portable comparison). Printed at exit, whatever the verdict,
+# so the hosted job log carries it; the trap never changes the exit status.
+CBM_SHA256_DIAG_FILE="${CBM_SHA256_DIAG_FILE:-${TMPDIR:-/tmp}/cbm-sha256-diag-$$.txt}"
+export CBM_SHA256_DIAG_FILE
+rm -f "$CBM_SHA256_DIAG_FILE"
+sha256_diag_dump() {
+    if [ -s "$CBM_SHA256_DIAG_FILE" ]; then
+        echo "=== TEMPORARY sha256 diag: $(wc -l < "$CBM_SHA256_DIAG_FILE" | tr -d ' ') line(s) ==="
+        head -n 600 "$CBM_SHA256_DIAG_FILE" || true
+    fi
+    rm -f "$CBM_SHA256_DIAG_FILE" || true
+}
+trap sha256_diag_dump EXIT
+
 # ── TSan mode (--tsan): the data-race gate ──
 # One entry for every venue: CI's tsan jobs and the compose test-tsan service
 # both run this instead of carrying their own make invocation.

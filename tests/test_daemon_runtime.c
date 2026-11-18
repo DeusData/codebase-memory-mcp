@@ -5019,6 +5019,8 @@ TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active) {
     ASSERT_TRUE(fingerprint_differs);
     ASSERT_TRUE(started);
     ASSERT_TRUE(foreign_ran);
+    /* 26 = the daemon answered with a rejection. A probe that got no answer
+     * inside the exchange budget exits 30 and must not pass here. */
     ASSERT_EQ(foreign_exit, 26);
     PASS();
 }
@@ -5092,6 +5094,8 @@ TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed)
     ASSERT_TRUE(changed_copied);
     ASSERT_TRUE(changed_bytes);
     ASSERT_TRUE(changed_ran);
+    /* 26 = the daemon answered with a rejection; no answer inside the
+     * exchange budget exits 30 and fails here instead of passing. */
     ASSERT_EQ(changed_exit, 26);
 #endif
     PASS();

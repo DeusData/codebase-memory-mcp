@@ -24,6 +24,7 @@ int tf_deselected_count = 0;
 #include "daemon/runtime.h"            /* bounded worker response probe */
 #include "daemon/ipc.h"                /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h"     /* Windows crash-turnover re-exec probe */
+#include "daemon/service_internal.h"   /* TEMPORARY sha256 diagnostic (drop before merge) */
 #include "mcp/index_supervisor.h"      /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"                   /* cbm_mcp_handle_tool — act as a real worker */
 #include "ui/http_server.h"            /* deleted-self executable probe */
@@ -713,7 +714,11 @@ static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
         !client || cbm_daemon_runtime_client_close(client, TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (!accepted) {
-        return 26;
+        /* 26 only when the daemon ANSWERED and refused. No answer inside the
+         * exchange budget (the daemon still hashing this copy, or I/O) is 30:
+         * a slow peer-image hash must fail loudly as itself, never satisfy a
+         * rejection assertion by timing out. */
+        return result.status == CBM_DAEMON_RUNTIME_CONNECT_ERROR ? 30 : 26;
     }
     return closed ? 0 : 27;
 }
@@ -743,7 +748,10 @@ static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
                         endpoint, &identity, (cbm_daemon_runtime_activation_action_t)action_value,
                         TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result);
     cbm_daemon_ipc_endpoint_free(endpoint);
-    return exchanged && result.accepted ? 0 : 29;
+    if (!exchanged) {
+        return 31; /* no answer inside the exchange budget; see the HELLO probe */
+    }
+    return result.accepted ? 0 : 29;
 }
 
 /* macOS adversarial HELLO probe: execute this mode from a foreign process
@@ -2406,6 +2414,9 @@ static void tf_msan_mi_output(const char *msg, void *arg) {
 #endif
 
 int main(int argc, char **argv) {
+    /* TEMPORARY diagnostic (drop before merge): read CBM_SHA256_DIAG_FILE here,
+     * before any role or thread, so exec'd roles record their hashes too. */
+    cbm_daemon_fingerprint_diag_init_for_testing();
 #ifdef TF_MSAN_MIMALLOC_OUTPUT
     mi_register_output(tf_msan_mi_output, NULL);
     tf_msan_mi_output_live = true;
@@ -2532,6 +2543,15 @@ int main(int argc, char **argv) {
     }
     if (!g_list_only) {
         printf("\n  codebase-memory-mcp  C test suite\n");
+        /* TEMPORARY diagnostic (drop before merge): once, in the daemon_bootstrap
+         * suite process only, before any test runs: time the selected SHA-256
+         * backend against the portable transform on this runner's own image. */
+        for (int i = 1; i < argc; i++) {
+            if (argv[i] && strcmp(argv[i], "daemon_bootstrap") == 0) {
+                cbm_daemon_fingerprint_diag_compare_for_testing(cbm_test_program_path);
+                break;
+            }
+        }
     }
 
     /* Runner isolation first: nothing below may reach the developer's daemon. */

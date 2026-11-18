@@ -32,4 +32,14 @@ typedef void (*cbm_daemon_conflict_log_test_hook_fn)(void *context,
 void cbm_daemon_conflict_log_set_test_hook(cbm_daemon_conflict_log_test_hook_fn hook,
                                            void *context);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* TEMPORARY diagnostic (drop before merge): read CBM_SHA256_DIAG_FILE once,
+ * before any thread starts; then every full-file fingerprint appends one
+ * "CBM-SHA256-DIAG kind=hash" line to it. The compare call (at most once per
+ * process) times the selected backend against the portable transform on the
+ * same bytes. POSIX only; no-ops on Windows. */
+void cbm_daemon_fingerprint_diag_init_for_testing(void);
+void cbm_daemon_fingerprint_diag_compare_for_testing(const char *path);
+#endif
+
 #endif /* CBM_DAEMON_SERVICE_INTERNAL_H */
