@@ -4884,6 +4884,137 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
     PASS();
 }
 
+/* Discovery indexes the configuration files of a deploy/ directory and skips
+ * its program source; every incremental route rediscovers with the same rule,
+ * so a manifest added there later reaches the graph, and the result equals a
+ * fresh full index of the same tree. Two additions: the first takes the route
+ * the planner picks, the second the forced full-load (legacy partial) route;
+ * then an edit of a manifest there (closure repair declines a changed
+ * Kubernetes manifest: full route), an edit of the program source there,
+ * which changes no input (no-op route), and an edit of the deploy script
+ * (closure repair). */
+static int deploy_inc_files(const char *db_path) {
+    return k8s_inc_count(db_path, "SELECT COUNT(*) FROM nodes WHERE label='File' AND "
+                                  "file_path LIKE 'deploy/%'");
+}
+
+/* A fresh full index of `repo` into its own database beside it (in `tmp`). */
+static int deploy_inc_fresh_files(const char *tmp, const char *repo, const char *name) {
+    char fresh[512];
+    snprintf(fresh, sizeof(fresh), "%s/%s", tmp, name);
+    return k8s_inc_index(repo, fresh) == 0 ? deploy_inc_files(fresh) : -1;
+}
+
+TEST(incremental_sees_config_added_under_deploy) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_depinc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    char repo[300];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    write_temp_file(repo, "app.py", "def serve():\n    return 1\n");
+    write_temp_file(repo, "deploy/main.py", "def serve():\n    return 2\n");
+    write_temp_file(repo, "deploy/k8s/app.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
+    write_temp_file(repo, "deploy/install.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nkubectl apply -f k8s/app.yaml\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/depinc.db", tmp);
+    static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
+    static const char copied[] = "SELECT COUNT(*) FROM nodes WHERE file_path='deploy/main.py'";
+    /* the same function outside deploy/ is indexed: the rule is what drops the copy */
+    static const char original[] = "SELECT COUNT(*) FROM nodes WHERE file_path='app.py' AND "
+                                   "label='Function' AND name='serve'";
+    static const char added[] = "SELECT COUNT(*) FROM nodes WHERE label='File' AND "
+                                "file_path IN ('deploy/k8s/extra.yaml','deploy/k8s/more.yaml')";
+
+    int rc_full = k8s_inc_index(repo, db_path);
+    int files_full = deploy_inc_files(db_path);
+    int copied_full = k8s_inc_count(db_path, copied);
+    int original_full = k8s_inc_count(db_path, original);
+
+    write_temp_file(repo, "deploy/k8s/extra.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n");
+    int rc_first = k8s_inc_index(repo, db_path);
+    cbm_incremental_route_t first_route = cbm_pipeline_incremental_test_last_route();
+    int files_first = deploy_inc_files(db_path);
+    int fresh_first = deploy_inc_fresh_files(tmp, repo, "fresh1.db");
+
+    write_temp_file(repo, "deploy/k8s/more.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: more\n");
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+#endif
+    int rc_second = k8s_inc_index(repo, db_path);
+    cbm_incremental_route_t second_route = cbm_pipeline_incremental_test_last_route();
+    int files_second = deploy_inc_files(db_path);
+    int fresh_second = deploy_inc_fresh_files(tmp, repo, "fresh2.db");
+    int added_second = k8s_inc_count(db_path, added);
+    int copied_second = k8s_inc_count(db_path, copied);
+    int original_second = k8s_inc_count(db_path, original);
+
+    /* an edit of a manifest there: the route an edit takes (closure repair
+     * unless it declines), against a fresh full index again */
+    static const char renamed[] = "SELECT COUNT(*) FROM nodes WHERE label='Resource' AND "
+                                  "file_path='deploy/k8s/extra.yaml' AND "
+                                  "qualified_name LIKE '%extra2%'";
+    write_temp_file(repo, "deploy/k8s/extra.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra2\n");
+    int rc_third = k8s_inc_index(repo, db_path);
+    cbm_incremental_route_t third_route = cbm_pipeline_incremental_test_last_route();
+    int renamed_third = k8s_inc_count(db_path, renamed);
+    char fresh3[512];
+    snprintf(fresh3, sizeof(fresh3), "%s/fresh3.db", tmp);
+    int renamed_fresh = k8s_inc_index(repo, fresh3) == 0 ? k8s_inc_count(fresh3, renamed) : -1;
+    /* an edit of the program source there changes no input: nothing to do */
+    write_temp_file(repo, "deploy/main.py", "def serve():\n    return 3\n");
+    int rc_fourth = k8s_inc_index(repo, db_path);
+    cbm_incremental_route_t fourth_route = cbm_pipeline_incremental_test_last_route();
+    int copied_fourth = k8s_inc_count(db_path, copied);
+    /* an edit of the script there: closure repair, as for any script */
+    write_temp_file(
+        repo, "deploy/install.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nkubectl apply -f k8s/app.yaml\n# edited\n");
+    int rc_fifth = k8s_inc_index(repo, db_path);
+    cbm_incremental_route_t fifth_route = cbm_pipeline_incremental_test_last_route();
+    int deploys_fifth = k8s_inc_count(db_path, deploys);
+    char fresh5[512];
+    snprintf(fresh5, sizeof(fresh5), "%s/fresh5.db", tmp);
+    int deploys_fresh = k8s_inc_index(repo, fresh5) == 0 ? k8s_inc_count(fresh5, deploys) : -1;
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(files_full, 2); /* app.yaml and install.sh; deploy/main.py is program source */
+    ASSERT_EQ(copied_full, 0);
+    ASSERT_EQ(original_full, 1);
+    ASSERT_EQ(rc_first, 0);
+    ASSERT_NEQ(first_route, CBM_INCREMENTAL_ROUTE_NONE);
+    ASSERT_NEQ(first_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(files_first, 3);
+    ASSERT_EQ(fresh_first, files_first);
+    ASSERT_EQ(rc_second, 0);
+    ASSERT_EQ(second_route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(files_second, 4);
+    ASSERT_EQ(fresh_second, files_second);
+    ASSERT_EQ(added_second, 2);
+    ASSERT_EQ(copied_second, 0);
+    ASSERT_EQ(original_second, 1);
+    ASSERT_EQ(rc_third, 0);
+    ASSERT_NEQ(third_route, CBM_INCREMENTAL_ROUTE_NONE);
+    ASSERT_NEQ(third_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(renamed_third, 1);
+    ASSERT_EQ(renamed_fresh, renamed_third);
+    ASSERT_EQ(rc_fourth, 0);
+    ASSERT_EQ(fourth_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(copied_fourth, 0);
+    ASSERT_EQ(rc_fifth, 0);
+    ASSERT_EQ(fifth_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(deploys_fifth, 1);
+    ASSERT_EQ(deploys_fresh, deploys_fifth);
+    PASS();
+}
+
 /* Deleting the only file that starts a program leaves no Process node
  * behind -- a full index never makes one without a SPAWNS edge. One script
  * (pass_shell.c) and one Python call (pass_spawns.c) start programs; the
@@ -36086,6 +36217,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
+    RUN_TEST(incremental_sees_config_added_under_deploy);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(incremental_deleted_caller_drops_its_route);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
