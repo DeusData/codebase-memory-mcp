@@ -2416,6 +2416,97 @@ TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
     PASS();
 }
 
+/* IMPORTS edges the Ansible pass drew (via ansible); -1 on a query error. */
+static int ansible_import_edges(cbm_store_t *s, const char *project) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM edges WHERE project=?1 AND type='IMPORTS' AND "
+                           "json_extract(properties,'$.via')='ansible'",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* A playbook extracts no imports of its own: its role and include edges come
+ * from the Ansible pass, so the semantic pass builds its import map from those
+ * IMPORTS edges (the slow path). Those keys were libc copies released through
+ * the memory core, and on macOS, where the core's allocator is not the libc
+ * one, the index worker crashed in the semantic pass on every repository of 50
+ * files or fewer holding a role or an include (any repository at one worker).
+ * Here the memory core's own count binds, whatever the allocator and wherever
+ * the string landed: a block the core takes back without having handed it out
+ * leaves its class below where it started. A first index of the same tree
+ * warms what the process builds once and keeps (the semantic pass's
+ * pretrained token table is one), so the readings are taken around a second,
+ * identical full index and an incremental re-index of the edited playbook
+ * (the incremental route runs the same pass for changed files): the verdict
+ * does not depend on what ran before in the process. */
+TEST(pipeline_semantic_import_map_keys_come_from_the_memory_core) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "site.yml",
+                    "- hosts: localhost\n  roles:\n    - web\n  tasks:\n"
+                    "    - include_tasks: tasks/setup.yml\n");
+    write_temp_file(g_tmpdir, "roles/web/tasks/main.yml",
+                    "- name: Say hi\n  debug:\n    msg: hi\n");
+    write_temp_file(g_tmpdir, "tasks/setup.yml", "- name: Setup\n  debug:\n    msg: setup\n");
+    char warm_path[512];
+    snprintf(warm_path, sizeof(warm_path), "%s/semantic_keys_warm.db", g_tmpdir);
+    int warm_rc = -1;
+    cbm_pipeline_t *warm = cbm_pipeline_new(g_tmpdir, warm_path, CBM_MODE_FULL);
+    if (warm) {
+        warm_rc = cbm_pipeline_run(warm);
+        cbm_pipeline_free(warm);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/semantic_keys.db", g_tmpdir);
+
+    cbm_mem_class_flush_thread();
+    size_t blocks_before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_SEMANTIC);
+    size_t bytes_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+    int full_rc = -1;
+    int incr_rc = -1;
+    int imports = -1;
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    if (p1) {
+        full_rc = cbm_pipeline_run(p1);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        if (s) {
+            imports = ansible_import_edges(s, cbm_pipeline_project_name(p1));
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p1);
+    }
+    write_temp_file(g_tmpdir, "site.yml",
+                    "- hosts: localhost\n  roles:\n    - web\n  tasks:\n"
+                    "    - include_tasks: tasks/setup.yml\n    - debug:\n        msg: edited\n");
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    if (p2) {
+        incr_rc = cbm_pipeline_run(p2);
+        cbm_pipeline_free(p2);
+    }
+    cbm_mem_class_flush_thread();
+    size_t blocks_after = cbm_mem_class_live_blocks(CBM_MEM_CLASS_SEMANTIC);
+    size_t bytes_after = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+    teardown_test_repo();
+
+    ASSERT_EQ(warm_rc, 0);
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(incr_rc, 0);
+    /* The playbook's role and include are the IMPORTS edges the slow path reads. */
+    ASSERT_TRUE(imports >= 2);
+    /* Every SEMANTIC block taken back was handed out: the class is where it began. */
+    ASSERT_TRUE(blocks_after == blocks_before);
+    ASSERT_TRUE(bytes_after == bytes_before);
+    PASS();
+}
+
 /* The CALLS edges an Ansible notify draws (via notify); -1 on a query error. */
 static int ansible_notify_calls(cbm_store_t *s, const char *project) {
     sqlite3_stmt *st = NULL;
@@ -35535,6 +35626,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
     RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
+    RUN_TEST(pipeline_semantic_import_map_keys_come_from_the_memory_core);
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
