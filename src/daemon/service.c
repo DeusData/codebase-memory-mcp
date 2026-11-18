@@ -8,6 +8,7 @@
 #include "daemon/ipc.h"
 #endif
 
+#include "foundation/build_stamp.h"
 #include "foundation/sha256.h"
 
 #include <errno.h>
@@ -370,8 +371,10 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
 
-    cbm_sha256_ctx context;
-    cbm_sha256_init(&context);
+    /* The fingerprint excludes the build-stamp payload (#2683); on an
+     * unstamped image this equals a plain SHA-256 of the bytes. */
+    cbm_build_stamp_hasher_t context;
+    cbm_build_stamp_hasher_init(&context);
     unsigned char buffer[DAEMON_SERVICE_IO_CAP];
     off_t offset = 0;
     bool ok = true;
@@ -380,7 +383,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         size_t request = remaining < (off_t)sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
         ssize_t count = pread(fd, buffer, request, offset);
         if (count > 0) {
-            cbm_sha256_update(&context, buffer, (size_t)count);
+            cbm_build_stamp_hasher_update(&context, buffer, (size_t)count);
             offset += (off_t)count;
         } else if (count == 0) {
             ok = false;
@@ -398,7 +401,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
-    cbm_sha256_final(&context, digest);
+    cbm_build_stamp_hasher_final(&context, digest);
     digest_to_hex(digest, out);
     return true;
 }
@@ -697,8 +700,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
         windows_same_file_identity(&original_info, &info) && GetFileSizeEx(file, &before) != 0 &&
         before.QuadPart >= 0;
-    cbm_sha256_ctx context;
-    cbm_sha256_init(&context);
+    /* Same stamp-excluding digest as the POSIX variant (#2683). */
+    cbm_build_stamp_hasher_t context;
+    cbm_build_stamp_hasher_init(&context);
     unsigned char buffer[DAEMON_SERVICE_IO_CAP];
     uint64_t total = 0;
     while (ok) {
@@ -708,7 +712,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         } else if (count == 0) {
             break;
         } else {
-            cbm_sha256_update(&context, buffer, count);
+            cbm_build_stamp_hasher_update(&context, buffer, count);
             total += count;
         }
     }
@@ -725,7 +729,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
-    cbm_sha256_final(&context, digest);
+    cbm_build_stamp_hasher_final(&context, digest);
     digest_to_hex(digest, out);
     return true;
 }

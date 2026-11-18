@@ -187,6 +187,21 @@ if ! "$STRIP_TOOL" --strip-debug "$DEBUG_STRIPPED" 2>/dev/null; then
     DEBUG_STRIP_INVOCATION="$(basename "$STRIP_TOOL") -S"
 fi
 
+# #2683: stamp the build identity into every ELF candidate. This must run
+# after strip (strip rewrites the bytes the stamp covers) and before any
+# signing; Mach-O and PE stay unstamped and keep hashing their image. The
+# stamper reads and writes bytes only: no candidate is executed here.
+case "$GOOS" in
+linux)
+    for candidate in "$UNSTRIPPED" "$DEBUG_STRIPPED" "$STRIPPED"; do
+        python3 "$ROOT/scripts/build-stamp.py" "$candidate" >/dev/null || {
+            echo "prepare-release-candidates: build-stamp failed for $candidate" >&2
+            exit 2
+        }
+    done
+    ;;
+esac
+
 UNSTRIPPED_PRE_SIGN_SHA="$(sha256_file "$UNSTRIPPED")"
 DEBUG_STRIPPED_PRE_SIGN_SHA="$(sha256_file "$DEBUG_STRIPPED")"
 STRIPPED_PRE_SIGN_SHA="$(sha256_file "$STRIPPED")"
