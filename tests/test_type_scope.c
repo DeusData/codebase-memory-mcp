@@ -989,6 +989,47 @@ TEST(type_scope_python_unbound_class_names_are_the_module_names) {
     return ts_twins("pyunbind", py_unbind_files, CBM_LANG_PYTHON, py_unbind_check);
 }
 
+/* A method declared with @overload (the shape of scrapy's Response.replace).
+ * Callers see the overloads, which pick the result from the arguments
+ * (`replace(cls=Text)` is a Text, python3 runs Text.css); the
+ * implementation's `-> Response` is no call's type, so no identity is taken
+ * from any of its signatures. A plain method keeps its own (run_plain), and so
+ * does an overloaded one whose definitions all return Response (run_opts, the
+ * shape of sqlalchemy's Connection.execution_options). */
+static const ts_file_t py_overload_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/resp.py", "from __future__ import annotations\n\nfrom typing import Self, TypeVar, overload\n\n"
+                    "T = TypeVar(\"T\", bound=\"Response\")\n\n\n"
+                    "class Response:\n    def css(self):\n        return 'base'\n\n"
+                    "    @overload\n    def replace(self, cls: type[T]) -> T: ...\n\n"
+                    "    @overload\n    def replace(self, cls: None = None) -> Self: ...\n\n"
+                    "    def replace(self, cls=None) -> Response:\n"
+                    "        return (cls or type(self))()\n\n"
+                    "    @overload\n    def opts(self, *, a: int) -> Response: ...\n\n"
+                    "    @overload\n    def opts(self, **kw: int) -> Response: ...\n\n"
+                    "    def opts(self, **kw) -> Response:\n        return Response()\n\n"
+                    "    def plain(self) -> Response:\n        return Response()\n\n\n"
+                    "class Text(Response):\n    def css(self):\n        return 'text'\n"},
+    {"pkg/make.py", "from pkg.resp import Response\n\n\ndef make() -> Response:\n    return Response()\n"},
+    {"pkg/use.py", "from pkg.make import make\nfrom pkg.resp import Text\n\n\n"
+                   "def run():\n    return make().replace(cls=Text).css()\n\n\n"
+                   "def run_plain():\n    return make().plain().css()\n\n\n"
+                   "def run_opts():\n    return make().opts(a=1).css()\n"},
+    {NULL, NULL}};
+
+static int py_overload_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "run", "pkg.resp.Response.css", NULL);
+    int plain = ts_calls_to(s, project, "run_plain", "pkg.resp.Response.css", NULL);
+    int agreed = ts_calls_to(s, project, "run_opts", "pkg.resp.Response.css", NULL);
+    printf("  python overloaded method (%s): run -> Response.css=%d, run_plain=%d, run_opts=%d\n",
+           label, wrong, plain, agreed);
+    return !(wrong == 0 && plain == 1 && agreed == 1);
+}
+
+TEST(type_scope_python_overloaded_method_takes_no_identity) {
+    return ts_twins("pyoverload", py_overload_files, CBM_LANG_PYTHON, py_overload_check);
+}
+
 /* A struct's embedded-type text is built once, with one buffer: the
  * extractor's work for n embedded types is linear in n. */
 static uint64_t ts_go_embedded_work(int n) {
@@ -2349,6 +2390,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_class_and_module_of_one_qn);
     RUN_TEST(type_scope_python_global_rebinding_takes_no_identity);
     RUN_TEST(type_scope_python_unbound_class_names_are_the_module_names);
+    RUN_TEST(type_scope_python_overloaded_method_takes_no_identity);
     RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
     RUN_TEST(type_scope_python_type_parameter_is_no_import);
     RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_per_file);

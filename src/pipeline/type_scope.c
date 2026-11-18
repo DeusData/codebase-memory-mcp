@@ -80,12 +80,16 @@ static char g_nest_open_mark;
 static char g_nest_local_mark;
 static char g_bound_once_mark;
 static char g_bound_many_mark;
+static char g_overload_mark;
+static char g_overload_differ_mark;
 #define TYPE_SCOPE_BOUND_ONCE ((void *)&g_bound_once_mark)
 #define TYPE_SCOPE_BOUND_MANY ((void *)&g_bound_many_mark)
 #define TYPE_SCOPE_AMBIGUOUS ((void *)&g_ambiguous_mark)
 #define TYPE_SCOPE_MISS ((void *)&g_miss_mark)
 #define TYPE_SCOPE_NEST_OPEN ((void *)&g_nest_open_mark)   /* module or class bodies only */
 #define TYPE_SCOPE_NEST_LOCAL ((void *)&g_nest_local_mark) /* inside a function */
+#define TYPE_SCOPE_OVERLOAD ((void *)&g_overload_mark)     /* declared with @overload */
+#define TYPE_SCOPE_OVERLOAD_DIFFER ((void *)&g_overload_differ_mark)
 
 struct cbm_type_scope_file {
     const cbm_type_scope_lang_t *lang;
@@ -97,6 +101,8 @@ struct cbm_type_scope_file {
     /* lexical scopes only */
     CBMHashTable *defs;          /* file def QN -> index + 1 into scope.file_defs */
     CBMHashTable *class_binds;   /* "<class QN>.<name>" a class body binds (not a def) */
+    CBMHashTable *overloaded;    /* QN some def declares with @overload -> the return text
+                                  * all its defs share, or TYPE_SCOPE_OVERLOAD_DIFFER */
     CBMHashTable *tparams;       /* every type parameter name the file declares */
     CBMHashTable *nesting;       /* def QN -> TYPE_SCOPE_NEST_OPEN / _LOCAL (memo) */
     CBMHashTable *bindings;      /* module-level name -> count of binding facts (1, 2+) */
@@ -195,15 +201,68 @@ static void type_scope_index_global_names(cbm_type_scope_file_t *f, const CBMDef
     }
 }
 
+/* Whether a decorator's text is typing's @overload (`@overload`,
+ * `@typing.overload`, `@t.overload`). */
+static bool type_scope_overload_decorator(const char *text) {
+    while (text && (*text == '@' || *text == ' ' || *text == '\t')) {
+        text++;
+    }
+    if (!text || !*text) {
+        return false;
+    }
+    size_t len = strcspn(text, "( \t\r\n");
+    const char *name = text;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == '.') {
+            name = text + i + 1;
+        }
+    }
+    return (size_t)(text + len - name) == strlen("overload") &&
+           memcmp(name, "overload", strlen("overload")) == 0;
+}
+
+/* A function with @overload declarations: callers see the overloads, which
+ * pick the result from the arguments, so the implementation's annotations are
+ * not its type at a call, nor is any one overload's -- unless all of its
+ * definitions declare the same return type (whichever overload a call picks,
+ * that is the type). Where they differ its QN takes no identity. */
+static void type_scope_index_overload(cbm_type_scope_file_t *f, const CBMDefinition *d) {
+    for (int i = 0; d->decorators && d->decorators[i] && d->qualified_name; i++) {
+        TYPE_SCOPE_WORK(1);
+        if (type_scope_overload_decorator(d->decorators[i])) {
+            cbm_ht_set(f->overloaded, d->qualified_name, TYPE_SCOPE_OVERLOAD);
+            return;
+        }
+    }
+}
+
+/* Second pass: whether the definitions of each overloaded QN agree on the
+ * return type text (none counts as a text of its own). */
+static void type_scope_compare_overloads(cbm_type_scope_file_t *f) {
+    int n = cbm_ht_count(f->overloaded) ? f->scope.file_def_count : 0;
+    for (int i = 0; i < n; i++) {
+        const CBMDefinition *d = &f->scope.file_defs[i];
+        void *seen = d->qualified_name ? cbm_ht_get(f->overloaded, d->qualified_name) : NULL;
+        const char *ret = d->return_type ? d->return_type : "";
+        TYPE_SCOPE_WORK(strlen(ret) + 1);
+        if (seen == TYPE_SCOPE_OVERLOAD) {
+            cbm_ht_set(f->overloaded, d->qualified_name, (void *)ret);
+        } else if (seen && seen != TYPE_SCOPE_OVERLOAD_DIFFER && strcmp((const char *)seen, ret)) {
+            cbm_ht_set(f->overloaded, d->qualified_name, TYPE_SCOPE_OVERLOAD_DIFFER);
+        }
+    }
+}
+
 /* Hash the file's own definitions, its type parameter names and the names
  * its class bodies bind. */
 static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
     int n = f->scope.file_def_count;
     f->defs = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(n + 1));
     f->class_binds = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
+    f->overloaded = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->tparams = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
     f->nesting = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(n + 1));
-    if (!f->defs || !f->class_binds || !f->tparams || !f->nesting ||
+    if (!f->defs || !f->class_binds || !f->overloaded || !f->tparams || !f->nesting ||
         !type_scope_index_module_facts(f)) {
         return false;
     }
@@ -215,6 +274,7 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
         }
         type_scope_index_class_bindings(f, d);
         type_scope_index_global_names(f, d);
+        type_scope_index_overload(f, d);
         for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
             const char *bar = strchr(p, '|');
             size_t len = bar ? (size_t)(bar - p) : strlen(p);
@@ -226,6 +286,7 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
             p = bar ? bar + 1 : p + len;
         }
     }
+    type_scope_compare_overloads(f);
     return true;
 }
 
@@ -276,6 +337,7 @@ void cbm_type_scope_file_end(cbm_type_scope_file_t *file) {
     cbm_ht_free(file->seen);
     cbm_ht_free(file->defs);
     cbm_ht_free(file->class_binds);
+    cbm_ht_free(file->overloaded);
     cbm_ht_free(file->tparams);
     cbm_ht_free(file->nesting);
     cbm_ht_free(file->bindings);
@@ -696,8 +758,9 @@ void cbm_type_scope_attach(cbm_type_scope_file_t *file, CBMArena *arena, CBMLSPD
          * binding unknown names), and a def inside a function (it sees locals
          * the step cannot list): neither gets one. */
         if (file->closed || !def->qualified_name ||
-            type_scope_function_local(file, def->qualified_name)) {
-            return;
+            type_scope_function_local(file, def->qualified_name) ||
+            cbm_ht_get(file->overloaded, def->qualified_name) == TYPE_SCOPE_OVERLOAD_DIFFER) {
+            return; /* (an overloaded function: type_scope_index_overload) */
         }
         file->enclosing_class = type_scope_enclosing_class(file, def->qualified_name);
     }
