@@ -60,6 +60,24 @@ typedef struct {
 int cbm_lsp_surface_python_namespace_from_json(CBMArena *arena, const char *json,
                                                cbm_lsp_python_namespace_t *out);
 
+/* A stored file's scope facts (the "is" key, see lsp_surface.c). Events keep
+ * their kind and flags; pos is the stored rank (source order, equal positions
+ * equal); a DEF's index is into defs (name, qualified_name), an INCLUDE's
+ * into modules (module paths). QREF events are not stored. */
+typedef struct {
+    CBMScopeEvent *events;
+    int event_count;
+    CBMDefinition *defs;
+    int def_count;
+    const char **modules;
+    int module_count;
+} cbm_lsp_scope_facts_t;
+
+/* Returns 1 with the row's facts copied into `arena`, 0 for a row without
+ * "is" (a language without a scope row, or a row an older binary wrote), -1
+ * for a malformed row or another "is" version. */
+int cbm_lsp_surface_scope_from_json(CBMArena *arena, const char *json, cbm_lsp_scope_facts_t *out);
+
 /* Conservative namespace admission for incremental planning. Both rows must
  * have a current, valid fact envelope before any equality shortcut is used.
  * Returns -1 for invalid/incomplete metadata, 0 when both rows are non-Python
