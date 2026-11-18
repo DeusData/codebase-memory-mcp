@@ -2092,6 +2092,16 @@ void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_ho
                                                             void *userdata);
 cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
 void cbm_pipeline_incremental_test_reset_faults(void);
+/* The last closure plan: an accepted plan's re-parse set size, surface-changed
+ * files and dependents (decline NULL), or a declined plan's reason (counters
+ * -1). All -1 / NULL after a reset and when no plan ran. */
+typedef struct {
+    int files;
+    int surface_changed;
+    int dependents;
+    const char *decline;
+} cbm_incremental_closure_plan_t;
+cbm_incremental_closure_plan_t cbm_pipeline_incremental_test_last_closure_plan(void);
 
 /* Shared persistence-hook plumbing. Tests use the incremental facade above so
  * one reset covers route, extraction, and publication faults. */

@@ -2630,6 +2630,14 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                             census_len(def->http_base_url) + census_list(def->extra_props) +
                             census_len(def->decl_namespace) + census_len(def->variant_key) +
                             census_len(def->alias_target);
+            if (def->type_facts) {
+                str_def_misc += sizeof(*def->type_facts) +
+                                census_len(def->type_facts->type_params) +
+                                census_len(def->type_facts->value_type) +
+                                census_len(def->type_facts->go_embedded) +
+                                census_len(def->type_facts->class_bindings) +
+                                census_len(def->type_facts->global_names);
+            }
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];
