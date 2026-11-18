@@ -346,6 +346,45 @@ static void go_unify_type(const CBMType *param_type, const CBMType *arg_type,
 
 // --- go_eval_expr_type: recursive expression type evaluator ---
 
+/* Walk a closure's body in a child scope (inheriting every outer binding)
+ * with its declared parameters bound: `func(reg *httpmock.Registry) {
+ * reg.Register(...) }` types `reg` wherever the literal stands (an
+ * argument, an assignment, a composite literal's field value). */
+static void go_walk_func_literal(GoLSPContext *ctx, TSNode node) {
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    CBMScope *saved = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+    if (!ts_node_is_null(params)) {
+        uint32_t nc = ts_node_child_count(params);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode param = ts_node_child(params, i);
+            if (ts_node_is_null(param) || !ts_node_is_named(param) ||
+                strcmp(ts_node_type(param), "parameter_declaration") != 0) {
+                continue;
+            }
+            TSNode type_node = ts_node_child_by_field_name(param, "type", 4);
+            const CBMType *pt = go_parse_type_node(ctx, type_node);
+            uint32_t pnc = ts_node_child_count(param);
+            for (uint32_t j = 0; j < pnc; j++) {
+                TSNode ch = ts_node_child(param, j);
+                if (!ts_node_is_null(ch) && ts_node_is_named(ch) &&
+                    strcmp(ts_node_type(ch), "identifier") == 0) {
+                    char *pname = lsp_node_text(ctx, ch);
+                    if (pname && strcmp(pname, "_") != 0) {
+                        cbm_scope_bind(ctx->current_scope, pname, pt);
+                    }
+                }
+            }
+        }
+    }
+    resolve_calls_in_node(ctx, body);
+    ctx->current_scope = saved;
+}
+
 const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -805,42 +844,7 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
     // --- Func literal (closure) ---
     if (strcmp(kind, "func_literal") == 0) {
         // Process the closure body to resolve calls with captured scope
-        TSNode body = ts_node_child_by_field_name(node, "body", 4);
-        if (!ts_node_is_null(body)) {
-            // Push child scope (inherits all outer bindings via parent chain)
-            CBMScope *saved = ctx->current_scope;
-            ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
-
-            // Bind closure parameters
-            TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
-            if (!ts_node_is_null(params)) {
-                uint32_t nc = ts_node_child_count(params);
-                for (uint32_t i = 0; i < nc; i++) {
-                    TSNode param = ts_node_child(params, i);
-                    if (ts_node_is_null(param) || !ts_node_is_named(param))
-                        continue;
-                    if (strcmp(ts_node_type(param), "parameter_declaration") != 0)
-                        continue;
-                    TSNode type_node = ts_node_child_by_field_name(param, "type", 4);
-                    const CBMType *pt = go_parse_type_node(ctx, type_node);
-                    uint32_t pnc = ts_node_child_count(param);
-                    for (uint32_t j = 0; j < pnc; j++) {
-                        TSNode ch = ts_node_child(param, j);
-                        if (!ts_node_is_null(ch) && ts_node_is_named(ch) &&
-                            strcmp(ts_node_type(ch), "identifier") == 0) {
-                            char *pname = lsp_node_text(ctx, ch);
-                            if (pname && strcmp(pname, "_") != 0)
-                                cbm_scope_bind(ctx->current_scope, pname, pt);
-                        }
-                    }
-                }
-            }
-
-            // Walk closure body to resolve calls
-            resolve_calls_in_node(ctx, body);
-
-            ctx->current_scope = saved;
-        }
+        go_walk_func_literal(ctx, node);
 
         // Build full FUNC type with param/return types from AST
         const CBMType *pt_arr[16];
@@ -1528,6 +1532,13 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
+
+    /* A closure the walk reaches is walked with its parameters bound, not
+     * as plain children in the enclosing scope. */
+    if (strcmp(kind, "func_literal") == 0) {
+        go_walk_func_literal(ctx, node);
+        return;
+    }
 
     // Process statements to build scope
     go_process_statement(ctx, node);

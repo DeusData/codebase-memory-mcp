@@ -987,6 +987,35 @@ TEST(type_scope_go_shared_type_qn_keeps_no_fields_shared) {
     return go_shared_qn_case(true);
 }
 
+/* ── Go: closure parameters ───────────────────────────────────────── */
+
+/* A closure parameter is typed wherever the literal stands, here as a
+ * composite literal's field value (a test table), not only where the literal
+ * is evaluated. decoy/ declares the same Store with the same method. */
+static const ts_file_t go_closure_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"store/store.go", "package store\n\ntype Store struct{ n int }\n\n"
+                       "func (s *Store) Get(k string) string { return k }\n"},
+    {"decoy/store.go", "package decoy\n\ntype Store struct{ n int }\n\n"
+                       "func (s *Store) Get(k string) string { return k }\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/store\"\n\n"
+                   "type stub struct {\n\trun func(s *store.Store) string\n}\n\n"
+                   "func Closure() string {\n"
+                   "\ttt := []stub{{run: func(s *store.Store) string { return s.Get(\"x\") }}}\n"
+                   "\treturn tt[0].run(nil)\n}\n"},
+    {NULL, NULL}};
+
+static int go_closure_check(cbm_store_t *s, const char *project, const char *label) {
+    int closure = ts_calls_to(s, project, "Closure", "store.Store.Get", TS_LSP);
+    int decoy = ts_calls_to(s, project, "Closure", "decoy.Store.Get", NULL);
+    printf("  go closure (%s): closure=%d decoy=%d\n", label, closure, decoy);
+    return !(closure == 1 && decoy == 0);
+}
+
+TEST(type_scope_go_closure_parameters_in_composite_literals) {
+    return ts_twins("goclos", go_closure_files, CBM_LANG_GO, go_closure_check);
+}
+
 /* ── Full index versus every incremental route ───────────────────── */
 
 static void ts_listing_append(sqlite3 *db, const char *sql, const char *project, char **buf,
@@ -1353,6 +1382,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_shared);
     RUN_TEST(type_scope_go_shared_type_qn_keeps_no_fields_per_file);
     RUN_TEST(type_scope_go_shared_type_qn_keeps_no_fields_shared);
+    RUN_TEST(type_scope_go_closure_parameters_in_composite_literals);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
     RUN_TEST(type_scope_incremental_body_edit_stays_one_file);
     RUN_TEST(type_scope_incremental_named_type_field_change_matches_full);
