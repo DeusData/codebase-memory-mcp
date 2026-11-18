@@ -576,6 +576,45 @@ static const CBMType *parse_type_arguments(JavaLSPContext *ctx, TSNode targs_nod
 
 /* ── Type-name resolution (JLS §6.5) ──────────────────────────────── */
 
+/* A member type `name` that the class `cls` inherits from a supertype (JLS
+ * 8.5): `Entry` in a subclass of LinkedHashMap is java.util.Map.Entry. Only a
+ * member registered under its supertype's own QN answers (the JDK seed's
+ * nested types, this file's own); another file's project type registers its
+ * member types flattened into its package, where a top-level type of that
+ * name could stand, so it answers nothing here. A bounded walk over the
+ * supertypes the registry records. */
+enum { JAVA_INHERITED_MEMBER_QUEUE = 32 };
+
+static const char *java_inherited_member_type(JavaLSPContext *ctx, const char *cls,
+                                              const char *name) {
+    const CBMRegisteredType *rt = cls ? cbm_registry_lookup_type(ctx->registry, cls) : NULL;
+    const char *queue[JAVA_INHERITED_MEMBER_QUEUE];
+    int head = 0;
+    int tail = 0;
+    for (int k = 0;
+         rt && rt->embedded_types && rt->embedded_types[k] && tail < JAVA_INHERITED_MEMBER_QUEUE;
+         k++) {
+        queue[tail++] = rt->embedded_types[k];
+    }
+    while (head < tail) {
+        const char *super = queue[head++];
+        CBM_LSP_WORK(1);
+        char buf[JAVA_LSP_BUF];
+        int n = snprintf(buf, sizeof(buf), "%s.%s", super, name);
+        if (n > 0 && (size_t)n < sizeof(buf) && cbm_registry_lookup_type(ctx->registry, buf) &&
+            !java_type_ambiguous(ctx->registry, buf)) {
+            return cbm_arena_strdup(ctx->arena, buf);
+        }
+        const CBMRegisteredType *st = cbm_registry_lookup_type(ctx->registry, super);
+        for (int k = 0; st && st->embedded_types && st->embedded_types[k] &&
+                        tail < JAVA_INHERITED_MEMBER_QUEUE;
+             k++) {
+            queue[tail++] = st->embedded_types[k];
+        }
+    }
+    return NULL;
+}
+
 const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     if (!name || !ctx)
         return NULL;
@@ -595,6 +634,15 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         }
     }
 
+    /* 0b. A member type an enclosing class inherits: in scope in the class
+     * body, so it shadows the imports and the package (JLS 6.4.1). */
+    for (int i = ctx->enclosing_class_depth - 1; i >= 0; i--) {
+        const char *member = java_inherited_member_type(ctx, ctx->enclosing_class_stack[i], name);
+        if (member) {
+            return member;
+        }
+    }
+
     /* 1. Same package — registry types whose QN ends with .name. */
     if (ctx->module_qn && ctx->module_qn[0]) {
         char buf[JAVA_LSP_BUF];
@@ -606,9 +654,14 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         }
     }
 
-    /* 2. Single-type imports: the calling file's verified identity (the
-     * declared-type step's, one type of the project registered once here)
-     * first, then the imported name as written. */
+    /* 2. Single-type imports: an import binds the name, so nothing below
+     * answers for it. The calling file's verified identity answers (the
+     * declared-type step's, one type of the project registered once here).
+     * Without one, the imported name answers only when it is no project
+     * type: a JDK type of the seed, or a name the registry does not hold
+     * (a library; the dispatch judges its package as before). A project type
+     * the step could not verify gets no answer. */
+    const char *imported = NULL;
     for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
         const char *target = ctx->import_target_qns[i];
         if (ctx->import_kinds[i] == CBM_JAVA_IMPORT_IDENTITY && target &&
@@ -616,13 +669,13 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
             cbm_registry_lookup_type(ctx->registry, target)) {
             return target;
         }
-    }
-    for (int i = java_import_first(ctx, name); i >= 0; i = java_import_next(ctx, name, i)) {
-        if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE)
-            continue;
-        if (strcmp(ctx->import_local_names[i], name) == 0) {
-            return ctx->import_target_qns[i];
+        if (ctx->import_kinds[i] == CBM_JAVA_IMPORT_TYPE && !imported) {
+            imported = target;
         }
+    }
+    if (imported) {
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, imported);
+        return rt && java_is_project_type(rt) ? NULL : imported;
     }
 
     /* 3. Java package prefix. A type of the own package shadows every
@@ -665,38 +718,8 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     if (cbm_registry_lookup_type(ctx->registry, name)) {
         return cbm_arena_strdup(ctx->arena, name);
     }
-    /* Cross-file sole-definer fallback. A same-package static call
-     * `Util.square()` references class `Util` whose graph QN embeds the
-     * defining file's path ("<project>.Util.Util"), which the caller's
-     * module_qn ("<project>.Main") can't reconstruct — and the fixture has no
-     * import to pin it.  When the project-wide registry holds EXACTLY ONE type
-     * with this short name, resolve to it.  Bounded to a single candidate so an
-     * ambiguous name (>1 type) stays unresolved — sound, mirroring the
-     * registry's "unique_name" strategy.  Only fires after all qualified
-     * lookups miss, so it never overrides a more specific match. */
-    if (ctx->registry && ctx->registry->types) {
-        const char *only_qn = NULL;
-        int matches = 0;
-        /* The registry's own types of this short name: by name once it is indexed
-         * (cbm_registry_index_types_into), else every type, as before. */
-        CBMTypeShortIter named;
-        cbm_registry_types_by_short_name(ctx->registry, name, &named);
-        for (int i = -1; matches < 2 && (i = cbm_type_short_iter_next(&named)) >= 0;) {
-            CBM_LSP_WORK(1);
-            const CBMRegisteredType *t = &ctx->registry->types[i];
-            if (!t->qualified_name || !t->short_name || t->alias_of) {
-                continue;
-            }
-            if (strcmp(t->short_name, name) == 0) {
-                only_qn = t->qualified_name;
-                matches++;
-            }
-        }
-        if (matches == 1 && only_qn) {
-            return cbm_arena_strdup(ctx->arena, only_qn);
-        }
-    }
-
+    /* No scope of the file binds the name: no answer (a type of another
+     * package is only visible through an import, which step 2 answers). */
     return NULL;
 }
 
@@ -3412,14 +3435,8 @@ static const CBMType *parse_param_text_full(CBMArena *a, const char *text, const
                     }
                 }
             }
-            /* Fallback: module_qn.X (same package, top-level class). */
-            if (!base) {
-                if (module_qn && module_qn[0]) {
-                    base = cbm_type_named(a, cbm_arena_sprintf(a, "%s.%s", module_qn, no_gen));
-                } else {
-                    base = cbm_type_named(a, no_gen);
-                }
-            }
+            /* No scope of the file declares it: a name the file can only see
+             * through an import, or a type variable. No answer. */
         }
     }
     if (!base)

@@ -1820,6 +1820,7 @@ extern void suite_ts_lsp(void);
 extern void suite_java_lsp(void);
 extern void suite_java_lsp_coverage(void);
 extern void suite_java_typed_calls(void);
+extern void suite_java_type_scope(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_kotlin_typed_calls(void);
 extern void suite_rust_lsp(void);
@@ -2694,6 +2695,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(java_lsp);
     RUN_SELECTED_SUITE(java_lsp_coverage);
     RUN_SELECTED_SUITE(java_typed_calls);
+    RUN_SELECTED_SUITE(java_type_scope);
 
     /* Architecture + ADR + Louvain */
     RUN_SELECTED_SUITE(store_arch);
