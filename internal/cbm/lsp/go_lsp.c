@@ -2171,18 +2171,23 @@ void go_lsp_process_file(GoLSPContext *ctx, TSNode root) {
 
 // --- Helper: parse Go return type text into CBMType ---
 
-const CBMType *cbm_parse_return_type_text(CBMArena *a, const char *text, const char *module_qn) {
+/* scope_ix: the defining def's resolved type identities (CBMLSPDef.type_scope,
+ * indexed), NULL when it has none. A named type the scope knows is that
+ * identity; any other named type keeps the module qualification. */
+static const CBMType *go_parse_type_text_scoped(CBMArena *a, const char *text,
+                                                const char *module_qn,
+                                                const cbm_type_scope_index_t *scope_ix) {
     if (!text || !text[0])
         return cbm_type_unknown();
 
     // Pointer: *Foo
     if (text[0] == '*') {
-        return cbm_type_pointer(a, cbm_parse_return_type_text(a, text + 1, module_qn));
+        return cbm_type_pointer(a, go_parse_type_text_scoped(a, text + 1, module_qn, scope_ix));
     }
 
     // Slice: []Foo
     if (text[0] == '[' && text[1] == ']') {
-        return cbm_type_slice(a, cbm_parse_return_type_text(a, text + 2, module_qn));
+        return cbm_type_slice(a, go_parse_type_text_scoped(a, text + 2, module_qn, scope_ix));
     }
 
     // Builtin types
@@ -2195,19 +2200,30 @@ const CBMType *cbm_parse_return_type_text(CBMArena *a, const char *text, const c
             return cbm_type_builtin(a, text);
     }
 
+    // Named type the defining file's scope resolved (`pkg.T` through its import).
+    const char *scoped = cbm_type_scope_find(scope_ix, text, strlen(text));
+    if (scoped) {
+        return cbm_type_named(a, scoped);
+    }
+
     // Named type: assume local to module
     return cbm_type_named(a, cbm_arena_sprintf(a, "%s.%s", module_qn, text));
 }
 
+const CBMType *cbm_parse_return_type_text(CBMArena *a, const char *text, const char *module_qn) {
+    return go_parse_type_text_scoped(a, text, module_qn, NULL);
+}
+
 typedef struct {
     const char *module_qn;
+    const cbm_type_scope_index_t *scope_ix; /* the def's resolved type identities, or NULL */
 } CBMGoLSPSignatureParserContext;
 
 static const CBMType *cbm_go_lsp_parse_signature_param_text(CBMArena *arena, const char *text,
                                                             void *parser_ctx) {
     const CBMGoLSPSignatureParserContext *ctx = (const CBMGoLSPSignatureParserContext *)parser_ctx;
     const char *module_qn = ctx && ctx->module_qn ? ctx->module_qn : "";
-    return cbm_parse_return_type_text(arena, text, module_qn);
+    return go_parse_type_text_scoped(arena, text, module_qn, ctx ? ctx->scope_ix : NULL);
 }
 
 // --- Shared Go stdlib registry ---
@@ -2682,8 +2698,10 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 // --- Cross-file LSP: parse source, build registry from defs, run LSP ---
 
-// Helper: split "|"-separated string into array of CBMType*.
-static const CBMType **split_pipe_types(CBMArena *a, const char *text, const char *module_qn) {
+// Helper: split "|"-separated string into array of CBMType*. scope_ix: the
+// defining def's resolved type identities (go_parse_type_text_scoped).
+static const CBMType **split_pipe_types(CBMArena *a, const char *text, const char *module_qn,
+                                        const cbm_type_scope_index_t *scope_ix) {
     if (!text || !text[0])
         return NULL;
 
@@ -2708,7 +2726,7 @@ static const CBMType **split_pipe_types(CBMArena *a, const char *text, const cha
             char save = *p;
             *p = '\0';
             if (start[0]) {
-                arr[idx++] = cbm_parse_return_type_text(a, start, module_qn);
+                arr[idx++] = go_parse_type_text_scoped(a, start, module_qn, scope_ix);
             }
             if (save == '\0')
                 break;
@@ -2780,7 +2798,8 @@ static const char *go_alias_target_qn(CBMArena *arena, const char *target,
 /* Parse "name:type|name:type" into NULL-terminated name/type arrays. False when
  * nothing parsed (or on allocation failure): the type keeps no field info. */
 static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char *def_module_qn,
-                             const char ***names_out, const CBMType ***types_out) {
+                             const cbm_type_scope_index_t *scope_ix, const char ***names_out,
+                             const CBMType ***types_out) {
 
     // Count fields
     int count = 1;
@@ -2815,7 +2834,7 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
             if (colon && idx < count) {
                 *colon = '\0';
                 names[idx] = cbm_arena_strdup(arena, start);
-                types[idx] = cbm_parse_return_type_text(arena, colon + 1, def_module_qn);
+                types[idx] = go_parse_type_text_scoped(arena, colon + 1, def_module_qn, scope_ix);
                 idx++;
             }
             if (save == '\0')
@@ -2831,12 +2850,13 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
 }
 
 static void parse_field_defs_into_type(CBMArena *arena, CBMTypeRegistry *reg, const char *type_qn,
-                                       const char *field_defs, const char *def_module_qn) {
+                                       const char *field_defs, const char *def_module_qn,
+                                       const cbm_type_scope_index_t *scope_ix) {
     if (!field_defs || !field_defs[0] || !type_qn)
         return;
     const char **names = NULL;
     const CBMType **types = NULL;
-    if (parse_field_defs(arena, field_defs, def_module_qn, &names, &types)) {
+    if (parse_field_defs(arena, field_defs, def_module_qn, scope_ix, &names, &types)) {
         // Find the registered type and update field info
         for (int ti = 0; ti < reg->type_count; ti++) {
             if (reg->types[ti].qualified_name &&
@@ -3364,6 +3384,8 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             continue;
 
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        /* The def's declared-type identities, indexed once for its texts. */
+        const cbm_type_scope_index_t *scope_ix = cbm_type_scope_index(arena, d->type_scope);
 
         // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
         // Struct included so Go structs (now labelled "Struct") register as types.
@@ -3385,7 +3407,8 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
             // Populate struct field types from field_defs
             if (d->field_defs && d->field_defs[0]) {
-                parse_field_defs_into_type(arena, &reg, rt.qualified_name, d->field_defs, def_mod);
+                parse_field_defs_into_type(arena, &reg, rt.qualified_name, d->field_defs, def_mod,
+                                           scope_ix);
             }
         }
 
@@ -3397,8 +3420,8 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rf.short_name = d->short_name;         // borrowed
 
             // Build FUNC type from return_types text
-            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod};
+            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod, scope_ix);
+            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod, scope_ix};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);
@@ -3666,6 +3689,8 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
          * (set by cbm_pxc_collect_all_defs). There is no caller module to
          * fall back to — this registry is project-wide, not per-file. */
         const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
+        /* The def's declared-type identities, indexed once for its texts. */
+        const cbm_type_scope_index_t *scope_ix = cbm_type_scope_index(arena, d->type_scope);
 
         // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
         // Struct included so Go structs (now labelled "Struct") register as types.
@@ -3687,13 +3712,14 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
                     const char **names = NULL;
                     const CBMType **types = NULL;
                     uintptr_t at = (uintptr_t)cbm_ht_get(first_type, rt.qualified_name);
-                    if (parse_field_defs(arena, d->field_defs, def_mod, &names, &types) && at) {
+                    if (parse_field_defs(arena, d->field_defs, def_mod, scope_ix, &names, &types) &&
+                        at) {
                         reg->types[at - 1].field_names = names;
                         reg->types[at - 1].field_types = types;
                     }
                 } else {
                     parse_field_defs_into_type(arena, reg, rt.qualified_name, d->field_defs,
-                                               def_mod);
+                                               def_mod, scope_ix);
                 }
             }
         }
@@ -3703,8 +3729,8 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name; /* borrowed */
             rf.short_name = d->short_name;
-            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod};
+            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod, scope_ix);
+            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod, scope_ix};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);

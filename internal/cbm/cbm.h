@@ -328,6 +328,12 @@ typedef struct {
      * for a defined type `type A B` (its method set is its own) and in every
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
+    /* Python only: the names a PEP 695 type parameter list declares
+     * (`def f[T, *Ts, **P]`, `class C[T]`), '|'-joined. The cross-file type
+     * step keeps them from taking a real type's identity (type_scope.h); never
+     * written to the graph. NULL when none and in every other language. Tail
+     * field: zero-init stays valid. */
+    const char *type_params;
 } CBMDefinition;
 
 /* extra_props key of a generated member, one the compiler writes and the

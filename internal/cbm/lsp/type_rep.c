@@ -1,4 +1,5 @@
 #include "type_rep.h"
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -962,4 +963,101 @@ const CBMType *cbm_type_substitute(CBMArena *a, const CBMType *t, const char **t
         // ALIAS — no in-place substitution needed at v1 (or stub-only).
         return t;
     }
+}
+
+/* ── Declared-type identities of one definition ─────────────────── */
+
+typedef struct {
+    const char *name; /* spelling, NUL-terminated copy */
+    size_t len;
+    const char *qn; /* NUL-terminated copy */
+} cbm_type_scope_entry_t;
+
+struct cbm_type_scope_index {
+    cbm_type_scope_entry_t *slots; /* open addressing, power-of-two size */
+    uint32_t mask;
+};
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_type_scope_index_work;
+uint64_t cbm_type_scope_index_test_work(void) {
+    return atomic_load_explicit(&g_type_scope_index_work, memory_order_relaxed);
+}
+#define TYPE_SCOPE_INDEX_WORK(n) \
+    atomic_fetch_add_explicit(&g_type_scope_index_work, (uint64_t)(n), memory_order_relaxed)
+#else
+#define TYPE_SCOPE_INDEX_WORK(n) ((void)0)
+#endif
+
+static uint32_t type_scope_hash(const char *s, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h = (h ^ (unsigned char)s[i]) * 16777619u;
+    }
+    return h;
+}
+
+const cbm_type_scope_index_t *cbm_type_scope_index(CBMArena *a, const char *scope) {
+    if (!a || !scope || !scope[0]) {
+        return NULL;
+    }
+    size_t n = strlen(scope);
+    TYPE_SCOPE_INDEX_WORK(n);
+    uint32_t entries = 1;
+    for (size_t i = 0; i < n; i++) {
+        entries += scope[i] == '|';
+    }
+    uint32_t size = 4;
+    while (size < entries * 2) {
+        size *= 2;
+    }
+    char *copy = cbm_arena_strndup(a, scope, n);
+    cbm_type_scope_index_t *ix = (cbm_type_scope_index_t *)cbm_arena_alloc(a, sizeof(*ix));
+    cbm_type_scope_entry_t *slots =
+        (cbm_type_scope_entry_t *)cbm_arena_alloc(a, (size_t)size * sizeof(*slots));
+    if (!copy || !ix || !slots) {
+        return NULL;
+    }
+    memset(slots, 0, (size_t)size * sizeof(*slots));
+    ix->slots = slots;
+    ix->mask = size - 1;
+    for (char *p = copy; p && *p;) {
+        char *bar = strchr(p, '|');
+        if (bar) {
+            *bar = '\0';
+        }
+        char *eq = strchr(p, '=');
+        if (eq && eq > p && eq[1]) {
+            *eq = '\0';
+            size_t len = (size_t)(eq - p);
+            uint32_t at = type_scope_hash(p, len) & ix->mask;
+            while (slots[at].name &&
+                   !(slots[at].len == len && memcmp(slots[at].name, p, len) == 0)) {
+                TYPE_SCOPE_INDEX_WORK(1);
+                at = (at + 1) & ix->mask;
+            }
+            if (!slots[at].name) { /* the first entry of a spelling stands */
+                slots[at] = (cbm_type_scope_entry_t){.name = p, .len = len, .qn = eq + 1};
+            }
+        }
+        p = bar ? bar + 1 : NULL;
+    }
+    return ix;
+}
+
+const char *cbm_type_scope_find(const cbm_type_scope_index_t *ix, const char *name,
+                                size_t name_len) {
+    if (!ix || !name || name_len == 0) {
+        return NULL;
+    }
+    TYPE_SCOPE_INDEX_WORK(name_len);
+    uint32_t at = type_scope_hash(name, name_len) & ix->mask;
+    while (ix->slots[at].name) {
+        TYPE_SCOPE_INDEX_WORK(1);
+        if (ix->slots[at].len == name_len && memcmp(ix->slots[at].name, name, name_len) == 0) {
+            return ix->slots[at].qn;
+        }
+        at = (at + 1) & ix->mask;
+    }
+    return NULL;
 }

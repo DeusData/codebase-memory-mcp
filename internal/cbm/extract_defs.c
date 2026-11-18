@@ -6939,6 +6939,50 @@ static bool make_rule_sets_variable(TSNode rule, const char *src) {
                        (strchr("+?!", src[p]) && p + SKIP_ONE < end && src[p + SKIP_ONE] == '='));
 }
 
+/* Python: the names a PEP 695 type parameter list declares on a function or
+ * class definition (`def f[T, *Ts, **P]`, `class C[T: Base]`), '|'-joined, or
+ * NULL. Each parameter is a `type` whose first identifier is its name. */
+static TSNode py_type_param_ident(TSNode param) {
+    while (!ts_node_is_null(param) && strcmp(ts_node_type(param), "identifier") != 0) {
+        param = ts_node_named_child_count(param) ? ts_node_named_child(param, 0) : (TSNode){0};
+    }
+    return param;
+}
+
+static const char *py_type_param_names(CBMArena *a, TSNode node, const char *source) {
+    if (strcmp(ts_node_type(node), "decorated_definition") == 0) {
+        node = ts_node_child_by_field_name(node, TS_FIELD("definition"));
+    }
+    TSNode list = ts_node_is_null(node)
+                      ? node
+                      : ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    size_t total = 0; /* every name plus one separator or the terminator */
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode id = py_type_param_ident(ts_node_named_child(list, i));
+        total += ts_node_is_null(id) ? 0 : ts_node_end_byte(id) - ts_node_start_byte(id) + 1;
+    }
+    char *out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode id = py_type_param_ident(ts_node_named_child(list, i));
+        if (ts_node_is_null(id)) {
+            continue;
+        }
+        if (at) {
+            out[at++] = '|';
+        }
+        size_t len = ts_node_end_byte(id) - ts_node_start_byte(id);
+        memcpy(out + at, source + ts_node_start_byte(id), len);
+        at += len;
+    }
+    out[at] = '\0';
+    return at ? out : NULL;
+}
+
 /* Make: a rule names several targets (`up down: deps`), each a goal
  * `make <target>` runs. The rule's definition carries the first target;
  * every further one gets a definition of its own over the same rule span --
@@ -7250,6 +7294,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+    if (ctx->language == CBM_LANG_PYTHON) {
+        def.type_params = py_type_param_names(a, node, ctx->source);
+    }
 
     // Rust: cfg-gated twins (#[cfg(windows)] fn f / #[cfg(not(windows))] fn f)
     // keep the plain QN: they are variants of ONE definition, and the graph
@@ -8973,6 +9020,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
+    if (ctx->language == CBM_LANG_PYTHON) {
+        def.type_params = py_type_param_names(a, node, ctx->source);
+    }
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
@@ -9497,6 +9547,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    if (ctx->language == CBM_LANG_PYTHON) {
+        def.type_params = py_type_param_names(a, child, ctx->source);
+    }
     const char *client_path = NULL;
     const char *client_method = NULL;
     /* Retrofit services must be interfaces; Pippo and Rapidoid put the path in

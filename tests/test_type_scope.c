@@ -1,0 +1,1212 @@
+/*
+ * test_type_scope.c — declared types resolved once, in the scope that wrote
+ * them (src/pipeline/type_scope.h).
+ *
+ * Unit tests pin the shared step's answers against a hand-built registry: an
+ * identity is stored only when the declaring file's scope gives exactly one
+ * answer and that answer is a project type. Growth tests count the work of
+ * every loop the step adds at two sizes. Pipeline tests index small fixtures
+ * per engine (a caller, a file declaring a function or field whose type it
+ * imports, the file defining that type, and a same-named decoy) with one
+ * worker and with four, above the parallel threshold; the shapes the review
+ * of the first cut found false edges in get no edge; and every incremental
+ * route gives the full index's graph.
+ */
+#include "test_framework.h"
+#include "test_helpers.h"
+
+#include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/arena.h"
+#include "lsp/type_rep.h"
+#include "pipeline/lsp_surface.h"
+#include "pipeline/pass_lsp_cross.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h" /* incremental route seam */
+#include "pipeline/type_scope.h"
+#include "sqlite3.h"
+#include "store/store.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ── Unit: the shared step ─────────────────────────────────────────── */
+
+typedef struct {
+    cbm_registry_t *reg;
+    CBMArena arena;
+} ts_unit_t;
+
+static void ts_unit_begin(ts_unit_t *u) {
+    u->reg = cbm_registry_new();
+    cbm_arena_init(&u->arena);
+    cbm_registry_add(u->reg, "Store", "p.a.Store", "Class", false);
+    cbm_registry_add(u->reg, "Store", "p.b.Store", "Class", false);
+    cbm_registry_add(u->reg, "Result", "p.c.Result", "Variable", false);
+    cbm_registry_add(u->reg, "make", "p.c.make", "Function", false);
+    cbm_registry_add(u->reg, "Local", "p.app.Local", "Class", false);
+}
+
+static void ts_unit_end(ts_unit_t *u) {
+    cbm_registry_free(u->reg);
+    cbm_arena_destroy(&u->arena);
+}
+
+/* A Python module's namespace facts: each name bound once by an import. */
+typedef struct {
+    CBMPyNamespaceFact items[16];
+    CBMPyNamespaceFacts facts;
+} ts_facts_t;
+
+static const CBMPyNamespaceFacts *ts_facts(ts_facts_t *f, const char *const *bound, int n) {
+    memset(f, 0, sizeof(*f));
+    for (int i = 0; i < n && i < 16; i++) {
+        f->items[i] = (CBMPyNamespaceFact){.kind = CBM_PY_NS_IMPORT_NAME, .local_name = bound[i]};
+    }
+    f->facts = (CBMPyNamespaceFacts){.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                     .language = CBM_LANG_PYTHON,
+                                     .status = CBM_PY_NS_COMPLETE,
+                                     .items = f->items,
+                                     .count = n < 16 ? n : 16,
+                                     .cap = 16};
+    return &f->facts;
+}
+
+typedef struct {
+    CBMLanguage lang;
+    const char *def_qn; /* default p.app.f */
+    const char *ret;
+    const char *const *keys;
+    const char *const *vals;
+    int n;
+    const CBMDefinition *file_defs;
+    int file_def_count;
+    const CBMPyNamespaceFacts *facts; /* Python; NULL = one complete empty record */
+} ts_attach_t;
+
+/* The type_scope one def gets in module p.app. */
+static const char *ts_unit_attach_with(ts_unit_t *u, const ts_attach_t *in) {
+    ts_facts_t empty;
+    cbm_type_scope_t scope = {.reg = u->reg,
+                              .module_qn = "p.app",
+                              .imp_keys = in->keys,
+                              .imp_vals = in->vals,
+                              .imp_count = in->n,
+                              .file_defs = in->file_defs,
+                              .file_def_count = in->file_def_count,
+                              .module_facts = in->facts ? in->facts : ts_facts(&empty, NULL, 0)};
+    cbm_type_scope_file_t *f = cbm_type_scope_file_begin(cbm_type_scope_lang(in->lang), &scope);
+    if (!f) {
+        return "<no file state>";
+    }
+    CBMLSPDef def = {0};
+    def.qualified_name = in->def_qn ? in->def_qn : "p.app.f";
+    def.short_name = "f";
+    def.label = "Function";
+    def.return_types = in->ret;
+    def.lang = in->lang;
+    cbm_type_scope_attach(f, &u->arena, &def);
+    cbm_type_scope_file_end(f);
+    return def.type_scope;
+}
+
+static const char *ts_unit_attach(ts_unit_t *u, CBMLanguage lang, const char *ret,
+                                  const char *const *keys, const char *const *vals, int n) {
+    ts_attach_t in = {.lang = lang, .ret = ret, .keys = keys, .vals = vals, .n = n};
+    return ts_unit_attach_with(u, &in);
+}
+
+TEST(type_scope_import_binding_is_the_identity) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    /* `from p.a import Store`-shaped (a module-valued binding) and a direct
+     * one; the same-named Store of the other module is never chosen. */
+    const char *keys[] = {"Store"};
+    const char *mod_vals[] = {"p.a"};
+    const char *direct_vals[] = {"p.b.Store"};
+    ts_facts_t facts;
+    ts_attach_t in = {.lang = CBM_LANG_PYTHON,
+                      .ret = "Optional[Store]",
+                      .keys = keys,
+                      .vals = mod_vals,
+                      .n = 1,
+                      .facts = ts_facts(&facts, keys, 1)};
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Store=p.a.Store");
+    in.vals = direct_vals;
+    in.ret = "list[Store]";
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Store=p.b.Store");
+    /* The own module declares Store as well: two bindings of one name. */
+    cbm_registry_add(u.reg, "Store", "p.app.Store", "Class", false);
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    ts_unit_end(&u);
+    PASS();
+}
+
+TEST(type_scope_dotted_spelling_through_its_head) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    const char *keys[] = {"a"};
+    const char *vals[] = {"p.a"};
+    /* Go `*a.Store`, `[]a.Store`, a map value: one identity for `a.Store`. */
+    const char *got =
+        ts_unit_attach(&u, CBM_LANG_GO, "*a.Store|[]a.Store|map[string]a.Store", keys, vals, 1);
+    ASSERT_STR_EQ(got, "a.Store=p.a.Store");
+    /* A name the head's module does not declare: nothing. */
+    ASSERT_NULL(ts_unit_attach(&u, CBM_LANG_GO, "*a.Missing", keys, vals, 1));
+    ts_unit_end(&u);
+    PASS();
+}
+
+TEST(type_scope_stores_nothing_without_one_answer) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    ts_facts_t facts;
+    /* Two imports bind Store to different targets: ambiguous. */
+    const char *keys2[] = {"Store", "Store"};
+    const char *vals2[] = {"p.a.Store", "p.b.Store"};
+    const char *one[] = {"Store"};
+    ts_attach_t in = {.lang = CBM_LANG_PYTHON,
+                      .ret = "Store",
+                      .keys = keys2,
+                      .vals = vals2,
+                      .n = 2,
+                      .facts = ts_facts(&facts, one, 1)};
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    /* Not found anywhere in scope. */
+    ASSERT_NULL(ts_unit_attach(&u, CBM_LANG_PYTHON, "Nowhere", NULL, NULL, 0));
+    /* Bound, but to something no members are looked up on: a variable and a
+     * function. */
+    const char *rk[] = {"Result", "make"};
+    const char *rv[] = {"p.c.Result", "p.c.make"};
+    ts_attach_t bound = {.lang = CBM_LANG_PYTHON,
+                         .ret = "Result[make]",
+                         .keys = rk,
+                         .vals = rv,
+                         .n = 2,
+                         .facts = ts_facts(&facts, rk, 2)};
+    ASSERT_NULL(ts_unit_attach_with(&u, &bound));
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* Finding 6: an import that names no project definition (the standard
+ * library, a third-party package) is no identity, and the engine keeps its
+ * own handling of the spelling (`Self`). */
+TEST(type_scope_names_outside_the_project_get_none) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    ts_facts_t facts;
+    const char *keys[] = {"Self", "logging", "pathlib"};
+    /* What the import map makes of them: project-prefixed paths no node has. */
+    const char *vals[] = {"p.typing.Self", "p.logging", "p.pathlib"};
+    ts_attach_t in = {.lang = CBM_LANG_PYTHON,
+                      .ret = "Self",
+                      .keys = keys,
+                      .vals = vals,
+                      .n = 3,
+                      .facts = ts_facts(&facts, keys, 3)};
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    in.ret = "logging.Logger";
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    in.ret = "pathlib.Path";
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* Go imports bind packages: a bare name never resolves through one, so a
+ * type parameter (never dotted) named like an import cannot take a type of
+ * that package; and an own-module name is left to the engine. */
+TEST(type_scope_go_bare_names_and_own_module) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "T", "p.tpkg.T", "Struct", false);
+    const char *keys[] = {"T"};
+    const char *vals[] = {"p.tpkg"};
+    ASSERT_NULL(ts_unit_attach(&u, CBM_LANG_GO, "T", keys, vals, 1));
+    ASSERT_STR_EQ(ts_unit_attach(&u, CBM_LANG_GO, "*T.T", keys, vals, 1), "T.T=p.tpkg.T");
+    ASSERT_NULL(ts_unit_attach(&u, CBM_LANG_GO, "*Local", NULL, NULL, 0));
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* Python's cross registrar keeps bare spellings, so an own-module identity
+ * is stored (a forward reference in quotes too). */
+TEST(type_scope_python_own_module) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    ASSERT_STR_EQ(ts_unit_attach(&u, CBM_LANG_PYTHON, "Optional[\"Local\"]", NULL, NULL, 0),
+                  "Local=p.app.Local");
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* Finding 3: a method's annotation is looked up in its class body first. A
+ * name the enclosing class declares (a nested class, a class attribute) gets
+ * no identity, and a def inside a function none at all. */
+TEST(type_scope_python_enclosing_scopes) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "Config", "p.app.Config", "Class", false);
+    cbm_registry_add(u.reg, "Config", "p.app.Model.Config", "Class", false);
+    cbm_registry_add(u.reg, "Alias", "p.app.Alias", "Class", false);
+    const CBMDefinition defs[] = {
+        {.qualified_name = "p.app.Config", .label = "Class"},
+        {.qualified_name = "p.app.Alias", .label = "Class"},
+        {.qualified_name = "p.app.Model", .label = "Class"},
+        {.qualified_name = "p.app.Model.Config", .label = "Class"},
+        {.qualified_name = "p.app.Model.Alias", .label = "Variable"},
+        {.qualified_name = "p.app.Model.cfg", .label = "Method"},
+        {.qualified_name = "p.app.Model.alias", .label = "Method"},
+        {.qualified_name = "p.app.Model.Config.owner", .label = "Method"},
+        {.qualified_name = "p.app.outer", .label = "Function"},
+        {.qualified_name = "p.app.outer.inner", .label = "Function"},
+        {.qualified_name = "p.app.top", .label = "Function"},
+    };
+    int n = (int)(sizeof(defs) / sizeof(defs[0]));
+    ts_attach_t in = {
+        .lang = CBM_LANG_PYTHON, .file_defs = defs, .file_def_count = n, .ret = "Config"};
+    in.def_qn = "p.app.Model.cfg"; /* Model.Config */
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    in.def_qn = "p.app.Model.alias";
+    in.ret = "Alias"; /* the class attribute Model.Alias */
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    in.def_qn = "p.app.outer.inner"; /* inside a function: its locals */
+    in.ret = "Config";
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    /* The module scope answers where nothing encloses the name. */
+    in.def_qn = "p.app.top";
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Config=p.app.Config");
+    in.def_qn = "p.app.Model.Config.owner"; /* its class declares no `Alias` */
+    in.ret = "Alias";
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Alias=p.app.Alias");
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* Type parameters: a PEP 695 parameter of the file (`def f[T]`,
+ * `class C[T]`) and a TypeVar the module assigns over an import never take a
+ * real type's identity. */
+TEST(type_scope_python_type_parameters) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "T", "p.app.T", "Class", false);
+    cbm_registry_add(u.reg, "Item", "p.a.Item", "Class", false);
+    const CBMDefinition defs[] = {
+        {.qualified_name = "p.app.T", .label = "Class"},
+        {.qualified_name = "p.app.wrap", .label = "Function", .type_params = "T"},
+        {.qualified_name = "p.app.Box", .label = "Class", .type_params = "K|T"},
+        {.qualified_name = "p.app.Box.get", .label = "Method"},
+    };
+    ts_attach_t in = {.lang = CBM_LANG_PYTHON,
+                      .file_defs = defs,
+                      .file_def_count = 4,
+                      .def_qn = "p.app.wrap",
+                      .ret = "T"};
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    in.def_qn = "p.app.Box.get";
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    /* `from p.a import Item` then `Item = TypeVar("Item")`: bound twice. */
+    CBMPyNamespaceFact twice[] = {
+        {.kind = CBM_PY_NS_IMPORT_NAME, .local_name = "Item"},
+        {.kind = CBM_PY_NS_SHADOW, .local_name = "Item", .reason = CBM_PY_NS_REASON_VALUE}};
+    CBMPyNamespaceFacts facts = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                 .language = CBM_LANG_PYTHON,
+                                 .status = CBM_PY_NS_COMPLETE,
+                                 .items = twice,
+                                 .count = 2,
+                                 .cap = 2};
+    const char *keys[] = {"Item"};
+    const char *vals[] = {"p.a.Item"};
+    ts_attach_t tv = {.lang = CBM_LANG_PYTHON,
+                      .ret = "Item",
+                      .keys = keys,
+                      .vals = vals,
+                      .n = 1,
+                      .facts = &facts};
+    ASSERT_NULL(ts_unit_attach_with(&u, &tv));
+    facts.count = 1; /* the import alone decides */
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &tv), "Item=p.a.Item");
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* A module whose bindings cannot be listed gets no identity: a star import,
+ * a parse error, an incomplete record. */
+TEST(type_scope_python_unlisted_bindings_get_none) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    CBMPyNamespaceFact star[] = {{.kind = CBM_PY_NS_IMPORT_STAR, .module_name = "p.c"}};
+    CBMPyNamespaceFacts facts = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                 .language = CBM_LANG_PYTHON,
+                                 .status = CBM_PY_NS_COMPLETE,
+                                 .items = star,
+                                 .count = 1,
+                                 .cap = 1};
+    ts_attach_t in = {.lang = CBM_LANG_PYTHON, .ret = "Local", .facts = &facts};
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    CBMPyNamespaceFact parse[] = {{.kind = CBM_PY_NS_UNKNOWN, .reason = CBM_PY_NS_REASON_PARSE}};
+    facts.items = parse;
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    /* An effect (a call) does not hide bindings from the step. */
+    parse[0].reason = CBM_PY_NS_REASON_EFFECT;
+    ASSERT_STR_EQ(ts_unit_attach_with(&u, &in), "Local=p.app.Local");
+    facts.status = CBM_PY_NS_INCOMPLETE;
+    ASSERT_NULL(ts_unit_attach_with(&u, &in));
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* ── Growth: counted work at two sizes ─────────────────────────────── */
+
+static bool ts_linear(uint64_t small, uint64_t large) {
+    /* Twice the input: close to twice the work (names grow by a digit). */
+    return small > 0 && large * 10 >= small * 18 && large * 10 <= small * 23;
+}
+
+/* `defs` defs in one file, each writing its own `a.T<i>` (no memo hit), or
+ * one def writing `defs` distinct names. */
+static uint64_t ts_step_work(int defs, bool one_def) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    char qn[64];
+    for (int i = 0; i < defs; i++) {
+        snprintf(qn, sizeof(qn), "p.a.T%d", i);
+        cbm_registry_add(u.reg, qn + 4, qn, "Struct", false);
+    }
+    const char *keys[] = {"a"};
+    const char *vals[] = {"p.a"};
+    cbm_type_scope_t scope = {
+        .reg = u.reg, .module_qn = "p.app", .imp_keys = keys, .imp_vals = vals, .imp_count = 1};
+    cbm_type_scope_file_t *f = cbm_type_scope_file_begin(cbm_type_scope_lang(CBM_LANG_GO), &scope);
+    char *all = (char *)calloc((size_t)defs, 16);
+    size_t at = 0;
+    uint64_t before = cbm_type_scope_test_work();
+    for (int i = 0; i < defs; i++) {
+        char text[32];
+        snprintf(text, sizeof(text), "*a.T%d", i);
+        if (one_def) {
+            at += (size_t)snprintf(all + at, 16, "%s%s", at ? "|" : "", text);
+            continue;
+        }
+        CBMLSPDef def = {.qualified_name = "p.app.f", .short_name = "f", .label = "Function"};
+        def.return_types = text;
+        def.lang = CBM_LANG_GO;
+        cbm_type_scope_attach(f, &u.arena, &def);
+    }
+    if (one_def) {
+        CBMLSPDef def = {.qualified_name = "p.app.f", .short_name = "f", .label = "Function"};
+        def.return_types = all;
+        def.lang = CBM_LANG_GO;
+        cbm_type_scope_attach(f, &u.arena, &def);
+    }
+    uint64_t work = cbm_type_scope_test_work() - before;
+    free(all);
+    cbm_type_scope_file_end(f);
+    ts_unit_end(&u);
+    return work;
+}
+
+TEST(type_scope_step_work_grows_linearly) {
+    uint64_t defs_small = ts_step_work(1000, false);
+    uint64_t defs_large = ts_step_work(2000, false);
+    uint64_t names_small = ts_step_work(1000, true);
+    uint64_t names_large = ts_step_work(2000, true);
+    printf("  step work: defs 1000=%llu 2000=%llu, names in one def 1000=%llu 2000=%llu\n",
+           (unsigned long long)defs_small, (unsigned long long)defs_large,
+           (unsigned long long)names_small, (unsigned long long)names_large);
+    ASSERT_TRUE(ts_linear(defs_small, defs_large));
+    ASSERT_TRUE(ts_linear(names_small, names_large));
+    PASS();
+}
+
+/* The engines' lookup: one def with k identities, k lookups. */
+static uint64_t ts_lookup_work(int k) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    size_t cap = (size_t)k * 40 + 1;
+    char *scope = (char *)calloc(cap, 1);
+    size_t at = 0;
+    for (int i = 0; i < k; i++) {
+        at += (size_t)snprintf(scope + at, cap - at, "%sa.T%d=p.a.T%d", at ? "|" : "", i, i);
+    }
+    uint64_t before = cbm_type_scope_index_test_work();
+    const cbm_type_scope_index_t *ix = cbm_type_scope_index(&a, scope);
+    int found = 0;
+    for (int i = 0; i < k; i++) {
+        char name[32];
+        int n = snprintf(name, sizeof(name), "a.T%d", i);
+        found += cbm_type_scope_find(ix, name, (size_t)n) != NULL;
+    }
+    uint64_t work = cbm_type_scope_index_test_work() - before;
+    free(scope);
+    cbm_arena_destroy(&a);
+    return found == k ? work : 0;
+}
+
+TEST(type_scope_lookup_work_grows_linearly) {
+    uint64_t small = ts_lookup_work(1000);
+    uint64_t large = ts_lookup_work(2000);
+    printf("  lookup work: 1000 identities=%llu 2000=%llu\n", (unsigned long long)small,
+           (unsigned long long)large);
+    ASSERT_TRUE(ts_linear(small, large));
+    PASS();
+}
+
+/* The per-file selection's worklist. A chain (module i's def names module
+ * i-1's type) and a fan (n modules' defs all name one module of n defs): the
+ * fan walked that module once per identity before. */
+static uint64_t ts_reach_work(int n, bool fan) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    int count = fan ? 2 * n : n;
+    CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)count, sizeof(CBMLSPDef));
+    for (int i = 0; i < count; i++) {
+        CBMLSPDef *d = &defs[i];
+        bool hub = fan && i >= n; /* the fan's target module, n defs */
+        int mod = hub ? n : i;
+        d->def_module_qn = cbm_arena_sprintf(&a, "p.m%d", mod);
+        d->qualified_name = cbm_arena_sprintf(&a, "p.m%d.T%d", mod, i);
+        d->short_name = "T";
+        d->label = hub || !fan ? "Struct" : "Function";
+        d->lang = CBM_LANG_GO;
+        if (!hub && (fan || i > 0)) {
+            int target = fan ? n : i - 1;
+            int target_def = fan ? n : i - 1;
+            d->type_scope = cbm_arena_sprintf(&a, "x.T=p.m%d.T%d", target, target_def);
+        }
+    }
+    CBMModuleDefIndex *idx = cbm_pxc_build_module_def_index(defs, count);
+    char own[32];
+    snprintf(own, sizeof(own), "p.m%d", fan ? 0 : n - 1);
+    /* The fan's caller imports every holder module. */
+    const char **imps = (const char **)calloc((size_t)n, sizeof(char *));
+    for (int i = 0; i < n; i++) {
+        imps[i] = cbm_arena_sprintf(&a, "p.m%d", i);
+    }
+    uint64_t before = cbm_pxc_test_reach_work();
+    int out = 0;
+    bool ok = false;
+    CBMLSPDef *sel = cbm_pxc_filter_defs_for_file(idx, defs, CBM_LANG_GO, NULL, own,
+                                                  fan ? imps : NULL, fan ? n : 0, &out, &ok);
+    uint64_t work = cbm_pxc_test_reach_work() - before;
+    free(sel);
+    free(imps);
+    cbm_pxc_free_module_def_index(idx);
+    free(defs);
+    cbm_arena_destroy(&a);
+    return ok && out == count ? work : 0;
+}
+
+TEST(type_scope_reach_work_grows_linearly) {
+    uint64_t chain_small = ts_reach_work(1000, false);
+    uint64_t chain_large = ts_reach_work(2000, false);
+    uint64_t fan_small = ts_reach_work(1000, true);
+    uint64_t fan_large = ts_reach_work(2000, true);
+    printf("  reach work: chain 1000=%llu 2000=%llu, fan 1000=%llu 2000=%llu\n",
+           (unsigned long long)chain_small, (unsigned long long)chain_large,
+           (unsigned long long)fan_small, (unsigned long long)fan_large);
+    ASSERT_TRUE(ts_linear(chain_small, chain_large));
+    ASSERT_TRUE(ts_linear(fan_small, fan_large));
+    PASS();
+}
+
+/* The planner's identity gate over n stored rows, each holding one identity,
+ * after a change of the type one of them names. */
+static uint64_t ts_decline_work(int n, const char **reason) {
+    cbm_lsp_surface_row_t *rows = (cbm_lsp_surface_row_t *)calloc((size_t)n, sizeof(*rows));
+    for (int i = 0; i < n; i++) {
+        char *json = (char *)malloc(256);
+        snprintf(json, 256,
+                 "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
+                 "\"Function\",\"lg\":%d,\"ty\":\"store.T%d=p.store.T%d\"}],\"reg\":[],\"py\":null}",
+                 (int)CBM_LANG_GO, i, (int)CBM_LANG_GO, i, i);
+        rows[i].defs_json = json;
+    }
+    char before_row[256];
+    snprintf(before_row, sizeof(before_row),
+             "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "\"lg\":%d,\"al\":\"Impl\"}],\"reg\":[],\"py\":null}",
+             (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
+    char after_row[256];
+    snprintf(after_row, sizeof(after_row),
+             "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "\"lg\":%d,\"al\":null}],\"reg\":[],\"py\":null}",
+             (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
+    const char *old_rows[] = {before_row};
+    const char *new_rows[] = {after_row};
+    uint64_t work = 0;
+    *reason = cbm_lsp_surface_identity_decline(old_rows, new_rows, 1, rows, n, &work);
+    for (int i = 0; i < n; i++) {
+        free((void *)rows[i].defs_json);
+    }
+    free(rows);
+    return work;
+}
+
+TEST(type_scope_identity_gate_work_grows_linearly) {
+    const char *small_reason = NULL;
+    const char *large_reason = NULL;
+    uint64_t small = ts_decline_work(1000, &small_reason);
+    uint64_t large = ts_decline_work(2000, &large_reason);
+    printf("  identity gate work: 1000 rows=%llu 2000=%llu (%s)\n", (unsigned long long)small,
+           (unsigned long long)large, large_reason ? large_reason : "kept");
+    ASSERT_STR_EQ(small_reason, "identity_target_changed");
+    ASSERT_STR_EQ(large_reason, "identity_target_changed");
+    ASSERT_TRUE(ts_linear(small, large));
+    PASS();
+}
+
+/* ── Pipeline fixtures ─────────────────────────────────────────────── */
+
+/* CALLS edges from a node named `src` to the node whose QN ends in
+ * `tgt_qn_tail` whose properties contain `fragment` (NULL = any). */
+static int ts_calls_to(cbm_store_t *s, const char *project, const char *src,
+                       const char *tgt_qn_tail, const char *fragment) {
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    size_t tail = strlen(tgt_qn_tail);
+    for (int i = 0; i < count; i++) {
+        cbm_node_t a = {0};
+        cbm_node_t b = {0};
+        bool ok = cbm_store_find_node_by_id(s, edges[i].source_id, &a) == CBM_STORE_OK &&
+                  cbm_store_find_node_by_id(s, edges[i].target_id, &b) == CBM_STORE_OK;
+        size_t qn_len = ok && b.qualified_name ? strlen(b.qualified_name) : 0;
+        if (ok && a.name && strcmp(a.name, src) == 0 && qn_len >= tail &&
+            strcmp(b.qualified_name + qn_len - tail, tgt_qn_tail) == 0 &&
+            (qn_len == tail || b.qualified_name[qn_len - tail - 1] == '.') &&
+            (!fragment || (edges[i].properties_json && strstr(edges[i].properties_json, fragment)))) {
+            matches++;
+        }
+        cbm_node_free_fields(&a);
+        cbm_node_free_fields(&b);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, count);
+    }
+    return matches;
+}
+
+#define TS_LSP "\"strategy\":\"lsp_"
+
+typedef struct {
+    const char *rel;
+    const char *content;
+} ts_file_t;
+
+static void ts_write(const char *tmp, const ts_file_t *files) {
+    for (int i = 0; files && files[i].rel; i++) {
+        th_write_file(TH_PATH(tmp, files[i].rel), files[i].content);
+    }
+}
+
+/* Filler files that put a fixture above the parallel threshold. */
+static void ts_pad(const char *tmp, CBMLanguage lang, int count) {
+    for (int i = 0; i < count; i++) {
+        char rel[64];
+        char body[128];
+        if (lang == CBM_LANG_GO) {
+            snprintf(rel, sizeof(rel), "fill/f%d.go", i);
+            snprintf(body, sizeof(body), "package fill\n\nfunc F%d() int { return %d }\n", i, i);
+        } else {
+            snprintf(rel, sizeof(rel), "fill/f%d.py", i);
+            snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
+        }
+        th_write_file(TH_PATH(tmp, rel), body);
+    }
+}
+
+enum { TS_PAD_FILES = 52 }; /* above the parallel threshold (50 files) */
+
+/* Full index of `tmp` with CBM_WORKERS=workers into tmp/<db_name>. */
+static cbm_store_t *ts_index_workers(const char *tmp, const char *db_name, int workers,
+                                     char *project, size_t project_size) {
+    char *saved = NULL;
+    const char *old = getenv("CBM_WORKERS");
+    saved = old ? strdup(old) : NULL;
+    char w[16];
+    snprintf(w, sizeof(w), "%d", workers);
+    cbm_setenv("CBM_WORKERS", w, 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (p) {
+        snprintf(project, project_size, "%s", cbm_pipeline_project_name(p));
+    }
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    return rc == 0 ? cbm_store_open_path(db_path) : NULL;
+}
+
+/* One fixture indexed with one worker and with four (both above the parallel
+ * threshold); `check` returns 0 when the graph is right. */
+typedef int (*ts_check_fn)(cbm_store_t *s, const char *project, const char *label);
+
+static int ts_twins(const char *name, const ts_file_t *files, CBMLanguage pad_lang,
+                    ts_check_fn check) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_tscope_%s_XXXXXX", name);
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    ts_write(tmp, files);
+    ts_pad(tmp, pad_lang, TS_PAD_FILES);
+    int bad = 0;
+    for (int run = 0; run < 2 && !bad; run++) {
+        int workers = run == 0 ? 1 : 4;
+        char project[256] = {0};
+        cbm_store_t *s = ts_index_workers(tmp, run == 0 ? "seq.db" : "par.db", workers, project,
+                                          sizeof(project));
+        if (!s) {
+            bad = 1;
+            break;
+        }
+        bad = check(s, project, run == 0 ? "1 worker" : "4 workers");
+        cbm_store_close(s);
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(bad, 0);
+    PASS();
+}
+
+/* Go: app calls fixture.New() (returns *store.Store) and reads
+ * fixture.NewHolder().S (a field of type *store.Store); fixture.go imports
+ * store. decoy/ declares a same-named Store with the same method. */
+static const ts_file_t go_scope_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"store/store.go", "package store\n\ntype Store struct{ n int }\n\n"
+                       "func (s *Store) Get(k string) string { return k }\n"},
+    {"decoy/store.go", "package decoy\n\ntype Store struct{ n int }\n\n"
+                       "func (s *Store) Get(k string) string { return k }\n"},
+    {"fixture/fixture.go", "package fixture\n\nimport \"example.com/demo/store\"\n\n"
+                           "type Holder struct {\n\tS *store.Store\n}\n\n"
+                           "func New() *store.Store { return &store.Store{} }\n\n"
+                           "func NewHolder() Holder { return Holder{} }\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/fixture\"\n\n"
+                   "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n\n"
+                   "func Field() string {\n\th := fixture.NewHolder()\n\treturn h.S.Get(\"y\")\n}\n"},
+    {NULL, NULL}};
+
+static int go_scope_check(cbm_store_t *s, const char *project, const char *label) {
+    int ret_hit = ts_calls_to(s, project, "Run", "store.Store.Get", TS_LSP);
+    int ret_decoy = ts_calls_to(s, project, "Run", "decoy.Store.Get", NULL);
+    int field_hit = ts_calls_to(s, project, "Field", "store.Store.Get", TS_LSP);
+    int field_decoy = ts_calls_to(s, project, "Field", "decoy.Store.Get", NULL);
+    printf("  go (%s): return=%d decoy=%d field=%d decoy=%d\n", label, ret_hit, ret_decoy,
+           field_hit, field_decoy);
+    return !(ret_hit == 1 && ret_decoy == 0 && field_hit == 1 && field_decoy == 0);
+}
+
+TEST(type_scope_go_return_and_field_types) {
+    return ts_twins("go", go_scope_files, CBM_LANG_GO, go_scope_check);
+}
+
+/* Go: a type parameter named like an import (`import T "…/tpkg"`, then
+ * `func Wrap[T any](x T) T`) is the parameter inside Wrap, not tpkg's T. */
+static const ts_file_t go_tparam_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"tpkg/t.go", "package tpkg\n\ntype T struct{ n int }\n\nfunc (t T) M() string { return \"t\" }\n"},
+    {"other/x.go", "package other\n\ntype X struct{ n int }\n\nfunc (x X) M() string { return \"x\" }\n"},
+    {"fixture/fixture.go", "package fixture\n\nimport T \"example.com/demo/tpkg\"\n\n"
+                           "var Keep T.T\n\nfunc Wrap[T any](x T) T { return x }\n"},
+    {"app/app.go", "package app\n\nimport (\n\t\"example.com/demo/fixture\"\n"
+                   "\t\"example.com/demo/other\"\n)\n\n"
+                   "func Run() string { return fixture.Wrap(other.X{}).M() }\n"},
+    {NULL, NULL}};
+
+static int go_tparam_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "Run", "tpkg.T.M", NULL);
+    printf("  go type parameter (%s): edge to tpkg.T.M=%d\n", label, wrong);
+    return wrong != 0;
+}
+
+TEST(type_scope_go_type_parameter_is_no_import) {
+    return ts_twins("gotp", go_tparam_files, CBM_LANG_GO, go_tparam_check);
+}
+
+/* Python: app.py calls fixture.make() (-> Store, imported by fixture.py from
+ * pkg.store) and fixture.local() (-> Local, fixture.py's own class). decoy.py
+ * declares a same-named Store with the same method. */
+static const ts_file_t py_scope_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/store.py", "class Store:\n    def get(self, k):\n        return k\n"},
+    {"pkg/decoy.py", "class Store:\n    def get(self, k):\n        return k\n"},
+    {"pkg/fixture.py", "from pkg.store import Store\n\n\n"
+                       "class Local:\n    def ping(self):\n        return 1\n\n\n"
+                       "def make() -> Store:\n    return Store()\n\n\n"
+                       "def local() -> Local:\n    return Local()\n"},
+    {"pkg/app.py", "from pkg.fixture import make, local\n\n\n"
+                   "def run():\n    s = make()\n    return s.get(\"x\")\n\n\n"
+                   "def own():\n    v = local()\n    return v.ping()\n"},
+    {NULL, NULL}};
+
+static int py_scope_check(cbm_store_t *s, const char *project, const char *label) {
+    int ret_hit = ts_calls_to(s, project, "run", "pkg.store.Store.get", TS_LSP);
+    int ret_decoy = ts_calls_to(s, project, "run", "pkg.decoy.Store.get", NULL);
+    int own_hit = ts_calls_to(s, project, "own", "pkg.fixture.Local.ping", TS_LSP);
+    printf("  python (%s): return=%d decoy=%d own=%d\n", label, ret_hit, ret_decoy, own_hit);
+    return !(ret_hit == 1 && ret_decoy == 0 && own_hit == 1);
+}
+
+TEST(type_scope_python_return_types) {
+    return ts_twins("py", py_scope_files, CBM_LANG_PYTHON, py_scope_check);
+}
+
+/* Finding 3: `def cfg(self) -> Config` in a class with a nested `Config`
+ * names Model.Config, never the module-level Config. */
+static const ts_file_t py_nested_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/mod.py", "class Config:\n    def load(self):\n        return 1\n\n\n"
+                   "class Model:\n"
+                   "    class Config:\n        def load(self):\n            return 2\n\n"
+                   "    def cfg(self) -> Config:\n        return Model.Config()\n"},
+    {"pkg/use.py", "from pkg.mod import Model\n\n\n"
+                   "def run():\n    m = Model()\n    return m.cfg().load()\n"},
+    {NULL, NULL}};
+
+static int py_nested_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "run", "pkg.mod.Config.load", NULL);
+    printf("  python nested class (%s): edge to module-level Config.load=%d\n", label, wrong);
+    return wrong != 0;
+}
+
+TEST(type_scope_python_nested_class_is_not_the_module_class) {
+    return ts_twins("pynest", py_nested_files, CBM_LANG_PYTHON, py_nested_check);
+}
+
+/* Finding 6: `-> Self` chains across files keep main's edges; `Self` comes
+ * from typing, which the project does not define. A decoy declares the same
+ * method names. */
+static const ts_file_t py_self_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/builder.py", "from typing import Self\n\n\n"
+                       "class Builder:\n"
+                       "    def a(self) -> Self:\n        return self\n\n"
+                       "    def b(self) -> Self:\n        return self\n\n"
+                       "    def done(self) -> int:\n        return 1\n"},
+    {"pkg/app.py", "from pkg.builder import Builder\n\n\n"
+                   "def run():\n    x = Builder()\n    return x.a().b().done()\n"},
+    {"pkg/decoy.py", "class Other:\n"
+                     "    def a(self):\n        return self\n\n"
+                     "    def b(self):\n        return self\n\n"
+                     "    def done(self):\n        return 2\n"},
+    {NULL, NULL}};
+
+static int py_self_check(cbm_store_t *s, const char *project, const char *label) {
+    int a = ts_calls_to(s, project, "run", "pkg.builder.Builder.a", NULL);
+    int b = ts_calls_to(s, project, "run", "pkg.builder.Builder.b", NULL);
+    int done = ts_calls_to(s, project, "run", "pkg.builder.Builder.done", NULL);
+    int decoy = ts_calls_to(s, project, "run", "pkg.decoy.Other.done", NULL) +
+                ts_calls_to(s, project, "run", "pkg.decoy.Other.b", NULL);
+    printf("  python Self chain (%s): a=%d b=%d done=%d decoy=%d\n", label, a, b, done, decoy);
+    return !(a == 1 && b == 1 && done == 1 && decoy == 0);
+}
+
+TEST(type_scope_python_self_chain_keeps_its_edges) {
+    return ts_twins("pyself", py_self_files, CBM_LANG_PYTHON, py_self_check);
+}
+
+/* Type parameters: `def wrap[Item](x: Item) -> Item` in a file that also
+ * imports a class Item; the caller passes an Other. */
+static const ts_file_t py_tparam_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/item.py", "class Item:\n    def save(self):\n        return 1\n"},
+    {"pkg/other.py", "class Other:\n    def save(self):\n        return 2\n"},
+    {"pkg/box.py", "from pkg.item import Item\n\n\n"
+                   "def touch(i: Item) -> None:\n    i.save()\n\n\n"
+                   "def wrap[Item](x: Item) -> Item:\n    return x\n"},
+    {"pkg/app.py", "from pkg.box import wrap\nfrom pkg.other import Other\n\n\n"
+                   "def go():\n    o = wrap(Other())\n    return o.save()\n"},
+    {NULL, NULL}};
+
+static int py_tparam_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "go", "pkg.item.Item.save", NULL);
+    printf("  python type parameter (%s): edge to pkg.item.Item.save=%d\n", label, wrong);
+    return wrong != 0;
+}
+
+TEST(type_scope_python_type_parameter_is_no_import) {
+    return ts_twins("pytp", py_tparam_files, CBM_LANG_PYTHON, py_tparam_check);
+}
+
+/* ── Full index versus every incremental route ───────────────────── */
+
+static void ts_listing_append(sqlite3 *db, const char *sql, const char *project, char **buf,
+                              size_t *len) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *row = (const char *)sqlite3_column_text(st, 0);
+        size_t n = row ? strlen(row) : 0;
+        char *grown = (char *)realloc(*buf, *len + n + 2);
+        if (!grown) {
+            break;
+        }
+        *buf = grown;
+        memcpy(*buf + *len, row ? row : "", n);
+        *len += n;
+        (*buf)[(*len)++] = '\n';
+        (*buf)[*len] = '\0';
+    }
+    sqlite3_finalize(st);
+}
+
+/* Every node (label, QN) and edge (type, source QN, target QN, properties)
+ * of the project, sorted: equal listings are equal graphs. A call's `args`
+ * are left out: on main already the closure route renders them differently
+ * from a full index (quote style, key order), whatever the resolver did. */
+static char *ts_listing(const char *db_path, const char *project) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    char *buf = (char *)calloc(1, 1);
+    size_t len = 0;
+    ts_listing_append(db,
+                      "SELECT label||'|'||qualified_name FROM nodes WHERE project=?1 ORDER BY 1",
+                      project, &buf, &len);
+    ts_listing_append(db,
+                      "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||"
+                      "CASE WHEN json_valid(e.properties) THEN json_remove(e.properties, '$.args') "
+                      "ELSE coalesce(e.properties, '') END FROM edges e "
+                      "JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 ORDER BY 1",
+                      project, &buf, &len);
+    sqlite3_close(db);
+    return buf;
+}
+
+/* Print the lines one listing has and the other lacks (a failing case). */
+static void ts_listing_diff(const char *a, const char *b, const char *tag) {
+    for (const char *line = a; line && *line;) {
+        const char *nl = strchr(line, '\n');
+        size_t n = nl ? (size_t)(nl - line) : strlen(line);
+        bool found = false;
+        for (const char *p = b; p && *p && !found;) {
+            const char *pnl = strchr(p, '\n');
+            size_t pn = pnl ? (size_t)(pnl - p) : strlen(p);
+            found = pn == n && memcmp(p, line, n) == 0;
+            p = pnl ? pnl + 1 : p + pn;
+        }
+        if (!found) {
+            printf("    only %s: %.*s\n", tag, (int)n, line);
+        }
+        line = nl ? nl + 1 : line + n;
+    }
+}
+
+typedef struct {
+    cbm_incremental_route_t route;
+    cbm_incremental_closure_plan_t plan;
+    bool same_graph;
+} ts_incr_result_t;
+
+/* Index `files` (plus `pad` Go or Python fillers), apply `edits`, index again
+ * incrementally into the same database, then index the edited tree afresh;
+ * the two graphs must be equal whatever route the incremental run took. */
+static ts_incr_result_t ts_incremental(const ts_file_t *files, CBMLanguage pad_lang, int pad,
+                                       const ts_file_t *edits, const char *tag) {
+    ts_incr_result_t r = {.route = CBM_INCREMENTAL_ROUTE_NONE};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_tscope_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return r;
+    }
+    ts_write(tmp, files);
+    ts_pad(tmp, pad_lang, pad);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/incr.db", tmp);
+    cbm_pipeline_t *base = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    char project[256] = {0};
+    if (base && cbm_pipeline_run(base) == 0) {
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(base));
+    }
+    cbm_pipeline_free(base);
+
+    ts_write(tmp, edits);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int rc = incr ? cbm_pipeline_run(incr) : -1;
+    r.route = cbm_pipeline_incremental_test_last_route();
+    r.plan = cbm_pipeline_incremental_test_last_closure_plan();
+    cbm_pipeline_free(incr);
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    int full_rc = full ? cbm_pipeline_run(full) : -1;
+    cbm_pipeline_free(full);
+
+    char *repaired = rc == 0 && project[0] ? ts_listing(db, project) : NULL;
+    char *fresh = full_rc == 0 && project[0] ? ts_listing(full_db, project) : NULL;
+    r.same_graph = repaired && fresh && strcmp(repaired, fresh) == 0;
+    printf("  incremental %s: route=%d plan files=%d surface_changed=%d dependents=%d "
+           "decline=%s same_graph=%d\n",
+           tag, (int)r.route, r.plan.files, r.plan.surface_changed, r.plan.dependents,
+           r.plan.decline ? r.plan.decline : "-", (int)r.same_graph);
+    if (!r.same_graph && repaired && fresh) {
+        ts_listing_diff(repaired, fresh, "incremental");
+        ts_listing_diff(fresh, repaired, "full");
+    }
+    free(repaired);
+    free(fresh);
+    th_rmtree(tmp);
+    return r;
+}
+
+/* Only the caller is re-parsed (a closure of one file: the per-file Go
+ * registrar): fixture.go's identities come back from its stored row. */
+TEST(type_scope_incremental_caller_edit_per_file_go) {
+    const ts_file_t edit[] = {
+        {"app/app.go", "package app\n\nimport \"example.com/demo/fixture\"\n\n"
+                       "func Run() string {\n\ts := fixture.New()\n\tv := s.Get(\"x\")\n\treturn v\n}\n\n"
+                       "func Field() string {\n\th := fixture.NewHolder()\n\treturn h.S.Get(\"y\")\n}\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(go_scope_files, CBM_LANG_GO, 0, edit, "go caller edit");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+/* Finding 9: a body edit of the file that holds the identities, with twelve
+ * dependents in a 40-file tree (the review's go-incr), stays a one-file
+ * repair as on main: the probe and the stored row hash the same bytes. */
+static const ts_file_t go_incr_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"store/store.go", "package store\n\ntype Store struct{ n int }\n\n"
+                       "func (s *Store) Get(k string) string { return k }\n"},
+    {"fixture/fixture.go", "package fixture\n\nimport \"example.com/demo/store\"\n\n"
+                           "type Holder struct {\n\tS *store.Store\n}\n\n"
+                           "func New() *store.Store { return &store.Store{} }\n\n"
+                           "func NewHolder() Holder { return Holder{} }\n"},
+    {"app0/app.go", "package app0\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app1/app.go", "package app1\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app2/app.go", "package app2\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app3/app.go", "package app3\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app4/app.go", "package app4\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app5/app.go", "package app5\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app6/app.go", "package app6\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app7/app.go", "package app7\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app8/app.go", "package app8\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app9/app.go", "package app9\n\nimport \"example.com/demo/fixture\"\n\n"
+                    "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app10/app.go", "package app10\n\nimport \"example.com/demo/fixture\"\n\n"
+                     "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {"app11/app.go", "package app11\n\nimport \"example.com/demo/fixture\"\n\n"
+                     "func Run() string {\n\ts := fixture.New()\n\treturn s.Get(\"x\")\n}\n"},
+    {NULL, NULL}};
+
+TEST(type_scope_incremental_body_edit_stays_one_file) {
+    const ts_file_t edit[] = {
+        {"fixture/fixture.go", "package fixture\n\nimport \"example.com/demo/store\"\n\n"
+                               "type Holder struct {\n\tS *store.Store\n}\n\n"
+                               "func New() *store.Store {\n\ts := &store.Store{}\n\treturn s\n}\n\n"
+                               "func NewHolder() Holder { return Holder{} }\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(go_incr_files, CBM_LANG_GO, 25, edit, "go body edit");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_EQ(r.plan.surface_changed, 0);
+    ASSERT_EQ(r.plan.dependents, 0);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+/* Finding 7, Go: the type an identity names changes in its declaring file
+ * while every name stays (an alias that becomes a defined type, a type that
+ * becomes a variable), and a caller two imports away resolved through it.
+ * The methods live in other files of the package, so the caller is no
+ * dependent of the edited file. The doc-link scope records an exported
+ * type's kind and alias target, so main already declines these; the graph
+ * must still be the full index's. */
+static const ts_file_t go_alias_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"store/b.go", "package store\n\ntype Impl struct{ n int }\n\ntype Impl2 struct{ n int }\n\n"
+                   "type T = Impl\n"},
+    {"store/b2.go", "package store\n\nfunc (i Impl) M() string { return \"impl\" }\n"},
+    {"store/b3.go", "package store\n\nfunc (i Impl2) M() string { return \"impl2\" }\n"},
+    {"decoy/d.go", "package decoy\n\ntype T struct{ n int }\n\nfunc (t T) M() string { return \"d\" }\n"},
+    {"fixture/a.go", "package fixture\n\nimport \"example.com/demo/store\"\n\n"
+                     "func Make() store.T { return store.T{} }\n"},
+    {"app/c.go", "package app\n\nimport \"example.com/demo/fixture\"\n\n"
+                 "func Run() string { return fixture.Make().M() }\n"},
+    {NULL, NULL}};
+
+/* The change the doc-link scope does not see (it records an exported type's
+ * name, kind, alias target and field names, never a field's type): the
+ * struct an identity names gets another field type. The caller resolved
+ * `fixture.Get().S.Get()` through fixture.go's identity `model.Holder` and
+ * Holder's field; it has no edge into model/b.go. */
+TEST(type_scope_incremental_named_type_field_change_matches_full) {
+    const ts_file_t files[] = {
+        {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+        {"store/store.go", "package store\n\ntype Store struct{ n int }\n\ntype Other struct{ n int }\n"},
+        {"store/m1.go", "package store\n\nfunc (s *Store) Get() string { return \"s\" }\n"},
+        {"store/m2.go", "package store\n\nfunc (o *Other) Get() string { return \"o\" }\n"},
+        {"model/b.go", "package model\n\nimport \"example.com/demo/store\"\n\n"
+                       "type Holder struct {\n\tS *store.Store\n}\n"},
+        {"fixture/a.go", "package fixture\n\nimport \"example.com/demo/model\"\n\n"
+                         "func Get() model.Holder { return model.Holder{} }\n"},
+        {"app/c.go", "package app\n\nimport \"example.com/demo/fixture\"\n\n"
+                     "func Run() string { return fixture.Get().S.Get() }\n"},
+        {NULL, NULL}};
+    const ts_file_t edit[] = {
+        {"model/b.go", "package model\n\nimport \"example.com/demo/store\"\n\n"
+                       "type Holder struct {\n\tS *store.Other\n}\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 0, edit, "go named type field change");
+    ASSERT_TRUE(r.same_graph);
+    ASSERT_STR_EQ(r.plan.decline, "identity_target_changed");
+    PASS();
+}
+
+TEST(type_scope_incremental_type_shape_changes_match_full) {
+    const ts_file_t to_defined[] = {
+        {"store/b.go", "package store\n\ntype Impl struct{ n int }\n\ntype Impl2 struct{ n int }\n\n"
+                       "type T Impl\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r =
+        ts_incremental(go_alias_files, CBM_LANG_GO, 0, to_defined, "go alias->defined type");
+    ASSERT_TRUE(r.same_graph);
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    const ts_file_t to_var[] = {
+        {"store/b.go", "package store\n\ntype Impl struct{ n int }\n\ntype Impl2 struct{ n int }\n\n"
+                       "var T = Impl{}\n"},
+        {NULL, NULL}};
+    r = ts_incremental(go_alias_files, CBM_LANG_GO, 0, to_var, "go type->var");
+    ASSERT_TRUE(r.same_graph);
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* The gate is narrow: a signature change of another definition in the
+ * declaring file stays a repair. */
+TEST(type_scope_incremental_other_def_edit_stays_a_repair) {
+    const ts_file_t edit[] = {
+        {"store/b.go", "package store\n\ntype Impl struct{ n int }\n\ntype T = Impl\n\n"
+                       "func Helper(n int) int { return n }\n"},
+        {NULL, NULL}};
+    const ts_file_t files[] = {
+        {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+        {"store/b.go", "package store\n\ntype Impl struct{ n int }\n\ntype T = Impl\n\n"
+                       "func Helper() int { return 1 }\n"},
+        {"store/b2.go", "package store\n\nfunc (i Impl) M() string { return \"impl\" }\n"},
+        {"fixture/a.go", "package fixture\n\nimport \"example.com/demo/store\"\n\n"
+                         "func Make() store.T { return store.T{} }\n"},
+        {"app/c.go", "package app\n\nimport \"example.com/demo/fixture\"\n\n"
+                     "func Run() string { return fixture.Make().M() }\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 0, edit, "go other def edit");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+/* Python: a caller's body edit re-resolves that file alone with the per-file
+ * Python registrar, reading fixture.py's identities from its stored row; a
+ * body edit of fixture.py itself stays a one-file repair too. */
+TEST(type_scope_incremental_python_body_edits) {
+    const ts_file_t caller[] = {
+        {"pkg/app.py", "from pkg.fixture import make, local\n\n\n"
+                       "def run():\n    s = make()\n    v = s.get(\"x\")\n    return v\n\n\n"
+                       "def own():\n    v = local()\n    return v.ping()\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(py_scope_files, CBM_LANG_PYTHON, 0, caller, "py caller");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_TRUE(r.same_graph);
+    const ts_file_t declaring[] = {
+        {"pkg/fixture.py", "from pkg.store import Store\n\n\n"
+                           "class Local:\n    def ping(self):\n        return 1\n\n\n"
+                           "def make() -> Store:\n    s = Store()\n    return s\n\n\n"
+                           "def local() -> Local:\n    return Local()\n"},
+        {NULL, NULL}};
+    r = ts_incremental(py_scope_files, CBM_LANG_PYTHON, 0, declaring, "py declaring body");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_EQ(r.plan.surface_changed, 0);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+/* Finding 7, Python: the declaring module's name changes from an alias to a
+ * class (and a class to a function), a caller two imports away. */
+TEST(type_scope_incremental_python_declaring_change_matches_full) {
+    const ts_file_t files[] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/b.py", "class Impl:\n    def m(self):\n        return 1\n\n\nT = Impl\n"},
+        {"pkg/a.py", "from pkg.b import T\n\n\ndef make() -> T:\n    return T()\n"},
+        {"pkg/c.py", "from pkg.a import make\n\n\ndef run():\n    return make().m()\n"},
+        {NULL, NULL}};
+    const ts_file_t to_class[] = {
+        {"pkg/b.py", "class Impl:\n    def m(self):\n        return 1\n\n\n"
+                     "class T:\n    def m(self):\n        return 2\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_PYTHON, 0, to_class, "py alias->class");
+    ASSERT_TRUE(r.same_graph);
+    const ts_file_t start_class[] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/b.py", "class T:\n    def m(self):\n        return 1\n"},
+        {"pkg/a.py", "from pkg.b import T\n\n\ndef make() -> T:\n    return T()\n"},
+        {"pkg/c.py", "from pkg.a import make\n\n\ndef run():\n    return make().m()\n"},
+        {NULL, NULL}};
+    const ts_file_t to_function[] = {
+        {"pkg/b.py", "def T():\n    return 1\n\n\ndef m():\n    return 2\n"}, {NULL, NULL}};
+    r = ts_incremental(start_class, CBM_LANG_PYTHON, 0, to_function, "py class->function");
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+SUITE(type_scope) {
+    RUN_TEST(type_scope_import_binding_is_the_identity);
+    RUN_TEST(type_scope_dotted_spelling_through_its_head);
+    RUN_TEST(type_scope_stores_nothing_without_one_answer);
+    RUN_TEST(type_scope_names_outside_the_project_get_none);
+    RUN_TEST(type_scope_go_bare_names_and_own_module);
+    RUN_TEST(type_scope_python_own_module);
+    RUN_TEST(type_scope_python_enclosing_scopes);
+    RUN_TEST(type_scope_python_type_parameters);
+    RUN_TEST(type_scope_python_unlisted_bindings_get_none);
+    RUN_TEST(type_scope_step_work_grows_linearly);
+    RUN_TEST(type_scope_lookup_work_grows_linearly);
+    RUN_TEST(type_scope_reach_work_grows_linearly);
+    RUN_TEST(type_scope_identity_gate_work_grows_linearly);
+    RUN_TEST(type_scope_go_return_and_field_types);
+    RUN_TEST(type_scope_go_type_parameter_is_no_import);
+    RUN_TEST(type_scope_python_return_types);
+    RUN_TEST(type_scope_python_nested_class_is_not_the_module_class);
+    RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
+    RUN_TEST(type_scope_python_type_parameter_is_no_import);
+    RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
+    RUN_TEST(type_scope_incremental_body_edit_stays_one_file);
+    RUN_TEST(type_scope_incremental_named_type_field_change_matches_full);
+    RUN_TEST(type_scope_incremental_type_shape_changes_match_full);
+    RUN_TEST(type_scope_incremental_other_def_edit_stays_a_repair);
+    RUN_TEST(type_scope_incremental_python_body_edits);
+    RUN_TEST(type_scope_incremental_python_declaring_change_matches_full);
+}

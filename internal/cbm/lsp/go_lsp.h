@@ -111,6 +111,11 @@ typedef struct {
      * by the registrar against def_module_qn like return_types. NULL = not an
      * identity alias. */
     const char *alias_target;
+    /* Identities of the type names this def's declared types write, resolved
+     * once in the scope of the file that wrote them (src/pipeline/type_scope.h):
+     * "spelling=QN|spelling=QN". Read with cbm_type_scope_find (type_rep.h).
+     * NULL = no name needs one; the engine then qualifies as before. */
+    const char *type_scope;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.
