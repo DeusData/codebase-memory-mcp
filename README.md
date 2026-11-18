@@ -315,11 +315,12 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 - **Change impact**: `detect_changes` maps uncommitted changes to affected symbols with risk classification and can report test impact with `scope: "tests"`; `compare_graphs` compares indexed snapshots
 - **Runtime observations**: `ingest_traces` adds observed call relationships from separately collected traces alongside static analysis; static call paths alone do not show what ran
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
-- **Dead code candidates**: find functions with no indexed callers, excluding entry points. Check dynamic dispatch, coverage gaps, and framework conventions before removing code.
+- **Dead code candidates**: use `query_graph` with `MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name, f.file_path` to find functions with no indexed `CALLS` callers (repeat for `Method` as needed). Check entry points, callbacks, dynamic dispatch, coverage gaps, and framework conventions before removing code. `search_graph(max_degree=0, exclude_entry_points=true)` finds isolated symbols instead: its degree includes both incoming and outgoing calls, references, and type relationships, so it omits uncalled functions that call other code.
 - **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
 
 ### Search
 - **Semantic search** (the `semantic_query` parameter of `search_graph`, not a separate tool): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary; no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
+  Supply individual keywords, e.g. `semantic_query: ["handle", "scan"]`, rather than natural-language sentences. Each array element is looked up as one token; results use the minimum cosine across tokens. Unknown tokens fall back to deterministic sparse-random vectors and can suppress useful matches. For BM25 text search use `query`; it cannot be combined with `semantic_query` in the same request.
 - **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware)
 - **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
 - **Code search** (`search_code`): graph-augmented grep over indexed files only

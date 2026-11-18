@@ -1827,7 +1827,7 @@ static const char released_skill_content_v0_10_3[] =
 #undef CBM_RELEASED_SKILL_HEADER_QUOTED
 #undef CBM_RELEASED_SKILL_HEADER_UNQUOTED
 
-static const char skill_content[] =
+static const char released_skill_content_v0_12_1[] =
     "---\n"
     "name: codebase-memory\n"
     /* #1554: the value contains "Triggers on: " — a colon-space, which YAML
@@ -1948,6 +1948,137 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
 
+static const char skill_content[] =
+    "---\n"
+    "name: codebase-memory\n"
+    /* #1554: the value contains "Triggers on: " — a colon-space, which YAML
+     * reads as a nested-mapping indicator inside an unquoted scalar. Strict
+     * parsers (js-yaml's load, the frontmatter reader in `npx skills`) reject
+     * the whole file, so the skill silently fails to load rather than loading
+     * wrongly. Quoting the scalar is the fix; the text itself is unchanged. */
+    "description: \"Use the codebase knowledge graph for structural code queries. "
+    "Triggers on: explore the codebase, understand the architecture, what functions exist, "
+    "show me the structure, who calls this function, what does X call, trace the call chain, "
+    "find callers of, show dependencies, impact analysis, dead code, unused functions, "
+    "high fan-out, refactor candidates, code quality audit, graph query syntax, "
+    "Cypher query examples, edge types, how to use search_graph.\"\n"
+    "---\n"
+    "\n"
+    "# Codebase Memory — Knowledge Graph Tools\n"
+    "\n"
+    "Graph tools return precise structural results in ~500 tokens vs ~80K for grep.\n"
+    "\n"
+    "## Quick Decision Matrix\n"
+    "\n"
+    "| Question | Tool call |\n"
+    "|----------|----------|\n"
+    "| Who calls X? | `trace_path(direction=\"inbound\")` |\n"
+    "| What does X call? | `trace_path(direction=\"outbound\")` |\n"
+    "| Full call context | `trace_path(direction=\"both\")` |\n"
+    "| Find by name pattern | `search_graph(name_pattern=\"...\")` |\n"
+    "| Dead-code candidates | `query_graph` with inbound `NOT EXISTS` (see below) |\n"
+    "| Cross-service edges | `query_graph` with Cypher |\n"
+    "| Impact of local changes | `detect_changes()` |\n"
+    "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
+    "| Text search | `search_code` or Grep |\n"
+    "\n"
+    "## Exploration Workflow\n"
+    /* #1690: a guessed repo or folder name misses the project whenever the
+     * checkout directory differs from it; the root_path is what identifies it. */
+    "1. `list_projects` — pick the project whose `root_path` contains your working directory; "
+    "pass its `name` (or the absolute directory itself) as `project`, never a repo or folder "
+    "name\n"
+    "2. `get_graph_schema` — understand node/edge types\n"
+    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
+    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
+    "\n"
+    "## Tracing Workflow\n"
+    "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
+    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace\n"
+    "3. `detect_changes()` — map git diff to affected symbols\n"
+    "\n"
+    "## Evidence Tiers\n"
+    "- **Scout (Tier 1):** fast positive lookup with few graph calls and targeted source checks. "
+    "Treat results as provisional; never make absence, exhaustive, dead-code, or complete-impact "
+    "claims.\n"
+    "- **Verify (Tier 2, default):** task-directed searches, relevant trace directions, exact "
+    "snippets for material claims, and all relevant result pages.\n"
+    "- **Auditor (Tier 3):** bounded-scope full verification with a current graph generation, "
+    "complete relevant pagination, both call directions and broader relationships when material, "
+    "plus explicit unresolved limitations.\n"
+    "- **Every tier:** after candidate paths are known, call `check_index_coverage` once with "
+    "every "
+    "evidence path. For negative or exhaustive claims also include the relevant scopes. A clean "
+    "result means no recorded gap, not proof of completeness. For partial, skipped, excluded, "
+    "stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying on "
+    "the graph.\n"
+    "\n"
+    "## Sessions and Subagents\n"
+    "- At session start or after compaction, call `list_projects`/`index_status` before "
+    "structural exploration, then choose Scout, Verify, or Auditor for the task.\n"
+    "- Before delegating, query the graph and coverage in the parent. Pass the tier, exact "
+    "project, "
+    "generation/freshness, bounded scope, queries and pagination state, qualified symbols, paths, "
+    "call-chain findings, coverage ranges/reasons, source fallback already performed, and "
+    "unresolved "
+    "questions to the child.\n"
+    "- Runtimes such as Hermes isolate child context: put those graph findings in the "
+    "`context` argument to `delegate_task`; do not assume the child inherits MCP access or "
+    "the parent's conversation.\n"
+    "- A child without MCP tools must not call or claim MCP access. It should work from the "
+    "supplied "
+    "evidence and use read/grep on exact source, especially every reported missed-coverage range.\n"
+    "\n"
+    "## Quality Analysis\n"
+    "- No indexed CALLS callers: use `query_graph` with:\n"
+    "  `MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name, f.file_path`\n"
+    "  Repeat for `Method` as needed. These are candidates: verify coverage, entry points, "
+    "callbacks and dynamic dispatch before removing code.\n"
+    "- `search_graph(max_degree=0, exclude_entry_points=true)` finds isolated symbols: "
+    "degree is incoming plus outgoing CALLS/USAGE/CALL_REFERENCE/INHERITS/IMPLEMENTS. "
+    "An uncalled function that calls another function is not isolated.\n"
+    "- High fan-out: `search_graph(min_degree=10, relationship=\"CALLS\", "
+    "direction=\"outbound\")`\n"
+    "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
+    "direction=\"inbound\")`\n"
+    "\n"
+    "## MCP Tools\n"
+    "Use the server's `tools/list` response for the current tool inventory and parameter schemas.\n"
+    "\n"
+    "## Semantic Queries\n"
+    "`search_graph(semantic_query=[\"handle\",\"scan\"])` takes individual keywords, "
+    "not natural-language sentences. Each array element is looked up as one token, "
+    "and the score is the minimum cosine across elements. Unknown tokens use "
+    "deterministic sparse-random vectors, so they can suppress useful matches. "
+    "Use `query` for BM25 text search; `query` and `semantic_query` are mutually exclusive.\n"
+    "\n"
+    "## Edge Types\n"
+    "CALLS, HTTP_CALLS, ASYNC_CALLS, SPAWNS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
+    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, REFERENCES_FILE,\n"
+    "MENTIONS (doc comment -> referenced code), FILE_CHANGES_WITH, SIMILAR_TO,\n"
+    "SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
+    "INFRA_MAPS (K8s Service -> selected workloads), DEPENDS_ON (chart / manifest -> dependency),\n"
+    "DEPLOYS (what puts manifests / charts on a cluster -> what it puts there),\n"
+    "CONNECTS_TO (workload / compose service -> the Service its environment addresses)\n"
+    "\n"
+    "## Cypher Examples (for query_graph)\n"
+    "```\n"
+    "MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, "
+    "r.confidence LIMIT 20\n"
+    "MATCH (f:Function) WHERE f.name =~ '.*Handler.*' RETURN f.name, f.file_path\n"
+    "MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'main' RETURN b.name\n"
+    "```\n"
+    "\n"
+    "## Gotchas\n"
+    "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
+    "use `query_graph` with Cypher to see actual edges.\n"
+    "2. `query_graph` has a 100k row ceiling — add a Cypher `LIMIT` for broad queries "
+    "or use `search_graph` pagination.\n"
+    "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
+    "4. `direction=\"outbound\"` misses cross-service callers — use "
+    "`direction=\"both\"`.\n"
+    "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
+
 /* Byte-exact consolidated skill payloads shipped by each release range. */
 static const char *const released_skill_contents[] = {
     /* 0.6.0 through v0.9.0 */
@@ -1958,8 +2089,10 @@ static const char *const released_skill_contents[] = {
     released_skill_content_v0_10_0,
     /* v0.10.3 through v0.10.8 */
     released_skill_content_v0_10_3,
+    /* v0.12.1 / main before the query-guidance correction */
+    released_skill_content_v0_12_1,
 };
-enum { RELEASED_SKILL_CONTENT_COUNT = 4 };
+enum { RELEASED_SKILL_CONTENT_COUNT = 5 };
 
 static const char codex_instructions_content[] =
     "For structural codebase exploration, use the installed `codebase-memory` skill.\n";
