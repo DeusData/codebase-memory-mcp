@@ -16124,7 +16124,7 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
     if (root_length > SIZE_MAX - file_length - PAIR_LEN) {
         return;
     }
-    char *abs_path = malloc(root_length + file_length + PAIR_LEN);
+    char *abs_path = cbm_alloc(CBM_MEM_CLASS_OTHER, root_length + file_length + PAIR_LEN);
     if (!abs_path) {
         return;
     }
@@ -16137,7 +16137,7 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
      * followed) must not be read back into the response. Same guard the
      * snippet path already uses. */
     if (!root_containment_check(containment, abs_path)) {
-        free(abs_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, abs_path);
         return;
     }
 
@@ -16146,7 +16146,7 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
     } else if (context_lines > 0 && r->match_count > 0) {
         attach_context_result_source(doc, item, r, context_lines, abs_path);
     }
-    free(abs_path);
+    cbm_free(CBM_MEM_CLASS_OTHER, abs_path);
 }
 
 /* Aggregate hits by top-level directory. Directory keys are allocation-backed:
@@ -22521,7 +22521,9 @@ static bool mcp_snapshot_cancelled(void *context) {
 }
 
 /* Keep the tool's original format inside data. A JSON envelope makes the same
- * publication identity observable through MCP structuredContent and the CLI. */
+ * publication identity observable through MCP structuredContent and the CLI.
+ * Returns `result` itself when it is an error that stands; anything else is its
+ * replacement. Either way the caller keeps ownership of `result`. */
 static char *mcp_snapshot_result(char *result, const char *generation) {
     yyjson_doc *wire = result ? yyjson_read(result, strlen(result), 0) : NULL;
     yyjson_val *root = wire ? yyjson_doc_get_root(wire) : NULL;
@@ -22553,7 +22555,6 @@ static char *mcp_snapshot_result(char *result, const char *generation) {
     free(payload);
     yyjson_mut_doc_free(doc);
     yyjson_doc_free(wire);
-    free(result);
     return wrapped ? wrapped
                    : cbm_mcp_text_result("snapshot_unavailable: cannot encode evidence", true);
 }
@@ -22615,12 +22616,16 @@ static char *mcp_snapshot_finish(cbm_mcp_server_t *srv, mcp_snapshot_request_t *
         int checked = cbm_store_read_scope_check(snapshot->scope);
         int closed = cbm_store_read_scope_close(snapshot->scope);
         snapshot->discard_store = closed == CBM_STORE_SCOPE_DISCARD;
+        char *replacement = result;
         if (checked != CBM_STORE_OK || closed != CBM_STORE_OK) {
-            free(result);
-            result =
+            replacement =
                 cbm_mcp_text_result("snapshot_unavailable: read scope lost or cancelled", true);
         } else if (!snapshot->error) {
-            result = mcp_snapshot_result(result, snapshot->generation);
+            replacement = mcp_snapshot_result(result, snapshot->generation);
+        }
+        if (replacement != result) {
+            free(result);
+            result = replacement;
         }
     }
     if (snapshot->discard_store && srv) {
