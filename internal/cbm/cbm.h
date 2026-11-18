@@ -1437,6 +1437,11 @@ void cbm_extract_dbt(CBMExtractCtx *ctx);
 // parse past `?>` (#2000). Same length and line breaks as the input; returns
 // `source` itself when nothing needs rewriting. Defined in php_inline_html.c.
 const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int source_len);
+// C-family source with each `\` CR LF line splice rewritten as space `\` LF so
+// the grammars built on tree-sitter-c read it as they read the LF splice
+// (#1546). Same length and line breaks as the input; returns `source` itself
+// when there is no such splice. Defined in cbm.c.
+const char *cbm_c_mask_crlf_splices(CBMArena *arena, const char *source, int source_len);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);

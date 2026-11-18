@@ -307,6 +307,8 @@ static bool g_harness_spill = false;
 static int64_t g_harness_parked = -1;
 /* Opt-in: hand cbm_parallel_resolve the production Tier-2 C# registry. */
 static bool g_harness_cs_registry = false;
+/* Opt-in: the same for the Tier-2 C/C++ registry. */
+static bool g_harness_c_registry = false;
 
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
@@ -385,10 +387,14 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     if (g_harness_cs_registry && all_defs) {
         harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
     }
+    if (g_harness_c_registry && all_defs) {
+        harness_registries.c = cbm_c_build_cross_registry(&cross_arena, all_defs, def_count);
+    }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,
-                         g_harness_cs_registry ? &harness_registries
-                                               : NULL /* tests use per-file path */);
+                         g_harness_cs_registry || g_harness_c_registry
+                             ? &harness_registries
+                             : NULL /* tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);
@@ -4879,6 +4885,115 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     PASS();
 }
 
+/* #1546: the per-file extract parses a C-family file with each `\` CR LF line
+ * splice rewritten as space `\` LF. The cross-file C/C++ LSP pass reads the
+ * file again (the parallel driver from its retained copy, the sequential one
+ * from disk) and must read it the same way. o->run() after the string splice
+ * is a call only that pass resolves: the struct is declared in another file.
+ * LF is the control; with CRLF the cross pass used to see the rest of main.cpp
+ * as one ERROR region and lose the edge in both drivers. */
+static const char *const crlf_splice_files[][2] = {
+    {"other.h", "#ifndef OTHER_H\n"
+                "#define OTHER_H\n"
+                "struct ops { int (*run)(int); };\n"
+                "struct ops *get_ops(void);\n"
+                "#endif\n"},
+    {"other.cpp", "#include \"other.h\"\n"
+                  "static int run_impl(int x) { return x; }\n"
+                  "static struct ops the_ops = { run_impl };\n"
+                  "struct ops *get_ops(void)\n"
+                  "{\n"
+                  "    return &the_ops;\n"
+                  "}\n"},
+    {"main.cpp", "#include \"other.h\"\n"
+                 "void Middle(void)\n"
+                 "{\n"
+                 "    const wchar_t* s = L\"line 0\\r\\n\\\n"
+                 "line 1\\r\\n\";\n"
+                 "}\n"
+                 "\n"
+                 "int after_one(void)\n"
+                 "{\n"
+                 "    struct ops *o = get_ops();\n"
+                 "    return o->run(3);\n"
+                 "}\n"},
+};
+
+static int write_with_line_endings(const char *path, const char *lf_text, bool crlf) {
+    char *text = malloc(strlen(lf_text) * 2 + 1);
+    if (!text) {
+        return -1;
+    }
+    size_t n = 0;
+    for (const char *p = lf_text; *p; p++) {
+        if (crlf && *p == '\n') {
+            text[n++] = '\r';
+        }
+        text[n++] = *p;
+    }
+    text[n] = '\0';
+    int rc = th_write_file(path, text);
+    free(text);
+    return rc;
+}
+
+static bool crlf_splice_has_lsp_edge(const cbm_gbuf_t *gbuf) {
+    const cbm_gbuf_edge_t *edge =
+        gbuf ? find_call_edge_to_target_fragment(gbuf, "main.after_one", "ops.run") : NULL;
+    return edge && edge->properties_json &&
+           strstr(edge->properties_json, "\"strategy\":\"lsp") != NULL;
+}
+
+TEST(cross_file_cpp_lsp_after_crlf_string_splice_issue1546) {
+    enum { CRLF_SPLICE_FILES = 3 };
+    bool seq_edge[2] = {false};
+    bool par_edge[2] = {false};
+    for (int crlf = 0; crlf < 2; crlf++) {
+        char tmpdir[256];
+        snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_crlf_XXXXXX");
+        if (!cbm_mkdtemp(tmpdir)) {
+            FAIL("mkdtemp failed");
+        }
+        char paths[CRLF_SPLICE_FILES][512];
+        cbm_file_info_t files[CRLF_SPLICE_FILES] = {0};
+        bool written = true;
+        for (int i = 0; i < CRLF_SPLICE_FILES; i++) {
+            snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, crlf_splice_files[i][0]);
+            written = written &&
+                      write_with_line_endings(paths[i], crlf_splice_files[i][1], crlf != 0) == 0;
+            files[i].path = paths[i];
+            files[i].rel_path = (char *)crlf_splice_files[i][0];
+            files[i].language = CBM_LANG_CPP;
+        }
+        if (!written) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write the CRLF splice fixture");
+        }
+        /* Both drivers resolve C/C++ against the shared Tier-2 registry, as
+         * production does; tests/test_c_lsp.c covers the per-file entry. */
+        cbm_gbuf_t *seq =
+            run_sequential_with_lsp_cross("cbm_crlf", tmpdir, files, CRLF_SPLICE_FILES);
+        g_harness_c_registry = true;
+        cbm_gbuf_t *par = run_parallel("cbm_crlf", tmpdir, files, CRLF_SPLICE_FILES, 2);
+        g_harness_c_registry = false;
+        seq_edge[crlf] = crlf_splice_has_lsp_edge(seq);
+        par_edge[crlf] = crlf_splice_has_lsp_edge(par);
+        if (!seq_edge[crlf] || !par_edge[crlf]) {
+            printf("  CRLF splice diagnostic (%s): sequential=%s parallel=%s\n",
+                   crlf ? "CRLF" : "LF", seq_edge[crlf] ? "present" : "absent",
+                   par_edge[crlf] ? "present" : "absent");
+        }
+        cbm_gbuf_free(seq);
+        cbm_gbuf_free(par);
+        th_rmtree(tmpdir);
+    }
+    ASSERT_TRUE(seq_edge[0]);
+    ASSERT_TRUE(par_edge[0]);
+    ASSERT_TRUE(seq_edge[1]);
+    ASSERT_TRUE(par_edge[1]);
+    PASS();
+}
+
 /* issue #294: gRPC service-name extraction must (a) preserve the canonical
  * proto service name (FooServiceClient → FooService, not Foo) and (b) only
  * match real stub/client types — ordinary receiver vars must NOT produce
@@ -6138,6 +6253,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
+    RUN_TEST(cross_file_cpp_lsp_after_crlf_string_splice_issue1546);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_rust_external_target_contract);
     RUN_TEST(parallel_java_external_target_contract);
