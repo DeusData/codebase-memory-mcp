@@ -133,24 +133,34 @@ static const CBMType *resolve_builtin_type(GoLSPContext *ctx, const char *name) 
  * in its body are not the package's types of those names: `func F[T any](x T)`
  * and `func F() { type T struct{...}; var t T }` in a package with its own T.
  * The walker types such a name as unknown (it abstains) instead of the
- * package-level type. A local type's scope starts at its declaration; one
- * declared in an inner block shadows for the rest of the function (an
- * abstention, never another answer). */
+ * package-level type. Each one is bound in the walker's own lexical scope
+ * under a key no identifier can spell ("#T"), so it holds exactly where Go's
+ * does: a type parameter for the function, a local type from its declaration
+ * to the end of its block or closure. */
+#define GO_SHADOW_KEY_MAX 256
+
+static bool go_shadow_key(const char *name, char *key) {
+    size_t n = name ? strlen(name) : 0;
+    if (n == 0 || n + 2 > GO_SHADOW_KEY_MAX) {
+        return false;
+    }
+    key[0] = '#';
+    memcpy(key + 1, name, n + 1);
+    return true;
+}
+
 static bool go_type_shadowed(const GoLSPContext *ctx, const char *name) {
-    return ctx->shadow_types && name && cbm_ht_get(ctx->shadow_types, name) != NULL;
+    char key[GO_SHADOW_KEY_MAX];
+    return go_shadow_key(name, key) && cbm_scope_contains(ctx->current_scope, key);
 }
 
 static void go_shadow_add(GoLSPContext *ctx, TSNode name_node) {
     char *name = ts_node_is_null(name_node) ? NULL : lsp_node_text(ctx, name_node);
-    if (!name || !name[0] || strcmp(name, "_") == 0) {
+    char key[GO_SHADOW_KEY_MAX];
+    if (!name || strcmp(name, "_") == 0 || !go_shadow_key(name, key)) {
         return;
     }
-    if (!ctx->shadow_types) {
-        ctx->shadow_types = cbm_ht_create(16);
-    }
-    if (ctx->shadow_types && !cbm_ht_get(ctx->shadow_types, name)) {
-        cbm_ht_set(ctx->shadow_types, name, name);
-    }
+    cbm_scope_bind(ctx->current_scope, cbm_arena_strdup(ctx->arena, key), cbm_type_unknown());
 }
 
 /* `[K comparable, V any]`: every name of every type_parameter_declaration. */
@@ -2211,10 +2221,9 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
 
     // The function's type parameters (and its receiver's) shadow the
-    // package's types of those names, in its signature and its body.
-    CBMHashTable *saved_shadow = ctx->shadow_types;
+    // package's types of those names, in its signature and its body (bound in
+    // the function scope just pushed).
     bool saved_in_function = ctx->in_function;
-    ctx->shadow_types = NULL;
     ctx->in_function = true;
     go_shadow_type_params(ctx, ts_node_child_by_field_name(func_node, "type_parameters", 15));
     if (strcmp(ts_node_type(func_node), "method_declaration") == 0) {
@@ -2333,8 +2342,6 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
 
     // Restore scope
     ctx->current_scope = saved_scope;
-    cbm_ht_free(ctx->shadow_types); /* NULL-safe */
-    ctx->shadow_types = saved_shadow;
     ctx->in_function = saved_in_function;
 }
 

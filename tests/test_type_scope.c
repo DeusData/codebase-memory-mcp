@@ -1672,6 +1672,34 @@ TEST(type_scope_go_function_declared_types_are_not_the_package_types) {
     return ts_twins("goshadow", go_shadowtype_files, CBM_LANG_GO, go_shadowtype_check);
 }
 
+/* A local type declared in an inner block or in a
+ * closure shadows the package's type only there (Go's block scope): after the
+ * `if` block and outside the closure, `T` is the package's again, whose
+ * embedded p1.E promotes Hello (`go run`: Block p1, Clo p2p1). Inside the
+ * closure the local T (embedding p2.E) gets no package edge. */
+static const ts_file_t go_blocktype_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"p1/e.go", "package p1\n\ntype E struct{}\n\nfunc (E) Hello() string { return \"p1\" }\n"},
+    {"p2/e.go", "package p2\n\ntype E struct{}\n\nfunc (E) Hello() string { return \"p2\" }\n"},
+    {"m/t.go", "package m\n\nimport \"example.com/demo/p1\"\n\ntype T struct{ p1.E }\n"},
+    {"m/use.go", "package m\n\nimport \"example.com/demo/p2\"\n\n"
+                 "func Block(c bool) string {\n\tif c {\n\t\ttype T struct{ p2.E }\n\t\tvar t T\n"
+                 "\t\t_ = t\n\t}\n\tvar t T\n\treturn t.Hello()\n}\n\n"
+                 "func Clo() string {\n\tf := func() string {\n\t\ttype T struct{ p2.E }\n"
+                 "\t\tvar t T\n\t\treturn t.Hello()\n\t}\n\tvar t T\n\treturn f() + t.Hello()\n}\n"},
+    {NULL, NULL}};
+
+static int go_blocktype_check(cbm_store_t *s, const char *project, const char *label) {
+    int block = ts_calls_to(s, project, "Block", "p1.E.Hello", NULL);
+    int clo = ts_calls_to(s, project, "Clo", "p1.E.Hello", NULL);
+    printf("  go block-local types (%s): Block p1=%d, Clo p1=%d\n", label, block, clo);
+    return !(block == 1 && clo == 1);
+}
+
+TEST(type_scope_go_local_types_shadow_only_their_block) {
+    return ts_twins("goblock", go_blocktype_files, CBM_LANG_GO, go_blocktype_check);
+}
+
 /* Round 3, the 63-field limit beside N4: a struct of 66 named fields whose
  * last two are typed. Every route registers every field now. */
 static const ts_file_t go_wide_files[] = {
@@ -2335,6 +2363,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_promotion_takes_the_shallowest_depth);
     RUN_TEST(type_scope_go_embedded_field_names_are_fields);
     RUN_TEST(type_scope_go_function_declared_types_are_not_the_package_types);
+    RUN_TEST(type_scope_go_local_types_shadow_only_their_block);
     RUN_TEST(type_scope_go_embedded_text_work_grows_linearly);
     RUN_TEST(type_scope_go_struct_fields_have_no_limit);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);

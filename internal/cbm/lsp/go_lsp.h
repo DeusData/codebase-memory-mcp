@@ -23,10 +23,8 @@ typedef struct {
 
     // Current function context
     const char* enclosing_func_qn;
-    // Type names the function being walked declares itself -- its type
-    // parameters (and its receiver's) and the local types declared so far:
-    // they never name the package's type of that name. NULL when none.
-    struct CBMHashTable* shadow_types;
+    // Walking a function body: a type declaration met there shadows the
+    // package's type of its name in the current block (go_shadow_add).
     bool in_function;
     const char* package_qn;  // module QN for this file
     const char* rel_path;    // repo-relative file path: init() QN suffix (#1910); NULL = flat
