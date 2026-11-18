@@ -885,7 +885,7 @@ TEST_GO_LSP_SRCS = tests/test_go_lsp.c
 
 TEST_C_LSP_SRCS = tests/test_c_lsp.c
 
-TEST_PHP_LSP_SRCS = tests/test_php_lsp.c
+TEST_PHP_LSP_SRCS = tests/test_php_lsp.c tests/test_member_walk.c
 
 TEST_CS_LSP_SRCS = tests/test_cs_lsp.c
 
