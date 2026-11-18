@@ -1418,6 +1418,159 @@ TEST(type_scope_go_promotion_takes_the_shallowest_depth) {
     return ts_twins("godepth", go_depth_files, CBM_LANG_GO, go_depth_check);
 }
 
+/* Round 3, N1: the unqualified type name of an embedded field is a field of
+ * its depth (Go spec). srv.Server{ Config; base.Handler } with Handler's own
+ * field `Config *base.Config`: s.Config is srv.Config at depth 0, in another
+ * package and in one of srv's files (main's right edge there stays); an
+ * embedded func type `Logger` shadows base.W's method Logger one level down;
+ * the same in one file; an embedded type the project does not have
+ * (sync.Mutex) still shadows a deeper `Mutex`; and build variants of one
+ * struct, one of which declares a field `Item` the other does not, select no
+ * deeper `Item`. `go run` agrees on each. */
+static const ts_file_t go_embfield_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"base/base.go", "package base\n\ntype Config struct{ n int }\n\n"
+                     "func (c *Config) Validate() string { return \"base\" }\n\n"
+                     "type Handler struct {\n\tConfig *Config\n}\n\n"
+                     "type W struct{ n int }\n\nfunc (w W) Logger(s string) string { return s }\n\n"
+                     "type M struct{ n int }\n\nfunc (m *M) Lock() {}\n\n"
+                     "type Locker struct {\n\tMutex *M\n}\n\n"
+                     "type Item struct{ n int }\n\nfunc (i *Item) Do() string { return \"item\" }\n\n"
+                     "type Item2 struct{ n int }\n\nfunc (i *Item2) Do() string { return \"item2\" }\n\n"
+                     "type Deep struct {\n\tItem *Item2\n}\n"},
+    {"srv/config.go", "package srv\n\ntype Config struct{ port int }\n\n"
+                      "func (c Config) Validate() string { return \"srv\" }\n"},
+    {"srv/server.go", "package srv\n\nimport (\n\t\"sync\"\n\n\t\"example.com/demo/base\"\n)\n\n"
+                      "type Server struct {\n\tConfig\n\tbase.Handler\n}\n\n"
+                      "type Logger func(string) string\n\n"
+                      "type Outer struct {\n\tLogger\n\tbase.W\n}\n\n"
+                      "type U struct {\n\tsync.Mutex\n\tbase.Locker\n}\n"},
+    {"srv/local.go", "package srv\n\nfunc Local(s *Server) string { return s.Config.Validate() }\n"},
+    {"srv/v_linux.go", "//go:build linux\n\npackage srv\n\nimport \"example.com/demo/base\"\n\n"
+                       "type V struct {\n\tItem *base.Item\n\tbase.Deep\n}\n"},
+    {"srv/v_other.go", "//go:build !linux\n\npackage srv\n\nimport \"example.com/demo/base\"\n\n"
+                       "type V struct {\n\tbase.Deep\n}\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/srv\"\n\n"
+                   "func Run(s *srv.Server) string { return s.Config.Validate() }\n\n"
+                   "func Log(o srv.Outer) string { return o.Logger(\"x\") }\n\n"
+                   "func Lock(u *srv.U) { u.Mutex.Lock() }\n\n"
+                   "func Use(v *srv.V) string { return v.Item.Do() }\n"},
+    {"one/one.go", "package one\n\ntype Cfg struct{ n int }\n\nfunc (c Cfg) Check() string { return \"cfg\" }\n\n"
+                   "type Other struct{ n int }\n\nfunc (o Other) Check() string { return \"other\" }\n\n"
+                   "type H struct {\n\tCfg Other\n}\n\n"
+                   "type S struct {\n\tCfg\n\tH\n}\n\n"
+                   "func Here(s *S) string { return s.Cfg.Check() }\n"},
+    {NULL, NULL}};
+
+static int go_embfield_check(cbm_store_t *s, const char *project, const char *label) {
+    int run_right = ts_calls_to(s, project, "Run", "srv.Config.Validate", NULL);
+    int local_right = ts_calls_to(s, project, "Local", "srv.Config.Validate", NULL);
+    int wrong = ts_calls_to(s, project, "Run", "base.Config.Validate", NULL) +
+                ts_calls_to(s, project, "Local", "base.Config.Validate", NULL) +
+                ts_calls_to(s, project, "Log", "base.W.Logger", NULL) +
+                ts_calls_to(s, project, "Lock", "base.M.Lock", NULL) +
+                ts_calls_to(s, project, "Use", "base.Item2.Do", NULL) +
+                ts_calls_to(s, project, "Here", "one.Other.Check", NULL);
+    int here_right = ts_calls_to(s, project, "Here", "one.Cfg.Check", NULL);
+    printf("  go embedded field names (%s): Run=%d Local=%d Here=%d, wrong=%d\n", label, run_right,
+           local_right, here_right, wrong);
+    return !(run_right == 1 && local_right == 1 && here_right <= 1 && wrong == 0);
+}
+
+TEST(type_scope_go_embedded_field_names_are_fields) {
+    return ts_twins("goembfield", go_embfield_files, CBM_LANG_GO, go_embfield_check);
+}
+
+/* Round 3, N3: a type the function declares itself -- a local `type T` and a
+ * type parameter, of a function, of a generic receiver, of a generic type --
+ * is never the package's T, whose embedded p1.E would promote Hello: not in
+ * the walker (Local, Generic, Direct: main's own false `Direct -> m.T.Own`
+ * goes too) and not through another package's signatures (Call through a
+ * generic result, Boxed through a generic method's result). Pkg uses the
+ * package's T and keeps its promoted edge. `go run` agrees on each. */
+static const ts_file_t go_shadowtype_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"p1/e.go", "package p1\n\ntype E struct{}\n\nfunc (E) Hello() string { return \"p1\" }\n"},
+    {"p2/e.go", "package p2\n\ntype E struct{}\n\nfunc (E) Hello() string { return \"p2\" }\n\n"
+                "func (E) Own() string { return \"p2own\" }\n"},
+    {"m/t.go", "package m\n\nimport \"example.com/demo/p1\"\n\ntype T struct{ p1.E }\n\n"
+               "func (T) Own() string { return \"m\" }\n"},
+    {"m/use.go", "package m\n\nimport \"example.com/demo/p2\"\n\n"
+                 "func Local() string {\n\ttype T struct{ p2.E }\n\tvar t T\n\treturn t.Hello()\n}\n\n"
+                 "func Generic[T interface{ Hello() string }](x T) string { return x.Hello() }\n\n"
+                 "func Direct[T interface{ Own() string }](x T) string { return x.Own() }\n\n"
+                 "func Pkg() string {\n\tvar t T\n\treturn t.Hello()\n}\n\n"
+                 "func First[T any](xs []T) T { return xs[0] }\n\n"
+                 "type Box[T any] struct{ v T }\n\n"
+                 "func (b Box[T]) Get() T { return b.v }\n"},
+    {"app/app.go", "package app\n\nimport (\n\t\"example.com/demo/m\"\n\t\"example.com/demo/p2\"\n)\n\n"
+                   "func Call() string { return m.First([]p2.E{{}}).Hello() }\n\n"
+                   "func Boxed() string { return m.Box[p2.E]{}.Get().Hello() }\n"},
+    {NULL, NULL}};
+
+static int go_shadowtype_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "Local", "p1.E.Hello", NULL) +
+                ts_calls_to(s, project, "Generic", "p1.E.Hello", NULL) +
+                ts_calls_to(s, project, "Direct", "m.T.Own", NULL) +
+                ts_calls_to(s, project, "Call", "p1.E.Hello", NULL) +
+                ts_calls_to(s, project, "Boxed", "p1.E.Hello", NULL);
+    int pkg = ts_calls_to(s, project, "Pkg", "p1.E.Hello", NULL);
+    printf("  go function-declared types (%s): wrong=%d, package T Pkg=%d\n", label, wrong, pkg);
+    return !(wrong == 0 && pkg == 1);
+}
+
+TEST(type_scope_go_function_declared_types_are_not_the_package_types) {
+    return ts_twins("goshadow", go_shadowtype_files, CBM_LANG_GO, go_shadowtype_check);
+}
+
+/* Round 3, the 63-field limit beside N4: a struct of 66 named fields whose
+ * last two are typed. Every route registers every field now. */
+static const ts_file_t go_wide_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"kind/kind.go", "package kind\n\ntype K struct{}\n\nfunc (K) Name() string { return \"k\" }\n\n"
+                     "type L struct{}\n\nfunc (L) Name() string { return \"l\" }\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/wide\"\n\n"
+                   "func Run(w *wide.Wide) string { return w.Last.Name() }\n"},
+    {NULL, NULL}};
+
+static int go_wide_check(cbm_store_t *s, const char *project, const char *label) {
+    int run = ts_calls_to(s, project, "Run", "kind.L.Name", NULL);
+    int use = ts_calls_to(s, project, "Use", "kind.K.Name", NULL) +
+              ts_calls_to(s, project, "Use", "kind.L.Name", NULL);
+    printf("  go wide struct (%s): Run=%d Use=%d\n", label, run, use);
+    return !(run == 1 && use == 2);
+}
+
+static char g_go_wide_source[4096];
+static char g_go_wide_edited[4096];
+
+static const char *go_wide_source(char *buf, size_t cap, bool edited) {
+    size_t at = (size_t)snprintf(buf, cap,
+                                 "package wide\n\nimport \"example.com/demo/kind\"\n\ntype Wide struct {\n");
+    for (int i = 0; i < 64; i++) {
+        at += (size_t)snprintf(buf + at, cap - at, "\tF%d int\n", i);
+    }
+    snprintf(buf + at, cap - at,
+             "\tLate kind.K\n\tLast kind.L\n}\n\nfunc Use(w *Wide) string {\n\t%s\n}\n",
+             edited ? "s := w.Late.Name() + w.Last.Name()\n\treturn s"
+                    : "return w.Late.Name() + w.Last.Name()");
+    return buf;
+}
+
+static void go_wide_fixture(ts_file_t *files) {
+    int n = (int)(sizeof(go_wide_files) / sizeof(go_wide_files[0])) - 1;
+    memcpy(files, go_wide_files, (size_t)n * sizeof(ts_file_t));
+    files[n] = (ts_file_t){"wide/wide.go",
+                           go_wide_source(g_go_wide_source, sizeof(g_go_wide_source), false)};
+    files[n + 1] = (ts_file_t){NULL, NULL};
+}
+
+TEST(type_scope_go_struct_fields_have_no_limit) {
+    ts_file_t files[8];
+    go_wide_fixture(files);
+    return ts_twins("gowide", files, CBM_LANG_GO, go_wide_check);
+}
+
 /* ── Full index versus every incremental route ───────────────────── */
 
 static void ts_listing_append(sqlite3 *db, const char *sql, const char *project, char **buf,
@@ -1729,6 +1882,68 @@ TEST(type_scope_incremental_named_type_embed_change_matches_full) {
     PASS();
 }
 
+/* Round 3, N4 (the review's go-emb16): a body edit of the file declaring a
+ * struct of 17 embedded types is a one-file repair, and the repaired graph is
+ * the full index's: the per-file route takes the struct's embedded types from
+ * its definition, as the full index does, all of them (it kept 15). */
+static char g_go_emb_parts[4096];
+static char g_go_emb_big[2048];
+static char g_go_emb_big_edited[2048];
+
+static void go_emb_sources(void) {
+    size_t at = (size_t)snprintf(g_go_emb_parts, sizeof(g_go_emb_parts), "package big\n\n");
+    size_t fa = 0;
+    char fields[512];
+    for (int i = 0; i < 17; i++) {
+        at += (size_t)snprintf(g_go_emb_parts + at, sizeof(g_go_emb_parts) - at,
+                               "type E%d struct{}\n\nfunc (E%d) M%d() string { return \"%d\" }\n\n", i,
+                               i, i, i);
+        fa += (size_t)snprintf(fields + fa, sizeof(fields) - fa, "\tE%d\n", i);
+    }
+    snprintf(g_go_emb_big, sizeof(g_go_emb_big),
+             "package big\n\ntype Big struct {\n%s}\n\n"
+             "func Use(b *Big) string {\n\treturn b.M16() + b.M14()\n}\n",
+             fields);
+    snprintf(g_go_emb_big_edited, sizeof(g_go_emb_big_edited),
+             "package big\n\ntype Big struct {\n%s}\n\n"
+             "func Use(b *Big) string {\n\ts := b.M16() + b.M14()\n\treturn s\n}\n",
+             fields);
+}
+
+TEST(type_scope_incremental_many_embedded_types_match_full) {
+    go_emb_sources();
+    const ts_file_t files[] = {
+        {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+        {"big/parts.go", g_go_emb_parts},
+        {"big/big.go", g_go_emb_big},
+        {"big/use2.go", "package big\n\nfunc Use2(b *Big) string { return b.M16() }\n"},
+        {"decoy/d.go", "package decoy\n\ntype D struct{}\n\nfunc (D) M16() string { return \"d\" }\n\n"
+                       "func (D) M14() string { return \"d\" }\n"},
+        {"app/app.go", "package app\n\nimport \"example.com/demo/big\"\n\n"
+                       "func Run(b *big.Big) string { return b.M16() }\n"},
+        {NULL, NULL}};
+    const ts_file_t edit[] = {{"big/big.go", g_go_emb_big_edited}, {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 40, edit, "go 17 embedded types");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+/* The same for a struct of 66 fields (the 63-field limit beside N4). */
+TEST(type_scope_incremental_many_fields_match_full) {
+    ts_file_t files[8];
+    go_wide_fixture(files);
+    const ts_file_t edit[] = {
+        {"wide/wide.go", go_wide_source(g_go_wide_edited, sizeof(g_go_wide_edited), true)},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 40, edit, "go 66 fields");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
 /* The gate is narrow: a signature change of another definition in the
  * declaring file stays a repair. */
 TEST(type_scope_incremental_other_def_edit_stays_a_repair) {
@@ -1815,6 +2030,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_bare_names_and_own_module);
     RUN_TEST(type_scope_python_own_module);
     RUN_TEST(type_scope_python_enclosing_scopes);
+    RUN_TEST(type_scope_python_class_body_bindings);
     RUN_TEST(type_scope_python_type_parameters);
     RUN_TEST(type_scope_python_unlisted_bindings_get_none);
     RUN_TEST(type_scope_step_work_grows_linearly);
@@ -1825,6 +2041,8 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_type_parameter_is_no_import);
     RUN_TEST(type_scope_python_return_types);
     RUN_TEST(type_scope_python_nested_class_is_not_the_module_class);
+    RUN_TEST(type_scope_python_class_body_bindings_shadow_the_module);
+    RUN_TEST(type_scope_python_class_and_module_of_one_qn);
     RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
     RUN_TEST(type_scope_python_type_parameter_is_no_import);
     RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_per_file);
@@ -1837,16 +2055,18 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_build_variant_values_stay_typed);
     RUN_TEST(type_scope_go_embedded_members_promote);
     RUN_TEST(type_scope_go_promotion_takes_the_shallowest_depth);
+    RUN_TEST(type_scope_go_embedded_field_names_are_fields);
+    RUN_TEST(type_scope_go_function_declared_types_are_not_the_package_types);
+    RUN_TEST(type_scope_go_struct_fields_have_no_limit);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go_values);
     RUN_TEST(type_scope_incremental_body_edit_stays_one_file);
     RUN_TEST(type_scope_incremental_named_type_field_change_matches_full);
     RUN_TEST(type_scope_incremental_named_type_embed_change_matches_full);
+    RUN_TEST(type_scope_incremental_many_embedded_types_match_full);
+    RUN_TEST(type_scope_incremental_many_fields_match_full);
     RUN_TEST(type_scope_incremental_type_shape_changes_match_full);
     RUN_TEST(type_scope_incremental_other_def_edit_stays_a_repair);
     RUN_TEST(type_scope_incremental_python_body_edits);
     RUN_TEST(type_scope_incremental_python_declaring_change_matches_full);
 }
-    RUN_TEST(type_scope_python_class_body_bindings);
-    RUN_TEST(type_scope_python_class_body_bindings_shadow_the_module);
-    RUN_TEST(type_scope_python_class_and_module_of_one_qn);

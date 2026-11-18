@@ -33,6 +33,8 @@ static const CBMType *go_lookup_field(GoLSPContext *ctx, const char *type_qn,
                                       const char *field_name, int depth);
 static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, TSNode root,
                                          const char *source, const char *module_qn);
+static const char *go_embedded_spelling(const char **next, size_t *len);
+static const char *go_embedded_field_name(CBMArena *a, const char *s, size_t len);
 
 // --- Initialization ---
 
@@ -125,6 +127,80 @@ static const CBMType *resolve_builtin_type(GoLSPContext *ctx, const char *name) 
 
 // --- go_parse_type_node: AST type node -> CBMType ---
 
+/* ── Type names a function declares itself ────────────────────────────
+ *
+ * A function's type parameters (and its receiver's) and the types it declares
+ * in its body are not the package's types of those names: `func F[T any](x T)`
+ * and `func F() { type T struct{...}; var t T }` in a package with its own T.
+ * The walker types such a name as unknown (it abstains) instead of the
+ * package-level type. A local type's scope starts at its declaration; one
+ * declared in an inner block shadows for the rest of the function (an
+ * abstention, never another answer). */
+static bool go_type_shadowed(const GoLSPContext *ctx, const char *name) {
+    return ctx->shadow_types && name && cbm_ht_get(ctx->shadow_types, name) != NULL;
+}
+
+static void go_shadow_add(GoLSPContext *ctx, TSNode name_node) {
+    char *name = ts_node_is_null(name_node) ? NULL : lsp_node_text(ctx, name_node);
+    if (!name || !name[0] || strcmp(name, "_") == 0) {
+        return;
+    }
+    if (!ctx->shadow_types) {
+        ctx->shadow_types = cbm_ht_create(16);
+    }
+    if (ctx->shadow_types && !cbm_ht_get(ctx->shadow_types, name)) {
+        cbm_ht_set(ctx->shadow_types, name, name);
+    }
+}
+
+/* `[K comparable, V any]`: every name of every type_parameter_declaration. */
+static void go_shadow_type_params(GoLSPContext *ctx, TSNode list) {
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode decl = ts_node_named_child(list, i);
+        if (strcmp(ts_node_type(decl), "type_parameter_declaration") != 0) {
+            continue;
+        }
+        uint32_t cc = ts_node_child_count(decl);
+        for (uint32_t k = 0; k < cc; k++) {
+            const char *field = ts_node_field_name_for_child(decl, k);
+            if (field && strcmp(field, "name") == 0) {
+                go_shadow_add(ctx, ts_node_child(decl, k));
+            }
+        }
+    }
+}
+
+/* A generic receiver `(s *Set[K, V])` declares K and V: the type identifiers
+ * inside the receiver type's type arguments. */
+static void go_shadow_receiver_params(GoLSPContext *ctx, TSNode node, bool in_args, int depth) {
+    if (ts_node_is_null(node) || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (in_args && strcmp(kind, "type_identifier") == 0) {
+        go_shadow_add(ctx, node);
+        return;
+    }
+    bool args = in_args || strcmp(kind, "type_arguments") == 0;
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        go_shadow_receiver_params(ctx, ts_node_named_child(node, i), args, depth + 1);
+    }
+}
+
+/* `type T struct{...}` / `type T = U` inside the function being walked. */
+static void go_shadow_declared_types(GoLSPContext *ctx, TSNode decl) {
+    uint32_t n = ts_node_named_child_count(decl);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode spec = ts_node_named_child(decl, i);
+        const char *sk = ts_node_type(spec);
+        if (strcmp(sk, "type_spec") == 0 || strcmp(sk, "type_alias") == 0) {
+            go_shadow_add(ctx, ts_node_child_by_field_name(spec, "name", 4));
+        }
+    }
+}
+
 const CBMType *go_parse_type_node(GoLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -136,6 +212,8 @@ const CBMType *go_parse_type_node(GoLSPContext *ctx, TSNode node) {
         char *name = lsp_node_text(ctx, node);
         if (!name)
             return cbm_type_unknown();
+        if (go_type_shadowed(ctx, name))
+            return cbm_type_unknown(); /* the function's own T, not the package's */
         const CBMType *builtin = resolve_builtin_type(ctx, name);
         if (builtin)
             return builtin;
@@ -430,6 +508,9 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
         const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
         if (cbm_scope_contains(ctx->current_scope, name))
             return t ? t : cbm_type_unknown();
+        // A type the function declares itself (a conversion `T(x)`)
+        if (go_type_shadowed(ctx, name))
+            return cbm_type_unknown();
 
         // A package-level function or value (of any file of the package)
         const CBMType *st =
@@ -1635,6 +1716,10 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
         go_walk_func_literal(ctx, node);
         return;
     }
+    /* A type declared in the function shadows the package's from here on. */
+    if (ctx->in_function && strcmp(kind, "type_declaration") == 0) {
+        go_shadow_declared_types(ctx, node);
+    }
 
     // Process statements to build scope
     go_process_statement(ctx, node);
@@ -2125,6 +2210,18 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
     CBMScope *saved_scope = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
 
+    // The function's type parameters (and its receiver's) shadow the
+    // package's types of those names, in its signature and its body.
+    CBMHashTable *saved_shadow = ctx->shadow_types;
+    bool saved_in_function = ctx->in_function;
+    ctx->shadow_types = NULL;
+    ctx->in_function = true;
+    go_shadow_type_params(ctx, ts_node_child_by_field_name(func_node, "type_parameters", 15));
+    if (strcmp(ts_node_type(func_node), "method_declaration") == 0) {
+        go_shadow_receiver_params(ctx, ts_node_child_by_field_name(func_node, "receiver", 8), false,
+                                  0);
+    }
+
     // Bind parameters into scope (including variadic)
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);
     if (!ts_node_is_null(params)) {
@@ -2236,6 +2333,9 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
 
     // Restore scope
     ctx->current_scope = saved_scope;
+    cbm_ht_free(ctx->shadow_types); /* NULL-safe */
+    ctx->shadow_types = saved_shadow;
+    ctx->in_function = saved_in_function;
 }
 
 // --- Process entire file ---
@@ -2701,12 +2801,20 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                 if (ts_node_is_null(field_list))
                     continue;
 
-                // Scan field_declarations for embeds and named fields
-                const char *embeds[16];
+                // Scan field_declarations for embeds and named fields: all of
+                // them (no count decides what the registry holds). An embedded
+                // type is also a field named by its unqualified type name.
+                uint32_t fl_cap = ts_node_child_count(field_list) * 2 + 1;
+                const char **embeds =
+                    (const char **)cbm_arena_alloc(arena, fl_cap * sizeof(const char *));
                 int embed_count = 0;
-                const char *fld_names[64];
-                const CBMType *fld_types[64];
+                const char **fld_names =
+                    (const char **)cbm_arena_alloc(arena, fl_cap * sizeof(const char *));
+                const CBMType **fld_types =
+                    (const CBMType **)cbm_arena_alloc(arena, fl_cap * sizeof(const CBMType *));
                 int fld_count = 0;
+                if (!embeds || !fld_names || !fld_types)
+                    continue;
 
                 // Create a temporary LSP context for parsing field types
                 GoLSPContext tmp_ctx;
@@ -2730,18 +2838,24 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
                     if (ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         // Embedded field: has type but no name
-                        if (embed_count < 15) {
-                            char *embed_text = cbm_node_text(arena, ftype, source);
-                            if (embed_text && embed_text[0]) {
-                                const char *et = embed_text;
-                                while (*et == '*')
-                                    et++;
-                                embeds[embed_count++] =
-                                    cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                        char *embed_text = cbm_node_text(arena, ftype, source);
+                        if (embed_text && embed_text[0]) {
+                            const char *et = embed_text;
+                            while (*et == '*')
+                                et++;
+                            const char *eqn = cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                            embeds[embed_count++] = eqn;
+                            size_t elen = 0;
+                            const char *enext = embed_text;
+                            const char *es = go_embedded_spelling(&enext, &elen);
+                            const char *ename = es ? go_embedded_field_name(arena, es, elen) : NULL;
+                            if (ename && eqn) {
+                                fld_names[fld_count] = ename;
+                                fld_types[fld_count] = cbm_type_named(arena, eqn);
+                                fld_count++;
                             }
                         }
-                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) &&
-                               fld_count < 63) {
+                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         // Named field: name + type
                         char *fn = cbm_node_text(arena, fname, source);
                         if (fn && fn[0]) {
@@ -2922,6 +3036,51 @@ static CBMHashTable *go_value_qn_counts(CBMArena *a, const CBMLSPDef *defs, int 
  * (type_scope.h), or for a bare name the declaring package's own type; a
  * spelling neither gives is dropped. This is the one Go-specific step on top
  * of the shared layer. */
+/* One embedded spelling of a '|'-joined list, without its `*` and its type
+ * arguments (a generic instance names its type): sets *len, returns its
+ * start, or NULL at the end of the list. *next moves past it. */
+static const char *go_embedded_spelling(const char **next, size_t *len) {
+    const char *p = *next;
+    if (!p || !*p) {
+        return NULL;
+    }
+    const char *bar = strchr(p, '|');
+    size_t n = bar ? (size_t)(bar - p) : strlen(p);
+    *next = bar ? bar + 1 : p + n;
+    while (n > 0 && *p == '*') {
+        p++;
+        n--;
+    }
+    const char *bracket = memchr(p, '[', n);
+    *len = bracket ? (size_t)(bracket - p) : n;
+    return p;
+}
+
+/* The QN of one embedded spelling: its identity in the declaring file's
+ * scope, or for a bare name the declaring package's own type; NULL when
+ * neither gives one. */
+static const char *go_embedded_qn(CBMArena *a, const char *s, size_t len, const char *def_mod,
+                                  const cbm_type_scope_index_t *scope_ix) {
+    const char *qn = len ? cbm_type_scope_find(scope_ix, s, len) : NULL;
+    if (!qn && len && !memchr(s, '.', len) && def_mod && def_mod[0]) {
+        qn = cbm_arena_sprintf(a, "%s.%.*s", def_mod, (int)len, s);
+    }
+    return qn;
+}
+
+/* The field name an embedded spelling declares: Go's unqualified type name
+ * (`pkg.T` -> `T`). NULL when it has none. */
+static const char *go_embedded_field_name(CBMArena *a, const char *s, size_t len) {
+    const char *name = s;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '.') {
+            name = s + i + 1;
+        }
+    }
+    size_t n = len - (size_t)(name - s);
+    return n ? cbm_arena_strndup(a, name, n) : NULL;
+}
+
 static const char **go_embedded_qns(CBMArena *a, const char *embedded, const char *def_mod,
                                     const cbm_type_scope_index_t *scope_ix) {
     if (!embedded || !embedded[0]) {
@@ -2936,29 +3095,90 @@ static const char **go_embedded_qns(CBMArena *a, const char *embedded, const cha
         return NULL;
     }
     int n = 0;
-    for (const char *p = embedded; *p;) {
-        const char *bar = strchr(p, '|');
-        size_t len = bar ? (size_t)(bar - p) : strlen(p);
-        const char *s = p;
-        while (len > 0 && *s == '*') {
-            s++;
-            len--;
-        }
-        const char *bracket = memchr(s, '[', len); /* a generic instance: its type */
-        if (bracket) {
-            len = (size_t)(bracket - s);
-        }
-        const char *qn = len ? cbm_type_scope_find(scope_ix, s, len) : NULL;
-        if (!qn && len && !memchr(s, '.', len) && def_mod && def_mod[0]) {
-            qn = cbm_arena_sprintf(a, "%s.%.*s", def_mod, (int)len, s);
-        }
+    size_t len = 0;
+    for (const char *next = embedded, *s; (s = go_embedded_spelling(&next, &len)) != NULL;) {
+        const char *qn = go_embedded_qn(a, s, len, def_mod, scope_ix);
         if (qn) {
             out[n++] = qn;
         }
-        p = bar ? bar + 1 : p + strlen(p);
     }
     out[n] = NULL;
     return n > 0 ? out : NULL;
+}
+
+/* Append fields to rt (a name rt already declares keeps its entry). One hash
+ * set of the names, so the cost is linear in the fields. */
+static void go_append_fields(CBMArena *a, CBMRegisteredType *rt, const char *const *names,
+                             const CBMType *const *types, int n) {
+    if (n <= 0) {
+        return;
+    }
+    int had = 0;
+    while (rt->field_names && rt->field_names[had]) {
+        had++;
+    }
+    const char **out_names = (const char **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(char *));
+    const CBMType **out_types =
+        (const CBMType **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(CBMType *));
+    CBMHashTable *present = cbm_ht_create((uint32_t)(had + n + 8));
+    if (!out_names || !out_types || !present) {
+        cbm_ht_free(present);
+        return;
+    }
+    int count = 0;
+    for (int i = 0; i < had; i++) {
+        out_names[count] = rt->field_names[i];
+        out_types[count++] = rt->field_types ? rt->field_types[i] : NULL;
+        cbm_ht_set(present, rt->field_names[i], (void *)1);
+    }
+    for (int i = 0; i < n; i++) {
+        if (!names[i] || cbm_ht_get(present, names[i])) {
+            continue;
+        }
+        cbm_ht_set(present, names[i], (void *)1);
+        out_names[count] = names[i];
+        out_types[count++] = types[i] ? types[i] : cbm_type_unknown();
+    }
+    cbm_ht_free(present);
+    out_names[count] = NULL;
+    out_types[count] = NULL;
+    rt->field_names = out_names;
+    rt->field_types = out_types;
+}
+
+/* Go's selector rule names an embedded field by its unqualified type name, at
+ * the embedding type's depth: `s.Config` is the embedded Config even where an
+ * embedded type has a field Config one level down, and a method of that name
+ * one level down is shadowed by it. Each embedded spelling of `embedded`
+ * becomes a field of rt: typed as the embedded type when `typed` and its QN is
+ * known, else of unknown type (it shadows, and answers nothing). */
+static void go_add_embedded_fields(CBMArena *a, CBMRegisteredType *rt, const char *embedded,
+                                   const char *def_mod, const cbm_type_scope_index_t *scope_ix,
+                                   bool typed) {
+    if (!embedded || !embedded[0] || rt->is_interface) {
+        return;
+    }
+    int count = 1;
+    for (const char *p = embedded; *p; p++) {
+        count += *p == '|';
+    }
+    const char **names = (const char **)cbm_arena_alloc(a, (size_t)count * sizeof(char *));
+    const CBMType **types = (const CBMType **)cbm_arena_alloc(a, (size_t)count * sizeof(CBMType *));
+    if (!names || !types) {
+        return;
+    }
+    int n = 0;
+    size_t len = 0;
+    for (const char *next = embedded, *s; (s = go_embedded_spelling(&next, &len)) != NULL;) {
+        const char *name = go_embedded_field_name(a, s, len);
+        if (!name) {
+            continue;
+        }
+        const char *qn = typed ? go_embedded_qn(a, s, len, def_mod, scope_ix) : NULL;
+        names[n] = name;
+        types[n++] = qn ? cbm_type_named(a, qn) : cbm_type_unknown();
+    }
+    go_append_fields(a, rt, names, types, n);
 }
 
 /* A package-level value (a Go `var`/`const` Variable def whose declaration or
@@ -3051,14 +3271,12 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
                              const cbm_type_scope_index_t *scope_ix, const char ***names_out,
                              const CBMType ***types_out) {
 
-    // Count fields
+    // Count fields: all of them (no count decides which fields a struct has)
     int count = 1;
     for (const char *p = field_defs; *p; p++) {
         if (*p == '|')
             count++;
     }
-    if (count > 63)
-        count = 63;
 
     const char **names = (const char **)cbm_arena_alloc(arena, (count + 1) * sizeof(const char *));
     const CBMType **types =
@@ -3108,14 +3326,22 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
  *     name means the same type (its identity, or the package's own type);
  *   - the embedded types when every definition embeds the same types.
  * Build variants of one struct keep what they share; `foo` and `foo_test`
- * declaring different structs of one name keep only what agrees. */
+ * declaring different structs of one name keep only what agrees. A name any
+ * definition declares as a field (named or embedded) is still a field of the
+ * QN at its depth, of unknown type where they do not agree, so no deeper
+ * member of that name is selected (go_type_qn_shadow). */
 typedef struct {
     const CBMLSPDef *first;
     int count;                /* definitions of the QN */
     const char *first_embeds; /* the first definition's embedded QNs, '|'-joined */
     bool embeds_differ;
     bool fields_done;
-    const char *fields; /* count > 1: the fields every definition agrees on, or NULL */
+    const char *fields;    /* count > 1: the fields every definition agrees on, or NULL */
+    const CBMLSPDef **all; /* count > 1: every definition of the QN */
+    int all_cap;
+    bool shadow_done;
+    const char **shadow_names; /* every field name some definition declares */
+    int shadow_count;
 } go_type_qn_t;
 
 /* What a field type text means in one definition: the part the parser looks
@@ -3132,10 +3358,24 @@ static const char *go_join_embeds(CBMArena *a, const CBMLSPDef *d) {
     const char *mod = d->def_module_qn ? d->def_module_qn : "";
     const char **qns =
         go_embedded_qns(a, d->embedded_types, mod, cbm_type_scope_index(a, d->type_scope));
-    const char *out = "";
+    size_t total = 1;
     for (int i = 0; qns && qns[i]; i++) {
-        out = cbm_arena_sprintf(a, "%s%s%s", out, i ? "|" : "", qns[i]);
+        total += strlen(qns[i]) + 1;
     }
+    char *out = (char *)cbm_arena_alloc(a, total);
+    if (!out) {
+        return "";
+    }
+    size_t at = 0;
+    for (int i = 0; qns && qns[i]; i++) {
+        if (i) {
+            out[at++] = '|';
+        }
+        size_t n = strlen(qns[i]);
+        memcpy(out + at, qns[i], n);
+        at += n;
+    }
+    out[at] = '\0';
     return out;
 }
 
@@ -3161,9 +3401,11 @@ static const char *go_agreed_fields(CBMArena *a, const char *agreed, const CBMLS
         }
         p = bar ? bar + 1 : NULL;
     }
-    const char *out = NULL;
+    /* The kept fields are a subset of `agreed`: one buffer of its size. */
+    char *out = (char *)cbm_arena_alloc(a, strlen(agreed) + 1);
+    size_t at = 0;
     char *keep = cbm_arena_strdup(a, agreed);
-    for (char *p = keep; mine && p && *p;) {
+    for (char *p = keep; mine && out && p && *p;) {
         char *bar = strchr(p, '|');
         if (bar) {
             *bar = '\0';
@@ -3175,11 +3417,20 @@ static const char *go_agreed_fields(CBMArena *a, const char *agreed, const CBMLS
         if (theirs && strcmp(theirs, colon + 1) == 0 &&
             go_same_text(go_field_type_identity(agreed_ix, colon + 1),
                          go_field_type_identity(d_ix, theirs))) {
-            out = out ? cbm_arena_sprintf(a, "%s|%s", out, p) : cbm_arena_strdup(a, p);
+            size_t n = strlen(p);
+            if (at) {
+                out[at++] = '|';
+            }
+            memcpy(out + at, p, n);
+            at += n;
         }
         p = bar ? bar + 1 : NULL;
     }
     cbm_ht_free(mine);
+    if (!out || at == 0) {
+        return NULL;
+    }
+    out[at] = '\0';
     return out;
 }
 
@@ -3214,9 +3465,104 @@ static CBMHashTable *go_type_qn_table(CBMArena *a, const CBMLSPDef *defs, int de
             e->embeds_differ =
                 e->embeds_differ || !go_same_text(e->first_embeds, go_join_embeds(a, d));
             e->fields = go_agreed_fields(a, e->fields, e->first, d);
+            if (e->count > e->all_cap) {
+                int cap = e->all_cap ? e->all_cap * 2 : 4;
+                const CBMLSPDef **grown =
+                    (const CBMLSPDef **)cbm_arena_alloc(a, (size_t)cap * sizeof(*grown));
+                if (!grown) {
+                    cbm_ht_free(table);
+                    return NULL;
+                }
+                if (e->all_cap) {
+                    memcpy(grown, e->all, (size_t)(e->count - 1) * sizeof(*grown));
+                } else {
+                    grown[0] = e->first;
+                }
+                e->all = grown;
+                e->all_cap = cap;
+            }
+            e->all[e->count - 1] = d;
         }
     }
     return table;
+}
+
+/* The field names some definition of a QN of several declares (named fields
+ * and embedded types), each once; computed on the first call. */
+static int go_pipe_pieces(const char *s) {
+    int n = s && *s ? 1 : 0;
+    for (; s && *s; s++) {
+        n += *s == '|';
+    }
+    return n;
+}
+
+static void go_shadow_note(go_type_qn_t *e, CBMHashTable *seen, const char *name) {
+    if (name && !cbm_ht_get(seen, name)) {
+        cbm_ht_set(seen, name, (void *)name);
+        e->shadow_names[e->shadow_count++] = name;
+    }
+}
+
+static void go_type_qn_shadow(CBMArena *a, go_type_qn_t *e) {
+    if (e->shadow_done) {
+        return;
+    }
+    e->shadow_done = true;
+    int bound = 0;
+    for (int i = 0; i < e->count; i++) {
+        bound += go_pipe_pieces(e->all[i]->field_defs) + go_pipe_pieces(e->all[i]->embedded_types);
+    }
+    CBMHashTable *seen = bound ? cbm_ht_create((uint32_t)(bound + 8)) : NULL;
+    e->shadow_names =
+        seen ? (const char **)cbm_arena_alloc(a, (size_t)(bound + 1) * sizeof(char *)) : NULL;
+    if (!e->shadow_names) {
+        cbm_ht_free(seen);
+        return;
+    }
+    /* In definition order, then declaration order: a fixed order. */
+    for (int i = 0; i < e->count; i++) {
+        const CBMLSPDef *d = e->all[i];
+        for (const char *p = d->field_defs; p && *p;) {
+            const char *colon = strchr(p, ':');
+            const char *bar = strchr(p, '|');
+            if (colon && (!bar || colon < bar) && colon > p) {
+                go_shadow_note(e, seen, cbm_arena_strndup(a, p, (size_t)(colon - p)));
+            }
+            p = bar ? bar + 1 : NULL;
+        }
+        size_t len = 0;
+        for (const char *next = d->embedded_types, *s;
+             (s = go_embedded_spelling(&next, &len)) != NULL;) {
+            go_shadow_note(e, seen, go_embedded_field_name(a, s, len));
+        }
+    }
+    e->shadow_names[e->shadow_count] = NULL;
+    cbm_ht_free(seen);
+}
+
+/* A type QN of several definitions: every field name some definition
+ * declares that rt does not register with a type becomes a field of unknown
+ * type (it shadows deeper members and answers nothing). */
+static void go_add_shadow_fields(CBMArena *a, CBMRegisteredType *rt, const CBMHashTable *table,
+                                 const CBMLSPDef *d) {
+    go_type_qn_t *e = table ? (go_type_qn_t *)cbm_ht_get(table, d->qualified_name) : NULL;
+    if (!e || e->count < 2 || rt->is_interface) {
+        return;
+    }
+    go_type_qn_shadow(a, e);
+    if (e->shadow_count == 0) {
+        return;
+    }
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(a, (size_t)e->shadow_count * sizeof(CBMType *));
+    if (!types) {
+        return;
+    }
+    for (int i = 0; i < e->shadow_count; i++) {
+        types[i] = cbm_type_unknown();
+    }
+    go_append_fields(a, rt, e->shadow_names, types, e->shadow_count);
 }
 
 /* The fields to register for `d`: its own when it is its QN's only definition,
@@ -3784,6 +4130,11 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                 (void)parse_field_defs(arena, fields, def_mod, scope_ix, &rt.field_names,
                                        &rt.field_types);
             }
+            /* Embedded types are fields too (Go's selector rule), and a QN of
+             * several definitions shadows every field name one declares. */
+            go_add_embedded_fields(arena, &rt, d->embedded_types, def_mod, scope_ix,
+                                   go_type_qn_embeds(type_qns, d));
+            go_add_shadow_fields(arena, &rt, type_qns, d);
 
             cbm_registry_add_type(&reg, rt);
         }
@@ -3824,21 +4175,10 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
     cbm_ht_free(type_qns); /* NULL-safe */
     cbm_ht_free(value_qns);
 
-    // 3. Phase 1b: Scan AST for struct definitions to populate embedded_types
+    // 3. Phase 1b: the walked file's type aliases. Its structs' fields and
+    // embedded types come from their definitions, as on the shared registry:
+    // every field and every embedded type, the same answer on every route.
     {
-        /* One context parses every struct's field types, so its import rows are
-         * chained once (resolve_import), not once per struct. */
-        GoLSPContext tmp_ctx;
-        memset(&tmp_ctx, 0, sizeof(tmp_ctx));
-        tmp_ctx.arena = arena;
-        tmp_ctx.source = source;
-        tmp_ctx.source_len = source_len;
-        tmp_ctx.registry = &reg;
-        tmp_ctx.package_qn = module_qn;
-        tmp_ctx.import_local_names = import_names;
-        tmp_ctx.import_package_qns = import_qns;
-        tmp_ctx.import_count = import_count;
-
         // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
         uint32_t rkn = 0;
         TSNode *rkids = cbm_lsp_collect_children(arena, root, &rkn);
@@ -3885,112 +4225,6 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                         }
                     }
                     continue;
-                }
-
-                if (strcmp(spec_kind2, "type_spec") != 0)
-                    continue;
-
-                TSNode name_node = ts_node_child_by_field_name(spec, "name", 4);
-                TSNode type_node = ts_node_child_by_field_name(spec, "type", 4);
-                if (ts_node_is_null(name_node) || ts_node_is_null(type_node))
-                    continue;
-                if (strcmp(ts_node_type(type_node), "struct_type") != 0)
-                    continue;
-
-                char *type_name = cbm_node_text(arena, name_node, source);
-                if (!type_name || !type_name[0])
-                    continue;
-                const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
-
-                TSNode field_list = ts_node_child_by_field_name(type_node, "body", 4);
-                if (ts_node_is_null(field_list)) {
-                    if (ts_node_named_child_count(type_node) > 0)
-                        field_list = ts_node_named_child(type_node, 0);
-                }
-                if (ts_node_is_null(field_list))
-                    continue;
-
-                const char *embeds[16];
-                int embed_count = 0;
-                const char *fld_names[64];
-                const CBMType *fld_types[64];
-                int fld_count = 0;
-
-                uint32_t fl_nc = ts_node_child_count(field_list);
-                for (uint32_t k = 0; k < fl_nc; k++) {
-                    TSNode field = ts_node_child(field_list, k);
-                    if (ts_node_is_null(field) || !ts_node_is_named(field))
-                        continue;
-                    if (strcmp(ts_node_type(field), "field_declaration") != 0)
-                        continue;
-                    TSNode fname = ts_node_child_by_field_name(field, "name", 4);
-                    TSNode ftype = ts_node_child_by_field_name(field, "type", 4);
-                    if (ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
-                        if (embed_count < 15) {
-                            /* The embedded-member hook's QN: a bare name is
-                             * this package's, `pkg.T` the import's (the same
-                             * answer the shared registry gets from the
-                             * declaring file's scope). */
-                            char *embed_text = cbm_node_text(arena, ftype, source);
-                            char *et = embed_text;
-                            while (et && *et == '*')
-                                et++;
-                            char *bracket = et ? strchr(et, '[') : NULL;
-                            if (bracket)
-                                *bracket = '\0';
-                            char *dot = et ? strchr(et, '.') : NULL;
-                            const char *eqn = NULL;
-                            if (et && et[0] && !dot) {
-                                eqn = cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
-                            } else if (et && dot && dot > et) {
-                                *dot = '\0';
-                                const char *pkg_qn = resolve_import(&tmp_ctx, et);
-                                eqn = pkg_qn ? cbm_arena_sprintf(arena, "%s.%s", pkg_qn, dot + 1)
-                                             : NULL;
-                            }
-                            if (eqn) {
-                                embeds[embed_count++] = eqn;
-                            }
-                        }
-                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) &&
-                               fld_count < 63) {
-                        char *fn = cbm_node_text(arena, fname, source);
-                        if (fn && fn[0]) {
-                            fld_names[fld_count] = fn;
-                            fld_types[fld_count] = go_parse_type_node(&tmp_ctx, ftype);
-                            fld_count++;
-                        }
-                    }
-                }
-
-                for (int ti = 0; ti < reg.type_count; ti++) {
-                    if (!reg.types[ti].qualified_name ||
-                        strcmp(reg.types[ti].qualified_name, type_qn) != 0)
-                        continue;
-
-                    if (embed_count > 0) {
-                        const char **arr = (const char **)cbm_arena_alloc(
-                            arena, (embed_count + 1) * sizeof(const char *));
-                        for (int ei = 0; ei < embed_count; ei++)
-                            arr[ei] = embeds[ei];
-                        arr[embed_count] = NULL;
-                        reg.types[ti].embedded_types = arr;
-                    }
-                    if (fld_count > 0) {
-                        const char **names = (const char **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const char *));
-                        const CBMType **types = (const CBMType **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const CBMType *));
-                        for (int fi = 0; fi < fld_count; fi++) {
-                            names[fi] = fld_names[fi];
-                            types[fi] = fld_types[fi];
-                        }
-                        names[fld_count] = NULL;
-                        types[fld_count] = NULL;
-                        reg.types[ti].field_names = names;
-                        reg.types[ti].field_types = types;
-                    }
-                    break;
                 }
             }
         }
@@ -4116,6 +4350,11 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
                 (void)parse_field_defs(arena, fields, def_mod, scope_ix, &rt.field_names,
                                        &rt.field_types);
             }
+            /* Embedded types are fields too (Go's selector rule), and a QN of
+             * several definitions shadows every field name one declares. */
+            go_add_embedded_fields(arena, &rt, d->embedded_types, def_mod, scope_ix,
+                                   go_type_qn_embeds(type_qns, d));
+            go_add_shadow_fields(arena, &rt, type_qns, d);
             cbm_registry_add_type(reg, rt);
             GO_NOTE_NEW_TYPES();
             uintptr_t at = first_type ? (uintptr_t)cbm_ht_get(first_type, rt.qualified_name) : 0;
