@@ -840,6 +840,153 @@ TEST(type_scope_python_type_parameter_is_no_import) {
     return ts_twins("pytp", py_tparam_files, CBM_LANG_PYTHON, py_tparam_check);
 }
 
+/* ── Go registrars: fields ────────────────────────────────────────── */
+
+/* Resolve `source` (module test.main or `module_qn`) against `defs` with the
+ * per-file registrar or the shared one; the number of resolved calls to
+ * `callee`. */
+static int ts_go_registry_hits(bool shared, const char *source, const char *module_qn,
+                               CBMLSPDef *defs, int def_count, const char **imp_names,
+                               const char **imp_qns, int imp_count, const char *callee) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    if (shared) {
+        CBMTypeRegistry *reg = cbm_go_build_cross_registry(&arena, defs, def_count);
+        if (reg) {
+            cbm_run_go_lsp_cross_with_registry(&arena, source, (int)strlen(source), module_qn,
+                                               NULL, reg, imp_names, imp_qns, imp_count, NULL,
+                                               &out);
+        }
+    } else {
+        cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), module_qn, NULL, defs,
+                             def_count, imp_names, imp_qns, imp_count, NULL, &out);
+    }
+    int hits = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].callee_qn && strcmp(out.items[i].callee_qn, callee) == 0) {
+            hits++;
+        }
+    }
+    cbm_arena_destroy(&arena);
+    return hits;
+}
+
+/* A method of Configuration registered before the struct makes a receiver
+ * placeholder first; after finalize a type lookup answers with the last
+ * entry of that name, so the struct's fields must sit on its own entry. They
+ * sat on the placeholder, and every field chain through such a struct died
+ * (helm's `cfg.Releases.Get`). The field type also comes through an identity
+ * (`store.Storage`). */
+static int go_registry_field_case(bool shared) {
+    const char *source = "package main\n\n"
+                         "import \"p/cfg\"\n\n"
+                         "func run(c *cfg.Configuration) string {\n"
+                         "\treturn c.Releases.Get(\"x\")\n}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.run",
+         .short_name = "run",
+         .label = "Function",
+         .def_module_qn = "test.main",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "p.cfg.Configuration.hook",
+         .short_name = "hook",
+         .label = "Method",
+         .def_module_qn = "p.cfg",
+         .receiver_type = "p.cfg.Configuration",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "p.cfg.Configuration",
+         .short_name = "Configuration",
+         .label = "Struct",
+         .def_module_qn = "p.cfg",
+         .field_defs = "Releases:*store.Storage",
+         .type_scope = "store.Storage=p.store.Storage",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "p.store.Storage",
+         .short_name = "Storage",
+         .label = "Struct",
+         .def_module_qn = "p.store",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "p.store.Storage.Get",
+         .short_name = "Get",
+         .label = "Method",
+         .def_module_qn = "p.store",
+         .receiver_type = "p.store.Storage",
+         .return_types = "string",
+         .lang = CBM_LANG_GO},
+    };
+    const char *imp_names[] = {"cfg"};
+    const char *imp_qns[] = {"p.cfg"};
+    int hits = ts_go_registry_hits(shared, source, "test.main", defs, 5, imp_names, imp_qns, 1,
+                                   "p.store.Storage.Get");
+    printf("  go registry (%s): run -> Storage.Get resolved %d\n", shared ? "shared" : "per-file",
+           hits);
+    ASSERT_EQ(hits, 1);
+    PASS();
+}
+
+TEST(type_scope_go_fields_survive_an_earlier_receiver_per_file) {
+    return go_registry_field_case(false);
+}
+
+TEST(type_scope_go_fields_survive_an_earlier_receiver_shared) {
+    return go_registry_field_case(true);
+}
+
+/* `package svc` and `package svc_test` in one directory both declare a
+ * struct S (one QN): which S a lookup answers with depends on file order, so
+ * neither's fields are registered, and the answer is the same in both
+ * orders. */
+static int go_shared_qn_case(bool shared) {
+    const char *source = "package svc_test\n\n"
+                         "func run(s *S) string { return s.X.Get() }\n";
+    CBMLSPDef real_s = {.qualified_name = "p.svc.S",
+                        .short_name = "S",
+                        .label = "Struct",
+                        .def_module_qn = "p.svc",
+                        .field_defs = "X:*real.Store",
+                        .type_scope = "real.Store=p.real.Store",
+                        .lang = CBM_LANG_GO};
+    CBMLSPDef fake_s = real_s;
+    fake_s.field_defs = "X:*fake.Store";
+    fake_s.type_scope = "fake.Store=p.fake.Store";
+    CBMLSPDef rest[] = {
+        {.qualified_name = "p.real.Store", .short_name = "Store", .label = "Struct",
+         .def_module_qn = "p.real", .lang = CBM_LANG_GO},
+        {.qualified_name = "p.real.Store.Get", .short_name = "Get", .label = "Method",
+         .def_module_qn = "p.real", .receiver_type = "p.real.Store", .return_types = "string",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "p.fake.Store", .short_name = "Store", .label = "Struct",
+         .def_module_qn = "p.fake", .lang = CBM_LANG_GO},
+        {.qualified_name = "p.fake.Store.Get", .short_name = "Get", .label = "Method",
+         .def_module_qn = "p.fake", .receiver_type = "p.fake.Store", .return_types = "string",
+         .lang = CBM_LANG_GO},
+    };
+    int hits[2][2];
+    for (int order = 0; order < 2; order++) {
+        CBMLSPDef defs[6];
+        defs[0] = order ? fake_s : real_s;
+        defs[1] = order ? real_s : fake_s;
+        memcpy(defs + 2, rest, sizeof(rest));
+        hits[order][0] = ts_go_registry_hits(shared, source, "p.svc", defs, 6, NULL, NULL, 0,
+                                             "p.real.Store.Get");
+        hits[order][1] = ts_go_registry_hits(shared, source, "p.svc", defs, 6, NULL, NULL, 0,
+                                             "p.fake.Store.Get");
+    }
+    printf("  go shared QN (%s): order A real=%d fake=%d, order B real=%d fake=%d\n",
+           shared ? "shared" : "per-file", hits[0][0], hits[0][1], hits[1][0], hits[1][1]);
+    ASSERT_EQ(hits[0][0] + hits[0][1] + hits[1][0] + hits[1][1], 0);
+    PASS();
+}
+
+TEST(type_scope_go_shared_type_qn_keeps_no_fields_per_file) {
+    return go_shared_qn_case(false);
+}
+
+TEST(type_scope_go_shared_type_qn_keeps_no_fields_shared) {
+    return go_shared_qn_case(true);
+}
+
 /* ── Full index versus every incremental route ───────────────────── */
 
 static void ts_listing_append(sqlite3 *db, const char *sql, const char *project, char **buf,
@@ -1202,6 +1349,10 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_nested_class_is_not_the_module_class);
     RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
     RUN_TEST(type_scope_python_type_parameter_is_no_import);
+    RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_per_file);
+    RUN_TEST(type_scope_go_fields_survive_an_earlier_receiver_shared);
+    RUN_TEST(type_scope_go_shared_type_qn_keeps_no_fields_per_file);
+    RUN_TEST(type_scope_go_shared_type_qn_keeps_no_fields_shared);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
     RUN_TEST(type_scope_incremental_body_edit_stays_one_file);
     RUN_TEST(type_scope_incremental_named_type_field_change_matches_full);

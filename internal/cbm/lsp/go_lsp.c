@@ -935,13 +935,13 @@ const CBMType *go_eval_builtin_call(GoLSPContext *ctx, const char *name, TSNode 
 
 // --- Import-alias re-qualification ------------------------------------
 //
-// parse_field_defs_into_type qualifies struct field type texts as
-// "<def_module>.<text>". When the author wrote the text through an import
-// alias ("Svc:svc.Svc" in module test.main), that yields a QN
-// ("test.main.svc.Svc") that exists nowhere in the project-wide registry —
-// the real QN is "<import_qn>.Svc" and only the calling file's import map
-// can say so. On an exact-QN miss this rewrites the alias segment through
-// the file's imports; returns NULL when no alias segment is involved.
+// parse_field_defs qualifies a struct field type text the defining file's
+// scope did not resolve (no identity in the def's type_scope) as
+// "<def_module>.<text>". Written through an import alias ("Svc:svc.Svc" in
+// module test.main), that yields a QN ("test.main.svc.Svc") that exists
+// nowhere in the project-wide registry. On an exact-QN miss this rewrites the
+// alias segment through the calling file's imports; returns NULL when no alias
+// segment is involved.
 
 static const char *go_requalify_via_imports(GoLSPContext *ctx, const char *type_qn) {
     if (!ctx || !type_qn || !type_qn[0] || ctx->import_count <= 0)
@@ -2849,24 +2849,32 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
     return idx > 0;
 }
 
-static void parse_field_defs_into_type(CBMArena *arena, CBMTypeRegistry *reg, const char *type_qn,
-                                       const char *field_defs, const char *def_module_qn,
-                                       const cbm_type_scope_index_t *scope_ix) {
-    if (!field_defs || !field_defs[0] || !type_qn)
-        return;
-    const char **names = NULL;
-    const CBMType **types = NULL;
-    if (parse_field_defs(arena, field_defs, def_module_qn, scope_ix, &names, &types)) {
-        // Find the registered type and update field info
-        for (int ti = 0; ti < reg->type_count; ti++) {
-            if (reg->types[ti].qualified_name &&
-                strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
-                reg->types[ti].field_names = names;
-                reg->types[ti].field_types = types;
-                break;
-            }
+/* Go module QNs are directories, so a package and its external test package
+ * (`foo` and `foo_test`), or build-tagged variants, can declare two types of
+ * one QN. A type lookup answers with one entry of a name, which one depends on
+ * file order; what is keyed by such a QN (its fields, its embedded types) is
+ * therefore registered for neither. Returns the QNs two or more type
+ * definitions share (owned keys borrowed from defs; free with cbm_ht_free), or
+ * NULL on allocation failure (then nothing counts as shared). */
+static char g_go_qn_once_mark;
+static char g_go_qn_shared_mark;
+
+static CBMHashTable *go_shared_type_qns(const CBMLSPDef *defs, int def_count) {
+    CBMHashTable *seen = cbm_ht_create((uint32_t)(def_count / 4 + 64));
+    for (int i = 0; seen && i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->label || d->lang != CBM_LANG_GO ||
+            !cbm_label_is_type_like(d->label)) {
+            continue;
         }
+        void *prev = cbm_ht_get(seen, d->qualified_name);
+        cbm_ht_set(seen, d->qualified_name, prev ? &g_go_qn_shared_mark : &g_go_qn_once_mark);
     }
+    return seen;
+}
+
+static bool go_type_qn_shared(const CBMHashTable *shared, const char *qn) {
+    return shared && qn && cbm_ht_get(shared, qn) == &g_go_qn_shared_mark;
 }
 
 // --- Phase 1c: Extract type parameters from generic function declarations ---
@@ -3378,6 +3386,7 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
     // caller's arena which outlives this call, so cbm_arena_strdup is
     // wasted work. On kubernetes (~110k defs × 11k files × 5 strdups
     // ~= 6B mallocs) this alone saves ~90s of resolve wall time.
+    CBMHashTable *shared_qns = go_shared_type_qns(defs, def_count);
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
@@ -3403,13 +3412,17 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             }
             rt.alias_of = go_alias_target_qn(arena, d->alias_target, def_mod);
 
-            cbm_registry_add_type(&reg, rt);
-
-            // Populate struct field types from field_defs
-            if (d->field_defs && d->field_defs[0]) {
-                parse_field_defs_into_type(arena, &reg, rt.qualified_name, d->field_defs, def_mod,
-                                           scope_ix);
+            // Struct field types from field_defs, on this def's own entry: a
+            // type lookup answers with the last entry of a name, so fields on
+            // an earlier receiver placeholder were never seen. A QN two type
+            // definitions share keeps none (go_shared_type_qns).
+            if (d->field_defs && d->field_defs[0] &&
+                !go_type_qn_shared(shared_qns, d->qualified_name)) {
+                (void)parse_field_defs(arena, d->field_defs, def_mod, scope_ix, &rt.field_names,
+                                       &rt.field_types);
             }
+
+            cbm_registry_add_type(&reg, rt);
         }
 
         // Function/Method
@@ -3444,6 +3457,7 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             cbm_registry_add_func(&reg, rf);
         }
     }
+    cbm_ht_free(shared_qns); /* NULL-safe */
 
     // 3. Phase 1b: Scan AST for struct definitions to populate embedded_types
     {
@@ -3661,11 +3675,12 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
      * not finalized until the end, so its own lookup scans every type, and the
      * receiver check below plus the field-definition lookup made the build
      * O(types x (methods + structs)) -- 4.4 s single-threaded on the Go corpus,
-     * the scaling lane's parse_field_defs_into_type x2.9 (waste sanitizer,
-     * 2026-09-17). First-match semantics are kept exactly: a receiver's
-     * placeholder type added before its struct still receives the fields.
-     * NULL on allocation failure: the linear paths below run as before. */
+     * the scaling lane's field-definition lookup x2.9 (waste sanitizer,
+     * 2026-09-17). A receiver's placeholder type added before its struct
+     * receives the struct's fields as well as the struct's own entry.
+     * NULL on allocation failure: the receiver check scans the registry. */
     CBMHashTable *first_type = cbm_ht_create((uint32_t)(def_count / 4 + 1024));
+    CBMHashTable *shared_qns = go_shared_type_qns(defs, def_count);
     int noted_types = 0;
 #define GO_NOTE_NEW_TYPES()                                                        \
     do {                                                                           \
@@ -3705,22 +3720,22 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
                 rt.method_names = split_pipe_strings(arena, d->method_names_str);
             }
             rt.alias_of = go_alias_target_qn(arena, d->alias_target, def_mod);
+            /* Fields on this def's own entry, which a lookup after finalize
+             * answers with (the last entry of a name). The first entry -- a
+             * receiver placeholder when a method came earlier -- keeps them
+             * too, for the first-registered readers. A QN two type
+             * definitions share keeps none (go_shared_type_qns). */
+            if (d->field_defs && d->field_defs[0] &&
+                !go_type_qn_shared(shared_qns, d->qualified_name)) {
+                (void)parse_field_defs(arena, d->field_defs, def_mod, scope_ix, &rt.field_names,
+                                       &rt.field_types);
+            }
             cbm_registry_add_type(reg, rt);
             GO_NOTE_NEW_TYPES();
-            if (d->field_defs && d->field_defs[0]) {
-                if (first_type) {
-                    const char **names = NULL;
-                    const CBMType **types = NULL;
-                    uintptr_t at = (uintptr_t)cbm_ht_get(first_type, rt.qualified_name);
-                    if (parse_field_defs(arena, d->field_defs, def_mod, scope_ix, &names, &types) &&
-                        at) {
-                        reg->types[at - 1].field_names = names;
-                        reg->types[at - 1].field_types = types;
-                    }
-                } else {
-                    parse_field_defs_into_type(arena, reg, rt.qualified_name, d->field_defs,
-                                               def_mod, scope_ix);
-                }
+            uintptr_t at = first_type ? (uintptr_t)cbm_ht_get(first_type, rt.qualified_name) : 0;
+            if (rt.field_names && at && (int)at - 1 != reg->type_count - 1) {
+                reg->types[at - 1].field_names = rt.field_names;
+                reg->types[at - 1].field_types = rt.field_types;
             }
         }
 
@@ -3754,6 +3769,7 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     }
 #undef GO_NOTE_NEW_TYPES
     cbm_ht_free(first_type);
+    cbm_ht_free(shared_qns); /* NULL-safe */
 
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
