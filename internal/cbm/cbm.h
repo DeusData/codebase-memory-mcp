@@ -360,6 +360,10 @@ typedef struct CBMDefTypeFacts {
      * annotation alone binds nothing), '|'-joined. A method annotation naming
      * one of them means the class attribute, not the module's name. */
     const char *class_bindings;
+    /* Python function or class: the names its body declares `global` and
+     * binds, '|'-joined. The body rebinds them in the module, so no
+     * annotation of the file names them through the module's other binding. */
+    const char *global_names;
 } CBMDefTypeFacts;
 
 /* extra_props key of a generated member, one the compiler writes and the

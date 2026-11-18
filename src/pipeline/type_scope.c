@@ -178,6 +178,23 @@ static void type_scope_index_class_bindings(cbm_type_scope_file_t *f, const CBMD
     }
 }
 
+/* A name some function or class body of the file declares `global` and binds
+ * is rebound in the module by that body (when it runs, or at import for a
+ * class body): like a name the module binds twice, it gets no identity. */
+static void type_scope_index_global_names(cbm_type_scope_file_t *f, const CBMDefinition *d) {
+    const char *names = d->type_facts ? d->type_facts->global_names : NULL;
+    for (const char *p = names; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        TYPE_SCOPE_WORK(len + 1);
+        char *name = len ? cbm_arena_strndup(&f->keys, p, len) : NULL;
+        if (name) {
+            cbm_ht_set(f->bindings, name, TYPE_SCOPE_BOUND_MANY);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+}
+
 /* Hash the file's own definitions, its type parameter names and the names
  * its class bodies bind. */
 static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
@@ -197,6 +214,7 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
             cbm_ht_set(f->defs, d->qualified_name, (void *)(uintptr_t)(i + 1));
         }
         type_scope_index_class_bindings(f, d);
+        type_scope_index_global_names(f, d);
         for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
             const char *bar = strchr(p, '|');
             size_t len = bar ? (size_t)(bar - p) : strlen(p);

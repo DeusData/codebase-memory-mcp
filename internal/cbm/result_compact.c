@@ -290,6 +290,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
         cr_str(c, &facts->value_type);
         cr_str(c, &facts->go_embedded);
         cr_str(c, &facts->class_bindings);
+        cr_str(c, &facts->global_names);
     }
 }
 

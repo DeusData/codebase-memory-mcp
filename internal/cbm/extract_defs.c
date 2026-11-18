@@ -7006,6 +7006,13 @@ static void def_set_type_params(CBMArena *a, CBMDefinition *def, const char *nam
     }
 }
 
+static void def_set_global_names(CBMArena *a, CBMDefinition *def, const char *names) {
+    CBMDefTypeFacts *f = names && names[0] ? def_type_facts(a, def) : NULL;
+    if (f) {
+        f->global_names = names;
+    }
+}
+
 /* A '|'-joined list of names built in the arena (the grown buffers stay in
  * the arena: at most twice the final size). */
 typedef struct {
@@ -7013,6 +7020,10 @@ typedef struct {
     char *buf;
     size_t len;
     size_t cap;
+    /* Python binding walks: what a body binds in the module through names it
+     * declares `global` (py_body_global_names) -- `del`, `except ... as`, a
+     * nested def's or class's name bind; the declaration itself does not. */
+    bool module;
 } tf_names_t;
 
 static void tf_names_add(tf_names_t *b, const char *s, size_t n) {
@@ -7213,8 +7224,15 @@ static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int d
         return;
     }
     const char *kind = ts_node_type(s);
-    if (strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0 ||
-        strcmp(kind, "decorated_definition") == 0) {
+    if (py_defines_kind(kind)) {
+        if (b->module) {
+            TSNode def = strcmp(kind, "decorated_definition") == 0
+                             ? ts_node_child_by_field_name(s, TS_FIELD("definition"))
+                             : s;
+            if (!ts_node_is_null(def)) {
+                tf_names_node(b, ts_node_child_by_field_name(def, TS_FIELD("name")), source);
+            }
+        }
         return; /* definitions of the class: the step sees them as such */
     }
     if (strcmp(kind, "expression_statement") == 0) {
@@ -7269,10 +7287,15 @@ static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int d
         return;
     }
     if (strcmp(kind, "global_statement") == 0 || strcmp(kind, "nonlocal_statement") == 0) {
-        py_bind_target(b, s, source, depth + 1);
+        if (!b->module) {
+            py_bind_target(b, s, source, depth + 1);
+        }
         return;
     }
     if (strcmp(kind, "delete_statement") == 0) {
+        if (b->module) {
+            py_bind_target(b, s, source, depth + 1);
+        }
         return;
     }
     if (strcmp(kind, "type_alias_statement") == 0) {
@@ -7291,7 +7314,7 @@ static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int d
         if (strcmp(ck, "block") == 0) {
             py_bind_block(b, c, source, depth + 1);
         } else if (strncmp(ck, "except", 6) == 0 && strstr(ck, "_clause") != NULL) {
-            if (py_has_def(c, depth + 1)) {
+            if (b->module || py_has_def(c, depth + 1)) {
                 py_bind_as_targets(b, c, source, depth + 1);
             }
             uint32_t m = ts_node_named_child_count(c);
@@ -7395,6 +7418,62 @@ static const char *py_class_body_bindings(CBMArena *a, TSNode node, const char *
         p = bar ? bar + 1 : p + len;
     }
     cbm_ht_free(state);
+    return out.len ? out.buf : NULL;
+}
+
+/* The names declared `global` among a scope's statements (compound ones
+ * included, nested definitions not: they are scopes of their own). */
+static void py_global_statements(tf_names_t *b, TSNode node, const char *source, int depth) {
+    if (ts_node_is_null(node) || depth > TF_BIND_DEPTH) {
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "global_statement") == 0) {
+            py_bind_target(b, c, source, depth + 1);
+        } else if (!py_defines_kind(ck) && py_statement_level(ck)) {
+            py_global_statements(b, c, source, depth + 1);
+        }
+    }
+}
+
+/* Python: the names a function's or class's body declares `global` and
+ * binds, '|'-joined, or NULL: the body rebinds them in the module. */
+static const char *py_body_global_names(CBMArena *a, TSNode node, const char *source) {
+    TSNode body = py_def_body(node);
+    tf_names_t declared = {.a = a};
+    py_global_statements(&declared, body, source, 0);
+    if (!declared.len) {
+        return NULL;
+    }
+    tf_names_t bound = {.a = a, .module = true};
+    py_bind_block(&bound, body, source, 0);
+    CBMHashTable *binds = bound.len ? cbm_ht_create(16) : NULL;
+    if (!binds) {
+        return NULL;
+    }
+    for (const char *p = bound.buf; *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = cbm_arena_strndup(a, p, len);
+        if (name) {
+            cbm_ht_set(binds, name, name);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+    tf_names_t out = {.a = a};
+    for (const char *p = declared.buf; *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = cbm_arena_strndup(a, p, len);
+        if (name && cbm_ht_get(binds, name)) {
+            tf_names_add(&out, name, len);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+    cbm_ht_free(binds);
     return out.len ? out.buf : NULL;
 }
 
@@ -7711,6 +7790,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
     if (ctx->language == CBM_LANG_PYTHON) {
         def_set_type_params(a, &def, py_type_param_names(a, node, ctx->source));
+        def_set_global_names(a, &def, py_body_global_names(a, node, ctx->source));
     } else if (ctx->language == CBM_LANG_GO) {
         def_set_type_params(a, &def, go_type_param_names(a, node, ctx->source));
     }
@@ -9520,6 +9600,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.docstring = extract_docstring(ctx, node, name);
     if (ctx->language == CBM_LANG_PYTHON) {
         def_set_type_params(a, &def, py_type_param_names(a, node, ctx->source));
+        def_set_global_names(a, &def, py_body_global_names(a, node, ctx->source));
         const char *bound = py_class_body_bindings(a, node, ctx->source);
         CBMDefTypeFacts *facts = bound ? def_type_facts(a, &def) : NULL;
         if (facts) {
@@ -10060,6 +10141,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
     if (ctx->language == CBM_LANG_PYTHON) {
         def_set_type_params(a, &def, py_type_param_names(a, child, ctx->source));
+        def_set_global_names(a, &def, py_body_global_names(a, child, ctx->source));
     } else if (ctx->language == CBM_LANG_GO) {
         def_set_type_params(a, &def, go_type_param_names(a, child, ctx->source));
     }

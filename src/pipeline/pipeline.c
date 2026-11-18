@@ -2614,7 +2614,8 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                                 census_len(def->type_facts->type_params) +
                                 census_len(def->type_facts->value_type) +
                                 census_len(def->type_facts->go_embedded) +
-                                census_len(def->type_facts->class_bindings);
+                                census_len(def->type_facts->class_bindings) +
+                                census_len(def->type_facts->global_names);
             }
         }
         for (int c = 0; c < r->calls.count; c++) {

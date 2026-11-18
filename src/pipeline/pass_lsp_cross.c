@@ -1130,8 +1130,10 @@ static const char *pxc_py_add_class_bindings(CBMArena *arena, const char *field_
 
 /* The facts only the cross-file step reads (CBMDefTypeFacts), on the file's
  * LSP defs after the field folds: a Go generic type's field types name its
- * type parameters as `any`; a Python class body's bindings join its
- * field_defs. One hash of the file's defs, built only when one applies. */
+ * type parameters as `any`; a Python class body's bindings and a Python
+ * body's `global` names join its field_defs (as `name:`, no type), so they are
+ * part of the stored row the planner compares. One hash of the file's defs,
+ * built only when one applies. */
 static void pxc_apply_type_facts(CBMArena *arena, const CBMFileResult *fr, CBMLSPDef *defs,
                                  int start, int end, CBMLanguage lang) {
     if (!fr || (lang != CBM_LANG_GO && lang != CBM_LANG_PYTHON) || start >= end) {
@@ -1141,12 +1143,14 @@ static void pxc_apply_type_facts(CBMArena *arena, const CBMFileResult *fr, CBMLS
     for (int di = 0; di < fr->defs.count; di++) {
         const CBMDefinition *d = &fr->defs.items[di];
         const CBMDefTypeFacts *f = d->type_facts;
-        if (!f || !d->qualified_name || !d->label || !cbm_label_is_type_like(d->label)) {
+        if (!f || !d->qualified_name || !d->label) {
             continue;
         }
-        bool go_generic = lang == CBM_LANG_GO && f->type_params;
-        bool py_bound = lang == CBM_LANG_PYTHON && f->class_bindings;
-        if (!go_generic && !py_bound) {
+        bool type_like = cbm_label_is_type_like(d->label);
+        bool go_generic = lang == CBM_LANG_GO && type_like && f->type_params;
+        bool py_bound = lang == CBM_LANG_PYTHON && type_like && f->class_bindings;
+        bool py_global = lang == CBM_LANG_PYTHON && f->global_names;
+        if (!go_generic && !py_bound && !py_global) {
             continue;
         }
         if (!by_qn) {
@@ -1161,9 +1165,15 @@ static void pxc_apply_type_facts(CBMArena *arena, const CBMFileResult *fr, CBMLS
         if (!dst) {
             continue;
         }
-        dst->field_defs =
-            go_generic ? pxc_go_mask_field_types(arena, dst->field_defs, f->type_params)
-                       : pxc_py_add_class_bindings(arena, dst->field_defs, f->class_bindings);
+        if (go_generic) {
+            dst->field_defs = pxc_go_mask_field_types(arena, dst->field_defs, f->type_params);
+        }
+        if (py_bound) {
+            dst->field_defs = pxc_py_add_class_bindings(arena, dst->field_defs, f->class_bindings);
+        }
+        if (py_global) {
+            dst->field_defs = pxc_py_add_class_bindings(arena, dst->field_defs, f->global_names);
+        }
     }
     cbm_ht_free(by_qn);
 }

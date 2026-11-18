@@ -911,6 +911,45 @@ TEST(type_scope_python_class_and_module_of_one_qn) {
     return ts_twins("pyclassmod", py_classmod_files, CBM_LANG_PYTHON, py_classmod_check);
 }
 
+/* `global R` in a class body (run at import) or a function body that binds R
+ * rebinds the module's R, so `def make_r() -> R` after it names whatever that
+ * body bound (python3: pkg.b.R for the class body; for the function, whether
+ * it ran). No identity is taken from the import. A module that only imports R
+ * keeps it (run_a), and so does one whose function declares `global R` and
+ * only reads it (run_p). */
+static const ts_file_t py_global_files[] = {
+    {"pkg/__init__.py", ""},
+    {"pkg/a.py", "class R:\n    def save(self):\n        return 'a'\n"},
+    {"pkg/b.py", "class R:\n    def save(self):\n        return 'b'\n"},
+    {"pkg/mod.py", "from pkg.a import R\n\n\nclass Rebind:\n    global R\n    from pkg.b import R\n\n\n"
+                   "def make_r() -> R:\n    return R()\n"},
+    {"pkg/mod2.py", "from pkg.a import R\n\n\ndef setup():\n    global R\n    from pkg.b import R\n\n\n"
+                    "def make_s() -> R:\n    return R()\n"},
+    {"pkg/mod3.py", "from pkg.a import R\n\n\ndef make_a() -> R:\n    return R()\n"},
+    {"pkg/mod4.py", "from pkg.a import R\n\n\ndef peek():\n    global R\n    return R.__name__\n\n\n"
+                    "def make_p() -> R:\n    return R()\n"},
+    {"pkg/use.py", "from pkg.mod import make_r\nfrom pkg.mod2 import make_s\nfrom pkg.mod3 import make_a\n"
+                   "from pkg.mod4 import make_p\n\n\n"
+                   "def run_r():\n    return make_r().save()\n\n\n"
+                   "def run_s():\n    return make_s().save()\n\n\n"
+                   "def run_a():\n    return make_a().save()\n\n\n"
+                   "def run_p():\n    return make_p().save()\n"},
+    {NULL, NULL}};
+
+static int py_global_check(cbm_store_t *s, const char *project, const char *label) {
+    int wrong = ts_calls_to(s, project, "run_r", "pkg.a.R.save", NULL) +
+                ts_calls_to(s, project, "run_s", "pkg.a.R.save", NULL);
+    int kept = ts_calls_to(s, project, "run_a", "pkg.a.R.save", NULL);
+    int read = ts_calls_to(s, project, "run_p", "pkg.a.R.save", NULL);
+    printf("  python global rebinding (%s): rebound edges=%d, plain import=%d, global read=%d\n",
+           label, wrong, kept, read);
+    return !(wrong == 0 && kept == 1 && read == 1);
+}
+
+TEST(type_scope_python_global_rebinding_takes_no_identity) {
+    return ts_twins("pyglobal", py_global_files, CBM_LANG_PYTHON, py_global_check);
+}
+
 /* `except ValueError as E` unbinds E when the clause
  * ends, and `D = Other; del D` leaves D unbound: methods defined after them
  * name the module's E and D (python3 agrees). A `del` after a method that saw
@@ -2222,6 +2261,43 @@ TEST(type_scope_incremental_python_class_body_binding_matches_full) {
     PASS();
 }
 
+/* A function body edit (same lines) that declares the module's R `global`
+ * and binds it: the module's annotation `-> R` loses its identity. The
+ * function's global names are part of its stored row, so the run is not a
+ * one-file repair that keeps the caller's stale `run -> pkg.a.R.save`. */
+static int py_globaledit_before(cbm_store_t *s, const char *project, const char *label) {
+    int edge = ts_calls_to(s, project, "run", "pkg.a.R.save", NULL);
+    printf("  py global edit (%s): run -> pkg.a.R.save=%d\n", label, edge);
+    return edge != 1;
+}
+
+static int py_globaledit_after(cbm_store_t *s, const char *project, const char *label) {
+    int edge = ts_calls_to(s, project, "run", "pkg.a.R.save", NULL);
+    printf("  py global edit (%s): run -> pkg.a.R.save=%d\n", label, edge);
+    return edge != 0;
+}
+
+TEST(type_scope_incremental_python_global_binding_matches_full) {
+    const ts_file_t files[] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/a.py", "class R:\n    def save(self):\n        return 'a'\n"},
+        {"pkg/b.py", "class R:\n    def save(self):\n        return 'b'\n"},
+        {"pkg/mod.py", "from pkg.a import R\n\n\ndef setup():\n    r = None\n    from pkg.b import R\n\n\n"
+                       "def make() -> R:\n    return R()\n"},
+        {"pkg/use.py", "from pkg.mod import make\n\n\ndef run():\n    return make().save()\n"},
+        {NULL, NULL}};
+    const ts_file_t edit[] = {
+        {"pkg/mod.py", "from pkg.a import R\n\n\ndef setup():\n    global R\n    from pkg.b import R\n\n\n"
+                       "def make() -> R:\n    return R()\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental_checked(files, CBM_LANG_PYTHON, 0, edit, "py global binding",
+                                                py_globaledit_before, py_globaledit_after);
+    ASSERT_TRUE(r.same_graph);
+    ASSERT_EQ(r.before_bad, 0);
+    ASSERT_EQ(r.after_bad, 0);
+    PASS();
+}
+
 SUITE(type_scope) {
     RUN_TEST(type_scope_import_binding_is_the_identity);
     RUN_TEST(type_scope_dotted_spelling_through_its_head);
@@ -2243,6 +2319,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_nested_class_is_not_the_module_class);
     RUN_TEST(type_scope_python_class_body_bindings_shadow_the_module);
     RUN_TEST(type_scope_python_class_and_module_of_one_qn);
+    RUN_TEST(type_scope_python_global_rebinding_takes_no_identity);
     RUN_TEST(type_scope_python_unbound_class_names_are_the_module_names);
     RUN_TEST(type_scope_python_self_chain_keeps_its_edges);
     RUN_TEST(type_scope_python_type_parameter_is_no_import);
@@ -2268,6 +2345,7 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_incremental_many_embedded_types_match_full);
     RUN_TEST(type_scope_incremental_many_fields_match_full);
     RUN_TEST(type_scope_incremental_python_class_body_binding_matches_full);
+    RUN_TEST(type_scope_incremental_python_global_binding_matches_full);
     RUN_TEST(type_scope_incremental_type_shape_changes_match_full);
     RUN_TEST(type_scope_incremental_other_def_edit_stays_a_repair);
     RUN_TEST(type_scope_incremental_python_body_edits);
