@@ -12,6 +12,7 @@
 #include "../src/foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include <sqlite3.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -1404,6 +1405,116 @@ TEST(gbuf_dump_failure_logs_reason) {
     PASS();
 }
 
+/* ── Stable ids across generations ─────────────────────────────── */
+
+static int64_t stable_q_i64(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int64_t v = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        v = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return v;
+}
+
+static int64_t stable_node_id(sqlite3 *db, const char *qn) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT id FROM nodes WHERE qualified_name = '%s'", qn);
+    return stable_q_i64(db, sql);
+}
+
+static int64_t stable_edge_id(sqlite3 *db, const char *src_qn, const char *dst_qn) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT e.id FROM edges e JOIN nodes s ON s.id = e.source_id "
+             "JOIN nodes t ON t.id = e.target_id "
+             "WHERE s.qualified_name = '%s' AND t.qualified_name = '%s'",
+             src_qn, dst_qn);
+    return stable_q_i64(db, sql);
+}
+
+/* A full rebuild keeps the ids of unchanged nodes and edges, numbers new
+ * rows above the old high-water mark and never reuses a retired id, even
+ * when rows are added in front of existing ones (the case that renumbered
+ * the whole graph before). */
+TEST(gbuf_dump_stable_ids_across_generations) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_gbuf_stable_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char db1[320];
+    char db2[320];
+    char db3[320];
+    snprintf(db1, sizeof(db1), "%s/g1.db", dir);
+    snprintf(db2, sizeof(db2), "%s/g2.db", dir);
+    snprintf(db3, sizeof(db3), "%s/g3.db", dir);
+
+    /* Generation 1: a -> b -> c, a -> c, and z (the highest id, removed later). */
+    cbm_gbuf_t *g1 = cbm_gbuf_new("p", "/tmp/repo");
+    int64_t a = cbm_gbuf_upsert_node(g1, "Function", "a", "p.a", "a.go", 1, 2, "{}");
+    int64_t b = cbm_gbuf_upsert_node(g1, "Function", "b", "p.b", "b.go", 1, 2, "{}");
+    int64_t c = cbm_gbuf_upsert_node(g1, "Function", "c", "p.c", "c.go", 1, 2, "{}");
+    int64_t z = cbm_gbuf_upsert_node(g1, "Function", "z", "p.z", "z.go", 1, 2, "{}");
+    cbm_gbuf_insert_edge(g1, a, b, "CALLS", "{}");
+    cbm_gbuf_insert_edge(g1, b, c, "CALLS", "{}");
+    cbm_gbuf_insert_edge(g1, a, c, "CALLS", "{}");
+    cbm_gbuf_insert_edge(g1, c, z, "CALLS", "{}");
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(g1, db1), 0);
+    cbm_gbuf_free(g1);
+
+    /* Generation 2: n is new and comes first, b and z are gone. */
+    cbm_gbuf_t *g2 = cbm_gbuf_new("p", "/tmp/repo");
+    int64_t n2 = cbm_gbuf_upsert_node(g2, "Function", "n", "p.n", "n.go", 1, 2, "{}");
+    int64_t a2 = cbm_gbuf_upsert_node(g2, "Function", "a", "p.a", "a.go", 1, 2, "{}");
+    int64_t c2 = cbm_gbuf_upsert_node(g2, "Function", "c", "p.c", "c.go", 1, 2, "{}");
+    cbm_gbuf_insert_edge(g2, n2, a2, "CALLS", "{}");
+    cbm_gbuf_insert_edge(g2, a2, c2, "CALLS", "{}");
+    capture_logs_start();
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite_stable(g2, db2, db1), 0);
+    const char *logs = capture_logs_end();
+    ASSERT_NOT_NULL(strstr(logs, "gbuf.stable_ids"));
+    cbm_gbuf_free(g2);
+
+    sqlite3 *s1 = NULL;
+    sqlite3 *s2 = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db1, &s1, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_open_v2(db2, &s2, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+
+    int64_t node_hw = stable_q_i64(s1, "SELECT max(id) FROM nodes");
+    int64_t edge_hw = stable_q_i64(s1, "SELECT max(id) FROM edges");
+    ASSERT_EQ(stable_node_id(s2, "p.a"), stable_node_id(s1, "p.a"));
+    ASSERT_EQ(stable_node_id(s2, "p.c"), stable_node_id(s1, "p.c"));
+    ASSERT_EQ(stable_node_id(s2, "p.n"), node_hw + 1);
+    ASSERT_EQ(stable_edge_id(s2, "p.a", "p.c"), stable_edge_id(s1, "p.a", "p.c"));
+    ASSERT_EQ(stable_edge_id(s2, "p.n", "p.a"), edge_hw + 1);
+    /* the retired ids stay retired */
+    ASSERT(stable_q_i64(s2, "SELECT seq FROM sqlite_sequence WHERE name = 'nodes'") >= node_hw + 1);
+    ASSERT(stable_q_i64(s2, "SELECT seq FROM sqlite_sequence WHERE name = 'edges'") >= edge_hw + 1);
+    ASSERT_EQ(stable_q_i64(s2, "SELECT count(*) FROM nodes"), 3);
+    ASSERT_EQ(stable_q_i64(s2, "SELECT count(*) FROM edges"), 2);
+    /* a well-formed file whose indexes answer by the kept ids */
+    ASSERT_EQ(stable_q_i64(s2, "SELECT count(*) FROM pragma_integrity_check "
+                               "WHERE integrity_check <> 'ok'"),
+              0);
+    sqlite3_close(s1);
+    sqlite3_close(s2);
+
+    /* No prior file (or CBM_STABLE_IDS=0): sequential ids as before. */
+    cbm_gbuf_t *g3 = cbm_gbuf_new("p", "/tmp/repo");
+    cbm_gbuf_upsert_node(g3, "Function", "n", "p.n", "n.go", 1, 2, "{}");
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite_stable(g3, db3, "/nonexistent/cbm/prior.db"), 0);
+    cbm_gbuf_free(g3);
+    sqlite3 *s3 = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db3, &s3, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(stable_node_id(s3, "p.n"), 1);
+    sqlite3_close(s3);
+
+    cbm_unlink(db1);
+    cbm_unlink(db2);
+    cbm_unlink(db3);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* A worker buffer draws ids from the shared counter, so a dense id -> node
@@ -1514,4 +1625,5 @@ SUITE(graph_buffer) {
 
     /* Publish failure reporting */
     RUN_TEST(gbuf_dump_failure_logs_reason);
+    RUN_TEST(gbuf_dump_stable_ids_across_generations);
 }

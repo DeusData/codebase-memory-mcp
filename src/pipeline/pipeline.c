@@ -3355,7 +3355,8 @@ static int publish_generation_impl(const cbm_pipeline_generation_t *generation,
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
-    int dump_rc = cbm_gbuf_dump_to_sqlite(generation->gbuf, stage_path);
+    int dump_rc =
+        cbm_gbuf_dump_to_sqlite_stable(generation->gbuf, stage_path, generation->prior_db_path);
     if (dump_rc != 0) {
         discard_generation_frozen(stage_path, frozen);
         free(stage_path);
@@ -3719,6 +3720,10 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
     cbm_pipeline_generation_t generation = {
         .gbuf = p->gbuf,
         .final_db_path = db_path,
+        /* db_path is this run's stage, deleted before a rebuild
+         * (try_incremental_or_delete_db); the live file is the previous generation
+         * until the final rename. */
+        .prior_db_path = p->live_db_path,
         .project = p->project_name,
         .cancelled = p->cancelled,
         .manifest = manifest,

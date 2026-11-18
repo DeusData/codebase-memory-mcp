@@ -1661,6 +1661,12 @@ enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 typedef struct {
     cbm_gbuf_t *gbuf;
     const char *final_db_path;
+    /* The previous generation of this project, still the published file
+     * while this one is built (NULL: none). A full dump keeps the ids of the
+     * rows that survive into this generation (cbm_gbuf_dump_to_sqlite_stable),
+     * so id-keyed consumers such as the Neo4j delta sync see only what
+     * changed. Read-only; any read failure falls back to sequential ids. */
+    const char *prior_db_path;
     const char *project;
     atomic_int *cancelled;
     const cbm_file_hash_t *manifest;

@@ -21,6 +21,7 @@ enum {
     GB_URL_PATH_PREFIX = 12, /* strlen(""url_path":"") */
     GB_MIN_FOR_DEDUP = 2,    /* need at least 2 vectors to sort+dedup */
     GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
+    STABLE_BUSY_MS = 2000,   /* wait for a writer holding the previous generation */
 };
 
 /* Sentinel for an edge property blob carrying no parseable "confidence": any
@@ -32,6 +33,7 @@ enum {
 #include "sqlite_writer.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/platform.h"
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
@@ -2501,7 +2503,337 @@ static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fin
     CBM_PROF_END_N("dump", "5_vector_remap_sort", t_vec_remap, gb->dump_vector_count);
 }
 
+/* ── Stable ids across generations ─────────────────────────────────
+ *
+ * A full rebuild used to number nodes and edges 1..N in buffer order, so one
+ * added method shifted the id of nearly every row after it. Anything keyed by
+ * id across generations then saw the whole graph as new: the Neo4j delta sync
+ * (src/neo4j/neo4j_sync.c) gave up and re-uploaded everything.
+ *
+ * When the previous generation's database is readable, a node keeps its old
+ * id when its qualified name is unchanged (UNIQUE(project, qualified_name)),
+ * and an edge keeps its old id when its (source_id, target_id, type,
+ * local_name) key is unchanged after the node remap (the edges table's UNIQUE
+ * key). Everything else is numbered above the previous high-water mark, which
+ * is also carried into sqlite_sequence, so a retired id is never reused --
+ * the same rule the closure-repair route follows (pipeline_delta.c).
+ *
+ * The old rows are streamed in key order and merge-joined, so nothing of the
+ * old graph is held in memory. Any read failure leaves the sequential
+ * numbering in place: stable ids are an optimisation, never a requirement.
+ * CBM_STABLE_IDS=0 turns them off. */
+
+static bool stable_ids_enabled(void) {
+    const char *v = cbm_runtime_getenv("CBM_STABLE_IDS");
+    return !(v && strcmp(v, "0") == 0);
+}
+
+static sqlite3 *stable_prior_open(const char *prior_db_path) {
+    if (!prior_db_path || !*prior_db_path || !stable_ids_enabled()) {
+        return NULL;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(prior_db_path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) !=
+        SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    (void)sqlite3_busy_timeout(db, STABLE_BUSY_MS);
+    return db;
+}
+
+/* max(MAX(id), sqlite_sequence.seq) of a table, or -1 when unreadable. */
+static int64_t stable_high_water(sqlite3 *db, const char *table) {
+    char sql[CBM_SZ_256];
+    snprintf(sql, sizeof(sql),
+             "SELECT max(coalesce((SELECT max(id) FROM %s), 0),"
+             " coalesce((SELECT seq FROM sqlite_sequence WHERE name = '%s'), 0))",
+             table, table);
+    sqlite3_stmt *st = NULL;
+    int64_t out = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        out = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+static CBM_TLS const CBMDumpNode *g_stable_nodes;
+static CBM_TLS const CBMDumpEdge *g_stable_edges;
+static CBM_TLS const int64_t *g_stable_ids;
+
+static int cmp_stable_node_qn(const void *a, const void *b) {
+    return strcmp(g_stable_nodes[*(const int *)a].qualified_name,
+                  g_stable_nodes[*(const int *)b].qualified_name);
+}
+
+static int cmp_i64_val(int64_t a, int64_t b) {
+    return (a > b) - (a < b);
+}
+
+/* Order of the edges table's UNIQUE(source_id, target_id, type, local_name_gen)
+ * key under BINARY collation (strcmp on UTF-8 without NULs). */
+static int stable_edge_key_cmp(const CBMDumpEdge *e, int64_t s, int64_t t, const char *type,
+                               const char *local_name) {
+    int c = cmp_i64_val(e->source_id, s);
+    if (c == 0) {
+        c = cmp_i64_val(e->target_id, t);
+    }
+    if (c == 0) {
+        c = strcmp(e->type ? e->type : "", type);
+    }
+    if (c == 0) {
+        c = strcmp(e->local_name ? e->local_name : "", local_name);
+    }
+    return c;
+}
+
+static int cmp_stable_edge_key(const void *a, const void *b) {
+    const CBMDumpEdge *eb = &g_stable_edges[*(const int *)b];
+    return stable_edge_key_cmp(&g_stable_edges[*(const int *)a], eb->source_id, eb->target_id,
+                               eb->type ? eb->type : "", eb->local_name ? eb->local_name : "");
+}
+
+static int cmp_stable_id(const void *a, const void *b) {
+    return cmp_i64_val(g_stable_ids[*(const int *)a], g_stable_ids[*(const int *)b]);
+}
+
+/* ids[] holds the kept old id per row (0 for none). Number the rest above
+ * high_water in their current order and return a permutation listing the rows
+ * by ascending id, or NULL when the ids are not strictly increasing (the old
+ * file broke an invariant) or on OOM: the caller keeps sequential ids. */
+static int *stable_number_and_order(int64_t *ids, int n, int64_t high_water, int *kept) {
+    int64_t next = high_water;
+    *kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (ids[i] > 0) {
+            (*kept)++;
+        } else {
+            ids[i] = ++next;
+        }
+    }
+    int *order = cbm_alloc(CBM_MEM_CLASS_DUMP, (size_t)(n > 0 ? n : 1) * sizeof(int));
+    if (!order) {
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        order[i] = i;
+    }
+    g_stable_ids = ids;
+    qsort(order, (size_t)n, sizeof(int), cmp_stable_id);
+    g_stable_ids = NULL;
+    for (int i = 1; i < n; i++) {
+        if (ids[order[i]] <= ids[order[i - 1]]) {
+            cbm_free(CBM_MEM_CLASS_DUMP, order);
+            return NULL;
+        }
+    }
+    return order;
+}
+
+/* Old ids for dump_nodes, matched by qualified name. NULL when the prior file
+ * cannot be read. *high_water gets the prior nodes high-water mark. */
+static int64_t *stable_node_ids(sqlite3 *db, const char *project, const CBMDumpNode *nodes, int n,
+                                int64_t *high_water) {
+    *high_water = stable_high_water(db, "nodes");
+    if (*high_water < 0) {
+        return NULL;
+    }
+    size_t cap = (size_t)(n > 0 ? n : 1);
+    int64_t *ids = cbm_calloc(CBM_MEM_CLASS_DUMP, cap * sizeof(int64_t));
+    int *perm = cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(int));
+    sqlite3_stmt *st = NULL;
+    bool ok = ids && perm &&
+              sqlite3_prepare_v2(db,
+                                 "SELECT qualified_name, id FROM nodes WHERE project = ?1 "
+                                 "ORDER BY qualified_name",
+                                 -1, &st, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC) == SQLITE_OK;
+    if (ok) {
+        for (int i = 0; i < n; i++) {
+            perm[i] = i;
+        }
+        g_stable_nodes = nodes;
+        qsort(perm, (size_t)n, sizeof(int), cmp_stable_node_qn);
+        g_stable_nodes = NULL;
+        int i = 0;
+        int rc = sqlite3_step(st);
+        while (rc == SQLITE_ROW && i < n) {
+            const char *qn = (const char *)sqlite3_column_text(st, 0);
+            int c = qn ? strcmp(nodes[perm[i]].qualified_name, qn) : 1;
+            if (c < 0) {
+                i++;
+                continue;
+            }
+            if (c == 0) {
+                ids[perm[i]] = sqlite3_column_int64(st, 1);
+                i++;
+            }
+            rc = sqlite3_step(st);
+        }
+        ok = rc == SQLITE_ROW || rc == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    cbm_free(CBM_MEM_CLASS_DUMP, perm);
+    if (!ok) {
+        cbm_free(CBM_MEM_CLASS_DUMP, ids);
+        return NULL;
+    }
+    return ids;
+}
+
+/* As stable_node_ids, for edges whose endpoints already carry their final
+ * (stable) node ids. */
+static int64_t *stable_edge_ids(sqlite3 *db, const char *project, const CBMDumpEdge *edges, int n,
+                                int64_t *high_water) {
+    *high_water = stable_high_water(db, "edges");
+    if (*high_water < 0) {
+        return NULL;
+    }
+    size_t cap = (size_t)(n > 0 ? n : 1);
+    int64_t *ids = cbm_calloc(CBM_MEM_CLASS_DUMP, cap * sizeof(int64_t));
+    int *perm = cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(int));
+    sqlite3_stmt *st = NULL;
+    bool ok = ids && perm &&
+              sqlite3_prepare_v2(db,
+                                 "SELECT id, source_id, target_id, type, local_name_gen FROM edges "
+                                 "WHERE project = ?1 "
+                                 "ORDER BY source_id, target_id, type, local_name_gen",
+                                 -1, &st, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC) == SQLITE_OK;
+    if (ok) {
+        for (int i = 0; i < n; i++) {
+            perm[i] = i;
+        }
+        g_stable_edges = edges;
+        qsort(perm, (size_t)n, sizeof(int), cmp_stable_edge_key);
+        g_stable_edges = NULL;
+        int i = 0;
+        int rc = sqlite3_step(st);
+        while (rc == SQLITE_ROW && i < n) {
+            const char *type = (const char *)sqlite3_column_text(st, 3);
+            const char *ln = (const char *)sqlite3_column_text(st, 4);
+            int c = stable_edge_key_cmp(&edges[perm[i]], sqlite3_column_int64(st, 1),
+                                        sqlite3_column_int64(st, 2), type ? type : "",
+                                        ln ? ln : "");
+            if (c < 0) {
+                i++;
+                continue;
+            }
+            if (c == 0) {
+                ids[perm[i]] = sqlite3_column_int64(st, 0);
+                i++;
+            }
+            rc = sqlite3_step(st);
+        }
+        ok = rc == SQLITE_ROW || rc == SQLITE_DONE;
+    }
+    sqlite3_finalize(st);
+    cbm_free(CBM_MEM_CLASS_DUMP, perm);
+    if (!ok) {
+        cbm_free(CBM_MEM_CLASS_DUMP, ids);
+        return NULL;
+    }
+    return ids;
+}
+
+/* Give dump_nodes their stable ids, re-sorted ascending (the writer needs
+ * that), with src_nodes kept parallel and temp_to_final pointing at the new
+ * ids. false leaves everything as it was. */
+static bool stable_apply_nodes(sqlite3 *db, const char *project, CBMDumpNode **nodes_io,
+                               cbm_gbuf_node_t ***src_io, int n, int64_t *temp_to_final,
+                               int64_t max_temp_id, int64_t *high_water, int *kept) {
+    int64_t *ids = stable_node_ids(db, project, *nodes_io, n, high_water);
+    if (!ids) {
+        return false;
+    }
+    size_t cap = (size_t)(n > 0 ? n : 1);
+    int *order = stable_number_and_order(ids, n, *high_water, kept);
+    CBMDumpNode *sorted = order ? cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(CBMDumpNode)) : NULL;
+    cbm_gbuf_node_t **src_sorted =
+        (sorted && *src_io) ? cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(cbm_gbuf_node_t *))
+                            : NULL;
+    if (!sorted || (*src_io && !src_sorted)) {
+        cbm_free(CBM_MEM_CLASS_DUMP, sorted);
+        cbm_free(CBM_MEM_CLASS_DUMP, order);
+        cbm_free(CBM_MEM_CLASS_DUMP, ids);
+        return false;
+    }
+    /* temp_to_final holds 1-based dump positions; route them to the new ids. */
+    for (int64_t t = 0; t < max_temp_id; t++) {
+        int64_t pos = temp_to_final[t];
+        if (pos > 0 && pos <= n) {
+            temp_to_final[t] = ids[pos - 1];
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        sorted[i] = (*nodes_io)[order[i]];
+        sorted[i].id = ids[order[i]];
+        if (src_sorted) {
+            src_sorted[i] = (*src_io)[order[i]];
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_DUMP, *nodes_io);
+    *nodes_io = sorted;
+    if (src_sorted) {
+        cbm_free(CBM_MEM_CLASS_DUMP, *src_io);
+        *src_io = src_sorted;
+    }
+    cbm_free(CBM_MEM_CLASS_DUMP, order);
+    cbm_free(CBM_MEM_CLASS_DUMP, ids);
+    return true;
+}
+
+/* Same for edges, with their url_path/local_name buffers kept parallel. */
+static bool stable_apply_edges(sqlite3 *db, const char *project, CBMDumpEdge **edges_io,
+                               char ***url_io, char ***local_io, int n, int64_t *high_water,
+                               int *kept) {
+    int64_t *ids = stable_edge_ids(db, project, *edges_io, n, high_water);
+    if (!ids) {
+        return false;
+    }
+    size_t cap = (size_t)(n > 0 ? n : 1);
+    int *order = stable_number_and_order(ids, n, *high_water, kept);
+    CBMDumpEdge *sorted = order ? cbm_alloc(CBM_MEM_CLASS_DUMP, cap * sizeof(CBMDumpEdge)) : NULL;
+    char **url = sorted ? cbm_calloc(CBM_MEM_CLASS_DUMP, cap * sizeof(char *)) : NULL;
+    char **loc = url ? cbm_calloc(CBM_MEM_CLASS_DUMP, cap * sizeof(char *)) : NULL;
+    if (!loc) {
+        cbm_free(CBM_MEM_CLASS_DUMP, url);
+        cbm_free(CBM_MEM_CLASS_DUMP, sorted);
+        cbm_free(CBM_MEM_CLASS_DUMP, order);
+        cbm_free(CBM_MEM_CLASS_DUMP, ids);
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        sorted[i] = (*edges_io)[order[i]];
+        sorted[i].id = ids[order[i]];
+        url[i] = (*url_io)[order[i]];
+        loc[i] = (*local_io)[order[i]];
+    }
+    cbm_free(CBM_MEM_CLASS_DUMP, *edges_io);
+    cbm_free(CBM_MEM_CLASS_DUMP, *url_io);
+    cbm_free(CBM_MEM_CLASS_DUMP, *local_io);
+    *edges_io = sorted;
+    *url_io = url;
+    *local_io = loc;
+    cbm_free(CBM_MEM_CLASS_DUMP, order);
+    cbm_free(CBM_MEM_CLASS_DUMP, ids);
+    return true;
+}
+
+static void log_stable_ids(const char *table, int kept, int total) {
+    char k[CBM_SZ_16];
+    char t[CBM_SZ_16];
+    snprintf(k, sizeof(k), "%d", kept);
+    snprintf(t, sizeof(t), "%d", total);
+    cbm_log_info("gbuf.stable_ids", "table", table, "kept", k, "total", t);
+}
+
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
+    return cbm_gbuf_dump_to_sqlite_stable(gb, path, NULL);
+}
+
+int cbm_gbuf_dump_to_sqlite_stable(cbm_gbuf_t *gb, const char *path, const char *prior_db_path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
@@ -2525,6 +2857,23 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         build_dump_nodes(gb, live_count, temp_to_final, max_temp_id, &node_idx, &src_nodes);
     CBM_PROF_END_N("dump", "2_build_dump_nodes", t_build_nodes, node_idx);
 
+    /* Keep the previous generation's ids where the rows are the same (see
+     * "Stable ids across generations"). The prior file stays open until the
+     * edges are numbered too; no prior file means sequential ids as before. */
+    sqlite3 *prior = dump_nodes ? stable_prior_open(prior_db_path) : NULL;
+    int64_t node_floor = 0;
+    if (prior) {
+        int kept = 0;
+        if (stable_apply_nodes(prior, gb->project, &dump_nodes, &src_nodes, node_idx, temp_to_final,
+                               max_temp_id, &node_floor, &kept)) {
+            log_stable_ids("nodes", kept, node_idx);
+        } else {
+            node_floor = 0;
+            sqlite3_close(prior);
+            prior = NULL;
+        }
+    }
+
     /* Release ALL lookup indexes NOW: nothing between here and finalize reads
      * them (stream-append uses dump_nodes/src_nodes, build_dump_edges uses
      * temp_to_final + gb->edges, the vector remap uses temp_to_final). At
@@ -2547,6 +2896,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
         log_dump_failed(CBM_NOT_FOUND, errno, node_idx, 0);
+        sqlite3_close(prior);
         cbm_free(CBM_MEM_CLASS_DUMP, src_nodes);
         cbm_free(CBM_MEM_CLASS_DUMP, dump_nodes);
         cbm_free(CBM_MEM_CLASS_DUMP, temp_to_final);
@@ -2592,8 +2942,22 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         dump_edges =
             build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
+        if (prior && dump_edges) {
+            int64_t edge_floor = 0;
+            int kept = 0;
+            if (stable_apply_edges(prior, gb->project, &dump_edges, &url_paths, &local_names,
+                                   edge_idx, &edge_floor, &kept)) {
+                log_stable_ids("edges", kept, edge_idx);
+            } else {
+                edge_floor = 0;
+            }
+            cbm_writer_set_sequence_floor(w, node_floor, edge_floor);
+        }
         release_and_remap_vectors(gb, temp_to_final, max_temp_id);
     }
+
+    sqlite3_close(prior);
+    prior = NULL;
 
     /* Finalize: nodes-table interior + edges/vectors/metadata/indexes/sqlite_master.
      * Frees w and closes the file; handles a prior append error cleanly. */

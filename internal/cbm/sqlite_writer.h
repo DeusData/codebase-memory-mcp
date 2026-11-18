@@ -70,16 +70,22 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
 // produces byte-identical output.
 //
 // Usage: w = cbm_writer_open(path);
-//        cbm_writer_append_nodes(w, batch, n) x N  (ascending, contiguous ids);
+//        cbm_writer_append_nodes(w, batch, n) x N  (strictly ascending ids);
 //        cbm_writer_finalize(w, ...);   // consumes + frees w, closes the file.
 typedef struct cbm_db_writer cbm_db_writer_t;
 
 cbm_db_writer_t *cbm_writer_open(const char *path);
 
 // Append a batch of node records. Heavy `properties` are consumed here, so the
-// caller may free them after this returns. Node ids must be ascending and
-// contiguous across the whole sequence of append calls. Returns 0 on success.
+// caller may free them after this returns. Node ids must be strictly ascending
+// across the whole sequence of append calls; gaps are allowed (a stable-id
+// rebuild keeps the ids of the previous generation). Returns 0 on success.
 int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int count);
+
+// Keep sqlite_sequence for nodes/edges at least at these values (the previous
+// generation's high-water marks), so AUTOINCREMENT never hands a retired id to
+// a new row. Optional; call before finalize.
+void cbm_writer_set_sequence_floor(cbm_db_writer_t *w, int64_t node_seq, int64_t edge_seq);
 
 // Finalize: build the nodes-table interior, write edges/vectors/token_vectors,
 // metadata, all indexes, and sqlite_master + header. The node/edge/vector arrays

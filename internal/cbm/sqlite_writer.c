@@ -1784,6 +1784,10 @@ typedef struct {
     int vector_count;
     CBMDumpTokenVec *token_vecs;
     int token_vec_count;
+    /* sqlite_sequence never drops below these (0 = no floor): ids a previous
+     * generation handed out stay retired after a stable-id rebuild. */
+    int64_t node_seq_floor;
+    int64_t edge_seq_floor;
 } write_db_ctx_t;
 
 static int make_writer_temp_path(const char *path, const void *token, char *out, size_t out_size) {
@@ -1924,14 +1928,16 @@ static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
     RecordBuilder r2;
     rec_init(&r1);
     rec_add_text(&r1, "nodes");
-    rec_add_int(&r1, w->node_count > 0 ? w->nodes[w->node_count - SKIP_ONE].id : 0);
+    int64_t node_seq = w->node_count > 0 ? w->nodes[w->node_count - SKIP_ONE].id : 0;
+    rec_add_int(&r1, node_seq > w->node_seq_floor ? node_seq : w->node_seq_floor);
     int seq1_len;
     uint8_t *seq1 = rec_finalize(&r1, &seq1_len);
     rec_free(&r1);
 
     rec_init(&r2);
     rec_add_text(&r2, "edges");
-    rec_add_int(&r2, w->edge_count > 0 ? w->edges[w->edge_count - SKIP_ONE].id : 0);
+    int64_t edge_seq = w->edge_count > 0 ? w->edges[w->edge_count - SKIP_ONE].id : 0;
+    rec_add_int(&r2, edge_seq > w->edge_seq_floor ? edge_seq : w->edge_seq_floor);
     int seq2_len;
     uint8_t *seq2 = rec_finalize(&r2, &seq2_len);
     rec_free(&r2);
@@ -2390,6 +2396,13 @@ int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int co
         w->node_rows_written++;
     }
     return 0;
+}
+
+void cbm_writer_set_sequence_floor(cbm_db_writer_t *w, int64_t node_seq, int64_t edge_seq) {
+    if (w) {
+        w->wc.node_seq_floor = node_seq;
+        w->wc.edge_seq_floor = edge_seq;
+    }
 }
 
 int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *root_path,
