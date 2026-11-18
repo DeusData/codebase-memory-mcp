@@ -43,13 +43,18 @@
 /* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
 
+/* Collector failure distinct from missing configured test-owner definitions.
+ * Every driver must fail the attempt, preserving the serving generation. */
+#define CBM_PXC_DEFS_OVER_BUDGET (-2)
+
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
  * caller frees each entry then the array). String fields in the
  * returned CBMLSPDef[] are borrowed from cache[i]->arena and from
  * def_modules[i] — caller must keep both alive while the array is in
  * use. Returns the malloc'd array (free() it) and writes the entry
- * count to *out_count. Returns NULL on alloc failure or when no defs
+ * count to *out_count. A budget refusal returns NULL with
+ * *out_count = CBM_PXC_DEFS_OVER_BUDGET. Returns NULL on alloc failure or when no defs
  * exist. out_def_starts (optional, file_count + 1 entries, caller-owned)
  * receives per-file prefix offsets: file i's defs occupy
  * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
