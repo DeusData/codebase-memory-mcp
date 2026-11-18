@@ -365,14 +365,16 @@ static const char *cpp_branch_types[] = {"if_statement",    "for_statement",    
                                          "while_statement", "switch_statement", "case_statement",
                                          "try_statement",   "catch_clause",     NULL};
 static const char *cpp_var_types[] = {"declaration", NULL};
+/* No update_expression here, unlike C: a bare C++ name can be an implicit-this
+ * member, so a local counter's `i++` would bind by name to an unrelated member. */
 static const char *cpp_assign_types[] = {"assignment_expression", NULL};
 static const char *cpp_throw_types[] = {"throw_statement", NULL};
 
 // ==================== C# ====================
-static const char *cs_func_types[] = {"destructor_declaration",      "local_function_statement",
-                                      "function_pointer_type",       "constructor_declaration",
-                                      "anonymous_method_expression", "lambda_expression",
-                                      "method_declaration",          NULL};
+static const char *cs_func_types[] = {
+    "destructor_declaration",  "local_function_statement",    "function_pointer_type",
+    "constructor_declaration", "anonymous_method_expression", "lambda_expression",
+    "method_declaration",      "operator_declaration",        NULL};
 static const char *cs_class_types[] = {"class_declaration",
                                        "struct_declaration",
                                        "enum_declaration",
@@ -490,7 +492,7 @@ static const char *c_branch_types[] = {"if_statement",
                                        "case_statement",
                                        NULL};
 static const char *c_var_types[] = {"declaration", NULL};
-static const char *c_assign_types[] = {"assignment_expression", NULL};
+static const char *c_assign_types[] = {"assignment_expression", "update_expression", NULL};
 
 // ==================== BASH ====================
 static const char *bash_func_types[] = {"function_definition", NULL};

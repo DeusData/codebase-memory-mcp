@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "resolve_stats.h"
 #if defined(CBM_KOTLIN_DEDUP_TEST_API) && CBM_KOTLIN_DEDUP_TEST_API
 #include <stdatomic.h>
 #endif
@@ -2148,30 +2149,238 @@ static bool go_is_function_boundary(const char *k) {
            strcmp(k, "func_literal") == 0 || strcmp(k, "source_file") == 0;
 }
 
-/* Latest binding of `name` among the statements preceding `use` in its
- * enclosing blocks, innermost block first; a null node when none. */
-static TSNode go_find_binding(CBMArena *a, TSNode use, const char *name, const char *source) {
+/* A function of route registrations asks what each receiver is bound to, so one block's bindings
+ * are read once: every name each statement binds, by name and then in source order. A statement
+ * that names a variable but gives it no value has no row, as go_stmt_binding has no answer. */
+typedef struct {
+    const char *name;
+    uint32_t statement_start;
+    uint32_t order;
+    TSNode value;
+} go_binding_t;
+
+typedef struct {
+    const void *block;
+    go_binding_t *rows;
+    size_t count, capacity;
+} go_block_bindings_t;
+
+typedef struct {
+    go_block_bindings_t **slots;
+    size_t capacity, used;
+} go_bindings_table_t;
+
+static bool go_binding_add(CBMArena *a, go_block_bindings_t *block, TSNode statement,
+                           const char *name, const char *source) {
+    TSNode value = go_stmt_binding(a, statement, name, source);
+    if (ts_node_is_null(value)) {
+        return true;
+    }
+    if (block->count == block->capacity) {
+        size_t capacity = block->capacity ? block->capacity * 2 : 16;
+        go_binding_t *rows = cbm_arena_alloc(a, capacity * sizeof(*rows));
+        if (!rows) {
+            return false;
+        }
+        if (block->count) {
+            memcpy(rows, block->rows, block->count * sizeof(*rows));
+        }
+        block->rows = rows;
+        block->capacity = capacity;
+    }
+    block->rows[block->count] = (go_binding_t){.name = name,
+                                               .statement_start = ts_node_start_byte(statement),
+                                               .order = (uint32_t)block->count,
+                                               .value = value};
+    block->count++;
+    return true;
+}
+
+/* Every name a `var` statement declares, through its specs and their lists. */
+static bool go_var_names_add(CBMArena *a, go_block_bindings_t *block, TSNode statement, TSNode list,
+                             const char *source) {
+    uint32_t count = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(list, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "var_spec") == 0) {
+            uint32_t parts = ts_node_named_child_count(child);
+            for (uint32_t p = 0; p < parts; p++) {
+                TSNode part = ts_node_named_child(child, p);
+                const char *name = strcmp(ts_node_type(part), "identifier") == 0
+                                       ? cbm_node_text(a, part, source)
+                                       : NULL;
+                if (name && !go_binding_add(a, block, statement, name, source)) {
+                    return false;
+                }
+            }
+        } else if (strcmp(kind, "var_spec_list") == 0 &&
+                   !go_var_names_add(a, block, statement, child, source)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool go_statement_names_add(CBMArena *a, go_block_bindings_t *block, TSNode statement,
+                                   const char *source) {
+    const char *kind = ts_node_type(statement);
+    if (strcmp(kind, "var_declaration") == 0 || strcmp(kind, "var_spec_list") == 0) {
+        return go_var_names_add(a, block, statement, statement, source);
+    }
+    if (strcmp(kind, "short_var_declaration") != 0 && strcmp(kind, "assignment_statement") != 0) {
+        return true;
+    }
+    TSNode left = ts_node_child_by_field_name(statement, TS_FIELD("left"));
+    uint32_t count = ts_node_is_null(left) ? 0 : ts_node_named_child_count(left);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = cbm_node_text(a, ts_node_named_child(left, i), source);
+        if (name && !go_binding_add(a, block, statement, name, source)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int go_binding_order(const void *left, const void *right) {
+    const go_binding_t *a = left, *b = right;
+    int order = strcmp(a->name, b->name);
+    if (order) {
+        return order;
+    }
+    return a->order < b->order ? -1 : a->order > b->order;
+}
+
+static go_block_bindings_t *go_block_bindings_build(CBMArena *a, TSNode node, const char *source) {
+    go_block_bindings_t *block = cbm_arena_alloc(a, sizeof(*block));
+    if (!block) {
+        return NULL;
+    }
+    *block = (go_block_bindings_t){.block = node.id};
+    bool ok = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode statement = ts_tree_cursor_current_node(&cursor);
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            ok =
+                !ts_node_is_named(statement) || go_statement_names_add(a, block, statement, source);
+        } while (ok && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (!ok) {
+        return NULL;
+    }
+    if (block->count > 1) {
+        qsort(block->rows, block->count, sizeof(*block->rows), go_binding_order);
+    }
+    return block;
+}
+
+static size_t go_block_hash(const void *id, size_t capacity) {
+    uint64_t value = (uint64_t)(uintptr_t)id >> 3;
+    value *= UINT64_C(0x9E3779B97F4A7C15);
+    return (size_t)(value ^ (value >> 29)) & (capacity - 1);
+}
+
+/* This block's bindings, read the first time anything in it asks. */
+static go_block_bindings_t *go_block_bindings_of(CBMExtractCtx *ctx, TSNode node) {
+    enum { GO_BLOCKS_FIRST = 16 };
+    CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
+    go_bindings_table_t *table = ctx->go_block_bindings;
+    if (!table) {
+        table = cbm_arena_calloc(a, sizeof(*table));
+        go_block_bindings_t **slots =
+            table ? cbm_arena_calloc(a, GO_BLOCKS_FIRST * sizeof(*slots)) : NULL;
+        if (!slots) {
+            return NULL;
+        }
+        table->slots = slots;
+        table->capacity = GO_BLOCKS_FIRST;
+        ctx->go_block_bindings = table;
+    }
+    size_t at = go_block_hash(node.id, table->capacity);
+    while (table->slots[at]) {
+        if (table->slots[at]->block == node.id) {
+            return table->slots[at];
+        }
+        at = (at + 1) & (table->capacity - 1);
+    }
+    go_block_bindings_t *block = go_block_bindings_build(a, node, ctx->source);
+    if (!block) {
+        return NULL;
+    }
+    table->slots[at] = block;
+    table->used++;
+    if (table->used * 2 > table->capacity) {
+        size_t capacity = table->capacity * 2;
+        go_block_bindings_t **slots = cbm_arena_calloc(a, capacity * sizeof(*slots));
+        if (!slots) {
+            return NULL;
+        }
+        for (size_t i = 0; i < table->capacity; i++) {
+            if (table->slots[i]) {
+                size_t place = go_block_hash(table->slots[i]->block, capacity);
+                while (slots[place]) {
+                    place = (place + 1) & (capacity - 1);
+                }
+                slots[place] = table->slots[i];
+            }
+        }
+        table->slots = slots;
+        table->capacity = capacity;
+    }
+    return block;
+}
+
+/* The binding of `name` by the last statement in this block that starts before `before`. */
+static TSNode go_block_binding(const go_block_bindings_t *block, const char *name,
+                               uint32_t before) {
+    size_t low = 0, high = block->count;
+    while (low < high) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        size_t middle = low + (high - low) / 2;
+        const go_binding_t *row = &block->rows[middle];
+        int order = strcmp(row->name, name);
+        if (order < 0 || (order == 0 && row->statement_start < before)) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low == 0 || strcmp(block->rows[low - 1].name, name) != 0) {
+        return (TSNode){0};
+    }
+    return block->rows[low - 1].value;
+}
+
+/* Latest binding of `name` among the statements preceding `use` in its enclosing blocks, innermost
+ * block first; a null node when none. False when memory ran out and the answer is unknown. */
+static bool go_find_binding(CBMExtractCtx *ctx, TSNode use, const char *name, TSNode *binding) {
+    *binding = (TSNode){0};
     TSNode child = use;
     TSNode cur = ts_node_parent(use);
     while (!ts_node_is_null(cur) && !go_is_function_boundary(ts_node_type(cur))) {
         const char *k = ts_node_type(cur);
         if (strcmp(k, "block") == 0 || strcmp(k, "statement_list") == 0) {
-            for (TSNode s = ts_node_prev_named_sibling(child); !ts_node_is_null(s);
-                 s = ts_node_prev_named_sibling(s)) {
-                TSNode v = go_stmt_binding(a, s, name, source);
-                if (!ts_node_is_null(v)) {
-                    return v;
-                }
+            const go_block_bindings_t *block = go_block_bindings_of(ctx, cur);
+            if (!block) {
+                return false;
+            }
+            *binding = go_block_binding(block, name, ts_node_start_byte(child));
+            if (!ts_node_is_null(*binding)) {
+                return true;
             }
         }
         child = cur;
         cur = ts_node_parent(cur);
     }
-    TSNode none = {0};
-    return none;
+    return true;
 }
 
-static const char *go_group_prefix_for_call(CBMArena *a, TSNode call, const char *source) {
+static const char *go_group_prefix_for_call(CBMExtractCtx *ctx, TSNode call) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
     TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
     if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
         return NULL;
@@ -2190,7 +2399,11 @@ static const char *go_group_prefix_for_call(CBMArena *a, TSNode call, const char
         }
         if (strcmp(k, "identifier") == 0) {
             const char *name = cbm_node_text(a, recv, source);
-            recv = name ? go_find_binding(a, recv, name, source) : (TSNode){0};
+            TSNode bound = {0};
+            if (name && !go_find_binding(ctx, recv, name, &bound)) {
+                return NULL; /* never a partial prefix */
+            }
+            recv = bound;
             continue; /* unbound (parameter, package var): root reached */
         }
         TSNode inner = {0};
@@ -2223,7 +2436,7 @@ static const char *route_path_with_group_prefix(CBMExtractCtx *ctx, TSNode node,
     if (ctx->language == CBM_LANG_PHP) {
         gp = php_group_prefix_for_call(ctx->arena, node, ctx->source);
     } else if (ctx->language == CBM_LANG_GO) {
-        gp = go_group_prefix_for_call(ctx->arena, node, ctx->source);
+        gp = go_group_prefix_for_call(ctx, node);
     }
     return (gp && gp[0]) ? route_path_with_prefix(ctx->arena, gp, path) : path;
 }

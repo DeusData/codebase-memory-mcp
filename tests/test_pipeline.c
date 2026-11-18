@@ -2075,6 +2075,44 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
 }
 
+static bool cross_file_call_to_owner_has_strategy(cbm_store_t *s, const char *project,
+                                                  const char *src_name, const char *tgt_name,
+                                                  const char *owner_fragment,
+                                                  const char *strategy_fragment) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && tgts[k].qualified_name &&
+                    strstr(tgts[k].qualified_name, owner_fragment) && edges[j].properties_json &&
+                    strstr(edges[j].properties_json, strategy_fragment)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
 /* True iff the exact named CALLS edge exists and its serialized strategy
  * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
  * this on a separate ordinary-call control: it proves the cross-file LSP ran
@@ -2842,6 +2880,41 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
     ASSERT_EQ(labeled_edge_count(store, project, "USAGE", "show", "executable", "Field"), 1);
     ASSERT_EQ(labeled_edge_count(store, project, "USAGE", "show", "executable", "Method"), 0);
     ASSERT_EQ(labeled_edge_count(store, project, "CALLS", "run", "executable", "Method"), 1);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* C `x++` and `--x` write x. The C assignment node set held only
+ * assignment_expression, so an increment or a decrement left no WRITES edge,
+ * although the write resolver already handles update_expression and `x = 0`
+ * in the same file did write. */
+TEST(pipeline_c_increment_writes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incwrite_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "src/counter.c"),
+                  "struct counter { int n; };\n"
+                  "int hits;\n"
+                  "void hits_reset(void) { hits = 0; }\n"
+                  "void hits_bump(void) { hits++; }\n"
+                  "void hits_drop(void) { --hits; }\n"
+                  "void counter_tick(struct counter *c) { c->n++; }\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/incwrite.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    /* The plain assignment shows the fixture can produce WRITES at all. */
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_reset", "hits", "Variable"), 1);
+    /* Postfix and prefix on a file-level variable, postfix on a member. */
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_bump", "hits", "Variable"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "hits_drop", "hits", "Variable"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "counter_tick", "n", "Field"), 1);
     cbm_store_close(store);
     cbm_pipeline_free(p);
     th_cleanup(tmp);
@@ -14838,6 +14911,280 @@ TEST(pipeline_c_member_access_binds_field_by_object_type_parallel) {
     PASS();
 }
 
+static void write_scala_import_alias_fixture(const char *tmp) {
+    write_temp_file(tmp, "alias_targets.scala",
+                    "package alias_targets\n"
+                    "object CorrectObject { def execute(): Int = 1 }\n"
+                    "object WrongObject { def execute(): Int = 2 }\n"
+                    "object ExternalStateRef { def make(): Int = 3 }\n");
+    write_temp_file(tmp, "alias_caller.scala",
+                    "package alias_caller\n"
+                    "import alias_targets.{CorrectObject => ImportedAlias}\n"
+                    "import outside.library.ExternalStateRef\n"
+                    "object AliasCalls {\n"
+                    "  def invokeAlias(): Int = ImportedAlias.execute()\n"
+                    "  def invokeExternal(): Int = ExternalStateRef.make()\n"
+                    "}\n");
+}
+
+static bool scala_import_alias_edge_is_exact(cbm_store_t *s, const char *project) {
+    cbm_edge_t *imports = NULL;
+    int import_count = 0;
+    bool exact_call = cross_file_call_to_owner_has_strategy(s, project, "invokeAlias", "execute",
+                                                            "CorrectObject.execute", "import_map");
+    cbm_store_find_edges_by_type(s, project, "IMPORTS", &imports, &import_count);
+    if (imports) {
+        cbm_store_free_edges(imports, import_count);
+    }
+    return exact_call && import_count == 1;
+}
+
+TEST(pipeline_scala_import_alias_resolves_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_import_alias_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_alias.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_import_alias_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* `import pkg.Owner.member` when the package is split across modules and a
+ * second file in the same package declares a same-named member: the import
+ * must bind to Owner.member, not degrade to the owner (which would drop the
+ * unqualified `member()` call). */
+TEST(pipeline_scala_member_import_in_split_package_binds_owner_member) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_member_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "main_parser.scala",
+                    "package split_pkg\n"
+                    "object Parser { def check(s: String): Boolean = true }\n");
+    write_temp_file(tmp, "bench_parser.scala",
+                    "package split_pkg\n"
+                    "class ParserBench { def check(s: String): Boolean = false }\n");
+    write_temp_file(tmp, "member_caller.scala",
+                    "package member_caller\n"
+                    "import split_pkg.Parser.check\n"
+                    "object Decoder { def validate(s: String): Boolean = check(s) }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_member.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_to_owner_has_strategy(s, cbm_pipeline_project_name(p), "validate",
+                                                      "check", "Parser.check", "import_map"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Only the Scala resolver reads the top-level index, so a pass whose files
+ * hold no Scala importer must not pay the node walk and per-symbol keys for
+ * it: Java/Kotlin/C#/PHP corpora get exactly the namespace map, as before.
+ * One Scala file among the importers builds it, whether or not that file
+ * declares a package (a default-package Scala file still imports). */
+TEST(pipeline_scala_index_built_only_for_scala_importers) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "Codec.java", "proj.core.Codec.__file__",
+                                   "core/Codec.java", 0, 0, "{}"),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Class", "Codec", "proj.core.Codec", "core/Codec.java", 1, 3,
+                                   "{}"),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "App.scala", "proj.app.App.__file__",
+                                   "app/App.scala", 0, 0, "{}"),
+              0);
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "proj",
+        .repo_path = "/tmp/proj",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+
+    cbm_file_info_t java_only[] = {{.rel_path = "core/Codec.java", .language = CBM_LANG_JAVA}};
+    const char *java_ns[] = {"com.acme.core"};
+    CBMHashTable *namespace_map = NULL;
+    cbm_scala_index_t *scala_index = NULL;
+    cbm_pipeline_import_maps_build(&ctx, java_only, 1, java_ns, &namespace_map, &scala_index);
+    ASSERT_NOT_NULL(namespace_map);
+    ASSERT_NULL(scala_index);
+    cbm_pipeline_import_maps_free(namespace_map, scala_index);
+
+    cbm_file_info_t mixed[] = {{.rel_path = "core/Codec.java", .language = CBM_LANG_JAVA},
+                               {.rel_path = "app/App.scala", .language = CBM_LANG_SCALA}};
+    const char *mixed_ns[] = {"com.acme.core", NULL};
+    cbm_pipeline_import_maps_build(&ctx, mixed, 2, mixed_ns, &namespace_map, &scala_index);
+    ASSERT_NOT_NULL(namespace_map);
+    ASSERT_NOT_NULL(scala_index);
+    cbm_pipeline_import_maps_free(namespace_map, scala_index);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_scala_import_alias_parallel_resolves_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_import_alias_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "alias_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object AliasFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_alias_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_import_alias_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A Scala wildcard import (`import pkg._`, `import pkg.Owner._`) binds no
+ * local name: its IMPORTS edge carries the local name "*". Scala operators are
+ * method calls, so `h * width` is a call whose callee is "*" as well, and it
+ * must never bind to the wildcard's target through the import map. */
+static int scala_operator_calls(cbm_store_t *s) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT n.qualified_name, e.properties FROM edges e"
+                           " JOIN nodes n ON n.id = e.target_id WHERE e.type = 'CALLS'"
+                           " AND json_valid(e.properties)"
+                           " AND json_extract(e.properties, '$.callee') = '*'",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        fprintf(stderr, "  operator call bound: -> %s %s\n", sqlite3_column_text(st, 0),
+                sqlite3_column_text(st, 1));
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int scala_wildcard_operator_case(const char *tmpl, bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", tmpl);
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    write_temp_file(tmp, "wild_model.scala",
+                    "package wild_model\n"
+                    "object Consts { val Width: Int = 10 }\n"
+                    "object Helper { def run(): Int = 1 }\n");
+    write_temp_file(tmp, "wild_caller.scala",
+                    "package wild_caller\n"
+                    "import wild_model._\n"
+                    "import wild_model.Consts._\n"
+                    "import wild_model.Helper\n"
+                    "object Area {\n"
+                    "  def area(h: Int): Int = h * Width\n"
+                    "  def scaled(): Int = Helper.run() * 2\n"
+                    "}\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "wild_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object WildFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (parallel) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_wild.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int ok = p && cbm_pipeline_run(p) == 0;
+    cbm_store_t *s = ok ? cbm_store_open_path(db_path) : NULL;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        cbm_edge_t *imports = NULL;
+        int import_count = 0;
+        cbm_store_find_edges_by_type(s, project, "IMPORTS", &imports, &import_count);
+        if (imports) {
+            cbm_store_free_edges(imports, import_count);
+        }
+        /* Both wildcards and the named import keep their IMPORTS edges, and a
+         * named import still binds its calls through the import map. */
+        bool named = cross_file_call_to_owner_has_strategy(s, project, "scaled", "run",
+                                                           "Helper.run", "import_map");
+        int operators = scala_operator_calls(s);
+        if (import_count != 3 || !named || operators != 0) {
+            fprintf(stderr, "  wildcard case parallel=%d: imports=%d named=%d operator_calls=%d\n",
+                    parallel, import_count, named, operators);
+            ok = 0;
+        }
+        cbm_store_close(s);
+    } else {
+        ok = 0;
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else if (parallel) {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    return ok;
+}
+
+TEST(pipeline_scala_wildcard_import_binds_no_operator_call) {
+    ASSERT_TRUE(scala_wildcard_operator_case("/tmp/cbm_scala_wild_XXXXXX", false));
+    ASSERT_TRUE(scala_wildcard_operator_case("/tmp/cbm_scala_wild_par_XXXXXX", true));
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -25649,8 +25996,8 @@ static const cbm_gbuf_node_t *resolve_device_h_from(cbm_gbuf_t *gb) {
     CBMImport imp = {0};
     imp.module_path = "linux/device.h";
     imp.local_name = "h";
-    return cbm_pipeline_resolve_import_node(&ctx, "arch/x/bugs.c", "p.arch.x.bugs.c.__file__", &imp,
-                                            NULL);
+    return cbm_pipeline_resolve_import_node(&ctx, "arch/x/bugs.c", "p.arch.x.bugs.c.__file__",
+                                            CBM_LANG_C, &imp, NULL, NULL);
 }
 
 TEST(pipeline_header_include_target_is_independent_of_registration_order) {
@@ -26521,6 +26868,165 @@ TEST(pipeline_csharp_modern) {
     cbm_store_free_nodes(methods, mc);
 
     cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* C# local functions do not have graph nodes yet. Their calls must stay
+ * attributed to the enclosing method, whose definition span contains the call
+ * site, instead of falling back to the file node (#2964). */
+TEST(pipeline_csharp_local_function_calls_keep_enclosing_method_issue2964) {
+    const char *files[] = {"Repro.cs"};
+    const char *contents[] = {"using System;\n"
+                              "using System.Threading.Tasks;\n"
+                              "namespace Repro;\n"
+                              "public sealed class Queue {\n"
+                              "    public Task<int> RunAsync(int n) => Task.FromResult(n);\n"
+                              "}\n"
+                              "public sealed class Caller {\n"
+                              "    private readonly Queue _queue = new Queue();\n"
+                              "    public async Task<int> FromMethod() {\n"
+                              "        return await _queue.RunAsync(1);\n"
+                              "    }\n"
+                              "    public async Task<int> WithLocalFunction() {\n"
+                              "        async Task<int> Inner(int n) {\n"
+                              "            return await _queue.RunAsync(n);\n"
+                              "        }\n"
+                              "        return await Inner(2);\n"
+                              "    }\n"
+                              "    public async Task<int> WithLambda() {\n"
+                              "        Func<int, Task<int>> f = async n => await _queue.RunAsync(n);\n"
+                              "        return await f(3);\n"
+                              "    }\n"
+                              "    public async Task<int> WithNestedLocalFunction() {\n"
+                              "        async Task<int> Outer(int n) {\n"
+                              "            async Task<int> Deep(int m) {\n"
+                              "                return await _queue.RunAsync(m);\n"
+                              "            }\n"
+                              "            return await Deep(n);\n"
+                              "        }\n"
+                              "        return await Outer(4);\n"
+                              "    }\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "FromMethod", "RunAsync"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "WithLocalFunction", "RunAsync"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "WithLambda", "RunAsync"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "WithNestedLocalFunction", "RunAsync"),
+              1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* A top-level local function (C# top-level statements) is a Function node of
+ * its own, so calls in it stay attributed to it, and a local function nested
+ * in it attributes to that Function. Neither may fall back to the Module or
+ * File node, both named after the file (#2964). */
+TEST(pipeline_csharp_top_level_local_function_calls_keep_function_issue2964) {
+    const char *files[] = {"Program.cs"};
+    const char *contents[] = {"using System;\n"
+                              "var q = new Queue();\n"
+                              "Console.WriteLine(Helper(1));\n"
+                              "Console.WriteLine(Twice(2));\n"
+                              "int Helper(int n) {\n"
+                              "    return q.Run(n);\n"
+                              "}\n"
+                              "static int Twice(int n) {\n"
+                              "    int Inner(int m) => Calc.Square(m);\n"
+                              "    return Inner(n) * 2;\n"
+                              "}\n"
+                              "class Queue {\n"
+                              "    public int Run(int n) => n;\n"
+                              "}\n"
+                              "static class Calc {\n"
+                              "    public static int Square(int x) => x * x;\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Helper", "Run"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Twice", "Square"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Program.cs", "Run"), 0);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Program.cs", "Square"), 0);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* C# 14 extension block members parse as local functions, but the def side
+ * lifts them onto the type as methods (#2071): calls in them stay attributed
+ * to those methods, under #if too, and a local function nested in a member
+ * attributes to that member (#2964). */
+TEST(pipeline_csharp_extension_member_calls_keep_method_issue2964) {
+    const char *files[] = {"NumberExtensions.cs"};
+    const char *contents[] = {"using System.Collections.Generic;\n"
+                              "namespace App;\n"
+                              "public static class Calc {\n"
+                              "    public static int Total(IEnumerable<int> xs) => 0;\n"
+                              "    public static int Nothing() => 0;\n"
+                              "    public static int One() => 1;\n"
+                              "}\n"
+                              "public static class NumberExtensions {\n"
+                              "    extension(IEnumerable<int> numbers) {\n"
+                              "        public int SumPositive() => Calc.Total(numbers);\n"
+                              "#if FEATURE\n"
+                              "        public static int Zero() => Calc.Nothing();\n"
+                              "#endif\n"
+                              "        public int Nest() { int Inner() => Calc.One(); return Inner(); }\n"
+                              "    }\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "SumPositive", "Total"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Zero", "Nothing"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "Nest", "One"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "NumberExtensions.cs", "Total"), 0);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "NumberExtensions.cs", "Nothing"), 0);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "NumberExtensions.cs", "One"), 0);
+
+    cbm_store_close(store);
     cbm_pipeline_free(p);
     teardown_lang_repo();
     PASS();
@@ -35032,6 +35538,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
+    RUN_TEST(pipeline_c_increment_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
@@ -35110,6 +35617,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
+    RUN_TEST(pipeline_scala_member_import_in_split_package_binds_owner_member);
+    RUN_TEST(pipeline_scala_index_built_only_for_scala_importers);
+    RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
+    RUN_TEST(pipeline_scala_wildcard_import_binds_no_operator_call);
     RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355);
@@ -35244,6 +35756,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_kotlin_project);
     RUN_TEST(pipeline_lua_anonymous_functions);
     RUN_TEST(pipeline_csharp_modern);
+    RUN_TEST(pipeline_csharp_local_function_calls_keep_enclosing_method_issue2964);
+    RUN_TEST(pipeline_csharp_top_level_local_function_calls_keep_function_issue2964);
+    RUN_TEST(pipeline_csharp_extension_member_calls_keep_method_issue2964);
     RUN_TEST(pipeline_bom_stripping);
     RUN_TEST(pipeline_form_call_resolution);
     RUN_TEST(pipeline_python_type_inference);

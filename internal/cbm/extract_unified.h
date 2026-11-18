@@ -20,6 +20,14 @@
 #define INLINE_PYTHON_DIRECTIVES 16
 #define INLINE_PY_PARAM_SLOTS 64
 #define INLINE_PY_PARAM_STACK 64
+#define FLAT_LOOKBACK_LEVELS 4
+
+/* Under parent, the search from sibling `asked` found this label, or none. */
+typedef struct {
+    const void *parent;
+    const void *asked;
+    TSNode found;
+} CBMFlatLookback;
 
 // ObjectScript type map: variable name → class name (for instance_method_call
 // resolution). Stack-allocated, per-method scope. Overflow is silent (no crash).
@@ -129,6 +137,12 @@ typedef struct {
     uint8_t kind;
 } CBMPythonDirective;
 
+// The lowest node a usage classifier has climbed from to the root undecided.
+typedef struct {
+    TSNode node;
+    uint32_t depth;
+} CBMOccurrenceClimb;
+
 // WalkState tracks scope context during the unified cursor walk.
 // Replaces parent-chain walks for enclosing_func_qn, import context, etc.
 typedef struct {
@@ -137,6 +151,10 @@ typedef struct {
     TSNode enclosing_class_node;        // that class scope's node (null when not known)
     const TSTreeCursor *current_cursor; // unified walk cursor at the current node
     TSTreeCursor *occurrence_cursor;    // reusable parent-preserving classifier cursor
+    uint32_t walk_depth;                // depth of the current node in the unified walk
+    CBMOccurrenceClimb binding_climb;   // settled by is_binding_occurrence
+    CBMOccurrenceClimb label_climb;     // settled by is_call_argument_label_walk
+    CBMOccurrenceClimb write_climb;     // settled by is_write_occurrence
     CBMInvocationKind invocation_kind;  // exact active invocation/reference role
     TSNode callee_expr;                 // exact active callee expression, if any
     TSNode callee_leaf;                 // exact active terminal callee, if any
@@ -163,6 +181,8 @@ typedef struct {
     uint32_t flat_anchor_start_byte;
     uint32_t flat_anchor_end_byte;
     const char *flat_function_qn;
+    /* What the last flat label search found, one per ancestor level it looked at. */
+    CBMFlatLookback flat_lookback[FLAT_LOOKBACK_LEVELS];
 
     CBMLexicalBinding *lexical_bindings;
     CBMLexicalBinding inline_lexical_bindings[INLINE_LEXICAL_BINDINGS];

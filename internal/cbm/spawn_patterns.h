@@ -59,6 +59,11 @@ typedef struct {
 const cbm_spawn_api_t *cbm_spawn_match(CBMLanguage lang, const char *callee,
                                        const CBMImport *imports, int count);
 
+/* Around one file's loop over its calls, on one thread: a match on exactly these rows asks them
+ * by name, the same answer as reading them all. Any other rows are read as usual. */
+void cbm_spawn_file_begin(const CBMImport *imports, int count);
+void cbm_spawn_file_end(void);
+
 /* The program a matched spawn starts: the first literal in its program
  * argument, that literal's first word, without directories
  * ("/usr/bin/git status" -> "git"). CBM_SPAWN_DYNAMIC when the program is

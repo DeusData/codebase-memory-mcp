@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "vba",
+      "camelcase": "Vba",
+      "scope": "source.vba",
+      "path": "vba",
+      "file-types": ["bas", "cls", "frm"]
+    }
+  ],
+  "metadata": {
+    "version": "0.14.5-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-vba @ 83c5c3c (vba dialect, generated with tree-sitter-cli 0.25.10)"
+  }
+}
