@@ -67,6 +67,17 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
     return 0;
 }
 
+static const CBMImport *find_import(CBMFileResult *r, const char *local, const char *path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local) == 0 &&
+            strcmp(imp->module_path, path) == 0) {
+            return imp;
+        }
+    }
+    return NULL;
+}
+
 /* Count definitions with a given label. */
 /* Check for a definition with the given qualified name. Distinct from
  * find_def_by_name, which returns the first match by NAME and so cannot tell two
@@ -3139,6 +3150,81 @@ TEST(haskell_infix_definition_name) {
     ASSERT_FALSE(has_def(r, "Function", "a"));
     ASSERT_FALSE(has_def(r, "Function", "x"));
     cbm_free_result(r);
+    PASS();
+}
+
+/* #2439: the vendored grammar lexes an escaped char literal with
+ * /'\\[^ ]*'/, whose `[^ ]*` also matches newlines and quotes. With only
+ * newlines between `'\n'` and the next definition's primed name, the char
+ * token runs from `'\n` through `g'`, so `f` swallows `g'` and `g'` gets no
+ * node. Each top-level definition must keep its own node and span. */
+TEST(haskell_escaped_char_does_not_swallow_primed_def) {
+    CBMFileResult *r = extract("module M where\n"
+                               "\n"
+                               "f = '\\n'\n"
+                               "\n"
+                               "g' = 2\n"
+                               "\n"
+                               "h = 3\n",
+                               CBM_LANG_HASKELL, "t", "M.hs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *f = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "f") == 0) {
+            f = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ((int)f->end_line, 3);
+    ASSERT(has_def(r, "Function", "g'"));
+    ASSERT(has_def(r, "Function", "h"));
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Append the text of every `char` node under root to out, space-separated. */
+static void haskell_char_texts(TSNode root, const char *src, char *out, size_t out_sz) {
+    TSTreeCursor c = ts_tree_cursor_new(root);
+    size_t len = 0;
+    for (;;) {
+        TSNode n = ts_tree_cursor_current_node(&c);
+        if (strcmp(ts_node_type(n), "char") == 0 && len < out_sz) {
+            uint32_t s = ts_node_start_byte(n);
+            uint32_t e = ts_node_end_byte(n);
+            len += (size_t)snprintf(out + len, out_sz - len, "%.*s ", (int)(e - s), src + s);
+        }
+        if (ts_tree_cursor_goto_first_child(&c)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&c)) {
+            if (!ts_tree_cursor_goto_parent(&c)) {
+                ts_tree_cursor_delete(&c);
+                return;
+            }
+        }
+    }
+}
+
+/* #2439, same-line form: the old regex ran from the first `'\` to the last
+ * `'` before a space, so `['\n','\t']` lexed as ONE char token with no parse
+ * error. Each literal must be its own token, and the escapes that contain a
+ * quote or a backslash (`'\''`, `'\\'`) must still lex whole. */
+TEST(haskell_escaped_char_list_lexes_each_literal) {
+    const char *src = "x = ['\\n','\\t','\\'','\\\\','\\x41','\\SOH','a']\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HASKELL)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    char got[128] = "";
+    haskell_char_texts(root, src, got, sizeof(got));
+    bool has_error = ts_node_has_error(root);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_FALSE(has_error);
+    ASSERT_STR_EQ(got, "'\\n' '\\t' '\\'' '\\\\' '\\x41' '\\SOH' 'a' ");
     PASS();
 }
 
@@ -10240,6 +10326,65 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_import_selectors_and_aliases) {
+    CBMFileResult *r = extract("import foo.Direct\n"
+                               "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
+                               "import modern.{Source as ModernAlias, *}\n"
+                               "import alpha.One, beta.Two\n",
+                               CBM_LANG_SCALA, "t", "Imports.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_import(r, "Direct", "foo.Direct"));
+    ASSERT_NOT_NULL(find_import(r, "Selected", "foo.Selected"));
+    ASSERT_NOT_NULL(find_import(r, "Alias", "foo.Original"));
+    ASSERT_NULL(find_import(r, "Hidden", "foo.Hidden"));
+    ASSERT_NOT_NULL(find_import(r, "*", "foo"));
+    ASSERT_NOT_NULL(find_import(r, "ModernAlias", "modern.Source"));
+    ASSERT_NOT_NULL(find_import(r, "*", "modern"));
+    ASSERT_NOT_NULL(find_import(r, "One", "alpha.One"));
+    ASSERT_NOT_NULL(find_import(r, "Two", "beta.Two"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_package_namespace) {
+    CBMFileResult *r = extract("package com.example.app.account\n"
+                               "import com.example.app.model.Target\n"
+                               "object Consumer\n",
+                               CBM_LANG_SCALA, "t", "modules/client/Consumer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app.account");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_chained_package_clauses) {
+    CBMFileResult *r = extract("package com.example\n"
+                               "// chained clause below\n"
+                               "package app.account\n"
+                               "import com.example.app.model.Target\n"
+                               "object Consumer\n",
+                               CBM_LANG_SCALA, "t", "modules/client/Consumer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app.account");
+    cbm_free_result(r);
+
+    /* A braced clause scopes only its body; the file namespace stays the outer one. */
+    r = extract("package com.example\n"
+                "package braced { object Inner }\n"
+                "object Outer\n",
+                CBM_LANG_SCALA, "t", "Outer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* this/super receivers keep the enclosing-class target, where a weak
  * namespace-proximity match is usually correct — so they are NOT flagged. A
  * new_expression has no member receiver and is never flagged either. */
@@ -15824,6 +15969,9 @@ SUITE(extraction) {
     RUN_TEST(extract_templ_method_qn_matches_call_scope);
     RUN_TEST(extract_go_multiple_init_disambiguated);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_import_selectors_and_aliases);
+    RUN_TEST(extract_scala_package_namespace);
+    RUN_TEST(extract_scala_chained_package_clauses);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
 
@@ -15979,6 +16127,8 @@ SUITE(extraction) {
     RUN_TEST(elixir_complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(haskell_function);
     RUN_TEST(haskell_infix_definition_name);
+    RUN_TEST(haskell_escaped_char_does_not_swallow_primed_def);
+    RUN_TEST(haskell_escaped_char_list_lexes_each_literal);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
 

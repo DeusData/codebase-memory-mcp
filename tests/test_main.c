@@ -44,6 +44,8 @@ int tf_deselected_count = 0;
 #include <windows.h>
 #include "foundation/win_utf8.h" /* cbm_module_path_utf8 — the runner's own image */
 #else
+#include <fcntl.h>    /* open: the process-tree probe's handshake FIFOs */
+#include <limits.h>   /* INT_MAX: a handed-down descriptor */
 #include <sys/wait.h> /* waitpid: the process-tree probe root */
 #include <unistd.h>
 #ifdef __APPLE__
@@ -1975,79 +1977,216 @@ static int tf_role_env_isolation(int argc, char **argv) {
     return 0;
 }
 
-/* Process-tree memory probe coverage (test_subprocess.c). The root starts ONE
- * descendant that charges a controlled amount of memory, so a tree total can
- * be checked against an allocation only a descendant holds. The descendant
- * publishes its pid by an atomic rename once every page is touched, then
- * blocks until it is killed. The root exits when its descendant dies, so a
- * failed setup ends the tree instead of leaving the test waiting. */
-static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
+/* Process-tree memory probe coverage (test_subprocess.c). The test creates
+ * two pipes, "up" (tree -> test) and "down" (test -> tree), and starts the
+ * root with their names. The root connects both FIRST -- the test is blocked
+ * until it has -- then starts ONE descendant that inherits the connected ends
+ * and drops its own copies, so the descendant alone holds the tree's side.
+ * The descendant and the test then move in lock step, each blocked in a pipe
+ * read until the other side writes:
+ *
+ *   descendant: 'I' up    started, nothing allocated   (test: idle sample)
+ *   test:       'L' down  allocate the load
+ *   descendant: 'R' up    every page of the load is touched (test: loaded sample)
+ *   test:       closes    the descendant frees the load and exits, then the root
+ *
+ * A read whose writer died returns end-of-file, so a failed descendant ends
+ * the wait on the other side instead of leaving it blocked. */
+#ifdef _WIN32
+typedef HANDLE tf_rss_pipe_t;
+#define TF_RSS_NO_PIPE INVALID_HANDLE_VALUE
+#else
+typedef int tf_rss_pipe_t;
+#define TF_RSS_NO_PIPE (-1)
+#endif
+
+static bool tf_rss_tree_say(tf_rss_pipe_t channel, char byte) {
+#ifdef _WIN32
+    DWORD written = 0;
+    return WriteFile(channel, &byte, 1, &written, NULL) && written == 1;
+#else
+    ssize_t count;
+    do {
+        count = write(channel, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    return count == 1;
+#endif
+}
+
+/* Blocks until the test writes; false once it closed its end. */
+static bool tf_rss_tree_hear(tf_rss_pipe_t channel, char *byte) {
+#ifdef _WIN32
+    DWORD got = 0;
+    return ReadFile(channel, byte, 1, &got, NULL) && got == 1;
+#else
+    ssize_t count;
+    do {
+        count = read(channel, byte, 1);
+    } while (count < 0 && errno == EINTR);
+    return count == 1;
+#endif
+}
+
+static int tf_rss_tree_hold(tf_rss_pipe_t up, tf_rss_pipe_t down, const char *mib_text) {
     char *end = NULL;
     long mib = strtol(mib_text, &end, 10);
     if (!end || *end != '\0' || mib < 0 || mib > 1024) {
         return 81;
+    }
+    if (!tf_rss_tree_say(up, 'I')) {
+        return 83;
+    }
+    char heard = 0;
+    if (!tf_rss_tree_hear(down, &heard)) {
+        return 0; /* released before the load */
+    }
+    if (heard != 'L') {
+        return 84;
     }
     size_t bytes = (size_t)mib * 1024U * 1024U;
     unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
     if (bytes > 0 && !block) {
         return 82;
     }
-    if (block) {
-        memset(block, 0xA5, bytes);
+    /* One store per 4 KiB reaches every page at every page size in use (4 KiB,
+     * 16 KiB on Apple silicon). volatile keeps the compiler from dropping
+     * stores to memory nothing reads back. */
+    volatile unsigned char *page = block;
+    for (size_t offset = 0; offset < bytes; offset += 4096U) {
+        page[offset] = 0xA5;
     }
-    char staged[1024];
-    int length = snprintf(staged, sizeof(staged), "%s.tmp", ready_path);
-    FILE *ready = length > 0 && (size_t)length < sizeof(staged) ? cbm_fopen(staged, "wb") : NULL;
-    if (!ready) {
-        return 83;
+    int code = tf_rss_tree_say(up, 'R') ? 0 : 83;
+    if (code == 0) {
+        (void)tf_rss_tree_hear(down, &heard); /* hold the load until released */
     }
-#ifdef _WIN32
-    (void)fprintf(ready, "%lu\n", (unsigned long)GetCurrentProcessId());
-#else
-    (void)fprintf(ready, "%ld\n", (long)getpid());
-#endif
-    if (fclose(ready) != 0 || rename(staged, ready_path) != 0) {
-        return 84;
-    }
-    volatile unsigned char keep = block ? block[bytes - 1] : 0;
-    (void)keep;
-    for (;;) {
-#ifdef _WIN32
-        Sleep(INFINITE);
-#else
-        (void)pause();
-#endif
-    }
+    free(block);
+    return code;
 }
 
+static bool tf_rss_tree_parse_pipe(const char *text, tf_rss_pipe_t *channel) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (!text[0] || !end || *end != '\0' || errno != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    *channel = (HANDLE)(uintptr_t)value;
+#else
+    if (value > (unsigned long long)INT_MAX) {
+        return false;
+    }
+    *channel = (int)value;
+#endif
+    return true;
+}
+
+/* The descendant as its own image (Windows): argv names the inherited ends. */
 static int tf_role_rss_tree_hold(int argc, char **argv) {
-    return argc == 4 ? tf_rss_tree_hold(argv[2], argv[3]) : -1;
-}
-
-static int tf_role_rss_tree_root(int argc, char **argv) {
-    if (argc != 4) {
+    if (argc != 5) {
         return -1;
     }
+    tf_rss_pipe_t up = TF_RSS_NO_PIPE;
+    tf_rss_pipe_t down = TF_RSS_NO_PIPE;
+    if (!tf_rss_tree_parse_pipe(argv[2], &up) || !tf_rss_tree_parse_pipe(argv[3], &down)) {
+        return 80;
+    }
+    return tf_rss_tree_hold(up, down, argv[4]);
+}
+
+static tf_rss_pipe_t tf_rss_tree_connect(const char *name, bool writer) {
 #ifdef _WIN32
+    /* Inheritable: the descendant receives this end through the handle list. */
+    SECURITY_ATTRIBUTES inheritable;
+    ZeroMemory(&inheritable, sizeof(inheritable));
+    inheritable.nLength = sizeof(inheritable);
+    inheritable.bInheritHandle = TRUE;
+    wchar_t *wide = cbm_utf8_to_wide(name);
+    HANDLE channel = wide ? CreateFileW(wide, writer ? GENERIC_WRITE : GENERIC_READ, 0,
+                                        &inheritable, OPEN_EXISTING, 0, NULL)
+                          : INVALID_HANDLE_VALUE;
+    free(wide);
+    return channel;
+#else
+    int channel;
+    do {
+        channel = open(name, writer ? O_WRONLY : O_RDONLY);
+    } while (channel < 0 && errno == EINTR);
+    return channel;
+#endif
+}
+
+static void tf_rss_tree_drop(tf_rss_pipe_t channel) {
+    if (channel == TF_RSS_NO_PIPE) {
+        return;
+    }
+#ifdef _WIN32
+    (void)CloseHandle(channel);
+#else
+    (void)close(channel);
+#endif
+}
+
+#ifdef _WIN32
+/* Start the descendant with exactly the two pipe ends inherited. The child
+ * joins this process's Job Object by default, which is the tree the probe
+ * under test enumerates. */
+static bool tf_rss_tree_start_descendant(HANDLE up, HANDLE down, const char *mib_text,
+                                         PROCESS_INFORMATION *child) {
+    char up_text[32];
+    char down_text[32];
+    (void)snprintf(up_text, sizeof(up_text), "%llu", (unsigned long long)(uintptr_t)up);
+    (void)snprintf(down_text, sizeof(down_text), "%llu", (unsigned long long)(uintptr_t)down);
     char *self = cbm_module_path_utf8();
-    const char *child_argv[] = {self, "__cbm_rss_tree_hold", argv[2], argv[3], NULL};
+    const char *child_argv[] = {self, "__cbm_rss_tree_hold", up_text, down_text, mib_text, NULL};
     char command_line[8192];
     bool built = self && cbm_build_win_cmdline(command_line, sizeof(command_line), child_argv);
     wchar_t *wide_self = built ? cbm_utf8_to_wide(self) : NULL;
     wchar_t *wide_command = built ? cbm_utf8_to_wide(command_line) : NULL;
-    STARTUPINFOW startup;
+    HANDLE inherit[2] = {up, down};
+    SIZE_T attrs_size = 0;
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attrs_size);
+    bool attrs_init = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
+    bool attrs_ready =
+        attrs_init && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                inherit, sizeof(inherit), NULL, NULL);
+    STARTUPINFOEXW startup;
     ZeroMemory(&startup, sizeof(startup));
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION child;
-    ZeroMemory(&child, sizeof(child));
-    /* The child joins this process's Job Object by default, which is the tree
-     * the probe under test enumerates. */
-    BOOL started = wide_self && wide_command &&
-                   CreateProcessW(wide_self, wide_command, NULL, NULL, FALSE, 0, NULL, NULL,
-                                  &startup, &child);
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = attrs;
+    ZeroMemory(child, sizeof(*child));
+    BOOL started =
+        wide_self && wide_command && attrs_ready &&
+        CreateProcessW(wide_self, wide_command, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
+                       NULL, NULL, &startup.StartupInfo, child);
+    if (attrs_init) {
+        DeleteProcThreadAttributeList(attrs);
+    }
+    free(attrs);
     free(wide_self);
     free(wide_command);
     free(self);
+    return started != FALSE;
+}
+#endif
+
+static int tf_role_rss_tree_root(int argc, char **argv) {
+    if (argc != 5) {
+        return -1;
+    }
+    /* Connect before anything else: the test's first blocking step waits for
+     * these two ends, in this order. */
+    tf_rss_pipe_t up = tf_rss_tree_connect(argv[2], true);
+    tf_rss_pipe_t down =
+        up != TF_RSS_NO_PIPE ? tf_rss_tree_connect(argv[3], false) : TF_RSS_NO_PIPE;
+    bool connected = up != TF_RSS_NO_PIPE && down != TF_RSS_NO_PIPE;
+#ifdef _WIN32
+    PROCESS_INFORMATION child;
+    bool started = connected && tf_rss_tree_start_descendant(up, down, argv[4], &child);
+    /* From here the descendant holds the tree's only copies of both ends. */
+    tf_rss_tree_drop(up);
+    tf_rss_tree_drop(down);
     if (!started) {
         return 85;
     }
@@ -2055,12 +2194,15 @@ static int tf_role_rss_tree_root(int argc, char **argv) {
     (void)WaitForSingleObject(child.hProcess, INFINITE);
     CloseHandle(child.hProcess);
 #else
-    pid_t child = fork();
+    pid_t child = connected ? fork() : -1;
+    if (child == 0) {
+        _exit(tf_rss_tree_hold(up, down, argv[4]));
+    }
+    /* From here the descendant holds the tree's only copies of both ends. */
+    tf_rss_tree_drop(up);
+    tf_rss_tree_drop(down);
     if (child < 0) {
         return 85;
-    }
-    if (child == 0) {
-        _exit(tf_rss_tree_hold(argv[2], argv[3]));
     }
     int status = 0;
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {

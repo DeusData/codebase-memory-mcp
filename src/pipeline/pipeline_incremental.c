@@ -3430,6 +3430,88 @@ done:
     return 1;
 }
 
+/* ── Stored package clauses ──────────────────────────────────────
+ *
+ * Both incremental routes hand the passes only the changed files, and the
+ * passes build the import maps (namespace map, Scala top-level index) from
+ * the files they are handed. The maps therefore knew only the changed files'
+ * packages: an import into an unchanged package resolved through the looser
+ * symbol fallback, or with the fail-closed Scala resolver not at all, until
+ * the next full index. The definitions/registry pass persists each file's
+ * clause on its File node (`package` property); read those back for every
+ * file that stays, so the passes see the whole project as a full build does.
+ * `skip` holds the rel paths whose rows are still present but about to be
+ * replaced or removed (legacy route); NULL once the purge already ran. */
+static void incr_free_stored_namespaces(cbm_file_namespace_t *ns, int count) {
+    for (int i = 0; i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, ns[i].rel_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, ns[i].namespace_name);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, ns);
+}
+
+static int incr_load_stored_namespaces(cbm_store_t *store, const char *project,
+                                       const CBMHashTable *skip, cbm_file_namespace_t **out,
+                                       int *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return -1;
+    }
+    /* LIKE keeps the JSON parse off the File nodes without a clause;
+     * json_valid() guards it because json_extract() raises on malformed
+     * properties (same shape as the store's FTS body expression). */
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT file_path, json_extract(properties, '$.package') FROM nodes"
+                           " WHERE project = ?1 AND label = 'File'"
+                           " AND properties LIKE '%\"package\"%' AND json_valid(properties)",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    cbm_file_namespace_t *rows = NULL;
+    int count = 0;
+    int cap = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *rel = (const char *)sqlite3_column_text(stmt, 0);
+        const char *ns = (const char *)sqlite3_column_text(stmt, 1);
+        if (!rel || !rel[0] || !ns || !ns[0] || (skip && cbm_ht_has(skip, rel))) {
+            continue;
+        }
+        if (count == cap) {
+            int new_cap = cap ? cap * 2 : CBM_SZ_64;
+            cbm_file_namespace_t *grown = cbm_realloc(
+                CBM_MEM_CLASS_OTHER, rows, (size_t)new_cap * sizeof(cbm_file_namespace_t));
+            if (!grown) {
+                step_rc = SQLITE_NOMEM;
+                break;
+            }
+            rows = grown;
+            cap = new_cap;
+        }
+        rows[count].rel_path = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel);
+        rows[count].namespace_name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, ns);
+        if (!rows[count].rel_path || !rows[count].namespace_name) {
+            cbm_free(CBM_MEM_CLASS_OTHER, rows[count].rel_path);
+            cbm_free(CBM_MEM_CLASS_OTHER, rows[count].namespace_name);
+            step_rc = SQLITE_NOMEM;
+            break;
+        }
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE) {
+        incr_free_stored_namespaces(rows, count);
+        return -1;
+    }
+    *out = rows;
+    *out_count = count;
+    return 0;
+}
+
 static bool incremental_metadata_current(int meta_rc, const cbm_coverage_meta_t *meta,
                                          const char *mode_name) {
     return meta_rc == CBM_STORE_OK && meta->coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
@@ -3696,6 +3778,16 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         cbm_log_error("delta.err", "phase", "doc_link_scopes");
         goto out;
     }
+    /* The purge already removed the closure and deleted files, so every File
+     * row left in the stage is a file the passes will not see. A failed read
+     * is a delta-route failure: the maps would silently diverge from a full
+     * build. */
+    cbm_file_namespace_t *stored_ns = NULL;
+    int stored_ns_count = 0;
+    if (incr_load_stored_namespaces(staging, project, NULL, &stored_ns, &stored_ns_count) != 0) {
+        cbm_log_error("delta.err", "phase", "stored_namespaces");
+        goto out;
+    }
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
@@ -3711,6 +3803,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .stored_namespaces = stored_ns,
+        .stored_namespace_count = stored_ns_count,
         .doc_link_base = doc_base,
         .doc_link_base_count = doc_base_count,
         .build_decl_files = decl_files,
@@ -3752,6 +3846,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     if (ctx.macro_table) {
         free((void *)ctx.macro_table);
     }
+    incr_free_stored_namespaces(stored_ns, stored_ns_count);
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
@@ -4343,8 +4438,29 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                  itoa_buf(cbm_gbuf_edge_count(existing)), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
-    if (load_rc != 0) {
-        cbm_log_error("incremental.err", "msg", "load_db_failed");
+    /* Package clauses of the files that stay: the changed and deleted files
+     * are still in the database here, so they are skipped explicitly. A
+     * failed read aborts the route and shares the failed load's cleanup. */
+    cbm_file_namespace_t *stored_ns = NULL;
+    int stored_ns_count = 0;
+    int ns_rc = 0;
+    if (load_rc == 0) {
+        CBMHashTable *skip = cbm_ht_create((size_t)(ci + deleted_count) * PAIR_LEN + CBM_SZ_64);
+        for (int i = 0; skip && i < ci; i++) {
+            cbm_ht_set(skip, changed_files[i].rel_path, &changed_files[i]);
+        }
+        for (int i = 0; skip && i < deleted_count; i++) {
+            cbm_ht_set(skip, deleted[i], deleted[i]);
+        }
+        ns_rc =
+            skip ? incr_load_stored_namespaces(store, project, skip, &stored_ns, &stored_ns_count)
+                 : -1;
+        cbm_ht_free(skip); /* keys borrowed */
+    }
+
+    if (load_rc != 0 || ns_rc != 0) {
+        cbm_log_error("incremental.err", "msg",
+                      load_rc != 0 ? "load_db_failed" : "stored_namespaces_failed");
         cbm_gbuf_free(existing);
         free(changed_files);
         for (int i = 0; i < deleted_count; i++) {
@@ -4355,7 +4471,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_free_coverage(old_cov, old_cov_count);
         cbm_store_close(store);
         closure_plan_free(&closure_plan);
-        return CBM_NOT_FOUND;
+        return load_rc != 0 ? CBM_NOT_FOUND : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
     /* ADRs live in the "<db>.adr.db" sidecar, which the delta clone/patch/rename
@@ -4446,6 +4562,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .stored_namespaces = stored_ns,
+        .stored_namespace_count = stored_ns_count,
         .doc_link_base = legacy_doc.scopes,
         .doc_link_base_count = legacy_doc.scope_count,
     };
@@ -4503,6 +4621,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free((void *)ctx.macro_table);
         ctx.macro_table = NULL;
     }
+    incr_free_stored_namespaces(stored_ns, stored_ns_count);
+    ctx.stored_namespaces = NULL;
+    ctx.stored_namespace_count = 0;
 
     /* Parallel extraction builds the process-global package map. Match the
      * full pipeline's ownership boundary on both success and failure. */
