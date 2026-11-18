@@ -169,8 +169,8 @@ static void type_scope_index_class_bindings(cbm_type_scope_file_t *f, const CBMD
         const char *bar = strchr(p, '|');
         size_t len = bar ? (size_t)(bar - p) : strlen(p);
         TYPE_SCOPE_WORK(len + 1);
-        char *key = len ? cbm_arena_sprintf(&f->keys, "%s.%.*s", d->qualified_name, (int)len, p)
-                        : NULL;
+        char *key =
+            len ? cbm_arena_sprintf(&f->keys, "%s.%.*s", d->qualified_name, (int)len, p) : NULL;
         if (key && !cbm_ht_get(f->class_binds, key)) {
             cbm_ht_set(f->class_binds, key, key);
         }
@@ -278,9 +278,9 @@ static const char *type_scope_target(const cbm_type_scope_file_t *f, const char 
     }
     for (const char *const *l = f->lang->labels; *l; l++) {
         if (strcmp(*l, label) == 0) {
-            const cbm_gbuf_node_t *node =
-                f->lang->lexical_scopes && f->scope.graph ? cbm_gbuf_find_by_qn(f->scope.graph, qn)
-                                                          : NULL;
+            const cbm_gbuf_node_t *node = f->lang->lexical_scopes && f->scope.graph
+                                              ? cbm_gbuf_find_by_qn(f->scope.graph, qn)
+                                              : NULL;
             return node && node->label && strcmp(node->label, "Module") == 0 ? NULL : qn;
         }
     }

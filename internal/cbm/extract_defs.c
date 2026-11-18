@@ -7274,7 +7274,8 @@ static const char *py_class_body_bindings(CBMArena *a, TSNode node, const char *
     if (strcmp(ts_node_type(node), "decorated_definition") == 0) {
         node = ts_node_child_by_field_name(node, TS_FIELD("definition"));
     }
-    TSNode body = ts_node_is_null(node) ? node : ts_node_child_by_field_name(node, TS_FIELD("body"));
+    TSNode body =
+        ts_node_is_null(node) ? node : ts_node_child_by_field_name(node, TS_FIELD("body"));
     tf_names_t b = {.a = a};
     py_bind_block(&b, body, source, 0);
     return b.len ? b.buf : NULL;

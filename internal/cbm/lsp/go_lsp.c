@@ -3117,7 +3117,8 @@ static void go_append_fields(CBMArena *a, CBMRegisteredType *rt, const char *con
     while (rt->field_names && rt->field_names[had]) {
         had++;
     }
-    const char **out_names = (const char **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(char *));
+    const char **out_names =
+        (const char **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(char *));
     const CBMType **out_types =
         (const CBMType **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(CBMType *));
     CBMHashTable *present = cbm_ht_create((uint32_t)(had + n + 8));

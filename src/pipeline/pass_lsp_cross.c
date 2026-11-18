@@ -1161,9 +1161,9 @@ static void pxc_apply_type_facts(CBMArena *arena, const CBMFileResult *fr, CBMLS
         if (!dst) {
             continue;
         }
-        dst->field_defs = go_generic
-                              ? pxc_go_mask_field_types(arena, dst->field_defs, f->type_params)
-                              : pxc_py_add_class_bindings(arena, dst->field_defs, f->class_bindings);
+        dst->field_defs =
+            go_generic ? pxc_go_mask_field_types(arena, dst->field_defs, f->type_params)
+                       : pxc_py_add_class_bindings(arena, dst->field_defs, f->class_bindings);
     }
     cbm_ht_free(by_qn);
 }

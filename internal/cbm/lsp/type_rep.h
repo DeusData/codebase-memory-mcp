@@ -238,8 +238,10 @@ const CBMType* cbm_type_substitute(CBMArena* a, const CBMType* t,
 // The identities of the type names one definition's declared types write
 // ("spelling=QN|spelling=QN", CBMLSPDef.type_scope, resolved once in the scope
 // of the file that wrote it by the pipeline's type-scope step), indexed once
-// per definition so each lookup is a hash probe. NULL for a NULL or empty
-// scope (or on allocation failure: the engine then qualifies as before).
+// per definition: a short list (up to 4 identities, most definitions) or a
+// hash table, 12 bytes an entry, so each lookup is bounded work. NULL for a
+// NULL or empty scope (or on allocation failure: the engine then qualifies as
+// before).
 typedef struct cbm_type_scope_index cbm_type_scope_index_t;
 const cbm_type_scope_index_t *cbm_type_scope_index(CBMArena *a, const char *scope);
 
