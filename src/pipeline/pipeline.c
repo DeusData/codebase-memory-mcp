@@ -3116,6 +3116,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * all filter to subsets never pay the build/RSS. */
     CBMCrossLspRegistries cross_registries;
     memset(&cross_registries, 0, sizeof(cross_registries));
+    cross_registries.ctx = ctx;
     if (all_defs) {
         /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
          * ONE engine instead of re-diagnosing the whole pass (the cs builder

@@ -840,85 +840,42 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     return 0;
 }
 
-/* Go and C: fold per-field "Field" definitions into their owning type's
- * field_defs. extract_defs.c emits one flat CBMDefinition per struct field
- * (label "Field", parent_class = owning struct QN, name = field name,
- * return_type = raw type text). Those rows are dropped by pxc_build_lsp_def
- * (pxc_map_label excludes "Field"), so without this fold every struct
- * registers with zero fields: Go field-chain calls (h.svc.Handle) can never
- * resolve, and a C member access on a struct from another file (every header)
- * has no owner to bind. Fields are always declared in the same file as their
- * struct, so scanning the file's own defs covers every case. Runs inside
+/* The file's fields onto their owner types (field_defs "name:type|...", the
+ * text the registrars read), as the language's engine row describes them
+ * (pxc_engine_t field_*); defined with the engine table below. Runs inside
  * cbm_pxc_collect_all_defs — one site covers both the prebuilt-registry path
- * and the per-file fallback, since both consume all_defs.
- *
- * type_label is the label the language's aggregate carries: "Struct" for Go,
- * "Class" for a C struct or union. */
-static void pxc_fold_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
-                                   int start, int end, const char *type_label) {
-    if (!arena || !result || !defs || start >= end || result->defs.count <= 0) {
-        return;
+ * and the per-file fallback, since both consume all_defs. */
+static void pxc_fold_fields(CBMArena *arena, const CBMFileResult *fr, CBMLSPDef *defs, int start,
+                            int end, CBMLanguage lang, const pxc_base_scope_t *bs,
+                            const char *module_qn);
+
+/* One file's declared-type scope (type_scope.h): the project registry, the
+ * file's module and LSP import map, and for a lexical row the file's
+ * definitions and module facts. The collector attaches the file's identities
+ * with it, and a walk reads the calling file's own identities from the same
+ * scope (cbm_pxc_file_scope). */
+static cbm_type_scope_file_t *pxc_file_scope_begin(const cbm_pipeline_ctx_t *ctx,
+                                                   const cbm_type_scope_lang_t *row,
+                                                   const CBMFileResult *fr, const char *module_qn,
+                                                   const char **imp_keys, const char **imp_vals,
+                                                   int imp_count) {
+    if (!ctx || !ctx->registry || !row || !fr) {
+        return NULL;
     }
-    /* A generated file holds hundreds of types and thousands of fields: each type's
-     * fields are one chain, in definition order, instead of a scan of the file per type.
-     * next_field[di] is the 1-based index of the field after di of the same owner. */
-    int *next_field =
-        cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)result->defs.count * sizeof(*next_field));
-    CBMHashTable *fields_of = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 32);
-    bool joined = next_field && fields_of;
-    for (int di = result->defs.count - 1; joined && di >= 0; di--) {
-        const CBMDefinition *fd = &result->defs.items[di];
-        if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
-            !fd->return_type[0] || strcmp(fd->label, "Field") != 0) {
-            continue;
-        }
-        next_field[di] =
-            (int)(intptr_t)cbm_ht_set(fields_of, fd->parent_class, (void *)(intptr_t)(di + 1));
+    cbm_type_scope_t scope = {.reg = ctx->registry,
+                              .module_qn = module_qn,
+                              .imp_keys = imp_keys,
+                              .imp_vals = imp_vals,
+                              .imp_count = imp_count};
+    if (row->lexical_scopes) {
+        /* The file's own scopes: its definitions and the module's ordered
+         * namespace facts. */
+        scope.file_defs = fr->defs.items;
+        scope.file_def_count = fr->defs.count;
+        scope.module_facts = &fr->py_namespace;
+        scope.graph = ctx->gbuf; /* the graph the import map read */
     }
-    for (int si = start; joined && si < end; si++) {
-        CBMLSPDef *dst = &defs[si];
-        if (!dst->label || strcmp(dst->label, type_label) != 0 || !dst->qualified_name) {
-            continue;
-        }
-        int count = 0;
-        size_t total = 0; /* "name:type" bytes; separators and NUL added below */
-        int first_field = (int)(intptr_t)cbm_ht_get(fields_of, dst->qualified_name);
-        for (int link = first_field; link; link = next_field[link - 1]) {
-            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
-            const CBMDefinition *fd = &result->defs.items[link - 1];
-            total += strlen(fd->name) + 1 + strlen(fd->return_type);
-            count++;
-        }
-        if (count == 0) {
-            continue;
-        }
-        /* count - 1 separators + NUL. */
-        size_t bufsz = total + (size_t)(count - 1) + 1;
-        char *buf = (char *)cbm_arena_alloc(arena, bufsz);
-        if (!buf) {
-            continue;
-        }
-        char *p = buf;
-        int written = 0;
-        for (int link = first_field; link; link = next_field[link - 1]) {
-            const CBMDefinition *fd = &result->defs.items[link - 1];
-            size_t n = strlen(fd->name);
-            memcpy(p, fd->name, n);
-            p += n;
-            *p++ = ':';
-            n = strlen(fd->return_type);
-            memcpy(p, fd->return_type, n);
-            p += n;
-            if (written + 1 < count) {
-                *p++ = '|';
-            }
-            written++;
-        }
-        *p = '\0';
-        dst->field_defs = buf;
-    }
-    cbm_ht_free(fields_of);
-    cbm_free(CBM_MEM_CLASS_EXTRACT, next_field);
+    return cbm_type_scope_file_begin(row, &scope);
 }
 
 /* Python annotation text -> the one type name it declares, or NULL. Strips a
@@ -970,79 +927,6 @@ static const char *pxc_py_annotation_type_name(CBMArena *arena, const char *text
         }
     }
     return cbm_arena_strndup(arena, text, n);
-}
-
-/* Python: fold the file's annotated instance fields (result->field_types,
- * #1277) into their class defs' field_defs as "name:QN|name:QN", the format
- * py_register_lsp_defs reads. Each annotation resolves through the same
- * registry + import map, and the same weak-strategy and type-like vetoes, as
- * the file's base classes (pxc_resolve_base_qn): a field whose type is not a
- * confidently-known project type is left out rather than guessed. Linear in
- * the file: one hash of the file's class defs, one pass over its fields. */
-typedef struct {
-    int owner; /* index into defs[], or -1 */
-    const char *type_qn;
-} pxc_py_field_t;
-
-static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
-                                    int start, int end, const pxc_base_scope_t *bs,
-                                    const char *module_qn) {
-    int nf = result ? result->field_types.count : 0;
-    if (!arena || nf == 0 || !defs || start >= end || !bs || !bs->reg) {
-        return;
-    }
-    CBMHashTable *by_qn = cbm_ht_create((uint32_t)(end - start));
-    pxc_py_field_t *fields = (pxc_py_field_t *)cbm_arena_alloc(arena, (size_t)nf * sizeof(*fields));
-    /* Per class def: exact buffer size, then the write cursor into it. */
-    size_t *lens = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
-    size_t *used = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
-    if (!by_qn || !fields || !lens || !used) {
-        cbm_ht_free(by_qn); /* NULL-safe */
-        return;
-    }
-    memset(lens, 0, (size_t)(end - start) * sizeof(size_t));
-    memset(used, 0, (size_t)(end - start) * sizeof(size_t));
-    for (int si = start; si < end; si++) {
-        if (defs[si].label && strcmp(defs[si].label, "Class") == 0 && defs[si].qualified_name) {
-            cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
-        }
-    }
-    for (int f = 0; f < nf; f++) {
-        const CBMFieldType *ft = &result->field_types.items[f];
-        fields[f].owner = -1;
-        fields[f].type_qn = NULL;
-        CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
-        const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
-        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn, NULL) : NULL;
-        if (!qn || !ft->field_name || !ft->field_name[0]) {
-            continue;
-        }
-        fields[f].owner = (int)(owner - defs);
-        fields[f].type_qn = qn;
-        /* "name:QN" plus one byte for the '|' or the NUL after it. */
-        lens[fields[f].owner - start] += strlen(ft->field_name) + 1 + strlen(qn) + 1;
-    }
-    cbm_ht_free(by_qn);
-    for (int si = start; si < end; si++) {
-        char *buf = lens[si - start] ? (char *)cbm_arena_alloc(arena, lens[si - start]) : NULL;
-        if (buf) {
-            buf[0] = '\0';
-        }
-        defs[si].field_defs = buf;
-    }
-    for (int f = 0; f < nf; f++) {
-        char *buf = fields[f].owner >= 0 ? (char *)defs[fields[f].owner].field_defs : NULL;
-        if (!buf) {
-            continue;
-        }
-        int slot = fields[f].owner - start;
-        int wrote =
-            snprintf(buf + used[slot], lens[slot] - used[slot], "%s%s:%s", used[slot] ? "|" : "",
-                     result->field_types.items[f].field_name, fields[f].type_qn);
-        if (wrote > 0) {
-            used[slot] += (size_t)wrote;
-        }
-    }
 }
 
 /* Go: a generic type's field_defs ("name:type|...") with its type parameters
@@ -1547,8 +1431,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 idx++;
             }
         }
+        /* The file's fields onto their owner types, as the engine row says. */
+        pxc_fold_fields(arena, fr, defs, file_start, idx, files[fi].language, &bs, def_modules[fi]);
         if (files[fi].language == CBM_LANG_PYTHON) {
-            pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
             /* Package namespace records (re-exports), reserved in the bound
              * above; written only while they fit it (a result whose loaded
              * stream outgrew its header would otherwise overflow). */
@@ -1556,13 +1441,6 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             if (need > 0 && idx + need <= capacity) {
                 idx += pxc_build_py_namespace_records(arena, fr, def_modules[fi], &defs[idx]);
             }
-        }
-        if (files[fi].language == CBM_LANG_GO) {
-            pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Struct");
-        } else if (files[fi].language == CBM_LANG_C || files[fi].language == CBM_LANG_CPP) {
-            /* Both: a `.h` file is classified C++, and that is where C declares
-             * the structs its `.c` files access. */
-            pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Class");
         }
         /* Go generic types and Python class bodies (CBMDefTypeFacts). */
         pxc_apply_type_facts(arena, fr, defs, file_start, idx, files[fi].language);
@@ -1578,20 +1456,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         /* Every declared type this file wrote, resolved once in this file's
          * scope; the identities travel with the defs (and their surface). */
         if (scope_lang) {
-            cbm_type_scope_t scope = {.reg = ctx->registry,
-                                      .module_qn = def_modules[fi],
-                                      .imp_keys = bs.imp_keys,
-                                      .imp_vals = bs.imp_vals,
-                                      .imp_count = bs.imp_count};
-            if (scope_lang->lexical_scopes) {
-                /* The file's own scopes: its definitions and the module's
-                 * ordered namespace facts. */
-                scope.file_defs = fr->defs.items;
-                scope.file_def_count = fr->defs.count;
-                scope.module_facts = &fr->py_namespace;
-                scope.graph = ctx->gbuf; /* the graph the import map read */
-            }
-            cbm_type_scope_file_t *ts_file = cbm_type_scope_file_begin(scope_lang, &scope);
+            cbm_type_scope_file_t *ts_file = pxc_file_scope_begin(
+                ctx, scope_lang, fr, def_modules[fi], bs.imp_keys, bs.imp_vals, bs.imp_count);
             for (int di = file_start; ts_file && di < idx; di++) {
                 cbm_type_scope_attach(ts_file, arena, &defs[di]);
             }
@@ -2361,6 +2227,10 @@ typedef struct {
     const CBMModuleDefIndex *module_def_index;
     CBMLSPDef *all_defs;
     int all_def_count;
+    /* The pipeline context (CBMCrossLspRegistries.ctx; NULL on the
+     * cbm_pxc_run_one route): a walk reads the calling file's own identities
+     * through cbm_pxc_file_scope(f->ctx, ...). */
+    const cbm_pipeline_ctx_t *ctx;
 } pxc_file_t;
 
 /* One walk: where it resolves (`reg`, the per-file overlay chained to the
@@ -2384,6 +2254,27 @@ typedef bool (*pxc_walk_fn)(const pxc_file_t *f, pxc_walk_t *w);
 
 enum { PXC_ENGINE_LANGS = 3 };
 
+/* Where a file's fields come from. */
+typedef enum {
+    PXC_FIELDS_NONE = 0,
+    /* "Field" definitions (parent_class = the owner QN, name, return_type =
+     * the raw type text). extract_defs.c emits one flat CBMDefinition per
+     * struct field; pxc_build_lsp_def drops them (pxc_map_label excludes
+     * "Field"), so without the fold every struct registers with zero fields:
+     * Go field-chain calls (h.svc.Handle) can never resolve, and a C member
+     * access on a struct from another file (every header) has no owner to
+     * bind. Fields are always declared in the same file as their struct. */
+    PXC_FIELDS_DEFS,
+    /* The file's annotated instance fields (CBMFileResult.field_types,
+     * #1277), each annotation reduced to the one type it names
+     * (pxc_py_annotation_type_name) and resolved through the same registry,
+     * import map, weak-strategy and type-like vetoes as the file's base
+     * classes (pxc_resolve_base_qn): a field whose type is not a
+     * confidently-known project type is left out rather than guessed. Needs
+     * the pipeline registry (none on the surface-probe path). */
+    PXC_FIELDS_ANNOTATIONS,
+} pxc_field_source_t;
+
 struct pxc_engine {
     const char *name; /* the registry-build log name */
     CBMLanguage langs[PXC_ENGINE_LANGS];
@@ -2405,6 +2296,16 @@ struct pxc_engine {
      * attaches them to the language's defs and the per-file selection follows
      * them. The language has a cbm_type_scope_lang row. */
     bool wants_identities;
+    /* The fold of a file's fields into their owner type's field_defs
+     * ("name:type|..."), the text the registrars read (pxc_fold_fields). */
+    pxc_field_source_t field_source;
+    const char *field_owner_label; /* the owners' label */
+    /* Only the last owner definition of a QN takes the fields (Python: a
+     * class defined twice in one file); else every one of that QN does. */
+    bool field_owner_last;
+    /* The row's languages whose files fold (0: every one of them). */
+    CBMLanguage field_langs[PXC_ENGINE_LANGS];
+    int field_lang_count;
 };
 
 /* ── Go ── */
@@ -2611,20 +2512,32 @@ static const pxc_engine_t pxc_engines[] = {
      .build_registry = cbm_go_build_cross_registry,
      .run_with_registry = pxc_go_run_registry,
      .run_one = pxc_go_run_defs,
-     .wants_identities = true},
+     .wants_identities = true,
+     .field_source = PXC_FIELDS_DEFS,
+     .field_owner_label = "Struct"},
     {.name = "python",
      .langs = {CBM_LANG_PYTHON},
      .lang_count = 1,
      .build_registry = cbm_py_build_cross_registry,
      .run_with_registry = pxc_py_run_registry,
      .run_one = pxc_py_run_defs,
-     .wants_identities = true},
+     .wants_identities = true,
+     .field_source = PXC_FIELDS_ANNOTATIONS,
+     .field_owner_label = "Class",
+     .field_owner_last = true},
+    /* A C struct or union is a "Class". C and C++ files fold their fields
+     * (a `.h` file is classified C++, and that is where C declares the
+     * structs its `.c` files access); CUDA files fold none. */
     {.name = "c",
      .langs = {CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA},
      .lang_count = 3,
      .build_registry = cbm_c_build_cross_registry,
      .run_with_registry = pxc_c_run_registry,
-     .run_one = pxc_c_run_defs},
+     .run_one = pxc_c_run_defs,
+     .field_source = PXC_FIELDS_DEFS,
+     .field_owner_label = "Class",
+     .field_langs = {CBM_LANG_C, CBM_LANG_CPP},
+     .field_lang_count = 2},
     /* C# has no per-file walk: without its shared registry a C# file gets no
      * cross-file resolution. */
     {.name = "cs",
@@ -2717,6 +2630,154 @@ void cbm_pxc_build_cross_registries(CBMArena *arena, CBMLSPDef *defs, int def_co
 CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r, CBMLanguage lang) {
     int e = r ? cbm_pxc_engine_of_lang(lang) : -1;
     return e >= 0 ? r->by_engine[e] : NULL;
+}
+
+cbm_type_scope_file_t *cbm_pxc_file_scope(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
+                                          const CBMFileResult *result, const char *module_qn,
+                                          const char **imp_keys, const char **imp_vals,
+                                          int imp_count) {
+    if (!cbm_pxc_wants_identities(lang)) {
+        return NULL;
+    }
+    return pxc_file_scope_begin(ctx, cbm_type_scope_lang(lang), result, module_qn, imp_keys,
+                                imp_vals, imp_count);
+}
+
+/* ── The field fold ── */
+
+/* One field of the file, in source order. */
+typedef struct {
+    const char *owner; /* the owner type's QN */
+    const char *name;
+    const char *type; /* the raw text (DEFS) or a resolved QN (ANNOTATIONS) */
+    int next;         /* 1-based index of the owner's next field; 0 = its last */
+} pxc_field_item_t;
+
+static bool pxc_engine_folds(const pxc_engine_t *e, CBMLanguage lang) {
+    if (!e || e->field_source == PXC_FIELDS_NONE || !e->field_owner_label) {
+        return false;
+    }
+    bool listed = e->field_lang_count == 0;
+    for (int i = 0; i < e->field_lang_count; i++) {
+        listed = listed || e->field_langs[i] == lang;
+    }
+    return listed;
+}
+
+/* The fields of one file, whose owner is one of the file's owner definitions,
+ * in source order; their count. */
+static int pxc_field_items(CBMArena *arena, const CBMFileResult *fr, const pxc_engine_t *e,
+                           const CBMHashTable *owners, const pxc_base_scope_t *bs,
+                           const char *module_qn, pxc_field_item_t *items) {
+    int n = 0;
+    if (e->field_source == PXC_FIELDS_DEFS) {
+        for (int di = 0; di < fr->defs.count; di++) {
+            const CBMDefinition *fd = &fr->defs.items[di];
+            if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
+                !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
+                !cbm_ht_get(owners, fd->parent_class)) {
+                continue;
+            }
+            items[n++] = (pxc_field_item_t){fd->parent_class, fd->name, fd->return_type, 0};
+        }
+        return n;
+    }
+    for (int f = 0; f < fr->field_types.count; f++) {
+        const CBMFieldType *ft = &fr->field_types.items[f];
+        if (!ft->class_qn || !cbm_ht_get(owners, ft->class_qn)) {
+            continue;
+        }
+        const char *name = pxc_py_annotation_type_name(arena, ft->type_text);
+        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn, NULL) : NULL;
+        if (qn && ft->field_name && ft->field_name[0]) {
+            items[n++] = (pxc_field_item_t){ft->class_qn, ft->field_name, qn, 0};
+        }
+    }
+    return n;
+}
+
+/* Fold the file's fields into their owner definitions' field_defs as
+ * "name:type|name:type", each owner's fields in source order. One hash of the
+ * file's owner definitions, one pass over its fields, one chain per owner:
+ * linear in the file. An owner without fields keeps its field_defs. */
+static void pxc_fold_fields(CBMArena *arena, const CBMFileResult *fr, CBMLSPDef *defs, int start,
+                            int end, CBMLanguage lang, const pxc_base_scope_t *bs,
+                            const char *module_qn) {
+    const pxc_engine_t *e = pxc_engine_for(lang);
+    if (!arena || !fr || !defs || start >= end || !pxc_engine_folds(e, lang)) {
+        return;
+    }
+    bool annotations = e->field_source == PXC_FIELDS_ANNOTATIONS;
+    int cap = annotations ? fr->field_types.count : fr->defs.count;
+    if (cap <= 0 || (annotations && (!bs || !bs->reg))) {
+        return;
+    }
+    /* owner QN -> 1-based index of its owner definition (the last one with
+     * field_owner_last; any one otherwise, each is matched below by QN) */
+    CBMHashTable *owners = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(end - start + 1));
+    CBMHashTable *chains = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 32);
+    pxc_field_item_t *items = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)cap * sizeof(*items));
+    if (!owners || !chains || !items) {
+        cbm_ht_free(owners); /* NULL-safe */
+        cbm_ht_free(chains);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, items);
+        return;
+    }
+    for (int si = start; si < end; si++) {
+        if (defs[si].label && defs[si].qualified_name &&
+            strcmp(defs[si].label, e->field_owner_label) == 0) {
+            cbm_ht_set(owners, defs[si].qualified_name, (void *)(intptr_t)(si + 1));
+        }
+    }
+    int n = pxc_field_items(arena, fr, e, owners, bs, module_qn, items);
+    /* Chain each owner's fields in source order (prepend, walking back). */
+    for (int i = n - 1; i >= 0; i--) {
+        items[i].next =
+            (int)(intptr_t)cbm_ht_set(chains, items[i].owner, (void *)(intptr_t)(i + 1));
+    }
+    for (int si = start; si < end; si++) {
+        CBMLSPDef *dst = &defs[si];
+        if (!dst->label || !dst->qualified_name || strcmp(dst->label, e->field_owner_label) != 0 ||
+            (e->field_owner_last &&
+             (int)(intptr_t)cbm_ht_get(owners, dst->qualified_name) != si + 1)) {
+            continue;
+        }
+        int first = (int)(intptr_t)cbm_ht_get(chains, dst->qualified_name);
+        int count = 0;
+        size_t total = 0; /* "name:type" bytes; separators and NUL added below */
+        for (int link = first; link; link = items[link - 1].next) {
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            total += strlen(items[link - 1].name) + 1 + strlen(items[link - 1].type);
+            count++;
+        }
+        if (count == 0) {
+            continue;
+        }
+        /* count - 1 separators + NUL. */
+        char *buf = (char *)cbm_arena_alloc(arena, total + (size_t)(count - 1) + 1);
+        if (!buf) {
+            continue;
+        }
+        char *p = buf;
+        for (int link = first; link; link = items[link - 1].next) {
+            const pxc_field_item_t *it = &items[link - 1];
+            size_t len = strlen(it->name);
+            memcpy(p, it->name, len);
+            p += len;
+            *p++ = ':';
+            len = strlen(it->type);
+            memcpy(p, it->type, len);
+            p += len;
+            if (it->next) {
+                *p++ = '|';
+            }
+        }
+        *p = '\0';
+        dst->field_defs = buf;
+    }
+    cbm_ht_free(owners);
+    cbm_ht_free(chains);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, items);
 }
 
 /* One walk in its own scratch arena; its output joins the file's result
@@ -2893,7 +2954,8 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                     .php_bindings = bindings,
                     .module_def_index = module_def_index,
                     .all_defs = all_defs,
-                    .all_def_count = all_def_count};
+                    .all_def_count = all_def_count,
+                    .ctx = cross_registries ? cross_registries->ctx : NULL};
     CBMTypeRegistry *prebuilt = cbm_pxc_registry_for_lang(cross_registries, lang);
     if (prebuilt && e && e->run_with_registry) {
         pxc_walk_registry(e, &f, prebuilt, true);
@@ -3079,6 +3141,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
     CBMCrossLspRegistries cross_registries;
     memset(&cross_registries, 0, sizeof(cross_registries));
+    cross_registries.ctx = ctx;
     if (all_defs) {
         CBMArena *xa = &ctx->seq_cross_arena;
         if (!ctx->seq_cross_arena_live) {

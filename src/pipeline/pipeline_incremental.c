@@ -2002,9 +2002,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         int all_def_count = 0;
         char **def_modules = NULL;
         CBMModuleDefIndex *module_def_index = NULL;
+        /* Every route hands the walks the context; only a closure above the
+         * floor builds shared registries into it. */
         CBMCrossLspRegistries cross_registries;
         memset(&cross_registries, 0, sizeof(cross_registries));
-        CBMCrossLspRegistries *registries_arg = NULL;
+        cross_registries.ctx = ctx;
         CBMArena legacy_cross_arena;
         bool legacy_cross_arena_live = false;
         bool owner_walk_required = atomic_load(&ctx->test_definition_owners_seen) != 0;
@@ -2077,7 +2079,6 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
                     cbm_pxc_build_cross_registries(&closure->arena, all_defs, all_def_count,
                                                    &cross_registries);
-                    registries_arg = &cross_registries;
                 }
             } else {
                 all_def_count = 0;
@@ -2116,7 +2117,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_doclinks_begin(ctx, changed_files, ci, cache);
         rc = cbm_parallel_resolve(
             ctx, changed_files, ci, cache, &shared_ids, worker_count, all_defs, all_def_count,
-            closure ? closure->def_modules : def_modules, module_def_index, registries_arg);
+            closure ? closure->def_modules : def_modules, module_def_index, &cross_registries);
         cbm_doclinks_end(ctx);
 
     cross_resolve_cleanup:

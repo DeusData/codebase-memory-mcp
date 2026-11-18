@@ -39,6 +39,7 @@
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/type_scope.h" /* cbm_type_scope_file_t */
 #include <stdbool.h>
 
 /* ── The engine table ──
@@ -63,6 +64,18 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * collector attaches them (cbm_type_scope_lang must have the language's
  * row) and the per-file def selection follows them. */
 bool cbm_pxc_wants_identities(CBMLanguage lang);
+
+/* One file's declared-type scope, exactly as the collector builds it to
+ * attach the file's identities (the project registry, the file's module and
+ * LSP import map, and for a lexical row the file's definitions and module
+ * facts): a walk reads the calling file's own identity table from it
+ * (cbm_type_scope_file_imports). NULL without a pipeline context or for an
+ * engine that reads no identities; else end it with cbm_type_scope_file_end
+ * once the walk is done. */
+cbm_type_scope_file_t *cbm_pxc_file_scope(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
+                                          const CBMFileResult *result, const char *module_qn,
+                                          const char **imp_keys, const char **imp_vals,
+                                          int imp_count);
 
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
@@ -171,6 +184,10 @@ uint64_t cbm_pxc_test_reach_work(void);
  * parallel resolver builds it on the first file that needs it. */
 typedef struct {
     CBMTypeRegistry *by_engine[CBM_PXC_MAX_ENGINES]; /* indexed by engine row */
+    /* The pipeline context the walks may read (the project registry, for the
+     * calling file's own identities: cbm_pxc_file_scope). Every driver sets
+     * it, also when it builds no registry; NULL in a harness without one. */
+    const cbm_pipeline_ctx_t *ctx;
 } CBMCrossLspRegistries;
 
 /* Build one row's shared registry over all defs into out->by_engine[engine].
