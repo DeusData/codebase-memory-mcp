@@ -1896,7 +1896,13 @@ static void parse_es_imports(CBMExtractCtx *ctx) {
 }
 
 // --- Java imports ---
-// import_declaration -> scoped_identifier
+// import_declaration -> scoped_identifier [ "." asterisk ]
+//
+// A single-type import (`import a.b.C;`) binds its last segment. An on-demand
+// import (`import a.b.*;`, and `import static a.b.C.*;` over a type's static
+// members) binds no name: it opens every name of the package or type, so it
+// is recorded under the local name "*" with the package or type as its path
+// (the open-import key of the declared-type step, type_scope.h).
 
 static void parse_java_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
@@ -1912,19 +1918,25 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
             continue;
         }
 
-        // Get the full import path (skip "import" and "static" keywords)
+        // The full import path (skip "import" and "static" keywords), and
+        // whether an asterisk follows it.
+        char *path = NULL;
+        bool on_demand = false;
         uint32_t nc = ts_node_child_count(node);
         for (uint32_t j = 0; j < nc; j++) {
             TSNode child = ts_node_child(node, j);
             const char *ck = ts_node_type(child);
-            if (strcmp(ck, "scoped_identifier") == 0 || strcmp(ck, "identifier") == 0) {
-                char *path = cbm_node_text(a, child, ctx->source);
-                if (path && path[0]) {
-                    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
-                }
-                break;
+            if (!path && (strcmp(ck, "scoped_identifier") == 0 || strcmp(ck, "identifier") == 0)) {
+                path = cbm_node_text(a, child, ctx->source);
+            } else if (path && strcmp(ck, "asterisk") == 0) {
+                on_demand = true;
             }
+        }
+        if (path && path[0]) {
+            CBMImport imp = {.local_name =
+                                 on_demand ? cbm_arena_strdup(a, "*") : path_last(a, path),
+                             .module_path = path};
+            cbm_imports_push(&ctx->result->imports, a, imp);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);

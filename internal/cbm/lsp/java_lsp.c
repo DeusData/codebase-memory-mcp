@@ -3871,7 +3871,8 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
      * pre-grammar-version edge cases. */
     for (int i = 0; i < result->imports.count; i++) {
         CBMImport *imp = &result->imports.items[i];
-        if (!imp->local_name || !imp->module_path)
+        /* An on-demand import ("*") binds no name; the AST scan records it. */
+        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, "*") == 0)
             continue;
         java_lsp_add_import(&ctx, imp->local_name, imp->module_path, CBM_JAVA_IMPORT_TYPE);
     }
