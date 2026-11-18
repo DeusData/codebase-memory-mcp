@@ -706,6 +706,14 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
             ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn, src->qualified_name)
             : pxc_join_pipe(arena, src->base_classes);
+    if (lang == CBM_LANG_GO && src->go_embedded && src->go_embedded[0]) {
+        /* A Go struct's embedded types, as written; the Go registrar promotes
+         * their members (the embedded-member hook, go_lsp.c). */
+        dst->embedded_types =
+            dst->embedded_types && dst->embedded_types[0]
+                ? cbm_arena_sprintf(arena, "%s|%s", dst->embedded_types, src->go_embedded)
+                : cbm_arena_strdup(arena, src->go_embedded);
+    }
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
     if (src->signature_param_types && src->signature_param_count > 0) {

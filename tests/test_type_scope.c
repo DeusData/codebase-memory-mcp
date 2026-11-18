@@ -983,8 +983,37 @@ static int go_shared_qn_case(bool shared) {
     memcpy(variants + 2, rest, sizeof(rest));
     int same = ts_go_registry_hits(shared, source, "p.svc", variants, 6, NULL, NULL, 0,
                                    "p.real.Store.Get");
-    printf("  go shared QN, same fields (%s): real=%d\n", shared ? "shared" : "per-file", same);
+    /* Variants that differ elsewhere (prometheus' labels.Builder: one adds
+     * fields) keep the field they declare alike, in both orders. */
+    CBMLSPDef wider = real_s;
+    wider.field_defs = "X:*real.Store|Extra:int";
+    int partial[2];
+    for (int order = 0; order < 2; order++) {
+        CBMLSPDef defs[6] = {order ? wider : real_s, order ? real_s : wider};
+        memcpy(defs + 2, rest, sizeof(rest));
+        partial[order] = ts_go_registry_hits(shared, source, "p.svc", defs, 6, NULL, NULL, 0,
+                                             "p.real.Store.Get");
+    }
+    /* The same text naming another type in each (`store` is real in one,
+     * fake in the other): no agreement. */
+    CBMLSPDef via_real = real_s;
+    via_real.field_defs = "X:*store.Store";
+    via_real.type_scope = "store.Store=p.real.Store";
+    CBMLSPDef via_fake = via_real;
+    via_fake.type_scope = "store.Store=p.fake.Store";
+    CBMLSPDef split[6] = {via_real, via_fake};
+    memcpy(split + 2, rest, sizeof(rest));
+    int split_hits = ts_go_registry_hits(shared, source, "p.svc", split, 6, NULL, NULL, 0,
+                                         "p.real.Store.Get") +
+                     ts_go_registry_hits(shared, source, "p.svc", split, 6, NULL, NULL, 0,
+                                         "p.fake.Store.Get");
+    printf("  go shared QN (%s): same fields real=%d, agreed field %d/%d, same text other "
+           "identity %d\n",
+           shared ? "shared" : "per-file", same, partial[0], partial[1], split_hits);
     ASSERT_EQ(same, 1);
+    ASSERT_EQ(partial[0], 1);
+    ASSERT_EQ(partial[1], 1);
+    ASSERT_EQ(split_hits, 0);
     PASS();
 }
 
@@ -1186,6 +1215,89 @@ static int go_variant_value_check(cbm_store_t *s, const char *project, const cha
 
 TEST(type_scope_go_build_variant_values_stay_typed) {
     return ts_twins("govar", go_variant_value_files, CBM_LANG_GO, go_variant_value_check);
+}
+
+/* ── Go: embedded-member promotion ────────────────────────────────── */
+
+/* A struct of another file embeds `base.Base` (an imported package's type)
+ * and `*Local` (its own package's); the promoted methods are found through
+ * the declaring file's scope. decoy/ declares the same Base with the same
+ * method. */
+static const ts_file_t go_embed_files[] = {
+    {"go.mod", "module example.com/emb\n\ngo 1.21\n"},
+    {"base/base.go", "package base\n\ntype Base struct{ n int }\n\n"
+                     "func (b *Base) Hello() string { return \"x\" }\n"},
+    {"decoy/base.go", "package decoy\n\ntype Base struct{ n int }\n\n"
+                      "func (b *Base) Hello() string { return \"y\" }\n"},
+    {"outer/outer.go", "package outer\n\nimport \"example.com/emb/base\"\n\n"
+                       "type Outer struct {\n\tbase.Base\n\tname string\n}\n\n"
+                       "type Local struct{ k int }\n\nfunc (l *Local) Bye() string { return \"z\" }\n\n"
+                       "type Both struct {\n\t*Local\n}\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/emb/outer\"\n\n"
+                   "func Run(o *outer.Outer) string { return o.Hello() }\n\n"
+                   "func Run2(b *outer.Both) string { return b.Bye() }\n"},
+    {NULL, NULL}};
+
+static int go_embed_check(cbm_store_t *s, const char *project, const char *label) {
+    int imported = ts_calls_to(s, project, "Run", "base.Base.Hello", TS_LSP);
+    int decoy = ts_calls_to(s, project, "Run", "decoy.Base.Hello", NULL);
+    int own = ts_calls_to(s, project, "Run2", "outer.Local.Bye", TS_LSP);
+    printf("  go embedded (%s): imported=%d decoy=%d own=%d\n", label, imported, decoy, own);
+    return !(imported == 1 && decoy == 0 && own == 1);
+}
+
+TEST(type_scope_go_embedded_members_promote) {
+    return ts_twins("goemb", go_embed_files, CBM_LANG_GO, go_embed_check);
+}
+
+/* Finding 5: Go selects the member at the shallowest depth, and a tie there
+ * is no selection. Across files (the review's go-embed: Outer embeds base.A,
+ * which embeds Inner with Hello, and base.B with Hello: B.Hello at depth 1
+ * wins over Inner.Hello at depth 2), in one file the same, a tie of two
+ * embedded types at one depth, and an outer field of the member's name. */
+static const ts_file_t go_depth_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"base/base.go", "package base\n\ntype Inner struct{ n int }\n\n"
+                     "func (i *Inner) Hello() string { return \"inner\" }\n\n"
+                     "type A struct{ Inner }\n\n"
+                     "type B struct{ k int }\n\n"
+                     "func (b *B) Hello() string { return \"b\" }\n\n"
+                     "type C struct{ k int }\n\n"
+                     "func (c *C) Hello() string { return \"c\" }\n"},
+    {"outer/outer.go", "package outer\n\nimport \"example.com/demo/base\"\n\n"
+                       "type Outer struct {\n\tbase.A\n\tbase.B\n}\n\n"
+                       "type Tie struct {\n\tbase.B\n\tbase.C\n}\n\n"
+                       "type Shadow struct {\n\tHello func() string\n\tbase.B\n}\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/outer\"\n\n"
+                   "func Run(o *outer.Outer) string { return o.Hello() }\n\n"
+                   "func Tied(t *outer.Tie) string { return t.Hello() }\n\n"
+                   "func Field(s *outer.Shadow) string { return s.Hello() }\n"},
+    {"local/local.go", "package local\n\ntype Inner struct{ n int }\n\n"
+                       "func (i *Inner) Hello() string { return \"inner\" }\n\n"
+                       "type A struct{ Inner }\n\n"
+                       "type B struct{ k int }\n\n"
+                       "func (b *B) Hello() string { return \"b\" }\n\n"
+                       "type Outer struct {\n\tA\n\tB\n}\n\n"
+                       "func Here(o *Outer) string { return o.Hello() }\n"},
+    {NULL, NULL}};
+
+static int go_depth_check(cbm_store_t *s, const char *project, const char *label) {
+    int shallow = ts_calls_to(s, project, "Run", "base.B.Hello", NULL);
+    int deep = ts_calls_to(s, project, "Run", "base.Inner.Hello", NULL);
+    int tied = ts_calls_to(s, project, "Tied", "base.B.Hello", NULL) +
+               ts_calls_to(s, project, "Tied", "base.C.Hello", NULL);
+    int shadowed = ts_calls_to(s, project, "Field", "base.B.Hello", NULL);
+    int here_shallow = ts_calls_to(s, project, "Here", "local.B.Hello", NULL);
+    int here_deep = ts_calls_to(s, project, "Here", "local.Inner.Hello", NULL);
+    printf("  go promotion depth (%s): Run B=%d Inner=%d, tie=%d, field=%d, one file B=%d "
+           "Inner=%d\n",
+           label, shallow, deep, tied, shadowed, here_shallow, here_deep);
+    return !(deep == 0 && shallow <= 1 && tied == 0 && shadowed == 0 && here_deep == 0 &&
+             here_shallow <= 1);
+}
+
+TEST(type_scope_go_promotion_takes_the_shallowest_depth) {
+    return ts_twins("godepth", go_depth_files, CBM_LANG_GO, go_depth_check);
 }
 
 /* ── Full index versus every incremental route ───────────────────── */
@@ -1471,6 +1583,34 @@ TEST(type_scope_incremental_type_shape_changes_match_full) {
     PASS();
 }
 
+/* The shape only the identity gate catches: the struct an identity names
+ * embeds another package's type of the same name (`p1.E` -> `p2.E`, both
+ * imported already). The doc-link scope sees the same type, kind and field
+ * names; the caller reached the promoted method through fixture.go's
+ * identity and has no edge into model/b.go, so a repair would keep its stale
+ * edge to p1.E.Hello. */
+TEST(type_scope_incremental_named_type_embed_change_matches_full) {
+    const ts_file_t files[] = {
+        {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+        {"p1/e.go", "package p1\n\ntype E struct{ n int }\n\nfunc (e *E) Hello() string { return \"1\" }\n"},
+        {"p2/e.go", "package p2\n\ntype E struct{ n int }\n\nfunc (e *E) Hello() string { return \"2\" }\n"},
+        {"model/b.go", "package model\n\nimport (\n\t\"example.com/demo/p1\"\n\t\"example.com/demo/p2\"\n)\n\n"
+                       "var _ p2.E\n\ntype T struct {\n\tp1.E\n}\n"},
+        {"fixture/a.go", "package fixture\n\nimport \"example.com/demo/model\"\n\n"
+                         "func Make() *model.T { return &model.T{} }\n"},
+        {"app/c.go", "package app\n\nimport \"example.com/demo/fixture\"\n\n"
+                     "func Run() string { return fixture.Make().Hello() }\n"},
+        {NULL, NULL}};
+    const ts_file_t edit[] = {
+        {"model/b.go", "package model\n\nimport (\n\t\"example.com/demo/p1\"\n\t\"example.com/demo/p2\"\n)\n\n"
+                       "var _ p1.E\n\ntype T struct {\n\tp2.E\n}\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r = ts_incremental(files, CBM_LANG_GO, 0, edit, "go named type embed change");
+    ASSERT_TRUE(r.same_graph);
+    ASSERT_STR_EQ(r.plan.decline, "identity_target_changed");
+    PASS();
+}
+
 /* The gate is narrow: a signature change of another definition in the
  * declaring file stays a repair. */
 TEST(type_scope_incremental_other_def_edit_stays_a_repair) {
@@ -1577,10 +1717,13 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_package_values);
     RUN_TEST(type_scope_go_test_package_values_share_no_name);
     RUN_TEST(type_scope_go_build_variant_values_stay_typed);
+    RUN_TEST(type_scope_go_embedded_members_promote);
+    RUN_TEST(type_scope_go_promotion_takes_the_shallowest_depth);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go_values);
     RUN_TEST(type_scope_incremental_body_edit_stays_one_file);
     RUN_TEST(type_scope_incremental_named_type_field_change_matches_full);
+    RUN_TEST(type_scope_incremental_named_type_embed_change_matches_full);
     RUN_TEST(type_scope_incremental_type_shape_changes_match_full);
     RUN_TEST(type_scope_incremental_other_def_edit_stays_a_repair);
     RUN_TEST(type_scope_incremental_python_body_edits);

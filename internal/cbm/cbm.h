@@ -341,6 +341,12 @@ typedef struct {
      * and is never written to the graph. NULL for anything else and in every
      * other language. Tail field: zero-init stays valid. */
     const char *value_type;
+    /* Go only: the types a struct embeds, '|'-joined as written
+     * ("logging.LogHolder|*Base"). The cross-file LSP promotes their members
+     * (go_lsp.c, embedded-member hook); no graph edge is drawn from it. NULL
+     * when none and in every other language. Tail field: zero-init stays
+     * valid. */
+    const char *go_embedded;
 } CBMDefinition;
 
 /* extra_props key of a generated member, one the compiler writes and the

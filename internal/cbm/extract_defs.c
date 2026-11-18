@@ -8589,6 +8589,32 @@ static const char *cs_type_decl_namespace(CBMExtractCtx *ctx, TSNode node) {
     return ts_node_has_error(top) ? NULL : "";
 }
 
+/* Go: the types a struct type_spec embeds (its unnamed field declarations),
+ * '|'-joined as written, or NULL. */
+static const char *go_struct_embedded_text(CBMArena *a, TSNode spec, const char *source) {
+    TSNode st = ts_node_child_by_field_name(spec, TS_FIELD("type"));
+    if (ts_node_is_null(st) || strcmp(ts_node_type(st), "struct_type") != 0) {
+        return NULL;
+    }
+    TSNode list = cbm_find_child_by_kind(st, "field_declaration_list");
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    const char *out = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode field = ts_node_named_child(list, i);
+        if (strcmp(ts_node_type(field), "field_declaration") != 0 ||
+            !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("name")))) {
+            continue;
+        }
+        TSNode type = ts_node_child_by_field_name(field, TS_FIELD("type"));
+        const char *text = ts_node_is_null(type) ? NULL : cbm_node_text(a, type, source);
+        if (!text || !text[0] || strchr(text, '|')) {
+            continue;
+        }
+        out = out ? cbm_arena_sprintf(a, "%s|%s", out, text) : text;
+    }
+    return out;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
@@ -9022,6 +9048,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.docstring = extract_docstring(ctx, node, name);
     if (ctx->language == CBM_LANG_PYTHON) {
         def.type_params = py_type_param_names(a, node, ctx->source);
+    }
+    if (ctx->language == CBM_LANG_GO) {
+        def.go_embedded = go_struct_embedded_text(a, node, ctx->source);
     }
 
     cbm_defs_push(&ctx->result->defs, a, def);
