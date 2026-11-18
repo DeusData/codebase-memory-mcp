@@ -7190,16 +7190,22 @@ static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int d
         uint32_t n = ts_node_named_child_count(s);
         for (uint32_t i = 0; i < n; i++) {
             TSNode e = ts_node_named_child(s, i);
-            /* `a = b = v`: each assignment's left side, down the chain */
+            /* `a = b = v`: each assignment's left side, down the chain. An
+             * annotation alone (`x: T`) binds nothing (Python records it in
+             * __annotations__ only). */
             for (int chain = 0; !ts_node_is_null(e) && chain < TF_BIND_DEPTH; chain++) {
                 const char *ek = ts_node_type(e);
                 if (strcmp(ek, "assignment") != 0 && strcmp(ek, "augmented_assignment") != 0) {
                     py_bind_walrus(b, e, source, depth + 1);
                     break;
                 }
+                TSNode right = ts_node_child_by_field_name(e, TS_FIELD("right"));
+                if (ts_node_is_null(right)) {
+                    break;
+                }
                 py_bind_target(b, ts_node_child_by_field_name(e, TS_FIELD("left")), source,
                                depth + 1);
-                e = ts_node_child_by_field_name(e, TS_FIELD("right"));
+                e = right;
             }
         }
         return;

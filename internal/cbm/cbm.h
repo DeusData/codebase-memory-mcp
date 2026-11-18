@@ -355,9 +355,10 @@ typedef struct CBMDefTypeFacts {
      * and names them as fields (go_lsp.c, embedded-member hook). */
     const char *go_embedded;
     /* Python class: the names its body binds other than by a nested def or
-     * class (assignments, annotated names, imports, for/with/except/match
-     * targets, walrus, global/nonlocal/del), '|'-joined. A method annotation
-     * naming one of them means the class attribute, not the module's name. */
+     * class (assignments, annotated assignments with a value, imports,
+     * for/with/except/match targets, walrus, global/nonlocal/del; an
+     * annotation alone binds nothing), '|'-joined. A method annotation naming
+     * one of them means the class attribute, not the module's name. */
     const char *class_bindings;
 } CBMDefTypeFacts;
 

@@ -840,6 +840,7 @@ static const ts_file_t py_classbind_files[] = {
      "class Keep:\n    def load(self):\n        return 'keep'\n\n\n"
      "class Model:\n"
      "    Config = OtherConfig\n"
+     "    Keep: type\n" /* an annotation alone binds nothing: Keep stays the module's */
      "    from pkg.other import Other as A\n"
      "    B: type = Other\n"
      "    for C in (1,):\n        pass\n"
