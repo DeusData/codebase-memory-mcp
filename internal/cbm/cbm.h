@@ -334,6 +334,13 @@ typedef struct {
      * written to the graph. NULL when none and in every other language. Tail
      * field: zero-init stays valid. */
     const char *type_params;
+    /* Go only: the type a package-level `var`/`const` declares, or the type
+     * its single initializer spells (`T{}` is T, `&T{}` and `new(T)` are *T,
+     * a const block's bare spec repeats the previous one's). It reaches the
+     * cross-file LSP as the Variable's type (go_lsp.c, package-level values)
+     * and is never written to the graph. NULL for anything else and in every
+     * other language. Tail field: zero-init stays valid. */
+    const char *value_type;
 } CBMDefinition;
 
 /* extra_props key of a generated member, one the compiler writes and the

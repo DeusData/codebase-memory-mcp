@@ -283,6 +283,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->variant_key);
     cr_str(c, &d->alias_target);
     cr_str(c, &d->type_params);
+    cr_str(c, &d->value_type);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {

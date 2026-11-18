@@ -385,6 +385,35 @@ static void go_walk_func_literal(GoLSPContext *ctx, TSNode node) {
     ctx->current_scope = saved;
 }
 
+/* The type a package-level symbol has as an expression: a value's declared
+ * type (CBM_FUNC_FLAG_VALUE: the signature's single result), a function's
+ * own signature. NULL when unknown. */
+static const CBMType *go_symbol_type(const CBMRegisteredFunc *f) {
+    if (!f || !f->signature) {
+        return NULL;
+    }
+    if ((f->flags & CBM_FUNC_FLAG_VALUE) == 0) {
+        return f->signature;
+    }
+    const CBMType **rets =
+        f->signature->kind == CBM_TYPE_FUNC ? f->signature->data.func.return_types : NULL;
+    return rets && rets[0] ? rets[0] : NULL;
+}
+
+/* A package-level symbol a call can target: a function, never a value. */
+static const CBMRegisteredFunc *go_lookup_callable(const CBMTypeRegistry *reg,
+                                                   const char *package_qn, const char *name) {
+    const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(reg, package_qn, name);
+    return f && (f->flags & CBM_FUNC_FLAG_VALUE) ? NULL : f;
+}
+
+/* The same rule for a lookup by full QN (the fast resolve path). */
+static const CBMRegisteredFunc *go_lookup_func_callable(const CBMTypeRegistry *reg,
+                                                        const char *qn) {
+    const CBMRegisteredFunc *f = cbm_registry_lookup_func(reg, qn);
+    return f && (f->flags & CBM_FUNC_FLAG_VALUE) ? NULL : f;
+}
+
 const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -402,11 +431,11 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
         if (cbm_scope_contains(ctx->current_scope, name))
             return t ? t : cbm_type_unknown();
 
-        // Check if it's a package-level function
-        const CBMRegisteredFunc *f =
-            cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
-        if (f && f->signature)
-            return f->signature;
+        // A package-level function or value (of any file of the package)
+        const CBMType *st =
+            go_symbol_type(cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name));
+        if (st)
+            return st;
 
         // Check if it's a builtin type (for type conversions like string(x), int(x))
         const CBMType *bt = resolve_builtin_type(ctx, name);
@@ -439,11 +468,11 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
             if (pkg_name) {
                 const char *pkg_qn = resolve_import(ctx, pkg_name);
                 if (pkg_qn) {
-                    // Look up pkg.Symbol as a function or type
-                    const CBMRegisteredFunc *f =
-                        cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name);
-                    if (f && f->signature)
-                        return f->signature;
+                    // Look up pkg.Symbol as a function, a value or a type
+                    const CBMType *st = go_symbol_type(
+                        cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name));
+                    if (st)
+                        return st;
                     // Check if it's a type
                     char *type_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", pkg_qn, field_name);
                     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
@@ -1097,8 +1126,7 @@ static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node) {
         if (cbm_scope_contains(ctx->current_scope, name)) {
             return cbm_scope_lookup_callable(ctx->current_scope, name);
         }
-        const CBMRegisteredFunc *f =
-            cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
+        const CBMRegisteredFunc *f = go_lookup_callable(ctx->registry, ctx->package_qn, name);
         return f ? f->qualified_name : NULL;
     }
 
@@ -1115,8 +1143,7 @@ static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node) {
             char *local = lsp_node_text(ctx, operand);
             const char *package_qn = local ? resolve_import(ctx, local) : NULL;
             if (package_qn) {
-                const CBMRegisteredFunc *f =
-                    cbm_registry_lookup_symbol(ctx->registry, package_qn, member);
+                const CBMRegisteredFunc *f = go_lookup_callable(ctx->registry, package_qn, member);
                 return f ? f->qualified_name : NULL;
             }
         }
@@ -1570,7 +1597,7 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
                             const char *pkg_qn = resolve_import(ctx, pkg_name);
                             if (pkg_qn && field_name) {
                                 const CBMRegisteredFunc *f =
-                                    cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name);
+                                    go_lookup_callable(ctx->registry, pkg_qn, field_name);
                                 if (f) {
                                     emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f,
                                                        node);
@@ -1766,7 +1793,7 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
                     }
                     // Package-local function
                     const CBMRegisteredFunc *f =
-                        cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
+                        go_lookup_callable(ctx->registry, ctx->package_qn, name);
                     if (f) {
                         emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f, node);
                     } else {
@@ -2748,6 +2775,100 @@ static const CBMType **split_pipe_types(CBMArena *a, const char *text, const cha
     return idx > 0 ? arr : NULL;
 }
 
+/* The mark of a QN in the tables below (go_shared_type_qns,
+ * go_value_qn_counts) whose definitions give different answers; any other
+ * value is the QN's first definition. */
+static char g_go_qn_shared_mark;
+
+static bool go_type_qn_shared(const CBMHashTable *shared, const char *qn) {
+    return shared && qn && cbm_ht_get(shared, qn) == &g_go_qn_shared_mark;
+}
+
+static bool go_same_text(const char *a, const char *b) {
+    return (!a || !a[0]) ? (!b || !b[0]) : (b && strcmp(a, b) == 0);
+}
+
+/* The QN a package-level value registers under: <package>.<name>, or NULL
+ * for a def that is no typed value. */
+static const char *go_value_qn(CBMArena *a, const CBMLSPDef *d, const char *def_mod) {
+    if (!d->label || strcmp(d->label, "Variable") != 0 || !d->short_name || !d->return_types ||
+        !d->return_types[0] || strchr(d->return_types, '|') || !def_mod || !def_mod[0]) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(a, "%s.%s", def_mod, d->short_name);
+}
+
+/* Every Go def QN and every value QN, marked shared when two defs that give
+ * different answers have it. A directory holds both `package foo` and
+ * `package foo_test`, and their package-level names live under one directory
+ * QN: a value whose QN another definition also has (a value of another type
+ * or identity, a function, a type of the other package) is registered for
+ * neither, so no answer depends on file order. Two values of one QN that
+ * spell the same type with the same identities (build variants of one
+ * declaration) give one answer and stay. NULL on allocation failure (then no
+ * value is registered). */
+static CBMHashTable *go_value_qn_counts(CBMArena *a, const CBMLSPDef *defs, int def_count,
+                                        const char *fallback_mod) {
+    CBMHashTable *seen = cbm_ht_create((uint32_t)(def_count / 4 + 64));
+    for (int i = 0; seen && i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || d->lang != CBM_LANG_GO) {
+            continue;
+        }
+        const char *def_mod = d->def_module_qn ? d->def_module_qn : fallback_mod;
+        const char *value_qn = go_value_qn(a, d, def_mod);
+        const char *keys[2] = {d->qualified_name,
+                               value_qn && strcmp(value_qn, d->qualified_name) != 0 ? value_qn
+                                                                                    : NULL};
+        for (int k = 0; k < 2; k++) {
+            if (!keys[k]) {
+                continue;
+            }
+            void *prev = cbm_ht_get(seen, keys[k]);
+            if (!prev) {
+                cbm_ht_set(seen, keys[k], (void *)d); /* the first definition */
+                continue;
+            }
+            const CBMLSPDef *first = (const CBMLSPDef *)prev;
+            bool same_value = prev != &g_go_qn_shared_mark && value_qn &&
+                              go_value_qn(a, first, first->def_module_qn ? first->def_module_qn
+                                                                         : fallback_mod) &&
+                              go_same_text(first->return_types, d->return_types) &&
+                              go_same_text(first->type_scope, d->type_scope);
+            if (!same_value) {
+                cbm_ht_set(seen, keys[k], &g_go_qn_shared_mark);
+            }
+        }
+    }
+    return seen;
+}
+
+/* A package-level value (a Go `var`/`const` Variable def whose declaration or
+ * initializer spells its type): registered under <package>.<name> with
+ * CBM_FUNC_FLAG_VALUE and that type as the signature's single result, so
+ * `pkg.V.Method()` and a bare `V.Method()` of another file are typed. A
+ * value is never a call target (go_lookup_callable, go_lookup_func_callable),
+ * and a QN another definition shares registers no value (go_value_qn_counts). */
+static void go_register_value(CBMTypeRegistry *reg, CBMArena *a, const CBMLSPDef *d,
+                              const char *def_mod, const cbm_type_scope_index_t *scope_ix,
+                              const CBMHashTable *value_qns) {
+    const char *qn = go_value_qn(a, d, def_mod);
+    if (!qn || !value_qns || go_type_qn_shared(value_qns, qn)) {
+        return;
+    }
+    const CBMType **ret = split_pipe_types(a, d->return_types, def_mod, scope_ix);
+    if (!ret || !ret[0] || cbm_type_is_unknown(ret[0])) {
+        return;
+    }
+    CBMRegisteredFunc rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.qualified_name = qn;
+    rf.short_name = d->short_name;
+    rf.signature = cbm_type_func(a, NULL, NULL, ret);
+    rf.flags = CBM_FUNC_FLAG_VALUE;
+    cbm_registry_add_func(reg, rf);
+}
+
 // Helper: split "|"-separated string into array of const char*.
 static const char **split_pipe_strings(CBMArena *a, const char *text) {
     if (!text || !text[0])
@@ -2864,12 +2985,12 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
  * (`foo` and `foo_test`), or build-tagged variants, can declare two types of
  * one QN. A type lookup answers with one entry of a name, which one depends on
  * file order; what is keyed by such a QN (its fields, its embedded types) is
- * therefore registered for neither. Returns the QNs two or more type
- * definitions share (owned keys borrowed from defs; free with cbm_ht_free), or
- * NULL on allocation failure (then nothing counts as shared). */
-static char g_go_qn_once_mark;
-static char g_go_qn_shared_mark;
-
+ * therefore registered for neither, unless every definition of the QN spells
+ * the same fields and embedded types with the same identities (build variants
+ * of one struct): then every order gives one answer. Returns the QNs whose
+ * definitions differ (marked shared; keys borrowed from defs; free with
+ * cbm_ht_free), or NULL on allocation failure (then nothing counts as
+ * shared). */
 static CBMHashTable *go_shared_type_qns(const CBMLSPDef *defs, int def_count) {
     CBMHashTable *seen = cbm_ht_create((uint32_t)(def_count / 4 + 64));
     for (int i = 0; seen && i < def_count; i++) {
@@ -2879,13 +3000,19 @@ static CBMHashTable *go_shared_type_qns(const CBMLSPDef *defs, int def_count) {
             continue;
         }
         void *prev = cbm_ht_get(seen, d->qualified_name);
-        cbm_ht_set(seen, d->qualified_name, prev ? &g_go_qn_shared_mark : &g_go_qn_once_mark);
+        if (!prev) {
+            cbm_ht_set(seen, d->qualified_name, (void *)d); /* the first definition */
+            continue;
+        }
+        const CBMLSPDef *first = (const CBMLSPDef *)prev;
+        if (prev != &g_go_qn_shared_mark &&
+            (!go_same_text(first->field_defs, d->field_defs) ||
+             !go_same_text(first->embedded_types, d->embedded_types) ||
+             !go_same_text(first->type_scope, d->type_scope))) {
+            cbm_ht_set(seen, d->qualified_name, &g_go_qn_shared_mark);
+        }
     }
     return seen;
-}
-
-static bool go_type_qn_shared(const CBMHashTable *shared, const char *qn) {
-    return shared && qn && cbm_ht_get(shared, qn) == &g_go_qn_shared_mark;
 }
 
 // --- Phase 1c: Extract type parameters from generic function declarations ---
@@ -3398,6 +3525,7 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
     // wasted work. On kubernetes (~110k defs × 11k files × 5 strdups
     // ~= 6B mallocs) this alone saves ~90s of resolve wall time.
     CBMHashTable *shared_qns = go_shared_type_qns(defs, def_count);
+    CBMHashTable *value_qns = go_value_qn_counts(arena, defs, def_count, module_qn);
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
@@ -3467,8 +3595,10 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
             cbm_registry_add_func(&reg, rf);
         }
+        go_register_value(&reg, arena, d, def_mod, scope_ix, value_qns);
     }
     cbm_ht_free(shared_qns); /* NULL-safe */
+    cbm_ht_free(value_qns);
 
     // 3. Phase 1b: Scan AST for struct definitions to populate embedded_types
     {
@@ -3692,6 +3822,7 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
      * NULL on allocation failure: the receiver check scans the registry. */
     CBMHashTable *first_type = cbm_ht_create((uint32_t)(def_count / 4 + 1024));
     CBMHashTable *shared_qns = go_shared_type_qns(defs, def_count);
+    CBMHashTable *value_qns = go_value_qn_counts(arena, defs, def_count, "");
     int noted_types = 0;
 #define GO_NOTE_NEW_TYPES()                                                        \
     do {                                                                           \
@@ -3777,10 +3908,12 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             }
             cbm_registry_add_func(reg, rf);
         }
+        go_register_value(reg, arena, d, def_mod, scope_ix, value_qns);
     }
 #undef GO_NOTE_NEW_TYPES
     cbm_ht_free(first_type);
     cbm_ht_free(shared_qns); /* NULL-safe */
+    cbm_ht_free(value_qns);
 
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
@@ -3881,7 +4014,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
          * but the global registry has. (method_not_found with NAMED
          * receiver, or any other case where callee_qn looks like a
          * full QN). Direct lookup. */
-        const CBMRegisteredFunc *f = cbm_registry_lookup_func(reg, uc->callee_qn);
+        const CBMRegisteredFunc *f = go_lookup_func_callable(reg, uc->callee_qn);
 
         /* Case 2: callee_qn is "local_pkg_alias.suffix" — the alias
          * needs translating through the file's import map to get the
@@ -3901,7 +4034,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
                             char fq[1024];
                             int n = snprintf(fq, sizeof(fq), "%s.%s", import_qns[j], suffix);
                             if (n > 0 && n < (int)sizeof(fq)) {
-                                f = cbm_registry_lookup_func(reg, fq);
+                                f = go_lookup_func_callable(reg, fq);
                             }
                             break;
                         }
@@ -3915,7 +4048,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
          * an exact package-local lookup rather than a project-wide short-name
          * guess. */
         if (!f && !strchr(uc->callee_qn, '.') && result->module_qn) {
-            f = cbm_registry_lookup_symbol(reg, result->module_qn, uc->callee_qn);
+            f = go_lookup_callable(reg, result->module_qn, uc->callee_qn);
         }
 
         if (!f)

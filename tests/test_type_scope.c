@@ -976,6 +976,15 @@ static int go_shared_qn_case(bool shared) {
     printf("  go shared QN (%s): order A real=%d fake=%d, order B real=%d fake=%d\n",
            shared ? "shared" : "per-file", hits[0][0], hits[0][1], hits[1][0], hits[1][1]);
     ASSERT_EQ(hits[0][0] + hits[0][1] + hits[1][0] + hits[1][1], 0);
+    /* Build variants of one struct (prometheus' labels.Builder): the same
+     * fields with the same identities give one answer in every order, so
+     * the fields stay. */
+    CBMLSPDef variants[6] = {real_s, real_s};
+    memcpy(variants + 2, rest, sizeof(rest));
+    int same = ts_go_registry_hits(shared, source, "p.svc", variants, 6, NULL, NULL, 0,
+                                   "p.real.Store.Get");
+    printf("  go shared QN, same fields (%s): real=%d\n", shared ? "shared" : "per-file", same);
+    ASSERT_EQ(same, 1);
     PASS();
 }
 
@@ -1014,6 +1023,169 @@ static int go_closure_check(cbm_store_t *s, const char *project, const char *lab
 
 TEST(type_scope_go_closure_parameters_in_composite_literals) {
     return ts_twins("goclos", go_closure_files, CBM_LANG_GO, go_closure_check);
+}
+
+/* ── Go: package-level values ─────────────────────────────────────── */
+
+/* How many Variable nodes named `name` carry a `return_type` property: a
+ * value's type crosses files through the LSP defs only, never as a graph
+ * property (Variable nodes carry none on any other language). */
+static int ts_variable_return_type_props(cbm_store_t *s, const char *project, const char *name) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(s, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int hits = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, "Variable") == 0 && nodes[i].properties_json &&
+            strstr(nodes[i].properties_json, "\"return_type\"")) {
+            hits++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return hits;
+}
+
+/* Package-level values of another package typed by their declaration or
+ * initializer (`&T{}`, `T{}`, `new(T)`, a typed const and the const block's
+ * implicit repetition). decoy/ declares the same names. */
+#define TS_GO_VALUES_STORE                                                                         \
+    "type Store struct{ n int }\n\nfunc (s *Store) Get(k string) string { return k }\n\n"         \
+    "type Kind string\n\nfunc (k Kind) String() string { return string(k) }\n"
+static const ts_file_t go_values_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"store/store.go", "package store\n\n" TS_GO_VALUES_STORE},
+    {"decoy/store.go", "package decoy\n\n" TS_GO_VALUES_STORE},
+    {"conf/conf.go", "package conf\n\nimport \"example.com/demo/store\"\n\n"
+                     "var Default = &store.Store{}\n\nvar Plain = store.Store{}\n\n"
+                     "var Fresh = new(store.Store)\n\nconst Primary store.Kind = \"primary\"\n\n"
+                     "const (\n\tFirst store.Kind = \"a\"\n\tSecond\n)\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/conf\"\n\n"
+                   "func Pointer() string { return conf.Default.Get(\"a\") }\n\n"
+                   "func Value() string { return conf.Plain.Get(\"b\") }\n\n"
+                   "func Fresh() string { return conf.Fresh.Get(\"c\") }\n\n"
+                   "func Typed() string { return conf.Primary.String() }\n\n"
+                   "func Repeated() string { return conf.Second.String() }\n"},
+    {NULL, NULL}};
+
+static int go_values_check(cbm_store_t *s, const char *project, const char *label) {
+    int pointer = ts_calls_to(s, project, "Pointer", "store.Store.Get", TS_LSP);
+    int value = ts_calls_to(s, project, "Value", "store.Store.Get", TS_LSP);
+    int fresh = ts_calls_to(s, project, "Fresh", "store.Store.Get", TS_LSP);
+    int typed = ts_calls_to(s, project, "Typed", "store.Kind.String", TS_LSP);
+    int repeated = ts_calls_to(s, project, "Repeated", "store.Kind.String", TS_LSP);
+    int decoy = ts_calls_to(s, project, "Pointer", "decoy.Store.Get", NULL) +
+                ts_calls_to(s, project, "Value", "decoy.Store.Get", NULL) +
+                ts_calls_to(s, project, "Fresh", "decoy.Store.Get", NULL) +
+                ts_calls_to(s, project, "Typed", "decoy.Kind.String", NULL) +
+                ts_calls_to(s, project, "Repeated", "decoy.Kind.String", NULL);
+    /* A value is no callee: no CALLS edge reaches a Variable node. */
+    int to_value = ts_calls_to(s, project, "Pointer", "conf.Default", NULL) +
+                   ts_calls_to(s, project, "Value", "conf.Plain", NULL);
+    int props = ts_variable_return_type_props(s, project, "Default") +
+                ts_variable_return_type_props(s, project, "Primary");
+    printf("  go values (%s): pointer=%d value=%d new=%d typed=%d repeated=%d decoy=%d "
+           "to_value=%d return_type_props=%d\n",
+           label, pointer, value, fresh, typed, repeated, decoy, to_value, props);
+    return !(pointer == 1 && value == 1 && fresh == 1 && typed == 1 && repeated == 1 &&
+             decoy == 0 && to_value == 0 && props == 0);
+}
+
+TEST(type_scope_go_package_values) {
+    return ts_twins("govals", go_values_files, CBM_LANG_GO, go_values_check);
+}
+
+/* Finding 4: `package svc` and `package svc_test` in one directory declare
+ * a value of one name (svc.go: real, a_test.go: fake); b_test.go uses the
+ * fake one, use.go the real one. Their values share a directory QN, so
+ * neither is typed, in either file order; and a function value called
+ * through `conf.Hook()` keeps main's edge (the value is no call target of
+ * the LSP). */
+static int go_test_package_case(bool tests_last) {
+    const char *a_test = tests_last ? "svc/za_test.go" : "svc/a_test.go";
+    const char *b_test = tests_last ? "svc/zb_test.go" : "svc/b_test.go";
+    const ts_file_t files[] = {
+        {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+        {"conf/conf.go", "package conf\n\nfunc impl() string { return \"x\" }\n\n"
+                         "var Hook func() string = impl\n"},
+        {"app/app.go", "package app\n\nimport \"example.com/demo/conf\"\n\n"
+                       "func Run() string { return conf.Hook() }\n"},
+        {"real/real.go",
+         "package real\n\ntype Store struct{ n int }\n\nfunc (s *Store) Get() string { return \"r\" }\n"},
+        {"fake/fake.go",
+         "package fake\n\ntype Store struct{ n int }\n\nfunc (s *Store) Get() string { return \"f\" }\n"},
+        {"svc/svc.go", "package svc\n\nimport \"example.com/demo/real\"\n\n"
+                       "var defaultStore = &real.Store{}\n\n"
+                       "func Keep() *real.Store { return defaultStore }\n"},
+        {"svc/use.go", "package svc\n\nfunc Use() string { return defaultStore.Get() }\n"},
+        {a_test, "package svc_test\n\nimport \"example.com/demo/fake\"\n\n"
+                 "var defaultStore = &fake.Store{}\n"},
+        {b_test, "package svc_test\n\nfunc helper() string { return defaultStore.Get() }\n"},
+        {NULL, NULL}};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_tscope_gotest_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    ts_write(tmp, files);
+    ts_pad(tmp, CBM_LANG_GO, TS_PAD_FILES);
+    int bad = 0;
+    for (int run = 0; run < 2; run++) {
+        char project[256] = {0};
+        cbm_store_t *s = ts_index_workers(tmp, run ? "par.db" : "seq.db", run ? 4 : 1, project,
+                                          sizeof(project));
+        if (!s) {
+            bad++;
+            continue;
+        }
+        int helper_real = ts_calls_to(s, project, "helper", "real.Store.Get", NULL);
+        int helper_fake = ts_calls_to(s, project, "helper", "fake.Store.Get", NULL);
+        int use_fake = ts_calls_to(s, project, "Use", "fake.Store.Get", NULL);
+        int use_real = ts_calls_to(s, project, "Use", "real.Store.Get", NULL);
+        int hook = ts_calls_to(s, project, "Run", "conf.Hook", NULL);
+        int hook_main = ts_calls_to(s, project, "Run", "conf.Hook", "\"strategy\":\"import_map\"");
+        printf("  go test package (%s, tests %s): helper real=%d fake=%d, Use real=%d fake=%d, "
+               "Run->conf.Hook=%d (import_map %d)\n",
+               run ? "4 workers" : "1 worker", tests_last ? "last" : "first", helper_real,
+               helper_fake, use_real, use_fake, hook, hook_main);
+        bad += helper_real + helper_fake + use_fake + use_real != 0 || hook != 1 || hook_main != 1;
+        cbm_store_close(s);
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(bad, 0);
+    PASS();
+}
+
+TEST(type_scope_go_test_package_values_share_no_name) {
+    ASSERT_EQ(go_test_package_case(false), 0);
+    ASSERT_EQ(go_test_package_case(true), 0);
+    PASS();
+}
+
+/* Build variants of one value (`//go:build linux` and `!linux` files that
+ * both declare `var Default = &store.Store{}`) give one answer, so the value
+ * stays typed. */
+static const ts_file_t go_variant_value_files[] = {
+    {"go.mod", "module example.com/demo\n\ngo 1.21\n"},
+    {"store/store.go", "package store\n\ntype Store struct{ n int }\n\n"
+                       "func (s *Store) Get(k string) string { return k }\n"},
+    {"conf/conf_linux.go", "//go:build linux\n\npackage conf\n\nimport \"example.com/demo/store\"\n\n"
+                           "var Default = &store.Store{}\n"},
+    {"conf/conf_other.go", "//go:build !linux\n\npackage conf\n\nimport \"example.com/demo/store\"\n\n"
+                           "var Default = &store.Store{}\n"},
+    {"app/app.go", "package app\n\nimport \"example.com/demo/conf\"\n\n"
+                   "func Pointer() string { return conf.Default.Get(\"a\") }\n"},
+    {NULL, NULL}};
+
+static int go_variant_value_check(cbm_store_t *s, const char *project, const char *label) {
+    int hit = ts_calls_to(s, project, "Pointer", "store.Store.Get", TS_LSP);
+    printf("  go variant values (%s): pointer=%d\n", label, hit);
+    return hit != 1;
+}
+
+TEST(type_scope_go_build_variant_values_stay_typed) {
+    return ts_twins("govar", go_variant_value_files, CBM_LANG_GO, go_variant_value_check);
 }
 
 /* ── Full index versus every incremental route ───────────────────── */
@@ -1154,6 +1326,25 @@ TEST(type_scope_incremental_caller_edit_per_file_go) {
                        "func Field() string {\n\th := fixture.NewHolder()\n\treturn h.S.Get(\"y\")\n}\n"},
         {NULL, NULL}};
     ts_incr_result_t r = ts_incremental(go_scope_files, CBM_LANG_GO, 0, edit, "go caller edit");
+    ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(r.plan.files, 1);
+    ASSERT_TRUE(r.same_graph);
+    PASS();
+}
+
+/* The same through package-level values: the per-file Go registrar types
+ * `conf.Default` from conf.go's stored row. */
+TEST(type_scope_incremental_caller_edit_per_file_go_values) {
+    const ts_file_t edit[] = {
+        {"app/app.go", "package app\n\nimport \"example.com/demo/conf\"\n\n"
+                       "func Pointer() string {\n\tv := conf.Default.Get(\"a\")\n\treturn v\n}\n\n"
+                       "func Value() string { return conf.Plain.Get(\"b\") }\n\n"
+                       "func Fresh() string { return conf.Fresh.Get(\"c\") }\n\n"
+                       "func Typed() string { return conf.Primary.String() }\n\n"
+                       "func Repeated() string { return conf.Second.String() }\n"},
+        {NULL, NULL}};
+    ts_incr_result_t r =
+        ts_incremental(go_values_files, CBM_LANG_GO, 0, edit, "go values caller edit");
     ASSERT_EQ(r.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(r.plan.files, 1);
     ASSERT_TRUE(r.same_graph);
@@ -1383,7 +1574,11 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_go_shared_type_qn_keeps_no_fields_per_file);
     RUN_TEST(type_scope_go_shared_type_qn_keeps_no_fields_shared);
     RUN_TEST(type_scope_go_closure_parameters_in_composite_literals);
+    RUN_TEST(type_scope_go_package_values);
+    RUN_TEST(type_scope_go_test_package_values_share_no_name);
+    RUN_TEST(type_scope_go_build_variant_values_stay_typed);
     RUN_TEST(type_scope_incremental_caller_edit_per_file_go);
+    RUN_TEST(type_scope_incremental_caller_edit_per_file_go_values);
     RUN_TEST(type_scope_incremental_body_edit_stays_one_file);
     RUN_TEST(type_scope_incremental_named_type_field_change_matches_full);
     RUN_TEST(type_scope_incremental_type_shape_changes_match_full);

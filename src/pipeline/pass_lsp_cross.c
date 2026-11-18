@@ -694,6 +694,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     } else {
         dst->return_types = src->return_type ? cbm_arena_strdup(arena, src->return_type) : NULL;
     }
+    if (lang == CBM_LANG_GO && !dst->return_types && src->value_type) {
+        /* A Go package-level value's type: the Go registrars register the
+         * Variable as a value of it (go_lsp.c); the graph never sees it. */
+        dst->return_types = cbm_arena_strdup(arena, src->value_type);
+    }
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */

@@ -11067,6 +11067,53 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     }
 }
 
+/* Go: the type a package-level `var`/`const` spec declares, else the type
+ * its single initializer spells: `T{...}` is T, `&T{...}` is *T, `new(T)` is
+ * *T. NULL for anything else (a call's result, an arithmetic expression):
+ * nothing is inferred. */
+static const char *go_value_type_text(CBMArena *a, TSNode spec, const char *source) {
+    TSNode type = ts_node_child_by_field_name(spec, TS_FIELD("type"));
+    if (!ts_node_is_null(type)) {
+        return cbm_node_text(a, type, source);
+    }
+    TSNode value = ts_node_child_by_field_name(spec, TS_FIELD("value"));
+    if (!ts_node_is_null(value) && strcmp(ts_node_type(value), "expression_list") == 0) {
+        value = ts_node_named_child_count(value) == 1 ? ts_node_named_child(value, 0) : (TSNode){0};
+    }
+    if (ts_node_is_null(value)) {
+        return NULL;
+    }
+    bool pointer = false;
+    if (strcmp(ts_node_type(value), "unary_expression") == 0) {
+        TSNode op = ts_node_child_by_field_name(value, TS_FIELD("operator"));
+        const char *ot = ts_node_is_null(op) ? NULL : cbm_node_text(a, op, source);
+        if (!ot || strcmp(ot, "&") != 0) {
+            return NULL;
+        }
+        value = ts_node_child_by_field_name(value, TS_FIELD("operand"));
+        pointer = true;
+        if (ts_node_is_null(value)) {
+            return NULL;
+        }
+    }
+    const char *vk = ts_node_type(value);
+    const char *text = NULL;
+    if (strcmp(vk, "composite_literal") == 0) {
+        TSNode t = ts_node_child_by_field_name(value, TS_FIELD("type"));
+        text = ts_node_is_null(t) ? NULL : cbm_node_text(a, t, source);
+    } else if (!pointer && strcmp(vk, "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+        TSNode args = ts_node_child_by_field_name(value, TS_FIELD("arguments"));
+        const char *fname = ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
+        if (fname && strcmp(fname, "new") == 0 && !ts_node_is_null(args) &&
+            ts_node_named_child_count(args) == 1) {
+            text = cbm_node_text(a, ts_node_named_child(args, 0), source);
+            pointer = true;
+        }
+    }
+    return text && pointer ? cbm_arena_sprintf(a, "*%s", text) : text;
+}
+
 static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a,
                                     const char *kind) {
     (void)kind;
@@ -11095,13 +11142,27 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     }
     case CBM_LANG_GO: {
         uint32_t n = ts_node_named_child_count(node);
+        /* In a const block a spec with neither type nor value repeats the
+         * previous spec's (`A Kind = iota; B; C`). */
+        const char *repeated = NULL;
         for (uint32_t i = 0; i < n; i++) {
             TSNode child = ts_node_named_child(node, i);
             const char *ck = ts_node_type(child);
             if (strcmp(ck, "var_spec") == 0 || strcmp(ck, "const_spec") == 0) {
+                bool bare = strcmp(ck, "const_spec") == 0 &&
+                            ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("type"))) &&
+                            ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("value")));
+                const char *vtype = bare ? repeated : go_value_type_text(a, child, ctx->source);
+                repeated = vtype;
                 TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
                 if (!ts_node_is_null(vname)) {
+                    int before = ctx->result->defs.count;
                     push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+                    /* The value's type reaches other files (pkg.V.Method()),
+                     * never the graph (CBMDefinition.value_type). */
+                    if (vtype && ctx->result->defs.count == before + 1) {
+                        ctx->result->defs.items[before].value_type = vtype;
+                    }
                 }
             }
         }
