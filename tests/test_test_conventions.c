@@ -33,7 +33,7 @@ static cbm_test_declarations_t *tc_config(const char *records, const char *prese
 static CBMFileResult *tc_extract(const char *source, CBMLanguage language, const char *path,
                                const cbm_test_declarations_t *config) {
     return cbm_extract_file_ex_with_tests(source, (int)strlen(source), language,
-        "convproj", path, 0, NULL, NULL, NULL, NULL, config);
+        "convproj", path, 0, NULL, NULL, NULL, NULL, config, NULL);
 }
 
 static CBMFileResult *tc_legacy(const char *source, CBMLanguage language, const char *path) {

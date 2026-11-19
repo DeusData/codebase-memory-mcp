@@ -967,6 +967,11 @@ typedef struct CBMFileResult {
     const char **constants;     // NULL-terminated (NULL if none)
     const char **global_vars;   // NULL-terminated (NULL if none)
     const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
+    /* C, C++, CUDA: the repository files the preprocessed pass's #include
+     * lookup read (repository-relative, sorted, NULL-terminated; NULL if none).
+     * The file's graph depends on their bytes as well as its own, so an
+     * incremental refresh re-extracts the file when one of them changes. */
+    const char **included_files;
 
     bool has_error;
     const char *error_msg;
@@ -1315,15 +1320,29 @@ CBMFileResult *cbm_extract_file_ex(
     const CBMReturnTypeTable *return_type_table // OS return types, or NULL
 );
 
+/* The indexed repository as the C-family preprocessed pass's #include lookup
+ * sees it (#2993): `root` is the directory rel_path is relative to, and a
+ * quoted include resolves only to a file is_indexed() accepts -- one of the
+ * files the index run covers -- so the expansion is a function of the indexed
+ * tree alone, never of the process working directory. */
+typedef struct {
+    const char *root;
+    bool (*is_indexed)(const void *userdata, const char *rel_path);
+    const void *userdata;
+} CBMIncludeScope;
+
 /* Additive immutable-snapshot entry point. NULL preserves legacy behavior.
  * Snapshot must outlive this call; returned data is independently result-owned.
  * A non-OK result status is an explicit configured-mapping failure, not a
- * successful empty inventory. error_msg may be NULL on diagnostic OOM. */
+ * successful empty inventory. error_msg may be NULL on diagnostic OOM.
+ * include_scope: where quoted #include names resolve (preprocessor.h); NULL
+ * resolves none. */
 CBMFileResult *cbm_extract_file_ex_with_tests(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
     const char **include_paths, const CBMMacroTable *macro_table,
-    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations);
+    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations,
+    const CBMIncludeScope *include_scope);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);
