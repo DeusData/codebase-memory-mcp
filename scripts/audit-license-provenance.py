@@ -36,6 +36,9 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "cfml": "cfmleditor/tree-sitter-cfml",
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",
+    # haskell: our escaped-char-literal fork (#2547) of the pin we vendored before;
+    # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "haskell": "tree-sitter/tree-sitter-haskell",
     # javascript / tsx: our JSX lone-ampersand forks (#1736) of the pins we vendored
     # before; same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
     "javascript": "tree-sitter/tree-sitter-javascript",

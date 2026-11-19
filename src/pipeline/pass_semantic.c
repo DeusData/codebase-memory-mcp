@@ -154,9 +154,17 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             start += strlen("\"local_name\":\"");
             const char *end = strchr(start, '"');
             if (end && end > start) {
-                keys[count] = cbm_strndup(start, end - start);
-                vals[count] = target->qualified_name;
-                count++;
+                /* free_import_map releases every key through the memory core,
+                 * so this key comes from it too, like the fast path's. */
+                size_t len = (size_t)(end - start);
+                char *key = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, len + SKIP_ONE);
+                if (key) {
+                    memcpy(key, start, len);
+                    key[len] = '\0';
+                    keys[count] = key;
+                    vals[count] = target->qualified_name;
+                    count++;
+                }
             }
         }
     }
@@ -694,12 +702,13 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
         }
         return NULL;
     }
+    CBMIncludeScope include_scope = cbm_pipeline_include_scope(ctx);
     CBMFileResult *r =
         cbm_pipeline_test_force_extract_null(ctx, fi->language)
             ? NULL
             : cbm_extract_file_ex_with_tests(source, source_len, fi->language, ctx->project_name,
                                              fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, NULL,
-                                             NULL, ctx->test_declarations);
+                                             NULL, ctx->test_declarations, &include_scope);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, source);
     (void)cbm_pipeline_test_extraction_ok(ctx, fi->language, r);
     if (r) {
