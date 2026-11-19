@@ -1783,6 +1783,15 @@ static int toml_block_has_prior_table(const char *block, size_t block_len, size_
     return TOML_EDIT_OK;
 }
 
+/* Codex writes an approval for each tool as [<entry>.tools.<tool>] under the
+ * server table it rewrote (#2873). Those sub-tables belong to the entry, so
+ * they neither conflict with nor disqualify the entry's own table. */
+static int toml_is_tool_approval_table(const toml_key_path_t *path,
+                                       const toml_key_path_t *desired) {
+    return path->count == desired->count + 2U &&
+           strcmp(toml_key_path_segment(path, desired->count), "tools") == 0;
+}
+
 static int toml_existing_conflicts_with_table(const char *existing, size_t existing_len,
                                               size_t exclude_start, size_t exclude_end,
                                               const toml_key_path_t *desired) {
@@ -1801,7 +1810,8 @@ static int toml_existing_conflicts_with_table(const char *existing, size_t exist
                 return TOML_EDIT_ERR;
             }
             if (header.present) {
-                int conflict = !excluded && toml_key_path_has_prefix(&header.path, desired);
+                int conflict = !excluded && toml_key_path_has_prefix(&header.path, desired) &&
+                               !toml_is_tool_approval_table(&header.path, desired);
                 toml_key_path_dispose(&scope);
                 scope = header.path;
                 memset(&header.path, 0, sizeof(header.path));
@@ -1825,8 +1835,9 @@ static int toml_existing_conflicts_with_table(const char *existing, size_t exist
                         toml_key_path_dispose(&scope);
                         return TOML_EDIT_ERR;
                     }
-                    int conflict = toml_key_path_has_prefix(&full_key, desired) ||
-                                   toml_key_path_has_prefix(desired, &full_key);
+                    int conflict = !toml_is_tool_approval_table(&scope, desired) &&
+                                   (toml_key_path_has_prefix(&full_key, desired) ||
+                                    toml_key_path_has_prefix(desired, &full_key));
                     toml_key_path_dispose(&full_key);
                     toml_assignment_dispose(&assignment);
                     if (conflict) {
@@ -3125,7 +3136,8 @@ static int toml_strip_legacy_table(const char *existing, size_t existing_len,
                     memset(&shape, 0, sizeof(shape));
                     edit_start = header.edit_start;
                 } else if (target_active) {
-                    if (descendant || !toml_legacy_schema_is_owned(&shape)) {
+                    if (!toml_legacy_schema_is_owned(&shape) ||
+                        (descendant && !toml_is_tool_approval_table(&header.path, desired))) {
                         target_foreign = 1;
                     }
                     edit_end = header.edit_start;
