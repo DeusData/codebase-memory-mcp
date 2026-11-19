@@ -14,7 +14,8 @@
 #include "cbm.h"
 #include <string.h>
 #if !defined(_WIN32)
-#include <signal.h>
+#include <errno.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -107,46 +108,56 @@ TEST(repro_issue554_cpp_out_of_line_method_class_qualified) {
  * consuming, another livelock class.
  *
  * Expected: extraction RETURNS (the hang itself is the failure mode; the
- * fork+deadline harness below turns a regression back into a RED test instead
- * of a hung CI job), and the canonical valid-program fixture still extracts
- * PROGRAM-ID. Actual (buggy): never returns; last worker-log line
+ * fork + CPU-time-cap harness below turns a regression back into a RED test
+ * instead of a hung CI job), and the canonical valid-program fixture still
+ * extracts PROGRAM-ID. Actual (buggy): never returns; last worker-log line
  * "pass.start pass=definitions".
  * ─────────────────────────────────────────────────────────────────── */
 #if !defined(_WIN32)
-/* Parse src in a forked child under a wall-clock deadline.
- * Returns the child's exit code (0 = extraction returned), -1 on timeout
- * (child killed; i.e. the livelock reproduced), -2 on fork failure. */
-static int repro2998_parse_with_deadline(const char *src, CBMLanguage lang, const char *path) {
+/* CPU seconds the child may spend. Parsing these few bytes costs microseconds
+ * even under sanitizers; the livelock spends CPU without bound. */
+enum { REPRO2998_CPU_SECONDS = 5 };
+
+/* Parse src in a forked child whose CPU time is capped (RLIMIT_CPU), and wait
+ * for it with one blocking waitpid. A livelock burns CPU and is stopped by
+ * SIGXCPU; a busy host only delays the child without spending its CPU time, so
+ * the verdict does not depend on wall-clock time and nothing polls or sleeps.
+ * Returns the child's exit code (0 = extraction returned), 128 + the signal
+ * that stopped it (SIGXCPU/SIGKILL = the livelock reproduced), -2 on fork
+ * failure, -3 if the child could not be waited for. */
+static int repro2998_parse_cpu_capped(const char *src, CBMLanguage lang, const char *path) {
     fflush(NULL);
     pid_t pid = fork();
     if (pid < 0)
         return -2;
     if (pid == 0) {
+        struct rlimit no_core = {0, 0};
+        struct rlimit cpu = {REPRO2998_CPU_SECONDS, REPRO2998_CPU_SECONDS + 1};
+        (void)setrlimit(RLIMIT_CORE, &no_core);
+        (void)setrlimit(RLIMIT_CPU, &cpu);
         CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), lang, "t", path, 0, NULL, NULL);
         if (r)
             cbm_free_result(r);
         _exit(0); /* reaching _exit at all is what the bug took away */
     }
     int status = 0;
-    for (int i = 0; i < 1000; i++) { /* 10 s in 10 ms steps */
-        pid_t got = waitpid(pid, &status, WNOHANG);
-        if (got == pid)
-            return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
-        usleep(10 * 1000);
-    }
-    kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
-    return -1;
+    pid_t got;
+    do {
+        got = waitpid(pid, &status, 0);
+    } while (got < 0 && errno == EINTR);
+    if (got != pid)
+        return -3;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
 TEST(repro_issue2998_cobol_scanner_eof_livelock) {
     /* EOF lands inside the LINE_PREFIX_COMMENT column scan: shorter than
      * column 6, or a trailing newline leaving the lexer at column 0 of the
      * virtual empty last line. */
-    ASSERT_EQ(repro2998_parse_with_deadline("X", CBM_LANG_COBOL, "m.cob"), 0);
-    ASSERT_EQ(repro2998_parse_with_deadline("*<<", CBM_LANG_COBOL, "m.cob"), 0);
-    ASSERT_EQ(repro2998_parse_with_deadline("X\n", CBM_LANG_COBOL, "m.cob"), 0);
-    ASSERT_EQ(repro2998_parse_with_deadline("display 1.\n", CBM_LANG_COBOL, "m.cob"), 0);
+    ASSERT_EQ(repro2998_parse_cpu_capped("X", CBM_LANG_COBOL, "m.cob"), 0);
+    ASSERT_EQ(repro2998_parse_cpu_capped("*<<", CBM_LANG_COBOL, "m.cob"), 0);
+    ASSERT_EQ(repro2998_parse_cpu_capped("X\n", CBM_LANG_COBOL, "m.cob"), 0);
+    ASSERT_EQ(repro2998_parse_cpu_capped("display 1.\n", CBM_LANG_COBOL, "m.cob"), 0);
     PASS();
 }
 
