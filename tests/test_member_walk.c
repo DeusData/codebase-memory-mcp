@@ -881,6 +881,81 @@ static void mwl_type(CBMTypeRegistry *reg, const char *qn, bool iface, const CBM
  * before the hit (the node's own unknown interface) makes it possible, one
  * after it (the parent's) leaves it proven. Asked twice and from both ends,
  * the kept answers agree. */
+/* path_local: the engine's predicate ANDed over the `use` path of a mixin
+ * hit, from via_qn (the holder) down to the type whose group holds the owner;
+ * the owner itself is not asked, nor a class that reaches the holder through
+ * its chain. H1 -> T1 -> Ow with T1 not local: false; H2 -> T2 -> Ow, both
+ * local: true; depth 1 asks the holder only (H3 true, H4 false); K extends
+ * H2: true (K is not on the path). A member a non-leaf trait declares itself
+ * (review 4, F-A: the path below its owner is empty): T5 { use U5; m5 } used
+ * by H5, depth 1: true; T7 { use U5; m7 } under H6 -> T6 (local): true, under
+ * H7 -> T8 (not local): false. Without a predicate: false. The kept answer of
+ * T2 is reused by H2 and K alike, T7's by H6 and H7. */
+static bool mwt_local(void *ctx, const char *qn) {
+    for (const char *const *p = (const char *const *)ctx; *p; p++) {
+        if (strcmp(*p, qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(member_walk_path_local_over_the_use_path) {
+    static const mwt_type_t types[] = {
+        {"H1", "O:H1 G:1 S:T1 !"}, {"T1", "O:T1 G:1 S:Ow !"}, {"H2", "O:H2 G:1 S:T2 !"},
+        {"T2", "O:T2 G:1 S:Ow !"}, {"H3", "O:H3 G:1 S:Ow !"}, {"H4", "O:H4 G:1 S:Ow !"},
+        {"K", "O:K N:H2"},         {"Ow", "O:Ow !"},          {"H5", "O:H5 G:1 S:T5 !"},
+        {"T5", "O:T5 G:1 S:U5 !"}, {"U5", "O:U5 !"},          {"H6", "O:H6 G:1 S:T6 !"},
+        {"T6", "O:T6 G:1 S:T7 !"}, {"T7", "O:T7 G:1 S:U5 !"}, {"H7", "O:H7 G:1 S:T8 !"},
+        {"T8", "O:T8 G:1 S:T7 !"},
+    };
+    static const char *const here[] = {"H1", "H2", "T2", "H3", "K", "H5", "H6", "T6", "H7", NULL};
+    mwt_fixture_t f;
+    mwt_open(&f, types, 16);
+    mwt_add_method(&f.reg, "Ow", "m");
+    mwt_add_method(&f.reg, "T5", "m5");
+    mwt_add_method(&f.reg, "T7", "m7");
+    cbm_registry_finalize(&f.reg);
+    f.walker.local = mwt_local;
+    f.walker.local_ctx = (void *)here;
+    CBMMemberHit h;
+    ASSERT_EQ(mwt_find(&f, "H1", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_EQ(h.place, CBM_MW_PLACE_MIXIN);
+    ASSERT_EQ(h.mixin_depth, 2);
+    ASSERT_STR_EQ(h.via_qn, "H1");
+    ASSERT_FALSE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "H2", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_EQ(h.mixin_depth, 2);
+    ASSERT_TRUE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "H3", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_EQ(h.mixin_depth, 1);
+    ASSERT_TRUE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "H4", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_FALSE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "K", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_STR_EQ(h.via_qn, "H2");
+    ASSERT_TRUE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "H5", "m5", NULL, &h), CBM_MW_FOUND);
+    ASSERT_STR_EQ(h.owner_qn, "T5");
+    ASSERT_EQ(h.mixin_depth, 1);
+    ASSERT_TRUE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "H6", "m7", NULL, &h), CBM_MW_FOUND);
+    ASSERT_STR_EQ(h.owner_qn, "T7");
+    ASSERT_EQ(h.mixin_depth, 2);
+    ASSERT_TRUE(h.path_local);
+    ASSERT_EQ(mwt_find(&f, "H7", "m7", NULL, &h), CBM_MW_FOUND);
+    ASSERT_EQ(h.mixin_depth, 2);
+    ASSERT_FALSE(h.path_local);
+    mwt_close(&f);
+    mwt_open(&f, types, 16);
+    mwt_add_method(&f.reg, "Ow", "m");
+    cbm_registry_finalize(&f.reg);
+    ASSERT_EQ(mwt_find(&f, "H2", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_FALSE(h.path_local); /* no predicate */
+    mwt_close(&f);
+    PASS();
+}
+
 TEST(member_walk_later_composes_in_bfs_order) {
     static const mwt_type_t types[] = {
         {"X", "O:X L:Ia N:P"}, {"P", "O:P L:Ic !"},   {"Ia", "O:Ia L:Ib !"}, {"Ib", "O:Ib !"},
@@ -1398,6 +1473,7 @@ SUITE(member_walk) {
     RUN_TEST(member_walk_memo_keeps_softness);
     RUN_TEST(member_walk_later_cycle_abstains);
     RUN_TEST(member_walk_later_composes_in_bfs_order);
+    RUN_TEST(member_walk_path_local_over_the_use_path);
     RUN_TEST(member_walk_prepare_only_own_types);
     RUN_TEST(member_walk_lin_own_traits_parent);
     RUN_TEST(member_walk_depth_needs_no_stack);

@@ -124,6 +124,12 @@
  *     engine that shares orders across threads.
  *   - Arity and argument-type selection of overloads is the engine's, after
  *     COLLECT: the Java / Kotlin / C# slices add selectors with their reader.
+ *   - path_local counts a depth-0 hit inside a mixin's whole answer as the
+ *     mixin's own member (an empty path below it). That is exact for PHP,
+ *     whose traits have no parent and no interface steps. Where a mixin has
+ *     ancestors of its own, such a hit can be an ancestor's member, and the
+ *     exact test is the hit's owner against the mixin itself: the Ruby and
+ *     Scala slices (modules and traits with supertypes).
  *   - Sequential SUB steps that are not grouped (Ruby includes) cost one pass
  *     of the order per SUB step not yet answered (quadratic in the number of
  *     such steps of one order, once per name): the Ruby slice.
@@ -287,10 +293,21 @@ typedef struct {
                                       interface, 1 a direct mixin, 2+ a mixin's mixin
                                       (capped at 255) */
     bool renamed;                  /* found under an alias (a rename of a group's holder) */
+    bool path_local;               /* MIXIN: every type on the `use` path, from via_qn down
+                                      to the one whose group holds the owner, satisfies the
+                                      walker's `local` predicate (the owner itself is not
+                                      asked); false without a predicate */
 } CBMMemberHit;
+
+/* Which types the engine counts as its own for path_local (PHP: declared in
+ * the file being resolved). Set before the first lookup and fixed for the
+ * walker's life: the answers it keeps carry the flag. */
+typedef bool (*CBMMemberLocal)(void *ctx, const char *type_qn);
 
 typedef struct {
     uint64_t work; /* steps read, orders built, index entries made: the counted growth unit */
+    CBMMemberLocal local; /* optional, see CBMMemberLocal */
+    void *local_ctx;
     CBMMemberOrders *orders;
     void *state; /* answers kept across lookups, the frame stack, indexes (member_walk.c) */
     /* COLLECT / HIDE_BY_SIGNATURE: every hit of the last lookup. */

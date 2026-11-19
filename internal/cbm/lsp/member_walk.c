@@ -670,6 +670,12 @@ static bool mw_soft(const mw_walk_t *k, uint8_t flags) {
     return (flags & CBM_MW_SOFT) != 0 && !k->s->soft_off;
 }
 
+/* The engine's `local` predicate on the type whose group a mixin hit came
+ * through (path_local); false without one. */
+static bool mw_local(const mw_walk_t *k, const char *via) {
+    return k->w->local && via && k->w->local(k->w->local_ctx, via);
+}
+
 static bool mw_order(mw_walk_t *k, const char *type, int side, const CBMMemberStep **steps,
                      int *count) {
     return k->w->orders && cbm_member_orders_get(k->w->orders, type, side, steps, count);
@@ -800,8 +806,12 @@ static bool mw_requirement(const CBMMemberHit *h) {
 }
 
 /* Take a WHOLE node's answer at a mixin place of this order: the hit's place
- * and via become this order's, one mixin level deeper. *soft gets whether
- * the sub-order passed a SOFT place (before its hit, or anywhere). */
+ * and via become this order's, one mixin level deeper, and the path stays
+ * local only if `via` (this level's user) is. A hit at mixin depth 0 there
+ * is the mixin's own member: the path below its owner is empty, so `via`
+ * alone decides (a trait that uses traits and declares the member itself).
+ * *soft gets whether the sub-order passed a SOFT place (before its hit, or
+ * anywhere). */
 static uint8_t mw_take(mw_walk_t *k, const mw_ans_t *a, uint8_t place, const char *via,
                        bool complete, bool renamed, CBMMemberHit *out, bool *soft, bool *open) {
     *soft = a->soft;
@@ -809,6 +819,7 @@ static uint8_t mw_take(mw_walk_t *k, const mw_ans_t *a, uint8_t place, const cha
     if (a->result == MW_UNKNOWN) {
         return MW_UNKNOWN;
     }
+    const bool here = mw_local(k, via);
     if (k->collect) {
         for (int i = 0; i < a->hit_count; i++) {
             CBMMemberHit h = a->hits[i];
@@ -817,6 +828,7 @@ static uint8_t mw_take(mw_walk_t *k, const mw_ans_t *a, uint8_t place, const cha
             h.mixin_depth =
                 h.mixin_depth < MW_DEPTH_MAX ? (uint8_t)(h.mixin_depth + 1) : h.mixin_depth;
             h.renamed = h.renamed || renamed;
+            h.path_local = here && (a->hits[i].mixin_depth == 0 || a->hits[i].path_local);
             h.prefix_complete = complete && h.prefix_complete;
             if (!mw_collect(k, &h)) {
                 k->failed = true;
@@ -834,6 +846,7 @@ static uint8_t mw_take(mw_walk_t *k, const mw_ans_t *a, uint8_t place, const cha
     out->mixin_depth =
         out->mixin_depth < MW_DEPTH_MAX ? (uint8_t)(out->mixin_depth + 1) : out->mixin_depth;
     out->renamed = out->renamed || renamed;
+    out->path_local = here && (a->hit.mixin_depth == 0 || a->hit.path_local);
     out->prefix_complete = complete && a->hit.prefix_complete;
     return MW_HIT;
 }
@@ -1097,6 +1110,7 @@ static uint8_t mw_member(mw_walk_t *k, const CBMMemberStep *m, const char *name,
         if (r == MW_HIT) {
             out->mixin_depth = m->kind == CBM_MW_SUB ? 1 : 0;
             out->renamed = renamed;
+            out->path_local = mw_local(k, via); /* the owner's own user */
         }
         return r;
     }
