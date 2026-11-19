@@ -14,6 +14,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/mem_core.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,8 +23,8 @@
 
 static const cbm_closure_lang_t SC_ROWS[] = {
     /* Protobuf: an import is needed even inside one package; `import public`
-     * passes the imported file's names on; a qualified type name is read
-     * from the referring file's package outward. */
+     * passes the imported file's names on; a type reference is read against
+     * full names from the scopes around it (protoc's scope walk). */
     {.lang = CBM_LANG_PROTOBUF, .qualified_refs = true},
 };
 
@@ -55,19 +56,12 @@ typedef struct {
 typedef struct {
     const char *rel;
     const cbm_closure_lang_t *row;
-    const char *package; /* "" when none */
+    const char *package; /* "" when none, NULL when unknown */
     sc_ivec_t includes;  /* target file per include (-1: none) */
     sc_ivec_t reexports; /* parallel: 1 for a re-exporting include */
     bool opaque;
     int comp;
 } sc_file_t;
-
-/* What a component exports of one name: up to two distinct definitions and
- * whether one of them is conditional (enough to tell none, one, several). */
-typedef struct {
-    int def[2];
-    int n;
-} sc_sum_t;
 
 typedef struct {
     sc_ivec_t files;
@@ -89,8 +83,20 @@ struct cbm_closure {
     int ncomps;
     CBMHashTable *by_name;  /* name -> sc_ivec_t* of def indexes */
     CBMHashTable *packages; /* package -> sc_ivec_t* of file indexes (rows with package_visible) */
-    CBMHashTable *reach;    /* name -> CBMHashTable* (comp+1 as key text -> sc_sum_t*) */
+    CBMHashTable *by_rel;   /* rel -> file index + 1 */
     bool sealed;
+    uint64_t work;
+};
+
+/* One thread's memo: per name, the definitions each component exports. */
+struct cbm_closure_memo {
+    const cbm_closure_t *owner; /* the closure the memo was filled from */
+    CBMArena arena;
+    CBMHashTable *reach; /* name -> CBMHashTable* (component as key text -> sc_ivec_t* of defs) */
+    uint32_t *stamp;     /* per component: the search that reached it last */
+    uint32_t epoch;      /* the current search */
+    int *queue;          /* per component: the backward search's queue */
+    int ncomps;
     uint64_t work;
 };
 
@@ -134,33 +140,26 @@ cbm_closure_t *cbm_closure_new(void) {
     cbm_arena_init(&s->arena);
     s->by_name = cbm_ht_create(CBM_SZ_256);
     s->packages = cbm_ht_create(CBM_SZ_16);
-    s->reach = cbm_ht_create(CBM_SZ_256);
-    if (!s->by_name || !s->packages || !s->reach) {
+    s->by_rel = cbm_ht_create(CBM_SZ_256);
+    if (!s->by_name || !s->packages || !s->by_rel) {
         cbm_closure_free(s);
         return NULL;
     }
     return s;
 }
 
-static void sc_free_reach(const char *key, void *val, void *ud) {
-    (void)key;
-    (void)ud;
-    cbm_ht_free((CBMHashTable *)val);
-}
-
 void cbm_closure_free(cbm_closure_t *s) {
     if (!s) {
         return;
-    }
-    if (s->reach) {
-        cbm_ht_foreach(s->reach, sc_free_reach, NULL);
-        cbm_ht_free(s->reach);
     }
     if (s->by_name) {
         cbm_ht_free(s->by_name);
     }
     if (s->packages) {
         cbm_ht_free(s->packages);
+    }
+    if (s->by_rel) {
+        cbm_ht_free(s->by_rel);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, s->files);
     cbm_free(CBM_MEM_CLASS_OTHER, s->defs);
@@ -171,6 +170,14 @@ void cbm_closure_free(cbm_closure_t *s) {
 
 uint64_t cbm_closure_work(const cbm_closure_t *s) {
     return s ? s->work : 0;
+}
+
+int cbm_closure_file_count(const cbm_closure_t *s) {
+    return s ? s->nfiles : 0;
+}
+
+int cbm_closure_def_count(const cbm_closure_t *s) {
+    return s ? s->ndefs : 0;
 }
 
 /* Grow a heap array of `size`-byte elements to hold one more. */
@@ -194,7 +201,7 @@ static bool sc_grow(void **arr, int n, int *cap, size_t size) {
 
 int cbm_closure_add_file(cbm_closure_t *s, const char *rel, const cbm_closure_lang_t *row,
                          const char *package) {
-    if (!s || s->sealed || !rel || !row ||
+    if (!s || s->sealed || !rel || !row || cbm_ht_get(s->by_rel, rel) ||
         !sc_grow((void **)&s->files, s->nfiles, &s->cap_files, sizeof(*s->files))) {
         return CBM_NOT_FOUND;
     }
@@ -202,18 +209,27 @@ int cbm_closure_add_file(cbm_closure_t *s, const char *rel, const cbm_closure_la
     memset(f, 0, sizeof(*f));
     f->rel = cbm_arena_strdup(&s->arena, rel);
     f->row = row;
-    f->package = cbm_arena_strdup(&s->arena, package ? package : "");
+    f->package = package ? cbm_arena_strdup(&s->arena, package) : NULL;
     f->comp = -1;
-    if (!f->rel || !f->package) {
+    if (!f->rel || (package && !f->package)) {
         return CBM_NOT_FOUND;
     }
-    if (row->package_visible && f->package[0]) {
+    if (row->package_visible && f->package && f->package[0]) {
         sc_ivec_t *mates = sc_slot(&s->arena, s->packages, f->package);
         if (!mates || !sc_push(&s->arena, mates, s->nfiles)) {
             return CBM_NOT_FOUND;
         }
     }
+    cbm_ht_set(s->by_rel, f->rel, (void *)(intptr_t)(s->nfiles + SKIP_ONE));
     return s->nfiles++;
+}
+
+int cbm_closure_file(const cbm_closure_t *s, const char *rel) {
+    if (!s || !rel) {
+        return CBM_NOT_FOUND;
+    }
+    intptr_t v = (intptr_t)cbm_ht_get(s->by_rel, rel);
+    return v > 0 ? (int)(v - SKIP_ONE) : CBM_NOT_FOUND;
 }
 
 bool cbm_closure_add_def(cbm_closure_t *s, int file, const char *name, const char *full,
@@ -233,6 +249,7 @@ bool cbm_closure_add_def(cbm_closure_t *s, int file, const char *name, const cha
         return false;
     }
     s->ndefs++;
+    s->work++;
     return true;
 }
 
@@ -241,6 +258,7 @@ bool cbm_closure_add_include(cbm_closure_t *s, int file, int target, bool reexpo
         return false;
     }
     sc_file_t *f = &s->files[file];
+    s->work++;
     return sc_push(&s->arena, &f->includes, target < 0 ? CBM_NOT_FOUND : target) &&
            sc_push(&s->arena, &f->reexports, reexport ? SKIP_ONE : 0);
 }
@@ -426,170 +444,253 @@ int cbm_closure_seal(cbm_closure_t *s) {
     return ok ? 0 : CBM_NOT_FOUND;
 }
 
-/* ── Lookup ──────────────────────────────────────────────────────────── */
+/* ── The memo ────────────────────────────────────────────────────────── */
 
-static void sc_sum_add(sc_sum_t *sum, int def) {
-    for (int i = 0; i < sum->n && i < PAIR_LEN; i++) {
-        if (sum->def[i] == def) {
-            return;
+cbm_closure_memo_t *cbm_closure_memo_new(void) {
+    cbm_closure_memo_t *m = cbm_alloc(CBM_MEM_CLASS_OTHER, sizeof(*m));
+    if (!m) {
+        return NULL;
+    }
+    memset(m, 0, sizeof(*m));
+    cbm_arena_init(&m->arena);
+    return m;
+}
+
+static void sc_free_reach(const char *key, void *val, void *ud) {
+    (void)key;
+    (void)ud;
+    cbm_ht_free((CBMHashTable *)val);
+}
+
+/* Forget everything (another closure, or the memo's first use). */
+static void sc_memo_clear(cbm_closure_memo_t *m) {
+    if (m->reach) {
+        cbm_ht_foreach(m->reach, sc_free_reach, NULL);
+        cbm_ht_free(m->reach);
+        m->reach = NULL;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, m->stamp);
+    cbm_free(CBM_MEM_CLASS_OTHER, m->queue);
+    m->stamp = NULL;
+    m->queue = NULL;
+    m->ncomps = 0;
+    m->owner = NULL;
+    cbm_arena_destroy(&m->arena);
+    cbm_arena_init(&m->arena);
+}
+
+void cbm_closure_memo_free(cbm_closure_memo_t *m) {
+    if (!m) {
+        return;
+    }
+    sc_memo_clear(m);
+    cbm_arena_destroy(&m->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, m);
+}
+
+uint64_t cbm_closure_memo_work(const cbm_closure_memo_t *m) {
+    return m ? m->work : 0;
+}
+
+/* Bind the memo to `s`: emptied when it was filled from another closure. */
+static bool sc_memo_bind(cbm_closure_memo_t *m, const cbm_closure_t *s) {
+    if (m->owner == s && m->reach) {
+        return true;
+    }
+    uint64_t work = m->work;
+    sc_memo_clear(m);
+    m->work = work;
+    size_t n = (size_t)(s->ncomps ? s->ncomps : 1);
+    m->reach = cbm_ht_create(CBM_SZ_256);
+    m->stamp = cbm_alloc(CBM_MEM_CLASS_OTHER, n * sizeof(*m->stamp));
+    m->queue = cbm_alloc(CBM_MEM_CLASS_OTHER, n * sizeof(int));
+    if (!m->reach || !m->stamp || !m->queue) {
+        sc_memo_clear(m);
+        return false;
+    }
+    memset(m->stamp, 0, n * sizeof(*m->stamp));
+    m->epoch = 0;
+    m->ncomps = s->ncomps;
+    m->owner = s;
+    return true;
+}
+
+/* A mark no component carries yet: one per backward search. */
+static uint32_t sc_memo_epoch(cbm_closure_memo_t *m) {
+    if (m->epoch == UINT32_MAX) {
+        memset(m->stamp, 0, (size_t)(m->ncomps ? m->ncomps : 1) * sizeof(*m->stamp));
+        m->epoch = 0;
+    }
+    return ++m->epoch;
+}
+
+/* The reach of a name: for each component that exports a definition named
+ * `name`, the definitions it exports. Built once per memo, by a backward
+ * search from each defining file's component along re-export edges (each
+ * component once per definition). */
+static CBMHashTable *sc_reach(const cbm_closure_t *s, cbm_closure_memo_t *m, const char *name,
+                              const sc_ivec_t *named) {
+    CBMHashTable *reach = cbm_ht_get(m->reach, name);
+    if (reach) {
+        return reach;
+    }
+    reach = cbm_ht_create(CBM_SZ_16);
+    const char *key = cbm_arena_strdup(&m->arena, name);
+    if (!reach || !key) {
+        if (reach) {
+            cbm_ht_free(reach);
+        }
+        return NULL;
+    }
+    /* kept only once whole: a failed build leaves the memo as it was */
+    bool ok = true;
+    for (int k = 0; ok && named && k < named->n; k++) {
+        int d = named->v[k];
+        int head = 0;
+        int tail = 0;
+        int start = s->files[s->defs[d].file].comp;
+        uint32_t mark = sc_memo_epoch(m);
+        m->queue[tail++] = start;
+        m->stamp[start] = mark;
+        while (ok && head < tail) {
+            int c = m->queue[head++];
+            m->work++;
+            char ck[CBM_SZ_16];
+            snprintf(ck, sizeof(ck), "%d", c);
+            sc_ivec_t *defs = cbm_ht_get(reach, ck);
+            if (!defs) {
+                defs = cbm_arena_alloc(&m->arena, sizeof(*defs));
+                const char *ckey = cbm_arena_strdup(&m->arena, ck);
+                ok = defs && ckey;
+                if (ok) {
+                    memset(defs, 0, sizeof(*defs));
+                    cbm_ht_set(reach, ckey, defs);
+                }
+            }
+            ok = ok && sc_push(&m->arena, defs, d);
+            const sc_comp_t *comp = &s->comps[c];
+            for (int i = 0; ok && i < comp->pred.n; i++) {
+                int p = comp->pred.v[i];
+                if (m->stamp[p] != mark) {
+                    m->stamp[p] = mark;
+                    m->queue[tail++] = p;
+                }
+            }
         }
     }
-    if (sum->n < PAIR_LEN) {
-        sum->def[sum->n] = def;
+    if (!ok) {
+        cbm_ht_free(reach);
+        return NULL;
     }
-    if (sum->n <= PAIR_LEN) {
-        sum->n++; /* n == 3 means "more than two"; the verdict needs no more */
-    }
+    cbm_ht_set(m->reach, key, reach);
+    return reach;
 }
 
-static void sc_sum_merge(sc_sum_t *into, const sc_sum_t *from) {
-    for (int i = 0; i < from->n && i < PAIR_LEN; i++) {
-        sc_sum_add(into, from->def[i]);
-    }
-    if (from->n > PAIR_LEN) {
-        into->n = PAIR_LEN + SKIP_ONE;
-    }
+/* What a component exports of the name: its list, else nothing. */
+static const sc_ivec_t *sc_exports(CBMHashTable *reach, int comp) {
+    char ck[CBM_SZ_16];
+    snprintf(ck, sizeof(ck), "%d", comp);
+    return reach ? cbm_ht_get(reach, ck) : NULL;
 }
 
-/* Whether a definition answers the reference, by name and (for a row with
- * qualified references) by its full name read from `package` outward. */
+/* ── Lookup ──────────────────────────────────────────────────────────── */
+
+/* Whether a definition may be what the reference names. By name always; for
+ * a row with qualified references also by full name (scope_closure.h,
+ * cbm_closure_ref_t): never false for a definition the reference could name
+ * from some site of the file, so one candidate left is the one. */
 static bool sc_def_matches(const sc_def_t *d, const cbm_closure_ref_t *ref, const char *package,
                            bool qualified) {
     if (strcmp(d->name, ref->name) != 0) {
         return false;
     }
-    if (!qualified || !ref->qual || !ref->qual[0]) {
-        return true; /* a bare name: by its last segment */
+    if (!qualified || !d->full) {
+        return true;
     }
-    if (!d->full) {
+    const char *r = ref->written ? ref->written : ref->name;
+    if (r[0] == '.') {
+        return strcmp(d->full, r + SKIP_ONE) == 0;
+    }
+    size_t fl = strlen(d->full);
+    size_t rl = strlen(r);
+    if (fl == rl) {
+        return strcmp(d->full, r) == 0; /* the root scope */
+    }
+    if (fl < rl + SKIP_ONE || d->full[fl - rl - SKIP_ONE] != '.' ||
+        strcmp(d->full + fl - rl, r) != 0) {
         return false;
     }
-    char want[CBM_SZ_1K];
-    if (ref->qual[0] == '.') {
-        int n = snprintf(want, sizeof(want), "%s.%s", ref->qual + SKIP_ONE, ref->name);
-        return n > 0 && (size_t)n < sizeof(want) && strcmp(d->full, want) == 0;
+    size_t pl = fl - rl - SKIP_ONE; /* full = P "." r: is P a scope around the site? */
+    if (!package || !package[0]) {
+        return true; /* no package (or unknown): any message scope may be */
     }
-    /* "a.b" in package "p.q": p.q.a.b, p.a.b, a.b */
-    size_t plen = strlen(package);
-    for (;;) {
-        int n = plen ? snprintf(want, sizeof(want), "%.*s.%s.%s", (int)plen, package, ref->qual,
-                                ref->name)
-                     : snprintf(want, sizeof(want), "%s.%s", ref->qual, ref->name);
-        if (n > 0 && (size_t)n < sizeof(want) && strcmp(d->full, want) == 0) {
-            return true;
-        }
-        if (plen == 0) {
-            return false;
-        }
-        while (plen > 0 && package[plen - SKIP_ONE] != '.') {
-            plen--;
-        }
-        if (plen > 0) {
-            plen--;
-        }
+    size_t kl = strlen(package);
+    if (pl <= kl && strncmp(package, d->full, pl) == 0 &&
+        (package[pl] == '\0' || package[pl] == '.')) {
+        return true; /* the package, or a package around it */
     }
+    return pl > kl && strncmp(d->full, package, kl) == 0 && d->full[kl] == '.'; /* inside it */
 }
 
-/* The reach memo of a name: for each component that exports a definition
- * named `name`, what it exports. Built once, by a backward search from the
- * components of the defining files along re-export edges. */
-static CBMHashTable *sc_reach(cbm_closure_t *s, const char *name, const sc_ivec_t *named) {
-    CBMHashTable *memo = cbm_ht_get(s->reach, name);
-    if (memo) {
-        return memo;
-    }
-    memo = cbm_ht_create(CBM_SZ_16);
-    const char *key = cbm_arena_strdup(&s->arena, name);
-    if (!memo || !key) {
-        if (memo) {
-            cbm_ht_free(memo);
-        }
-        return NULL;
-    }
-    cbm_ht_set(s->reach, key, memo);
-    for (int k = 0; named && k < named->n; k++) {
-        int d = named->v[k];
-        /* every component this definition reaches, each once per definition */
-        sc_ivec_t queue = {0};
-        CBMHashTable *seen = cbm_ht_create(CBM_SZ_16);
-        if (!seen || !sc_push(&s->arena, &queue, s->files[s->defs[d].file].comp)) {
-            if (seen) {
-                cbm_ht_free(seen);
-            }
-            return NULL;
-        }
-        for (int q = 0; q < queue.n; q++) {
-            int c = queue.v[q];
-            char ck[CBM_SZ_16];
-            snprintf(ck, sizeof(ck), "%d", c);
-            s->work++;
-            if (cbm_ht_get(seen, ck)) {
-                continue;
-            }
-            const char *ckey = cbm_arena_strdup(&s->arena, ck);
-            sc_sum_t *sum = cbm_ht_get(memo, ck);
-            if (!sum && ckey) {
-                sum = cbm_arena_alloc(&s->arena, sizeof(*sum));
-                if (sum) {
-                    memset(sum, 0, sizeof(*sum));
-                    cbm_ht_set(memo, ckey, sum);
-                }
-            }
-            if (!sum || !ckey) {
-                cbm_ht_free(seen);
-                return NULL;
-            }
-            cbm_ht_set(seen, ckey, (void *)SKIP_ONE);
-            sc_sum_add(sum, d);
-            const sc_comp_t *comp = &s->comps[c];
-            for (int i = 0; i < comp->pred.n; i++) {
-                if (!sc_push(&s->arena, &queue, comp->pred.v[i])) {
-                    cbm_ht_free(seen);
-                    return NULL;
-                }
-            }
-        }
-        cbm_ht_free(seen);
-    }
-    return memo;
-}
+/* The visible candidates so far: the first, and whether another differs. */
+typedef struct {
+    int first;
+    bool several;
+    uint8_t via;
+} sc_acc_t;
 
-/* What a component exports of the name: the memo's summary, else nothing. */
-static const sc_sum_t *sc_exports(CBMHashTable *memo, int comp) {
-    char ck[CBM_SZ_16];
-    snprintf(ck, sizeof(ck), "%d", comp);
-    return memo ? cbm_ht_get(memo, ck) : NULL;
+static void sc_take(const cbm_closure_t *s, cbm_closure_memo_t *m, const sc_ivec_t *list,
+                    const cbm_closure_ref_t *ref, const sc_file_t *f, int file, uint8_t via,
+                    sc_acc_t *acc) {
+    for (int i = 0; list && i < list->n && !acc->several; i++) {
+        m->work++;
+        int d = list->v[i];
+        if (d == acc->first ||
+            !sc_def_matches(&s->defs[d], ref, f->package, f->row->qualified_refs)) {
+            continue;
+        }
+        if (acc->first < 0) {
+            acc->first = d;
+            acc->via = s->defs[d].file == file ? (uint8_t)CBM_CLOSURE_VIA_OWN : via;
+        } else {
+            acc->several = true;
+        }
+    }
 }
 
 /* The definitions a file sees of the name, and how the closure stands. */
-static void sc_visible(cbm_closure_t *s, int file, const cbm_closure_ref_t *ref, sc_sum_t *sum,
-                       uint8_t *via, uint32_t *why) {
+static void sc_visible(const cbm_closure_t *s, cbm_closure_memo_t *m, int file,
+                       const cbm_closure_ref_t *ref, sc_acc_t *acc, uint32_t *why) {
     const sc_file_t *f = &s->files[file];
     const sc_ivec_t *named = cbm_ht_get(s->by_name, ref->name);
-    CBMHashTable *memo = named ? sc_reach(s, ref->name, named) : NULL;
+    CBMHashTable *reach = named ? sc_reach(s, m, ref->name, named) : NULL;
+    if (named && !reach) {
+        *why |= CBM_CLOSURE_WHY_OPAQUE; /* out of memory: nothing is proven */
+    }
     if (f->opaque) {
         *why |= CBM_CLOSURE_WHY_OPAQUE;
     }
     if (f->row->prelude_external) {
         *why |= CBM_CLOSURE_WHY_PRELUDE;
     }
-    /* own definitions, then package mates */
-    for (int k = 0; named && k < named->n; k++) {
-        s->work++;
-        const sc_def_t *d = &s->defs[named->v[k]];
-        bool mate = f->row->package_visible && f->package[0] && d->file != file &&
-                    strcmp(s->files[d->file].package, f->package) == 0 &&
-                    s->files[d->file].row == f->row;
-        if ((d->file == file || mate) &&
-            sc_def_matches(d, ref, f->package, f->row->qualified_refs)) {
-            sc_sum_add(sum, named->v[k]);
-            *via = d->file == file ? CBM_CLOSURE_VIA_OWN : CBM_CLOSURE_VIA_PACKAGE;
+    /* the file's own component: its definitions, and those of the files it
+     * shares a re-export cycle with */
+    sc_take(s, m, sc_exports(reach, f->comp), ref, f, file, CBM_CLOSURE_VIA_INCLUDE, acc);
+    /* package mates (rows with package_visible): their own definitions */
+    if (f->row->package_visible && f->package && f->package[0]) {
+        for (int k = 0; named && k < named->n && !acc->several; k++) {
+            m->work++;
+            const sc_def_t *d = &s->defs[named->v[k]];
+            const sc_file_t *g = &s->files[d->file];
+            if (d->file != file && g->row == f->row && g->package &&
+                strcmp(g->package, f->package) == 0) {
+                sc_ivec_t one = {.v = &named->v[k], .n = SKIP_ONE, .cap = SKIP_ONE};
+                sc_take(s, m, &one, ref, f, file, CBM_CLOSURE_VIA_PACKAGE, acc);
+            }
         }
-    }
-    if (f->row->package_visible && f->package[0]) {
         const sc_ivec_t *mates = cbm_ht_get(s->packages, f->package);
         for (int i = 0; mates && i < mates->n; i++) {
-            s->work++;
+            m->work++;
             if (s->files[mates->v[i]].opaque) {
                 *why |= CBM_CLOSURE_WHY_OPAQUE;
             }
@@ -597,7 +698,7 @@ static void sc_visible(cbm_closure_t *s, int file, const cbm_closure_ref_t *ref,
     }
     /* what each include exports */
     for (int e = 0; e < f->includes.n; e++) {
-        s->work++;
+        m->work++;
         int t = f->includes.v[e];
         if (t < 0) {
             *why |= CBM_CLOSURE_WHY_UNRESOLVED;
@@ -607,53 +708,35 @@ static void sc_visible(cbm_closure_t *s, int file, const cbm_closure_ref_t *ref,
         if (!comp->export_complete) {
             *why |= comp->reexport_unresolved ? CBM_CLOSURE_WHY_UNRESOLVED : CBM_CLOSURE_WHY_OPAQUE;
         }
-        const sc_sum_t *ex = sc_exports(memo, s->files[t].comp);
-        if (!ex) {
-            continue;
-        }
-        sc_sum_t matched = {{0, 0}, 0};
-        for (int i = 0; i < ex->n && i < PAIR_LEN; i++) {
-            if (sc_def_matches(&s->defs[ex->def[i]], ref, f->package, f->row->qualified_refs)) {
-                sc_sum_add(&matched, ex->def[i]);
-            }
-        }
-        if (ex->n > PAIR_LEN) {
-            matched.n = PAIR_LEN + SKIP_ONE; /* more than the summary keeps: several */
-        }
-        if (matched.n > 0) {
-            sc_sum_merge(sum, &matched);
-            *via = CBM_CLOSURE_VIA_INCLUDE;
-        }
+        sc_take(s, m, sc_exports(reach, s->files[t].comp), ref, f, file, CBM_CLOSURE_VIA_INCLUDE,
+                acc);
     }
 }
 
-cbm_closure_answer_t cbm_closure_lookup(cbm_closure_t *s, int file, const cbm_closure_ref_t *ref) {
+static cbm_closure_answer_t sc_lookup(const cbm_closure_t *s, cbm_closure_memo_t *m, int file,
+                                      const cbm_closure_ref_t *ref) {
     cbm_closure_answer_t a = {.verdict = CBM_CLOSURE_NO_ANSWER, .file = -1};
-    if (!s || !s->sealed || file < 0 || file >= s->nfiles || !ref || !ref->name || !ref->name[0]) {
-        return a;
-    }
     if (ref->flags & CBM_CLOSURE_REF_LOCAL) {
         a.why = CBM_CLOSURE_WHY_LOCAL;
         return a;
     }
-    sc_sum_t sum = {{0, 0}, 0};
-    uint8_t via = 0;
+    sc_acc_t acc = {.first = -1, .several = false, .via = 0};
     uint32_t why = 0;
-    sc_visible(s, file, ref, &sum, &via, &why);
-    a.visible = sum.n > PAIR_LEN ? PAIR_LEN : sum.n;
+    sc_visible(s, m, file, ref, &acc, &why);
+    a.visible = acc.several ? PAIR_LEN : (acc.first >= 0 ? SKIP_ONE : 0);
     a.complete =
         (why & (CBM_CLOSURE_WHY_UNRESOLVED | CBM_CLOSURE_WHY_OPAQUE | CBM_CLOSURE_WHY_PRELUDE)) ==
         0;
-    if (sum.n == 0) {
+    if (acc.first < 0) {
         a.verdict = a.complete ? CBM_CLOSURE_PROVEN_ABSENT : CBM_CLOSURE_NO_ANSWER;
         a.why = why;
         return a;
     }
-    if (sum.n > SKIP_ONE) {
+    if (acc.several) {
         a.why = why | CBM_CLOSURE_WHY_AMBIGUOUS;
         return a;
     }
-    const sc_def_t *d = &s->defs[sum.def[0]];
+    const sc_def_t *d = &s->defs[acc.first];
     if (!d->qn) {
         a.why = why | CBM_CLOSURE_WHY_NO_NODE;
         return a;
@@ -662,8 +745,9 @@ cbm_closure_answer_t cbm_closure_lookup(cbm_closure_t *s, int file, const cbm_cl
         why |= CBM_CLOSURE_WHY_CONDITIONAL;
     }
     a.qn = d->qn;
+    a.full = d->full;
     a.file = d->file;
-    a.via = via;
+    a.via = acc.via;
     a.why = why;
     /* a row where a second visible definition would not compile: one found
      * past an unresolved source or a prelude is still the one (never past an
@@ -673,5 +757,22 @@ cbm_closure_answer_t cbm_closure_lookup(cbm_closure_t *s, int file, const cbm_cl
         unproven &= ~(uint32_t)(CBM_CLOSURE_WHY_UNRESOLVED | CBM_CLOSURE_WHY_PRELUDE);
     }
     a.verdict = unproven == 0 ? CBM_CLOSURE_PROVEN : CBM_CLOSURE_POSSIBLE;
+    return a;
+}
+
+cbm_closure_answer_t cbm_closure_lookup(const cbm_closure_t *s, cbm_closure_memo_t *memo, int file,
+                                        const cbm_closure_ref_t *ref) {
+    cbm_closure_answer_t none = {.verdict = CBM_CLOSURE_NO_ANSWER, .file = -1};
+    if (!s || !s->sealed || file < 0 || file >= s->nfiles || !ref || !ref->name || !ref->name[0]) {
+        return none;
+    }
+    cbm_closure_memo_t *own = memo ? NULL : cbm_closure_memo_new();
+    cbm_closure_memo_t *m = memo ? memo : own;
+    if (!m || !sc_memo_bind(m, s)) {
+        cbm_closure_memo_free(own);
+        return none;
+    }
+    cbm_closure_answer_t a = sc_lookup(s, m, file, ref);
+    cbm_closure_memo_free(own);
     return a;
 }

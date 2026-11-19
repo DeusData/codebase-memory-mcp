@@ -14,10 +14,18 @@ static const cbm_closure_lang_t ROW_PKG = {.lang = CBM_LANG_GO, .package_visible
 static const cbm_closure_lang_t ROW_PRELUDE = {.lang = CBM_LANG_SCALA, .prelude_external = true};
 static const cbm_closure_lang_t ROW_STRICT = {.lang = CBM_LANG_SCALA, .ambiguity_is_error = true};
 
-static cbm_closure_answer_t sc_ask(cbm_closure_t *s, int file, const char *name, const char *qual,
-                                   uint8_t flags) {
-    cbm_closure_ref_t ref = {.name = name, .qual = qual, .flags = flags};
-    return cbm_closure_lookup(s, file, &ref);
+/* `written`: the reference as written, NULL for the bare name. No memo: each
+ * answer computed afresh (sc_ask_memo shares one). */
+static cbm_closure_answer_t sc_ask(cbm_closure_t *s, int file, const char *name,
+                                   const char *written, uint8_t flags) {
+    cbm_closure_ref_t ref = {.name = name, .written = written, .flags = flags};
+    return cbm_closure_lookup(s, NULL, file, &ref);
+}
+
+static cbm_closure_answer_t sc_ask_memo(cbm_closure_t *s, cbm_closure_memo_t *m, int file,
+                                        const char *name, const char *written) {
+    cbm_closure_ref_t ref = {.name = name, .written = written};
+    return cbm_closure_lookup(s, m, file, &ref);
 }
 
 /* user includes lib, which defines T: the one T, proven */
@@ -126,7 +134,8 @@ TEST(scope_closure_ambiguous_conditional_and_nodeless) {
     PASS();
 }
 
-/* a qualified reference read from the package outward picks one of two */
+/* a reference read against the scopes around the site (protoc's scope walk)
+ * picks one of two; a definition elsewhere is no candidate */
 TEST(scope_closure_qualified_reference) {
     cbm_closure_t *s = cbm_closure_new();
     int user = cbm_closure_add_file(s, "a/b/user.proto", &ROW_QUAL, "a.b");
@@ -140,14 +149,102 @@ TEST(scope_closure_qualified_reference) {
     ASSERT_TRUE(cbm_closure_add_include(s, user, common, false));
     ASSERT_TRUE(cbm_closure_add_include(s, user, y, false));
     ASSERT_TRUE(cbm_closure_add_include(s, user, near, false));
+    /* nested messages of the user's own package */
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Inner", "a.b.Outer.Inner", "q.Outer.Inner", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Deep", "a.b.Outer.Mid.Deep", "q.Deep", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Twin", "a.b.One.Twin", "q.One.Twin", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Twin", "a.b.Two.Twin", "q.Two.Twin", false));
     ASSERT_EQ(cbm_closure_seal(s), 0);
-    cbm_closure_answer_t c = sc_ask(s, user, "Status", "common", 0);
+    cbm_closure_answer_t c = sc_ask(s, user, "Status", "common.Status", 0);
     ASSERT_EQ(c.verdict, CBM_CLOSURE_PROVEN);
     ASSERT_STR_EQ(c.qn, "q.common.Status");
-    ASSERT_STR_EQ(sc_ask(s, user, "Status", ".y", 0).qn, "q.y.Status");
-    ASSERT_EQ(sc_ask(s, user, "Status", NULL, 0).verdict, CBM_CLOSURE_NO_ANSWER); /* bare: two */
+    ASSERT_STR_EQ(sc_ask(s, user, "Status", ".y.Status", 0).qn, "q.y.Status");
+    /* bare `Status` inside package a.b reads a.b.Status, a.Status, Status and
+     * the messages inside a.b: neither common.Status nor y.Status */
+    ASSERT_EQ(sc_ask(s, user, "Status", NULL, 0).verdict, CBM_CLOSURE_PROVEN_ABSENT);
     /* `n.Kind` inside package a.b: a.b.n.Kind, then a.n.Kind */
-    ASSERT_STR_EQ(sc_ask(s, user, "Kind", "n", 0).qn, "q.a.n.Kind");
+    ASSERT_STR_EQ(sc_ask(s, user, "Kind", "n.Kind", 0).qn, "q.a.n.Kind");
+    /* a message scope inside the package: the one Inner, the one Mid.Deep */
+    ASSERT_STR_EQ(sc_ask(s, user, "Inner", NULL, 0).qn, "q.Outer.Inner");
+    ASSERT_STR_EQ(sc_ask(s, user, "Deep", "Mid.Deep", 0).qn, "q.Deep");
+    ASSERT_STR_EQ(sc_ask(s, user, "Inner", ".a.b.Outer.Inner", 0).qn, "q.Outer.Inner");
+    /* `Twin` from inside One is One.Twin, from inside Two is Two.Twin: the
+     * enclosing message is not known here, so no answer */
+    cbm_closure_answer_t twin = sc_ask(s, user, "Twin", NULL, 0);
+    ASSERT_EQ(twin.verdict, CBM_CLOSURE_NO_ANSWER);
+    ASSERT_EQ(twin.why & CBM_CLOSURE_WHY_AMBIGUOUS, CBM_CLOSURE_WHY_AMBIGUOUS);
+    ASSERT_STR_EQ(sc_ask(s, user, "Twin", "Two.Twin", 0).qn, "q.Two.Twin");
+    cbm_closure_free(s);
+    PASS();
+}
+
+/* a file whose package is unknown (no fact names it) reads every scope as
+ * possibly around its sites: more candidates, never fewer */
+TEST(scope_closure_unknown_package_reads_every_scope) {
+    cbm_closure_t *s = cbm_closure_new();
+    int user = cbm_closure_add_file(s, "user.proto", &ROW_QUAL, NULL);
+    int lib = cbm_closure_add_file(s, "lib.proto", &ROW_QUAL, "l");
+    ASSERT_TRUE(cbm_closure_add_def(s, lib, "T", "l.T", "q.l.T", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "T", "x.M.T", "q.x.T", false));
+    ASSERT_TRUE(cbm_closure_add_include(s, user, lib, false));
+    ASSERT_EQ(cbm_closure_seal(s), 0);
+    ASSERT_EQ(sc_ask(s, user, "T", NULL, 0).verdict, CBM_CLOSURE_NO_ANSWER); /* l.T and x.M.T */
+    ASSERT_STR_EQ(sc_ask(s, user, "T", "l.T", 0).qn, "q.l.T");
+    cbm_closure_free(s);
+    PASS();
+}
+
+/* Answers do not depend on the memo: none, a fresh one, or one filled by
+ * other lookups (in any order) give the same. */
+TEST(scope_closure_answers_do_not_depend_on_the_memo) {
+    cbm_closure_t *s = cbm_closure_new();
+    int user = cbm_closure_add_file(s, "user.proto", &ROW_QUAL, "u");
+    int pub = cbm_closure_add_file(s, "pub.proto", &ROW_QUAL, "u");
+    int lib = cbm_closure_add_file(s, "lib.proto", &ROW_QUAL, "u");
+    int far = cbm_closure_add_file(s, "far.proto", &ROW_QUAL, "f");
+    ASSERT_TRUE(cbm_closure_add_def(s, lib, "T", "u.T", "q.u.T", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, far, "T", "f.T", "q.f.T", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, far, "V", "f.V", "q.f.V", false));
+    ASSERT_TRUE(cbm_closure_add_include(s, user, pub, false));
+    ASSERT_TRUE(cbm_closure_add_include(s, pub, lib, true));
+    ASSERT_TRUE(cbm_closure_add_include(s, pub, far, false));
+    ASSERT_EQ(cbm_closure_seal(s), 0);
+    const struct {
+        int file;
+        const char *name;
+        const char *written;
+    } asks[] = {{user, "T", NULL},  {pub, "T", NULL},   {user, "V", NULL},
+                {pub, "V", "f.V"},  {far, "T", NULL},   {user, "T", "u.T"},
+                {lib, "T", ".u.T"}, {pub, "T", ".f.T"}, {user, "Nope", NULL}};
+    enum { N_ASKS = sizeof(asks) / sizeof(asks[0]) };
+    cbm_closure_answer_t fresh[N_ASKS];
+    for (int i = 0; i < N_ASKS; i++) {
+        fresh[i] = sc_ask(s, asks[i].file, asks[i].name, asks[i].written, 0);
+    }
+    for (int round = 0; round < 2; round++) {
+        cbm_closure_memo_t *m = cbm_closure_memo_new();
+        ASSERT_NOT_NULL(m);
+        for (int k = 0; k < N_ASKS; k++) {
+            int i = round == 0 ? k : N_ASKS - 1 - k; /* forward, then backward */
+            cbm_closure_answer_t a = sc_ask_memo(s, m, asks[i].file, asks[i].name, asks[i].written);
+            ASSERT_EQ(a.verdict, fresh[i].verdict);
+            ASSERT_EQ(a.visible, fresh[i].visible);
+            ASSERT_EQ(a.why, fresh[i].why);
+            ASSERT_EQ(a.file, fresh[i].file);
+            ASSERT_TRUE((a.qn == NULL) == (fresh[i].qn == NULL));
+            if (a.qn) {
+                ASSERT_STR_EQ(a.qn, fresh[i].qn);
+            }
+        }
+        cbm_closure_memo_free(m);
+    }
+    ASSERT_STR_EQ(fresh[0].qn, "q.u.T");                    /* through pub's re-export */
+    ASSERT_STR_EQ(fresh[1].qn, "q.u.T");                    /* f.T is no bare T in package u */
+    ASSERT_EQ(fresh[2].verdict, CBM_CLOSURE_PROVEN_ABSENT); /* far is not passed on */
+    ASSERT_STR_EQ(fresh[3].qn, "q.f.V");
+    ASSERT_EQ(cbm_closure_file(s, "pub.proto"), pub);
+    ASSERT_EQ(cbm_closure_file(s, "nope.proto"), -1);
+    ASSERT_EQ(cbm_closure_add_file(s, "late.proto", &ROW_QUAL, ""), -1); /* sealed */
     cbm_closure_free(s);
     PASS();
 }
@@ -186,8 +283,10 @@ TEST(scope_closure_rows) {
 
 /* Counted work of a header-heavy shape at n: (fan) one file defining N
  * included by n files, each asking N and one undefined name; (chain) n files
- * each re-exporting the next, the last defining N, each asking N. */
-static uint64_t sc_work(int n, bool chain) {
+ * each re-exporting the next, the last defining N, each asking N. `lookups`:
+ * the lookups' work (one memo for all, as one resolver thread), else the
+ * build's (files, definitions, includes, components). */
+static uint64_t sc_work(int n, bool chain, bool lookups) {
     cbm_closure_t *s = cbm_closure_new();
     if (!s) {
         return 0;
@@ -213,29 +312,37 @@ static uint64_t sc_work(int n, bool chain) {
         cbm_closure_free(s);
         return 0;
     }
-    bool right = true;
-    for (int i = 0; i < n; i++) {
-        right = right && sc_ask(s, first + i, "N", NULL, 0).verdict == CBM_CLOSURE_PROVEN;
-        right =
-            right && sc_ask(s, first + i, "Unknown", NULL, 0).verdict == CBM_CLOSURE_PROVEN_ABSENT;
+    /* one memo, as one resolver thread has */
+    cbm_closure_memo_t *m = cbm_closure_memo_new();
+    bool right = m != NULL;
+    for (int i = 0; right && i < n; i++) {
+        right = sc_ask_memo(s, m, first + i, "N", NULL).verdict == CBM_CLOSURE_PROVEN &&
+                sc_ask_memo(s, m, first + i, "Unknown", NULL).verdict == CBM_CLOSURE_PROVEN_ABSENT;
     }
-    uint64_t w = cbm_closure_work(s);
+    uint64_t w = lookups ? cbm_closure_memo_work(m) : cbm_closure_work(s);
+    cbm_closure_memo_free(m);
     cbm_closure_free(s);
     return right ? w : 0;
 }
 
 TEST(scope_closure_work_grows_linearly) {
     for (int chain = 0; chain < 2; chain++) {
-        uint64_t w1 = sc_work(100, chain);
-        uint64_t w4 = sc_work(400, chain);
-        uint64_t w16 = sc_work(1600, chain);
-        ASSERT_GT(w1, 0);
-        ASSERT_GT(w4, 0);
-        ASSERT_GT(w16, 0);
-        /* at most 4.5 times the work per 4 times the files */
-        ASSERT_TRUE(w4 * 2 <= w1 * 9);
-        ASSERT_TRUE(w16 * 2 <= w4 * 9);
+        for (int lookups = 0; lookups < 2; lookups++) { /* the build, then the lookups */
+            uint64_t w1 = sc_work(100, chain, lookups);
+            uint64_t w4 = sc_work(400, chain, lookups);
+            uint64_t w16 = sc_work(1600, chain, lookups);
+            printf("\n  %s %s: %llu / %llu / %llu at 1x / 4x / 16x", chain ? "chain" : "fan",
+                   lookups ? "lookups" : "build", (unsigned long long)w1, (unsigned long long)w4,
+                   (unsigned long long)w16);
+            ASSERT_GT(w1, 0);
+            ASSERT_GT(w4, 0);
+            ASSERT_GT(w16, 0);
+            /* at most 4.5 times the work per 4 times the files */
+            ASSERT_TRUE(w4 * 2 <= w1 * 9);
+            ASSERT_TRUE(w16 * 2 <= w4 * 9);
+        }
     }
+    printf("\n");
     PASS();
 }
 
@@ -245,6 +352,8 @@ SUITE(scope_closure) {
     RUN_TEST(scope_closure_incomplete_is_possible_or_no_answer);
     RUN_TEST(scope_closure_ambiguous_conditional_and_nodeless);
     RUN_TEST(scope_closure_qualified_reference);
+    RUN_TEST(scope_closure_unknown_package_reads_every_scope);
+    RUN_TEST(scope_closure_answers_do_not_depend_on_the_memo);
     RUN_TEST(scope_closure_rows);
     RUN_TEST(scope_closure_work_grows_linearly);
 }

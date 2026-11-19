@@ -584,6 +584,11 @@ typedef struct {
      * files with the context, read-only afterwards, freed with it. NULL: no
      * import is read by the path rule (main's strategies decide). */
     struct cbm_include_universe *include_universe;
+
+    /* The shared cross-file layer's scope (site_bind.h): built after IMPORTS
+     * on one thread, read only by the resolvers, freed by the route that
+     * built it. NULL: no file of a row language (every site NO_ANSWER). */
+    struct cbm_site_scope *site_scope;
 } cbm_pipeline_ctx_t;
 
 /* The set for cbm_pipeline_ctx_t.indexed_files: every rel_path of `files`

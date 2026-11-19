@@ -2097,7 +2097,10 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
      * log line so divergence between pipelines becomes observable. */
     int lsp_overrides;
     CBMFileResult *loaded; /* spill-loaded result this worker is using */
-    char _pad[CBM_CACHE_LINE - 2 * sizeof(void *) - ((PP_RING + 1) * sizeof(int))];
+    /* the shared layer's memo of this worker (site_bind.h), made on its
+     * first lookup, freed after the workers join */
+    cbm_site_memo_t *site_memo;
+    char _pad[CBM_CACHE_LINE - 3 * sizeof(void *) - ((PP_RING + 1) * sizeof(int))];
 } resolve_worker_state_t;
 
 typedef struct {
@@ -3354,7 +3357,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     bool field_index_ready = false;
     cbm_spawn_file_begin(result->imports.items, result->imports.count);
     cbm_site_file_t site;
-    cbm_pipeline_site_bind_begin(&site, rc->pctx, rc->main_gbuf, rel, lang, result);
+    cbm_pipeline_site_bind_begin(&site, rc->pctx, rc->main_gbuf, rel, lang, result, &ws->site_memo,
+                                 evidence);
     for (int c = 0; c < result->calls.count; c++) {
         const CBMCall *call = &result->calls.items[c];
         CBMCallEvidence fallback = {0};
@@ -3863,7 +3867,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     bool field_index_ready =
         cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
     cbm_site_file_t site;
-    cbm_pipeline_site_bind_begin(&site, rc->pctx, rc->main_gbuf, rel, lang, result);
+    cbm_pipeline_site_bind_begin(&site, rc->pctx, rc->main_gbuf, rel, lang, result, &ws->site_memo,
+                                 NULL);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -4021,11 +4026,20 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
          * also agree: the same repo indexed in parallel and sequentially has to
          * produce byte-identical edge properties. */
         char uprops[CBM_SZ_512];
-        char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
-        cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
-        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        if (scoped.verdict == CBM_SITE_PROVEN) {
+            /* a proven answer of the shared layer names its strategy
+             * (site_bind.h). MUST match pass_usages.c. */
+            cbm_pipeline_site_usage_props(uprops, sizeof(uprops), usage, CBM_SITE_PROVEN);
+        } else {
+            char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
+            cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
+            snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        }
         const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, uprops);
+        if (scoped.verdict == CBM_SITE_POSSIBLE) {
+            cbm_pipeline_site_bind_usage_drawn(&site, usage, tgt);
+        }
         ws->usages_resolved++;
     }
     cbm_pipeline_site_bind_end(&site, ws->local_edge_buf);
@@ -4919,6 +4933,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     int total_semantic = 0;
     int total_lsp_overrides = 0;
     for (int i = 0; i < worker_count; i++) {
+        cbm_pipeline_site_memo_free(workers[i].site_memo);
+        workers[i].site_memo = NULL;
         if (workers[i].local_edge_buf) {
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_edge_buf);
             total_calls += workers[i].calls_resolved;

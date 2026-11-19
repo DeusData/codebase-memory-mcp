@@ -21,6 +21,7 @@ enum { PD_SWIFT_PROPS_MARGIN = 80 };
 #include <stdint.h>
 #include <ctype.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/site_bind.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h" /* cbm_alloc/cbm_free: the grown properties buffer */
@@ -1234,6 +1235,24 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             cbm_pipeline_diagram_arrows(ctx, result);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
+        }
+        /* The shared layer's scope (site_bind.h): every file is extracted and
+         * its IMPORTS made; built once, before any resolver. The route that
+         * runs the resolvers frees it. Mirrors pipeline.c's parallel route. */
+        if (!ctx->site_scope) {
+            struct timespec st;
+            cbm_clock_gettime(CLOCK_MONOTONIC, &st);
+            ctx->site_scope = cbm_pipeline_site_scope_build(ctx, files, file_count, local_cache,
+                                                            NULL, 0, NULL, 0);
+            if (ctx->site_scope) {
+                struct timespec now;
+                cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+                long ms = (long)((now.tv_sec - st.tv_sec) * CBM_MSEC_PER_SEC +
+                                 (now.tv_nsec - st.tv_nsec) / CBM_NSEC_PER_MSEC);
+                char ms_buf[CBM_SZ_32];
+                snprintf(ms_buf, sizeof(ms_buf), "%ld", ms);
+                cbm_log_info("pass.timing", "pass", "site_scope", "elapsed_ms", ms_buf);
+            }
         }
         /* Publish instead of free — see the twin in pass_parallel.c (#1355).
          * Only the Scala index is pass-local. */

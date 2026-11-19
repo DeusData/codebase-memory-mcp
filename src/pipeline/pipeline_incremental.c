@@ -24,6 +24,8 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline_internal.h"
 #include "helpers.h" /* cbm_fqn_module */
 #include "pipeline/doc_links.h"
+#include "pipeline/scope_closure.h"
+#include "pipeline/site_bind.h"
 #include "store/store.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -1553,6 +1555,12 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
+    /* The shared layer's scope reads every discovered file: the re-parsed
+     * ones fresh, the others from their stored facts (borrowed). */
+    const cbm_file_info_t *all_files;
+    int all_count;
+    const cbm_lsp_surface_row_t *stored_rows;
+    int stored_count;
 } closure_resolve_t;
 
 typedef struct {
@@ -2015,6 +2023,19 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             atomic_store(&shared_ids, registry_next_id);
         }
 
+        /* The shared layer's scope (site_bind.h), sealed before the resolve
+         * workers start: the re-parsed files fresh, every other discovered
+         * file of a row language from its stored facts (closure repair). */
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        ctx->site_scope = cbm_pipeline_site_scope_build(
+            ctx, changed_files, ci, cache, closure ? closure->all_files : NULL,
+            closure ? closure->all_count : 0, closure ? closure->stored_rows : NULL,
+            closure ? closure->stored_count : 0);
+        if (ctx->site_scope) {
+            cbm_log_info("pass.timing", "pass", "incr_site_scope", "elapsed_ms",
+                         itoa_buf((int)elapsed_ms(t)));
+        }
+
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         CBMLSPDef *all_defs = NULL;
         int all_def_count = 0;
@@ -2139,6 +2160,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_doclinks_end(ctx);
 
     cross_resolve_cleanup:
+        cbm_pipeline_site_scope_free(ctx->site_scope);
+        ctx->site_scope = NULL;
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }
@@ -2209,6 +2232,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (rc == 0) {
             (void)cbm_pipeline_pass_doc_links(ctx, changed_files, ci);
         }
+        /* the definitions pass built the shared layer's scope */
+        cbm_pipeline_site_scope_free(ctx->site_scope);
+        ctx->site_scope = NULL;
         if (owns_cache) {
             free_incremental_result_cache(cache, ci);
             ctx->result_cache = prior_cache;
@@ -3143,6 +3169,107 @@ static const char *closure_add_includers(const cbm_lsp_surface_row_t *rows, int 
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
+/* The file names (last path component) a row's stored facts re-export
+ * (`import public`), into `names`; 0, -1 when the row has no facts ("is"),
+ * -2 when they cannot be read. */
+static int closure_scope_row(CBMArena *a, const cbm_lsp_surface_row_t *row, CBMHashTable *names) {
+    cbm_lsp_scope_facts_t facts;
+    int rc = cbm_lsp_surface_scope_from_json(a, row ? row->defs_json : NULL, &facts);
+    if (rc == 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (rc != SKIP_ONE) {
+        return -PAIR_LEN;
+    }
+    for (int i = 0; i < facts.event_count; i++) {
+        const CBMScopeEvent *e = &facts.events[i];
+        if (names && e->kind == CBM_SCOPE_INCLUDE && (e->flags & CBM_SCOPE_REEXPORT) &&
+            e->index >= 0 && e->index < facts.module_count) {
+            const char *slash = strrchr(facts.modules[e->index], '/');
+            cbm_ht_set(names, slash ? slash + SKIP_ONE : facts.modules[e->index], (void *)1);
+        }
+    }
+    return 0;
+}
+
+/* Whether a file may be what some re-export names (by its last path
+ * component: never fewer than the path rule would resolve). */
+static bool closure_scope_reexported(CBMHashTable *names, const char *rel) {
+    const char *slash = strrchr(rel, '/');
+    return cbm_ht_get(names, slash ? slash + SKIP_ONE : rel) != NULL;
+}
+
+/* The shared layer's scope (site_bind.h) on a repair reads every file of a
+ * row language the repair leaves alone from its stored facts: a row without
+ * them (an older binary wrote it) or with unreadable ones declines. A file's
+ * changed facts reach the files with an edge into it (its includers re-resolve
+ * as dependents); when it is re-exported (`import public`) they also reach
+ * the re-exporter's includers, which have no edge into it: a surface change
+ * (or deletion) of a file some re-export may name declines too. NULL: the
+ * repair may go on. */
+static const char *closure_scope_decline(const cbm_lsp_surface_row_t *stored, int stored_count,
+                                         CBMHashTable *rows_by_path,
+                                         const cbm_lsp_surface_row_t *fresh, int fresh_count,
+                                         CBMHashTable *files_by_path, char **changed, int n_changed,
+                                         int n_deleted) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *why = NULL;
+    CBMHashTable *reexported = cbm_ht_create(CBM_SZ_16);
+    if (!reexported) {
+        cbm_arena_destroy(&a);
+        return "alloc";
+    }
+    for (int i = 0; i < stored_count && !why; i++) {
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, stored[i].rel_path);
+        if (!info || !cbm_closure_lang(info->language)) {
+            continue;
+        }
+        int rc = closure_scope_row(&a, &stored[i], reexported);
+        why = rc == CBM_NOT_FOUND ? "scope_facts_missing" : rc < 0 ? "scope_facts_malformed" : NULL;
+    }
+    for (int i = 0; i < fresh_count && !why; i++) {
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, fresh[i].rel_path);
+        if (!info || !cbm_closure_lang(info->language)) {
+            continue;
+        }
+        int rc = closure_scope_row(&a, &fresh[i], reexported);
+        why = rc < 0 ? "scope_facts_malformed" : NULL;
+    }
+    bool changed_scope = false;
+    bool any = cbm_ht_count(reexported) > 0;
+    for (int i = 0; i < n_changed + n_deleted && !why && any && !changed_scope; i++) {
+        if (!closure_scope_reexported(reexported, changed[i])) {
+            continue;
+        }
+        const cbm_lsp_surface_row_t *old_row = cbm_ht_get(rows_by_path, changed[i]);
+        if (i >= n_changed) {
+            /* a deleted file whose row holds facts is of a row language */
+            changed_scope = old_row && closure_scope_row(&a, old_row, NULL) != CBM_NOT_FOUND;
+            continue;
+        }
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, changed[i]);
+        if (!info || !cbm_closure_lang(info->language)) {
+            continue;
+        }
+        const cbm_lsp_surface_row_t *new_row = NULL;
+        for (int j = 0; j < fresh_count; j++) {
+            if (strcmp(fresh[j].rel_path, changed[i]) == 0) {
+                new_row = &fresh[j];
+                break;
+            }
+        }
+        changed_scope = old_row && (!new_row || !old_row->surface_sha || !new_row->surface_sha ||
+                                    strcmp(old_row->surface_sha, new_row->surface_sha) != 0);
+    }
+    if (!why && changed_scope) {
+        why = "scope_reexport_changed";
+    }
+    cbm_ht_free(reexported); /* keys borrowed from the arena */
+    cbm_arena_destroy(&a);
+    return why;
+}
+
 static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
                             cbm_file_info_t *files, int file_count, const cbm_file_hash_t *stored,
                             int stored_count, const cbm_file_hash_t *fresh, int fresh_count,
@@ -3355,6 +3482,13 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             plan->fatal_rc = probe_rc;
         }
         decline = "probe_failed";
+        goto done;
+    }
+    decline =
+        closure_scope_decline(plan->stored_rows, plan->stored_count, rows_by_path, probe_rows,
+                              probe_count, files_by_path, changed_paths, n_changed, n_deleted);
+    if (decline) {
+        cbm_ht_free(rows_by_path);
         goto done;
     }
 
@@ -3824,6 +3958,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     }
     cbm_arena_init(&cr.arena);
     cr_arena_live = true;
+    cr.all_files = files;
+    cr.all_count = file_count;
+    cr.stored_rows = plan->stored_rows;
+    cr.stored_count = plan->stored_count;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     {
         /* Eligible rows first (skip everything being re-parsed or deleted),
