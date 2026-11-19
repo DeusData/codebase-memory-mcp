@@ -1007,6 +1007,27 @@ bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     return true;
 }
 
+CBMHashTable *cbm_pipeline_indexed_files_new(const cbm_file_info_t *files, int file_count) {
+    CBMHashTable *set = cbm_ht_create((uint32_t)((size_t)file_count * PAIR_LEN + CBM_SZ_64));
+    for (int i = 0; set && i < file_count; i++) {
+        cbm_ht_set(set, files[i].rel_path, (void *)&files[i]);
+    }
+    return set;
+}
+
+static bool pipeline_file_is_indexed(const void *userdata, const char *rel_path) {
+    return userdata && cbm_ht_get((const CBMHashTable *)userdata, rel_path) != NULL;
+}
+
+CBMIncludeScope cbm_pipeline_include_scope(const cbm_pipeline_ctx_t *ctx) {
+    CBMIncludeScope scope = {
+        .root = ctx ? ctx->repo_path : NULL,
+        .is_indexed = pipeline_file_is_indexed,
+        .userdata = ctx ? ctx->indexed_files : NULL,
+    };
+    return scope;
+}
+
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count) {
     if (!p) {
         cbm_store_free_lsp_surfaces(rows, count);
@@ -4394,6 +4415,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
+    CBMHashTable *indexed_files = NULL;
     cbm_file_hash_t *baseline_manifest = NULL;
     int baseline_count = 0;
     char **requested_excluded_dirs = NULL;
@@ -4559,11 +4581,17 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * when no usable configs are found — non-TS projects pay nothing. */
     path_aliases =
         cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
+    indexed_files = cbm_pipeline_indexed_files_new(files, file_count);
+    if (!indexed_files) {
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
         .project_name = p->project_name,
         .repo_path = p->repo_path,
+        .indexed_files = indexed_files,
         .gbuf = p->gbuf,
         .registry = p->registry,
         .cancelled = p->cancelled,
@@ -4609,6 +4637,7 @@ cleanup:
     cbm_registry_free(p->registry);
     p->registry = NULL;
     cbm_path_alias_collection_free(path_aliases);
+    cbm_ht_free(indexed_files); /* keys borrowed from files */
     if (restore_requested_discovery) {
         cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
         cbm_discover_free_ignored(p->ignored_files, p->ignored_count);
