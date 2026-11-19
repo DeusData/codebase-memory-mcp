@@ -36934,6 +36934,187 @@ TEST(pipeline_lsp_index_empty_leaf_row_keeps_the_index_complete) {
     PASS();
 }
 
+/* PHP's check for a receiver typed as a class the index does not hold read
+ * every row of the file for every call it was asked about. It now reads the
+ * per-file index. php_receiver_check_work counts index lookups plus rows read
+ * by a scan (counted inside the scan) for one PHP method of `n` calls on such a receiver, each of which
+ * the name resolver would bind to the one project method of that name. */
+static uint64_t php_receiver_check_work(int n, int *edges_to_project_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_check_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    char path[512];
+    int rc = 0;
+    snprintf(path, sizeof(path), "%s/src/Item.php", tmp);
+    rc |= th_write_file(path, "<?php\n"
+                              "namespace App;\n\n"
+                              "class Item\n"
+                              "{\n"
+                              "    public function getUid(): int\n"
+                              "    {\n"
+                              "        return 1;\n"
+                              "    }\n"
+                              "}\n");
+    size_t cap = (size_t)n * 32 + 256;
+    char *body = malloc(cap);
+    if (!body) {
+        th_rmtree(tmp);
+        return 0;
+    }
+    size_t len = (size_t)snprintf(body, cap,
+                                  "<?php\n"
+                                  "namespace App;\n\n"
+                                  "class Big\n"
+                                  "{\n"
+                                  "    public function run(Missing $m): void\n"
+                                  "    {\n");
+    for (int i = 0; i < n && len < cap; i++) {
+        len += (size_t)snprintf(body + len, cap - len, "        $m->getUid();\n");
+    }
+    if (len < cap) {
+        snprintf(body + len, cap - len, "    }\n}\n");
+    }
+    snprintf(path, sizeof(path), "%s/src/Big.php", tmp);
+    rc |= th_write_file(path, body);
+    free(body);
+    uint64_t work = 0;
+    if (rc == 0) {
+        XlangEnvSave save = xlang_env_select(false);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/work.db", tmp);
+        cbm_pp_lsp_linear_fallback_rows_reset();
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline && cbm_pipeline_run(pipeline) == 0) {
+            work = cbm_pp_lsp_scan_rows() + cbm_pp_lsp_index_lookups();
+            if (edges_to_project_method) {
+                cbm_store_t *store = cbm_store_open_path(db_path);
+                *edges_to_project_method =
+                    store ? named_edge_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                             "run", "getUid")
+                          : -1;
+                if (store) {
+                    cbm_store_close(store);
+                }
+            }
+        }
+        if (pipeline) {
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return work;
+}
+
+TEST(pipeline_php_receiver_check_work_grows_linearly) {
+    int edges = -1;
+    uint64_t w1 = php_receiver_check_work(40, &edges);
+    uint64_t w4 = php_receiver_check_work(160, NULL);
+    uint64_t w16 = php_receiver_check_work(640, NULL);
+    ASSERT_TRUE(w1 > 0);
+    /* The check ran and held: no call on the unindexed receiver is bound to
+     * the project method of the same name (#606). */
+    ASSERT_EQ(edges, 0);
+    /* Linear within 12.5%: a scan of every row per call grows 16x and 256x. */
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+/* The index answers PHP's unindexed-receiver check exactly as the scan does.
+ * Seeded rows and calls over three callers (one pair of caller and leaf that
+ * spells the same text around the key's separator as another pair), exact /
+ * legacy / corrupt spans, both origins, rows of another strategy, callees
+ * without a class, references, and calls that need the engine; a registry in
+ * which one of the receiver classes is a project type. Every answer is
+ * compared with cbm_pipeline_php_receiver_type_unindexed's. */
+TEST(pipeline_lsp_index_php_receiver_check_agrees_with_the_scan) {
+    /* "p.f|g" with leaf "m1" and "p.f" with leaf "g|m1": one text around the key's
+     * separator, two keys, because a key carries its caller's length. */
+    static const char *const callers[] = {"p.f", "p.g", "p.f|g"};
+    /* Two receiver classes under one leaf, twice each: rows that answer the
+     * same call with different verdicts are common. */
+    static const char *const callees[] = {"V.A.m1", "V.B.m1", "V.A.m1",  "V.B.m1",  "W.A.m2",
+                                          "m1",     ".m1",    "V.B.run", "V.B.g|m1"};
+    static const char *const strategies[] = {"php_method_typed_unindexed",
+                                             "php_method_typed_unindexed",
+                                             "php_method_typed_unindexed", "php_method_typed"};
+    static const char *const names[] = {"x.m1", "m2", "run", "y.run", "m1", "B::m1", "g|m1"};
+    static const uint32_t spans[][2] = {{0, 0}, {0, 0}, {10, 20}, {30, 40}, {5, 5}, {9, 3}};
+    cbm_registry_t *registry = cbm_registry_new();
+    cbm_registry_t *no_types = cbm_registry_new();
+    ASSERT_NOT_NULL(registry);
+    ASSERT_NOT_NULL(no_types);
+    cbm_registry_add(registry, "A", "p.A", "Class", false);
+    ASSERT_TRUE(cbm_registry_has_type_named(registry, "A"));
+    ASSERT_FALSE(cbm_registry_has_type_named(registry, "B"));
+    uint32_t seed = 0x0606beefu;
+    int mismatches = 0;
+    int answered = 0;
+    int suppressed = 0;
+    for (int trial = 0; trial < 20000; trial++) {
+        CBMResolvedCall rows[8];
+        int nrows = 1 + (int)(lsp_prop_next(&seed) % 8);
+        for (int i = 0; i < nrows; i++) {
+            memset(&rows[i], 0, sizeof(rows[i]));
+            rows[i].caller_qn = callers[lsp_prop_next(&seed) % 3];
+            rows[i].callee_qn = callees[lsp_prop_next(&seed) % 9];
+            rows[i].strategy = strategies[lsp_prop_next(&seed) % 4];
+            rows[i].confidence = lsp_prop_next(&seed) % 4 == 0 ? 0.95f : 0.55f;
+            rows[i].kind = lsp_prop_next(&seed) % 7 == 0 ? CBM_RESOLVED_CALL_REFERENCE
+                                                         : CBM_RESOLVED_INVOCATION;
+            const uint32_t *span = spans[lsp_prop_next(&seed) % 6];
+            rows[i].site_start_byte = span[0];
+            rows[i].site_end_byte = span[1];
+            rows[i].source_origin = lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED
+                                                                  : CBM_SOURCE_ORIGIN_RAW;
+        }
+        CBMResolvedCallArray arr = {rows, nrows, nrows};
+        CBMCall call;
+        memset(&call, 0, sizeof(call));
+        call.callee_name = names[lsp_prop_next(&seed) % 7];
+        call.enclosing_func_qn = callers[lsp_prop_next(&seed) % 3];
+        const uint32_t *span = spans[lsp_prop_next(&seed) % 6];
+        call.site_start_byte = span[0];
+        call.site_end_byte = span[1];
+        call.source_origin =
+            lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED : CBM_SOURCE_ORIGIN_RAW;
+        call.requires_lsp_resolution = lsp_prop_next(&seed) % 3 == 0;
+        /* Two calls in three are aimed at one of the rows (its caller, leaf,
+         * span and origin), so that a row answers in a fifth of the trials. */
+        if (lsp_prop_next(&seed) % 3 != 0) {
+            const CBMResolvedCall *aim = &rows[lsp_prop_next(&seed) % (uint32_t)nrows];
+            call.enclosing_func_qn = aim->caller_qn;
+            call.callee_name = cbm_lsp_bare_segment(aim->callee_qn);
+            call.site_start_byte = aim->site_start_byte;
+            call.site_end_byte = aim->site_end_byte;
+            call.source_origin = aim->source_origin;
+        }
+        cbm_pipeline_lsp_index_t idx;
+        cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, false);
+        bool by_index = cbm_pipeline_lsp_index_php_receiver_unindexed(&idx, &arr, &call, registry);
+        bool by_scan = cbm_pipeline_php_receiver_type_unindexed(&arr, &call, registry);
+        cbm_pipeline_lsp_index_free(&idx);
+        if (by_index != by_scan) {
+            mismatches++;
+        }
+        /* With no project type every answering row says "suppress". */
+        answered += cbm_pipeline_php_receiver_type_unindexed(&arr, &call, no_types);
+        suppressed += by_scan;
+    }
+    cbm_registry_free(registry);
+    cbm_registry_free(no_types);
+    ASSERT_EQ(mismatches, 0);
+    /* The comparison is not all "no row": a row answers in thousands of
+     * trials, with both verdicts. */
+    ASSERT_TRUE(answered > 2000);
+    ASSERT_TRUE(suppressed > 1000);
+    ASSERT_TRUE(answered - suppressed > 800);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_c_header_edit_refreshes_includers_incrementally);
     RUN_TEST(pipeline_c_include_lookup_uses_repo_root);
@@ -37066,6 +37247,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_sequential_lsp_lookup_work_grows_linearly);
     RUN_TEST(pipeline_lsp_index_find_agrees_with_the_matcher);
     RUN_TEST(pipeline_lsp_index_empty_leaf_row_keeps_the_index_complete);
+    RUN_TEST(pipeline_php_receiver_check_work_grows_linearly);
+    RUN_TEST(pipeline_lsp_index_php_receiver_check_agrees_with_the_scan);
     RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
     RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);

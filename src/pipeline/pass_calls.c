@@ -1398,7 +1398,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                             cbm_pipeline_get_nsmap()) ||
         /* MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry)) ||
+         cbm_pipeline_lsp_index_php_receiver_unindexed(lsp_index, lsp_calls, call,
+                                                       ctx->registry)) ||
         /* Same-module bound-receiver suppression (#1128): `axios.get()` with
          * axios imported must not bind the `get` this file happens to define.
          * The language list is inside the helper - MUST match pass_parallel.c. */

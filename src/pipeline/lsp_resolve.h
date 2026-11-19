@@ -418,36 +418,61 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
 /* #606: a sub-floor `php_method_typed_unindexed` row still proves the receiver
  * is not a project class, so a weak short-name fallback must not bind it. A
  * project class with the same simple name keeps the fallback, since the PHP
- * LSP does not follow every cross-file type. */
+ * LSP does not follow every cross-file type.
+ *
+ * The check is three questions, asked by the scan below and by the per-file
+ * index (cbm_pipeline_lsp_index_php_receiver_unindexed) in the same words. */
+
+/* Rows read by a per-call scan of a file's engine rows (this check's and the
+ * matcher's below), counted inside the scan, whoever asks. */
+extern _Atomic uint64_t g_lsp_scan_rows; /* defined in pass_parallel.c */
+
+/* Can this row answer the check at all: an unindexed-receiver row whose callee
+ * names a class and a method. */
+static inline bool cbm_pipeline_php_unindexed_row(const CBMResolvedCall *rc) {
+    if (!rc || rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+        !rc->strategy || strcmp(rc->strategy, "php_method_typed_unindexed") != 0) {
+        return false;
+    }
+    const char *method_dot = strrchr(rc->callee_qn, '.');
+    return method_dot && method_dot != rc->callee_qn &&
+           (size_t)(method_dot - rc->callee_qn) < (size_t)CBM_SZ_512;
+}
+
+/* Is such a row this call's: the same caller, the same occurrence (or the
+ * legacy join) and the same leaf. */
+static inline bool cbm_pipeline_php_unindexed_row_is_for(const CBMResolvedCall *rc,
+                                                         const CBMCall *call) {
+    if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
+        return false;
+    }
+    int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+    return site_rank != 0 && cbm_pipeline_invocation_leaf_matches(rc, call, site_rank);
+}
+
+/* The row's verdict: its receiver class is no type of the project. */
+static inline bool cbm_pipeline_php_unindexed_row_verdict(const CBMResolvedCall *rc,
+                                                          const cbm_registry_t *registry) {
+    char class_qn[CBM_SZ_512];
+    size_t class_len = (size_t)(strrchr(rc->callee_qn, '.') - rc->callee_qn);
+    memcpy(class_qn, rc->callee_qn, class_len);
+    class_qn[class_len] = '\0';
+    return !cbm_registry_has_type_named(registry, cbm_lsp_bare_segment(class_qn));
+}
+
+/* The first such row of the file, in array order, decides. */
 static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCallArray *arr,
                                                             const CBMCall *call,
                                                             const cbm_registry_t *registry) {
     if (!arr || !call || !call->enclosing_func_qn || !call->callee_name) {
         return false;
     }
+    atomic_fetch_add_explicit(&g_lsp_scan_rows, (uint64_t)arr->count, memory_order_relaxed);
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
-            !rc->strategy || strcmp(rc->strategy, "php_method_typed_unindexed") != 0 ||
-            strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
-            continue;
+        if (cbm_pipeline_php_unindexed_row(rc) && cbm_pipeline_php_unindexed_row_is_for(rc, call)) {
+            return cbm_pipeline_php_unindexed_row_verdict(rc, registry);
         }
-        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
-        if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
-            continue;
-        }
-        const char *method_dot = strrchr(rc->callee_qn, '.');
-        if (!method_dot || method_dot == rc->callee_qn) {
-            continue;
-        }
-        char class_qn[CBM_SZ_512];
-        size_t class_len = (size_t)(method_dot - rc->callee_qn);
-        if (class_len >= sizeof(class_qn)) {
-            continue;
-        }
-        memcpy(class_qn, rc->callee_qn, class_len);
-        class_qn[class_len] = '\0';
-        return !cbm_registry_has_type_named(registry, cbm_lsp_bare_segment(class_qn));
     }
     return false;
 }
@@ -477,7 +502,6 @@ static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCal
  * the per-file index (cbm_pipeline_lsp_index_find, pass_parallel.c), which
  * comes here only where the index may not hold the answer; g_lsp_scan_rows
  * counts the rows read here, whoever asks. */
-extern _Atomic uint64_t g_lsp_scan_rows; /* defined in pass_parallel.c */
 
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,

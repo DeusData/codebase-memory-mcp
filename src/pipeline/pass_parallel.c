@@ -3282,6 +3282,39 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
     return NULL;
 }
 
+/* One unindexed-receiver row of PHP into the index: the first row of a key in
+ * array order stays, as the scan answers from the first row that matches. A
+ * row with a partial or reversed span ranks for no call and is left out. */
+static void lsp_idx_insert_php(cbm_pipeline_lsp_index_t *idx, CBMResolvedCall *row,
+                               uint32_t capacity) {
+    bool exact_site = cbm_pipeline_source_site_present(row->site_start_byte, row->site_end_byte);
+    if (!exact_site && !cbm_pipeline_source_site_legacy(row->site_start_byte, row->site_end_byte)) {
+        return;
+    }
+    idx->php_rows++;
+    CBMHashTable **table = exact_site ? &idx->php_exact : &idx->php_legacy;
+    if (!*table) {
+        *table = cbm_ht_create(capacity);
+    }
+    char *key = *table
+                    ? lsp_idx_key(row->caller_qn, cbm_lsp_bare_segment(row->callee_qn), exact_site,
+                                  row->site_start_byte, row->site_end_byte, row->source_origin)
+                    : NULL;
+    if (!key) {
+        idx->php_complete = false;
+        return;
+    }
+    if (cbm_ht_get(*table, key)) {
+        cbm_free(CBM_MEM_CLASS_RESOLVE, key); /* an earlier row has the key */
+        return;
+    }
+    cbm_ht_set(*table, key, row);
+    if (cbm_ht_get(*table, key) != row) {
+        cbm_free(CBM_MEM_CLASS_RESOLVE, key);
+        idx->php_complete = false;
+    }
+}
+
 /* The per-file index both resolvers look a call's engine row up in:
  * exact caller+leaf+span first, then the legacy caller+leaf rows recorded
  * without a span. Repeated same-leaf calls stay O(1) and a high-confidence 0:0
@@ -3295,6 +3328,10 @@ void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolv
     idx->exact_complete = true;
     idx->legacy_complete = true;
     idx->has_destructor = false;
+    idx->php_exact = NULL;
+    idx->php_legacy = NULL;
+    idx->php_rows = 0;
+    idx->php_complete = true;
     if (!arr || arr->count <= 0) {
         return;
     }
@@ -3308,10 +3345,14 @@ void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolv
         idx->legacy_complete = false;
     }
     if (!idx->exact && !idx->legacy) {
+        idx->php_complete = false; /* no row was read */
         return;
     }
     for (int i = 0; i < arr->count; i++) {
         CBMResolvedCall *rc_e = &arr->items[i];
+        if (cbm_pipeline_php_unindexed_row(rc_e)) {
+            lsp_idx_insert_php(idx, rc_e, capacity);
+        }
         if (rc_e->kind != CBM_RESOLVED_INVOCATION || !rc_e->caller_qn || !rc_e->callee_qn ||
             rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
             continue;
@@ -3363,6 +3404,80 @@ void cbm_pipeline_lsp_index_free(cbm_pipeline_lsp_index_t *idx) {
         cbm_ht_free(idx->legacy);
         idx->legacy = NULL;
     }
+    if (idx->php_exact) {
+        cbm_ht_foreach(idx->php_exact, lsp_idx_free_key, NULL);
+        cbm_ht_free(idx->php_exact);
+        idx->php_exact = NULL;
+    }
+    if (idx->php_legacy) {
+        cbm_ht_foreach(idx->php_legacy, lsp_idx_free_key, NULL);
+        cbm_ht_free(idx->php_legacy);
+        idx->php_legacy = NULL;
+    }
+}
+
+/* PHP's check for a receiver typed as a class the index does not hold
+ * (cbm_pipeline_php_receiver_type_unindexed): the first row of the file that
+ * is this call's decides. A call's rows share its key (caller, leaf, span and
+ * origin, or caller, leaf and origin for a row without a span), and a key
+ * names exactly one such tuple (lsp_idx_key), so the first of them is the
+ * earlier of the two tables' rows for that key. A key that cannot be built
+ * and an incomplete index go to the scan. */
+bool cbm_pipeline_lsp_index_php_receiver_unindexed(const cbm_pipeline_lsp_index_t *idx,
+                                                   const CBMResolvedCallArray *arr,
+                                                   const CBMCall *call,
+                                                   const cbm_registry_t *registry) {
+    if (!arr || !call || !call->enclosing_func_qn || !call->callee_name) {
+        return false;
+    }
+    bool scan = !idx || !idx->php_complete;
+    if (!scan) {
+        if (idx->php_rows == 0) {
+            return false; /* the file has no such row */
+        }
+        const CBMResolvedCall *first = NULL;
+        bool site_present =
+            cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte);
+        if (!site_present &&
+            !cbm_pipeline_source_site_legacy(call->site_start_byte, call->site_end_byte)) {
+            return false; /* a partial or reversed span ranks no row */
+        }
+        const char *leaf = cbm_lsp_bare_segment(call->callee_name);
+        if (!leaf) {
+            return false; /* no leaf to match a row's */
+        }
+        atomic_fetch_add_explicit(&g_lsp_index_lookups, 1, memory_order_relaxed);
+        if (site_present && idx->php_exact) {
+            char *key = lsp_idx_key(call->enclosing_func_qn, leaf, true, call->site_start_byte,
+                                    call->site_end_byte, call->source_origin);
+            if (key) {
+                first = (const CBMResolvedCall *)cbm_ht_get(idx->php_exact, key);
+                cbm_free(CBM_MEM_CLASS_RESOLVE, key);
+            } else {
+                scan = true;
+            }
+        }
+        if (!scan && !call->requires_lsp_resolution && idx->php_legacy) {
+            char *key =
+                lsp_idx_key(call->enclosing_func_qn, leaf, false, 0, 0, call->source_origin);
+            if (key) {
+                const CBMResolvedCall *legacy =
+                    (const CBMResolvedCall *)cbm_ht_get(idx->php_legacy, key);
+                cbm_free(CBM_MEM_CLASS_RESOLVE, key);
+                if (legacy && (!first || legacy < first)) {
+                    first = legacy;
+                }
+            } else {
+                scan = true;
+            }
+        }
+        if (!scan) {
+            return first ? cbm_pipeline_php_unindexed_row_verdict(first, registry) : false;
+        }
+    }
+    atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows, (uint64_t)arr->count,
+                              memory_order_relaxed);
+    return cbm_pipeline_php_receiver_type_unindexed(arr, call, registry);
 }
 
 /* A call that needs the language engine, at an exact span that also holds a
@@ -3700,8 +3815,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                 cbm_pipeline_get_nsmap()) ||
             /* MUST match pass_calls.c exactly. */
             (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call,
-                                                      rc->registry)) ||
+             cbm_pipeline_lsp_index_php_receiver_unindexed(&lsp_index, &result->resolved_calls,
+                                                           call, rc->registry)) ||
             /* Same-module bound-receiver suppression (#1128) - see pass_calls.c;
              * the language list is inside the helper, so the two cannot drift. */
             cbm_suppress_same_module_bound_receiver(

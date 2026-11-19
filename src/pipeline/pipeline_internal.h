@@ -2066,6 +2066,13 @@ typedef struct {
     bool exact_complete;
     bool legacy_complete;
     bool has_destructor;
+    /* PHP's unindexed-receiver rows (cbm_pipeline_php_unindexed_row), which
+     * lie below the confidence floor and so in neither table above: the first
+     * row of each key in array order. */
+    CBMHashTable *php_exact;  /* caller|leaf|start:end|origin */
+    CBMHashTable *php_legacy; /* caller|leaf|origin, rows without a span */
+    int php_rows;             /* such rows in the file */
+    bool php_complete;
 } cbm_pipeline_lsp_index_t;
 
 void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolvedCallArray *arr,
@@ -2076,6 +2083,12 @@ const CBMResolvedCall *cbm_pipeline_lsp_index_find(const cbm_pipeline_lsp_index_
                                                    const CBMCall *call, bool allow_tail,
                                                    const cbm_gbuf_t *gbuf,
                                                    const char *project_name);
+/* cbm_pipeline_php_receiver_type_unindexed's answer, from the index where the
+ * index holds it and from that scan where it may not. */
+bool cbm_pipeline_lsp_index_php_receiver_unindexed(const cbm_pipeline_lsp_index_t *idx,
+                                                   const CBMResolvedCallArray *arr,
+                                                   const CBMCall *call,
+                                                   const cbm_registry_t *registry);
 void cbm_pipeline_lsp_index_free(cbm_pipeline_lsp_index_t *idx);
 
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
