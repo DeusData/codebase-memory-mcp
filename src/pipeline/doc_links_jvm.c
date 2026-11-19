@@ -2091,8 +2091,9 @@ static bool jr_scope_open(const jr_ctx_t *c) {
 
 /* True when package `pkg` lies in a directory the indexer never reads, below
  * a package the repository owns. A JVM package is a directory path, and
- * discovery skips some directory names wherever they occur (`env`, `target`,
- * `tmp` ...): what is declared there is on disk, but not in the graph. */
+ * discovery skips some directory names wherever they occur (`target`, `tmp`
+ * ..., and the program source of `deploy`): what is declared there is on disk,
+ * but not in the graph. */
 static bool jr_not_indexed(const jr_index_t *ix, const char *pkg) {
     char buf[JR_KEY_BUF];
     size_t n = strlen(pkg);
@@ -2108,7 +2109,8 @@ static bool jr_not_indexed(const jr_index_t *ix, const char *pkg) {
         }
         char keep = buf[i];
         buf[i] = '\0'; /* buf: the prefix through this segment; buf + seg: the segment */
-        if (owned && cbm_should_skip_dir(buf + seg, (cbm_index_mode_t)ix->mode)) {
+        if (owned && (cbm_should_skip_dir(buf + seg, (cbm_index_mode_t)ix->mode) ||
+                      cbm_discover_config_only_dir(buf + seg))) {
             return true;
         }
         owned = owned || cbm_ht_get(ix->packages, buf) || cbm_ht_get(ix->pkg_prefixes, buf);

@@ -235,4 +235,25 @@ const CBMType* cbm_type_resolve_alias(const CBMType* t);
 const CBMType* cbm_type_substitute(CBMArena* a, const CBMType* t,
     const char** type_params, const CBMType** type_args);
 
+// The identities of the type names one definition's declared types write
+// ("spelling=QN|spelling=QN", CBMLSPDef.type_scope, resolved once in the scope
+// of the file that wrote it by the pipeline's type-scope step), indexed once
+// per definition: a short list (up to 4 identities, most definitions) or a
+// hash table, 12 bytes an entry, so each lookup is bounded work. NULL for a
+// NULL or empty scope (or on allocation failure: the engine then qualifies as
+// before).
+typedef struct cbm_type_scope_index cbm_type_scope_index_t;
+const cbm_type_scope_index_t *cbm_type_scope_index(CBMArena *a, const char *scope);
+
+// The identity of one spelling exactly as the type text writes it (name_len
+// bytes): the QN (owned by the index's arena), or NULL when the def has none
+// for it (the engine then qualifies as before). NULL index = none.
+const char *cbm_type_scope_find(const cbm_type_scope_index_t *ix, const char *name,
+                                size_t name_len);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+// Work counter for the growth tests: bytes hashed and slots probed.
+uint64_t cbm_type_scope_index_test_work(void);
+#endif
+
 #endif // CBM_LSP_TYPE_REP_H

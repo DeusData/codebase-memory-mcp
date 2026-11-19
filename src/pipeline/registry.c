@@ -27,6 +27,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
+#include "discover/discover.h" /* cbm_language_is_build_config */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/arena.h"
@@ -1434,9 +1435,7 @@ static const char *path_basename(const char *path) {
  * file, so a bare-name bind into another language is always a collision
  * (2026-09-16 probe: kernel Makefile targets bound to `sk_psock.eval`). */
 static bool build_config_language(CBMLanguage lang) {
-    return lang == CBM_LANG_MAKEFILE || lang == CBM_LANG_CMAKE || lang == CBM_LANG_YAML ||
-           lang == CBM_LANG_TOML || lang == CBM_LANG_JSON || lang == CBM_LANG_INI ||
-           lang == CBM_LANG_DOCKERFILE;
+    return cbm_language_is_build_config(lang); /* the language registry's list */
 }
 
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
@@ -2154,6 +2153,14 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
                                            const char *suffix, const char **keys, const char **vals,
                                            int map_count) {
     if (!keys || !vals || map_count <= 0) {
+        return empty_result();
+    }
+    /* A wildcard import (`import pkg._`, `import pkg.*`, `from m import *`)
+     * binds no local name: its "*" entry only makes the package
+     * import-reachable for the strategies below. Scala operators are method
+     * calls, so `a * b` has the callee "*" and must not bind to the
+     * wildcard's target (#2360). */
+    if (strcmp(prefix, "*") == 0) {
         return empty_result();
     }
 
