@@ -405,6 +405,11 @@ void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
     arr->items[arr->count++] = imp;
 }
 
+void cbm_scope_events_push(CBMScopeEventArray *arr, CBMArena *a, CBMScopeEvent ev) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = ev;
+}
+
 bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
                                                size_t len) {
     if (!imports || !name) {
@@ -4159,6 +4164,7 @@ static CBMFileResult *extract_file_ex_body(
     cbm_extract_imports(&ctx);
     cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
+    cbm_extract_scope(&ctx);
     cbm_swift_type_imports(result, language);
     if (cbm_lang_needs_cpp_branch_views(language)) {
         extract_cpp_branch_views(&ctx, ts_lang, timeout_micros);

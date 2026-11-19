@@ -113,6 +113,9 @@ typedef struct {
     cbm_inventory_filter_disposition_t disposition;
     cbm_inventory_filter_reason_t reason;
     unsigned roles;
+    /* In or below a config-only directory (cbm_discover_config_only_dir): the
+     * language step keeps the file only for a configuration language. */
+    bool config_only;
     cbm_inventory_path_t excluded_ancestor; /* Otherwise {NULL,0}. */
 } cbm_inventory_filter_row_t;
 
