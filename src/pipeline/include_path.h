@@ -5,23 +5,28 @@
  * include_path.h — the path rule: which repository file an import statement
  * names, for the languages whose imports name files by path (a row below).
  *
- * The rule reads the import's text as a path and finds the one repository file
- * it names: the bases a row allows (the importing file's directory, the
+ * The rule reads the import's text as a path and finds the one indexed file it
+ * names: the bases a row allows (the importing file's directory, the
  * repository root), "exactly one" where two bases could both name a file, and
- * a whole-path tail (the one listed file whose path is the import's path or
- * ends with "/" + it). Existence is read from the run's File nodes and from a
- * listing of every file under the repository named like what a row's import
- * can name (names only, nothing read; `.git` and symbolic links not entered),
- * walked once per run on the first question that needs it. Uniqueness is a
- * statement about the repository, not about what the indexer keeps: a file
- * in a skipped directory counts. A listing that cannot complete answers none.
+ * a whole-path tail (the one indexed file whose path is the import's path or
+ * ends with "/" + it). The universe is the run's indexed file list (the files
+ * discovery kept, on every route), never a walk of the disk: a copy of a file
+ * in an ignored or skipped directory (node_modules, a .gitignore'd tree) is
+ * not seen, so an import only such a copy could satisfy names no file.
+ *
+ * A pick that depends on what the index cannot know is a guess, its own
+ * verdict, never FILE: the file beside a Protobuf importer when several
+ * indexed files end with the path (protoc reads the one under its -I root),
+ * and a Make include from a makefile below the root (GNU make reads relative
+ * paths from the directory it runs in). A guess decides no IMPORTS edge (main
+ * decides) and resolves no include of the shared layer.
  *
  * Lifted from the parked include-scope branch (round 5, include_scope.c
- * section 2): its universe, bases, exactly-one, tail index and import node;
- * the shell and Make evaluated paths and run directories stay there.
+ * section 2): its bases, exactly-one, tail index and import node; the shell
+ * and Make evaluated paths and run directories stay there.
  *
- * Threads: one universe per run. Every question is asked on one thread (the
- * import edges and the sequential import map); nothing is read concurrently.
+ * Threads: a universe is built once, from the file list, before any question,
+ * and is read-only afterwards: a question writes nothing (sealed at creation).
  */
 
 #include "cbm.h"
@@ -41,6 +46,9 @@ typedef struct {
     /* an import whose path does not end in one of `suffixes` is not a path
      * the rule reads (Protobuf: a row that names no `.proto` file) */
     bool path_needs_suffix;
+    /* a virtual path (protoc): `.` and `..` segments, `//` and backslashes are
+     * refused by the tool, so the rule reads no such path */
+    bool virtual_path;
     bool base_file_dir;   /* relative to the importing file's directory */
     bool base_root;       /* relative to the repository root */
     bool exactly_one;     /* two bases naming two files: none */
@@ -55,28 +63,32 @@ bool cbm_include_path_listed_name(const char *name);
 
 typedef struct cbm_include_universe cbm_include_universe_t;
 
-/* A universe for the repository at repo_path; nothing is walked yet. NULL on
- * allocation failure. */
-cbm_include_universe_t *cbm_include_universe_new(const char *repo_path);
+/* The universe of the run's indexed files (`files`, the discovered list of
+ * the run on every route): every file whose name a row's import can name.
+ * Built here, read-only afterwards. NULL on allocation failure. */
+cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, int count);
 void cbm_include_universe_free(cbm_include_universe_t *u);
 
-/* Directory entries the listing read, and tail-index keys made and probed:
- * the counted work of growth tests. */
-uint64_t cbm_include_universe_visited(const cbm_include_universe_t *u);
+/* Tail-index keys made while building: the counted work of growth tests (a
+ * question makes none). */
 uint64_t cbm_include_universe_tail_steps(const cbm_include_universe_t *u);
 
 typedef enum {
     CBM_INCLUDE_PATH_NOT_A_PATH = 0, /* no row, or not a path the row reads: main decides */
-    CBM_INCLUDE_PATH_FILE,           /* names one repository file (path in the buffer) */
+    CBM_INCLUDE_PATH_FILE,           /* names one indexed file (path in the buffer) */
     CBM_INCLUDE_PATH_NONE,           /* a path whose file the rule cannot tell (several, unknown) */
-    /* proven: no repository file is that path or ends with it (whole listing,
-     * letter case ignored, no symbolic link passed) */
+    /* proven: no indexed file is that path or ends with it (letter case
+     * ignored) */
     CBM_INCLUDE_PATH_NO_FILE,
+    /* a file picked by an assumption the index cannot check (path in the
+     * buffer): the include root or the directory make runs in. Not FILE: main
+     * decides the edge, the shared layer takes the include as unresolved. */
+    CBM_INCLUDE_PATH_GUESS,
 } cbm_include_path_verdict_t;
 
 /* The file the import `imp` of the file `rel` names, written into buf.
  * `graph`/`project`: the run's File nodes, which count as existing. */
-cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
+cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t *u,
                                                     const cbm_gbuf_t *graph, const char *project,
                                                     const char *rel, CBMLanguage lang,
                                                     const CBMImport *imp, char *buf, size_t buf_sz);
@@ -84,14 +96,16 @@ cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
 /* The IMPORTS target of an import, for resolve_import_strategies: true when
  * the path rule decides it, with *out the target node (the file's Module node
  * when it has one, else its File node) or NULL: no edge (the named file has no
- * node, or no repository file is named; a symbol is never the target of a
- * statement that names a file). False: main's strategies decide. */
+ * node, or no indexed file is named; a symbol is never the target of a
+ * statement that names a file). False: main's strategies decide (a guess is
+ * not a decision). */
 bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
                               const CBMImport *imp, const cbm_gbuf_node_t **out);
 
-/* The semantic-manifest digest of the listing: every listed path, sorted, or
- * a fixed marker when the listing cannot complete. Walks the repository.
- * Returns 0, or -1 on allocation failure. */
-int cbm_include_path_listing_digest(const char *repo_path, char out[CBM_SHA256_HEX_LEN + 1]);
+/* The semantic-manifest key of the universe: every indexed path a row's
+ * import can name, sorted, hashed. Reads the list only (no disk). Returns 0,
+ * or -1 on allocation failure. */
+int cbm_include_path_inventory_digest(const cbm_file_info_t *files, int count,
+                                      char out[CBM_SHA256_HEX_LEN + 1]);
 
 #endif /* CBM_INCLUDE_PATH_H */

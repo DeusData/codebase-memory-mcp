@@ -570,17 +570,18 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
     }
-    /* The path rule's listing (include_path.h), only where a file of a path
-     * row is discovered: its imports read files no manifest row tracks (a
-     * pruned or ignored `.proto`), and a changed set of those names, anywhere,
-     * must route to a full index. */
+    /* The path rule's universe (include_path.h), only where a file of a path
+     * row is discovered: a changed set of the indexed names a row's import
+     * can name (one added, removed or renamed) changes which file an import
+     * names in files that did not change, so it routes to a full index. A key
+     * of the discovered list: nothing is walked. */
     bool path_row_file = false;
     for (int i = 0; i < file_count && !path_row_file; i++) {
         path_row_file = cbm_include_path_row(files[i].language) != NULL;
     }
     if (rc == 0 && path_row_file) {
         char listing_digest[CBM_SHA256_HEX_LEN + 1];
-        rc = cbm_include_path_listing_digest(repo_path, listing_digest);
+        rc = cbm_include_path_inventory_digest(files, file_count, listing_digest);
         if (rc == 0) {
             rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_INCLUDE_LISTING,
                                               listing_digest, 0, 0);
@@ -3859,7 +3860,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         cbm_log_error("delta.err", "phase", "stored_namespaces");
         goto out;
     }
-    include_universe = cbm_include_universe_new(cbm_pipeline_repo_path(p));
+    include_universe = cbm_include_universe_new(files, file_count);
     cbm_pipeline_ctx_t ctx = {
         .include_universe = include_universe,
         .project_name = project,
@@ -4620,7 +4621,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_path_alias_collection_t *path_aliases =
         cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
-    cbm_include_universe_t *include_universe = cbm_include_universe_new(cbm_pipeline_repo_path(p));
+    cbm_include_universe_t *include_universe = cbm_include_universe_new(files, file_count);
 
     cbm_pipeline_ctx_t ctx = {
         .include_universe = include_universe,

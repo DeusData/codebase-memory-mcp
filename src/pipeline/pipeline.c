@@ -4561,9 +4561,8 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * when no usable configs are found — non-TS projects pay nothing. */
     path_aliases =
         cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
-    /* The path rule's universe (include_path.h): nothing is walked until an
-     * import of a path row asks. */
-    include_universe = cbm_include_universe_new(p->repo_path);
+    /* The path rule's universe (include_path.h): the run's indexed files. */
+    include_universe = cbm_include_universe_new(files, file_count);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {

@@ -23,19 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
-#include <dirent.h> /* DT_LNK */
-#endif
 
-/* A directory entry that is a symbolic link: compat_fs passes the POSIX
- * d_type (DT_LNK is 10 in every POSIX libc) and 0 on Windows. */
-#if defined(DT_LNK)
-#define IP_DT_LNK DT_LNK
-#else
-#define IP_DT_LNK 10
-#endif
-
-enum { IP_PATH_MAX = 1024 };
+enum { IP_PATH_MAX = 1024, IP_UP_LEN = 3 /* "../" */ };
 
 /* ── Rows ────────────────────────────────────────────────────────────── */
 
@@ -44,16 +33,20 @@ static const char *const IP_MAKE_SUFFIXES[] = {".mk", ".make", NULL};
 static const char *const IP_MAKE_PREFIXES[] = {"Makefile", "makefile", "GNUmakefile", NULL};
 
 static const cbm_include_path_row_t IP_ROWS[] = {
-    /* Protobuf: `import "a/b.proto"` names the one repository file that is
-     * that path or ends with it, else the file beside the importer. A row
-     * that names no `.proto` file is not read as a path. */
+    /* Protobuf: `import "a/b.proto"` names the one indexed file that is that
+     * path or ends with it. When several do, the file beside the importer is
+     * only a guess (protoc reads the one under its -I root). A row that names
+     * no `.proto` file, or a path protoc refuses, is not read as a path. */
     {.lang = CBM_LANG_PROTOBUF,
      .suffixes = IP_PROTO_SUFFIXES,
      .path_needs_suffix = true,
+     .virtual_path = true,
      .base_file_dir = true,
      .whole_path_tail = true},
     /* Make: `include x.mk` names the file from the makefile's directory or
-     * the repository root, and only when exactly one of them is a file. */
+     * the repository root, and only when exactly one of them is a file. Below
+     * the root that is a guess: GNU make reads a relative include from the
+     * directory it runs in, which the index does not know. */
     {.lang = CBM_LANG_MAKEFILE,
      .suffixes = IP_MAKE_SUFFIXES,
      .prefixes = IP_MAKE_PREFIXES,
@@ -163,7 +156,7 @@ static bool ip_dirname(char *out, size_t sz, const char *rel) {
     return true;
 }
 
-/* ── The universe and its listing ────────────────────────────────────── */
+/* ── The universe: the run's indexed files ───────────────────────────── */
 
 typedef struct {
     const char *path; /* the one path with this tail, or the first of several */
@@ -171,48 +164,17 @@ typedef struct {
 } ip_tail_t;
 
 struct cbm_include_universe {
-    char *root;
     CBMArena arena;
     CBMHashTable *listed; /* rel -> non-NULL */
     CBMHashTable *tails;  /* every path suffix on a '/' boundary -> ip_tail_t */
     /* the same suffixes in lower case: a path that matches one only when case
      * is ignored is not known absent (a case-insensitive disk opens it) */
     CBMHashTable *ftails;
-    const char **paths; /* listed paths, in listing order */
-    size_t npaths;
-    size_t cap_paths;
-    bool did_list;
+    /* false when an indexed path did not fit the rule's buffers: then no
+     * uniqueness and no absence is proven */
     bool complete;
-    /* the walk met a symbolic link (not entered): a path under one is not
-     * known absent */
-    bool saw_link;
-    uint64_t visited;    /* directory entries read by the listing */
-    uint64_t tail_steps; /* suffix keys made and looked up */
+    uint64_t tail_steps; /* suffix keys made while building */
 };
-
-cbm_include_universe_t *cbm_include_universe_new(const char *repo_path) {
-    if (!repo_path || !repo_path[0]) {
-        return NULL;
-    }
-    cbm_include_universe_t *u = cbm_alloc(CBM_MEM_CLASS_OTHER, sizeof(*u));
-    if (!u) {
-        return NULL;
-    }
-    memset(u, 0, sizeof(*u));
-    cbm_arena_init(&u->arena);
-    size_t n = strlen(repo_path);
-    while (n > 1 && repo_path[n - 1] == '/') {
-        n--;
-    }
-    u->root = cbm_arena_alloc(&u->arena, n + 1);
-    if (!u->root) {
-        cbm_include_universe_free(u);
-        return NULL;
-    }
-    memcpy(u->root, repo_path, n);
-    u->root[n] = '\0';
-    return u;
-}
 
 void cbm_include_universe_free(cbm_include_universe_t *u) {
     if (!u) {
@@ -227,33 +189,35 @@ void cbm_include_universe_free(cbm_include_universe_t *u) {
     if (u->ftails) {
         cbm_ht_free(u->ftails);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, u->paths);
     cbm_arena_destroy(&u->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, u);
-}
-
-uint64_t cbm_include_universe_visited(const cbm_include_universe_t *u) {
-    return u ? u->visited : 0;
 }
 
 uint64_t cbm_include_universe_tail_steps(const cbm_include_universe_t *u) {
     return u ? u->tail_steps : 0;
 }
 
-/* "a/B.proto" -> "a/b.proto" (ASCII), in the universe's arena. */
-static const char *ip_fold(cbm_include_universe_t *u, const char *p) {
-    char *f = cbm_arena_strdup(&u->arena, p);
-    for (char *c = f; c && *c; c++) {
-        if (*c >= 'A' && *c <= 'Z') {
-            *c = (char)(*c - 'A' + 'a');
-        }
+/* "a/B.proto" -> "a/b.proto" (ASCII) into out; false when it does not fit. */
+static bool ip_fold_into(char *out, size_t sz, const char *p) {
+    size_t n = strlen(p);
+    if (n >= sz) {
+        return false;
     }
-    return f;
+    for (size_t i = 0; i <= n; i++) {
+        char c = p[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    return true;
 }
 
-/* One listed path: into the set, the order, and the suffix indexes. */
-static bool ip_list_add(cbm_include_universe_t *u, const char *rel) {
-    const char *folded = ip_fold(u, rel);
+/* One indexed path: into the set and the suffix indexes (building only). */
+static bool ip_list_add(cbm_include_universe_t *u, const char *path) {
+    const char *rel = cbm_arena_strdup(&u->arena, path);
+    char fold[IP_PATH_MAX];
+    if (!rel || !ip_fold_into(fold, sizeof(fold), rel)) {
+        return false;
+    }
+    const char *folded = cbm_arena_strdup(&u->arena, fold);
     if (!folded) {
         return false;
     }
@@ -262,20 +226,6 @@ static bool ip_list_add(cbm_include_universe_t *u, const char *rel) {
         const char *slash = strchr(p, '/');
         p = slash ? slash + SKIP_ONE : NULL;
     }
-    if (u->npaths >= u->cap_paths) {
-        size_t ncap = u->cap_paths ? u->cap_paths * PAIR_LEN : CBM_SZ_256;
-        const char **np = cbm_alloc(CBM_MEM_CLASS_OTHER, ncap * sizeof(*np));
-        if (!np) {
-            return false;
-        }
-        if (u->npaths) {
-            memcpy((void *)np, (const void *)u->paths, u->npaths * sizeof(*np));
-        }
-        cbm_free(CBM_MEM_CLASS_OTHER, (void *)u->paths);
-        u->paths = np;
-        u->cap_paths = ncap;
-    }
-    u->paths[u->npaths++] = rel;
     cbm_ht_set(u->listed, rel, (void *)rel);
     for (const char *p = rel; p;) {
         u->tail_steps++;
@@ -296,145 +246,66 @@ static bool ip_list_add(cbm_include_universe_t *u, const char *rel) {
     return true;
 }
 
-/* Push dir onto the walk's stack (heap, grown by doubling). */
-static bool ip_push_dir(char ***stack, int *top, int *cap, char *dir) {
-    if (*top >= *cap) {
-        int ncap = *cap * PAIR_LEN;
-        char **ns = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)ncap * sizeof(*ns));
-        if (!ns) {
-            return false;
-        }
-        memcpy((void *)ns, (const void *)*stack, (size_t)*top * sizeof(*ns));
-        cbm_free(CBM_MEM_CLASS_OTHER, (void *)*stack);
-        *stack = ns;
-        *cap = ncap;
+cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, int count) {
+    cbm_include_universe_t *u = cbm_alloc(CBM_MEM_CLASS_OTHER, sizeof(*u));
+    if (!u) {
+        return NULL;
     }
-    (*stack)[(*top)++] = dir;
-    return true;
-}
-
-/* One directory of the walk: its listed files kept, its subdirectories
- * pushed; false when the listing cannot be whole. */
-static bool ip_list_dir(cbm_include_universe_t *u, const char *dir, char ***stack, int *top,
-                        int *cap) {
-    char abs[IP_PATH_MAX * PAIR_LEN];
-    if (snprintf(abs, sizeof(abs), "%s%s%s", u->root, dir[0] ? "/" : "", dir) >= (int)sizeof(abs)) {
-        return false;
-    }
-    cbm_dir_t *d = cbm_opendir(abs);
-    if (!d) {
-        return false;
-    }
-    bool ok = true;
-    cbm_dirent_t *ent;
-    while (ok && (ent = cbm_readdir(d)) != NULL) {
-        const char *name = ent->name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, ".git") == 0) {
-            continue;
-        }
-        u->visited++;
-        /* a symbolic link is not entered: it may leave the repository, and
-         * what it points at inside is listed anyway */
-        if (ent->d_type == IP_DT_LNK) {
-            u->saw_link = true;
-            continue;
-        }
-        if (!ent->is_dir && !cbm_include_path_listed_name(name)) {
-            continue;
-        }
-        char *rel = dir[0] ? cbm_arena_sprintf(&u->arena, "%s/%s", dir, name)
-                           : cbm_arena_strdup(&u->arena, name);
-        if (!rel || strlen(rel) >= IP_PATH_MAX) {
-            ok = false; /* a path the rule cannot hold: the listing is not whole */
-            break;
-        }
-        if (!ent->is_dir) {
-            ok = ip_list_add(u, rel);
-            continue;
-        }
-        char child[IP_PATH_MAX * PAIR_LEN];
-        cbm_path_info_t info;
-        if (snprintf(child, sizeof(child), "%s/%s", abs, name) >= (int)sizeof(child) ||
-            cbm_path_info_utf8(child, &info) != CBM_PATH_INFO_OK) {
-            ok = false;
-            break;
-        }
-        if (info.is_symlink) { /* a junction (Windows) is not entered either */
-            u->saw_link = true;
-        } else {
-            ok = ip_push_dir(stack, top, cap, rel);
-        }
-    }
-    cbm_closedir(d);
-    return ok;
-}
-
-/* The listing: an explicit stack of directories, each read once. */
-static void ip_list(cbm_include_universe_t *u) {
-    u->did_list = true;
+    memset(u, 0, sizeof(*u));
+    cbm_arena_init(&u->arena);
     u->listed = cbm_ht_create(CBM_SZ_4K);
     u->tails = cbm_ht_create(CBM_SZ_4K);
     u->ftails = cbm_ht_create(CBM_SZ_4K);
     if (!u->listed || !u->tails || !u->ftails) {
-        return;
+        cbm_include_universe_free(u);
+        return NULL;
     }
-    int cap = CBM_SZ_64;
-    int top = 0;
-    char **stack = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)cap * sizeof(*stack));
-    bool ok = stack != NULL;
-    if (ok) {
-        stack[top++] = cbm_arena_strdup(&u->arena, "");
-        ok = stack[0] != NULL;
+    u->complete = true;
+    for (int i = 0; files && i < count; i++) {
+        const char *rel = files[i].rel_path;
+        if (!rel || !rel[0]) {
+            continue;
+        }
+        const char *base = strrchr(rel, '/');
+        base = base ? base + SKIP_ONE : rel;
+        if (!cbm_include_path_listed_name(base) || cbm_ht_get(u->listed, rel)) {
+            continue; /* a name no row's import names, or listed already */
+        }
+        if (strlen(rel) >= IP_PATH_MAX) {
+            u->complete = false; /* a path the rule cannot hold */
+            continue;
+        }
+        if (!ip_list_add(u, rel)) {
+            cbm_include_universe_free(u);
+            return NULL;
+        }
     }
-    while (ok && top > 0) {
-        const char *dir = stack[--top];
-        ok = ip_list_dir(u, dir, &stack, &top, &cap);
-    }
-    cbm_free(CBM_MEM_CLASS_OTHER, (void *)stack);
-    u->complete = ok;
-    char b[CBM_SZ_32];
-    snprintf(b, sizeof(b), "%llu", (unsigned long long)u->visited);
-    if (!ok) {
-        cbm_log_warn("include_path.listing_incomplete", "visited", b, "effect",
-                     "answers_needing_it_abstain");
-    } else {
-        cbm_log_info("include_path.listing", "visited", b);
-    }
-}
-
-static bool ip_listing(cbm_include_universe_t *u) {
-    if (!u->did_list) {
-        ip_list(u);
-    }
-    return u->complete;
+    return u;
 }
 
 enum { IP_EXISTS_NO = 0, IP_EXISTS_YES = 1, IP_EXISTS_UNKNOWN = 2 };
 
-/* A file of the run (a File node), or a listed one; unknown when the listing
- * a listed name needs cannot complete. */
-static int ip_exists(cbm_include_universe_t *u, const cbm_gbuf_t *graph, const char *project,
+/* A file of the run (a File node), or an indexed one; unknown when the
+ * universe is not whole for a name a row keeps. */
+static int ip_exists(const cbm_include_universe_t *u, const cbm_gbuf_t *graph, const char *project,
                      const char *rel) {
     if (graph && project && cbm_pipeline_file_node(graph, project, rel)) {
         return IP_EXISTS_YES;
     }
+    if (cbm_ht_get(u->listed, rel)) {
+        return IP_EXISTS_YES;
+    }
     const char *base = strrchr(rel, '/');
     base = base ? base + SKIP_ONE : rel;
-    if (!cbm_include_path_listed_name(base)) {
-        return IP_EXISTS_NO; /* not a file of the run, and named like nothing the listing keeps */
-    }
-    if (!ip_listing(u)) {
-        return IP_EXISTS_UNKNOWN;
-    }
-    return cbm_ht_get(u->listed, rel) ? IP_EXISTS_YES : IP_EXISTS_NO;
+    return u->complete || !cbm_include_path_listed_name(base) ? IP_EXISTS_NO : IP_EXISTS_UNKNOWN;
 }
 
 /* Of the candidates, the one that names a file; NULL when none does, when
  * (exactly one required) several do, or when existence is unknown for a
  * candidate that decides the answer. */
-static const char *ip_pick(cbm_include_universe_t *u, const cbm_gbuf_t *graph, const char *project,
-                           char cands[][IP_PATH_MAX], int n, bool exactly_one, char *buf,
-                           size_t buf_sz) {
+static const char *ip_pick(const cbm_include_universe_t *u, const cbm_gbuf_t *graph,
+                           const char *project, char cands[][IP_PATH_MAX], int n, bool exactly_one,
+                           char *buf, size_t buf_sz) {
     const char *hit = NULL;
     for (int i = 0; i < n; i++) {
         bool dup = false;
@@ -467,15 +338,15 @@ static const char *ip_pick(cbm_include_universe_t *u, const cbm_gbuf_t *graph, c
     return buf;
 }
 
-/* The one listed file whose repository path is `key` or ends with "/" + key. */
-static const char *ip_unique_tail(cbm_include_universe_t *u, const cbm_include_path_row_t *row,
-                                  const char *key, char *buf, size_t buf_sz) {
+/* The one indexed file whose repository path is `key` or ends with "/" + key. */
+static const char *ip_unique_tail(const cbm_include_universe_t *u,
+                                  const cbm_include_path_row_t *row, const char *key, char *buf,
+                                  size_t buf_sz) {
     const char *base = strrchr(key, '/');
     base = base ? base + SKIP_ONE : key;
-    if (!base[0] || !ip_row_names(row, base) || !ip_listing(u)) {
-        return NULL; /* a name the listing does not keep, or no whole listing */
+    if (!base[0] || !ip_row_names(row, base) || !u->complete) {
+        return NULL; /* a name the universe does not keep, or not whole */
     }
-    u->tail_steps++;
     const ip_tail_t *e = cbm_ht_get(u->tails, key);
     if (!e || e->n != SKIP_ONE || strlen(e->path) >= buf_sz) {
         return NULL; /* none, or two files end with it */
@@ -484,22 +355,44 @@ static const char *ip_unique_tail(cbm_include_universe_t *u, const cbm_include_p
     return buf;
 }
 
-/* Proven that no repository file is `key` or ends with "/" + key: the whole
- * listing holds none, none when letter case is ignored, and the walk passed
- * no symbolic link a path could hide under. */
-static bool ip_absent_tail(cbm_include_universe_t *u, const cbm_include_path_row_t *row,
+/* Proven that no indexed file is `key` or ends with "/" + key, also when
+ * letter case is ignored. */
+static bool ip_absent_tail(const cbm_include_universe_t *u, const cbm_include_path_row_t *row,
                            const char *key) {
     const char *base = strrchr(key, '/');
     base = base ? base + SKIP_ONE : key;
-    if (!base[0] || !ip_row_names(row, base) || !ip_listing(u) || u->saw_link) {
+    char folded[IP_PATH_MAX];
+    if (!base[0] || !ip_row_names(row, base) || !u->complete ||
+        !ip_fold_into(folded, sizeof(folded), key)) {
         return false;
     }
-    u->tail_steps++;
-    const char *folded = ip_fold(u, key);
-    return folded && !cbm_ht_get(u->tails, key) && !cbm_ht_get(u->ftails, folded);
+    return !cbm_ht_get(u->tails, key) && !cbm_ht_get(u->ftails, folded);
 }
 
-cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
+/* A path protoc accepts as a virtual path: no `.` or `..` segment, no empty
+ * segment (`//`), no backslash. */
+static bool ip_virtual_ok(const char *p) {
+    if (strchr(p, '\\')) {
+        return false;
+    }
+    for (const char *s = p; *s;) {
+        size_t sl = strcspn(s, "/");
+        if (sl == 0 || (sl == SKIP_ONE && s[0] == '.') ||
+            (sl == PAIR_LEN && s[0] == '.' && s[1] == '.')) {
+            return false;
+        }
+        s += sl;
+        if (*s == '/') {
+            s++;
+            if (!*s) {
+                return false; /* a trailing slash: an empty segment */
+            }
+        }
+    }
+    return true;
+}
+
+cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t *u,
                                                     const cbm_gbuf_t *graph, const char *project,
                                                     const char *rel, CBMLanguage lang,
                                                     const CBMImport *imp, char *buf,
@@ -519,11 +412,19 @@ cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
         }
     }
     char dir[IP_PATH_MAX];
-    if (!u || p[0] == '/' || strpbrk(p, "$`") || !ip_dirname(dir, sizeof(dir), rel)) {
+    if (!u || p[0] == '/' || strpbrk(p, "$`") || (row->virtual_path && !ip_virtual_ok(p)) ||
+        !ip_dirname(dir, sizeof(dir), rel)) {
         return CBM_INCLUDE_PATH_NONE; /* a path the rule cannot read */
     }
+    /* The tail key: the path after its leading `./` and `../` segments (a
+     * Make path climbing out of its directory, from any directory make runs
+     * in, still names a file that ends with the rest). */
+    const char *kp = p;
+    while (strncmp(kp, "./", PAIR_LEN) == 0 || strncmp(kp, "../", IP_UP_LEN) == 0) {
+        kp += kp[1] == '.' ? IP_UP_LEN : PAIR_LEN;
+    }
     char key[IP_PATH_MAX];
-    bool keyed = ip_join(key, sizeof(key), "", p);
+    bool keyed = ip_join(key, sizeof(key), "", kp);
     if (row->whole_path_tail && keyed && ip_unique_tail(u, row, key, buf, buf_sz)) {
         return CBM_INCLUDE_PATH_FILE;
     }
@@ -536,11 +437,15 @@ cbm_include_path_verdict_t cbm_include_path_resolve(cbm_include_universe_t *u,
         n++;
     }
     if (ip_pick(u, graph, project, cands, n, row->exactly_one, buf, buf_sz)) {
-        return CBM_INCLUDE_PATH_FILE;
+        /* A tail row gets here only when several indexed files end with the
+         * path: the one beside the importer is an assumption about the include
+         * root. Below the root, a base is an assumption about the directory
+         * the tool runs in. Only a makefile at the root decides. */
+        return row->whole_path_tail || dir[0] ? CBM_INCLUDE_PATH_GUESS : CBM_INCLUDE_PATH_FILE;
     }
-    /* Proof of "no file": no repository file is the path or ends with it, so
-     * no include root or run directory inside the repository can supply one
-     * (absence at the bases alone would not do: another directory may). */
+    /* Proof of "no file": no indexed file is the path or ends with it, so no
+     * include root or run directory inside the index can supply one (absence
+     * at the bases alone would not do: another directory may). */
     return keyed && ip_absent_tail(u, row, key) ? CBM_INCLUDE_PATH_NO_FILE : CBM_INCLUDE_PATH_NONE;
 }
 
@@ -585,35 +490,33 @@ static int ip_strcmp_ptr(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-int cbm_include_path_listing_digest(const char *repo_path, char out[CBM_SHA256_HEX_LEN + 1]) {
-    cbm_include_universe_t *u = cbm_include_universe_new(repo_path);
-    if (!u) {
+int cbm_include_path_inventory_digest(const cbm_file_info_t *files, int count,
+                                      char out[CBM_SHA256_HEX_LEN + 1]) {
+    const char **sorted =
+        count > 0 ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(*sorted)) : NULL;
+    if (count > 0 && !sorted) {
         return CBM_NOT_FOUND;
     }
-    ip_list(u);
+    size_t n = 0;
+    for (int i = 0; i < count; i++) {
+        const char *rel = files[i].rel_path;
+        const char *base = rel ? strrchr(rel, '/') : NULL;
+        base = base ? base + SKIP_ONE : rel;
+        if (rel && rel[0] && cbm_include_path_listed_name(base)) {
+            sorted[n++] = rel;
+        }
+    }
+    if (n > SKIP_ONE) {
+        qsort((void *)sorted, n, sizeof(*sorted), ip_strcmp_ptr);
+    }
     cbm_sha256_ctx sha;
     cbm_sha256_init(&sha);
-    int rc = 0;
-    if (!u->complete) {
-        static const char marker[] = "include-listing-incomplete-v1";
-        cbm_sha256_update(&sha, marker, sizeof(marker) - SKIP_ONE);
-    } else {
-        const char **sorted =
-            u->npaths ? cbm_alloc(CBM_MEM_CLASS_OTHER, u->npaths * sizeof(*sorted)) : NULL;
-        if (u->npaths && !sorted) {
-            rc = CBM_NOT_FOUND;
-        }
-        for (size_t i = 0; sorted && i < u->npaths; i++) {
-            sorted[i] = u->paths[i];
-        }
-        if (sorted && u->npaths > SKIP_ONE) {
-            qsort((void *)sorted, u->npaths, sizeof(*sorted), ip_strcmp_ptr);
-        }
-        for (size_t i = 0; sorted && i < u->npaths; i++) {
-            cbm_sha256_update(&sha, sorted[i], strlen(sorted[i]) + SKIP_ONE);
-        }
-        cbm_free(CBM_MEM_CLASS_OTHER, (void *)sorted);
+    static const char version[] = "include-inventory-v1";
+    cbm_sha256_update(&sha, version, sizeof(version));
+    for (size_t i = 0; i < n; i++) {
+        cbm_sha256_update(&sha, sorted[i], strlen(sorted[i]) + SKIP_ONE);
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)sorted);
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&sha, digest);
     static const char hex[] = "0123456789abcdef";
@@ -622,6 +525,5 @@ int cbm_include_path_listing_digest(const char *repo_path, char out[CBM_SHA256_H
         out[i * PAIR_LEN + SKIP_ONE] = hex[digest[i] & 0x0f];
     }
     out[CBM_SHA256_HEX_LEN] = '\0';
-    cbm_include_universe_free(u);
-    return rc;
+    return 0;
 }
