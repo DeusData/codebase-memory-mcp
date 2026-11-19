@@ -360,6 +360,27 @@ database:
   host: localhost
 YAMLEOF
 
+# An Ansible playbook naming a role, under deploy/ (walked for its
+# configuration files). The playbook extracts no imports of its own: its role
+# edge comes from the Ansible pass, so the semantic pass builds this file's
+# import map from those edges (its slow path), on the sequential route a
+# project this small always takes. Those keys must come from the memory core
+# like the fast path's: libc copies released through the core crashed the
+# index worker of the PRODUCTION build (mimalloc core, macOS), which the unit
+# runner (libc core) cannot see. Phase 2 must report "indexed"; Phase 3 checks
+# that the role import was drawn, so the slow path was reached.
+mkdir -p "$TMPDIR/deploy/roles/web/tasks"
+cat > "$TMPDIR/deploy/site.yml" << 'YAMLEOF'
+- hosts: web
+  roles:
+    - web
+YAMLEOF
+cat > "$TMPDIR/deploy/roles/web/tasks/main.yml" << 'YAMLEOF'
+- name: Install
+  apt:
+    name: nginx
+YAMLEOF
+
 # C++ crash reproduction (#424): a large, templated C++ header. The vendored
 # tree-sitter runtime previously corrupted the heap and SEGV'd mid-parse on
 # large templated C++ in the PRODUCTION build (MI_OVERRIDE=1) — most reliably on
@@ -445,6 +466,23 @@ if [ "$TOTAL" -lt 1 ]; then
   echo "FAIL: search_graph for 'compute' returned 0 results"
   exit 1
 fi
+
+# 3a-ansible: the playbook under deploy/ (Phase 2) drew its role import, so
+# the semantic pass built that file's import map on its slow path. Both ends
+# are matched by name (the playbook's File node, the role's Folder node), like
+# every other check here, so no path separator or prefix enters the match.
+if ! ANSIBLE_IMPORTS=$(cli query_graph --project "$PROJECT" --query \
+    "MATCH (a:File)-[r:IMPORTS]->(b:Folder) WHERE a.name = 'site.yml' AND b.name = 'web' RETURN b.name"); then
+  echo "FAIL: query_graph for the Ansible role import exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
+ANSIBLE_ROWS=$(echo "$ANSIBLE_IMPORTS" | sed -n 's/^total: //p' | head -1)
+ANSIBLE_ROWS=${ANSIBLE_ROWS:-0}
+if [ "$ANSIBLE_ROWS" -lt 1 ]; then
+  echo "FAIL: the Ansible playbook under deploy/ has no role import"
+  echo "$ANSIBLE_IMPORTS"
+  exit 1
+fi
+echo "OK: Ansible playbook under deploy/ imports its role"
 
 echo ""
 echo "=== Phase 3z: structuredContent carries structure or is absent — never {} and never a copy (#1375, #1522) ==="
