@@ -4159,6 +4159,14 @@ static void apply_phpdoc_class_tags(PHPLSPContext *ctx, CBMTypeRegistry *reg, co
     }
 }
 
+/* A node spelling a trait name, `namespace\T` (relative_name) included: kept
+ * in place so the trait's ordinal matches the declaration's, whose spelling
+ * the extractor qualified (php_settle_declared). */
+static bool php_trait_name_node(const char *k) {
+    return strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0 ||
+           strcmp(k, "relative_name") == 0;
+}
+
 /* A trait use in a class body (`use A, B { A::m insteadof B; B::m as m2; }`)
  * read as facts of the class: each trait a supertype, resolved with the file's
  * `use` map; each `insteadof` an exclusion of the excluded trait's member; each
@@ -4171,7 +4179,7 @@ static void php_read_trait_use(PHPLSPContext *ctx, php_class_fields_t *f, TSNode
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_named_child(use_decl, i);
         const char *k = ts_node_type(c);
-        if (strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0) {
+        if (php_trait_name_node(k)) {
             char *tn = php_node_text(ctx, c);
             php_super_add(ctx->arena, f, CBM_SUPER_TRAIT,
                           tn ? php_resolve_class_name(ctx, tn) : NULL);
@@ -4201,7 +4209,7 @@ static void php_read_trait_use(PHPLSPContext *ctx, php_class_fields_t *f, TSNode
                     for (uint32_t s = 0; s < sc; s++) {
                         TSNode q = ts_node_named_child(p, s);
                         const char *qk = ts_node_type(q);
-                        if (strcmp(qk, "name") != 0 && strcmp(qk, "qualified_name") != 0) {
+                        if (!php_trait_name_node(qk)) {
                             continue;
                         }
                         if (!trait_text) {
@@ -4210,7 +4218,7 @@ static void php_read_trait_use(PHPLSPContext *ctx, php_class_fields_t *f, TSNode
                             method_text = php_node_text(ctx, q);
                         }
                     }
-                } else if (strcmp(pk, "name") == 0 || strcmp(pk, "qualified_name") == 0) {
+                } else if (php_trait_name_node(pk)) {
                     char *t = php_node_text(ctx, p);
                     if (instead) {
                         /* One excluded trait: its `method_text` gives way. */

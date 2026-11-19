@@ -617,6 +617,7 @@ TEST(phpmw_extractor_qualifies_trait_names) {
                       "use App\\Traits\\{Greets, Waves as W};\n"
                       "use function App\\Helpers\\Local;\n"
                       "class M { use HasThing, Greets, W, Local, Sub\\Deep; }\n"
+                      "class R { use namespace\\Sub\\Rel, NameSpace\\Rel2; }\n"
                       "namespace Other;\n"
                       "class N { use HasThing; }\n";
     CBMFileResult *r =
@@ -624,16 +625,24 @@ TEST(phpmw_extractor_qualifies_trait_names) {
     ASSERT_NOT_NULL(r);
     const CBMDefTypeFacts *mf = NULL;
     const CBMDefTypeFacts *nf = NULL;
+    const CBMDefTypeFacts *rf = NULL;
     for (int i = 0; i < r->defs.count; i++) {
         const CBMDefinition *d = &r->defs.items[i];
         if (d->name && strcmp(d->name, "M") == 0) {
             mf = d->type_facts;
         } else if (d->name && strcmp(d->name, "N") == 0) {
             nf = d->type_facts;
+        } else if (d->name && strcmp(d->name, "R") == 0) {
+            rf = d->type_facts;
         }
     }
     ASSERT_NOT_NULL(mf);
     ASSERT_NOT_NULL(nf);
+    ASSERT_NOT_NULL(rf);
+    /* `namespace\X` is relative to the current namespace, the keyword in any
+     * case (review 2, C8: php resolves it to App\Q\Sub\Rel there). */
+    ASSERT_STR_EQ(rf->mixins[0], "\\App\\Models\\Sub\\Rel");
+    ASSERT_STR_EQ(rf->mixins[1], "\\App\\Models\\Rel2");
     ASSERT_STR_EQ(mf->mixins[0], "\\Vendor\\Pkg\\HasThing");
     ASSERT_STR_EQ(mf->mixins[1], "\\App\\Traits\\Greets");
     ASSERT_STR_EQ(mf->mixins[2], "\\App\\Traits\\Waves");
@@ -669,9 +678,45 @@ TEST(phpmw_extractor_qualifies_trait_names) {
     PASS();
 }
 
+/* `use namespace\Sub\Rel` names App\Q\Sub\Rel, never the App\Q\Rel beside it
+ * (review 2, C8; php: ZRel), from a caller in the class's own file (the
+ * engine's own reader) and in another file (the extractor's names). Both
+ * callers' files import the traits and ZRel, as fx/qual's XCall does: what
+ * a file sees of other files' types comes through its imports. */
+TEST(phpmw_relative_trait_name_through_the_pipeline) {
+    static const PmwFile f[] = {
+        {"src/Q.php", "<?php\nnamespace App\\Q;\nuse App\\Q\\Rel as QRel;\n"
+                      "use App\\Q\\Sub\\Rel as SubRel;\nuse App\\Z\\ZRel;\n"
+                      "class C8 { use namespace\\Sub\\Rel; }\n"
+                      "class QCall { public function h8(C8 $x) { return $x->m()->spin(); } }\n"},
+        {"src/QDecoy.php",
+         "<?php\nnamespace App\\Q;\n"
+         "trait Rel { public function m(): \\App\\Z\\ZDecoy { return new \\App\\Z\\ZDecoy; } }\n"},
+        {"src/QSub.php",
+         "<?php\nnamespace App\\Q\\Sub;\n"
+         "trait Rel { public function m(): \\App\\Z\\ZRel { return new \\App\\Z\\ZRel; } }\n"},
+        {"src/Z.php", "<?php\nnamespace App\\Z;\n"
+                      "class ZRel { public function spin() { return 'ZRel'; } }\n"
+                      "class ZDecoy { public function spin() { return 'ZDecoy'; } }\n"},
+        {"src/Http/XCall.php",
+         "<?php\nnamespace App\\Http;\nuse App\\Q\\C8;\nuse App\\Q\\Rel as QRel;\n"
+         "use App\\Q\\Sub\\Rel as SubRel;\nuse App\\Z\\ZRel;\n"
+         "class XCall { public function g8(C8 $x) { return $x->m()->spin(); } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"XCall.g8", "ZRel.spin", true, true},
+        {"QCall.h8", "ZRel.spin", true, true},
+        {"XCall.g8", "ZDecoy.spin", false, false},
+        {"QCall.h8", "ZDecoy.spin", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 5, want, 4), 0);
+    PASS();
+}
+
 SUITE(php_member_walk) {
     RUN_TEST(phpmw_extractor_records_kinds_traits_rules);
     RUN_TEST(phpmw_extractor_qualifies_trait_names);
+    RUN_TEST(phpmw_relative_trait_name_through_the_pipeline);
     RUN_TEST(phpmw_trait_resolved_where_written);
     RUN_TEST(phpmw_trait_in_a_later_namespace);
     RUN_TEST(phpmw_requirement_beside_vendor_trait);

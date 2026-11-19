@@ -4842,6 +4842,11 @@ static const char *php_fq_class(CBMArena *a, const php_names_t *n, const char *s
     }
     const char *bs = strchr(spelled, '\\');
     size_t seg = bs ? (size_t)(bs - spelled) : strlen(spelled);
+    if (bs && seg == 9 && php_word_at(spelled, bs, "namespace")) {
+        /* `namespace\Sub\X`: relative to the current namespace, never an alias. */
+        return n->ns && n->ns[0] ? cbm_arena_sprintf(a, "\\%s%s", n->ns, bs)
+                                 : cbm_arena_sprintf(a, "%s", bs);
+    }
     for (int i = n->count - 1; i >= 0; i--) {
         if (php_seg_eq(n->alias[i], spelled, seg)) {
             return cbm_arena_sprintf(a, "\\%s%s", n->target[i], bs ? bs : "");
@@ -4861,6 +4866,13 @@ static void php_rule_append(CBMArena *a, char **rules, const char *kind, const c
                     : cbm_arena_sprintf(a, "%s %s %s %s", kind, t, method, other);
 }
 
+/* A node spelling a class or trait name: `T`, `A\T`, `\A\T`, or
+ * `namespace\T` (relative_name). */
+static bool php_class_name_node(const char *k) {
+    return strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0 ||
+           strcmp(k, "relative_name") == 0;
+}
+
 /* `T::m` of a class_constant_access_expression: its two name parts. */
 static void php_scoped_member(CBMArena *a, TSNode n, const char *source, char **trait,
                               char **method) {
@@ -4868,7 +4880,7 @@ static void php_scoped_member(CBMArena *a, TSNode n, const char *source, char **
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_named_child(n, i);
         const char *k = ts_node_type(c);
-        if (strcmp(k, "name") != 0 && strcmp(k, "qualified_name") != 0) {
+        if (!php_class_name_node(k)) {
             continue;
         }
         if (!*trait) {
@@ -4901,7 +4913,7 @@ static void php_use_list_rules(CBMArena *a, TSNode list, const char *source, cha
                 if (trait) {
                     trait = (char *)php_fq_class(a, names, trait);
                 }
-            } else if (strcmp(pk, "name") == 0 || strcmp(pk, "qualified_name") == 0) {
+            } else if (php_class_name_node(pk)) {
                 char *t = cbm_node_text(a, p, source);
                 if (instead) {
                     /* one excluded trait */
@@ -5009,7 +5021,7 @@ static void extract_php_member_bases(CBMExtractCtx *ctx, CBMArena *a, TSNode nod
                 php_use_list_rules(a, c, source, &rules, &names);
                 continue;
             }
-            if (strcmp(k, "name") != 0 && strcmp(k, "qualified_name") != 0) {
+            if (!php_class_name_node(k)) {
                 continue;
             }
             char *t = cbm_node_text(a, c, source);
