@@ -884,6 +884,189 @@ TEST(ei_typescript_type_import) {
     PASS();
 }
 
+/* Edges of `edge_type` from any node of `from_file` into any node of
+ * `to_file`; -1 on a store error. */
+static int ei_file_to_file_edges(cbm_store_t *store, const char *project, const char *from_file,
+                                 const char *to_file, const char *edge_type) {
+    cbm_node_t *targets = NULL;
+    int target_count = 0;
+    if (cbm_store_find_nodes_by_file(store, project, to_file, &targets, &target_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < target_count; i++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_target_type(store, targets[i].id, edge_type, &edges,
+                                                &edge_count) != CBM_STORE_OK) {
+            continue;
+        }
+        for (int j = 0; j < edge_count; j++) {
+            cbm_node_t source;
+            memset(&source, 0, sizeof(source));
+            if (cbm_store_find_node_by_id(store, edges[j].source_id, &source) == CBM_STORE_OK) {
+                n += source.file_path && strcmp(source.file_path, from_file) == 0;
+                cbm_node_free_fields(&source);
+            }
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(targets, target_count);
+    return n;
+}
+
+/* An ECMAScript import names one file (`./x`, `../x`, a tsconfig/jsconfig
+ * alias) or a package outside the tree (a `node:` URL, a Node builtin, a
+ * dependency a package.json declares from a registry). When that file has no
+ * node, or the package is not in the tree, the import binds nothing. Main's
+ * name fallbacks bound each of them to an unrelated project definition: the
+ * symbol-name fallback took a trailing segment of the specifier (`./App.vue`
+ * absent -> a test's App, `node:assert/strict` -> a spec's assert, `connect`
+ * -> the project's own connect, a missing `@app/lib/helper.util` -> helper),
+ * and the sibling-file fallback took the file beside the importer (`ws` ->
+ * ws.ts, `fs` -> fs.ts). Each such IMPORTS edge then fed an import_map CALLS
+ * edge. The controls must keep binding: a present dotted alias module (#2975),
+ * a workspace package declared `workspace:*`, a relative module, a relative
+ * `.vue` file, and a relative module in a dot-directory (`.theme`, as vite's
+ * `.vitepress`), whose Module QN drops the dot so Strategy 1 cannot reach it.
+ * `pad` above MIN_FILES_FOR_PARALLEL(50) runs the same fixture through the
+ * parallel pipeline. */
+static int ei_es_unbound_import_case(int pad) {
+    enum { EI_ES_BASE = 16, EI_ES_MAX = EI_ES_BASE + 64 };
+    static char names[EI_ES_MAX][32];
+    static const char importer[] = "src/server/index.ts";
+    EILangFile f[EI_ES_MAX];
+    int n = 0;
+    f[n++] =
+        (EILangFile){"package.json", "{\"name\":\"fx-app\",\"private\":true,\"dependencies\":{"
+                                     "\"ws\":\"^8.18.0\",\"connect\":\"^3.7.0\",\"@fx/shared\":"
+                                     "\"workspace:*\"}}\n"};
+    f[n++] = (EILangFile){"tsconfig.json",
+                          "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@app/*\":"
+                          "[\"src/*\"]}}}\n"};
+    f[n++] = (EILangFile){"packages/shared/package.json",
+                          "{\"name\":\"@fx/shared\",\"main\":\"src/index.ts\"}\n"};
+    f[n++] = (EILangFile){"packages/shared/src/index.ts",
+                          "export function sharedHelper(): number {\n  return 1;\n}\n"};
+    f[n++] = (EILangFile){"src/cats/cat.service.ts",
+                          "export class CatService {\n  findAll(): string[] {\n"
+                          "    return [];\n  }\n}\n"};
+    f[n++] = (EILangFile){"src/server/ws.ts", "export class WebSocketServer {\n"
+                                              "  close(): void {}\n}\n"};
+    f[n++] = (EILangFile){"src/server/fs.ts",
+                          "export function readFileSync(): string {\n  return \"\";\n}\n"};
+    f[n++] = (EILangFile){"src/server/util.ts", "export function local(): number {\n"
+                                                "  return 3;\n}\n"};
+    f[n++] =
+        (EILangFile){"src/server/Widget.vue", "<template><div /></template>\n<script>\n"
+                                              "export default { name: \"Widget\" };\n</script>\n"};
+    f[n++] = (EILangFile){"src/client/client.ts", "export function connect(): void {}\n"};
+    f[n++] = (EILangFile){"src/tests/app.spec.ts", "export function App(): void {}\n"};
+    f[n++] = (EILangFile){"src/tests/assert.spec.ts",
+                          "export function assert(value: boolean): void {}\n"};
+    f[n++] = (EILangFile){"src/other/misc.ts", "export function helper(): number {\n"
+                                               "  return 2;\n}\n"};
+    f[n++] = (EILangFile){importer, "import { WebSocketServer } from 'ws';\n"
+                                    "import connect from 'connect';\n"
+                                    "import { readFileSync } from 'fs';\n"
+                                    "import assert from 'node:assert/strict';\n"
+                                    "import { helper } from '@app/lib/helper.util';\n"
+                                    "import App from './App.vue';\n"
+                                    "import { CatService } from '@app/cats/cat.service';\n"
+                                    "import { sharedHelper } from '@fx/shared';\n"
+                                    "import { local } from './util';\n"
+                                    "import Widget from './Widget.vue';\n\n"
+                                    "export function start(): number {\n"
+                                    "  assert(true);\n"
+                                    "  connect();\n"
+                                    "  readFileSync();\n"
+                                    "  helper();\n"
+                                    "  sharedHelper();\n"
+                                    "  local();\n"
+                                    "  new WebSocketServer();\n"
+                                    "  new CatService();\n"
+                                    "  return [App, Widget].length;\n"
+                                    "}\n"};
+    f[n++] = (EILangFile){"src/.theme/useTheme.ts", "export function useTheme(): number {\n"
+                                                    "  return 4;\n}\n"};
+    f[n++] = (EILangFile){"src/.theme/App.ts", "import { useTheme } from './useTheme';\n"
+                                               "export const theme = useTheme();\n"};
+    for (int i = 0; i < pad && n < EI_ES_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.ts", i);
+        f[n] = (EILangFile){names[n], "export const filler = 0;\n"};
+        n++;
+    }
+    static const struct {
+        const char *file;
+        const char *why;
+    } decoys[] = {
+        {"src/tests/app.spec.ts", "missing relative file ./App.vue"},
+        {"src/other/misc.ts", "missing alias file @app/lib/helper.util"},
+        {"src/server/ws.ts", "declared npm dependency 'ws' beside ws.ts"},
+        {"src/client/client.ts", "declared npm dependency 'connect'"},
+        {"src/server/fs.ts", "Node builtin 'fs' beside fs.ts"},
+        {"src/tests/assert.spec.ts", "'node:assert/strict'"},
+    };
+    static const struct {
+        const char *importer;
+        const char *file;
+        const char *why;
+    } controls[] = {
+        {importer, "src/cats/cat.service.ts", "present dotted alias module @app/cats/cat.service"},
+        {importer, "packages/shared/src/index.ts", "workspace package @fx/shared"},
+        {importer, "src/server/util.ts", "relative module ./util"},
+        {importer, "src/server/Widget.vue", "relative file ./Widget.vue"},
+        {"src/.theme/App.ts", "src/.theme/useTheme.ts", "relative module in a dot-directory"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int ok = store != NULL;
+    for (size_t i = 0; store && i < sizeof(decoys) / sizeof(decoys[0]); i++) {
+        int imports = ei_file_to_file_edges(store, lp.project, importer, decoys[i].file, "IMPORTS");
+        int calls = ei_file_to_file_edges(store, lp.project, importer, decoys[i].file, "CALLS");
+        if (imports != 0 || calls != 0) {
+            fprintf(stderr, "  [es-import pad=%d] %s: IMPORTS=%d CALLS=%d into %s (want 0/0)\n",
+                    pad, decoys[i].why, imports, calls, decoys[i].file);
+            ok = 0;
+        }
+    }
+    for (size_t i = 0; store && i < sizeof(controls) / sizeof(controls[0]); i++) {
+        int imports = ei_file_to_file_edges(store, lp.project, controls[i].importer,
+                                            controls[i].file, "IMPORTS");
+        if (imports != 1) {
+            fprintf(stderr, "  [es-import pad=%d] control %s: IMPORTS=%d into %s (want 1)\n", pad,
+                    controls[i].why, imports, controls[i].file);
+            ok = 0;
+        }
+    }
+    int shared_calls = store ? ei_file_to_file_edges(store, lp.project, importer,
+                                                     "packages/shared/src/index.ts", "CALLS")
+                             : -1;
+    if (shared_calls < 1) {
+        fprintf(stderr, "  [es-import pad=%d] control sharedHelper(): CALLS=%d (want >=1)\n", pad,
+                shared_calls);
+        ok = 0;
+    }
+    int total = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : -1;
+    if (total != (int)(sizeof(controls) / sizeof(controls[0]))) {
+        fprintf(stderr, "  [es-import pad=%d] IMPORTS total=%d (want %d)\n", pad, total,
+                (int)(sizeof(controls) / sizeof(controls[0])));
+        ok = 0;
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_es_import_of_missing_file_or_external_package_binds_nothing) {
+    /* Both legs run before asserting so a failure diagnoses both drivers. */
+    int sequential_ok = ei_es_unbound_import_case(0);
+    int parallel_ok = ei_es_unbound_import_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * GREEN GUARD — Go
  *
@@ -3275,6 +3458,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_typescript_subdir_import);
     RUN_TEST(ei_typescript_re_export);
     RUN_TEST(ei_typescript_type_import);
+    RUN_TEST(ei_es_import_of_missing_file_or_external_package_binds_nothing);
 
     /* ── GREEN GUARDS — Go (must stay passing) ── */
     RUN_TEST(ei_go_same_module_import);
