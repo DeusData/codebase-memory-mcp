@@ -2258,6 +2258,12 @@ static bool java_emit_interface_resolution(JavaLSPContext *ctx, const char *ifac
         const CBMRegisteredFunc *cf = cbm_registry_lookup_method(ctx->registry, sole_impl, mname);
         const char *target =
             cf ? cf->qualified_name : cbm_arena_sprintf(ctx->arena, "%s.%s", sole_impl, mname);
+        /* The implementer's own method calling the interface (a decorator
+         * delegating to another instance): never itself. The call binds the
+         * interface's method, as javac binds it. */
+        if (ctx->enclosing_method_qn && strcmp(target, ctx->enclosing_method_qn) == 0) {
+            return false;
+        }
         java_emit_resolved(ctx, target, "lsp_interface_resolve", 0.85f);
         return true;
     }

@@ -301,6 +301,26 @@ static const jts_file_t JTS_FILES[] = {
      "class Nest2Sub extends Nest2 {\n"
      "    String usePart(Part2 p) { return p.v2(); }\n"
      "}\n"},
+    /* A decorator: Framed implements Shape2 and delegates to another Shape2;
+     * Square2 implements it elsewhere. */
+    {"src/main/java/iface2/Shape2.java",
+     "package iface2;\n\n"
+     "public interface Shape2 {\n"
+     "    String area2();\n"
+     "}\n"},
+    {"src/main/java/iface2/Square2.java",
+     "package iface2;\n\n"
+     "public class Square2 implements Shape2 {\n"
+     "    public String area2() { return \"iface2.Square2.area2\"; }\n"
+     "}\n"},
+    {"src/main/java/user/Framed.java",
+     "package user;\n\n"
+     "import iface2.Shape2;\n\n"
+     "public class Framed implements Shape2 {\n"
+     "    private final Shape2 inner;\n\n"
+     "    public Framed(Shape2 inner) { this.inner = inner; }\n\n"
+     "    public String area2() { return inner.area2(); }\n"
+     "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
      "    public String ping() { return \"Def.ping\"; }\n"
@@ -557,6 +577,13 @@ static int jts_check_inherited_member_type(jts_index_t *ix) {
     int ok = jts_expect_none_to(ix, "firstKeyNull", "getKey", "Decoys");
     ok &= jts_expect_engine(ix, "usePart", "v2", "lib.Nest2.Part2.v2");
     return ok;
+}
+
+/* 23: a decorator's call to its delegate, inner.area2() inside Framed.area2,
+ * binds Shape2.area2 (javap: invokeinterface iface2/Shape2.area2): never the
+ * calling method itself, the one implementer the calling file declares. */
+static int jts_check_decorator(jts_index_t *ix) {
+    return jts_expect_engine(ix, "area2", "area2", "iface2.Shape2.area2");
 }
 
 /* A package over two source trees: the class found in exactly one of them
@@ -964,6 +991,7 @@ JTS_ROUTES(split_package, jts_check_split_package)
 JTS_ROUTES(constructor_import, jts_check_constructor_import)
 JTS_ROUTES(unresolved_ctor, jts_check_unresolved_ctor)
 JTS_ROUTES(inherited_member_type, jts_check_inherited_member_type)
+JTS_ROUTES(decorator, jts_check_decorator)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -994,6 +1022,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_unresolved_ctor_parallel);
     RUN_TEST(java_type_scope_inherited_member_type_sequential);
     RUN_TEST(java_type_scope_inherited_member_type_parallel);
+    RUN_TEST(java_type_scope_decorator_sequential);
+    RUN_TEST(java_type_scope_decorator_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
