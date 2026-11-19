@@ -875,6 +875,45 @@ TEST(member_walk_later_cycle_abstains) {
 static void mwl_type(CBMTypeRegistry *reg, const char *qn, bool iface, const CBMSupertype *sup,
                      int nsup, uint32_t flags);
 
+/* Phase 2 kept per chain node composes in breadth-first order (N2): a
+ * parent's interface at level 0 comes before the node's own interface's
+ * parent at level 1; at one level the node's own come first; a SOFT place
+ * before the hit (the node's own unknown interface) makes it possible, one
+ * after it (the parent's) leaves it proven. Asked twice and from both ends,
+ * the kept answers agree. */
+TEST(member_walk_later_composes_in_bfs_order) {
+    static const mwt_type_t types[] = {
+        {"X", "O:X L:Ia N:P"}, {"P", "O:P L:Ic !"},   {"Ia", "O:Ia L:Ib !"}, {"Ib", "O:Ib !"},
+        {"Ic", "O:Ic !"},      {"Y", "O:Y L:Iy N:P"}, {"Iy", "O:Iy !"},      {"S", "O:S L:~ N:P"},
+        {"T", "O:T L:Ic N:Q"}, {"Q", "O:Q L:~ !"},
+    };
+    mwt_fixture_t f;
+    mwt_open(&f, types, 10);
+    mwt_add_method(&f.reg, "Ib", "m");
+    mwt_add_method(&f.reg, "Ic", "m");
+    mwt_add_method(&f.reg, "Iy", "m");
+    cbm_registry_finalize(&f.reg);
+    CBMMemberHit h;
+    ASSERT_EQ(mwt_find(&f, "P", "m", NULL, &h), CBM_MW_FOUND); /* the parent first: kept */
+    ASSERT_STR_EQ(h.func->qualified_name, "Ic.m");
+    ASSERT_EQ(mwt_find(&f, "X", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_STR_EQ(h.func->qualified_name, "Ic.m"); /* level 0 (parent's) before level 1 (own) */
+    ASSERT_TRUE(h.prefix_complete);
+    ASSERT_EQ(mwt_find(&f, "Y", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_STR_EQ(h.func->qualified_name, "Iy.m"); /* the node's own first at one level */
+    ASSERT_EQ(mwt_find(&f, "S", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_STR_EQ(h.func->qualified_name, "Ic.m");
+    ASSERT_FALSE(h.prefix_complete); /* the own SOFT place comes before the parent's hit */
+    ASSERT_EQ(mwt_find(&f, "T", "m", NULL, &h), CBM_MW_FOUND);
+    ASSERT_TRUE(h.prefix_complete); /* the parent's SOFT place comes after the own hit */
+    ASSERT_EQ(mwt_find(&f, "X", "nobody", NULL, &h), CBM_MW_ABSENT);
+    ASSERT_EQ(mwt_find(&f, "S", "nobody", NULL, &h), CBM_MW_ABSTAIN);
+    ASSERT_EQ(mwt_find(&f, "X", "m", NULL, &h), CBM_MW_FOUND); /* again, from the kept answers */
+    ASSERT_STR_EQ(h.func->qualified_name, "Ic.m");
+    mwt_close(&f);
+    PASS();
+}
+
 /* `prepare` sees only the types the orders' registry itself holds: a type
  * reached through its fallback (a shared registry) is never handed to it,
  * and the walk leaves it as it was (F8). */
@@ -1191,7 +1230,7 @@ TEST(member_walk_depth_needs_no_stack) {
 
 /* ── growth, counted at 1x, 4x, 16x ────────────────────────────────── */
 
-typedef enum { MWG_CHAIN, MWG_MANY_TRAITS, MWG_SHARED_TRAIT } mwg_shape_t;
+typedef enum { MWG_CHAIN, MWG_MANY_TRAITS, MWG_SHARED_TRAIT, MWG_ICHAIN } mwg_shape_t;
 
 /* The total work (steps read, orders built, index entries made) of all the
  * lookups a shape of size n asks, through the PHP lineariser: every lookup
@@ -1201,12 +1240,34 @@ static uint64_t mwg_work(mwg_shape_t shape, int n) {
     cbm_arena_init(&arena);
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, &arena);
-    CBMSupertype *sup = (CBMSupertype *)cbm_arena_alloc(&arena, (size_t)(n + 1) * sizeof(*sup));
+    CBMSupertype *sup = (CBMSupertype *)cbm_arena_alloc(&arena, (size_t)(2 * n + 2) * sizeof(*sup));
     const char **names = (const char **)cbm_arena_alloc(&arena, (size_t)(n + 1) * sizeof(*names));
     for (int i = 0; i <= n; i++) {
         names[i] = cbm_arena_sprintf(&arena, "Ty%d", i);
     }
-    if (shape == MWG_CHAIN) {
+    if (shape == MWG_ICHAIN) {
+        /* fx/ichain: Ty0 <- ... <- Tyn, each class implementing its own
+         * interface If_i; only If0 declares the name. Looked up from every
+         * class, and a miss from every class (phase 2 every time). */
+        for (int i = 0; i <= n; i++) {
+            const char *ifc = cbm_arena_sprintf(&arena, "If%d", i);
+            mwl_type(&reg, ifc, true, NULL, 0, 0);
+            CBMSupertype *s2 = &sup[2 * i];
+            int ns = 0;
+            if (i > 0) {
+                s2[ns].type_qn = names[i - 1];
+                s2[ns].kind = CBM_SUPER_EXTENDS;
+                s2[ns].state = CBM_SUPER_KNOWN;
+                ns++;
+            }
+            s2[ns].type_qn = ifc;
+            s2[ns].kind = CBM_SUPER_IMPLEMENTS;
+            s2[ns].state = CBM_SUPER_KNOWN;
+            ns++;
+            mwl_type(&reg, names[i], false, s2, ns, 0);
+        }
+        mwt_add_method(&reg, "If0", "idecl");
+    } else if (shape == MWG_CHAIN) {
         /* Ty0 <- Ty1 <- ... <- Tyn; a method on the root, looked up from
          * every class, and a miss from every class. */
         for (int i = 0; i <= n; i++) {
@@ -1251,7 +1312,17 @@ static uint64_t mwg_work(mwg_shape_t shape, int n) {
     CBMMemberHit h;
     uint64_t found = 0;
     uint64_t want = 0;
-    if (shape == MWG_CHAIN) {
+    if (shape == MWG_ICHAIN) {
+        for (int i = 0; i <= n; i++) {
+            q.type_qn = names[i];
+            q.name = "idecl";
+            found += cbm_member_lookup(&w, &q, &h) == CBM_MW_FOUND &&
+                     h.place == CBM_MW_PLACE_INTERFACE_DEFAULT;
+            q.name = "nobody";
+            found += cbm_member_lookup(&w, &q, &h) == CBM_MW_ABSENT;
+        }
+        want = 2 * (uint64_t)(n + 1);
+    } else if (shape == MWG_CHAIN) {
         /* From every class, the deepest first: n + 1 lookups of the root's
          * method over a chain of n + 1 classes, and n + 1 misses. */
         for (int i = n; i >= 0; i--) {
@@ -1288,8 +1359,8 @@ static uint64_t mwg_work(mwg_shape_t shape, int n) {
 
 TEST(member_walk_growth_is_linear) {
     static const char *shape_names[] = {"deep chain", "class using n traits",
-                                        "trait used by n classes"};
-    for (int s = 0; s < 3; s++) {
+                                        "trait used by n classes", "chain, interface per class"};
+    for (int s = 0; s < 4; s++) {
         uint64_t w1 = mwg_work((mwg_shape_t)s, 250);
         uint64_t w4 = mwg_work((mwg_shape_t)s, 1000);
         uint64_t w16 = mwg_work((mwg_shape_t)s, 4000);
@@ -1326,6 +1397,7 @@ SUITE(member_walk) {
     RUN_TEST(member_walk_mixin_requirement_defers);
     RUN_TEST(member_walk_memo_keeps_softness);
     RUN_TEST(member_walk_later_cycle_abstains);
+    RUN_TEST(member_walk_later_composes_in_bfs_order);
     RUN_TEST(member_walk_prepare_only_own_types);
     RUN_TEST(member_walk_lin_own_traits_parent);
     RUN_TEST(member_walk_depth_needs_no_stack);

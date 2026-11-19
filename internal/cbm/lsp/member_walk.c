@@ -262,7 +262,18 @@ typedef struct mw_later {
     const struct mw_later *next;
     int side;
     bool soft;
+    uint32_t level; /* in a phase-2 queue: breadth-first level (0 = listed by the chain) */
 } mw_later_t;
+
+/* A place in phase 2's breadth-first order, seen from a chain node: the
+ * level, then the chain position (0 = the node's own entries, 1 = its
+ * parent's, ...; a node's own entries come first at every level), then the
+ * position within those. */
+typedef struct {
+    uint32_t level;
+    uint32_t rank;
+    uint32_t pos;
+} mw_at_t;
 
 /* What an order holds for a name, as seen from the order's own type. */
 typedef struct {
@@ -271,14 +282,31 @@ typedef struct {
     bool outside;   /* an OUTSIDE place was passed without the member, before the hit */
     bool open;      /* an OPEN step was passed */
     CBMMemberHit hit;
-    const mw_later_t *laters; /* CHAIN, NONE: phase 2 still to search */
+    const mw_later_t *laters; /* CHAIN, NONE: phase 2 still to search (own entries first) */
+    int own_laters;           /* CHAIN, NONE: how many of them this order listed itself */
+    const char *next_type;    /* CHAIN, NONE through a NEXT link: the parent */
+    int next_side;
     const CBMMemberHit *hits; /* collecting modes: every declaration, in order */
     int hit_count;
+    /* LATER: phase 2 of a CHAIN node's entries and its parent's, as a profile
+     * that composes: the first hit, the first SOFT place and the first
+     * unknown place in breadth-first order (unset when none), and whether a
+     * cycle was met among the entries. */
+    bool p2_hit;
+    bool p2_soft;
+    bool p2_unknown;
+    bool p2_cycle;
+    mw_at_t p2_hit_at;
+    mw_at_t p2_soft_at;
+    mw_at_t p2_unknown_at;
 } mw_ans_t;
 
 static const mw_ans_t MW_ANS_UNKNOWN = {.result = MW_UNKNOWN};
 
-enum { MW_NODE_CHAIN = 1, MW_NODE_WHOLE = 2, MW_NODE_QUERY = 3 };
+/* CHAIN: phase 1 of an order (a NEXT link followed as the parent's CHAIN
+ * node); LATER: phase 2 over what a CHAIN node and its parents deferred;
+ * WHOLE: CHAIN, then its LATER; QUERY: a `super` lookup (not kept). */
+enum { MW_NODE_CHAIN = 1, MW_NODE_WHOLE = 2, MW_NODE_QUERY = 3, MW_NODE_LATER = 4 };
 enum { MW_SLOT_EMPTY = 0, MW_SLOT_QUEUED = 1, MW_SLOT_BUSY = 2, MW_SLOT_DONE = 3 };
 
 /* A node: CHAIN (phase 1 of an order, a NEXT link followed as the parent's
@@ -1248,6 +1276,7 @@ static bool mw_later_tmp(mw_walk_t *k, const CBMMemberStep *st) {
     e->side = st->side;
     e->soft = st->type_id == NULL && mw_soft(k, st->flags);
     e->next = NULL;
+    e->level = 0;
     return true;
 }
 
@@ -1309,9 +1338,20 @@ static bool mw_answer_req(mw_ans_t *out, CBMMemberHit req, bool soft, bool outsi
     return mw_answer(out, &req, soft, outside, open);
 }
 
+/* A NONE that went on through the NEXT link to (type, side): its phase 2 is
+ * its own entries and then the parent's (MW_NODE_LATER composes them). */
+static void mw_none_linked(mw_walk_t *k, mw_ans_t *out, const mw_ans_t *nx, const char *type,
+                           int side) {
+    out->own_laters = k->s->later_tmp_count;
+    out->laters = mw_later_list(k, nx->laters);
+    out->next_type = type;
+    out->next_side = side;
+}
+
 /* The rest of a chain, past a NEXT link, as the parent's CHAIN node says. */
 static bool mw_link(mw_walk_t *k, mw_ans_t *out, const mw_ans_t *nx, bool soft, bool outside,
-                    bool open, bool have_req, const CBMMemberHit *req) {
+                    bool open, bool have_req, const CBMMemberHit *req, const char *next_type,
+                    int next_side) {
     if (nx->result == MW_UNKNOWN) {
         return mw_unknown(out);
     }
@@ -1334,7 +1374,7 @@ static bool mw_link(mw_walk_t *k, mw_ans_t *out, const mw_ans_t *nx, bool soft, 
         out->soft = soft || nx->soft;
         out->outside = outside || nx->outside;
         out->open = open;
-        out->laters = mw_later_list(k, nx->laters);
+        mw_none_linked(k, out, nx, next_type, next_side);
         mw_set_hits(k, out);
         return true;
     }
@@ -1367,7 +1407,7 @@ static bool mw_link(mw_walk_t *k, mw_ans_t *out, const mw_ans_t *nx, bool soft, 
     out->soft = soft || nx->soft;
     out->outside = outside || nx->outside;
     out->open = open;
-    out->laters = mw_later_list(k, nx->laters);
+    mw_none_linked(k, out, nx, next_type, next_side);
     return true;
 }
 
@@ -1426,7 +1466,7 @@ static bool mw_pass_chain(mw_walk_t *k, const char *type, int side, const char *
             if (!nx) {
                 return false;
             }
-            return mw_link(k, out, nx, soft, outside, open, have_req, &req);
+            return mw_link(k, out, nx, soft, outside, open, have_req, &req, st->type_id, st->side);
         }
         uint8_t place = st->place;
         if (depth > 0 && place == CBM_MW_PLACE_OWN) {
@@ -1560,6 +1600,7 @@ static bool mw_pass_chain(mw_walk_t *k, const char *type, int side, const char *
     out->soft = soft;
     out->outside = outside;
     out->open = open;
+    out->own_laters = s->later_tmp_count;
     out->laters = mw_later_list(k, NULL);
     mw_set_hits(k, out);
     return true;
@@ -1567,7 +1608,7 @@ static bool mw_pass_chain(mw_walk_t *k, const char *type, int side, const char *
 
 /* ── phase 2 ────────────────────────────────────────────────────── */
 
-static bool mw_queue_add(mw_state_t *s, const char *type, int side, bool soft) {
+static bool mw_queue_add(mw_state_t *s, const char *type, int side, bool soft, uint32_t level) {
     if (!mw_vec_room((void **)&s->queue, &s->queue_cap, s->queue_count, sizeof(*s->queue))) {
         return false;
     }
@@ -1576,7 +1617,28 @@ static bool mw_queue_add(mw_state_t *s, const char *type, int side, bool soft) {
     e->side = side;
     e->soft = soft;
     e->next = NULL;
+    e->level = level;
     return true;
+}
+
+static bool mw_at_lt(mw_at_t a, mw_at_t b) {
+    if (a.level != b.level) {
+        return a.level < b.level;
+    }
+    if (a.rank != b.rank) {
+        return a.rank < b.rank;
+    }
+    return a.pos < b.pos;
+}
+
+/* Note the first place of a kind (places come in breadth-first order). */
+static void mw_mark(bool *set, mw_at_t *at, uint32_t level, uint32_t pos) {
+    if (!*set) {
+        *set = true;
+        at->level = level;
+        at->rank = 0;
+        at->pos = pos;
+    }
 }
 
 /* Is there a cycle among the phase-2 entries this pass visited? (They are
@@ -1663,7 +1725,7 @@ static bool mw_pass_later(mw_walk_t *k, const char *name, const mw_ans_t *c, mw_
         }
     }
     for (const mw_later_t *e = c->laters; e; e = e->next) {
-        if (!mw_queue_add(s, e->type, e->side, e->soft)) {
+        if (!mw_queue_add(s, e->type, e->side, e->soft, 0)) {
             k->failed = true;
             return mw_unknown(out);
         }
@@ -1742,7 +1804,7 @@ static bool mw_pass_later(mw_walk_t *k, const char *name, const mw_ans_t *c, mw_
                 break;
             case CBM_MW_LATER:
                 if (!mw_queue_add(s, st->type_id, st->side,
-                                  st->type_id == NULL && mw_soft(k, st->flags))) {
+                                  st->type_id == NULL && mw_soft(k, st->flags), e.level + 1)) {
                     k->failed = true;
                     return mw_unknown(out);
                 }
@@ -1798,11 +1860,247 @@ static bool mw_pass_later(mw_walk_t *k, const char *name, const mw_ans_t *c, mw_
     return true;
 }
 
+/* Phase 2 of a CHAIN node, kept per (node, name) (MW_NODE_LATER): breadth
+ * first over the node's own deferred entries, as a profile (the first hit,
+ * the first SOFT and the first unknown place), then composed with the
+ * parent's LATER node, whose places come after the node's own at every
+ * level. The first places of the composition are exactly those of one
+ * breadth-first search over the whole list: a type both parts reach is
+ * reached first by the earlier one, and everything it holds comes first
+ * there too. So n lookups over one chain search each node's entries once. */
+static bool mw_pass_later_node(mw_walk_t *k, const char *type, int side, const char *name,
+                               mw_ans_t *out) {
+    mw_state_t *s = k->s;
+    CBMMemberWalker *w = k->w;
+    const mw_ans_t *c = mw_dep(k, MW_NODE_CHAIN, type, side, name);
+    if (!c) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->result = MW_NONE;
+    if (c->result != MW_NONE) {
+        return true; /* no phase 2 */
+    }
+    s->queue_count = 0;
+    int n = 0;
+    for (const mw_later_t *e = c->laters; e && n < c->own_laters; e = e->next, n++) {
+        if (!mw_queue_add(s, e->type, e->side, e->soft, 0)) {
+            k->failed = true;
+            return mw_unknown(out);
+        }
+    }
+    mw_seen_begin(s);
+    bool revisit = false;
+    for (int qi = 0; qi < s->queue_count && !out->p2_hit; qi++) {
+        mw_later_t e = s->queue[qi];
+        uint32_t pos = (uint32_t)qi;
+        w->work++;
+        CBM_LSP_WORK(1);
+        if (!e.type) {
+            if (e.soft) {
+                mw_mark(&out->p2_soft, &out->p2_soft_at, e.level, pos);
+            } else {
+                mw_mark(&out->p2_unknown, &out->p2_unknown_at, e.level, pos);
+            }
+            continue;
+        }
+        int fresh = mw_seen_add(s, e.type, e.side, MW_SEEN_LATER);
+        if (fresh < 0) {
+            k->failed = true;
+            return mw_unknown(out);
+        }
+        if (fresh == 0) {
+            revisit = true;
+            continue;
+        }
+        mw_seen_t *mark = mw_seen_find(s, e.type, e.side, MW_SEEN_LATER);
+        if (mark) {
+            mark->pos = qi;
+        }
+        const CBMMemberStep *steps = NULL;
+        int count = 0;
+        if (!mw_order(k, e.type, e.side, &steps, &count)) {
+            mw_mark(&out->p2_unknown, &out->p2_unknown_at, e.level, pos);
+            continue;
+        }
+        bool ended = false;
+        bool broken = false; /* what follows in this entry is unknown */
+        bool entry_soft = false;
+        for (int i = 0; i < count && !ended && !broken; i++) {
+            const CBMMemberStep *st = &steps[i];
+            w->work++;
+            CBM_LSP_WORK(1);
+            bool step_soft = false;
+            uint8_t r = MW_NONE;
+            CBMMemberHit hit;
+            memset(&hit, 0, sizeof(hit));
+            switch (st->kind) {
+            case CBM_MW_OWN:
+                r = st->type_id ? mw_own(k, st->type_id, name, NULL, CBM_MW_PLACE_INTERFACE_DEFAULT,
+                                         !entry_soft, &hit)
+                                : MW_UNKNOWN;
+                break;
+            case CBM_MW_SUB: {
+                if (!st->type_id) {
+                    r = MW_UNKNOWN;
+                    break;
+                }
+                const mw_ans_t *a = mw_dep(k, MW_NODE_WHOLE, st->type_id, st->side, name);
+                if (!a) {
+                    return false;
+                }
+                r = mw_take(k, a, CBM_MW_PLACE_INTERFACE_DEFAULT, NULL, !entry_soft, false, &hit,
+                            &step_soft, &out->open);
+                break;
+            }
+            case CBM_MW_GROUP:
+                if (st->count <= 0 || i + st->count >= count) {
+                    r = MW_UNKNOWN;
+                    break;
+                }
+                r = mw_group(k, steps, i, name, !entry_soft, &hit, &step_soft, &out->open);
+                if (k->blocked) {
+                    return false;
+                }
+                i += st->count;
+                break;
+            case CBM_MW_LATER:
+                if (!mw_queue_add(s, st->type_id, st->side,
+                                  st->type_id == NULL && mw_soft(k, st->flags), e.level + 1)) {
+                    k->failed = true;
+                    return mw_unknown(out);
+                }
+                break;
+            case CBM_MW_OPEN:
+                out->open = true;
+                break;
+            case CBM_MW_STOP:
+                ended = true;
+                break;
+            case CBM_MW_NEXT: {
+                int f2 = st->type_id && i == count - 1
+                             ? mw_seen_add(s, st->type_id, st->side, MW_SEEN_LINK)
+                             : 0;
+                if (f2 <= 0 || !mw_order(k, st->type_id, st->side, &steps, &count)) {
+                    r = MW_UNKNOWN; /* malformed, or a cycle of links */
+                    break;
+                }
+                i = -1;
+                break;
+            }
+            case CBM_MW_UNSEEN:
+                if (mw_soft(k, st->flags)) {
+                    step_soft = true;
+                } else {
+                    r = MW_UNKNOWN;
+                }
+                break;
+            default: /* malformed */
+                r = MW_UNKNOWN;
+                break;
+            }
+            if (r == MW_UNKNOWN) {
+                mw_mark(&out->p2_unknown, &out->p2_unknown_at, e.level, pos);
+                broken = true;
+            } else if (r == MW_HIT) {
+                out->hit = hit; /* its own prefix: the steps before it in this entry */
+                mw_mark(&out->p2_hit, &out->p2_hit_at, e.level, pos);
+            } else if (step_soft) {
+                entry_soft = true;
+                mw_mark(&out->p2_soft, &out->p2_soft_at, e.level, pos);
+            }
+            if (out->p2_hit) {
+                break;
+            }
+        }
+        if (!out->p2_hit && !broken && !ended) {
+            /* an order that does not end with STOP is not complete */
+            mw_mark(&out->p2_unknown, &out->p2_unknown_at, e.level, pos);
+        }
+    }
+    if (!out->p2_hit && revisit && mw_later_cycle(k)) {
+        out->p2_cycle = true;
+    }
+    /* The parent's part, unless this node's hit is at level 0 (nothing of the
+     * parent's comes before it then). */
+    if (c->next_type && !(out->p2_hit && out->p2_hit_at.level == 0)) {
+        const mw_ans_t *p = mw_dep(k, MW_NODE_LATER, c->next_type, c->next_side, name);
+        if (!p) {
+            return false;
+        }
+        mw_at_t hit_at = p->p2_hit_at, soft_at = p->p2_soft_at, unknown_at = p->p2_unknown_at;
+        hit_at.rank++;
+        soft_at.rank++;
+        unknown_at.rank++;
+        if (p->p2_hit && (!out->p2_hit || mw_at_lt(hit_at, out->p2_hit_at))) {
+            out->p2_hit = true;
+            out->p2_hit_at = hit_at;
+            out->hit = p->hit;
+        }
+        if (p->p2_soft && (!out->p2_soft || mw_at_lt(soft_at, out->p2_soft_at))) {
+            out->p2_soft = true;
+            out->p2_soft_at = soft_at;
+        }
+        if (p->p2_unknown && (!out->p2_unknown || mw_at_lt(unknown_at, out->p2_unknown_at))) {
+            out->p2_unknown = true;
+            out->p2_unknown_at = unknown_at;
+        }
+        out->p2_cycle = out->p2_cycle || p->p2_cycle;
+        out->open = out->open || p->open;
+    }
+    out->result = out->p2_hit ? MW_HIT : MW_NONE;
+    return true;
+}
+
+/* A WHOLE node's answer from its chain's (NONE) and the LATER profile. */
+static bool mw_whole_from_later(mw_ans_t *out, const mw_ans_t *c, const mw_ans_t *l) {
+    bool open = c->open || l->open;
+    if (l->p2_unknown && (!l->p2_hit || mw_at_lt(l->p2_unknown_at, l->p2_hit_at))) {
+        return mw_unknown(out); /* an unknown place before any hit */
+    }
+    if (l->p2_hit) {
+        CBMMemberHit h = l->hit;
+        bool soft_before = l->p2_soft && mw_at_lt(l->p2_soft_at, l->p2_hit_at);
+        h.prefix_complete = h.prefix_complete && !c->soft && !c->outside && !soft_before;
+        return mw_answer(out, &h, c->soft || soft_before, c->outside, open);
+    }
+    if (l->p2_cycle) {
+        return mw_unknown(out); /* a cycle among the interfaces: never "absent" */
+    }
+    memset(out, 0, sizeof(*out));
+    out->result = MW_NONE;
+    out->soft = c->soft || l->p2_soft;
+    out->outside = c->outside;
+    out->open = open;
+    return true;
+}
+
 /* One pass over a frame's node. */
 static bool mw_pass(mw_walk_t *k, const mw_frame_t *f, mw_ans_t *out) {
     if (f->node == MW_NODE_CHAIN) {
         return mw_pass_chain(k, f->type, f->side, f->name, NULL, 0, out);
     }
+    if (f->node == MW_NODE_LATER) {
+        return mw_pass_later_node(k, f->type, f->side, f->name, out);
+    }
+    if (f->node == MW_NODE_WHOLE && !k->collect) {
+        const mw_ans_t *a = mw_dep(k, MW_NODE_CHAIN, f->type, f->side, f->name);
+        if (!a) {
+            return false;
+        }
+        if (a->result != MW_NONE) {
+            *out = *a;
+            out->laters = NULL;
+            return true;
+        }
+        const mw_ans_t *l = mw_dep(k, MW_NODE_LATER, f->type, f->side, f->name);
+        if (!l) {
+            return false;
+        }
+        return mw_whole_from_later(out, a, l);
+    }
+    /* A `super` lookup, and the collecting modes: one breadth-first search
+     * over the whole deferred list. */
     mw_ans_t c;
     if (f->node == MW_NODE_QUERY) {
         if (!mw_pass_chain(k, f->type, f->side, f->name, k->q->after, k->q->after_side, &c)) {

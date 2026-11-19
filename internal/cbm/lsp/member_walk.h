@@ -127,11 +127,12 @@
  *   - Sequential SUB steps that are not grouped (Ruby includes) cost one pass
  *     of the order per SUB step not yet answered (quadratic in the number of
  *     such steps of one order, once per name): the Ruby slice.
- *   - Phase 2 is answered once per (start type, name); n lookups from n
- *     different classes of one n-deep chain whose classes each implement an
- *     interface, for a name only the interfaces declare, search the
- *     interfaces of every level each time (quadratic in that shape): the
- *     first engine whose phase 2 holds more than interface declarations.
+ *   - Phase 2 is kept per (chain node, name) and composed along the chain
+ *     (n lookups from n classes of an n-deep chain each implementing an
+ *     interface search each node's interfaces once). The collecting modes
+ *     and `super` lookups still search the whole deferred list per lookup,
+ *     quadratic in that shape: the Java / Kotlin / C# slices (COLLECT) and
+ *     the first engine with `super` lookups.
  */
 #ifndef CBM_LSP_MEMBER_WALK_H
 #define CBM_LSP_MEMBER_WALK_H
