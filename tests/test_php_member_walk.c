@@ -172,7 +172,9 @@ static bool pmw_php_strategy(const char *s) {
 }
 
 /* One expectation on a fixture: the edge src -> tgt, and whether the PHP
- * engine drew it (strategy php_*) or not; want_edge false = no edge at all. */
+ * engine drew it (strategy php_*) or not; want_edge false = no edge at all.
+ * want_edge false with want_php true: no edge the PHP engine drew, whatever a
+ * name guess does (main's guesses differ by route on some shapes). */
 typedef struct {
     const char *src;
     const char *tgt;
@@ -193,8 +195,10 @@ static int pmw_check(const PmwFile *files, int n, const PmwExpect *want, int nwa
         for (int i = 0; i < nwant; i++) {
             char strategy[64];
             bool edge = pmw_edge(&p, want[i].src, want[i].tgt, strategy, sizeof(strategy));
-            bool ok = edge == want[i].want_edge &&
-                      (!edge || pmw_php_strategy(strategy) == want[i].want_php);
+            bool no_typed = !want[i].want_edge && want[i].want_php;
+            bool ok = no_typed ? !edge || !pmw_php_strategy(strategy)
+                               : edge == want[i].want_edge &&
+                                     (!edge || pmw_php_strategy(strategy) == want[i].want_php);
             if (!ok) {
                 printf("  [pmw] %s route: %s -> %s: edge=%d strategy=%s (want edge=%d php=%d)\n",
                        route ? "parallel" : "sequential", want[i].src, want[i].tgt, edge,
@@ -502,13 +506,17 @@ TEST(phpmw_possible_answer_in_the_walks_order) {
     PASS();
 }
 
-/* A possible trait member is drawn when the trait that declares it and the
- * class whose `use` brings it in are both declared in the file walked, at any
- * depth of traits using traits: what main's same-file flattening reached
- * (N3, fx/tt; php: Inner::deep runs for all four, Za; main types all four).
- * Negative partner: the inner trait declared in another file, behind the
- * vendor trait: nothing is drawn from the possible hit; without the vendor
- * trait the hit is proven and drawn. */
+/* A possible trait member is drawn when every class or trait on its `use`
+ * path, from the holder down to the trait that uses the owner, is declared in
+ * the file walked; the owner may be anywhere (review 3; what main's
+ * flattening reached). fx/tt: all in one file (php: Za for all four; main
+ * types all four). fx/ttx: the owner Inner in another file, the path P, Outer
+ * here, behind the vendor trait V (php: Za for every V php accepts, review
+ * 3; main typed): kept. fx/d1x: depth 1, the owner T2 imported (php: Za; main
+ * typed): kept. Negative partner fx/pathx: the path leaves the file (P here
+ * uses Outer of another file; php: Za, but main draws nothing there and the
+ * walk's answer is only possible): no edge; without V the hit is proven and
+ * drawn. fx/ttown and fx/d1y below: a non-leaf trait's own member. */
 TEST(phpmw_possible_trait_member_same_file) {
     static const PmwFile f[] = {
         {"src/TT.php", "<?php\nnamespace App\\TT;\nuse Vendor\\Pkg\\V;\n"
@@ -551,11 +559,171 @@ TEST(phpmw_possible_trait_member_same_file) {
                        "    public function b(Plain $p) { return $p->deep()->spin(); }\n"
                        "}\n"},
     };
-    /* No edge at all for TCall.a (main typed it): TT.php imports neither Za
-     * nor Zb, so no name guess stands in (one would differ by route, main's). */
     static const PmwExpect gwant[] = {
+        {"TCall.a", "Za.spin", true, true},
+        {"TCall.b", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(g, 2, gwant, 2), 0);
+    static const PmwFile d[] = {
+        {"src/Lib/T2.php", "<?php\nnamespace App\\Lib;\n"
+                           "class Za { public function spin() { return 'Za'; } }\n"
+                           "class Zb { public function spin() { return 'Zb'; } }\n"
+                           "trait T2 { public function deep(): Za { return new Za; } }\n"},
+        {"src/D1.php", "<?php\nnamespace App\\D1;\nuse Vendor\\Pkg\\V;\nuse App\\Lib\\T2;\n"
+                       "class P { use T2; }\n"
+                       "class Hidden extends P { use V; }\n"
+                       "class Plain extends P {}\n"
+                       "class DCall {\n"
+                       "    public function a(Hidden $h) { return $h->deep()->spin(); }\n"
+                       "    public function b(Plain $p) { return $p->deep()->spin(); }\n"
+                       "}\n"},
+    };
+    static const PmwExpect dwant[] = {
+        {"DCall.a", "Za.spin", true, true},
+        {"DCall.b", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(d, 2, dwant, 2), 0);
+    static const PmwFile x[] = {
+        {"src/In/Inner.php", "<?php\nnamespace App\\In;\n"
+                             "class Za { public function spin() { return 'Za'; } }\n"
+                             "class Zb { public function spin() { return 'Zb'; } }\n"
+                             "trait Inner { public function deep(): Za { return new Za; } }\n"},
+        {"src/Lib/Outer.php",
+         "<?php\nnamespace App\\Lib;\nuse App\\In\\Inner;\ntrait Outer { use Inner; }\n"},
+        {"src/TT.php", "<?php\nnamespace App\\TT;\nuse Vendor\\Pkg\\V;\nuse App\\Lib\\Outer;\n"
+                       "use App\\In\\Inner;\n"
+                       "class P { use Outer; }\n"
+                       "class Hidden extends P { use V; }\n"
+                       "class Plain extends P {}\n"
+                       "class TCall {\n"
+                       "    public function a(Hidden $h) { return $h->deep()->spin(); }\n"
+                       "    public function b(Plain $p) { return $p->deep()->spin(); }\n"
+                       "}\n"},
+    };
+    /* No edge at all for TCall.a: TT.php imports neither Za nor Zb, so no
+     * name guess stands in (one would differ by route, main's). */
+    static const PmwExpect xwant[] = {
         {"TCall.a", "Za.spin", false, false},
         {"TCall.b", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(x, 3, xwant, 2), 0);
+    /* A member a trait declares itself while it also uses a trait (review 4,
+     * F-A): the path below its owner is empty. fx/ttown, all in one file (php:
+     * O1 Hidden->shallow Za, O2 Za, O3 Hidden->deep Za; main types a and c);
+     * fx/d1y, depth 1, the owner T2 { use U; deep } in another file (php: Y1,
+     * Y2 Za; main types both). */
+    static const PmwFile o[] = {
+        {"src/TO.php",
+         "<?php\nnamespace App\\TO;\nuse Vendor\\Pkg\\V;\n"
+         "class Za { public function spin() { return 'Za'; } }\n"
+         "class Zb { public function spin() { return 'Zb'; } }\n"
+         "trait Inner { public function deep(): Za { return new Za; } }\n"
+         "trait Outer { use Inner; public function shallow(): Za { return new Za; } }\n"
+         "class P { use Outer; }\n"
+         "class Hidden extends P { use V; }\n"
+         "class Plain extends P {}\n"
+         "class TCall {\n"
+         "    public function a(Hidden $h) { return $h->shallow()->spin(); }\n"
+         "    public function b(Plain $p) { return $p->shallow()->spin(); }\n"
+         "    public function c(Hidden $h) { return $h->deep()->spin(); }\n"
+         "}\n"},
+    };
+    static const PmwExpect owant[] = {
+        {"TCall.a", "Za.spin", true, true},
+        {"TCall.b", "Za.spin", true, true},
+        {"TCall.c", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(o, 1, owant, 3), 0);
+    static const PmwFile y[] = {
+        {"src/Lib/T2.php", "<?php\nnamespace App\\Lib;\n"
+                           "class Za { public function spin() { return 'Za'; } }\n"
+                           "class Zb { public function spin() { return 'Zb'; } }\n"
+                           "trait U { public function other() { return 1; } }\n"
+                           "trait T2 { use U; public function deep(): Za { return new Za; } }\n"},
+        {"src/D1.php", "<?php\nnamespace App\\D1;\nuse Vendor\\Pkg\\V;\nuse App\\Lib\\T2;\n"
+                       "class P { use T2; }\n"
+                       "class Hidden extends P { use V; }\n"
+                       "class Plain extends P {}\n"
+                       "class DCall {\n"
+                       "    public function a(Hidden $h) { return $h->deep()->spin(); }\n"
+                       "    public function b(Plain $p) { return $p->deep()->spin(); }\n"
+                       "}\n"},
+    };
+    static const PmwExpect ywant[] = {
+        {"DCall.a", "Za.spin", true, true},
+        {"DCall.b", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(y, 2, ywant, 2), 0);
+    /* fx/u2 (review 5): T (here) uses U (U { use W; deep }) and the leaf U2
+     * (deep2), both in another file; P uses T; behind V at depth 2 (php: U1-U4
+     * Za; main types all four). */
+    static const PmwFile u[] = {
+        {"src/Lib/U.php", "<?php\nnamespace App\\Lib;\n"
+                          "class Za { public function spin() { return 'Za'; } }\n"
+                          "class Zb { public function spin() { return 'Zb'; } }\n"
+                          "trait W { public function other() { return 1; } }\n"
+                          "trait U { use W; public function deep(): Za { return new Za; } }\n"
+                          "trait U2 { public function deep2(): Za { return new Za; } }\n"},
+        {"src/TT.php", "<?php\nnamespace App\\U2;\nuse Vendor\\Pkg\\V;\nuse App\\Lib\\U;\n"
+                       "use App\\Lib\\U2;\n"
+                       "trait T { use U, U2; }\n"
+                       "class P { use T; }\n"
+                       "class Hidden extends P { use V; }\n"
+                       "class Plain extends P {}\n"
+                       "class UCall {\n"
+                       "    public function a(Hidden $h) { return $h->deep()->spin(); }\n"
+                       "    public function b(Hidden $h) { return $h->deep2()->spin(); }\n"
+                       "    public function c(Plain $p) { return $p->deep()->spin(); }\n"
+                       "    public function d(Plain $p) { return $p->deep2()->spin(); }\n"
+                       "}\n"},
+    };
+    static const PmwExpect uwant[] = {
+        {"UCall.a", "Za.spin", true, true},
+        {"UCall.b", "Za.spin", true, true},
+        {"UCall.c", "Za.spin", true, true},
+        {"UCall.d", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(u, 2, uwant, 4), 0);
+    PASS();
+}
+
+/* A trait's requirement in another file, beside a vendor trait (review 3,
+ * fx/rqx; php: the vendor trait's m runs, Zv): the per-file pass, which
+ * cannot see NeedM, must not leave the parent's P.m standing; the
+ * requirement's copy answers, as on main (Zi.spin typed by its declared
+ * type, no edge the engine draws to P.m). Positive partner fx/rqxp: without
+ * the vendor trait the parent implements it (php: P::m runs, Zp): P.m and
+ * Zp.spin typed (main misses both). */
+TEST(phpmw_requirement_in_another_file) {
+    static const char *need = "<?php\nnamespace App\\Lib;\n"
+                              "class Zi { public function spin() { return 'Zi'; } }\n"
+                              "class Zp extends Zi { public function spin() { return 'Zp'; } }\n"
+                              "class Zv extends Zp { public function spin() { return 'Zv'; } }\n"
+                              "trait NeedM { abstract public function m(): Zi; }\n";
+    const PmwFile f[] = {
+        {"src/Lib/NeedM.php", need},
+        {"src/RQ.php", "<?php\nnamespace App\\RQ;\nuse Vendor\\Pkg\\VTrait;\nuse App\\Lib\\NeedM;\n"
+                       "use App\\Lib\\Zp;\n"
+                       "class P { public function m(): Zp { return new Zp; } }\n"
+                       "class C extends P {\n    use NeedM, VTrait;\n"
+                       "    public function run() { return $this->m()->spin(); }\n}\n"},
+    };
+    static const PmwExpect want[] = {
+        {"C.run", "P.m", false, true}, /* no typed edge (main guesses it by name on one route) */
+        {"C.run", "Zi.spin", true, true},
+        {"C.run", "Zp.spin", false, true},
+    };
+    ASSERT_EQ(pmw_check(f, 2, want, 3), 0);
+    const PmwFile g[] = {
+        {"src/Lib/NeedM.php", need},
+        {"src/RQ.php", "<?php\nnamespace App\\RQ;\nuse App\\Lib\\NeedM;\nuse App\\Lib\\Zp;\n"
+                       "class P { public function m(): Zp { return new Zp; } }\n"
+                       "class D extends P {\n    use NeedM;\n"
+                       "    public function run() { return $this->m()->spin(); }\n}\n"},
+    };
+    static const PmwExpect gwant[] = {
+        {"D.run", "P.m", true, true},
+        {"D.run", "Zp.spin", true, true},
     };
     ASSERT_EQ(pmw_check(g, 2, gwant, 2), 0);
     PASS();
@@ -807,6 +975,7 @@ SUITE(php_member_walk) {
     RUN_TEST(phpmw_requirement_beside_vendor_trait);
     RUN_TEST(phpmw_possible_answer_in_the_walks_order);
     RUN_TEST(phpmw_possible_trait_member_same_file);
+    RUN_TEST(phpmw_requirement_in_another_file);
     RUN_TEST(phpmw_same_file_is_exact);
     RUN_TEST(phpmw_trait_chain_40k);
     RUN_TEST(phpmw_parent_method_beats_interface_declaration);

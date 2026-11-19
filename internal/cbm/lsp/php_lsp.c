@@ -562,6 +562,11 @@ static bool php_declared_here(const PHPLSPContext *ctx, const char *qn) {
            strchr(qn + n + 1, '.') == NULL;
 }
 
+/* The member walk's `local` predicate (CBMMemberLocal). */
+static bool php_local_type(void *ctx, const char *qn) {
+    return php_declared_here((const PHPLSPContext *)ctx, qn);
+}
+
 /* A seeded library type lists its parents without kinds (php_stdlib_data.c):
  * an interface among them is an implemented interface (an interface's parent
  * when the type is one), a class the superclass. */
@@ -684,6 +689,10 @@ void php_members_begin(PHPLSPContext *ctx, CBMTypeRegistry *reg) {
     m->orders.prepare = php_settle_type;
     m->orders.prepare_ctx = ctx;
     cbm_member_walker_init(&m->walker, &m->orders);
+    /* path_local: a type on a trait's `use` path counts as this file's. The
+     * walker lives for this file only, so the predicate is fixed for it. */
+    m->walker.local = php_local_type;
+    m->walker.local_ctx = ctx;
     ctx->members = m;
 }
 
@@ -796,19 +805,21 @@ const CBMRegisteredFunc *php_find_method(PHPLSPContext *ctx, const char *class_q
      *    is drawn only where today's engine gave an answer at that site: a
      *    member among the class's own members, its known parents and its
      *    known interface declarations (place OWN, SUPER, INTERFACE_DEFAULT),
-     *    or the copy of a trait's member when the trait that declares it (the
-     *    owner) and the class whose `use` brings it in (the holder) are both
-     *    declared in this file, at any depth of traits using traits, and no
-     *    alias was involved: what today's same-file flattening reached
-     *    (fx/tt). Where both answer behind an unknown and differ only in order
-     *    (fx/twoifc: the walk's I1.m against the old stack's I2.m) the walk's
-     *    order, php's, stands;
-     *  - what the walk adds beyond the deleted lookup (an alias, a trait or a
-     *    holder declared in another file) gives nothing when only possible:
+     *    or the copy of a trait's member when every class or trait on the
+     *    `use` path, from the holder (the class whose `use` starts it) down to
+     *    the trait that uses the owner, is declared in this file
+     *    (hit.path_local), and no alias was involved. The owner itself may be
+     *    in any module the registry holds: today's flattening copied imported
+     *    traits into this file's types (fx/tt, fx/ttx, fx/d1x; review 3). A
+     *    requirement answered that way supersedes the per-file pass's parent
+     *    hit, as before (fx/rqx). Where both answer behind an unknown and
+     *    differ only in order (fx/twoifc: the walk's I1.m against the old
+     *    stack's I2.m) the walk's order, php's, stands;
+     *  - what the walk adds beyond the deleted lookup (an alias, a `use` path
+     *    through a type of another file) gives nothing when only possible:
      *    the call keeps the pipeline's other rules. */
     if (hit.place == CBM_MW_PLACE_MIXIN && hit.via_qn) {
-        if (!hit.prefix_complete && (hit.renamed || !php_declared_here(ctx, hit.owner_qn) ||
-                                     !php_declared_here(ctx, hit.via_qn))) {
+        if (!hit.prefix_complete && (hit.renamed || !hit.path_local)) {
             return NULL;
         }
         return php_mixin_member(ctx, &hit, method_name);
