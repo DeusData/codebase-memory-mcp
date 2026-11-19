@@ -597,6 +597,25 @@ static const jts_file_t JTS_FILES[] = {
      "        System.out.println(new Sub31().use31() + \" \" + new Sub31().key31());\n"
      "    }\n"
      "}\n"},
+    /* 32: a split package. The project declares sp32.shared (Own32); C32
+     * extends sp32.shared.Base32, a library type of the same package
+     * (compiled for javac, never indexed). javac: Help32 in C32 is
+     * app32.Help32, invokevirtual app32/Help32.ping32. */
+    {"src/main/java/sp32/shared/Own32.java",
+     "package sp32.shared;\n\n"
+     "public class Own32 {\n"
+     "}\n"},
+    {"src/main/java/app32/Help32.java",
+     "package app32;\n\n"
+     "public class Help32 {\n"
+     "    public String ping32() { return \"app32.Help32.ping32\"; }\n"
+     "}\n"},
+    {"src/main/java/app32/C32.java",
+     "package app32;\n\n"
+     "public class C32 extends sp32.shared.Base32 {\n"
+     "    String m32() { Help32 h = new Help32(); return h.ping32(); }\n"
+     "    public static void main(String[] a) { System.out.println(new C32().m32()); }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -974,6 +993,13 @@ static int jts_check_owner_spelled_supertype(jts_index_t *ix) {
     return ok;
 }
 
+/* 32: a library type in a package the project also declares is outside
+ * the index, not a project type the run cannot see: the answer stands (rule
+ * ii, counted as "in a project package"). */
+static int jts_check_library_split_package(jts_index_t *ix) {
+    return jts_expect_engine(ix, "m32", "ping32", "app32.Help32.ping32");
+}
+
 /* Both routes draw the same engine edges for the fixture. Name-chain edges
  * are left out: their strategy and pick already differ between the routes on
  * main (route differences D5, D9). */
@@ -1134,7 +1160,7 @@ TEST(java_type_scope_incremental_import_edit) {
  * incremental route: the repaired graph's engine edges are a fresh full
  * index's of the edited tree, and the inherited project member types still
  * answer (javac: Right24 / Right25). */
-static bool jts_incremental_append(const char *rel, const char *append) {
+static bool jts_incremental_append(const char *rel, const char *append, jts_check_fn check) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_jtsa_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -1171,7 +1197,7 @@ static bool jts_incremental_append(const char *rel, const char *append) {
     if (!same) {
         printf("\n  incremental:\n%s\n  full:\n%s\n", a ? a : "(none)", b ? b : "(none)");
     }
-    ok = ok && same && opened && jts_check_inherited_project_member(&inc);
+    ok = ok && same && opened && check(&inc);
     free(a);
     free(b);
     sqlite3_close(inc.db);
@@ -1182,13 +1208,24 @@ static bool jts_incremental_append(const char *rel, const char *append) {
 
 /* The review's edit: a newline appended to the subclass's file. */
 TEST(java_type_scope_incremental_inherited_member) {
-    ASSERT_TRUE(jts_incremental_append("src/main/java/msub/Sub24.java", "\n"));
+    ASSERT_TRUE(jts_incremental_append("src/main/java/msub/Sub24.java", "\n",
+                                       jts_check_inherited_project_member));
     PASS();
 }
 
 /* The supertype's own file is the edited one. */
 TEST(java_type_scope_incremental_supertype_edit) {
-    ASSERT_TRUE(jts_incremental_append("src/main/java/mbase/Base24.java", "\n"));
+    ASSERT_TRUE(jts_incremental_append("src/main/java/mbase/Base24.java", "\n",
+                                       jts_check_inherited_project_member));
+    PASS();
+}
+
+/* The split package's calling file is the edited one: the closure repair
+ * answers as a full index (its registry is partial, and the index does not
+ * hold Base32 either). */
+TEST(java_type_scope_incremental_library_split_package) {
+    ASSERT_TRUE(
+        jts_incremental_append("src/main/java/app32/C32.java", "\n", jts_check_library_split_package));
     PASS();
 }
 
@@ -1654,6 +1691,7 @@ JTS_ROUTES(qualified_interface, jts_check_qualified_interface)
 JTS_ROUTES(bare_library_supertype, jts_check_bare_library_supertype)
 JTS_ROUTES(library_supertype, jts_check_library_supertype)
 JTS_ROUTES(owner_spelled_supertype, jts_check_owner_spelled_supertype)
+JTS_ROUTES(library_split_package, jts_check_library_split_package)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1698,11 +1736,14 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_library_supertype_parallel);
     RUN_TEST(java_type_scope_owner_spelled_supertype_sequential);
     RUN_TEST(java_type_scope_owner_spelled_supertype_parallel);
+    RUN_TEST(java_type_scope_library_split_package_sequential);
+    RUN_TEST(java_type_scope_library_split_package_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
     RUN_TEST(java_type_scope_incremental_inherited_member);
     RUN_TEST(java_type_scope_incremental_supertype_edit);
+    RUN_TEST(java_type_scope_incremental_library_split_package);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(java_type_scope_growth_package_table);
     RUN_TEST(java_type_scope_growth_many_imports);

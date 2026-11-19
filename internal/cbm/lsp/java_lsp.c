@@ -608,10 +608,10 @@ typedef struct {
  * (in the scope of the file that declares the class: an identity, an import's
  * target, a java.lang name, or the spelling as written). */
 enum {
-    /* Rule (i): a project type the registry in hand does not hold (a
-     * qualified spelling in a package of the run's package table, or of the
-     * packages the shared registrar records), or a spelling that cannot be
-     * read as a type name. No answer rests on it. */
+    /* Rule (i): a spelling that cannot be read as a type name, or on a
+     * closure run a qualified spelling of a type the run's index holds and
+     * the closure's registry lacks (JAVA_UNSEEN_CLOSURE as well). No answer
+     * rests on it. */
     JAVA_UNSEEN_PROJECT = 1u << 0,
     /* Rule (ii), known outside the project: a qualified spelling in another
      * package (an import's target, a full qualification), or a java.lang name. */
@@ -619,6 +619,13 @@ enum {
     /* Rule (ii), no project type, package unknown: a bare spelling no scope
      * of its file placed (an on-demand import's, or a library's). */
     JAVA_UNSEEN_UNKNOWN = 1u << 2,
+    /* With JAVA_UNSEEN_PROJECT: a type the index holds, the closure lacks. */
+    JAVA_UNSEEN_CLOSURE = 1u << 3,
+    /* Rule (ii), in a project package outside the index: a qualified spelling
+     * of a project package whose type the index does not hold (a library type
+     * in a split package, a generated or excluded source). A full run's
+     * registry holds every indexed type, so there it is every such spelling. */
+    JAVA_UNSEEN_PACKAGE = 1u << 4,
 };
 
 static bool java_project_package(const JavaUnseenJudge *j, const char *qn, size_t pkg_len) {
@@ -658,14 +665,22 @@ static unsigned java_unseen_kind(const JavaUnseenJudge *j, const char *qn) {
     if (!type || isupper((unsigned char)qn[0])) {
         return JAVA_UNSEEN_UNKNOWN;
     }
-    return java_project_package(j, qn, (size_t)(type - 1 - qn)) ? JAVA_UNSEEN_PROJECT
-                                                                  : JAVA_UNSEEN_EXTERNAL;
+    size_t pkg_len = (size_t)(type - 1 - qn);
+    if (!java_project_package(j, qn, pkg_len)) {
+        return JAVA_UNSEEN_EXTERNAL;
+    }
+    if (j->packages && j->packages->indexed &&
+        j->packages->indexed(j->packages->ud, qn, pkg_len, type, strcspn(type, ".<"))) {
+        return JAVA_UNSEEN_PROJECT | JAVA_UNSEEN_CLOSURE;
+    }
+    return JAVA_UNSEEN_PACKAGE;
 }
 
 /* Answers withheld under rule (i), each once (engine step 0 of a cross run,
  * a registrar's declared type). On a full run every project type is
  * registered: each is a defect of ours to look at. */
 static _Atomic uint64_t g_java_unseen_project;
+static _Atomic uint64_t g_java_unseen_closure; /* of those: a type the closure lacks */
 
 /* The member type `name` that the type `owner` declares, or NULL. *unnamed is
  * set when it declares one whose QN two types share: the name is then that
@@ -814,8 +829,10 @@ static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *a
             /* A project spelling may name a nested type through its owner;
              * the walk then visits the type it names. */
             unsigned kind = java_unseen_kind(judge, super);
-            const char *nested =
-                kind == JAVA_UNSEEN_PROJECT ? java_owner_spelled_type(reg, arena, super) : NULL;
+            const char *nested = NULL;
+            if (kind & (JAVA_UNSEEN_PROJECT | JAVA_UNSEEN_PACKAGE)) {
+                nested = java_owner_spelled_type(reg, arena, super);
+            }
             if (nested) {
                 java_type_queue_push(arena, &q, nested);
             } else {
@@ -847,20 +864,26 @@ const char *cbm_java_test_inherited_member(const CBMTypeRegistry *reg, CBMArena 
 static _Atomic uint64_t g_java_unknown_scope_answers;
 static _Atomic uint64_t g_java_unseen_external_answers;
 static _Atomic uint64_t g_java_unseen_unknown_answers;
+static _Atomic uint64_t g_java_unseen_package_answers;
 
 uint64_t cbm_java_take_unknown_scope_answers(void) {
     return atomic_exchange_explicit(&g_java_unknown_scope_answers, 0, memory_order_relaxed);
 }
 
-void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *external, uint64_t *unknown) {
+void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *closure, uint64_t *external,
+                                 uint64_t *unknown, uint64_t *package) {
     *project = atomic_exchange_explicit(&g_java_unseen_project, 0, memory_order_relaxed);
+    *closure = atomic_exchange_explicit(&g_java_unseen_closure, 0, memory_order_relaxed);
     *external = atomic_exchange_explicit(&g_java_unseen_external_answers, 0, memory_order_relaxed);
     *unknown = atomic_exchange_explicit(&g_java_unseen_unknown_answers, 0, memory_order_relaxed);
+    *package = atomic_exchange_explicit(&g_java_unseen_package_answers, 0, memory_order_relaxed);
 }
 
 /* The values of ctx->unknown_scope_types: the type rests on a supertype of
- * unknown package (or on external ones only). */
+ * unknown package, else on one in a project package outside the index, else
+ * on external ones only. */
 static char g_java_rests_unknown;
+static char g_java_rests_package;
 static char g_java_rests_external;
 
 static void java_note_unknown_scope_type(JavaLSPContext *ctx, const char *qn, unsigned unseen) {
@@ -870,9 +893,16 @@ static void java_note_unknown_scope_type(JavaLSPContext *ctx, const char *qn, un
     if (!ctx->unknown_scope_types) {
         ctx->unknown_scope_types = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 16);
     }
-    void *kind = (unseen & JAVA_UNSEEN_UNKNOWN) ? &g_java_rests_unknown : &g_java_rests_external;
+    void *kind = &g_java_rests_external;
+    if (unseen & JAVA_UNSEEN_UNKNOWN) {
+        kind = &g_java_rests_unknown;
+    } else if (unseen & JAVA_UNSEEN_PACKAGE) {
+        kind = &g_java_rests_package;
+    }
     void *had = ctx->unknown_scope_types ? cbm_ht_get(ctx->unknown_scope_types, qn) : NULL;
-    if (ctx->unknown_scope_types && (!had || (had != kind && kind == &g_java_rests_unknown))) {
+    bool weaker = had == &g_java_rests_external ||
+                  (had == &g_java_rests_package && kind == &g_java_rests_unknown);
+    if (ctx->unknown_scope_types && (!had || (had != kind && weaker))) {
         const char *key = had ? qn : cbm_arena_strdup(ctx->arena, qn);
         if (key) {
             cbm_ht_set(ctx->unknown_scope_types, key, kind);
@@ -897,9 +927,13 @@ static void java_count_unknown_scope_answer(const JavaLSPContext *ctx, const cha
     }
     if (hit) {
         atomic_fetch_add_explicit(&g_java_unknown_scope_answers, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(hit == &g_java_rests_unknown ? &g_java_unseen_unknown_answers
-                                                               : &g_java_unseen_external_answers,
-                                  1, memory_order_relaxed);
+        _Atomic uint64_t *by_kind = &g_java_unseen_external_answers;
+        if (hit == &g_java_rests_unknown) {
+            by_kind = &g_java_unseen_unknown_answers;
+        } else if (hit == &g_java_rests_package) {
+            by_kind = &g_java_unseen_package_answers;
+        }
+        atomic_fetch_add_explicit(by_kind, 1, memory_order_relaxed);
     }
 }
 
@@ -965,8 +999,8 @@ static JavaStep0 java_step0_compute(JavaLSPContext *ctx, const char *name) {
             return r;
         }
         if ((met & JAVA_UNSEEN_PROJECT) && ctx->cross_run) {
-            /* Rule (i): a project type the run's registry does not hold (or a
-             * spelling no type has) may declare the name; it has no proven
+            /* Rule (i): a spelling no type has, or a type the run's index
+             * holds and this closure lacks, may declare the name; no proven
              * type here, and neither the outer classes, the imports nor the
              * package answer for it. A cross run judges this (its registry
              * holds the project or a closure of it); the per-file run's
@@ -1029,6 +1063,9 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
     *unseen |= s0.unseen;
     if (s0.withheld) {
         atomic_fetch_add_explicit(&g_java_unseen_project, 1, memory_order_relaxed);
+        if (s0.unseen & JAVA_UNSEEN_CLOSURE) {
+            atomic_fetch_add_explicit(&g_java_unseen_closure, 1, memory_order_relaxed);
+        }
     }
     if (s0.decided) {
         return s0.qn;
@@ -3929,6 +3966,9 @@ static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const c
         if (unseen & JAVA_UNSEEN_PROJECT) {
             *unnamed = true; /* rule (i): no proven type for the name */
             atomic_fetch_add_explicit(&g_java_unseen_project, 1, memory_order_relaxed);
+            if (unseen & JAVA_UNSEEN_CLOSURE) {
+                atomic_fetch_add_explicit(&g_java_unseen_closure, 1, memory_order_relaxed);
+            }
             break;
         }
         if (java_type_ambiguous(s->reg, o)) {

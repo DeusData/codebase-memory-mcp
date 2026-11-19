@@ -218,6 +218,11 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
 typedef struct CBMJavaProjectPackages {
     bool (*declared)(const void *ud, const char *package, size_t len);
     const void *ud;
+    /* The run's index (its graph) holds a type `name` (name_len bytes) of
+     * `package` (len bytes): one a closure's registry may lack. NULL: not
+     * known, as for a full run, whose registry holds every indexed type. */
+    bool (*indexed)(const void *ud, const char *package, size_t len, const char *name,
+                    size_t name_len);
 } CBMJavaProjectPackages;
 
 /* cbm_run_java_lsp_cross with the run's project packages (NULL: as
@@ -239,12 +244,14 @@ uint64_t cbm_java_take_unknown_scope_answers(void);
 
 /* The supertypes a cross run's registry does not hold, since the last call
  * (which restarts them; CBM_PROFILE line java.unseen, end of a resolve):
- * *project, answers withheld because the supertype is a project type the
- * registry does not hold or a spelling no type has (rule i; on a full run
- * each is a defect); *external and *unknown, the answers of
- * cbm_java_take_unknown_scope_answers split by the supertypes they rest on
- * (rule ii): all known outside the project, or one of unknown package. */
-void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *external, uint64_t *unknown);
+ * *project, answers withheld (rule i: a spelling no type has, or on a closure
+ * run a type the index holds that the closure lacks); *closure, those of the
+ * latter kind (each a defect of the closure); *external, *unknown and
+ * *package, the answers of cbm_java_take_unknown_scope_answers split by the
+ * supertypes they rest on (rule ii): one of unknown package, else one in a
+ * project package outside the index, else all known outside the project. */
+void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *closure, uint64_t *external,
+                                 uint64_t *unknown, uint64_t *package);
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* The member type `name` that the type `cls` inherits along its registered

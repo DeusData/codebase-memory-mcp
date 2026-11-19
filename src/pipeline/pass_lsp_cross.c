@@ -3449,13 +3449,29 @@ static bool pxc_package_declared(const void *ud, const char *package, size_t len
     return lo < t->count && strncmp(t->by_package[lo].package, below, len + 1) == 0;
 }
 
+/* CBMJavaProjectPackages.indexed over the run's package table: its type
+ * index holds every project type of the run's graph by (package, name). */
+static bool pxc_package_indexed(const void *ud, const char *package, size_t len, const char *name,
+                                size_t name_len) {
+    const cbm_pxc_packages_t *t = (const cbm_pxc_packages_t *)ud;
+    char simple[CBM_SZ_256];
+    if (!t || !package || !name || name_len == 0 || name_len >= sizeof(simple)) {
+        return false;
+    }
+    memcpy(simple, name, name_len);
+    simple[name_len] = '\0';
+    int first = 0;
+    return pxc_package_type_modules(t, package, len, simple, &first) > 0;
+}
+
 static bool pxc_java_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
     const char **locals = NULL;
     const char **qns = NULL;
     int n = pxc_jvm_file_imports(f, w->scratch, &locals, &qns);
     /* No shared registry here (an incremental closure of a few files): the
      * engine judges a library receiver by the run's package table. */
-    CBMJavaProjectPackages packages = {.declared = pxc_package_declared, .ud = f->packages};
+    CBMJavaProjectPackages packages = {
+        .declared = pxc_package_declared, .ud = f->packages, .indexed = pxc_package_indexed};
     cbm_run_java_lsp_cross_packages(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
                                     w->def_count, locals, qns, n, f->result->cached_tree,
                                     f->packages ? &packages : NULL, f->result, w->out);
@@ -4547,14 +4563,15 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {
         snprintf(n, sizeof(n), "%llu", (unsigned long long)unknown_scope);
         cbm_log_info("java.unknown_scope", "answers", n);
     }
-    uint64_t unseen[3];
-    cbm_java_take_unseen_counts(&unseen[0], &unseen[1], &unseen[2]);
+    uint64_t unseen[5];
+    cbm_java_take_unseen_counts(&unseen[0], &unseen[1], &unseen[2], &unseen[3], &unseen[4]);
     if (cbm_profile_active) {
-        char n[3][CBM_SZ_32];
-        for (int i = 0; i < 3; i++) {
+        char n[5][CBM_SZ_32];
+        for (int i = 0; i < 5; i++) {
             snprintf(n[i], sizeof(n[i]), "%llu", (unsigned long long)unseen[i]);
         }
-        cbm_log_info("java.unseen", "project", n[0], "external", n[1], "unknown", n[2]);
+        cbm_log_info("java.unseen", "project", n[0], "closure", n[1], "external", n[2], "unknown",
+                     n[3], "project_package", n[4]);
     }
     if (!idx) {
         return;
