@@ -12586,8 +12586,11 @@ int cbm_cmd_install(int argc, char **argv) {
      * Previously install only re-signed whatever was already at the target, so
      * `install --force` from a freshly built binary silently kept the OLD file
      * — operators ran stale code believing they had upgraded (#472). Copy the
-     * running binary to ~/.local/bin (unless we ARE that file), then sign it. */
-    if (!same_binary && target_exists && !force) {
+     * running binary to ~/.local/bin (unless we ARE that file), then sign it.
+     * Never with --skip-binary or an externally managed binary (#1566/#2722):
+     * the prompt's "yes" (or --yes) would replace the very file those promise
+     * to leave alone. */
+    if (!skip_binary && !same_binary && target_exists && !force) {
         printf("A different binary already exists at:\n  %s\n", bin_target);
         if (prompt_yn("Replace it with the binary you ran install from?")) {
             do_copy = true;
@@ -12600,8 +12603,9 @@ int cbm_cmd_install(int argc, char **argv) {
     /* A freshly clang-built arm64 binary is linker-signed (flags=0x20002)
      * and gets Killed:9 when spawned by an MCP host. Sign the private staged
      * candidate before disrupting sessions, then publish those exact verified
-     * bytes inside the activation window. */
-    bool sign_binary = do_copy || target_exists;
+     * bytes inside the activation window. A target that is not ours to place
+     * is not re-signed and republished either. */
+    bool sign_binary = do_copy || (target_exists && !skip_binary);
     bool prepare_binary = sign_binary;
 #else
     bool prepare_binary = do_copy;
