@@ -4116,7 +4116,9 @@ static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
      * number (tens), never the corpus, so this stays O(file), not O(corpus). */
     for (int i = 0; i < ctx->result->imports.count; i++) {
         const char *local_name = ctx->result->imports.items[i].local_name;
-        if (local_name && strcmp(local_name, name) == 0) {
+        /* A def's own import (#2285) binds no root elsewhere in the file. */
+        if (local_name && !ctx->result->imports.items[i].function_scope &&
+            strcmp(local_name, name) == 0) {
             return true;
         }
     }
