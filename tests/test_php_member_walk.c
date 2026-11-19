@@ -502,27 +502,112 @@ TEST(phpmw_possible_answer_in_the_walks_order) {
     PASS();
 }
 
-/* A possible answer the walk reaches through a trait's trait is beyond what
- * today's lookup answered: nothing is drawn from it (F5). Partner: the same
- * requirement through a direct trait is the copy today's flattening made, its
- * return type typing the chained call. */
-TEST(phpmw_possible_answer_only_where_today_answered) {
+/* A possible trait member is drawn when the trait that declares it and the
+ * class whose `use` brings it in are both declared in the file walked, at any
+ * depth of traits using traits: what main's same-file flattening reached
+ * (N3, fx/tt; php: Inner::deep runs for all four, Za; main types all four).
+ * Negative partner: the inner trait declared in another file, behind the
+ * vendor trait: nothing is drawn from the possible hit; without the vendor
+ * trait the hit is proven and drawn. */
+TEST(phpmw_possible_trait_member_same_file) {
     static const PmwFile f[] = {
-        {"src/Deep.php", "<?php\nnamespace App;\nuse Vendor\\Pkg\\VBase;\n"
-                         "class Zb { public function spin(): int { return 1; } }\n"
-                         "class Decoy { public function spin(): int { return 2; } }\n"
-                         "trait B { abstract public function m(): Zb; }\n"
-                         "trait A { use B; }\n"
-                         "class Deep extends VBase {\n    use A;\n"
-                         "    public function run(): void { $this->m()->spin(); }\n}\n"
-                         "class Flat extends VBase {\n    use B;\n"
-                         "    public function run(): void { $this->m()->spin(); }\n}\n"},
+        {"src/TT.php", "<?php\nnamespace App\\TT;\nuse Vendor\\Pkg\\V;\n"
+                       "class Za { public function spin() { return 'Za'; } }\n"
+                       "class Zb { public function spin() { return 'Zb'; } }\n"
+                       "trait Inner { public function deep(): Za { return new Za; } }\n"
+                       "trait Outer { use Inner; }\n"
+                       "class P { use Outer; }\n"
+                       "class PB { public function deep(): Zb { return new Zb; } }\n"
+                       "class Hidden extends P { use V; }\n"
+                       "class Plain extends P {}\n"
+                       "class Direct { use Outer; }\n"
+                       "class DirectV { use Outer, V; }\n"
+                       "class TCall {\n"
+                       "    public function a(Hidden $h) { return $h->deep()->spin(); }\n"
+                       "    public function b(Plain $p) { return $p->deep()->spin(); }\n"
+                       "    public function c(Direct $d) { return $d->deep()->spin(); }\n"
+                       "    public function d(DirectV $d) { return $d->deep()->spin(); }\n"
+                       "}\n"},
     };
     static const PmwExpect want[] = {
-        {"Deep.run", "Zb.spin", false, false},
-        {"Flat.run", "Zb.spin", true, true},
+        {"TCall.a", "Za.spin", true, true},
+        {"TCall.b", "Za.spin", true, true},
+        {"TCall.c", "Za.spin", true, true},
+        {"TCall.d", "Za.spin", true, true},
     };
-    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    ASSERT_EQ(pmw_check(f, 1, want, 4), 0);
+    static const PmwFile g[] = {
+        {"src/In/Inner.php", "<?php\nnamespace App\\In;\n"
+                             "class Za { public function spin() { return 'Za'; } }\n"
+                             "class Zb { public function spin() { return 'Zb'; } }\n"
+                             "trait Inner { public function deep(): Za { return new Za; } }\n"},
+        {"src/TT.php", "<?php\nnamespace App\\TT;\nuse Vendor\\Pkg\\V;\nuse App\\In\\Inner;\n"
+                       "trait Outer { use Inner; }\n"
+                       "class P { use Outer; }\n"
+                       "class Hidden extends P { use V; }\n"
+                       "class Plain extends P {}\n"
+                       "class TCall {\n"
+                       "    public function a(Hidden $h) { return $h->deep()->spin(); }\n"
+                       "    public function b(Plain $p) { return $p->deep()->spin(); }\n"
+                       "}\n"},
+    };
+    /* No edge at all for TCall.a (main typed it): TT.php imports neither Za
+     * nor Zb, so no name guess stands in (one would differ by route, main's). */
+    static const PmwExpect gwant[] = {
+        {"TCall.a", "Za.spin", false, false},
+        {"TCall.b", "Za.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(g, 2, gwant, 2), 0);
+    PASS();
+}
+
+/* "Declared in this file" compares the module exactly (N1): the module of
+ * src/Foo.php is a prefix of every class of src/Foo/Kid.php (fx/prefix). A
+ * possible trait member of such a class is not drawn (php: the vendor trait's
+ * m runs, Zv; main's guess stays); the control layout (fx/prefixctl) draws
+ * nothing either. Positive partner: the same shape with the classes really
+ * declared in the caller's file is drawn typed. */
+TEST(phpmw_same_file_is_exact) {
+    static const char *kid = "<?php\nnamespace App\\Foo;\nuse Vendor\\Pkg\\V;\n"
+                             "class Zt { public function spin() { return 'Zt'; } }\n"
+                             "class Zv extends Zt { public function spin() { return 'Zv'; } }\n"
+                             "trait T { public function m(): Zt { return new Zt; } }\n"
+                             "class P { use T; }\n"
+                             "class Kid extends P { use V; }\n";
+    const PmwFile f[] = {
+        {"src/Foo/Kid.php", kid},
+        {"src/Foo.php",
+         "<?php\nnamespace App;\nuse App\\Foo\\Kid;\n"
+         "class Caller { public function go(Kid $k) { return $k->m()->spin(); } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"Caller.go", "Zt.spin", true, false}, /* main's guess, as on main */
+    };
+    ASSERT_EQ(pmw_check(f, 2, want, 1), 0);
+    const PmwFile g[] = {
+        {"src/Foo/Kid.php", kid},
+        {"src/Bar.php",
+         "<?php\nnamespace App;\nuse App\\Foo\\Kid;\n"
+         "class Caller { public function go(Kid $k) { return $k->m()->spin(); } }\n"},
+    };
+    static const PmwExpect gwant[] = {
+        {"Caller.go", "Zt.spin", false, false},
+    };
+    ASSERT_EQ(pmw_check(g, 2, gwant, 1), 0);
+    static const PmwFile h[] = {
+        {"src/Foo.php",
+         "<?php\nnamespace App;\nuse Vendor\\Pkg\\V;\n"
+         "class Zh { public function spin() { return 'Zh'; } }\n"
+         "class Zw extends Zh { public function spin() { return 'Zw'; } }\n"
+         "trait H { public function h(): Zh { return new Zh; } }\n"
+         "class PH { use H; }\n"
+         "class KidH extends PH { use V; }\n"
+         "class Caller { public function here(KidH $k) { return $k->h()->spin(); } }\n"},
+    };
+    static const PmwExpect hwant[] = {
+        {"Caller.here", "Zh.spin", true, true},
+    };
+    ASSERT_EQ(pmw_check(h, 1, hwant, 1), 0);
     PASS();
 }
 
@@ -721,7 +806,8 @@ SUITE(php_member_walk) {
     RUN_TEST(phpmw_trait_in_a_later_namespace);
     RUN_TEST(phpmw_requirement_beside_vendor_trait);
     RUN_TEST(phpmw_possible_answer_in_the_walks_order);
-    RUN_TEST(phpmw_possible_answer_only_where_today_answered);
+    RUN_TEST(phpmw_possible_trait_member_same_file);
+    RUN_TEST(phpmw_same_file_is_exact);
     RUN_TEST(phpmw_trait_chain_40k);
     RUN_TEST(phpmw_parent_method_beats_interface_declaration);
     RUN_TEST(phpmw_chain_past_the_old_cap);

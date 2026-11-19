@@ -553,10 +553,13 @@ static const char *php_settle_rename_trait(PHPLSPContext *ctx, const CBMRegister
     return match ? match : spelled;
 }
 
-/* Whether `qn` is a type this file declares (its QN is the file's module's). */
+/* Whether `qn` is a type this file declares: its QN is exactly the file's
+ * module and one more segment. Module QNs come from paths, so a prefix test
+ * would also take every type of `src/Foo/Kid.php` for one of `src/Foo.php`. */
 static bool php_declared_here(const PHPLSPContext *ctx, const char *qn) {
     size_t n = ctx->module_qn ? strlen(ctx->module_qn) : 0;
-    return n > 0 && qn && strncmp(qn, ctx->module_qn, n) == 0 && qn[n] == '.';
+    return n > 0 && qn && strncmp(qn, ctx->module_qn, n) == 0 && qn[n] == '.' && qn[n + 1] &&
+           strchr(qn + n + 1, '.') == NULL;
 }
 
 /* A seeded library type lists its parents without kinds (php_stdlib_data.c):
@@ -793,17 +796,19 @@ const CBMRegisteredFunc *php_find_method(PHPLSPContext *ctx, const char *class_q
      *    is drawn only where today's engine gave an answer at that site: a
      *    member among the class's own members, its known parents and its
      *    known interface declarations (place OWN, SUPER, INTERFACE_DEFAULT),
-     *    or the copy of a member of a trait a class of this file uses itself
-     *    (mixin depth 1, no alias), which today's flattening made. Where both
-     *    answer behind an unknown and differ only in order (fx/twoifc: the
-     *    walk's I1.m against the old stack's I2.m) the walk's order, php's,
-     *    stands;
-     *  - what the walk adds beyond the deleted lookup (a trait's trait, an
-     *    alias, a trait of a class declared in another file) gives nothing
-     *    when only possible: the call keeps the pipeline's other rules. */
+     *    or the copy of a trait's member when the trait that declares it (the
+     *    owner) and the class whose `use` brings it in (the holder) are both
+     *    declared in this file, at any depth of traits using traits, and no
+     *    alias was involved: what today's same-file flattening reached
+     *    (fx/tt). Where both answer behind an unknown and differ only in order
+     *    (fx/twoifc: the walk's I1.m against the old stack's I2.m) the walk's
+     *    order, php's, stands;
+     *  - what the walk adds beyond the deleted lookup (an alias, a trait or a
+     *    holder declared in another file) gives nothing when only possible:
+     *    the call keeps the pipeline's other rules. */
     if (hit.place == CBM_MW_PLACE_MIXIN && hit.via_qn) {
-        if (!hit.prefix_complete &&
-            (hit.mixin_depth != 1 || hit.renamed || !php_declared_here(ctx, hit.via_qn))) {
+        if (!hit.prefix_complete && (hit.renamed || !php_declared_here(ctx, hit.owner_qn) ||
+                                     !php_declared_here(ctx, hit.via_qn))) {
             return NULL;
         }
         return php_mixin_member(ctx, &hit, method_name);
