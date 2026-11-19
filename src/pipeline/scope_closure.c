@@ -315,9 +315,10 @@ bool cbm_closure_add_def(cbm_closure_t *s, int file, const char *name, const cha
         if (!at_package) {
             char key[SC_FULL_MAX];
             int kn = snprintf(key, sizeof(key), "%d\x1f%s", file, d->name);
-            sc_ivec_t *own = kn > 0 && (size_t)kn < sizeof(key)
-                                 ? sc_slot(&s->arena, s->nested, key)
-                                 : NULL;
+            sc_ivec_t *own = NULL;
+            if (kn > 0 && (size_t)kn < sizeof(key)) {
+                own = sc_slot(&s->arena, s->nested, key);
+            }
             if (!own || !sc_push(&s->arena, own, s->ndefs)) {
                 return false;
             }
@@ -870,22 +871,23 @@ static void sc_scope_walk(const cbm_closure_t *s, int file, const cbm_closure_re
     }
     size_t xl = strcspn(r, ".");
     char key[SC_FULL_MAX];
-    int n = 0;
     const char *k = ref->scope; /* the innermost scope around the site */
     if (!k) {
         if (!f->package) {
             w->any_scope = true;
             return;
         }
-        n = snprintf(key, sizeof(key), "%d\x1f%s", file, ref->name);
-        w->own = n > 0 && (size_t)n < sizeof(key) ? cbm_ht_get(s->nested, key) : NULL;
-        n = snprintf(key, sizeof(key), "%d\x1f%.*s", file, (int)xl, r);
-        w->maybe = n > 0 && (size_t)n < sizeof(key) && cbm_ht_get(s->nested, key);
+        int kn = snprintf(key, sizeof(key), "%d\x1f%s", file, ref->name);
+        if (kn > 0 && (size_t)kn < sizeof(key)) {
+            w->own = cbm_ht_get(s->nested, key);
+        }
+        kn = snprintf(key, sizeof(key), "%d\x1f%.*s", file, (int)xl, r);
+        w->maybe = kn > 0 && (size_t)kn < sizeof(key) && cbm_ht_get(s->nested, key);
         k = f->package;
     }
     for (size_t l = strlen(k);;) {
-        n = l ? snprintf(key, sizeof(key), "%.*s.%.*s", (int)l, k, (int)xl, r)
-              : snprintf(key, sizeof(key), "%.*s", (int)xl, r);
+        int n = l ? snprintf(key, sizeof(key), "%.*s.%.*s", (int)l, k, (int)xl, r)
+                  : snprintf(key, sizeof(key), "%.*s", (int)xl, r);
         if (n > 0 && (size_t)n < sizeof(key) &&
             (cbm_ht_get(s->fulls, key) || cbm_ht_get(s->pkgs, key))) {
             int m = l ? snprintf(w->buf, sizeof(w->buf), "%.*s.%s", (int)l, k, r)
