@@ -3225,6 +3225,195 @@ static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate,
     return inserted;
 }
 
+static bool lsp_idx_insert_tail_leaf(CBMHashTable *index, CBMResolvedCall *row, const char *tail,
+                                     const char *leaf, const cbm_gbuf_t *gbuf,
+                                     const char *project_name) {
+    char *key = lsp_idx_key(tail, leaf, false, 0, 0, row->source_origin);
+    if (!key) {
+        return false;
+    }
+    bool inserted = lsp_idx_keep_best(index, key, row, gbuf, project_name, true);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, key);
+    return inserted;
+}
+
+/* A row without a span into the JVM tail table: under the Class.method tail of
+ * its caller and each leaf it answers to (its callee's, and its reason's for an
+ * indirect resolver), as the main tables hold it under its whole caller. A
+ * caller too short to have such a tail equals no call's tail and is left out;
+ * so is an empty leaf, whose call has no key and goes to the matcher. */
+static void lsp_idx_insert_tail_row(cbm_pipeline_lsp_index_t *idx, CBMResolvedCall *row,
+                                    uint32_t capacity, const cbm_gbuf_t *gbuf,
+                                    const char *project_name) {
+    const char *tail = cbm_pipeline_qn_class_method_tail(row->caller_qn);
+    if (!tail) {
+        return;
+    }
+    if (!idx->tail_legacy) {
+        idx->tail_legacy = cbm_ht_create(capacity);
+    }
+    const char *leaf = cbm_lsp_bare_segment(row->callee_qn);
+    if (!(leaf && !leaf[0]) &&
+        !lsp_idx_insert_tail_leaf(idx->tail_legacy, row, tail, leaf, gbuf, project_name)) {
+        idx->tail_legacy_complete = false;
+    }
+    if (row->reason && cbm_pipeline_invocation_reason_join_strategy(row->strategy)) {
+        const char *reason_leaf = cbm_lsp_bare_segment(row->reason);
+        if (!(reason_leaf && !reason_leaf[0]) &&
+            !lsp_idx_insert_tail_leaf(idx->tail_legacy, row, tail, reason_leaf, gbuf,
+                                      project_name)) {
+            idx->tail_legacy_complete = false;
+        }
+    }
+}
+
+static int lsp_idx_site_row_cmp(const void *lhs, const void *rhs) {
+    const cbm_pipeline_lsp_site_row_t *a = (const cbm_pipeline_lsp_site_row_t *)lhs;
+    const cbm_pipeline_lsp_site_row_t *b = (const cbm_pipeline_lsp_site_row_t *)rhs;
+    if (a->start != b->start) {
+        return a->start < b->start ? -1 : 1;
+    }
+    if (a->end != b->end) {
+        return a->end < b->end ? -1 : 1;
+    }
+    if (a->origin != b->origin) {
+        return a->origin < b->origin ? -1 : 1;
+    }
+    /* The array position last: the order is total, so an unstable sort still
+     * leaves the rows of one occurrence in array order. */
+    return a->row < b->row ? -1 : (a->row > b->row ? 1 : 0);
+}
+
+/* Every row that can rank at an exact occurrence, sorted so that the rows of
+ * one occurrence are neighbours in array order. */
+static void lsp_idx_build_site_rows(cbm_pipeline_lsp_index_t *idx,
+                                    const CBMResolvedCallArray *arr) {
+    int count = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (cbm_pipeline_invocation_row(rc) &&
+            cbm_pipeline_source_site_present(rc->site_start_byte, rc->site_end_byte)) {
+            count++;
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    cbm_pipeline_lsp_site_row_t *rows = (cbm_pipeline_lsp_site_row_t *)cbm_alloc(
+        CBM_MEM_CLASS_RESOLVE, (size_t)count * sizeof(*rows));
+    if (!rows) {
+        idx->site_complete = false;
+        return;
+    }
+    int filled = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (cbm_pipeline_invocation_row(rc) &&
+            cbm_pipeline_source_site_present(rc->site_start_byte, rc->site_end_byte)) {
+            rows[filled].start = rc->site_start_byte;
+            rows[filled].end = rc->site_end_byte;
+            rows[filled].origin = (uint32_t)rc->source_origin;
+            rows[filled].row = i;
+            filled++;
+        }
+    }
+    qsort(rows, (size_t)count, sizeof(*rows), lsp_idx_site_row_cmp);
+    idx->site_rows = rows;
+    idx->site_count = count;
+}
+
+/* The rows at the call's own occurrence: their number, and through `first`
+ * where they start in idx->site_rows. */
+static int lsp_idx_site_range(const cbm_pipeline_lsp_index_t *idx, const CBMCall *call,
+                              int *first) {
+    cbm_pipeline_lsp_site_row_t want = {call->site_start_byte, call->site_end_byte,
+                                        (uint32_t)call->source_origin, -1};
+    int lo = 0;
+    int hi = idx->site_count;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / 2);
+        if (lsp_idx_site_row_cmp(&idx->site_rows[mid], &want) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    *first = lo;
+    int count = 0;
+    while (lo + count < idx->site_count && idx->site_rows[lo + count].start == want.start &&
+           idx->site_rows[lo + count].end == want.end &&
+           idx->site_rows[lo + count].origin == want.origin) {
+        count++;
+    }
+    return count;
+}
+
+/* The matcher's choice among the rows at the call's own occurrence, by the
+ * matcher's own row tests: its first phase (the call's own caller), or with
+ * `tail_phase` the exact rows of its tail phase. `*any` says whether a row
+ * qualified, because an ambiguous choice answers NULL as well. */
+static const CBMResolvedCall *lsp_idx_site_choice(const cbm_pipeline_lsp_index_t *idx,
+                                                  const CBMResolvedCallArray *arr,
+                                                  const CBMCall *call, bool tail_phase,
+                                                  bool allow_tail, const cbm_gbuf_t *gbuf,
+                                                  const char *project_name, bool *any) {
+    int first = 0;
+    int count = lsp_idx_site_range(idx, call, &first);
+    atomic_fetch_add_explicit(&g_lsp_index_lookups, 1U + (uint64_t)count, memory_order_relaxed);
+    const char *call_tail =
+        tail_phase ? cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn) : NULL;
+    const CBMResolvedCall *best = NULL;
+    bool ambiguous = false;
+    for (int i = first; i < first + count; i++) {
+        const CBMResolvedCall *rc = &arr->items[idx->site_rows[i].row];
+        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+        if (site_rank != 2) {
+            continue;
+        }
+        bool caller_matches =
+            tail_phase ? cbm_pipeline_invocation_tail_caller_matches(rc, call, call_tail, site_rank)
+                       : strcmp(rc->caller_qn, call->enclosing_func_qn) == 0;
+        if (!caller_matches || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
+            continue;
+        }
+        cbm_pipeline_invocation_fold(&best, &ambiguous, rc, gbuf, project_name, allow_tail);
+    }
+    *any = best != NULL;
+    return ambiguous ? NULL : best;
+}
+
+/* The tail phase's rows without a span: the choice among the rows whose caller
+ * has the call's Class.method tail. `*authoritative` goes false where the table
+ * cannot answer for this call (no key, or a row the call rejects). */
+static const CBMResolvedCall *lsp_idx_tail_legacy_choice(const cbm_pipeline_lsp_index_t *idx,
+                                                         const CBMCall *call, bool *authoritative) {
+    *authoritative = true;
+    const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
+    if (!call_tail || !idx->tail_legacy) {
+        return NULL; /* no caller tail to share, or no such row in the file */
+    }
+    char *key = lsp_idx_key(call_tail, cbm_pipeline_call_callee_leaf(call->callee_name), false, 0,
+                            0, call->source_origin);
+    if (!key) {
+        *authoritative = false;
+        return NULL;
+    }
+    atomic_fetch_add_explicit(&g_lsp_index_lookups, 1, memory_order_relaxed);
+    const CBMResolvedCall *candidate = (const CBMResolvedCall *)cbm_ht_get(idx->tail_legacy, key);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, key);
+    if (!candidate || candidate == LSP_IDX_AMBIGUOUS) {
+        return NULL;
+    }
+    if (cbm_pipeline_invocation_row(candidate) &&
+        cbm_pipeline_qn_class_method_tail_eq(candidate->caller_qn, call_tail) &&
+        cbm_pipeline_invocation_site_rank(candidate, call) == 1 &&
+        cbm_pipeline_invocation_leaf_matches(candidate, call, 1)) {
+        return candidate;
+    }
+    *authoritative = false;
+    return NULL;
+}
+
 static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CBMCall *call,
                                              bool exact_site, bool *key_built, bool *ambiguous) {
     if (key_built) {
@@ -3327,7 +3516,12 @@ void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolv
     idx->legacy = NULL;
     idx->exact_complete = true;
     idx->legacy_complete = true;
-    idx->has_destructor = false;
+    idx->site_rows = NULL;
+    idx->site_count = 0;
+    idx->site_complete = true;
+    idx->tail_legacy = NULL;
+    idx->tail_legacy_complete = true;
+    idx->tail_indexed = allow_tail;
     idx->php_exact = NULL;
     idx->php_legacy = NULL;
     idx->php_rows = 0;
@@ -3335,6 +3529,7 @@ void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolv
     if (!arr || arr->count <= 0) {
         return;
     }
+    lsp_idx_build_site_rows(idx, arr);
     uint32_t capacity = (uint32_t)arr->count * 2u + 16u;
     idx->exact = cbm_ht_create(capacity);
     idx->legacy = cbm_ht_create(capacity);
@@ -3346,6 +3541,7 @@ void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolv
     }
     if (!idx->exact && !idx->legacy) {
         idx->php_complete = false; /* no row was read */
+        idx->tail_legacy_complete = false;
         return;
     }
     for (int i = 0; i < arr->count; i++) {
@@ -3384,11 +3580,8 @@ void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolv
                 *complete = false;
             }
         }
-        if (exact_site && rc_e->strategy && strcmp(rc_e->strategy, "lsp_destructor") == 0) {
-            idx->has_destructor = true;
-            if (!lsp_idx_insert_leaf(index, rc_e, "~", true, gbuf, project_name, allow_tail)) {
-                idx->exact_complete = false;
-            }
+        if (legacy_site && allow_tail) {
+            lsp_idx_insert_tail_row(idx, rc_e, capacity, gbuf, project_name);
         }
     }
 }
@@ -3403,6 +3596,16 @@ void cbm_pipeline_lsp_index_free(cbm_pipeline_lsp_index_t *idx) {
         cbm_ht_foreach(idx->legacy, lsp_idx_free_key, NULL);
         cbm_ht_free(idx->legacy);
         idx->legacy = NULL;
+    }
+    if (idx->tail_legacy) {
+        cbm_ht_foreach(idx->tail_legacy, lsp_idx_free_key, NULL);
+        cbm_ht_free(idx->tail_legacy);
+        idx->tail_legacy = NULL;
+    }
+    if (idx->site_rows) {
+        cbm_free(CBM_MEM_CLASS_RESOLVE, idx->site_rows);
+        idx->site_rows = NULL;
+        idx->site_count = 0;
     }
     if (idx->php_exact) {
         cbm_ht_foreach(idx->php_exact, lsp_idx_free_key, NULL);
@@ -3480,29 +3683,29 @@ bool cbm_pipeline_lsp_index_php_receiver_unindexed(const cbm_pipeline_lsp_index_
     return cbm_pipeline_php_receiver_type_unindexed(arr, call, registry);
 }
 
-/* A call that needs the language engine, at an exact span that also holds a
- * destructor row: the matcher joins that row by its span whatever the call's
- * leaf (cbm_pipeline_invocation_leaf_matches), the index only under "~". */
-static bool lsp_idx_destructor_at(const cbm_pipeline_lsp_index_t *idx, const CBMCall *call,
-                                  const char *leaf) {
-    if (!idx->has_destructor || !call->requires_lsp_resolution || strcmp(leaf, "~") == 0) {
-        return false;
-    }
-    char *key = lsp_idx_key(call->enclosing_func_qn, "~", true, call->site_start_byte,
-                            call->site_end_byte, call->source_origin);
-    if (!key) {
-        return true;
-    }
-    bool present = cbm_ht_get(idx->exact, key) != NULL;
-    cbm_free(CBM_MEM_CLASS_RESOLVE, key);
-    return present;
+/* The matcher's answer by its scan of every row, where the index may not hold
+ * the answer. */
+static const CBMResolvedCall *lsp_idx_scan(const CBMResolvedCallArray *arr, const CBMCall *call,
+                                           bool allow_tail, const cbm_gbuf_t *gbuf,
+                                           const char *project_name) {
+    atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows, arr ? (uint64_t)arr->count : 0U,
+                              memory_order_relaxed);
+    return cbm_pipeline_find_lsp_resolution_in_graph(arr, call, allow_tail, gbuf, project_name);
 }
 
 /* The language engine's row for one call: the answer of the matcher
  * (cbm_pipeline_find_lsp_resolution_in_graph), from the index where the index
  * holds it and from the matcher's scan where it may not (an incomplete index,
- * a key that cannot be built, a hit the call rejects, JVM tail matches, calls
- * that need the engine). Both resolvers call this. */
+ * a key that cannot be built, a hit the call rejects). Both resolvers call
+ * this.
+ *
+ * The matcher has two phases. The first takes the rows of the call's own
+ * caller: at the call's exact occurrence first, then those without a span.
+ * Only if there is none, and only for a JVM caller, the tail phase takes the
+ * rows whose caller shares the call's Class.method tail (or, at the exact
+ * occurrence, its bare name), again exact before span-less. A call that needs
+ * the engine ranks no span-less row, so both its phases are among the rows at
+ * its own occurrence. */
 const CBMResolvedCall *cbm_pipeline_lsp_index_find(const cbm_pipeline_lsp_index_t *idx,
                                                    const CBMResolvedCallArray *arr,
                                                    const CBMCall *call, bool allow_tail,
@@ -3515,40 +3718,70 @@ const CBMResolvedCall *cbm_pipeline_lsp_index_find(const cbm_pipeline_lsp_index_
         /* A partial or reversed span ranks no row: the matcher finds none. */
         return NULL;
     }
-    const CBMResolvedCall *lsp = NULL;
-    bool exact_key_built = true;
-    bool exact_key_ambiguous = false;
-    bool legacy_key_built = true;
+    bool any = false;
+    if (call->requires_lsp_resolution) {
+        if (!idx->site_complete || !call->enclosing_func_qn || !call->callee_name) {
+            return lsp_idx_scan(arr, call, allow_tail, gbuf, project_name);
+        }
+        if (!site_present) {
+            return NULL; /* no row ranks for it without an occurrence */
+        }
+        const CBMResolvedCall *own =
+            lsp_idx_site_choice(idx, arr, call, false, allow_tail, gbuf, project_name, &any);
+        if (any || !allow_tail) {
+            return own;
+        }
+        return lsp_idx_site_choice(idx, arr, call, true, allow_tail, gbuf, project_name, &any);
+    }
+
+    /* First phase, the call's own caller: the exact occurrence, then the rows
+     * without a span. A miss counts only where the table is complete and the
+     * key could be built and was the call's; elsewhere the matcher decides. */
+    bool key_built = true;
+    bool ambiguous = false;
     if (site_present) {
-        lsp = lsp_idx_lookup(idx->exact, call, true, &exact_key_built, &exact_key_ambiguous);
-        const char *leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
-        if (exact_key_built && leaf && lsp_idx_destructor_at(idx, call, leaf)) {
-            lsp = NULL;
-            exact_key_built = false;
+        const CBMResolvedCall *exact =
+            lsp_idx_lookup(idx->exact, call, true, &key_built, &ambiguous);
+        if (exact) {
+            return exact;
+        }
+        if (!idx->exact_complete || !key_built) {
+            /* An incomplete exact index must fail closed: the matcher is
+             * asked before a row without a span can win. */
+            return lsp_idx_scan(arr, call, allow_tail, gbuf, project_name);
+        }
+        if (ambiguous) {
+            return NULL; /* rows of its own caller exist and disagree */
+        }
+    } else if (!idx->exact_complete) {
+        return lsp_idx_scan(arr, call, allow_tail, gbuf, project_name);
+    }
+    const CBMResolvedCall *legacy =
+        lsp_idx_lookup(idx->legacy, call, false, &key_built, &ambiguous);
+    if (legacy) {
+        return legacy;
+    }
+    if (!idx->legacy_complete || !key_built) {
+        return lsp_idx_scan(arr, call, allow_tail, gbuf, project_name);
+    }
+    if (ambiguous || !allow_tail) {
+        return NULL;
+    }
+
+    /* Tail phase (JVM): no row of the call's own caller answers it. */
+    if (!idx->site_complete || !idx->tail_legacy_complete || !idx->tail_indexed) {
+        return lsp_idx_scan(arr, call, allow_tail, gbuf, project_name);
+    }
+    if (site_present) {
+        const CBMResolvedCall *exact_tail =
+            lsp_idx_site_choice(idx, arr, call, true, allow_tail, gbuf, project_name, &any);
+        if (any) {
+            return exact_tail;
         }
     }
-    bool exact_index_authoritative = idx->exact_complete && exact_key_built;
-    if (!lsp && !exact_index_authoritative) {
-        /* An incomplete exact index must fail closed: consult the
-         * authoritative matcher before a legacy row can win. */
-        atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows, (uint64_t)arr->count,
-                                  memory_order_relaxed);
-        lsp = cbm_pipeline_find_lsp_resolution_in_graph(arr, call, allow_tail, gbuf, project_name);
-    }
-    if (!lsp && !call->requires_lsp_resolution && exact_index_authoritative &&
-        !exact_key_ambiguous) {
-        lsp = lsp_idx_lookup(idx->legacy, call, false, &legacy_key_built, NULL);
-    }
-    if (!lsp && (!idx->legacy_complete || !legacy_key_built || allow_tail ||
-                 call->requires_lsp_resolution)) {
-        /* Fallback to the linear scan for edge cases the index may
-         * miss (e.g. callee_name that wasn't the registered short
-         * name). Keeps semantics identical. */
-        atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows, (uint64_t)arr->count,
-                                  memory_order_relaxed);
-        lsp = cbm_pipeline_find_lsp_resolution_in_graph(arr, call, allow_tail, gbuf, project_name);
-    }
-    return lsp;
+    bool authoritative = true;
+    const CBMResolvedCall *legacy_tail = lsp_idx_tail_legacy_choice(idx, call, &authoritative);
+    return authoritative ? legacy_tail : lsp_idx_scan(arr, call, allow_tail, gbuf, project_name);
 }
 
 static CBMCallEvidence *resolve_evidence_at(CBMCallEvidence *evidence, int index,

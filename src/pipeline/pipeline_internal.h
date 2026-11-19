@@ -2061,11 +2061,30 @@ uint64_t cbm_pp_lsp_scan_rows(void);
  * cbm_pipeline_find_lsp_resolution_in_graph returns, scanning only where the
  * index may not hold the answer. */
 typedef struct {
+    uint32_t start;
+    uint32_t end;
+    uint32_t origin;
+    int row; /* position in the file's row array */
+} cbm_pipeline_lsp_site_row_t;
+
+typedef struct {
     CBMHashTable *exact;  /* caller|leaf|start:end|origin */
     CBMHashTable *legacy; /* caller|leaf|origin, rows without a span */
     bool exact_complete;
     bool legacy_complete;
-    bool has_destructor;
+    /* Every row with a span, sorted by span, origin and array position: the
+     * rows at one occurrence are neighbours, in array order. Only such a row
+     * ranks for a call that needs the engine, so that call is answered from
+     * these alone; the JVM tail phase reads them for its exact rows. */
+    cbm_pipeline_lsp_site_row_t *site_rows;
+    int site_count;
+    bool site_complete;
+    /* JVM callers only: the rows without a span by the Class.method tail of
+     * their caller (tail|leaf|origin), for the tail phase. Built only when
+     * the index was built for tail matching (tail_indexed). */
+    CBMHashTable *tail_legacy;
+    bool tail_legacy_complete;
+    bool tail_indexed;
     /* PHP's unindexed-receiver rows (cbm_pipeline_php_unindexed_row), which
      * lie below the confidence floor and so in neither table above: the first
      * row of each key in array order. */
