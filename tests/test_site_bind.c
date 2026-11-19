@@ -655,6 +655,58 @@ TEST(site_bind_protobuf_never_proven_where_protoc_rejects) {
     PASS();
 }
 
+/* protoc 3.21.12 on rpc types (scope-evidence/review-3/rpc): protoc searches
+ * an rpc's types from its service, so a method named like the type is found
+ * first: `rpc Foo(Foo)` gives "Foo" is not a message type, as does a method
+ * named like an imported message and a response named like its method.
+ * `.p.Foo` from the root and a method named unlike every type compile. In
+ * the graph the method Foo and the message Foo are one node (`s.Foo`, the
+ * method's), so `rpc Foo(.p.Foo)` has no node of protoc's target and nothing
+ * is proven there; `rpc Get(.p.Foo)` is the root reference's partner. The
+ * same collision leaves nothing to prove in `same` and `response` before the
+ * fix too: the imported cases (method and message in two files) are the ones
+ * the walk proved wrong. */
+TEST(site_bind_protobuf_rpc_type_a_method_hides_is_never_proven) {
+    static const char *const same[][2] = {
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nmessage Foo { int32 a = 1; }\n"
+                    "message Bar { int32 b = 1; }\nservice S {\n  rpc Foo(Foo) returns (Bar);\n}\n"}};
+    static const char *const dotted[][2] = {
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nmessage Foo { int32 a = 1; }\n"
+                    "message Bar { int32 b = 1; }\nservice S {\n  rpc Foo(.p.Foo) returns (Bar);\n}\n"}};
+    static const char *const dotted_get[][2] = {
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nmessage Foo { int32 a = 1; }\n"
+                    "message Bar { int32 b = 1; }\nservice S {\n  rpc Get(.p.Foo) returns (Bar);\n}\n"}};
+    static const char *const partner[][2] = {
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nmessage Foo { int32 a = 1; }\n"
+                    "message Bar { int32 b = 1; }\nservice S {\n  rpc Get(Foo) returns (Bar);\n}\n"}};
+    static const char *const imported[][2] = {
+        {"q.proto", "syntax = \"proto3\";\npackage p;\nmessage Baz { int32 a = 1; }\n"},
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nimport \"q.proto\";\n"
+                    "message Bar { int32 b = 1; }\nservice S {\n  rpc Baz(Baz) returns (Bar);\n}\n"}};
+    static const char *const imported_response[][2] = {
+        {"q.proto", "syntax = \"proto3\";\npackage p;\nmessage Baz { int32 a = 1; }\n"},
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nimport \"q.proto\";\n"
+                    "message Foo { int32 b = 1; }\nservice S {\n  rpc Baz(Foo) returns (Baz);\n}\n"}};
+    static const char *const response[][2] = {
+        {"s.proto", "syntax = \"proto3\";\npackage p;\nmessage Foo { int32 a = 1; }\n"
+                    "message Bar { int32 b = 1; }\nservice S {\n  rpc Bar(Foo) returns (Bar);\n}\n"}};
+    int ok = 1;
+    ok &= sb_protoc_expect("rpc same", sb_protoc_case(same, 1, "s.Foo"), 0);
+    ok &= sb_protoc_expect("rpc dotted", sb_protoc_case(dotted, 1, "s.Foo"), 0);
+    ok &= sb_protoc_expect("rpc dotted get", sb_protoc_case(dotted_get, 1, "s.Foo"), 1);
+    ok &= sb_protoc_expect("rpc partner request", sb_protoc_case(partner, 1, "s.Foo"), 1);
+    ok &= sb_protoc_expect("rpc partner response", sb_protoc_case(partner, 1, "s.Bar"), 1);
+    ok &= sb_protoc_expect("rpc imported", sb_protoc_case(imported, 2, "q.Baz"), 0);
+    ok &= sb_protoc_expect("rpc imported response", sb_protoc_case(imported_response, 2, "q.Baz"),
+                           0);
+    ok &= sb_protoc_expect("rpc imported response request",
+                           sb_protoc_case(imported_response, 2, "s.Foo"), 1);
+    ok &= sb_protoc_expect("rpc response", sb_protoc_case(response, 1, "s.Bar"), 0);
+    ok &= sb_protoc_expect("rpc response request", sb_protoc_case(response, 1, "s.Foo"), 1);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* protoc 3.21.12 on review 3's fx4/scope: A's field is .p.A.Type (the
  * enclosing message is searched first), B's is .p.Type. Both are proven to
  * those, and the outer Type never at A's site, where the inner one shadows
@@ -689,6 +741,7 @@ TEST(site_bind_protobuf_enclosing_message_decides_first) {
 SUITE(site_bind) {
     RUN_TEST(site_bind_protobuf_never_proven_where_protoc_rejects);
     RUN_TEST(site_bind_protobuf_enclosing_message_decides_first);
+    RUN_TEST(site_bind_protobuf_rpc_type_a_method_hides_is_never_proven);
     RUN_TEST(site_bind_language_without_row_answers_nothing);
     RUN_TEST(site_bind_protobuf_reference_binds_what_protoc_resolves);
     RUN_TEST(site_bind_protobuf_incremental_equals_full);

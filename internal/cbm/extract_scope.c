@@ -28,6 +28,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,6 +37,7 @@ typedef enum {
     SC_ROLE_TYPE,    /* defines a type (Protobuf message, enum) */
     SC_ROLE_INCLUDE, /* an include statement, when an import starts here */
     SC_ROLE_QREF,    /* a qualified type reference: its text, qualifier included */
+    SC_ROLE_SERVICE, /* a service: its methods are symbols an rpc's types meet first */
 } sc_role_t;
 
 typedef struct {
@@ -51,17 +53,22 @@ typedef struct {
     const char *package_kind;      /* the statement naming the file's package; NULL: none */
     const char *nest_kind;         /* a type kind whose nested types it names; NULL: none */
     bool public_reexports;         /* `import public` re-exports what it imports */
+    /* a symbol scope that is no type (Protobuf: a service, its methods), the
+     * kinds of their name children ("<kind>_name"); NULL: none */
+    const char *service_kind;
+    const char *method_kind;
 } sc_lang_t;
 
 static const sc_rule_t SC_PROTO_RULES[] = {
     {"message", SC_ROLE_TYPE, "Class"}, {"enum", SC_ROLE_TYPE, "Class"},
     {"import", SC_ROLE_INCLUDE, NULL},  {"message_or_enum_type", SC_ROLE_QREF, NULL},
-    {NULL, SC_ROLE_NONE, NULL},
+    {"service", SC_ROLE_SERVICE, NULL}, {NULL, SC_ROLE_NONE, NULL},
 };
 static const char *const SC_PROTO_NAMES[] = {"message_name", "enum_name", NULL};
 
 static const sc_lang_t SC_LANGS[] = {
-    {CBM_LANG_PROTOBUF, SC_PROTO_RULES, SC_PROTO_NAMES, "package", "message", true},
+    {CBM_LANG_PROTOBUF, SC_PROTO_RULES, SC_PROTO_NAMES, "package", "message", true, "service",
+     "rpc"},
 };
 
 static _Atomic uint64_t g_scope_nodes_visited = 0;
@@ -136,6 +143,14 @@ typedef struct {
     uint32_t *cond_depth;
     uint32_t ncond;
     uint32_t cap_cond;
+    /* symbols that are no type: the file's services, and the methods of the
+     * service holding bytes [svc_start, svc_end); each sorted by name */
+    const char **svcs;
+    uint32_t nsvcs;
+    const char **methods;
+    uint32_t nmethods;
+    uint32_t svc_start;
+    uint32_t svc_end;
 } sc_walk_t;
 
 /* The definition of `label` named `name` that starts on `line`; -1 when there
@@ -278,6 +293,84 @@ static void sc_include(sc_walk_t *w, TSNode n) {
     }
 }
 
+static int sc_str_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* The names of `n`'s children of kind `kind` (each through its "<kind>_name"
+ * child), sorted, into an arena array; false when memory ran out. */
+static bool sc_names_of(sc_walk_t *w, TSNode n, const char *kind, const char ***out,
+                        uint32_t *count) {
+    char name_kind[CBM_SZ_64];
+    *out = NULL;
+    *count = 0;
+    if (snprintf(name_kind, sizeof(name_kind), "%s_name", kind) >= (int)sizeof(name_kind)) {
+        return true;
+    }
+    uint32_t c = ts_node_named_child_count(n);
+    const char **v = c ? cbm_arena_alloc(w->ctx->arena, c * sizeof(*v)) : NULL;
+    if (c && !v) {
+        return false;
+    }
+    for (uint32_t i = 0; i < c; i++) {
+        TSNode ch = ts_node_named_child(n, i);
+        if (strcmp(ts_node_type(ch), kind) != 0) {
+            continue;
+        }
+        uint32_t cc = ts_node_named_child_count(ch);
+        for (uint32_t j = 0; j < cc; j++) {
+            TSNode nm = ts_node_named_child(ch, j);
+            if (strcmp(ts_node_type(nm), name_kind) == 0) {
+                const char *t = sc_text(w, nm);
+                if (t) {
+                    v[(*count)++] = t;
+                }
+                break;
+            }
+        }
+    }
+    if (*count > SKIP_ONE) {
+        qsort(v, *count, sizeof(*v), sc_str_cmp);
+    }
+    *out = v;
+    return true;
+}
+
+/* Entering a service: its methods, which an rpc's types meet first. */
+static bool sc_service(sc_walk_t *w, TSNode n) {
+    w->svc_start = ts_node_start_byte(n);
+    w->svc_end = ts_node_end_byte(n);
+    return sc_names_of(w, n, w->lang->method_kind, &w->methods, &w->nmethods);
+}
+
+static bool sc_sorted_has(sc_walk_t *w, const char *const *v, uint32_t n, const char *key) {
+    w->steps++; /* one search */
+    return n > 0 && bsearch(&key, v, n, sizeof(*v), sc_str_cmp) != NULL;
+}
+
+/* Whether, on the way out from the reference at byte `at`, its first
+ * component names a symbol that is no type before any type: in an rpc a
+ * method of its service (protoc searches the service first and resolves any
+ * symbol there), or a service of the file; elsewhere a service only when the
+ * reference is qualified (an unqualified field type skips what is no type). */
+static bool sc_meets_no_type(sc_walk_t *w, const char *text, uint32_t at) {
+    if (!w->lang->service_kind || text[0] == '.') {
+        return false; /* from the root: no scope is searched */
+    }
+    size_t fl = strcspn(text, ".");
+    char first[CBM_SZ_256];
+    if (fl >= sizeof(first)) {
+        return true; /* not read: never proven */
+    }
+    memcpy(first, text, fl);
+    first[fl] = '\0';
+    bool in_rpc = at >= w->svc_start && at < w->svc_end;
+    if (in_rpc && sc_sorted_has(w, w->methods, w->nmethods, first)) {
+        return true;
+    }
+    return (in_rpc || text[fl] == '.') && sc_sorted_has(w, w->svcs, w->nsvcs, first);
+}
+
 /* A qualified type reference as written, blanks and comments between its
  * parts dropped: "google.protobuf.Empty", ".a.B", "Empty". */
 static void sc_qref(sc_walk_t *w, TSNode n) {
@@ -305,7 +398,8 @@ static void sc_qref(sc_walk_t *w, TSNode n) {
     const char *scope = w->nnest > 0 ? w->nest_full[w->nnest - SKIP_ONE]
                                      : (w->lang->package_kind ? w->pkg : NULL);
     if (k > 0) {
-        sc_emit(w, CBM_SCOPE_QREF, text, scope, (int32_t)b, e, 0);
+        uint8_t flags = sc_meets_no_type(w, text, b) ? (uint8_t)CBM_SCOPE_NOT_A_TYPE : 0;
+        sc_emit(w, CBM_SCOPE_QREF, text, scope, (int32_t)b, e, flags);
     }
 }
 
@@ -330,6 +424,9 @@ static bool sc_visit(sc_walk_t *w, TSNode n, bool *failed) {
         case SC_ROLE_QREF:
             sc_qref(w, n);
             return false;
+        case SC_ROLE_SERVICE:
+            *failed = !sc_service(w, n);
+            return true;
         case SC_ROLE_NONE:
         default:
             return true;
@@ -435,6 +532,9 @@ void cbm_extract_scope(CBMExtractCtx *ctx) {
     sc_walk_t w = {.ctx = ctx, .lang = lang, .pkg = ""};
     if (lang->package_kind) {
         w.pkg = sc_package(&w, ctx->root);
+    }
+    if (lang->service_kind && !sc_names_of(&w, ctx->root, lang->service_kind, &w.svcs, &w.nsvcs)) {
+        return;
     }
     const CBMDefArray *defs = &ctx->result->defs;
     if (defs->count > 0) {

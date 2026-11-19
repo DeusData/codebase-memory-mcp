@@ -604,6 +604,9 @@ cbm_site_answer_t cbm_pipeline_site_bind_usage(cbm_site_file_t *sf, const CBMUsa
     if (!qref) {
         return sb_no_answer(); /* not the last name of a type reference */
     }
+    if (qref->flags & CBM_SCOPE_NOT_A_TYPE) {
+        return sb_no_answer(); /* protoc resolves it to a method or a service */
+    }
     const char *written = qref->name;
     const char *dot = strrchr(written, '.');
     if (strcmp(dot ? dot + SKIP_ONE : written, usage->ref_name) != 0) {

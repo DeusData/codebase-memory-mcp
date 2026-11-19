@@ -782,6 +782,10 @@ enum {
     CBM_SCOPE_REEXPORT = 1u << 4, /* INCLUDE: its names reach this file's includers */
     /* inside a parse error: may or may not hold where a later name is used */
     CBM_SCOPE_CONDITIONAL = 1u << 5,
+    /* QREF: on the way out, the first component names a symbol that is no
+     * type (Protobuf: a method of the enclosing service, a service of the
+     * file): protoc resolves the reference to it and rejects the file */
+    CBM_SCOPE_NOT_A_TYPE = 1u << 6,
 };
 
 typedef struct {
