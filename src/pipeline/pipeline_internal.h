@@ -580,9 +580,9 @@ typedef struct {
     int tf_release_n;
     int tf_release_cap;
 
-    /* The path rule's universe (include_path.h): made with the context, its
-     * listing walked on the first import that needs it, freed with it. NULL:
-     * no import is read by the path rule (main's strategies decide). */
+    /* The path rule's universe (include_path.h): built from the run's indexed
+     * files with the context, read-only afterwards, freed with it. NULL: no
+     * import is read by the path rule (main's strategies decide). */
     struct cbm_include_universe *include_universe;
 } cbm_pipeline_ctx_t;
 
@@ -1703,10 +1703,10 @@ bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *s
 #define CBM_SEMANTIC_INPUT_GIT_CONTEXT CBM_SEMANTIC_INPUT_PREFIX "git-context-v1"
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
-/* The path rule's listing (include_path.h): every file under the repository
- * named like what a path row's import names; present only when a file of a
- * path-row language is discovered. A changed set of such names, anywhere,
- * routes the run to a full index. */
+/* The path rule's inventory (include_path.h): the indexed files named like
+ * what a path row's import names; present only when a file of a path-row
+ * language is discovered. A changed set of such names, anywhere, routes the
+ * run to a full index. */
 #define CBM_SEMANTIC_INPUT_INCLUDE_LISTING CBM_SEMANTIC_INPUT_PREFIX "include-listing-v1"
 
 int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *project,
