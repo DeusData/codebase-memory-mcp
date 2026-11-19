@@ -586,6 +586,47 @@ static const CBMType *parse_type_arguments(JavaLSPContext *ctx, TSNode targs_nod
  * this file's own types is registered under its owner's QN instead. */
 #define JAVA_MEMBER_KEY "\x1e"
 #define JAVA_OWNER_KEY "\x1d"
+/* "\x1c<package>": a package the shared registrar saw a project type in; the
+ * key alone marks a registry that records them (java_register_types). */
+#define JAVA_PACKAGE_KEY "\x1c"
+
+/* Whether a supertype the registry does not hold is known to lie outside the
+ * project (the possible-against-proven rule): its package, read from the
+ * spelling (the segments before the first capitalised one), is no package of
+ * the run. The run's package table answers when the run has one, else the
+ * packages a shared registrar recorded; a registry with neither (a per-file
+ * run) judges nothing, nor does a spelling without a package. Not judged
+ * outside = possibly a project type whose members no answer sees. */
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const CBMJavaProjectPackages *packages;
+} JavaUnseenJudge;
+
+static bool java_unseen_outside(const JavaUnseenJudge *j, const char *qn) {
+    if (!j || !j->reg || !qn || !islower((unsigned char)qn[0])) {
+        return false;
+    }
+    const char *type = NULL;
+    for (const char *p = qn; (p = strchr(p, '.')) != NULL; p++) {
+        if (isupper((unsigned char)p[1])) {
+            type = p + 1;
+            break;
+        }
+    }
+    if (!type) {
+        return false;
+    }
+    size_t pkg_len = (size_t)(type - 1 - qn);
+    if (j->packages && j->packages->declared) {
+        return !j->packages->declared(j->packages->ud, qn, pkg_len);
+    }
+    if (!cbm_registry_lookup_type(j->reg, JAVA_PACKAGE_KEY)) {
+        return false;
+    }
+    char key[JAVA_LSP_BUF];
+    int n = snprintf(key, sizeof(key), JAVA_PACKAGE_KEY "%.*s", (int)pkg_len, qn);
+    return n > 0 && (size_t)n < sizeof(key) && !cbm_registry_lookup_type(j->reg, key);
+}
 
 /* The member type `name` that the type `owner` declares, or NULL. *unnamed is
  * set when it declares one whose QN two types share: the name is then that
@@ -671,7 +712,8 @@ static void java_type_queue_push(CBMArena *arena, JavaTypeQueue *q, const char *
  * know (a library type) was met; it may declare member types no answer sees. */
 static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *arena,
                                          const char *cls, const char *name, bool *unnamed,
-                                         bool *unknown) {
+                                         bool *unknown, const JavaUnseenJudge *judge,
+                                         bool *unseen_inside) {
     const char *local[JAVA_TYPE_QUEUE_LOCAL] = {0};
     JavaTypeQueue q = {.items = local, .cap = JAVA_TYPE_QUEUE_LOCAL};
     const CBMRegisteredType *rt = cls ? cbm_registry_lookup_type(reg, cls) : NULL;
@@ -689,6 +731,9 @@ static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *a
         const CBMRegisteredType *st = cbm_registry_lookup_type(reg, super);
         if (!st) {
             *unknown = true;
+            if (!java_unseen_outside(judge, super)) {
+                *unseen_inside = true; /* possibly a project type: rule (i) */
+            }
             continue;
         }
         for (int k = 0; st->embedded_types && st->embedded_types[k]; k++) {
@@ -704,7 +749,8 @@ const char *cbm_java_test_inherited_member(const CBMTypeRegistry *reg, CBMArena 
                                            const char *cls, const char *name) {
     bool unnamed = false;
     bool unknown = false;
-    return java_inherited_member(reg, arena, cls, name, &unnamed, &unknown);
+    bool unseen_inside = false;
+    return java_inherited_member(reg, arena, cls, name, &unnamed, &unknown, NULL, &unseen_inside);
 }
 #endif
 
@@ -792,12 +838,24 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
             }
         }
         bool unnamed = false;
-        const char *member =
-            java_inherited_member(ctx->registry, ctx->arena, outer, name, &unnamed, unknown_scope);
+        bool unseen_inside = false;
+        JavaUnseenJudge judge = {.reg = ctx->registry, .packages = ctx->project_packages};
+        const char *member = java_inherited_member(ctx->registry, ctx->arena, outer, name, &unnamed,
+                                                   unknown_scope, &judge, &unseen_inside);
         if (member) {
             return member;
         }
         if (unnamed) {
+            return NULL;
+        }
+        if (unseen_inside && ctx->cross_run) {
+            /* Rule (i): a supertype the run cannot see and cannot place outside
+             * the project may declare the name; it has no proven type here,
+             * and neither the outer classes, the imports nor the package
+             * answer for it. A cross run judges this (its registry holds the
+             * project or a closure of it); the per-file run's registry holds
+             * one file and the JDK seed and judges nothing: it answers as main
+             * does, and a cross answer replaces its answer at that call. */
             return NULL;
         }
     }
@@ -3666,9 +3724,14 @@ typedef struct {
 /* The member type `name` that the class `owner` or one of its enclosing
  * classes (the member index's owner links) declares or inherits, innermost
  * first, or NULL; *unnamed as java_declared_member_type. Each class once. */
+/* The run's package table while a closure registrar runs
+ * (cbm_run_java_lsp_cross_packages); NULL for the shared build. */
+static _Thread_local const CBMJavaProjectPackages *g_java_reg_packages;
+
 static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const char *name,
                                     bool *unnamed) {
     const char *local[JAVA_TYPE_QUEUE_LOCAL] = {0};
+    JavaUnseenJudge judge = {.reg = s->reg, .packages = g_java_reg_packages};
     JavaTypeQueue chain = {.items = local, .cap = JAVA_TYPE_QUEUE_LOCAL};
     const char *found = NULL;
     bool unknown = false;
@@ -3682,8 +3745,14 @@ static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const c
         if (found || *unnamed) {
             break;
         }
-        found = java_inherited_member(s->reg, a, o, name, unnamed, &unknown);
+        bool unseen_inside = false;
+        found =
+            java_inherited_member(s->reg, a, o, name, unnamed, &unknown, &judge, &unseen_inside);
         if (found || *unnamed) {
+            break;
+        }
+        if (unseen_inside) {
+            *unnamed = true; /* rule (i): no proven type for the name */
             break;
         }
         if (java_type_ambiguous(s->reg, o)) {
@@ -4380,8 +4449,48 @@ static const char **java_split_pipe(CBMArena *arena, const char *text) {
 /* Register the type defs: QN, short name, the interface flag, the package that
  * marks a project type, and the supertypes as written (their identities come
  * with java_register_type_details). */
+/* JAVA_PACKAGE_KEY entries: each package a project type of `defs` is in,
+ * once, and the bare key that says the registry records them. */
+static void java_register_packages(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                   int def_count) {
+    CBMHashTable *seen = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 64);
+    if (!seen) {
+        return;
+    }
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        const char *dot =
+            d->qualified_name && java_type_label(d->label) ? strrchr(d->qualified_name, '.') : NULL;
+        if (!dot) {
+            continue;
+        }
+        char *key = cbm_arena_sprintf(arena, JAVA_PACKAGE_KEY "%.*s",
+                                      (int)(dot - d->qualified_name), d->qualified_name);
+        if (!key || cbm_ht_get(seen, key)) {
+            continue;
+        }
+        cbm_ht_set(seen, key, key);
+        CBMRegisteredType mark;
+        memset(&mark, 0, sizeof(mark));
+        mark.qualified_name = key;
+        mark.short_name = JAVA_PACKAGE_KEY;
+        mark.alias_of = key; /* no type: every walk over types skips it */
+        cbm_registry_add_type(reg, mark);
+    }
+    if (cbm_ht_count(seen) > 0) {
+        CBMRegisteredType mark;
+        memset(&mark, 0, sizeof(mark));
+        mark.qualified_name = JAVA_PACKAGE_KEY;
+        mark.short_name = JAVA_PACKAGE_KEY;
+        mark.alias_of = JAVA_PACKAGE_KEY;
+        cbm_registry_add_type(reg, mark);
+    }
+    cbm_ht_free(seen);
+}
+
 static void java_register_types(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count) {
+    java_register_packages(arena, reg, defs, def_count);
     for (int i = 0; i < def_count; i++) {
         const CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !java_type_label(d->label))
@@ -4809,8 +4918,10 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
     java_register_types(arena, &reg, defs, def_count);
     cbm_java_mark_ambiguous_types(arena, &reg, defs, def_count);
     cbm_registry_finalize_into(&reg, &idx_arena);
+    g_java_reg_packages = packages;
     java_register_type_details(arena, &reg, defs, def_count);
     java_register_funcs(arena, &reg, defs, def_count);
+    g_java_reg_packages = NULL;
     cbm_registry_finalize_into(&reg, &idx_arena);
 
     /* Parse if needed. */

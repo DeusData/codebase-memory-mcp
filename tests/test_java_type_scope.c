@@ -465,6 +465,55 @@ static const jts_file_t JTS_FILES[] = {
      "public class Tag2 {\n"
      "    public String seal() { return \"p2.Tag2.seal\"; }\n"
      "}\n"},
+    /* 27: a member type inherited through an interface whose extends list
+     * names the supertype qualified (the reviewer's fx5; javac
+     * invokevirtual i1/I1$Z1.pickC, then ec/RightC.hitC). */
+    {"src/main/java/i1/I1.java",
+     "package i1;\n\n"
+     "import ec.*;\n\n"
+     "public interface I1 {\n"
+     "    class Z1 {\n"
+     "        public RightC pickC() { return new RightC(); }\n"
+     "    }\n"
+     "}\n"},
+    {"src/main/java/i2/I2.java",
+     "package i2;\n\n"
+     "public interface I2 extends i1.I1 {\n"
+     "}\n"},
+    {"src/main/java/i3/Z1.java",
+     "package i3;\n\n"
+     "import ec.*;\n\n"
+     "public class Z1 {\n"
+     "    public WrongC pickC() { return new WrongC(); }\n"
+     "}\n"},
+    {"src/main/java/i4/Impl.java",
+     "package i4;\n\n"
+     "import i2.I2;\n"
+     "import i3.Z1;\n\n"
+     "public class Impl implements I2 {\n"
+     "    String ifaceDeep(Z1 z) { return z.pickC().hitC(); }\n"
+     "    public static void main(String[] a) { System.out.println(new Impl().ifaceDeep(new Z1())); }\n"
+     "}\n"},
+    {"src/main/java/i7/I7.java",
+     "package i7;\n\n"
+     "public interface I7 extends i1.I1, java.lang.Comparable<String> {\n"
+     "}\n"},
+    {"src/main/java/i7/Impl7.java",
+     "package i7;\n\n"
+     "import i3.Z1;\n\n"
+     "public abstract class Impl7 implements I7 {\n"
+     "    String ifaceDotted2(Z1 z) { return z.pickC().hitC(); }\n"
+     "}\n"},
+    {"src/main/java/ec/RightC.java",
+     "package ec;\n\n"
+     "public class RightC {\n"
+     "    public String hitC() { return \"RightC.hitC\"; }\n"
+     "}\n"},
+    {"src/main/java/ec/WrongC.java",
+     "package ec;\n\n"
+     "public class WrongC {\n"
+     "    public String hitC() { return \"WrongC.hitC\"; }\n"
+     "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
      "    public String ping() { return \"Def.ping\"; }\n"
@@ -793,6 +842,15 @@ static int jts_check_type_param(jts_index_t *ix) {
     int ok = jts_expect_no_engine_to(ix, "tpClass", "weigh26", "tp.Item26");
     ok &= jts_expect_no_engine_to(ix, "tpMethod", "weigh26", "tp.Item26");
     ok &= jts_expect_engine(ix, "tpPartner", "weigh26", "tp.Other26.weigh26");
+    return ok;
+}
+
+/* 27: Impl implements I2, `interface I2 extends i1.I1` (qualified), and I1
+ * declares Z1: Z1 in Impl is I1.Z1, which shadows the imported i3.Z1; the
+ * same through `interface I7 extends i1.I1, java.lang.Comparable<String>`. */
+static int jts_check_qualified_interface(jts_index_t *ix) {
+    int ok = jts_expect_engine(ix, "ifaceDeep", "hitC", "ec.RightC.hitC");
+    ok &= jts_expect_engine(ix, "ifaceDotted2", "hitC", "ec.RightC.hitC");
     return ok;
 }
 
@@ -1355,6 +1413,7 @@ JTS_ROUTES(inherited_member_type, jts_check_inherited_member_type)
 JTS_ROUTES(decorator, jts_check_decorator)
 JTS_ROUTES(inherited_project_member, jts_check_inherited_project_member)
 JTS_ROUTES(type_param, jts_check_type_param)
+JTS_ROUTES(qualified_interface, jts_check_qualified_interface)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1391,6 +1450,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_inherited_project_member_parallel);
     RUN_TEST(java_type_scope_type_param_sequential);
     RUN_TEST(java_type_scope_type_param_parallel);
+    RUN_TEST(java_type_scope_qualified_interface_sequential);
+    RUN_TEST(java_type_scope_qualified_interface_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
