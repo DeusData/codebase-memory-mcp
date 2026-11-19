@@ -1211,18 +1211,7 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
  * Used by the filesystem walker; cbm_pkgmap_try_parse is the source of
  * truth for which basenames produce entries. */
 static bool is_pkgmap_manifest_basename(const char *basename) {
-    if (!basename) {
-        return false;
-    }
-    if (strcmp(basename, "package.json") == 0 || strcmp(basename, "go.mod") == 0 ||
-        strcmp(basename, "Cargo.toml") == 0 || strcmp(basename, "pyproject.toml") == 0 ||
-        strcmp(basename, "composer.json") == 0 || strcmp(basename, "pubspec.yaml") == 0 ||
-        strcmp(basename, "pom.xml") == 0 || strcmp(basename, "build.gradle") == 0 ||
-        strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0 ||
-        strcmp(basename, "Package.swift") == 0) {
-        return true;
-    }
-    return ends_with(basename, ".gemspec");
+    return cbm_discover_is_package_manifest(basename); /* one list, shared with discovery */
 }
 
 /* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
@@ -1354,7 +1343,10 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+            /* deploy/ and deployed/ hold no indexed program source (their
+             * configuration files only), so a package manifest there names
+             * no package of the graph: skipped, as before. */
+            if (cbm_should_skip_dir(name, CBM_MODE_FULL) || cbm_discover_config_only_dir(name) ||
                 cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
                 continue;
             }

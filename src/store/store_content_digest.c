@@ -42,8 +42,8 @@ static const sc_query_t sc_queries[] = {
                        "(SELECT 1 FROM main.nodes n WHERE n.id=e.target_id));"},
     {"file_hashes", "SELECT rel_path,sha256,size FROM main.file_hashes WHERE project=?1 "
                     "ORDER BY 1,2,3;"},
-    {"lsp_surface", "SELECT rel_path,surface_sha,defs_json,ref_bloom,config_ctx FROM "
-                    "main.lsp_surface WHERE project=?1 ORDER BY 1,2,3,4,5;"},
+    {"lsp_surface", "SELECT rel_path,surface_sha,defs_json,ref_bloom,config_ctx,included_files "
+                    "FROM main.lsp_surface WHERE project=?1 ORDER BY 1,2,3,4,5,6;"},
     {"index_coverage", "SELECT rel_path,kind,detail FROM main.index_coverage WHERE project=?1 "
                        "ORDER BY 1,2,3;"},
     {"index_coverage_meta",
@@ -87,6 +87,22 @@ static void sc_frame(cbm_sha256_ctx *ctx, unsigned char tag, const void *bytes, 
     }
 }
 
+/* Read-only legacy databases retain their existing content digest: a table
+ * that gained a column is read with its earlier query when the column is
+ * absent. NULL for tables without an earlier shape. */
+static const char *sc_legacy_query(const char *name) {
+    if (strcmp(name, "index_coverage_meta") == 0) {
+        return "SELECT index_mode,recording_status,ignored_files_stored,"
+               "ignored_files_total,coverage_version,hash_records_complete FROM "
+               "main.index_coverage_meta WHERE project=?1;";
+    }
+    if (strcmp(name, "lsp_surface") == 0) {
+        return "SELECT rel_path,surface_sha,defs_json,ref_bloom,config_ctx FROM "
+               "main.lsp_surface WHERE project=?1 ORDER BY 1,2,3,4,5;";
+    }
+    return NULL;
+}
+
 static bool sc_table(sqlite3 *db, const sc_query_t *q, const char *project, cbm_sha256_ctx *ctx) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, q->sql, -1, &st, NULL) != SQLITE_OK) {
@@ -105,13 +121,8 @@ static bool sc_table(sqlite3 *db, const sc_query_t *q, const char *project, cbm_
                 sqlite3_step(schema) == SQLITE_DONE;
             return sqlite3_finalize(schema) == SQLITE_OK && absent;
         }
-        /* Read-only legacy databases retain their existing content digest. */
-        if (strcmp(q->name, "index_coverage_meta") != 0 ||
-            sqlite3_prepare_v2(db,
-                               "SELECT index_mode,recording_status,ignored_files_stored,"
-                               "ignored_files_total,coverage_version,hash_records_complete FROM "
-                               "main.index_coverage_meta WHERE project=?1;",
-                               SC_SQL_TEXT_LENGTH, &st, NULL) != SQLITE_OK) {
+        const char *legacy = sc_legacy_query(q->name);
+        if (!legacy || sqlite3_prepare_v2(db, legacy, SC_SQL_TEXT_LENGTH, &st, NULL) != SQLITE_OK) {
             sqlite3_finalize(st);
             return false;
         }

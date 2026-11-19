@@ -2020,8 +2020,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         int all_def_count = 0;
         char **def_modules = NULL;
         CBMModuleDefIndex *module_def_index = NULL;
-        CBMCrossLspRegistries cross_registries = {0};
-        CBMCrossLspRegistries *registries_arg = NULL;
+        /* Every route hands the walks the context; only a closure above the
+         * floor builds shared registries into it. */
+        CBMCrossLspRegistries cross_registries;
+        memset(&cross_registries, 0, sizeof(cross_registries));
+        cross_registries.ctx = ctx;
         CBMArena legacy_cross_arena;
         bool legacy_cross_arena_live = false;
         bool owner_walk_required = atomic_load(&ctx->test_definition_owners_seen) != 0;
@@ -2092,16 +2095,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                  * for languages without a shared registry, so convergence
                  * is unaffected; only the amortization strategy changes. */
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
-                    CBMArena *xa = &closure->arena;
-                    cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.python =
-                        cbm_py_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.java =
-                        cbm_java_build_cross_registry(xa, all_defs, all_def_count);
-                    registries_arg = &cross_registries;
+                    cbm_pxc_build_cross_registries(&closure->arena, all_defs, all_def_count,
+                                                   &cross_registries);
                 }
             } else {
                 all_def_count = 0;
@@ -2140,7 +2135,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_doclinks_begin(ctx, changed_files, ci, cache);
         rc = cbm_parallel_resolve(
             ctx, changed_files, ci, cache, &shared_ids, worker_count, all_defs, all_def_count,
-            closure ? closure->def_modules : def_modules, module_def_index, registries_arg);
+            closure ? closure->def_modules : def_modules, module_def_index, &cross_registries);
         cbm_doclinks_end(ctx);
 
     cross_resolve_cleanup:
@@ -2406,6 +2401,7 @@ static void *rehydrate_worker(void *arg) {
  * correctness stays trivially reasoned. Returns heap rows via out. */
 static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
                                   cbm_file_info_t *probe_files, int probe_count,
+                                  const CBMHashTable *indexed_files,
                                   cbm_lsp_surface_row_t **out_rows, int *out_count) {
     *out_rows = NULL;
     *out_count = 0;
@@ -2421,6 +2417,7 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
     cbm_pipeline_ctx_t probe_ctx = {
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
+        .indexed_files = indexed_files,
         .gbuf = probe_gbuf,
         .registry = NULL,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
@@ -3064,6 +3061,85 @@ static bool closure_metadata_current(bool metadata_current, const cbm_file_hash_
     return current && old_count == new_count;
 }
 
+/* Does `list` (one repository path per line, as lsp_surface.included_files
+ * stores it) name a file of `delta`? Every listed file must have been tracked
+ * by the previous generation: a file it did not hash cannot be proven
+ * unchanged, which *untracked reports. */
+static bool closure_list_names_delta(const char *list, const CBMHashTable *delta,
+                                     const CBMHashTable *stored_by_path, bool *untracked) {
+    bool hit = false;
+    char name[CBM_SZ_4K];
+    for (const char *at = list; at && *at;) {
+        const char *end = strchr(at, '\n');
+        size_t n = end ? (size_t)(end - at) : strlen(at);
+        if (n > 0) {
+            if (n >= sizeof(name)) {
+                *untracked = true;
+                return hit;
+            }
+            memcpy(name, at, n);
+            name[n] = '\0';
+            if (!cbm_ht_get(stored_by_path, name)) {
+                *untracked = true;
+            }
+            if (cbm_ht_get(delta, name)) {
+                hit = true;
+            }
+        }
+        at = end ? end + 1 : at + n;
+    }
+    return hit;
+}
+
+/* The includers of a changed or deleted file (#2993). A C-family file's
+ * preprocessed pass reads the repository files its #include lines name, so
+ * its graph changes with their bytes even when its own bytes do not. Every
+ * stored surface row lists the files its file's lookup read, transitively
+ * (the headers a header includes are on the includer's own list), so one pass
+ * over the rows finds every includer. Each joins the delta as a changed file
+ * and goes through the same surface comparison as the others. `paths` holds
+ * the changed files, then the deleted ones; the includers are inserted after
+ * the changed files. Linear in the total length of the lists. Returns a
+ * decline reason, or NULL. */
+static const char *closure_add_includers(const cbm_lsp_surface_row_t *rows, int row_count,
+                                         const CBMHashTable *stored_by_path,
+                                         const CBMHashTable *files_by_path, char **paths,
+                                         int *n_changed, int n_deleted) {
+    int changed = *n_changed;
+    CBMHashTable *delta =
+        cbm_ht_create((uint32_t)((size_t)(changed + n_deleted) * PAIR_LEN + CBM_SZ_64));
+    char **found = (char **)cbm_alloc(CBM_MEM_CLASS_OTHER,
+                                      (size_t)(row_count > 0 ? row_count : 1) * sizeof(char *));
+    const char *why = !delta || !found ? "alloc" : NULL;
+    for (int i = 0; !why && i < changed + n_deleted; i++) {
+        cbm_ht_set(delta, paths[i], paths[i]);
+    }
+    int found_count = 0;
+    for (int i = 0; !why && i < row_count; i++) {
+        bool untracked = false;
+        bool hit =
+            closure_list_names_delta(rows[i].included_files, delta, stored_by_path, &untracked);
+        if (untracked) {
+            why = "include_untracked";
+        } else if (hit && !cbm_ht_get(delta, rows[i].rel_path)) {
+            if (!cbm_ht_get(files_by_path, rows[i].rel_path)) {
+                why = "includer_not_discovered";
+            } else {
+                found[found_count++] = (char *)rows[i].rel_path;
+            }
+        }
+    }
+    if (!why && found_count > 0) {
+        memmove(paths + changed + found_count, paths + changed, (size_t)n_deleted * sizeof(char *));
+        memcpy(paths + changed, found, (size_t)found_count * sizeof(char *));
+        *n_changed = changed + found_count;
+        cbm_log_info("incremental.closure_includers", "includers", itoa_buf(found_count));
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, found);
+    cbm_ht_free(delta); /* keys borrowed */
+    return why;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -3247,6 +3323,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     for (int i = 0; i < plan->stored_count; i++) {
         cbm_ht_set(rows_by_path, plan->stored_rows[i].rel_path, &plan->stored_rows[i]);
     }
+    decline = closure_add_includers(plan->stored_rows, plan->stored_count, stored_by_path,
+                                    files_by_path, changed_paths, &n_changed, n_deleted);
+    if (decline) {
+        cbm_ht_free(rows_by_path);
+        goto done;
+    }
 
     probe_files =
         (cbm_file_info_t *)calloc((size_t)(n_changed ? n_changed : 1), sizeof(cbm_file_info_t));
@@ -3265,7 +3347,7 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         probe_files[i] = *info;
     }
     int probe_rc = n_changed > 0 ? closure_probe_surfaces(p, project, probe_files, n_changed,
-                                                          &probe_rows, &probe_count)
+                                                          files_by_path, &probe_rows, &probe_count)
                                  : 0;
     if (probe_rc != 0) {
         cbm_ht_free(rows_by_path);
@@ -3638,6 +3720,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_include_universe_t *include_universe = NULL;
+    CBMHashTable *indexed_files = NULL;
     CBMHashTable *stale_surface_set = NULL;
     closure_resolve_t cr = {0};
     bool cr_arena_live = false;
@@ -3850,6 +3933,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         cbm_log_error("delta.err", "phase", "doc_link_scopes");
         goto out;
     }
+    indexed_files = cbm_pipeline_indexed_files_new(files, file_count);
+    if (!indexed_files) {
+        cbm_log_error("delta.err", "phase", "indexed_files");
+        goto out;
+    }
     /* The purge already removed the closure and deleted files, so every File
      * row left in the stage is a file the passes will not see. A failed read
      * is a delta-route failure: the maps would silently diverge from a full
@@ -3865,6 +3953,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .include_universe = include_universe,
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
+        .indexed_files = indexed_files,
         .gbuf = gbuf,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
@@ -4208,6 +4297,7 @@ out:
     }
     cbm_path_alias_collection_free(path_aliases);
     cbm_include_universe_free(include_universe);
+    cbm_ht_free(indexed_files); /* keys borrowed from files */
     if (gbuf) {
         cbm_gbuf_free(gbuf);
     }
@@ -4622,11 +4712,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_path_alias_collection_t *path_aliases =
         cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
     cbm_include_universe_t *include_universe = cbm_include_universe_new(files, file_count);
+    CBMHashTable *indexed_files = cbm_pipeline_indexed_files_new(files, file_count);
 
     cbm_pipeline_ctx_t ctx = {
         .include_universe = include_universe,
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
+        .indexed_files = indexed_files,
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
@@ -4715,6 +4807,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
         cbm_include_universe_free(include_universe);
+        cbm_ht_free(indexed_files); /* keys borrowed from files */
         incr_free_edge_capture(&edge_cap);
         cbm_store_free_coverage(old_cov, old_cov_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
@@ -4815,6 +4908,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);
     cbm_include_universe_free(include_universe);
+    cbm_ht_free(indexed_files); /* keys borrowed from files */
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after
      * re-resolution AND post-passes so the freshly re-created target nodes

@@ -39,8 +39,11 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *   6  #2360: File nodes record their declared package clause (`package`
  *      property); an incremental run reads it back to build the namespace
  *      map and the Scala top-level index for the files it does not
- *      re-extract. */
-#define CBM_INDEX_FORMAT_VERSION 6
+ *      re-extract.
+ *   7  #2993: lsp_surface rows record the repository files a C-family file's
+ *      #include lookup read (`included_files`); an incremental run
+ *      re-extracts the file when one of them changes. */
+#define CBM_INDEX_FORMAT_VERSION 7
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -113,6 +116,11 @@ typedef struct {
     const void *ref_bloom;   /* referenced-identifier bloom blob (may be NULL) */
     int ref_bloom_len;
     const char *config_ctx; /* governing-config context hash ("" = none) */
+    /* The repository files the file's C-family #include lookup read
+     * (CBMFileResult.included_files): sorted, one per line, "" = none. Not part
+     * of the surface: an incremental run re-extracts the file when one of
+     * them changes. */
+    const char *included_files;
 } cbm_lsp_surface_row_t;
 
 /* The definition variants that lie in a file (graph_buffer.c "Definition

@@ -537,12 +537,12 @@ static pc_spill_witness_t pc_collect_spill_witness(pc_fixture_t *f) {
     decl = cbm_test_declarations_parse(pc_config0, strlen(pc_config0), false);
     if (!decl) goto done;
     cache[0] = cbm_extract_file_ex_with_tests(plain, (int)strlen(plain), CBM_LANG_C,
-        PC_PROJECT, "contributor.c", 0, NULL, NULL, NULL, NULL, decl);
+        PC_PROJECT, "contributor.c", 0, NULL, NULL, NULL, NULL, decl, NULL);
     if (!cache[0] || cache[0]->test_declarations_status != CBM_TEST_EXTRACT_OK || cache[0]->defs.count < 1)
         goto done;
     cbm_result_compact(cache[0]);
     cache[1] = cbm_extract_file_ex_with_tests(owner, (int)strlen(owner), CBM_LANG_C,
-        PC_PROJECT, "parked.c", 0, NULL, NULL, NULL, NULL, decl);
+        PC_PROJECT, "parked.c", 0, NULL, NULL, NULL, NULL, decl, NULL);
     if (!pc_result_case(cache[1], "CHECK_parked", PC_PROJECT ".parked.CHECK_parked")) goto done;
     cbm_result_compact(cache[1]);
     ctx.test_declarations = decl;
