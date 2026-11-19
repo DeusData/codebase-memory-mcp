@@ -608,6 +608,202 @@ const char *cbm_lsp_surface_identity_decline(const char *const *old_rows,
     return decline;
 }
 
+/* ── Scope facts: the "is" key ──────────────────────────────────────────
+ *
+ * A file's scope facts (cbm.h, CBMScopeEvent), stored as
+ *   "is": {"v": SURFACE_SCOPE_V, "ev": [[kind, flags, rank, ...], ...], "im": [module path, ...]}
+ * where rank orders the stored events by position (equal positions share a
+ * rank): an edit that moves bytes but keeps the facts keeps the stored bytes,
+ * and so the surface hash. Per kind: DEF [.., name, qualified name, qual],
+ * INCLUDE [.., index into "im"], ASSIGN [.., name], OPAQUE [..]. QREF events
+ * are not stored: a reference is read where its own file is re-extracted.
+ * Written only for a language with a scope row, so every other file's bytes
+ * stay as they were. A row of such a language written by an older binary has
+ * no "is": a reader must take its facts as unknown, never as empty. */
+enum { SURFACE_SCOPE_V = 1 };
+
+static bool surface_scope_stored(const CBMFileResult *r, const CBMScopeEvent *e) {
+    switch (e->kind) {
+    case CBM_SCOPE_INCLUDE:
+        return e->index >= 0 && e->index < r->imports.count &&
+               r->imports.items[e->index].module_path;
+    case CBM_SCOPE_DEF:
+        return e->index >= 0 && e->index < r->defs.count && e->name &&
+               r->defs.items[e->index].qualified_name;
+    case CBM_SCOPE_ASSIGN:
+        return e->name != NULL;
+    case CBM_SCOPE_OPAQUE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool surface_arr_add_str_or_null(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *s) {
+    return s ? yyjson_mut_arr_add_strcpy(doc, arr, s) : yyjson_mut_arr_add_null(doc, arr);
+}
+
+/* One stored event into `ev` (its module path into `im`). */
+static bool surface_scope_event(yyjson_mut_doc *doc, yyjson_mut_val *ev, yyjson_mut_val *im,
+                                int *nim, const CBMFileResult *r, const CBMScopeEvent *e,
+                                int rank) {
+    yyjson_mut_val *a = yyjson_mut_arr(doc);
+    bool ok = a && yyjson_mut_arr_add_int(doc, a, e->kind) &&
+              yyjson_mut_arr_add_int(doc, a, e->flags) && yyjson_mut_arr_add_int(doc, a, rank);
+    switch (e->kind) {
+    case CBM_SCOPE_INCLUDE:
+        ok = ok && yyjson_mut_arr_add_strcpy(doc, im, r->imports.items[e->index].module_path) &&
+             yyjson_mut_arr_add_int(doc, a, (*nim)++);
+        break;
+    case CBM_SCOPE_DEF:
+        ok = ok && yyjson_mut_arr_add_strcpy(doc, a, e->name) &&
+             yyjson_mut_arr_add_strcpy(doc, a, r->defs.items[e->index].qualified_name) &&
+             surface_arr_add_str_or_null(doc, a, e->qual);
+        break;
+    case CBM_SCOPE_ASSIGN:
+        ok = ok && yyjson_mut_arr_add_strcpy(doc, a, e->name);
+        break;
+    default:
+        break;
+    }
+    return ok && yyjson_mut_arr_add_val(ev, a);
+}
+
+static bool surface_add_scope(yyjson_mut_doc *doc, yyjson_mut_val *root, const CBMFileResult *r,
+                              CBMLanguage language) {
+    if (!cbm_extract_scope_has_row(language)) {
+        return true; /* no row: nothing to write */
+    }
+    yyjson_mut_val *is = yyjson_mut_obj(doc);
+    yyjson_mut_val *ev = yyjson_mut_arr(doc);
+    yyjson_mut_val *im = yyjson_mut_arr(doc);
+    if (!is || !ev || !im) {
+        return false;
+    }
+    int rank = -1;
+    int64_t last = -1;
+    int nim = 0;
+    for (int i = 0; r && i < r->scope.count; i++) {
+        const CBMScopeEvent *e = &r->scope.items[i];
+        if (!surface_scope_stored(r, e)) {
+            continue;
+        }
+        if ((int64_t)e->pos != last) {
+            rank++;
+            last = e->pos;
+        }
+        if (!surface_scope_event(doc, ev, im, &nim, r, e, rank)) {
+            return false;
+        }
+    }
+    return yyjson_mut_obj_add_int(doc, is, "v", SURFACE_SCOPE_V) &&
+           yyjson_mut_obj_add_val(doc, is, "ev", ev) && yyjson_mut_obj_add_val(doc, is, "im", im) &&
+           yyjson_mut_obj_add_val(doc, root, "is", is);
+}
+
+static const char *surface_json_strdup(CBMArena *a, yyjson_val *v) {
+    const char *s = v ? yyjson_get_str(v) : NULL;
+    return s ? cbm_arena_strdup(a, s) : NULL;
+}
+
+/* One stored event into e (its definition into defs[*ndefs] for a DEF);
+ * false: malformed. */
+static bool surface_scope_event_parse(CBMArena *a, yyjson_val *item, size_t nim, CBMScopeEvent *e,
+                                      CBMDefinition *defs, int *ndefs) {
+    if (!yyjson_is_arr(item) || yyjson_arr_size(item) < 3) {
+        return false;
+    }
+    yyjson_val *kind = yyjson_arr_get(item, 0);
+    yyjson_val *flags = yyjson_arr_get(item, 1);
+    yyjson_val *rank = yyjson_arr_get(item, 2);
+    if (!yyjson_is_int(kind) || !yyjson_is_int(flags) || !yyjson_is_int(rank) ||
+        yyjson_get_int(rank) < 0) {
+        return false;
+    }
+    memset(e, 0, sizeof(*e));
+    e->kind = (uint8_t)yyjson_get_int(kind);
+    e->flags = (uint8_t)yyjson_get_int(flags);
+    e->pos = (uint32_t)yyjson_get_int(rank);
+    e->index = -1;
+    yyjson_val *x = yyjson_arr_get(item, 3);
+    switch (e->kind) {
+    case CBM_SCOPE_INCLUDE:
+        e->index = (int32_t)yyjson_get_int(x);
+        return yyjson_is_int(x) && e->index >= 0 && (size_t)e->index < nim;
+    case CBM_SCOPE_DEF: {
+        CBMDefinition *d = &defs[*ndefs];
+        memset(d, 0, sizeof(*d));
+        e->name = surface_json_strdup(a, x);
+        e->qual = surface_json_strdup(a, yyjson_arr_get(item, 5));
+        d->name = e->name;
+        d->qualified_name = surface_json_strdup(a, yyjson_arr_get(item, 4));
+        e->index = (*ndefs)++;
+        return e->name && d->qualified_name;
+    }
+    case CBM_SCOPE_ASSIGN:
+        e->name = surface_json_strdup(a, x);
+        return e->name != NULL;
+    case CBM_SCOPE_OPAQUE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int cbm_lsp_surface_scope_from_json(CBMArena *arena, const char *json, cbm_lsp_scope_facts_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!arena || !json) {
+        return CBM_NOT_FOUND;
+    }
+    yyjson_doc *jd = yyjson_read(json, strlen(json), 0);
+    yyjson_val *root = jd ? yyjson_doc_get_root(jd) : NULL;
+    yyjson_val *is = root ? yyjson_obj_get(root, "is") : NULL;
+    if (!is) {
+        yyjson_doc_free(jd);
+        return jd ? 0 : CBM_NOT_FOUND;
+    }
+    yyjson_val *ver = yyjson_obj_get(is, "v");
+    yyjson_val *ev = yyjson_obj_get(is, "ev");
+    yyjson_val *im = yyjson_obj_get(is, "im");
+    bool ok = yyjson_is_int(ver) && yyjson_get_int(ver) == SURFACE_SCOPE_V && yyjson_is_arr(ev) &&
+              yyjson_is_arr(im);
+    size_t nev = ok ? yyjson_arr_size(ev) : 0;
+    size_t nim = ok ? yyjson_arr_size(im) : 0;
+    CBMScopeEvent *events = nev ? cbm_arena_alloc(arena, nev * sizeof(*events)) : NULL;
+    CBMDefinition *defs = nev ? cbm_arena_alloc(arena, nev * sizeof(*defs)) : NULL;
+    const char **modules = nim ? cbm_arena_alloc(arena, nim * sizeof(*modules)) : NULL;
+    ok = ok && (!nev || (events && defs)) && (!nim || modules);
+    size_t idx;
+    size_t max;
+    yyjson_val *item;
+    if (ok) {
+        yyjson_arr_foreach(im, idx, max, item) {
+            modules[idx] = surface_json_strdup(arena, item);
+            ok = ok && modules[idx];
+        }
+    }
+    int ndefs = 0;
+    if (ok) {
+        yyjson_arr_foreach(ev, idx, max, item) {
+            ok = ok && surface_scope_event_parse(arena, item, nim, &events[idx], defs, &ndefs);
+        }
+    }
+    yyjson_doc_free(jd);
+    if (!ok) {
+        return CBM_NOT_FOUND;
+    }
+    *out = (cbm_lsp_scope_facts_t){.events = events,
+                                   .event_count = (int)nev,
+                                   .defs = defs,
+                                   .def_count = ndefs,
+                                   .modules = modules,
+                                   .module_count = (int)nim};
+    return SKIP_ONE;
+}
+
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
  * symbols from its raw extraction defs. Returns the JSON string (malloc'd, or
  * from `alc` when given) and its length. With identities, each def's
@@ -752,6 +948,10 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_doc_free(doc);
         return NULL;
     }
+    if (!surface_add_scope(doc, root, result, language)) {
+        yyjson_mut_doc_free(doc);
+        return NULL; /* missing facts would diverge silently: fail the row */
+    }
     /* Names, types and strings come from source text, which need not be UTF-8:
      * one such byte must not cost the repository every surface row. */
     char *json = cbm_json_write_text(doc, alc, out_len);
@@ -774,6 +974,42 @@ typedef struct {
     _Atomic int next_file;
     _Atomic bool failed;
 } surface_job_t;
+
+/* Row strings are released with cbm_store_free_lsp_surfaces (free), so they
+ * come from the C heap: one place allocates them. */
+static char *surface_row_alloc(size_t n) {
+    return malloc(n);
+}
+
+static char *surface_row_strdup(const char *s) {
+    size_t n = strlen(s);
+    char *copy = surface_row_alloc(n + 1);
+    if (copy) {
+        memcpy(copy, s, n + 1);
+    }
+    return copy;
+}
+
+/* CBMFileResult.included_files, one file per line ("" when none). */
+static char *surface_row_included_files(const CBMFileResult *fr) {
+    size_t len = 0;
+    for (const char *const *f = fr->included_files; f && *f; f++) {
+        len += strlen(*f) + 1;
+    }
+    char *out = surface_row_alloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (const char *const *f = fr->included_files; f && *f; f++) {
+        size_t n = strlen(*f);
+        memcpy(out + at, *f, n);
+        at += n;
+        out[at++] = '\n';
+    }
+    out[at] = '\0';
+    return out;
+}
 
 static void surface_row_build(int i, void *arg) {
     surface_job_t *job = (surface_job_t *)arg;
@@ -814,19 +1050,23 @@ static void surface_row_build(int i, void *arg) {
         cbm_free(CBM_MEM_CLASS_OTHER, json);
         json = stored;
     }
+    char *included = surface_row_included_files(fr);
     cbm_pipeline_result_release(fr, loaded);
-    if (!json) {
+    if (!json || !included) {
+        free(json);
+        free(included);
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
         return;
     }
     cbm_lsp_surface_row_t *r = &job->rows[i];
     r->defs_json = json; /* set first: it marks the row present for the compaction */
-    r->project = strdup(job->project);
-    r->rel_path = strdup(job->files[i].rel_path);
-    r->surface_sha = strdup(sha);
+    r->project = surface_row_strdup(job->project);
+    r->rel_path = surface_row_strdup(job->files[i].rel_path);
+    r->surface_sha = surface_row_strdup(sha);
     r->ref_bloom = NULL;
     r->ref_bloom_len = 0;
-    r->config_ctx = strdup("");
+    r->config_ctx = surface_row_strdup("");
+    r->included_files = included;
     if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
     }
