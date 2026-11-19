@@ -16,6 +16,7 @@
 #include "pipeline/worker_pool.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/helm_template.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -36693,6 +36694,246 @@ TEST(pipeline_c_header_edit_refreshes_includers_incrementally) {
     PASS();
 }
 
+/* The sequential resolver looked each call's engine row up by scanning every
+ * row of the file: O(calls x rows) per file, 13.4 s for one generated
+ * file of 16,000 tests. It now uses the parallel resolver's per-file index.
+ * lsp_lookup_work counts index lookups plus rows read by a scan (counted
+ * inside the scan, whoever calls it) for one Go file of `n` functions, each
+ * calling two methods of a typed receiver, on the sequential resolver. */
+static uint64_t lsp_lookup_work(int n) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_lsp_work_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    char path[512];
+    int rc = 0;
+    snprintf(path, sizeof(path), "%s/go.mod", tmp);
+    rc |= th_write_file(path, "module example.com/work\n\ngo 1.21\n");
+    snprintf(path, sizeof(path), "%s/calc/calc.go", tmp);
+    rc |= th_write_file(path, "package calc\n\n"
+                              "type Calc struct{}\n\n"
+                              "func (c *Calc) Add(a, b int) int { return a + b }\n\n"
+                              "func (c *Calc) Positive(a int) bool { return a > 0 }\n");
+    size_t cap = (size_t)n * 128 + 128;
+    char *body = malloc(cap);
+    if (!body) {
+        th_rmtree(tmp);
+        return 0;
+    }
+    size_t len = (size_t)snprintf(body, cap, "package calc\n\n");
+    for (int i = 0; i < n && len < cap; i++) {
+        len += (size_t)snprintf(
+            body + len, cap - len,
+            "func Case%d(c *Calc) bool {\n\treturn c.Positive(c.Add(%d, 1))\n}\n\n", i, i);
+    }
+    snprintf(path, sizeof(path), "%s/calc/cases.go", tmp);
+    rc |= th_write_file(path, body);
+    free(body);
+    uint64_t work = 0;
+    if (rc == 0) {
+        XlangEnvSave save = xlang_env_select(false);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/work.db", tmp);
+        cbm_pp_lsp_linear_fallback_rows_reset();
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline && cbm_pipeline_run(pipeline) == 0) {
+            work = cbm_pp_lsp_scan_rows() + cbm_pp_lsp_index_lookups();
+        }
+        if (pipeline) {
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return work;
+}
+
+TEST(pipeline_sequential_lsp_lookup_work_grows_linearly) {
+    uint64_t w1 = lsp_lookup_work(40);
+    uint64_t w4 = lsp_lookup_work(160);
+    uint64_t w16 = lsp_lookup_work(640);
+    ASSERT_TRUE(w1 > 0);
+    /* Linear within 12.5%: a scan of every row per call grows 16x and 256x. */
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+/* The index lookup answers exactly what the matcher answers. Seeded rows and
+ * calls over two callers, exact / legacy / corrupt spans, both origins,
+ * floors, references, reason joins, destructor rows, calls that need the
+ * engine, and JVM tail matching on and off; every answer is compared with
+ * cbm_pipeline_find_lsp_resolution_in_graph's. */
+static uint32_t lsp_prop_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state >> 8;
+}
+
+TEST(pipeline_lsp_index_find_agrees_with_the_matcher) {
+    /* "a.K.f" and "b.K.f" share the Class.method tail the JVM tail phase joins
+     * by; "p.f|g" with leaf "m1" and "p.f" with leaf "g|m1" spell the same
+     * text around the key's separator. */
+    static const char *const callers[] = {"p.f", "p.g", "a.K.f", "b.K.f", "p.f|g"};
+    static const char *const callees[] = {"p.A.m1", "p.B.m1",  "p.A.m2",
+                                          "p.C.~C", "p.D.run", "p.B.g|m1"};
+    static const char *const strategies[] = {"lsp_direct", "lsp_type_dispatch", "lsp_destructor",
+                                             "lsp_callable_alias"};
+    static const char *const reasons[] = {NULL, "m1", "m2", "run"};
+    static const char *const names[] = {"x.m1", "m2", "~", "run", "y.run", "m1", "g|m1"};
+    static const uint32_t spans[][2] = {{0, 0}, {10, 20}, {30, 40}, {5, 5}, {9, 3}};
+    uint32_t seed = 0x5eed1234u;
+    int mismatches = 0;
+    int answered = 0;
+    int tail_answered = 0;
+    int two_rows = 0;
+    for (int trial = 0; trial < 20000; trial++) {
+        CBMResolvedCall rows[8];
+        int nrows = 1 + (int)(lsp_prop_next(&seed) % 8);
+        for (int i = 0; i < nrows; i++) {
+            memset(&rows[i], 0, sizeof(rows[i]));
+            rows[i].caller_qn = callers[lsp_prop_next(&seed) % 5];
+            rows[i].callee_qn = callees[lsp_prop_next(&seed) % 6];
+            rows[i].strategy = strategies[lsp_prop_next(&seed) % 4];
+            rows[i].reason = reasons[lsp_prop_next(&seed) % 4];
+            uint32_t conf = lsp_prop_next(&seed) % 5;
+            rows[i].confidence = conf == 0 ? 0.5f : 0.7f + 0.05f * (float)conf;
+            rows[i].kind = lsp_prop_next(&seed) % 7 == 0 ? CBM_RESOLVED_CALL_REFERENCE
+                                                         : CBM_RESOLVED_INVOCATION;
+            const uint32_t *span = spans[lsp_prop_next(&seed) % 5];
+            rows[i].site_start_byte = span[0];
+            rows[i].site_end_byte = span[1];
+            rows[i].source_origin = lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED
+                                                                  : CBM_SOURCE_ORIGIN_RAW;
+            /* One row in three sits at the previous row's caller and
+             * occurrence, so two rows under one key (the same target, another
+             * target, another confidence) are common. */
+            if (i > 0 && lsp_prop_next(&seed) % 3 == 0) {
+                rows[i].caller_qn = rows[i - 1].caller_qn;
+                rows[i].site_start_byte = rows[i - 1].site_start_byte;
+                rows[i].site_end_byte = rows[i - 1].site_end_byte;
+                rows[i].source_origin = rows[i - 1].source_origin;
+            }
+        }
+        CBMResolvedCallArray arr = {rows, nrows, nrows};
+        CBMCall call;
+        memset(&call, 0, sizeof(call));
+        call.callee_name = names[lsp_prop_next(&seed) % 7];
+        call.enclosing_func_qn = callers[lsp_prop_next(&seed) % 5];
+        const uint32_t *span = spans[lsp_prop_next(&seed) % 5];
+        call.site_start_byte = span[0];
+        call.site_end_byte = span[1];
+        call.source_origin =
+            lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED : CBM_SOURCE_ORIGIN_RAW;
+        call.requires_lsp_resolution = lsp_prop_next(&seed) % 3 == 0;
+        bool allow_tail = lsp_prop_next(&seed) % 2 == 0;
+        /* Two calls in three are aimed at one of the rows: its caller, its
+         * occurrence, and its leaf or the leaf of its reason. One aimed call
+         * in four then moves to the caller's tail twin, which only the tail
+         * phase can join. */
+        if (lsp_prop_next(&seed) % 3 != 0) {
+            const CBMResolvedCall *aim = &rows[lsp_prop_next(&seed) % (uint32_t)nrows];
+            call.enclosing_func_qn = aim->caller_qn;
+            call.callee_name = (aim->reason && lsp_prop_next(&seed) % 2 == 0)
+                                   ? aim->reason
+                                   : cbm_lsp_bare_segment(aim->callee_qn);
+            call.site_start_byte = aim->site_start_byte;
+            call.site_end_byte = aim->site_end_byte;
+            call.source_origin = aim->source_origin;
+            if (lsp_prop_next(&seed) % 4 == 0) {
+                if (strcmp(call.enclosing_func_qn, "a.K.f") == 0) {
+                    call.enclosing_func_qn = "b.K.f";
+                } else if (strcmp(call.enclosing_func_qn, "b.K.f") == 0) {
+                    call.enclosing_func_qn = "a.K.f";
+                }
+            }
+        }
+        cbm_pipeline_lsp_index_t idx;
+        cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, allow_tail);
+        const CBMResolvedCall *by_index =
+            cbm_pipeline_lsp_index_find(&idx, &arr, &call, allow_tail, NULL, NULL);
+        const CBMResolvedCall *by_matcher =
+            cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, allow_tail, NULL, NULL);
+        cbm_pipeline_lsp_index_free(&idx);
+        if (by_index != by_matcher) {
+            mismatches++;
+        }
+        /* What the trial exercised: an answer at all; an answer only the
+         * tail phase gives; two or more rows that are this call's. */
+        answered += by_matcher != NULL;
+        tail_answered += allow_tail && by_matcher &&
+                         !cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, false, NULL, NULL);
+        int mine = 0;
+        for (int i = 0; i < nrows; i++) {
+            int rank = cbm_pipeline_invocation_site_rank(&rows[i], &call);
+            mine += rows[i].kind == CBM_RESOLVED_INVOCATION &&
+                    rows[i].confidence >= CBM_LSP_CONFIDENCE_FLOOR &&
+                    strcmp(rows[i].caller_qn, call.enclosing_func_qn) == 0 && rank != 0 &&
+                    cbm_pipeline_invocation_leaf_matches(&rows[i], &call, rank);
+        }
+        two_rows += mine >= 2;
+    }
+    if (answered <= 3000 || tail_answered <= 100 || two_rows <= 300) {
+        printf("  generator coverage: answered=%d tail=%d two_rows=%d\n", answered, tail_answered,
+               two_rows);
+    }
+    ASSERT_EQ(mismatches, 0);
+    /* The comparison is not all "no row". */
+    ASSERT_TRUE(answered > 3000);
+    ASSERT_TRUE(tail_answered > 100);
+    ASSERT_TRUE(two_rows > 300);
+    PASS();
+}
+
+/* One engine row whose leaf is empty must not switch the file's index off.
+ * The C engine writes such a row for a call through a project `operator->`
+ * (the callee ends in a separator). With it in the file, a call without a
+ * row of its own is still answered without a scan, and the row's own call,
+ * which has no key, is still decided by the matcher. */
+TEST(pipeline_lsp_index_empty_leaf_row_keeps_the_index_complete) {
+    CBMResolvedCall rows[2];
+    memset(rows, 0, sizeof(rows));
+    rows[0].caller_qn = "p.f";
+    rows[0].callee_qn = "p.T.operator->";
+    rows[0].strategy = "lsp_direct";
+    rows[0].confidence = 0.9f;
+    rows[0].kind = CBM_RESOLVED_INVOCATION;
+    rows[0].site_start_byte = 10;
+    rows[0].site_end_byte = 20;
+    rows[1] = rows[0];
+    rows[1].callee_qn = "p.A.m1";
+    rows[1].site_start_byte = 30;
+    rows[1].site_end_byte = 40;
+    CBMResolvedCallArray arr = {rows, 2, 2};
+    ASSERT_TRUE(cbm_lsp_bare_segment(rows[0].callee_qn)[0] == '\0'); /* the premise */
+
+    cbm_pipeline_lsp_index_t idx;
+    cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, false);
+    ASSERT_TRUE(idx.exact_complete);
+
+    CBMCall call;
+    memset(&call, 0, sizeof(call));
+    call.enclosing_func_qn = "p.f";
+    call.callee_name = "other";
+    call.site_start_byte = 50;
+    call.site_end_byte = 60;
+    cbm_pp_lsp_linear_fallback_rows_reset();
+    ASSERT_NULL(cbm_pipeline_lsp_index_find(&idx, &arr, &call, false, NULL, NULL));
+    call.callee_name = "m1";
+    call.site_start_byte = 30;
+    call.site_end_byte = 40;
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, false, NULL, NULL) == &rows[1]);
+    ASSERT_EQ(cbm_pp_lsp_scan_rows(), 0); /* neither lookup read the rows */
+
+    call.callee_name = "operator->";
+    call.site_start_byte = 10;
+    call.site_end_byte = 20;
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, false, NULL, NULL) == &rows[0]);
+    ASSERT_TRUE(cbm_pp_lsp_scan_rows() > 0); /* that one was the matcher's */
+    cbm_pipeline_lsp_index_free(&idx);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_c_header_edit_refreshes_includers_incrementally);
     RUN_TEST(pipeline_c_include_lookup_uses_repo_root);
@@ -36822,6 +37063,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_parallel);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
+    RUN_TEST(pipeline_sequential_lsp_lookup_work_grows_linearly);
+    RUN_TEST(pipeline_lsp_index_find_agrees_with_the_matcher);
+    RUN_TEST(pipeline_lsp_index_empty_leaf_row_keeps_the_index_complete);
     RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
     RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);

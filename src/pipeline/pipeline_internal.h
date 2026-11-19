@@ -2048,6 +2048,35 @@ void cbm_pp_bp_nap_cycles_reset(void);
  * coverage; deterministic and independent of wall-clock timing. */
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
+/* Index lookups made by cbm_pipeline_lsp_index_find since the last reset of
+ * the counter above (the same reset clears both). */
+uint64_t cbm_pp_lsp_index_lookups(void);
+/* Rows read by a per-call scan of a file's engine rows since that reset,
+ * counted inside the scan itself (lsp_resolve.h), whoever called it. */
+uint64_t cbm_pp_lsp_scan_rows(void);
+
+/* One file's engine rows (CBMResolvedCall invocations) by caller, leaf and
+ * span, built and searched by the same code on both resolvers
+ * (pass_parallel.c). cbm_pipeline_lsp_index_find returns what the matcher
+ * cbm_pipeline_find_lsp_resolution_in_graph returns, scanning only where the
+ * index may not hold the answer. */
+typedef struct {
+    CBMHashTable *exact;  /* caller|leaf|start:end|origin */
+    CBMHashTable *legacy; /* caller|leaf|origin, rows without a span */
+    bool exact_complete;
+    bool legacy_complete;
+    bool has_destructor;
+} cbm_pipeline_lsp_index_t;
+
+void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolvedCallArray *arr,
+                                  const cbm_gbuf_t *gbuf, const char *project_name,
+                                  bool allow_tail);
+const CBMResolvedCall *cbm_pipeline_lsp_index_find(const cbm_pipeline_lsp_index_t *idx,
+                                                   const CBMResolvedCallArray *arr,
+                                                   const CBMCall *call, bool allow_tail,
+                                                   const cbm_gbuf_t *gbuf,
+                                                   const char *project_name);
+void cbm_pipeline_lsp_index_free(cbm_pipeline_lsp_index_t *idx);
 
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
 /* Test-only view of the Studio Export range join, so the ",+<N>" truncation

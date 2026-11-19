@@ -471,7 +471,14 @@ static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCal
  * bare last segment by cbm_lsp_bare_segment before matching.
  *
  * The pointer returned aliases into `arr` and stays valid as long as the
- * underlying CBMFileResult is alive. */
+ * underlying CBMFileResult is alive.
+ *
+ * This reads every row of the file for one call. Both resolvers ask through
+ * the per-file index (cbm_pipeline_lsp_index_find, pass_parallel.c), which
+ * comes here only where the index may not hold the answer; g_lsp_scan_rows
+ * counts the rows read here, whoever asks. */
+extern _Atomic uint64_t g_lsp_scan_rows; /* defined in pass_parallel.c */
+
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
     const cbm_gbuf_t *gbuf, const char *project_name) {
@@ -481,6 +488,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
+    atomic_fetch_add_explicit(&g_lsp_scan_rows, (uint64_t)arr->count, memory_order_relaxed);
 
     const CBMResolvedCall *best_exact_caller = NULL;
     int best_exact_caller_rank = 0;
@@ -529,6 +537,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     }
 
     const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
+    atomic_fetch_add_explicit(&g_lsp_scan_rows, (uint64_t)arr->count, memory_order_relaxed);
 
     const CBMResolvedCall *best_tail_exact = NULL;
     const CBMResolvedCall *best_tail_legacy = NULL;
