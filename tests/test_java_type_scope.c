@@ -562,6 +562,41 @@ static const jts_file_t JTS_FILES[] = {
      "public class Svc29 extends Base29 {\n"
      "    String onDemand29() { Help28 h = new Help28(); return h.ping28(); }\n"
      "}\n"},
+    /* 31: a supertype spelled through its owner, `extends p31.Outer31.Inner31`
+     * (the registry keys the nested type as p31.Inner31). javac: Help31 in
+     * Sub31 is q31.Help31; Key31 is Inner31's member type, which shadows the
+     * own package's q31.Key31 (JLS 6.4.1): invokevirtual
+     * p31/Outer31$Inner31$Key31.turn31. The twin's method has another name:
+     * a pick of the twin then has no turn31 (the call join keys on the
+     * `Class.method` tail, so a same-named method would hide the pick). */
+    {"src/main/java/p31/Outer31.java",
+     "package p31;\n\n"
+     "public class Outer31 {\n"
+     "    public static class Inner31 {\n"
+     "        public static class Key31 {\n"
+     "            public String turn31() { return \"p31.Outer31.Inner31.Key31.turn31\"; }\n"
+     "        }\n"
+     "    }\n"
+     "}\n"},
+    {"src/main/java/q31/Help31.java",
+     "package q31;\n\n"
+     "public class Help31 {\n"
+     "    public String ping31() { return \"q31.Help31.ping31\"; }\n"
+     "}\n"},
+    {"src/main/java/q31/Key31.java",
+     "package q31;\n\n"
+     "public class Key31 {\n"
+     "    public String spin31() { return \"q31.Key31.spin31\"; }\n"
+     "}\n"},
+    {"src/main/java/q31/Sub31.java",
+     "package q31;\n\n"
+     "public class Sub31 extends p31.Outer31.Inner31 {\n"
+     "    String use31() { Help31 h = new Help31(); return h.ping31(); }\n"
+     "    String key31() { Key31 k = new Key31(); return k.turn31(); }\n"
+     "    public static void main(String[] a) {\n"
+     "        System.out.println(new Sub31().use31() + \" \" + new Sub31().key31());\n"
+     "    }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -927,6 +962,15 @@ static int jts_check_bare_library_supertype(jts_index_t *ix) {
 static int jts_check_library_supertype(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "imported28", "ping28", "sv.Help28.ping28");
     ok &= jts_expect_engine(ix, "onDemand29", "ping28", "sv.Help28.ping28");
+    return ok;
+}
+
+/* 31: a project supertype spelled through its owner is the nested type it
+ * names, which the registry holds: no rule-(i) withholding, and its member
+ * type answers (the reveal: q31.Key31 is the own package's twin). */
+static int jts_check_owner_spelled_supertype(jts_index_t *ix) {
+    int ok = jts_expect_engine(ix, "use31", "ping31", "q31.Help31.ping31");
+    ok &= jts_expect_engine(ix, "key31", "turn31", "p31.Outer31.Inner31.Key31.turn31");
     return ok;
 }
 
@@ -1554,6 +1598,7 @@ JTS_ROUTES(type_param, jts_check_type_param)
 JTS_ROUTES(qualified_interface, jts_check_qualified_interface)
 JTS_ROUTES(bare_library_supertype, jts_check_bare_library_supertype)
 JTS_ROUTES(library_supertype, jts_check_library_supertype)
+JTS_ROUTES(owner_spelled_supertype, jts_check_owner_spelled_supertype)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1596,6 +1641,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_bare_library_supertype_parallel);
     RUN_TEST(java_type_scope_library_supertype_sequential);
     RUN_TEST(java_type_scope_library_supertype_parallel);
+    RUN_TEST(java_type_scope_owner_spelled_supertype_sequential);
+    RUN_TEST(java_type_scope_owner_spelled_supertype_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);

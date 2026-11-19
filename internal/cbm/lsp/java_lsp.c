@@ -692,6 +692,48 @@ static const char *java_declared_member_type(const CBMTypeRegistry *reg, CBMAren
     return e->alias_of;
 }
 
+/* A nested type spelled through its owner (`p.Outer.Inner`, a form javac takes
+ * in a supertype list): the registry keys a nested type by its package and
+ * simple name and links it to its owner (JAVA_MEMBER_KEY), so the spelling
+ * names the member of the longest prefix the registry holds as a type, one
+ * segment at a time. NULL when no prefix is a type, a segment is no member,
+ * or a member's QN two types share. Work linear in the segments. */
+static const char *java_owner_spelled_type(const CBMTypeRegistry *reg, CBMArena *arena,
+                                           const char *qn) {
+    size_t len = qn ? strlen(qn) : 0;
+    if (len == 0 || memchr(qn, '<', len)) {
+        return NULL;
+    }
+    const char *owner = NULL;
+    size_t cut = len;
+    while (!owner) {
+        while (cut > 0 && qn[cut - 1] != '.') {
+            cut--;
+        }
+        if (cut <= 1) {
+            return NULL; /* no prefix of the spelling is a type */
+        }
+        cut--; /* the dot */
+        CBM_LSP_WORK(1);
+        char *prefix = cbm_arena_strndup(arena, qn, cut);
+        if (!prefix) {
+            return NULL;
+        }
+        if (cbm_registry_lookup_type(reg, prefix)) {
+            owner = prefix;
+        }
+    }
+    for (const char *rest = qn + cut + 1; owner && *rest;) {
+        size_t seg = strcspn(rest, ".");
+        char *name = cbm_arena_strndup(arena, rest, seg);
+        bool unnamed = false;
+        CBM_LSP_WORK(1);
+        owner = name ? java_declared_member_type(reg, arena, owner, name, &unnamed) : NULL;
+        rest += seg + (rest[seg] == '.');
+    }
+    return owner;
+}
+
 /* The supertypes a walk has queued: each once (a linear check while few, a
  * hash set after), the queue growing with the chain. */
 enum { JAVA_TYPE_QUEUE_LOCAL = 16, JAVA_TYPE_QUEUE_LINEAR = 8 };
@@ -767,7 +809,16 @@ static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *a
         }
         const CBMRegisteredType *st = cbm_registry_lookup_type(reg, super);
         if (!st) {
-            *unseen |= java_unseen_kind(judge, super);
+            /* A project spelling may name a nested type through its owner;
+             * the walk then visits the type it names. */
+            unsigned kind = java_unseen_kind(judge, super);
+            const char *nested =
+                kind == JAVA_UNSEEN_PROJECT ? java_owner_spelled_type(reg, arena, super) : NULL;
+            if (nested) {
+                java_type_queue_push(arena, &q, nested);
+            } else {
+                *unseen |= kind;
+            }
             continue;
         }
         for (int k = 0; st->embedded_types && st->embedded_types[k]; k++) {
