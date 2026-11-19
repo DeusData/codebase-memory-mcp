@@ -12,6 +12,7 @@
  */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/include_path.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "discover/discover.h"
 #include "helpers.h" /* cbm_fqn_module_source_lang */
@@ -3255,6 +3256,13 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
     const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only,
     CBMLanguage language, const cbm_scala_index_t *scala_index) {
+    /* Strategy 0: a language whose imports name files by path (include_path.h):
+     * the path rule decides the target. */
+    const cbm_gbuf_node_t *by_path = NULL;
+    if (cbm_include_path_decides(ctx, source_rel, src_lang, imp, &by_path)) {
+        return by_path;
+    }
+
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
      * No label filter here: directory-module languages (Go/Java packages)
      * legitimately resolve straight to a Folder node -- that's the intended,
