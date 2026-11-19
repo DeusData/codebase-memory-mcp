@@ -16903,6 +16903,89 @@ TEST(clsp_issue1527_cross_file_memo_failures_propagate) {
     PASS();
 }
 
+/* #1546: the cross entry points get the file as it is on disk and must read a
+ * `\` CR LF string splice the way the per-file extract does. Read raw, the CR
+ * ends the escape, the LF ends the literal, and run() falls into the ERROR
+ * region with its call. LF is the control; per-file, shared-registry and
+ * batch entry each. */
+TEST(clsp_issue1546_cross_entry_points_read_crlf_string_splice) {
+    static const char *const srcs[2] = {"struct S { int m() { return 1; } };\n"
+                                        "void Middle()\n"
+                                        "{\n"
+                                        "    const wchar_t* s = L\"line 0\\r\\n\\\n"
+                                        "line 1\\r\\n\";\n"
+                                        "}\n"
+                                        "\n"
+                                        "void run() { S s; s.m(); }\n",
+                                        "struct S { int m() { return 1; } };\r\n"
+                                        "void Middle()\r\n"
+                                        "{\r\n"
+                                        "    const wchar_t* s = L\"line 0\\r\\n\\\r\n"
+                                        "line 1\\r\\n\";\r\n"
+                                        "}\r\n"
+                                        "\r\n"
+                                        "void run() { S s; s.m(); }\r\n"};
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_CPP},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_CPP},
+    };
+    bool resolved[2][3] = {{false}};
+    for (int e = 0; e < 2; e++) {
+        const char *src = srcs[e];
+        int len = (int)strlen(src);
+        for (int mode = 0; mode < 3; mode++) {
+            CBMArena a;
+            cbm_arena_init(&a);
+            CBMTypeRegistry reg;
+            cbm_registry_init(&reg, &a);
+            reg.fallback = cbm_c_build_cross_registry(&a, defs, 2);
+            CBMResolvedCallArray out = {0};
+            CBMBatchCLSPFile file = {.source = src,
+                                     .source_len = len,
+                                     .module_qn = "test",
+                                     .cpp_mode = true,
+                                     .defs = defs,
+                                     .def_count = 2};
+            if (mode == 0) {
+                (void)cbm_run_c_lsp_cross(&a, src, len, "test", true, defs, 2, NULL, NULL, 0, NULL,
+                                          &out);
+            } else if (mode == 1) {
+                (void)cbm_run_c_lsp_cross_with_registry(&a, src, len, "test", true, &reg, NULL,
+                                                        NULL, 0, NULL, &out);
+            } else {
+                (void)cbm_batch_c_lsp_cross(&a, &file, 1, &out);
+            }
+            for (int i = 0; i < out.count; i++) {
+                const CBMResolvedCall *rc = &out.items[i];
+                if (rc->caller_qn && strcmp(rc->caller_qn, "test.run") == 0 && rc->callee_qn &&
+                    strcmp(rc->callee_qn, "test.S.m") == 0) {
+                    resolved[e][mode] = true;
+                }
+            }
+            cbm_arena_destroy(&a);
+        }
+    }
+    for (int e = 0; e < 2; e++) {
+        for (int mode = 0; mode < 3; mode++) {
+            if (!resolved[e][mode]) {
+                printf("  CRLF splice diagnostic: %s entry %d did not resolve run -> S.m\n",
+                       e ? "CRLF" : "LF", mode);
+            }
+        }
+    }
+    for (int e = 0; e < 2; e++) {
+        for (int mode = 0; mode < 3; mode++) {
+            ASSERT_TRUE(resolved[e][mode]);
+        }
+    }
+    PASS();
+}
+
 /* A chain's LENGTH is not nesting depth (#1527 follow-up). An operator chain
  * `a + a + ... + a` and a receiver chain `b.a().a()...` are evaluated link by
  * link, so neither consumes the evaluator's depth guard: the file keeps its
@@ -17083,6 +17166,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_preprocessed_depth_failure_is_reported);
     RUN_TEST(registry_issue1527_index_preserves_registration_order);
     RUN_TEST(clsp_issue1527_cross_file_memo_failures_propagate);
+    RUN_TEST(clsp_issue1546_cross_entry_points_read_crlf_string_splice);
     RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
     RUN_TEST(clsp_issue1527_long_receiver_chain_is_not_nesting);
     RUN_TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences);

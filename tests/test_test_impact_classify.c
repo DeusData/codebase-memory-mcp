@@ -117,6 +117,164 @@ done:
     return ni_finish(&n, inventory, result);
 }
 
+/* Discovery and the pinned inventory decide the same thing about directories
+ * named deploy, deployed and env: one table of paths, committed as HEAD and
+ * materialized as the pinned tree, then discovered on that tree and classified
+ * from the inventory. A file is kept by the inventory when the ledger gives it
+ * a language. The two must keep exactly the same files, and the expected
+ * column pins the decision itself, so a wrong shared rule cannot pass by
+ * agreeing with itself. */
+typedef struct {
+    const char *path;
+    const char *content;
+    bool kept;
+} tic_policy_t;
+
+/* At most 15 directories with the root: the native fixture's pinned tree allows 16. */
+static const tic_policy_t TIC_POLICY[] = {
+    {".cbmignore", "!deployed/\n", false},
+    {"deploy/bootstrap", "#!/bin/sh\nkubectl apply -f k8s\n", true}, /* shell by its shebang */
+    {"deploy/chart/Chart.yaml", "apiVersion: v2\nname: web\n", true},
+    {"deploy/chart/hook.py", "def hook():\n    pass\n", false},
+    {"deploy/k8s/app.yaml", "apiVersion: v1\nkind: ConfigMap\n", true},
+    {"deploy/main.go", "package deploy\n", false},
+    {"deploy/run", "#!/usr/bin/env python3\nprint(1)\n", false}, /* Python by its shebang */
+    /* `!deployed/` in .cbmignore lifts the rule for that directory, as it
+     * un-skipped any built-in skip directory before */
+    {"deployed/Dockerfile", "FROM alpine:3.20\n", true},
+    {"deployed/tool.rb", "class Tool; end\n", true},
+    {"env/pyvenv.cfg", "home = /usr/bin\n", false},
+    {"env/site.py", "x = 1\n", false},
+    {"main.go", "package main\n", true},
+    {"pkg/env/env.go", "package env\n", true},
+    {"src/main/java/deploy/Tool.java", "package deploy;\nclass Tool {}\n", true},
+    {"x/env/Scripts/activate", "# activate\n", false},
+    {"x/env/Scripts/x.py", "x = 1\n", false},
+    {"x/tool.py", "x = 1\n", true},
+};
+
+/* Commits `rows` as HEAD, classifies the inventory into *ledger and discovers
+ * the pinned tree. Counts the rows the two keep differently and the rows
+ * either keeps against the expected column (.cbmignore is not judged). */
+static bool tic_policy_compare(if_native *n, const tic_policy_t *rows, size_t nrows,
+                               cbm_test_impact_inventory_t **inventory,
+                               cbm_test_impact_ledger_t **ledger, int *disagreements,
+                               int *unexpected) {
+    enum { TIC_POLICY_MAX = 24 };
+    tic_file_t table[TIC_POLICY_MAX];
+    if (nrows > TIC_POLICY_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < nrows; i++) {
+        table[i] = (tic_file_t){rows[i].path, rows[i].content};
+    }
+    cbm_inventory_error_t error;
+    if (!tic_snapshot(n, table, nrows, inventory) ||
+        cbm_test_impact_classify(*inventory, n->input.tree, NULL, &n->input.control, ledger,
+                                 &error) != CBM_INVENTORY_OK) {
+        return false;
+    }
+    const cbm_pinned_tree_view_t *tree = cbm_pinned_tree_view(n->input.tree);
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    if (!tree || !tree->root || cbm_discover(tree->root, &opts, &files, &count) != 0) {
+        return false;
+    }
+    *disagreements = 0;
+    *unexpected = 0;
+    for (size_t i = 0; i < nrows; i++) {
+        const cbm_test_impact_classified_t *row = tic_row(*ledger, n, rows[i].path);
+        bool by_inventory = row && row->language != CBM_LANG_COUNT;
+        bool by_discovery = false;
+        for (int f = 0; f < count; f++) {
+            by_discovery = by_discovery || strcmp(files[f].rel_path, rows[i].path) == 0;
+        }
+        if (by_inventory != by_discovery) {
+            fprintf(stderr, "  %s: inventory %d, discovery %d\n", rows[i].path, (int)by_inventory,
+                    (int)by_discovery);
+            (*disagreements)++;
+        }
+        if (strcmp(rows[i].path, ".cbmignore") != 0 && by_discovery != rows[i].kept) {
+            fprintf(stderr, "  %s: kept %d, expected %d\n", rows[i].path, (int)by_discovery,
+                    (int)rows[i].kept);
+            (*unexpected)++;
+        }
+    }
+    cbm_discover_free(files, count);
+    return true;
+}
+
+TEST(test_impact_classify_matches_discovery_in_deploy_and_env) {
+    if_native n = {0};
+    cbm_test_impact_inventory_t *inventory = NULL;
+    cbm_test_impact_ledger_t *ledger = NULL;
+    int result = 1;
+    int disagreements = -1;
+    int unexpected = -1;
+    NI_CHECK(tic_policy_compare(&n, TIC_POLICY, sizeof(TIC_POLICY) / sizeof(TIC_POLICY[0]),
+                                &inventory, &ledger, &disagreements, &unexpected));
+    NI_CHECK(disagreements == 0);
+    NI_CHECK(unexpected == 0);
+    /* How each was dropped: program source in deploy/ was reached and
+     * classified (a ledger row with no language), a virtual environment is an
+     * excluded subtree (no row). */
+    const char *reached[] = {"deploy/chart/hook.py", "deploy/main.go", "deploy/run"};
+    for (size_t i = 0; i < sizeof(reached) / sizeof(reached[0]); i++) {
+        const cbm_test_impact_classified_t *row = tic_row(ledger, &n, reached[i]);
+        NI_CHECK(row && row->language == CBM_LANG_COUNT);
+    }
+    const cbm_test_impact_classified_t *yaml = tic_row(ledger, &n, "deploy/k8s/app.yaml");
+    const cbm_test_impact_classified_t *script = tic_row(ledger, &n, "deploy/bootstrap");
+    NI_CHECK(yaml && yaml->language == CBM_LANG_YAML);
+    NI_CHECK(script && script->language == CBM_LANG_BASH);
+    NI_CHECK(tic_row(ledger, &n, "env/site.py") == NULL);
+    NI_CHECK(tic_row(ledger, &n, "x/env/Scripts/x.py") == NULL);
+    result = 0;
+done:
+    cbm_test_impact_ledger_free(ledger);
+    return ni_finish(&n, inventory, result);
+}
+
+/* Python environment layouts, decided the same by both: a conda environment
+ * (conda-meta/history) is skipped, and a marker is its exact stored name, so
+ * one that differs only in letter case makes no virtual environment, on any
+ * platform and whatever the file system's case rules. */
+static const tic_policy_t TIC_ENV_LAYOUTS[] = {
+    {"a/env/conda-meta/history", "==> 2026-11-18 <==\n", false},
+    {"a/env/x.py", "x = 1\n", false},
+    {"b/env/PYVENV.CFG", "home = /usr/bin\n", false},
+    {"b/env/b.py", "x = 1\n", true},
+    {"c/env/c.py", "x = 1\n", true},
+    {"c/env/scripts/activate", "# activate\n", false},
+    {"d/env/bin/activate", "# activate\n", false},
+    {"d/env/d.py", "x = 1\n", false},
+    {"e/env/bin/Activate", "# activate\n", false},
+    {"e/env/e.py", "x = 1\n", true},
+};
+
+TEST(test_impact_classify_matches_discovery_on_env_layouts) {
+    if_native n = {0};
+    cbm_test_impact_inventory_t *inventory = NULL;
+    cbm_test_impact_ledger_t *ledger = NULL;
+    int result = 1;
+    int disagreements = -1;
+    int unexpected = -1;
+    NI_CHECK(tic_policy_compare(&n, TIC_ENV_LAYOUTS,
+                                sizeof(TIC_ENV_LAYOUTS) / sizeof(TIC_ENV_LAYOUTS[0]), &inventory,
+                                &ledger, &disagreements, &unexpected));
+    NI_CHECK(disagreements == 0);
+    NI_CHECK(unexpected == 0);
+    /* the kept ones were classified, the skipped ones are excluded subtrees */
+    NI_CHECK(tic_row(ledger, &n, "b/env/b.py") != NULL);
+    NI_CHECK(tic_row(ledger, &n, "a/env/x.py") == NULL);
+    NI_CHECK(tic_row(ledger, &n, "d/env/d.py") == NULL);
+    result = 0;
+done:
+    cbm_test_impact_ledger_free(ledger);
+    return ni_finish(&n, inventory, result);
+}
+
 /* Reads and the probe length are charged to what the inventory's limits leave
  * after the filter. Running out is a LIMIT for the whole pass, with no ledger,
  * and never a default language for the files that were not read. */
@@ -381,6 +539,8 @@ SUITE(test_impact_classify) {
     RUN_TEST(test_impact_registry_reads_the_snapshot_tests);
     RUN_TEST(test_impact_registry_names_nothing_it_cannot_read);
     RUN_TEST(test_impact_classify_gives_discovery_languages);
+    RUN_TEST(test_impact_classify_matches_discovery_in_deploy_and_env);
+    RUN_TEST(test_impact_classify_matches_discovery_on_env_layouts);
     RUN_TEST(test_impact_classify_limits_are_errors_not_defaults);
     RUN_TEST(test_impact_classify_uses_the_given_config);
     RUN_TEST(test_impact_classify_read_failure_is_an_error);
