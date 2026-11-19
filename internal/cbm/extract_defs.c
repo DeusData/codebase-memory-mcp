@@ -6984,6 +6984,46 @@ static const char *py_type_param_names(CBMArena *a, TSNode node, const char *sou
     return at ? out : NULL;
 }
 
+/* Java: the names a class, interface, record, method or constructor
+ * declares in its type parameter list (`<K, V extends Base>`), '|'-joined, or
+ * NULL. A type_parameter's name is its first type_identifier (annotations may
+ * precede it). */
+static const char *java_type_param_names(CBMArena *a, TSNode node, const char *source) {
+    TSNode list = ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    size_t total = 0;
+    TSNode ids[CBM_SZ_64];
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < n && count < CBM_SZ_64; i++) {
+        TSNode param = ts_node_named_child(list, i);
+        uint32_t m = ts_node_named_child_count(param);
+        for (uint32_t j = 0; j < m; j++) {
+            TSNode c = ts_node_named_child(param, j);
+            const char *k = ts_node_type(c);
+            if (strcmp(k, "type_identifier") == 0 || strcmp(k, "identifier") == 0) {
+                ids[count++] = c;
+                total += ts_node_end_byte(c) - ts_node_start_byte(c) + 1;
+                break;
+            }
+        }
+    }
+    char *out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (at) {
+            out[at++] = '|';
+        }
+        size_t len = ts_node_end_byte(ids[i]) - ts_node_start_byte(ids[i]);
+        memcpy(out + at, source + ts_node_start_byte(ids[i]), len);
+        at += len;
+    }
+    out[at] = '\0';
+    return at ? out : NULL;
+}
+
 /* ── Facts only the declared-type scope step reads (CBMDefTypeFacts) ── */
 
 /* The record of a definition being built, allocated on first use. */
@@ -7793,6 +7833,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def_set_global_names(a, &def, py_body_global_names(a, node, ctx->source));
     } else if (ctx->language == CBM_LANG_GO) {
         def_set_type_params(a, &def, go_type_param_names(a, node, ctx->source));
+    } else if (ctx->language == CBM_LANG_JAVA) {
+        def_set_type_params(a, &def, java_type_param_names(a, node, ctx->source));
     }
 
     // Rust: cfg-gated twins (#[cfg(windows)] fn f / #[cfg(not(windows))] fn f)
@@ -9607,6 +9649,9 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
             facts->class_bindings = bound;
         }
     }
+    if (ctx->language == CBM_LANG_JAVA) {
+        def_set_type_params(a, &def, java_type_param_names(a, node, ctx->source));
+    }
     if (ctx->language == CBM_LANG_GO) {
         def_set_type_params(a, &def, go_type_param_names(a, node, ctx->source));
         const char *embedded = go_struct_embedded_text(a, node, ctx->source);
@@ -10144,6 +10189,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         def_set_global_names(a, &def, py_body_global_names(a, child, ctx->source));
     } else if (ctx->language == CBM_LANG_GO) {
         def_set_type_params(a, &def, go_type_param_names(a, child, ctx->source));
+    } else if (ctx->language == CBM_LANG_JAVA) {
+        def_set_type_params(a, &def, java_type_param_names(a, child, ctx->source));
     }
     const char *client_path = NULL;
     const char *client_method = NULL;

@@ -387,6 +387,35 @@ static const jts_file_t JTS_FILES[] = {
      "public class Ret24 {\n"
      "    String inhReturn() { return new msub.Sub24().mk25().pick25().hit25(); }\n"
      "}\n"},
+    /* 26: type parameters named like classes of the declaring package. */
+    {"src/main/java/tp/Item26.java",
+     "package tp;\n\n"
+     "public class Item26 {\n"
+     "    public String weigh26() { return \"tp.Item26.weigh26\"; }\n"
+     "}\n"},
+    {"src/main/java/tp/Other26.java",
+     "package tp;\n\n"
+     "public class Other26 {\n"
+     "    public String weigh26() { return \"tp.Other26.weigh26\"; }\n"
+     "}\n"},
+    {"src/main/java/tp/Box26.java",
+     "package tp;\n\n"
+     "public class Box26<Item26> {\n"
+     "    private final Item26 v;\n\n"
+     "    public Box26(Item26 v) { this.v = v; }\n\n"
+     "    public Item26 get26() { return v; }\n\n"
+     "    public Other26 other26() { return new Other26(); }\n\n"
+     "    public static <Item26> Item26 pick26(Item26 x) { return x; }\n"
+     "}\n"},
+    {"src/main/java/tpu/Use26.java",
+     "package tpu;\n\n"
+     "import tp.Box26;\n"
+     "import tp.Other26;\n\n"
+     "public class Use26 {\n"
+     "    String tpClass(Box26<Other26> b) { return b.get26().weigh26(); }\n\n"
+     "    String tpMethod() { return Box26.pick26(new Other26()).weigh26(); }\n\n"
+     "    String tpPartner(Box26<Other26> b) { return b.other26().weigh26(); }\n"
+     "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
      "    public String ping() { return \"Def.ping\"; }\n"
@@ -526,6 +555,26 @@ static int jts_expect_no_engine(jts_index_t *ix, const char *caller, const char 
     }
     printf("\n  %s -> %s: want no engine edge:\n%s", caller, leaf, got);
     return 0;
+}
+
+/* No engine edge for (caller, leaf) reaches a node whose QN contains `bad`
+ * (a name-chain edge may: it is no engine answer). */
+static int jts_expect_no_engine_to(jts_index_t *ix, const char *caller, const char *leaf,
+                                   const char *bad) {
+    char got[4096];
+    (void)jts_targets(ix, caller, leaf, got, sizeof(got));
+    for (const char *line = got; *line;) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        char one[1024];
+        snprintf(one, sizeof(one), "%.*s", (int)len, line);
+        if (strstr(one, bad) && strstr(one, "|lsp_")) {
+            printf("\n  %s -> %s: an engine edge reaches %s:\n%s", caller, leaf, bad, got);
+            return 0;
+        }
+        line = nl ? nl + 1 : line + len;
+    }
+    return 1;
 }
 
 /* ── Checks ──────────────────────────────────────────────────────────── */
@@ -671,6 +720,19 @@ static int jts_check_inherited_project_member(jts_index_t *ix) {
     ok &= jts_expect_engine(ix, "inhPackage", "hit25", "hit.Right25.hit25");
     ok &= jts_expect_engine(ix, "inhEnclosing", "hit24", "hit.Right24.hit24");
     ok &= jts_expect_engine(ix, "inhReturn", "hit25", "hit.Right25.hit25");
+    return ok;
+}
+
+/* 26: a type parameter named like a class of the declaring package is the
+ * parameter (class Box26<Item26>, method <Item26> pick26), never tp.Item26:
+ * javac runs Other26.weigh26 for both. The step gives the spelling no
+ * identity and its erasure no answer (the type argument is not the step's),
+ * so no engine edge reaches Item26; partner: other26()'s Other26 types the
+ * call. */
+static int jts_check_type_param(jts_index_t *ix) {
+    int ok = jts_expect_no_engine_to(ix, "tpClass", "weigh26", "tp.Item26");
+    ok &= jts_expect_no_engine_to(ix, "tpMethod", "weigh26", "tp.Item26");
+    ok &= jts_expect_engine(ix, "tpPartner", "weigh26", "tp.Other26.weigh26");
     return ok;
 }
 
@@ -1143,6 +1205,7 @@ JTS_ROUTES(unresolved_ctor, jts_check_unresolved_ctor)
 JTS_ROUTES(inherited_member_type, jts_check_inherited_member_type)
 JTS_ROUTES(decorator, jts_check_decorator)
 JTS_ROUTES(inherited_project_member, jts_check_inherited_project_member)
+JTS_ROUTES(type_param, jts_check_type_param)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1177,6 +1240,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_decorator_parallel);
     RUN_TEST(java_type_scope_inherited_project_member_sequential);
     RUN_TEST(java_type_scope_inherited_project_member_parallel);
+    RUN_TEST(java_type_scope_type_param_sequential);
+    RUN_TEST(java_type_scope_type_param_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);

@@ -79,6 +79,7 @@ static const cbm_type_scope_lang_t type_scope_langs[] = {
      .open_imports = true, /* `import a.*;` and `import static a.B.*;` */
      .implicit_external = cbm_java_lang_type,
      .nested_types = true,
+     .type_params_shadow = true, /* `class Box<Item>`: Item is no project class */
      .return_types = true,
      .param_types = true,
      .field_types = true,
@@ -335,6 +336,20 @@ static void type_scope_compare_overloads(cbm_type_scope_file_t *f) {
     }
 }
 
+/* One definition's type parameter names into f->tparams. */
+static void type_scope_index_type_params(cbm_type_scope_file_t *f, const CBMDefinition *d) {
+    for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = len ? cbm_arena_strndup(&f->keys, p, len) : NULL;
+        TYPE_SCOPE_WORK(len + 1);
+        if (name && !cbm_ht_get(f->tparams, name)) {
+            cbm_ht_set(f->tparams, name, name);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+}
+
 /* Hash the file's own definitions, its type parameter names and the names
  * its class bodies bind. */
 static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
@@ -359,16 +374,7 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
         type_scope_index_class_bindings(f, d);
         type_scope_index_global_names(f, d);
         type_scope_index_overload(f, d);
-        for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
-            const char *bar = strchr(p, '|');
-            size_t len = bar ? (size_t)(bar - p) : strlen(p);
-            char *name = len ? cbm_arena_strndup(&f->keys, p, len) : NULL;
-            TYPE_SCOPE_WORK(len + 1);
-            if (name && !cbm_ht_get(f->tparams, name)) {
-                cbm_ht_set(f->tparams, name, name);
-            }
-            p = bar ? bar + 1 : p + len;
-        }
+        type_scope_index_type_params(f, d);
     }
     type_scope_compare_overloads(f);
     return true;
@@ -400,6 +406,16 @@ cbm_type_scope_file_t *cbm_type_scope_file_begin(const cbm_type_scope_lang_t *la
         (lang->lexical_scopes && !type_scope_index_file_defs(f))) {
         cbm_type_scope_file_end(f);
         return NULL;
+    }
+    if (lang->type_params_shadow && !lang->lexical_scopes) {
+        f->tparams = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
+        if (!f->tparams) {
+            cbm_type_scope_file_end(f);
+            return NULL;
+        }
+        for (int i = 0; i < scope->file_def_count && scope->file_defs; i++) {
+            type_scope_index_type_params(f, &scope->file_defs[i]);
+        }
     }
     for (int i = 0; i < scope->imp_count; i++) {
         const char *key = scope->imp_keys ? scope->imp_keys[i] : NULL;
@@ -992,6 +1008,15 @@ static void type_scope_on_name(const char *name, size_t len, void *ud) {
     }
     if (b->file->lang->lexical_scopes && type_scope_shadowed(b->file, name, len)) {
         return;
+    }
+    if (b->file->lang->type_params_shadow && b->file->tparams) {
+        char head[CBM_SZ_256];
+        size_t head_len = type_scope_head_len(name, len);
+        TYPE_SCOPE_WORK(1);
+        if (!type_scope_key(name, head_len, head, sizeof(head)) ||
+            cbm_ht_get(b->file->tparams, head)) {
+            return; /* a type parameter of the file: no identity */
+        }
     }
     bool decided = false;
     const char *qn = b->file->nest_memo ? type_scope_nested(b->file, name, len, &decided) : NULL;

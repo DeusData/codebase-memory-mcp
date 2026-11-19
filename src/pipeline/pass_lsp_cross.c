@@ -1368,6 +1368,9 @@ static cbm_type_scope_file_t *pxc_file_scope_begin(
         scope.file_def_count = fr->defs.count;
         scope.module_facts = &fr->py_namespace;
         scope.graph = ctx->gbuf; /* the graph the import map read */
+    } else if (row->type_params_shadow) {
+        scope.file_defs = fr->defs.items; /* their type parameters */
+        scope.file_def_count = fr->defs.count;
     }
     return cbm_type_scope_file_begin(row, &scope);
 }

@@ -116,6 +116,13 @@ typedef struct {
      * supertype declares is not seen: past an enclosing type with a supertype
      * the answer is a possible type, not a proven one. */
     bool nested_types;
+    /* Type parameters (Java): a bare name the file declares as a type
+     * parameter of a class, interface, method or constructor
+     * (CBMDefTypeFacts.type_params) gets no identity anywhere in the file;
+     * where it is in scope it is that parameter, and the step does not track
+     * each one's scope. Needs cbm_type_scope_t.file_defs. (A lexical row
+     * already gives its file's type parameters none.) */
+    bool type_params_shadow;
     /* Which CBMLSPDef texts hold raw type spellings for this language. Every
      * row states each one. */
     bool return_types;
@@ -136,8 +143,9 @@ typedef struct {
     const char *const *imp_keys;
     const char *const *imp_vals;
     int imp_count;
-    /* lexical_scopes only: the file's extraction definitions, in any order
-     * (their QNs, labels and type facts); NULL with def_count 0 = none. */
+    /* lexical_scopes (and type_params_shadow): the file's extraction
+     * definitions, in any order (their QNs, labels and type facts); NULL with
+     * def_count 0 = none. */
     const CBMDefinition *file_defs;
     int file_def_count;
     /* lexical_scopes only: the module's ordered namespace facts. Without a
