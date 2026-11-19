@@ -67,6 +67,8 @@ static const jts_file_t JTS_FILES[] = {
      "    public String put(Object k, Object v) { return \"decoy.Decoys.put\"; }\n"
      "    public Object getKey() { return null; }\n"
      "    public String v2() { return \"decoy.Decoys.v2\"; }\n"
+     "    public String area2() { return \"decoy.Decoys.area2\"; }\n"
+     "    public String get() { return \"decoy.Decoys.get\"; }\n"
      "}\n"},
     {"src/main/java/other/Service.java",
      "package other;\n\n"
@@ -416,6 +418,20 @@ static const jts_file_t JTS_FILES[] = {
      "    String tpMethod() { return Box26.pick26(new Other26()).weigh26(); }\n\n"
      "    String tpPartner(Box26<Other26> b) { return b.other26().weigh26(); }\n"
      "}\n"},
+    /* 23b: a decorator over an interface whose method is a library
+     * super-interface's (Supplier.get); decoy.Decoys has get() and area2(). */
+    {"src/main/java/iface3/Shape3.java",
+     "package iface3;\n\n"
+     "public interface Shape3 extends java.util.function.Supplier<String> {\n"
+     "}\n"},
+    {"src/main/java/user/Framed3.java",
+     "package user;\n\n"
+     "import iface3.Shape3;\n\n"
+     "public class Framed3 implements Shape3 {\n"
+     "    private final Shape3 inner;\n\n"
+     "    public Framed3(Shape3 inner) { this.inner = inner; }\n\n"
+     "    public String get() { return inner == null ? \"user.Framed3.get\" : inner.get(); }\n"
+     "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
      "    public String ping() { return \"Def.ping\"; }\n"
@@ -698,7 +714,14 @@ static int jts_check_inherited_member_type(jts_index_t *ix) {
  * binds Shape2.area2 (javap: invokeinterface iface2/Shape2.area2): never the
  * calling method itself, the one implementer the calling file declares. */
 static int jts_check_decorator(jts_index_t *ix) {
-    return jts_expect_engine(ix, "area2", "area2", "iface2.Shape2.area2");
+    /* One edge: never decoy.Decoys.area2, never Framed.area2 itself. */
+    int ok = jts_expect_engine(ix, "area2", "area2", "iface2.Shape2.area2");
+    /* 23b: inner.get() inside Framed3.get binds Supplier.get (javap:
+     * invokeinterface iface3/Shape3.get, a library method): no project
+     * method, neither the decoy nor the calling method. */
+    ok &= jts_expect_none_to(ix, "get", "get", "Decoys");
+    ok &= jts_expect_none_to(ix, "get", "get", "user.Framed3.get");
+    return ok;
 }
 
 /* A package over two source trees: the class found in exactly one of them
