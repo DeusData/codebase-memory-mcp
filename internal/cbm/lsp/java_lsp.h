@@ -87,6 +87,9 @@ typedef struct {
     /* The run's project packages, for a cross run without a shared registry
      * (java_receiver_is_external); NULL when not known. */
     const struct CBMJavaProjectPackages *project_packages;
+    bool cross_run;            /* a cross-file run (counts answers, see below) */
+    void *unknown_scope_types; /* CBMHashTable of types a simple name resolved to inside a
+                                * class with a supertype the registry does not know */
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
@@ -219,6 +222,21 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
                                      int import_count, TSTree *cached_tree,
                                      const CBMJavaProjectPackages *packages,
                                      CBMResolvedCallArray *out);
+
+/* Engine answers of cross runs that rest on a simple type name resolved
+ * inside a class whose supertypes (its own or an enclosing class's) include
+ * one the registry does not know (a library type, which may declare member
+ * types no answer sees): the count since the last call, which restarts it. A
+ * measurement only (CBM_PROFILE line java.unknown_scope, end of a resolve). */
+uint64_t cbm_java_take_unknown_scope_answers(void);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* The member type `name` that the type `cls` inherits along its registered
+ * supertypes (JLS 8.5), or NULL: the walk the resolver runs, for the growth
+ * tests (its work counts in cbm_lsp_work_steps). */
+const char *cbm_java_test_inherited_member(const CBMTypeRegistry *reg, CBMArena *arena,
+                                           const char *cls, const char *name);
+#endif
 
 /* Register the Java standard library (java.lang/util/io/etc.) into reg.
  * Implementation lives in generated/java_stdlib_data.c. */

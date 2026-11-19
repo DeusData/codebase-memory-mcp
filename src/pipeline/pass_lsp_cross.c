@@ -39,6 +39,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/profile.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h" /* CBM_TLS */
 
@@ -1089,6 +1090,29 @@ static const char *pxc_jvm_identities(CBMArena *arena, const char *type_scope,
 
 /* A JVM def renamed into the namespace form (pxc_jvm_def_qn), from the graph
  * QN, parent class and name it was collected with. */
+/* A Java nested type's owner, the type it is declared in (its graph QN, which
+ * the rename below turns into the namespace form): the member-type index of
+ * the Java registries reads it (java_register_types). A top-level type, or
+ * any other def, keeps what it has. */
+static void pxc_java_type_owner(CBMArena *arena, CBMLSPDef *d, const char *module_qn) {
+    /* The labels the Java registrar registers as types (java_type_label). */
+    static const char *const type_labels[] = {"Class", "Interface", "Enum", "Type", NULL};
+    bool type = false;
+    for (int i = 0; d->label && type_labels[i] && !type; i++) {
+        type = strcmp(d->label, type_labels[i]) == 0;
+    }
+    size_t mod_len = module_qn ? strlen(module_qn) : 0;
+    const char *qn = d->qualified_name;
+    if (!type || d->receiver_type || !qn || !mod_len || strncmp(qn, module_qn, mod_len) != 0 ||
+        qn[mod_len] != '.') {
+        return;
+    }
+    const char *last = strrchr(qn + mod_len + 1, '.');
+    if (last) {
+        d->receiver_type = cbm_arena_strndup(arena, qn, (size_t)(last - qn));
+    }
+}
+
 static void pxc_jvm_rename(CBMArena *arena, CBMLSPDef *d, const char *namespace_name) {
     CBMDefinition src;
     memset(&src, 0, sizeof(src));
@@ -1966,6 +1990,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs_ex(const cbm_pipeline_ctx_t *ctx, CBMArena *
          * and the attach above read their graph QNs), and their identities
          * with them. */
         for (int di = file_start; pxc_is_jvm_lang(files[fi].language) && di < idx; di++) {
+            if (files[fi].language == CBM_LANG_JAVA) {
+                pxc_java_type_owner(arena, &defs[di], def_modules[fi]);
+            }
             if (defs[di].type_scope) {
                 defs[di].type_scope = pxc_jvm_identities(arena, defs[di].type_scope,
                                                          def_modules[fi], namespace_name, packages);
@@ -4244,6 +4271,15 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
 }
 
 void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {
+    /* Every route frees the index once its resolve is done (the sequential
+     * driver, the parallel resolve, an incremental run): the measurement of
+     * the Java answers the registry cannot fully scope ends there. */
+    uint64_t unknown_scope = cbm_java_take_unknown_scope_answers();
+    if (cbm_profile_active && unknown_scope > 0) {
+        char n[CBM_SZ_32];
+        snprintf(n, sizeof(n), "%llu", (unsigned long long)unknown_scope);
+        cbm_log_info("java.unknown_scope", "answers", n);
+    }
     if (!idx) {
         return;
     }

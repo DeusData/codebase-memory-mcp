@@ -28,6 +28,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "foundation/arena.h"
+#include "lsp/java_lsp.h"
+#include "lsp/lsp_work.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -321,6 +323,70 @@ static const jts_file_t JTS_FILES[] = {
      "    public Framed(Shape2 inner) { this.inner = inner; }\n\n"
      "    public String area2() { return inner.area2(); }\n"
      "}\n"},
+    /* 24: member types inherited from a project supertype of another file
+     * and package: Base24 declares Key24 and Val25; mtwin.Key24 (imported)
+     * and msub.Val25 (own package) are same-named twins. Each class's pick
+     * returns another class, so a wrong receiver type shows on hit24/hit25. */
+    {"src/main/java/hit/Right24.java",
+     "package hit;\n\n"
+     "public class Right24 {\n"
+     "    public String hit24() { return \"hit.Right24.hit24\"; }\n"
+     "}\n"},
+    {"src/main/java/hit/Wrong24.java",
+     "package hit;\n\n"
+     "public class Wrong24 {\n"
+     "    public String hit24() { return \"hit.Wrong24.hit24\"; }\n"
+     "}\n"},
+    {"src/main/java/hit/Right25.java",
+     "package hit;\n\n"
+     "public class Right25 {\n"
+     "    public String hit25() { return \"hit.Right25.hit25\"; }\n"
+     "}\n"},
+    {"src/main/java/hit/Wrong25.java",
+     "package hit;\n\n"
+     "public class Wrong25 {\n"
+     "    public String hit25() { return \"hit.Wrong25.hit25\"; }\n"
+     "}\n"},
+    {"src/main/java/mbase/Base24.java",
+     "package mbase;\n\n"
+     "import hit.*;\n\n"
+     "public class Base24 {\n"
+     "    public static class Key24 {\n"
+     "        public Right24 pick24() { return new Right24(); }\n"
+     "    }\n\n"
+     "    public static class Val25 {\n"
+     "        public Right25 pick25() { return new Right25(); }\n"
+     "    }\n"
+     "}\n"},
+    {"src/main/java/mtwin/Key24.java",
+     "package mtwin;\n\n"
+     "import hit.*;\n\n"
+     "public class Key24 {\n"
+     "    public Wrong24 pick24() { return new Wrong24(); }\n"
+     "}\n"},
+    {"src/main/java/msub/Val25.java",
+     "package msub;\n\n"
+     "import hit.*;\n\n"
+     "public class Val25 {\n"
+     "    public Wrong25 pick25() { return new Wrong25(); }\n"
+     "}\n"},
+    {"src/main/java/msub/Sub24.java",
+     "package msub;\n\n"
+     "import mbase.Base24;\n"
+     "import mtwin.Key24;\n\n"
+     "public class Sub24 extends Base24 {\n"
+     "    String inhImport(Key24 k) { return k.pick24().hit24(); }\n\n"
+     "    String inhPackage(Val25 v) { return v.pick25().hit25(); }\n\n"
+     "    public Val25 mk25() { return new Val25(); }\n\n"
+     "    static class Inner24 {\n"
+     "        String inhEnclosing(Key24 k) { return k.pick24().hit24(); }\n"
+     "    }\n"
+     "}\n"},
+    {"src/main/java/muse/Ret24.java",
+     "package muse;\n\n"
+     "public class Ret24 {\n"
+     "    String inhReturn() { return new msub.Sub24().mk25().pick25().hit25(); }\n"
+     "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
      "    public String ping() { return \"Def.ping\"; }\n"
@@ -591,6 +657,20 @@ static int jts_check_decorator(jts_index_t *ix) {
 static int jts_check_split_package(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "splitTree", "probe", "split.Probe.probe");
     ok &= jts_expect_no_engine(ix, "splitDup", "probe");
+    return ok;
+}
+
+/* 24: a member type inherited from a project supertype of another file and
+ * package shadows the single-type import, the own package and the
+ * same-named classes (JLS 6.4.1, 8.5): Key24 and Val25 in Sub24 (extends
+ * Base24) are Base24's, also inside Sub24's nested Inner24 and through
+ * Sub24.mk25's return type in another file (javap: Base24$Key24.pick24,
+ * then Right24.hit24). */
+static int jts_check_inherited_project_member(jts_index_t *ix) {
+    int ok = jts_expect_engine(ix, "inhImport", "hit24", "hit.Right24.hit24");
+    ok &= jts_expect_engine(ix, "inhPackage", "hit25", "hit.Right25.hit25");
+    ok &= jts_expect_engine(ix, "inhEnclosing", "hit24", "hit.Right24.hit24");
+    ok &= jts_expect_engine(ix, "inhReturn", "hit25", "hit.Right25.hit25");
     return ok;
 }
 
@@ -965,6 +1045,76 @@ TEST(java_type_scope_growth_large_package) {
     ASSERT_TRUE((double)w16 <= (double)w1 * 1.25);
     PASS();
 }
+
+/* The inherited-member walk over a supertype chain of n types: C<i> extends
+ * C<i+1> and C<i+2> (a diamond at every step: each type is met twice), the
+ * last declaring the member type M; and the same chain closed into a cycle
+ * (the last extends C0) without M. Returns the counted work; *found whether
+ * M was found. */
+static uint64_t jts_chain_work(int n, bool cycle, bool *found) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    for (int i = 0; i < n; i++) {
+        CBMRegisteredType t;
+        memset(&t, 0, sizeof(t));
+        t.qualified_name = cbm_arena_sprintf(&arena, "ch.C%d", i);
+        t.short_name = cbm_arena_sprintf(&arena, "C%d", i);
+        const char **sup = (const char **)cbm_arena_alloc(&arena, 3 * sizeof(char *));
+        int k = 0;
+        if (i + 1 < n) {
+            sup[k++] = cbm_arena_sprintf(&arena, "ch.C%d", i + 1);
+        } else if (cycle) {
+            sup[k++] = "ch.C0";
+        }
+        if (i + 2 < n) {
+            sup[k++] = cbm_arena_sprintf(&arena, "ch.C%d", i + 2);
+        }
+        sup[k] = NULL;
+        t.embedded_types = sup;
+        cbm_registry_add_type(&reg, t);
+    }
+    if (!cycle) {
+        CBMRegisteredType m;
+        memset(&m, 0, sizeof(m));
+        m.qualified_name = cbm_arena_sprintf(&arena, "ch.C%d.M", n - 1);
+        m.short_name = "M";
+        cbm_registry_add_type(&reg, m);
+    }
+    cbm_registry_finalize(&reg);
+    (void)cbm_lsp_work_take();
+    *found = cbm_java_test_inherited_member(&reg, &arena, "ch.C0", "M") != NULL;
+    uint64_t work = cbm_lsp_work_take();
+    cbm_arena_destroy(&arena);
+    return work;
+}
+
+/* A supertype chain of 50 / 200 / 800 types: the member at its end is found
+ * (no cap decides it), the cycle ends, and the counted work grows linearly
+ * with the chain. */
+TEST(java_type_scope_growth_supertype_chain) {
+    bool f1 = false;
+    bool f4 = false;
+    bool f16 = false;
+    bool c1 = true;
+    bool c16 = true;
+    uint64_t w1 = jts_chain_work(50, false, &f1);
+    uint64_t w4 = jts_chain_work(200, false, &f4);
+    uint64_t w16 = jts_chain_work(800, false, &f16);
+    uint64_t y1 = jts_chain_work(50, true, &c1);
+    uint64_t y16 = jts_chain_work(800, true, &c16);
+    printf("\n  chain 50/200/800: work %llu / %llu / %llu, found %d %d %d; "
+           "cycle 50/800: work %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16, f1, f4, f16,
+           (unsigned long long)y1, (unsigned long long)y16);
+    ASSERT_TRUE(f1 && f4 && f16);
+    ASSERT_TRUE(!c1 && !c16);
+    ASSERT_TRUE(w1 > 0 && y1 > 0);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    ASSERT_TRUE((double)y16 <= (double)y1 * 16.0 * 1.25);
+    PASS();
+}
 #endif
 
 #define JTS_ROUTES(name, check)                \
@@ -992,6 +1142,7 @@ JTS_ROUTES(constructor_import, jts_check_constructor_import)
 JTS_ROUTES(unresolved_ctor, jts_check_unresolved_ctor)
 JTS_ROUTES(inherited_member_type, jts_check_inherited_member_type)
 JTS_ROUTES(decorator, jts_check_decorator)
+JTS_ROUTES(inherited_project_member, jts_check_inherited_project_member)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1024,6 +1175,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_inherited_member_type_parallel);
     RUN_TEST(java_type_scope_decorator_sequential);
     RUN_TEST(java_type_scope_decorator_parallel);
+    RUN_TEST(java_type_scope_inherited_project_member_sequential);
+    RUN_TEST(java_type_scope_inherited_project_member_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
@@ -1031,5 +1184,6 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_growth_package_table);
     RUN_TEST(java_type_scope_growth_many_imports);
     RUN_TEST(java_type_scope_growth_large_package);
+    RUN_TEST(java_type_scope_growth_supertype_chain);
 #endif
 }
