@@ -2043,7 +2043,9 @@ static bool private_directory_walk_reopen(int *directory_fd) {
     int opened = openat(*directory_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (opened < 0 || !fd_set_cloexec(opened)) {
         if (opened >= 0) {
+            int saved_errno = errno;
             (void)close(opened);
+            errno = saved_errno;
         }
         return false;
     }
@@ -2125,8 +2127,16 @@ static int private_directory_tree_open(const char *directory_path) {
                  S_ISDIR(status.st_mode) &&
                  posix_directory_transition_secure(current_fd, next_fd, path);
             if (ok && created) {
-                ok = status.st_uid == geteuid() && private_directory_walk_reopen(&next_fd) &&
-                     fchmod(next_fd, 0700) == 0 && cbm_macos_extended_acl_fd_clear(next_fd) &&
+                ok = status.st_uid == geteuid();
+                if (ok && !private_directory_walk_reopen(&next_fd)) {
+                    ipc_validation_detail_set(
+                        "%s: could not reopen the new directory '%s' to set its mode (errno %d; "
+                        "it needs owner execute permission and, in a sandbox, the right to "
+                        "list it)",
+                        directory_path, component, errno);
+                    ok = false;
+                }
+                ok = ok && fchmod(next_fd, 0700) == 0 && cbm_macos_extended_acl_fd_clear(next_fd) &&
                      cbm_macos_extended_acl_fd_is_empty(next_fd);
             }
             if (ok) {
@@ -2157,7 +2167,14 @@ static int private_directory_tree_open(const char *directory_path) {
                                   (long)final_status.st_uid, (long)geteuid());
         ok = false;
     }
-    if (ok && (!private_directory_walk_reopen(&current_fd) || fchmod(current_fd, 0700) != 0)) {
+    if (ok && !private_directory_walk_reopen(&current_fd)) {
+        ipc_validation_detail_set("%s: could not reopen the directory to set its mode (errno %d; "
+                                  "it needs owner execute permission and, in a sandbox, the "
+                                  "right to list it)",
+                                  directory_path, errno);
+        ok = false;
+    }
+    if (ok && fchmod(current_fd, 0700) != 0) {
         ipc_validation_detail_set("%s: chmod 0700 failed (errno %d)", directory_path, errno);
         ok = false;
     }

@@ -5433,7 +5433,9 @@ TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014) {
         struct landlock_ruleset_attr ruleset = {.handled_access_fs = LANDLOCK_ACCESS_FS_READ_DIR};
         int ruleset_fd = (int)syscall(SYS_landlock_create_ruleset, &ruleset, sizeof(ruleset), 0U);
         if (ruleset_fd < 0) {
-            _exit(errno == ENOSYS || errno == EOPNOTSUPP ? 2 : 3);
+            /* 2: the kernel has no Landlock; 4: the environment refuses it
+             * (EPERM, e.g. a container's seccomp filter); 3: anything else. */
+            _exit(errno == ENOSYS || errno == EOPNOTSUPP ? 2 : errno == EPERM ? 4 : 3);
         }
         struct landlock_path_beneath_attr beneath = {
             .allowed_access = LANDLOCK_ACCESS_FS_READ_DIR,
@@ -5473,6 +5475,10 @@ TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014) {
     if (WEXITSTATUS(status) == 2) {
         SKIP_PLATFORM("Landlock is not available in this Linux kernel");
     }
+    if (WEXITSTATUS(status) == 4) {
+        SKIP_PLATFORM("this environment refuses Landlock (EPERM from landlock_create_ruleset, "
+                      "e.g. a container's seccomp filter); the sandbox cannot be built here");
+    }
     if (WEXITSTATUS(status) == 3) {
         FAIL("Landlock smoke could not build a sandbox that refuses listing /");
     }
@@ -5486,7 +5492,7 @@ TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014) {
     ASSERT_TRUE(hardened);
     PASS();
 #else
-    SKIP_PLATFORM("Landlock is Linux-only");
+    SKIP_PLATFORM("Landlock needs Linux with <linux/landlock.h> and the landlock syscall numbers");
 #endif
 }
 
