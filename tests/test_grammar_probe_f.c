@@ -7092,6 +7092,54 @@ TEST(probe_requirements_utf8_plain_issue2941) {
     PASS();
 }
 
+/* UTF-16 bytes from explicit code units (BOM included), so a test can hold
+ * surrogates. */
+static size_t gpf_utf16_units(const uint16_t *units, size_t count, int big_endian,
+                              unsigned char *out, size_t cap) {
+    size_t n = 0;
+    for (size_t i = 0; i < count && n + 2 <= cap; i++) {
+        unsigned char hi = (unsigned char)(units[i] >> 8);
+        unsigned char lo = (unsigned char)(units[i] & 0xFF);
+        out[n++] = big_endian ? hi : lo;
+        out[n++] = big_endian ? lo : hi;
+    }
+    return n;
+}
+
+/* GREEN guard for the transcoder's multi-byte paths: a 2-byte (U+00E9), a
+ * 3-byte (U+540D) and a 4-byte code point (U+1F600, a surrogate pair), and an
+ * unpaired low surrogate (-> U+FFFD), each inside a package name, come out as
+ * exact UTF-8 from both byte orders. */
+TEST(probe_requirements_utf16_non_ascii_issue2941) {
+    static const uint16_t units[] = {
+        0xFEFF, 'c',    'a', 'f', 0x00E9, '=', '=',  '1',  '\r', '\n', 0x540D,
+        '=',    '=',    '1', '\r', '\n',  0xD83D, 0xDE00, '=', '=',  '1',  '\r',
+        '\n',   'x',    0xDC00, 'y', '=',  '=',  '1',  '\r', '\n',
+    };
+    for (int big_endian = 0; big_endian <= 1; big_endian++) {
+        unsigned char buf[256];
+        size_t n = gpf_utf16_units(units, sizeof(units) / sizeof(units[0]), big_endian, buf,
+                                   sizeof(buf));
+        char names[256];
+        ASSERT_TRUE(gpf_requirements_packages(buf, n, names, sizeof(names)));
+        ASSERT_STR_EQ(names, "caf\xC3\xA9,x\xEF\xBF\xBDy,\xE5\x90\x8D,\xF0\x9F\x98\x80");
+    }
+    PASS();
+}
+
+/* GREEN guard: a file that is only a BOM (UTF-8, UTF-16 LE, UTF-16 BE)
+ * decodes to empty text and yields no Package. */
+TEST(probe_requirements_bom_only_issue2941) {
+    static const unsigned char boms[3][3] = {{0xEF, 0xBB, 0xBF}, {0xFF, 0xFE, 0}, {0xFE, 0xFF, 0}};
+    static const size_t lens[3] = {3, 2, 2};
+    for (int k = 0; k < 3; k++) {
+        char names[256];
+        ASSERT_TRUE(gpf_requirements_packages(boms[k], lens[k], names, sizeof(names)));
+        ASSERT_STR_EQ(names, "");
+    }
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * SUITE wiring
  * ══════════════════════════════════════════════════════════════════ */
@@ -7324,4 +7372,6 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_requirements_utf16be_bom_issue2941);
     RUN_TEST(probe_requirements_utf8_bom_issue2941);
     RUN_TEST(probe_requirements_utf8_plain_issue2941);
+    RUN_TEST(probe_requirements_utf16_non_ascii_issue2941);
+    RUN_TEST(probe_requirements_bom_only_issue2941);
 }

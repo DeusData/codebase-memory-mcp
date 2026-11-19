@@ -3259,8 +3259,9 @@ static uint32_t dep_utf16_unit(const unsigned char *u, bool le) {
     return le ? (uint32_t)u[0] | ((uint32_t)u[1] << 8U) : ((uint32_t)u[0] << 8U) | (uint32_t)u[1];
 }
 
-/* Append code point `c` to `out` as UTF-8; returns the bytes written. */
-static size_t dep_put_utf8(char *out, uint32_t c) {
+/* Append BMP code point `c` (one UTF-16 unit, not a surrogate) to `out` as
+ * UTF-8; returns the bytes written (at most 3). */
+static size_t dep_put_utf8_bmp(char *out, uint32_t c) {
     unsigned char *o = (unsigned char *)out;
     if (c < 0x80U) {
         o[0] = (unsigned char)c;
@@ -3271,12 +3272,17 @@ static size_t dep_put_utf8(char *out, uint32_t c) {
         o[1] = (unsigned char)(0x80U | (c & 0x3FU));
         return 2;
     }
-    if (c < 0x10000U) {
-        o[0] = (unsigned char)(0xE0U | (c >> 12U));
-        o[1] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
-        o[2] = (unsigned char)(0x80U | (c & 0x3FU));
-        return 3;
-    }
+    o[0] = (unsigned char)(0xE0U | (c >> 12U));
+    o[1] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
+    o[2] = (unsigned char)(0x80U | (c & 0x3FU));
+    return 3;
+}
+
+/* Append the code point of surrogate pair `hi`/`lo` to `out` as UTF-8 (always
+ * 4 bytes, fits the 3-bytes-per-unit budget of the two units). */
+static size_t dep_put_utf8_pair(char *out, uint32_t hi, uint32_t lo) {
+    uint32_t c = 0x10000U + ((hi - 0xD800U) << 10U) + (lo - 0xDC00U);
+    unsigned char *o = (unsigned char *)out;
     o[0] = (unsigned char)(0xF0U | (c >> 18U));
     o[1] = (unsigned char)(0x80U | ((c >> 12U) & 0x3FU));
     o[2] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
@@ -3289,13 +3295,20 @@ static size_t dep_put_utf8(char *out, uint32_t c) {
  * `pip freeze > requirements.txt` as UTF-16 LE with a BOM, and many editors
  * put a UTF-8 BOM in front. Read as raw bytes, UTF-16 stops at the NUL after
  * the first letter, and a UTF-8 BOM sticks to the first package name.
- * Drops a UTF-8 BOM in place, or returns a new UTF-8 buffer for UTF-16 (BOM
- * dropped, `src` freed). Keeps the K8S_TS_PAD zero tail k8s_read_file adds. */
+ * Drops a UTF-8 BOM in place (the freed tail bytes are zeroed, so the zero tail
+ * k8s_read_file adds stays intact), or returns a new UTF-8 buffer with a
+ * K8S_TS_PAD zero tail for UTF-16 (BOM dropped, `src` freed). A non-positive
+ * length (an empty file, or a size k8s_read_file could not represent as int)
+ * is returned unchanged. */
 static char *dep_manifest_utf8(char *src, int *len) {
+    if (*len <= 0) {
+        return src;
+    }
     const unsigned char *b = (const unsigned char *)src;
     size_t n = (size_t)*len;
     if (n >= DEP_UTF8_BOM_LEN && b[0] == 0xEFU && b[1] == 0xBBU && b[2] == 0xBFU) {
-        memmove(src, src + DEP_UTF8_BOM_LEN, n - DEP_UTF8_BOM_LEN + K8S_TS_PAD);
+        memmove(src, src + DEP_UTF8_BOM_LEN, n - DEP_UTF8_BOM_LEN);
+        memset(src + n - DEP_UTF8_BOM_LEN, 0, DEP_UTF8_BOM_LEN);
         *len = (int)(n - DEP_UTF8_BOM_LEN);
         return src;
     }
@@ -3316,14 +3329,15 @@ static char *dep_manifest_utf8(char *src, int *len) {
         if (c >= 0xD800U && c <= 0xDBFFU && i + SKIP_ONE < units) {
             uint32_t lo = dep_utf16_unit(u + ((i + SKIP_ONE) * DEP_UTF16_UNIT), le);
             if (lo >= 0xDC00U && lo <= 0xDFFFU) {
-                c = 0x10000U + ((c - 0xD800U) << 10U) + (lo - 0xDC00U);
+                w += dep_put_utf8_pair(out + w, c, lo);
                 i++;
+                continue;
             }
         }
         if (c >= 0xD800U && c <= 0xDFFFU) {
             c = 0xFFFDU; /* unpaired surrogate */
         }
-        w += dep_put_utf8(out + w, c);
+        w += dep_put_utf8_bmp(out + w, c);
     }
     memset(out + w, 0, K8S_TS_PAD);
     cbm_free(CBM_MEM_CLASS_OTHER, src);
