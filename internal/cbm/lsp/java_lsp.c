@@ -602,31 +602,68 @@ typedef struct {
     const CBMJavaProjectPackages *packages;
 } JavaUnseenJudge;
 
-static bool java_unseen_outside(const JavaUnseenJudge *j, const char *qn) {
-    if (!j || !j->reg || !qn || !islower((unsigned char)qn[0])) {
-        return false;
-    }
-    const char *type = NULL;
-    for (const char *p = qn; (p = strchr(p, '.')) != NULL; p++) {
-        if (isupper((unsigned char)p[1])) {
-            type = p + 1;
-            break;
-        }
-    }
-    if (!type) {
-        return false;
-    }
-    size_t pkg_len = (size_t)(type - 1 - qn);
+/* What a supertype the registry does not hold is, as the registry spells it
+ * (in the scope of the file that declares the class: an identity, an import's
+ * target, a java.lang name, or the spelling as written). */
+enum {
+    /* Rule (i): a project type the registry in hand does not hold (a
+     * qualified spelling in a package of the run's package table, or of the
+     * packages the shared registrar records), or a spelling that cannot be
+     * read as a type name. No answer rests on it. */
+    JAVA_UNSEEN_PROJECT = 1u << 0,
+    /* Rule (ii), known outside the project: a qualified spelling in another
+     * package (an import's target, a full qualification), or a java.lang name. */
+    JAVA_UNSEEN_EXTERNAL = 1u << 1,
+    /* Rule (ii), no project type, package unknown: a bare spelling no scope
+     * of its file placed (an on-demand import's, or a library's). */
+    JAVA_UNSEEN_UNKNOWN = 1u << 2,
+};
+
+static bool java_project_package(const JavaUnseenJudge *j, const char *qn, size_t pkg_len) {
     if (j->packages && j->packages->declared) {
-        return !j->packages->declared(j->packages->ud, qn, pkg_len);
-    }
-    if (!cbm_registry_lookup_type(j->reg, JAVA_PACKAGE_KEY)) {
-        return false;
+        return j->packages->declared(j->packages->ud, qn, pkg_len);
     }
     char key[JAVA_LSP_BUF];
     int n = snprintf(key, sizeof(key), JAVA_PACKAGE_KEY "%.*s", (int)pkg_len, qn);
-    return n > 0 && (size_t)n < sizeof(key) && !cbm_registry_lookup_type(j->reg, key);
+    return n > 0 && (size_t)n < sizeof(key) && cbm_registry_lookup_type(j->reg, key) != NULL;
 }
+
+static unsigned java_unseen_kind(const JavaUnseenJudge *j, const char *qn) {
+    size_t len = qn ? strcspn(qn, "<") : 0;
+    if (!j || !j->reg || len == 0) {
+        return JAVA_UNSEEN_PROJECT;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)qn[i];
+        bool part = isalnum(c) || c == '_' || c == '$' || c >= 0x80;
+        if (!(part || (c == '.' && i > 0 && i + 1 < len && qn[i + 1] != '.'))) {
+            return JAVA_UNSEEN_PROJECT; /* no type name: "a-b.C", "a..B", ".B" */
+        }
+    }
+    const char *dot = memchr(qn, '.', len);
+    if (!dot) {
+        return cbm_java_lang_type(qn, len) ? JAVA_UNSEEN_EXTERNAL : JAVA_UNSEEN_UNKNOWN;
+    }
+    /* The package: the segments before the first one that starts upper-case
+     * (`a.b.Outer.Inner` is package a.b). None, or no package before it
+     * (`Outer.Inner`): its package is unknown. */
+    const char *type = NULL;
+    for (size_t i = (size_t)(dot - qn); i + 1 < len && !type; i++) {
+        if (qn[i] == '.' && isupper((unsigned char)qn[i + 1])) {
+            type = qn + i + 1;
+        }
+    }
+    if (!type || isupper((unsigned char)qn[0])) {
+        return JAVA_UNSEEN_UNKNOWN;
+    }
+    return java_project_package(j, qn, (size_t)(type - 1 - qn)) ? JAVA_UNSEEN_PROJECT
+                                                                  : JAVA_UNSEEN_EXTERNAL;
+}
+
+/* Answers withheld under rule (i), each once (engine step 0 of a cross run,
+ * a registrar's declared type). On a full run every project type is
+ * registered: each is a defect of ours to look at. */
+static _Atomic uint64_t g_java_unseen_project;
 
 /* The member type `name` that the type `owner` declares, or NULL. *unnamed is
  * set when it declares one whose QN two types share: the name is then that
@@ -708,12 +745,12 @@ static void java_type_queue_push(CBMArena *arena, JavaTypeQueue *q, const char *
  * subclass of a project class that declares a member type X is that member.
  * Every supertype the registry records is visited once, so a cyclic or long
  * chain ends in work linear in its length. *unnamed: as
- * java_declared_member_type. *unknown: a supertype the registry does not
- * know (a library type) was met; it may declare member types no answer sees. */
+ * java_declared_member_type. *unseen: the kinds (JAVA_UNSEEN_*) of the
+ * supertypes met that the registry does not hold; each may declare member
+ * types no answer sees. */
 static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *arena,
                                          const char *cls, const char *name, bool *unnamed,
-                                         bool *unknown, const JavaUnseenJudge *judge,
-                                         bool *unseen_inside) {
+                                         const JavaUnseenJudge *judge, unsigned *unseen) {
     const char *local[JAVA_TYPE_QUEUE_LOCAL] = {0};
     JavaTypeQueue q = {.items = local, .cap = JAVA_TYPE_QUEUE_LOCAL};
     const CBMRegisteredType *rt = cls ? cbm_registry_lookup_type(reg, cls) : NULL;
@@ -730,10 +767,7 @@ static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *a
         }
         const CBMRegisteredType *st = cbm_registry_lookup_type(reg, super);
         if (!st) {
-            *unknown = true;
-            if (!java_unseen_outside(judge, super)) {
-                *unseen_inside = true; /* possibly a project type: rule (i) */
-            }
+            *unseen |= java_unseen_kind(judge, super);
             continue;
         }
         for (int k = 0; st->embedded_types && st->embedded_types[k]; k++) {
@@ -748,33 +782,47 @@ static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *a
 const char *cbm_java_test_inherited_member(const CBMTypeRegistry *reg, CBMArena *arena,
                                            const char *cls, const char *name) {
     bool unnamed = false;
-    bool unknown = false;
-    bool unseen_inside = false;
-    return java_inherited_member(reg, arena, cls, name, &unnamed, &unknown, NULL, &unseen_inside);
+    unsigned unseen = 0;
+    return java_inherited_member(reg, arena, cls, name, &unnamed, NULL, &unseen);
 }
 #endif
 
 /* Engine answers that rest on a simple type name resolved inside a class
  * whose supertypes (its own or an enclosing class's) include one the
- * registry does not know: counted per answer of a cross run (a measurement,
- * no behaviour depends on it). */
+ * registry does not hold (rule ii): counted per answer of a cross run, split
+ * by the supertypes' kind (a measurement, no behaviour depends on it). */
 static _Atomic uint64_t g_java_unknown_scope_answers;
+static _Atomic uint64_t g_java_unseen_external_answers;
+static _Atomic uint64_t g_java_unseen_unknown_answers;
 
 uint64_t cbm_java_take_unknown_scope_answers(void) {
     return atomic_exchange_explicit(&g_java_unknown_scope_answers, 0, memory_order_relaxed);
 }
 
-static void java_note_unknown_scope_type(JavaLSPContext *ctx, const char *qn) {
+void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *external, uint64_t *unknown) {
+    *project = atomic_exchange_explicit(&g_java_unseen_project, 0, memory_order_relaxed);
+    *external = atomic_exchange_explicit(&g_java_unseen_external_answers, 0, memory_order_relaxed);
+    *unknown = atomic_exchange_explicit(&g_java_unseen_unknown_answers, 0, memory_order_relaxed);
+}
+
+/* The values of ctx->unknown_scope_types: the type rests on a supertype of
+ * unknown package (or on external ones only). */
+static char g_java_rests_unknown;
+static char g_java_rests_external;
+
+static void java_note_unknown_scope_type(JavaLSPContext *ctx, const char *qn, unsigned unseen) {
     if (!ctx->cross_run || !qn) {
         return;
     }
     if (!ctx->unknown_scope_types) {
         ctx->unknown_scope_types = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 16);
     }
-    if (ctx->unknown_scope_types && !cbm_ht_get(ctx->unknown_scope_types, qn)) {
-        const char *key = cbm_arena_strdup(ctx->arena, qn);
+    void *kind = (unseen & JAVA_UNSEEN_UNKNOWN) ? &g_java_rests_unknown : &g_java_rests_external;
+    void *had = ctx->unknown_scope_types ? cbm_ht_get(ctx->unknown_scope_types, qn) : NULL;
+    if (ctx->unknown_scope_types && (!had || (had != kind && kind == &g_java_rests_unknown))) {
+        const char *key = had ? qn : cbm_arena_strdup(ctx->arena, qn);
         if (key) {
-            cbm_ht_set(ctx->unknown_scope_types, key, (void *)key);
+            cbm_ht_set(ctx->unknown_scope_types, key, kind);
         }
     }
 }
@@ -788,14 +836,17 @@ static void java_count_unknown_scope_answer(const JavaLSPContext *ctx, const cha
     char owner[JAVA_LSP_BUF];
     const char *dot = strrchr(callee_qn, '.');
     size_t n = dot ? (size_t)(dot - callee_qn) : 0;
-    bool hit = cbm_ht_get(ctx->unknown_scope_types, callee_qn) != NULL;
+    void *hit = cbm_ht_get(ctx->unknown_scope_types, callee_qn);
     if (!hit && n > 0 && n < sizeof(owner)) {
         memcpy(owner, callee_qn, n);
         owner[n] = '\0';
-        hit = cbm_ht_get(ctx->unknown_scope_types, owner) != NULL;
+        hit = cbm_ht_get(ctx->unknown_scope_types, owner);
     }
     if (hit) {
         atomic_fetch_add_explicit(&g_java_unknown_scope_answers, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(hit == &g_java_rests_unknown ? &g_java_unseen_unknown_answers
+                                                               : &g_java_unseen_external_answers,
+                                  1, memory_order_relaxed);
     }
 }
 
@@ -805,19 +856,19 @@ static void java_lsp_ctx_done(JavaLSPContext *ctx) {
 }
 
 static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
-                                             bool *unknown_scope);
+                                             unsigned *unseen);
 
 const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
-    bool unknown_scope = false;
-    const char *qn = java_resolve_type_name_in(ctx, name, &unknown_scope);
-    if (qn && unknown_scope && name && !strchr(name, '.')) {
-        java_note_unknown_scope_type(ctx, qn);
+    unsigned unseen = 0;
+    const char *qn = java_resolve_type_name_in(ctx, name, &unseen);
+    if (qn && unseen && name && !strchr(name, '.')) {
+        java_note_unknown_scope_type(ctx, qn, unseen);
     }
     return qn;
 }
 
 static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
-                                             bool *unknown_scope) {
+                                             unsigned *unseen) {
     if (!name || !ctx)
         return NULL;
 
@@ -838,24 +889,28 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
             }
         }
         bool unnamed = false;
-        bool unseen_inside = false;
+        unsigned met = 0;
         JavaUnseenJudge judge = {.reg = ctx->registry, .packages = ctx->project_packages};
         const char *member = java_inherited_member(ctx->registry, ctx->arena, outer, name, &unnamed,
-                                                   unknown_scope, &judge, &unseen_inside);
+                                                   &judge, &met);
+        *unseen |= met;
         if (member) {
             return member;
         }
         if (unnamed) {
             return NULL;
         }
-        if (unseen_inside && ctx->cross_run) {
-            /* Rule (i): a supertype the run cannot see and cannot place outside
-             * the project may declare the name; it has no proven type here,
-             * and neither the outer classes, the imports nor the package
-             * answer for it. A cross run judges this (its registry holds the
-             * project or a closure of it); the per-file run's registry holds
-             * one file and the JDK seed and judges nothing: it answers as main
-             * does, and a cross answer replaces its answer at that call. */
+        if ((met & JAVA_UNSEEN_PROJECT) && ctx->cross_run) {
+            /* Rule (i): a project type the run's registry does not hold (or a
+             * spelling no type has) may declare the name; it has no proven
+             * type here, and neither the outer classes, the imports nor the
+             * package answer for it. A cross run judges this (its registry
+             * holds the project or a closure of it); the per-file run's
+             * registry holds one file and the JDK seed and judges nothing: it
+             * answers as main does, and a cross answer replaces its answer at
+             * that call. A supertype known outside the project, or of no
+             * known package (rule ii), leaves the answer standing. */
+            atomic_fetch_add_explicit(&g_java_unseen_project, 1, memory_order_relaxed);
             return NULL;
         }
     }
@@ -3737,7 +3792,6 @@ static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const c
     JavaUnseenJudge judge = {.reg = s->reg, .packages = g_java_reg_packages};
     JavaTypeQueue chain = {.items = local, .cap = JAVA_TYPE_QUEUE_LOCAL};
     const char *found = NULL;
-    bool unknown = false;
     for (const char *o = s->owner; o && !found && !*unnamed;) {
         int before = chain.count;
         java_type_queue_push(a, &chain, o);
@@ -3748,14 +3802,14 @@ static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const c
         if (found || *unnamed) {
             break;
         }
-        bool unseen_inside = false;
-        found =
-            java_inherited_member(s->reg, a, o, name, unnamed, &unknown, &judge, &unseen_inside);
+        unsigned unseen = 0;
+        found = java_inherited_member(s->reg, a, o, name, unnamed, &judge, &unseen);
         if (found || *unnamed) {
             break;
         }
-        if (unseen_inside) {
+        if (unseen & JAVA_UNSEEN_PROJECT) {
             *unnamed = true; /* rule (i): no proven type for the name */
+            atomic_fetch_add_explicit(&g_java_unseen_project, 1, memory_order_relaxed);
             break;
         }
         if (java_type_ambiguous(s->reg, o)) {

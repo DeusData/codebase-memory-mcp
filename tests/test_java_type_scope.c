@@ -516,6 +516,32 @@ static const jts_file_t JTS_FILES[] = {
      "public class WrongC {\n"
      "    public String hitC() { return \"WrongC.hitC\"; }\n"
      "}\n"},
+    /* 30: Svc30 extends Mid30 of another file, which implements the library
+     * interface org.lib28.Life28 (compiled for javac, never indexed); the
+     * shared registrar keeps `Life28` as written. javac: Help28 in Svc30 is
+     * sv.Help28 (Life28 declares no member type of that name), for a local
+     * and for a field: invokevirtual sv/Help28.ping28. */
+    {"src/main/java/sv/Help28.java",
+     "package sv;\n\n"
+     "public class Help28 {\n"
+     "    public String ping28() { return \"sv.Help28.ping28\"; }\n"
+     "}\n"},
+    {"src/main/java/sv/Mid30.java",
+     "package sv;\n\n"
+     "import org.lib28.Life28;\n\n"
+     "public abstract class Mid30 implements Life28 {\n"
+     "}\n"},
+    {"src/main/java/sv/Svc30.java",
+     "package sv;\n\n"
+     "public class Svc30 extends Mid30 {\n"
+     "    Help28 helper30 = new Help28();\n"
+     "    String deep30() { Help28 h = new Help28(); return h.ping28(); }\n"
+     "    String field30() { return helper30.ping28(); }\n"
+     "    public static void main(String[] a) {\n"
+     "        Svc30 s = new Svc30();\n"
+     "        System.out.println(s.deep30() + \" \" + s.field30());\n"
+     "    }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -861,6 +887,16 @@ static int jts_check_type_param(jts_index_t *ix) {
 static int jts_check_qualified_interface(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "ifaceDeep", "hitC", "ec.RightC.hitC");
     ok &= jts_expect_engine(ix, "ifaceDotted2", "hitC", "ec.RightC.hitC");
+    return ok;
+}
+
+/* 30: a library supertype another file's class spells bare (the shared
+ * registrar keeps it as written) is of unknown package, no project type the
+ * registry misses: the answers stand (rule ii), for a local's type in the
+ * engine and for a field's type in the registrar. */
+static int jts_check_bare_library_supertype(jts_index_t *ix) {
+    int ok = jts_expect_engine(ix, "deep30", "ping28", "sv.Help28.ping28");
+    ok &= jts_expect_engine(ix, "field30", "ping28", "sv.Help28.ping28");
     return ok;
 }
 
@@ -1486,6 +1522,7 @@ JTS_ROUTES(decorator, jts_check_decorator)
 JTS_ROUTES(inherited_project_member, jts_check_inherited_project_member)
 JTS_ROUTES(type_param, jts_check_type_param)
 JTS_ROUTES(qualified_interface, jts_check_qualified_interface)
+JTS_ROUTES(bare_library_supertype, jts_check_bare_library_supertype)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1524,6 +1561,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_type_param_parallel);
     RUN_TEST(java_type_scope_qualified_interface_sequential);
     RUN_TEST(java_type_scope_qualified_interface_parallel);
+    RUN_TEST(java_type_scope_bare_library_supertype_sequential);
+    RUN_TEST(java_type_scope_bare_library_supertype_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);

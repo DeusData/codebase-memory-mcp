@@ -230,6 +230,15 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
  * measurement only (CBM_PROFILE line java.unknown_scope, end of a resolve). */
 uint64_t cbm_java_take_unknown_scope_answers(void);
 
+/* The supertypes a cross run's registry does not hold, since the last call
+ * (which restarts them; CBM_PROFILE line java.unseen, end of a resolve):
+ * *project, answers withheld because the supertype is a project type the
+ * registry does not hold or a spelling no type has (rule i; on a full run
+ * each is a defect); *external and *unknown, the answers of
+ * cbm_java_take_unknown_scope_answers split by the supertypes they rest on
+ * (rule ii): all known outside the project, or one of unknown package. */
+void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *external, uint64_t *unknown);
+
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* The member type `name` that the type `cls` inherits along its registered
  * supertypes (JLS 8.5), or NULL: the walk the resolver runs, for the growth

@@ -4547,6 +4547,15 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {
         snprintf(n, sizeof(n), "%llu", (unsigned long long)unknown_scope);
         cbm_log_info("java.unknown_scope", "answers", n);
     }
+    uint64_t unseen[3];
+    cbm_java_take_unseen_counts(&unseen[0], &unseen[1], &unseen[2]);
+    if (cbm_profile_active) {
+        char n[3][CBM_SZ_32];
+        for (int i = 0; i < 3; i++) {
+            snprintf(n[i], sizeof(n[i]), "%llu", (unsigned long long)unseen[i]);
+        }
+        cbm_log_info("java.unseen", "project", n[0], "external", n[1], "unknown", n[2]);
+    }
     if (!idx) {
         return;
     }
