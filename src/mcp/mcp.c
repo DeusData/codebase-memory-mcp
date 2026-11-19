@@ -20751,25 +20751,34 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     int hunk_count = 0;
     if (!seed_rows.failed && (want_symbols || seed_req.list)) {
         char hunk_cmd[CBM_SZ_2K];
+        int hunk_len;
 #ifdef _WIN32
-        snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
-                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
-                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>NUL",
-                 root_path, merge_base, head_oid, root_path);
+        hunk_len =
+            snprintf(hunk_cmd, sizeof(hunk_cmd),
+                     "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " \"%s\" \"%s\" -- 2>NUL && "
+                     "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>NUL",
+                     root_path, merge_base, head_oid, root_path);
 #else
-        snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
-                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
-                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>/dev/null",
-                 root_path, merge_base, head_oid, root_path);
+        hunk_len =
+            snprintf(hunk_cmd, sizeof(hunk_cmd),
+                     "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " '%s' '%s' -- 2>/dev/null && "
+                     "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>/dev/null",
+                     root_path, merge_base, head_oid, root_path);
 #endif
+        /* A root path long enough to truncate the command would run a cut-off
+         * git command (an error, or a flag list without --unified=0): skip hunk
+         * scoping instead, which leaves whole-file seeding. */
+        bool hunk_cmd_fits = hunk_len > 0 && (size_t)hunk_len < sizeof(hunk_cmd);
         char hunk_output_path[CBM_SZ_2K] = {0};
         cbm_proc_result_t hunk_result = {0};
         int hunk_run =
-            mcp_run_shell_command_cancellable(srv, hunk_cmd, hunk_output_path, &hunk_result);
+            hunk_cmd_fits
+                ? mcp_run_shell_command_cancellable(srv, hunk_cmd, hunk_output_path, &hunk_result)
+                : -1;
         bool hunk_cancelled = hunk_result.cancellation_requested || mcp_request_cancelled(srv);
         FILE *hfp = (!hunk_cancelled && hunk_run == 0 && hunk_result.exit_code == 0)
                         ? cbm_fopen(hunk_output_path, "rb")
