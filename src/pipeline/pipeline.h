@@ -486,12 +486,16 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
  * from a weak short-name strategy — so the edge is fabricated by construction
  * (`def f(run): run()` must not bind an unrelated `SatoriLive.run`). Shares the
  * member guard's drop-list, so lsp_* / import / same-module matches are kept.
- * Deliberately keyed on the SCOPE FACT, not on the callee's spelling. The
- * language set lives at the call sites (pass_calls.c / pass_parallel.c) and must
- * be identical in both, or the sequential and parallel resolvers diverge.
- * Pure; unit-tested in test_registry.c. */
+ * Deliberately keyed on the SCOPE FACT, not on the callee's spelling. Both
+ * call sites (pass_calls.c / pass_parallel.c) take `enabled` from
+ * cbm_weak_local_binding_guard_lang, so the sequential and parallel resolvers
+ * cannot diverge. Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
+/* The languages whose extractor sets CBMCall.callee_is_locally_bound: Python
+ * (a parameter) and JS/TS/TSX/ArkTS (a parameter, or a local that names no
+ * definition). Pure; unit-tested in test_registry.c. */
+bool cbm_weak_local_binding_guard_lang(CBMLanguage lang);
 /* #1355: drop a project-wide same-name guess (suffix_match / unique_name /
  * field_type_hint / fuzzy) for a BARE call whose name the calling file binds to
  * a NON-RELATIVE (package) import that resolved to nothing in the graph —

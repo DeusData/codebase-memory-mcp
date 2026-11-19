@@ -776,6 +776,15 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
  * same reason as the member guard: the two call sites in pass_calls.c and
  * pass_parallel.c MUST enumerate the identical language set, or the sequential
  * and parallel resolvers diverge. Pure; unit-tested in test_registry.c. */
+/* The languages whose extractor sets CBMCall.callee_is_locally_bound: Python
+ * for a parameter (#1912), and the JS family for a parameter or a local that
+ * names no definition (`const submit = useCallback(...)`, an array-pattern
+ * element; #1355). One list for both resolvers. */
+bool cbm_weak_local_binding_guard_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+           lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
+}
+
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy) {
     if (!enabled || !callee_is_locally_bound) {

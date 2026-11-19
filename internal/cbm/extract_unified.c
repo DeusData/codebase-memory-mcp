@@ -3060,6 +3060,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.py_param_stack_count = 0;
     state.py_param_tracking_failed = false;
     state.usage_start_index = ctx->result->usages.count;
+    state.call_start_index = ctx->result->calls.count;
     state.root_lexical_scope_id = add_lexical_scope(&state, ctx->root, CBM_LEXICAL_SCOPE_MODULE);
     /* Base walk-state tuple (previously established by the first
      * recompute_state call): module scope, nothing else active. */

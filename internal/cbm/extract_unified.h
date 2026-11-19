@@ -124,6 +124,12 @@ typedef struct {
     uint32_t active_start;
     uint32_t active_end;
     const char *name;
+    /* JS/TS only: a parameter, or a local this declaration names for a value
+     * that is no function it declares (`const save = useCallback(...)`,
+     * `const [open, setOpen] = useState()`). No definition in the project
+     * carries that name through this binding, so a bare call of it cannot be
+     * placed by short name. Sits in the struct's tail padding. */
+    bool names_no_definition;
 } CBMLexicalBinding;
 
 typedef enum {
@@ -189,6 +195,7 @@ typedef struct {
     int lexical_binding_capacity;
     int lexical_binding_count;
     int usage_start_index;
+    int call_start_index;
     bool lexical_binding_tracking_failed;
     CBMPythonDirective *python_directives;
     CBMPythonDirective inline_python_directives[INLINE_PYTHON_DIRECTIVES];

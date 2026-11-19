@@ -2187,6 +2187,15 @@ TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies) {
     ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_direct"));
     /* Languages outside the caller's gate are never affected. */
     ASSERT_FALSE(cbm_suppress_weak_local_binding_call(false, true, "suffix_match"));
+    /* The gate both resolvers share: the languages whose extractor sets the
+     * flag, and no other. */
+    ASSERT_TRUE(cbm_weak_local_binding_guard_lang(CBM_LANG_PYTHON));
+    ASSERT_TRUE(cbm_weak_local_binding_guard_lang(CBM_LANG_JAVASCRIPT));
+    ASSERT_TRUE(cbm_weak_local_binding_guard_lang(CBM_LANG_TYPESCRIPT));
+    ASSERT_TRUE(cbm_weak_local_binding_guard_lang(CBM_LANG_TSX));
+    ASSERT_TRUE(cbm_weak_local_binding_guard_lang(CBM_LANG_ARKTS));
+    ASSERT_FALSE(cbm_weak_local_binding_guard_lang(CBM_LANG_GO));
+    ASSERT_FALSE(cbm_weak_local_binding_guard_lang(CBM_LANG_VUE));
     /* No match (NULL/empty strategy) → nothing to suppress. */
     ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, NULL));
     ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, ""));

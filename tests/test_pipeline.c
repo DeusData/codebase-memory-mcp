@@ -15862,6 +15862,161 @@ TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355) {
     PASS();
 }
 
+/* #1355: a bare call whose callee the calling function binds locally to a
+ * value that is no definition (`const submitForm = useCallback(...)`, a
+ * useState setter, a callback parameter) must not bind by short name to an unrelated
+ * function that merely shares the name, in a file the caller never imports.
+ * `pad_files` filler modules push the run over MIN_FILES_FOR_PARALLEL. */
+static void write_local_binding_shadow_fixture(const char *dir, int pad_files) {
+    /* The lone project functions named submitForm / setOpen / onDone. Nothing
+     * imports this file. */
+    write_temp_file(dir, "src/Elsewhere.tsx",
+                    "export function submitForm(v: string) {\n"
+                    "  return v;\n"
+                    "}\n"
+                    "export function setOpen(v: boolean) {\n"
+                    "  return v;\n"
+                    "}\n"
+                    "export function onDone() {\n"
+                    "  return 0;\n"
+                    "}\n");
+    write_temp_file(dir, "src/Caller.tsx",
+                    "import { useCallback, useState } from 'react';\n"
+                    "\n"
+                    "export function Caller() {\n"
+                    "  const [open, setOpen] = useState(false);\n"
+                    "  const submitForm = useCallback(async (v: string) => v.length, []);\n"
+                    "  const localStep = () => 1;\n"
+                    "  const go = () => {\n"
+                    "    void submitForm('x');\n"
+                    "    setOpen(!open);\n"
+                    "    localStep();\n"
+                    "  };\n"
+                    "  return <button onClick={go} />;\n"
+                    "}\n"
+                    "\n"
+                    "export function useRunner(onDone: () => void) {\n"
+                    "  const finish = () => {\n"
+                    "    onDone();\n"
+                    "  };\n"
+                    "  return finish;\n"
+                    "}\n");
+    /* No binding of the name at all: nothing in the caller's source contradicts
+     * the guess, so the pre-existing fallback keeps its edge. */
+    write_temp_file(dir, "src/NoBinding.tsx",
+                    "export function callsUnbound() {\n"
+                    "  return submitForm('y');\n"
+                    "}\n");
+    /* An object-pattern key names a member that a definition does declare, so
+     * its name guess is kept. */
+    write_temp_file(dir, "src/useStore.ts",
+                    "export function useStore() {\n"
+                    "  return { removeItem: (id: number) => id };\n"
+                    "}\n");
+    write_temp_file(dir, "src/ListPage.tsx",
+                    "import { useStore } from './useStore';\n"
+                    "\n"
+                    "export function ListPage() {\n"
+                    "  const { removeItem } = useStore();\n"
+                    "  return <button onClick={() => removeItem(1)} />;\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function bindingPad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_local_binding_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the reported bug: locally bound names must not bind to the homonyms
+     * in the never-imported file (RED before the fix, on both resolvers). */
+    if (cross_file_call_exists(s, project, "go", "submitForm")) {
+        rc = 4;
+    }
+    if (rc == 0 && cross_file_call_exists(s, project, "go", "setOpen")) {
+        rc = 5;
+    }
+    if (rc == 0 && cross_file_call_exists(s, project, "finish", "onDone")) {
+        rc = 6;
+    }
+    /* (2) an arrow-valued local is a real definition and keeps its edge. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "go", "localStep")) {
+        rc = 7;
+    }
+    /* (3) a bare call of a name the caller never binds keeps its edge. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "callsUnbound", "submitForm")) {
+        rc = 8;
+    }
+    /* (4) a destructured hook member keeps its edge. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "ListPage", "removeItem")) {
+        rc = 9;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_tsx_local_binding_not_bound_to_homonym_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_local_binding_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* The guard lives at two emit sites (pass_calls.c and pass_parallel.c), so
+     * the same tree is indexed by each resolver in turn. */
+    write_local_binding_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_local_binding_shadow_contract(tmp, "binding-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_local_binding_shadow_contract(tmp, "binding-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
 /* #1355 / #1732: the same tree, but the bare specifier now names a WORKSPACE
  * package that the repository itself ships. `main` deliberately points at a
  * build artifact that is not checked in — the shape every real monorepo has,
@@ -36317,6 +36472,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
     RUN_TEST(pipeline_scala_wildcard_import_binds_no_operator_call);
     RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
+    RUN_TEST(pipeline_tsx_local_binding_not_bound_to_homonym_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355);
