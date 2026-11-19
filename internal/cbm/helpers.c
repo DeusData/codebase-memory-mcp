@@ -454,6 +454,8 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
         return has_suffix(base, "Test.php");
     case CBM_LANG_CSHARP:
         return has_suffix(base, "Tests.cs") || has_suffix(base, "Test.cs");
+    case CBM_LANG_VISUALBASIC:
+        return has_suffix(base, "Tests.vb") || has_suffix(base, "Test.vb");
     case CBM_LANG_CPP:
     case CBM_LANG_C:
         return has_suffix(base, "_test.c") || has_suffix(base, "_test.cc") ||
