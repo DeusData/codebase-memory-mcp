@@ -174,7 +174,8 @@ static const jts_file_t JTS_FILES[] = {
     {"src/test/java/split/Probe.java",
      "package split;\n\n"
      "public class Probe {\n"
-     "    public String probe() { return \"split.Probe.probe\"; }\n"
+     "    public String probe() { return \"split.Probe.probe\"; }\n\n"
+     "    public ProbeTag tagProbe() { return new ProbeTag(); }\n"
      "}\n"},
     {"src/test/java/split/Dup.java",
      "package split;\n\n"
@@ -189,7 +190,8 @@ static const jts_file_t JTS_FILES[] = {
      "public class SplitUse {\n"
      "    String splitTree(Probe p) { return p.probe(); }\n\n"
      "    String splitDup(Dup d) { return d.probe(); }\n\n"
-     "    String splitDupTag(Dup d) { return d.tagDup().sealDup(); }\n"
+     "    String splitDupTag(Dup d) { return d.tagDup().sealDup(); }\n\n"
+     "    String splitTreeTag(Probe p) { return p.tagProbe().sealProbe(); }\n"
      "}\n"},
     {"src/main/java/user/Main.java",
      "package user;\n\n"
@@ -514,6 +516,12 @@ static const jts_file_t JTS_FILES[] = {
      "public class WrongC {\n"
      "    public String hitC() { return \"WrongC.hitC\"; }\n"
      "}\n"},
+    /* The single-tree partner of the split-package reveal. */
+    {"src/test/java/split/ProbeTag.java",
+     "package split;\n\n"
+     "public class ProbeTag {\n"
+     "    public String sealProbe() { return \"split.ProbeTag.sealProbe\"; }\n"
+     "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
      "    public String ping() { return \"Def.ping\"; }\n"
@@ -815,6 +823,8 @@ static int jts_check_split_package(jts_index_t *ix) {
     ok &= jts_expect_no_engine(ix, "splitDup", "probe");
     /* The two Dups' tagDup() return different classes: a pick types sealDup(). */
     ok &= jts_expect_no_engine(ix, "splitDupTag", "sealDup");
+    /* Partner: the same chain through the class one tree has is typed. */
+    ok &= jts_expect_engine(ix, "splitTreeTag", "sealProbe", "split.ProbeTag.sealProbe");
     return ok;
 }
 
