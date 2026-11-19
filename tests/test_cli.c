@@ -13,6 +13,7 @@
 #include "../src/foundation/compat_thread.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "test_image_probe.h"
 #include <cli/agent_profiles.h>
 #include <cli/activation_transaction.h>
 #include <cli/cli.h>
@@ -917,6 +918,25 @@ static int cli_test_cmd_install(int argc, char **argv) {
     return cli_test_cmd_dispatch(cbm_cmd_install, argc, argv);
 }
 
+/* An install whose running binary is the image probe (tests/test_image_probe.h),
+ * not this runner. These tests need a real executable to stage, verify (it is
+ * run with --version) and publish, never this one: each install of the ~800 MB
+ * sanitized runner made up to five full SHA-256 passes and two fsync'd staged
+ * copies of it, and one such hash costs 70-95 s on some hosted x86 CPUs. -1,
+ * said on stderr, when the probe was not built. */
+static int cli_test_cmd_install_probe(int argc, char **argv) {
+    static char probe[1024];
+    if (!probe[0] && !th_image_probe_path(probe, sizeof(probe))) {
+        (void)fprintf(stderr, "cli: no image probe beside this runner; it is built with the "
+                              "runner (Makefile.cbm, <runner>-image-probe)\n");
+        return -1;
+    }
+    cbm_cli_set_self_path_override_for_test(probe);
+    int rc = cli_test_cmd_install(argc, argv);
+    cbm_cli_set_self_path_override_for_test(NULL);
+    return rc;
+}
+
 static int cli_test_cmd_uninstall(int argc, char **argv) {
     return cli_test_cmd_dispatch(cbm_cmd_uninstall, argc, argv);
 }
@@ -1017,6 +1037,24 @@ static unsigned char *create_test_targz(const char *filename, const unsigned cha
     free(tar);
     return gz;
 }
+
+/* Two update tests package a native executable as the release, and on macOS
+ * that executable is this test runner. An ASan runner that carries every
+ * vendored grammar sits right at the updater's 500 MiB decompression limit;
+ * the ObjectScript v1.11.0 parse tables took the CI runners past it, and the
+ * archive was refused ("binary not found in archive") before the step under
+ * test ran. The limit has its own test; these tests only need their archive
+ * accepted, so the limit is sized to the fixture. Twice the inflated tar can
+ * never refuse it: the decompression buffer only doubles from below the
+ * inflated size. cbm_cli_set_decompress_max_for_test(0) restores the limit.
+ * Both tests use the tar path, which is POSIX-only. */
+#ifndef _WIN32
+static void cli_update_fit_decompress_limit(long fixture_size) {
+    /* create_test_targz adds a header block, block padding and two end blocks. */
+    enum { TARGZ_OVERHEAD = 4 * 512 };
+    cbm_cli_set_decompress_max_for_test(((size_t)fixture_size + TARGZ_OVERHEAD) * 2U);
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Mandatory daemon activation safety
@@ -1430,7 +1468,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = child_ready ? cli_test_cmd_install_probe(4, install_argv) : -1;
     close(install_done_pipe[1]); /* the child's watch ends here at the latest */
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
@@ -1541,7 +1579,7 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = orphan_created ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = orphan_created ? cli_test_cmd_install_probe(4, install_argv) : -1;
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
@@ -1951,7 +1989,7 @@ static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, con
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
     char *install_argv[] = {skip_binary ? "--skip-binary" : "--force", "--skip-config", "--yes",
                             dir_arg};
-    int rc = cli_test_cmd_install(4, install_argv);
+    int rc = cli_test_cmd_install_probe(4, install_argv);
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
     return rc;
@@ -2375,7 +2413,7 @@ TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force"};
-    int rc = cli_test_cmd_install(1, argv);
+    int rc = cli_test_cmd_install_probe(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
 
     const char *installed = read_test_file(bin_target);
@@ -2427,11 +2465,11 @@ TEST(cli_install_dir_and_skip_config_stage_first_install_safely) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--skip-config", "--yes", "--dir", install_dir};
-    int rc = cli_test_cmd_install(5, argv);
+    int rc = cli_test_cmd_install_probe(5, argv);
     char equals_arg[640];
     snprintf(equals_arg, sizeof(equals_arg), "--dir=%s", install_dir);
     char *dry_argv[] = {"--force", "--skip-config", "--dry-run", equals_arg};
-    int dry_rc = cli_test_cmd_install(4, dry_argv);
+    int dry_rc = cli_test_cmd_install_probe(4, dry_argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -2835,12 +2873,12 @@ TEST(cli_no_hooks_removes_codex_pretool_hook) {
     size_t owned = 0U;
     size_t foreign = 0U;
     char *default_args[] = {"--skip-binary", "--clients=codex", "--yes"};
-    int default_rc = cli_test_cmd_install(3, default_args);
+    int default_rc = cli_test_cmd_install_probe(3, default_args);
     test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
     bool default_json = default_rc == 0 && owned == 1U && foreign == 1U;
 
     char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=codex", "--yes"};
-    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    int no_hooks_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
     char *json_state = read_test_file_alloc(hooks_path);
     char *toml_state = read_test_file_alloc(config_path);
@@ -2851,26 +2889,26 @@ TEST(cli_no_hooks_removes_codex_pretool_hook) {
     free(json_state);
     free(toml_state);
 
-    int bare_rc = cli_test_cmd_install(3, default_args);
+    int bare_rc = cli_test_cmd_install_probe(3, default_args);
     test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
     bool bare_disabled = bare_rc == 0 && owned == 0U && foreign == 1U;
 
     /* Without hooks.json the config.toml managed block carries the hooks. */
     (void)remove(hooks_path);
     char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=codex", "--yes"};
-    int toml_enable_rc = cli_test_cmd_install(4, hooks_args);
+    int toml_enable_rc = cli_test_cmd_install_probe(4, hooks_args);
     toml_state = read_test_file_alloc(config_path);
     bool toml_enabled = toml_enable_rc == 0 && toml_state &&
                         test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
     free(toml_state);
-    int toml_disable_rc = cli_test_cmd_install(4, no_hooks_args);
+    int toml_disable_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     toml_state = read_test_file_alloc(config_path);
     bool toml_disabled = toml_disable_rc == 0 && toml_state &&
                          !strstr(toml_state, "hooks.PreToolUse") &&
                          !strstr(toml_state, "hook-augment") &&
                          strstr(toml_state, "[mcp_servers.codebase-memory-mcp]");
     free(toml_state);
-    int restore_rc = cli_test_cmd_install(4, hooks_args);
+    int restore_rc = cli_test_cmd_install_probe(4, hooks_args);
     toml_state = read_test_file_alloc(config_path);
     bool restored = restore_rc == 0 && toml_state &&
                     test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
@@ -2951,12 +2989,12 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
     cbm_cli_set_activation_ops_for_test(&ops);
 
     char *default_args[] = {"--skip-binary", "--clients=augment", "--yes"};
-    int default_rc = cli_test_cmd_install(3, default_args);
+    int default_rc = cli_test_cmd_install_probe(3, default_args);
     bool default_scripts =
         default_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
 
     char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=augment", "--yes"};
-    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    int no_hooks_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     bool scripts_removed =
         no_hooks_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
     char *settings = read_test_file_alloc(settings_path);
@@ -2966,12 +3004,12 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
                     !strstr(settings, "codebase-memory-coverage");
     free(settings);
 
-    int bare_rc = cli_test_cmd_install(3, default_args);
+    int bare_rc = cli_test_cmd_install_probe(3, default_args);
     bool bare_disabled =
         bare_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
 
     char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=augment", "--yes"};
-    int hooks_rc = cli_test_cmd_install(4, hooks_args);
+    int hooks_rc = cli_test_cmd_install_probe(4, hooks_args);
     settings = read_test_file_alloc(settings_path);
     bool restored = hooks_rc == 0 && cbm_file_exists(session_path) &&
                     cbm_file_exists(coverage_path) && settings &&
@@ -2987,7 +3025,7 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
              owned_session ? owned_session : "");
     free(owned_session);
     write_test_file(session_path, user_session);
-    int user_rc = cli_test_cmd_install(4, no_hooks_args);
+    int user_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     char *kept_session = read_test_file_alloc(session_path);
     bool user_script_kept = user_rc == 0 && kept_session &&
                             strcmp(kept_session, user_session) == 0 &&
@@ -2997,7 +3035,7 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
     /* End on --hooks, as the Codex case does: the opt-out is process state,
      * and later tests install without the command line. */
     (void)remove(session_path);
-    int final_rc = cli_test_cmd_install(4, hooks_args);
+    int final_rc = cli_test_cmd_install_probe(4, hooks_args);
     bool final_restored =
         final_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
 
@@ -3057,7 +3095,7 @@ TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--reset-indexes", "--yes"};
-    int rc = cli_test_cmd_install(3, argv);
+    int rc = cli_test_cmd_install_probe(3, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3375,7 +3413,7 @@ TEST(cli_install_config_failure_keeps_published_binary) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--yes"};
-    int rc = cli_test_cmd_install(2, argv);
+    int rc = cli_test_cmd_install_probe(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3618,6 +3656,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
+    cli_update_fit_decompress_limit(native_size);
     char *argv[] = {"--force"};
     int rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -3643,6 +3682,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     cbm_cli_set_activation_ops_for_test(&failure_ops);
     int config_failure_rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_decompress_max_for_test(0);
     struct stat updated_status;
     bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
                             updated_status.st_size != (off_t)(sizeof(old_binary) - 1U);
@@ -3760,6 +3800,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
+    cli_update_fit_decompress_limit(native_size);
     FILE *capture = tmpfile();
     int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
     int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
@@ -3785,6 +3826,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
         close(saved_stderr);
     }
     cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_decompress_max_for_test(0);
     char output[16384] = {0};
     if (capture) {
         rewind(capture);

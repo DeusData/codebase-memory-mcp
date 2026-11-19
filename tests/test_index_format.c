@@ -568,6 +568,89 @@ TEST(index_format_v5_scala_packages_rebuild) {
     PASS();
 }
 
+/* Format 6 recorded no included files on its lsp_surface rows (#2993). An
+ * incremental refresh re-extracts the includers of a changed header from that
+ * record, so a format-6 index refreshed in place would keep an includer's
+ * edges stale after an edit to its header alone. */
+static const RFile k_include_files[] = {
+    {"lib/m.h", "#ifndef M_H\n#define M_H\n#define DO_WORK(x) real_target(x)\n#endif\n"},
+    {"lib/a.c",
+     "#define A_LOCAL 1\n#include \"m.h\"\n\nvoid caller(int v) {\n    DO_WORK(v);\n}\n"},
+    {"lib/t.c", "void real_target(int x) { (void)x; }\nvoid other_target(int x) { (void)x; }\n"},
+};
+
+/* CALLS edges from the function `caller` to the Function `target`. */
+static int include_caller_calls(cbm_store_t *s, const char *target) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+             "t.id=e.target_id WHERE e.type='CALLS' AND s.name='caller' AND t.name='%s' AND "
+             "t.label='Function'",
+             target);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), sql, -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int count = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return count;
+}
+
+static int include_rows_recorded(cbm_store_t *s) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM lsp_surface WHERE included_files <> ''", -1, &st,
+                           NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int count = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return count;
+}
+
+TEST(index_format_v6_included_files_rebuild) {
+    RProj lp;
+    cbm_store_t *q0 = rh_index_files(&lp, k_include_files, 3);
+    ASSERT_NOT_NULL(q0);
+    ASSERT_EQ(include_caller_calls(q0, "real_target"), 1);
+    ASSERT_EQ(include_rows_recorded(q0), 1);
+    cbm_store_close(q0);
+
+    /* The old shape: no row records the files its lookup read. */
+    cbm_store_t *w = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(w);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(w), "UPDATE lsp_surface SET included_files = ''", NULL,
+                           NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(cbm_store_set_format_version(w, 6), CBM_STORE_OK);
+    cbm_store_close(w);
+
+    /* Only the header changes. */
+    char path[700];
+    snprintf(path, sizeof(path), "%s/lib/m.h", lp.tmpdir);
+    FILE *fp = fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("#ifndef M_H\n#define M_H\n#define DO_WORK(x) other_target(x)\n#endif\n", fp);
+    fclose(fp);
+
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_store_t *r = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(include_caller_calls(r, "other_target"), 1);
+    ASSERT_EQ(include_caller_calls(r, "real_target"), 0);
+    if (!strstr(g_log_buf, "format_change_reindex")) {
+        FAIL("a format-6 index was not routed through the full-reindex path");
+    }
+    ASSERT_EQ(include_rows_recorded(r), 1);
+    int format = -1;
+    ASSERT_EQ(cbm_store_get_format_version(r, &format), CBM_STORE_OK);
+    ASSERT_EQ(format, CBM_INDEX_FORMAT_VERSION);
+    rh_cleanup(&lp, r);
+    PASS();
+}
+
 SUITE(index_format) {
     RUN_TEST(index_format_siblings_distinct_and_searchable);
     RUN_TEST(index_format_legacy_index_rebuilds_and_repairs);
@@ -575,4 +658,5 @@ SUITE(index_format) {
     RUN_TEST(index_format_swift_collisions_and_stale_calls_rebuild);
     RUN_TEST(index_format_v2_images_rebuild_without_invented_host);
     RUN_TEST(index_format_v5_scala_packages_rebuild);
+    RUN_TEST(index_format_v6_included_files_rebuild);
 }

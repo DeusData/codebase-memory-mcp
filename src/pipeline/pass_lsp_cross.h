@@ -12,9 +12,10 @@
  * so the same cbm_pipeline_find_lsp_resolution path that handles per-
  * file LSP picks them up.
  *
- * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
- * TSX, PHP, C#, and JVM (Java/Kotlin via the shared filter helper).
- * Anything else short-circuits via cbm_pxc_has_cross_lsp.
+ * The languages covered are the rows of one engine table (pass_lsp_cross.c
+ * pxc_engines): Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/TSX, PHP,
+ * C#, Java, Kotlin and Rust. Anything else short-circuits via
+ * cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
  * (cbm_pipeline_pass_lsp_cross) that re-read every source file from
@@ -38,10 +39,43 @@
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/type_scope.h" /* cbm_type_scope_file_t */
 #include <stdbool.h>
 
-/* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
+/* ── The engine table ──
+ *
+ * One row per type-aware engine (pass_lsp_cross.c pxc_engines): the
+ * languages it serves, the shared registry it builds once over all defs, its
+ * walk of one file against a registry, its walk of one file over a def list,
+ * and whether it reads declared-type identities (type_scope.h). Every
+ * per-language decision of the cross-file pass is a field of that row; an
+ * engine plugs in by adding its row. A row's index is its engine number. */
+enum { CBM_PXC_MAX_ENGINES = 16 };
+
+/* Number of rows; a row's name ("go", "python", ...; NULL out of range); the
+ * row that serves `lang` (-1: none). */
+int cbm_pxc_engine_count(void);
+const char *cbm_pxc_engine_name(int engine);
+int cbm_pxc_engine_of_lang(CBMLanguage lang);
+
+/* True iff this language has an engine row. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
+/* True iff the language's engine reads declared-type identities: the
+ * collector attaches them (cbm_type_scope_lang must have the language's
+ * row) and the per-file def selection follows them. */
+bool cbm_pxc_wants_identities(CBMLanguage lang);
+
+/* One file's declared-type scope, exactly as the collector builds it to
+ * attach the file's identities (the project registry, the file's module and
+ * LSP import map, and for a lexical row the file's definitions and module
+ * facts): a walk reads the calling file's own identity table from it
+ * (cbm_type_scope_file_imports). NULL without a pipeline context or for an
+ * engine that reads no identities; else end it with cbm_type_scope_file_end
+ * once the walk is done. */
+cbm_type_scope_file_t *cbm_pxc_file_scope(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
+                                          const CBMFileResult *result, const char *module_qn,
+                                          const char **imp_keys, const char **imp_vals,
+                                          int imp_count);
 
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
@@ -140,28 +174,33 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
 uint64_t cbm_pxc_test_reach_work(void);
 #endif
 
-/* ── Tier 2 full: pre-built per-language cross-LSP registries ─────
+/* ── Tier 2 full: pre-built per-engine cross-LSP registries ─────
  *
- * Each non-NULL registry is built ONCE in pipeline.c (in a dedicated
- * cross_lsp_arena), finalized, and shared READ-ONLY across all
- * resolve workers for files of that language. The worker uses the
- * matching cbm_run_X_lsp_cross_with_registry variant which skips the
- * per-file registry build entirely. NULL → fall back to the per-file
- * cbm_pxc_run_one path. */
+ * Each non-NULL registry is built ONCE per run (in a dedicated arena),
+ * finalized, and shared READ-ONLY across all resolve workers for files of
+ * that engine's languages. The walk then runs against a per-file overlay
+ * chained to it and skips the per-file registry build entirely. NULL → the
+ * per-file path. A row whose registry is lazy (Rust) is not built here: the
+ * parallel resolver builds it on the first file that needs it. */
 typedef struct {
-    CBMTypeRegistry *go;     /* CBM_LANG_GO */
-    CBMTypeRegistry *c;      /* CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA */
-    CBMTypeRegistry *python; /* CBM_LANG_PYTHON */
-    CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
-    CBMTypeRegistry *php;    /* CBM_LANG_PHP */
-    CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
-    CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
-    /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
-     * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
+    CBMTypeRegistry *by_engine[CBM_PXC_MAX_ENGINES]; /* indexed by engine row */
+    /* The pipeline context the walks may read (the project registry, for the
+     * calling file's own identities: cbm_pxc_file_scope). Every driver sets
+     * it, also when it builds no registry; NULL in a harness without one. */
+    const cbm_pipeline_ctx_t *ctx;
 } CBMCrossLspRegistries;
 
-/* Return the appropriate pre-built registry for a language, or NULL
- * if none was built (or language has no cross-LSP entrypoint). */
+/* Build one row's shared registry over all defs into out->by_engine[engine].
+ * False (slot untouched) for a row without an eagerly built registry. */
+bool cbm_pxc_build_engine_registry(int engine, CBMArena *arena, CBMLSPDef *defs, int def_count,
+                                   CBMCrossLspRegistries *out);
+/* Every row's, in row order. */
+void cbm_pxc_build_cross_registries(CBMArena *arena, CBMLSPDef *defs, int def_count,
+                                    CBMCrossLspRegistries *out);
+/* The pre-built registry of the engine serving `lang`, or NULL if none was
+ * built (or the language has no engine; r may be NULL). */
+CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r, CBMLanguage lang);
+
 /* Per-file registry-build cost (#1669): how many defs the per-file cross-LSP
  * path actually registered, and how often the module filter failed. */
 /* Count defs an overlay registered for one file (complexity-gate telemetry). */
@@ -169,35 +208,6 @@ void cbm_pxc_count_perfile_defs(uint64_t defs);
 
 void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint64_t *filter_files,
                           uint64_t *filter_failed);
-
-static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
-                                                         CBMLanguage lang) {
-    if (!r) {
-        return NULL;
-    }
-    switch (lang) {
-    case CBM_LANG_GO:
-        return r->go;
-    case CBM_LANG_C:   /* fallthrough */
-    case CBM_LANG_CPP: /* fallthrough */
-    case CBM_LANG_CUDA:
-        return r->c;
-    case CBM_LANG_PYTHON:
-        return r->python;
-    case CBM_LANG_JAVASCRIPT: /* fallthrough */
-    case CBM_LANG_TYPESCRIPT: /* fallthrough */
-    case CBM_LANG_TSX:
-        return r->ts;
-    case CBM_LANG_PHP:
-        return r->php;
-    case CBM_LANG_CSHARP:
-        return r->cs;
-    case CBM_LANG_JAVA:
-        return r->java;
-    default:
-        return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
-    }
-}
 
 /* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
  * The manifest owns strings in manifest_arena; callers keep that arena alive
@@ -213,8 +223,8 @@ void cbm_pxc_thread_scratch_begin(void);
 void cbm_pxc_thread_scratch_end(void);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
-/* Run the cross-file LSP resolver for non-TS languages. Appends
- * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
+/* Run the engine's per-file cross-file walk for one file over `defs`.
+ * Appends resolved CALLS into r->resolved_calls (lives in r->arena). Caller
  * owns source, module_qn, defs, imp_names, imp_qns.
  * NOTE: defs is read-only in practice but typed non-const to match
  * the existing cbm_run_X_lsp_cross callee signatures. */
@@ -231,18 +241,12 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
                                        const char **imp_qns, int imp_count,
                                        const CBMPHPImportBindings *bindings);
 
-/* TS / JS / JSX / TSX variant with explicit dialect flags. */
-void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
-                        CBMLSPDef *defs, int def_count, const char **imp_names,
-                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
-                        bool dts_mode);
-
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
- * sequential driver (one path = one semantics): module-def-index filter →
- * shared prebuilt registry (overlay pattern, no per-file registry build) →
- * per-file fallback with FILTERED defs for languages without a shared
- * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
- * registry for NULL-filter rust files. */
+ * sequential driver (one path = one semantics): shared prebuilt registry
+ * (overlay pattern, no per-file registry build) → per-file fallback with
+ * the module-def-index's FILTERED defs for engines without one.
+ * rust_shared_get (nullable) supplies the lazily-built shared registry of
+ * the engine whose registry is lazy (Rust). */
 void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
                            int source_len, const char *rel, const char *def_module,
                            const CBMCrossLspRegistries *cross_registries,

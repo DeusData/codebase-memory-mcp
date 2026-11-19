@@ -142,6 +142,11 @@ static bool cls_run(cni_context *c, const cbm_inventory_filter_view_t *view,
         if (!cls_one(c, &reader, config, budget, ledger, row->file_index, &language)) {
             return false;
         }
+        if (row->config_only &&
+            (!cbm_language_is_deployment_config(language) ||
+             cbm_discover_is_package_manifest(cls_basename(&view->files[row->file_index].path)))) {
+            language = CBM_LANG_COUNT; /* as discovery: program source and manifests in deploy/ */
+        }
         ledger->rows[ledger->count++] =
             (cbm_test_impact_classified_t){.file_index = row->file_index, .language = language};
     }
