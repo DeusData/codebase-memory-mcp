@@ -21,7 +21,8 @@
  *
  * The fixture runs on the sequential route and, padded past
  * MIN_FILES_FOR_PARALLEL, on the parallel one; an import edit through the
- * incremental closure repair gives a full index's engine edges.
+ * incremental closure repair gives a full index's engine edges, and a body
+ * edit of a file with a library-receiver call gives a full index's edges.
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
@@ -722,6 +723,85 @@ TEST(java_type_scope_incremental_import_edit) {
     PASS();
 }
 
+/* Every CALLS edge out of user/Main.java, one sorted line each, the project
+ * prefix dropped. */
+static char *jts_main_edges(jts_index_t *ix) {
+    const char *sql = "SELECT group_concat(x, char(10)) FROM (SELECT s.name || '|' || "
+                      "coalesce(json_extract(e.properties,'$.callee'),'') || '|' || "
+                      "substr(t.qualified_name, length(?1) + 2) || '|' || "
+                      "json_extract(e.properties,'$.strategy') AS x FROM edges e "
+                      "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                      "WHERE e.type = 'CALLS' AND s.file_path LIKE '%user/Main.java' ORDER BY x)";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(ix->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    sqlite3_bind_text(st, 1, ix->project, -1, SQLITE_STATIC);
+    char *out = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(st, 0);
+        out = strdup(text ? (const char *)text : "");
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+/* A body edit (a newline) of Main.java, which calls run() on ext.Service (a
+ * library type; the project has other.Service): the closure repair re-parses
+ * Main.java alone and has no shared registry, and its CALLS edges must be a
+ * full index's: no edge for that call (a library receiver), never the name
+ * guess other.Service.run or Decoys.run. */
+TEST(java_type_scope_incremental_library_receiver) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_jtsl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    char inc_db[512];
+    char full_db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    jts_write_fixture(repo, 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    bool ok = jts_pipeline(repo, inc_db, NULL);
+    char main_path[600];
+    snprintf(main_path, sizeof(main_path), "%s/src/main/java/user/Main.java", repo);
+    char *text = jts_read_file(main_path);
+    ok = ok && text;
+    if (text) {
+        char edited[8192];
+        snprintf(edited, sizeof(edited), "%s\n", text);
+        th_write_file(main_path, edited);
+    }
+    free(text);
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    ok = ok && jts_pipeline(repo, inc_db, &route) && jts_pipeline(repo, full_db, NULL);
+    if (route != CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR) {
+        printf("\n  the edit did not take the closure repair (route %d)\n", (int)route);
+        ok = false;
+    }
+    jts_index_t inc;
+    jts_index_t full;
+    bool inc_open = jts_open(&inc, inc_db);
+    bool full_open = jts_open(&full, full_db);
+    bool opened = inc_open && full_open;
+    char *a = opened ? jts_main_edges(&inc) : NULL;
+    char *b = opened ? jts_main_edges(&full) : NULL;
+    bool same = a && b && strcmp(a, b) == 0;
+    if (!same) {
+        printf("\n  incremental:\n%s\n  full:\n%s\n", a ? a : "(none)", b ? b : "(none)");
+    }
+    ok = ok && same && opened && jts_expect_none_to(&inc, "externalImport", "run", "Service") &&
+         jts_expect_none_to(&inc, "externalImport", "run", "Decoys");
+    free(a);
+    free(b);
+    sqlite3_close(inc.db);
+    sqlite3_close(full.db);
+    th_cleanup(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* ── Growth (counted work, never time) ───────────────────────────────── */
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
@@ -916,6 +996,7 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_inherited_member_type_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
+    RUN_TEST(java_type_scope_incremental_library_receiver);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(java_type_scope_growth_package_table);
     RUN_TEST(java_type_scope_growth_many_imports);

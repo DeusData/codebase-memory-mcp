@@ -3126,12 +3126,45 @@ static bool pxc_java_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
     return true;
 }
 
+/* Whether some project file declares `package` (len bytes) or a package
+ * below it: the package table's answer for a Java cross run without a shared
+ * registry (CBMJavaProjectPackages), which is how the shared registry judges
+ * a receiver's package. Two binary searches. */
+static bool pxc_package_declared(const void *ud, const char *package, size_t len) {
+    const cbm_pxc_packages_t *t = (const cbm_pxc_packages_t *)ud;
+    if (!t || !package || len == 0 || len + 1 >= CBM_SZ_1K) {
+        return false;
+    }
+    if (cbm_pxc_package_modules(t, package, len, NULL) > 0) {
+        return true;
+    }
+    char below[CBM_SZ_1K]; /* "<package>.": the first package under it */
+    memcpy(below, package, len);
+    below[len] = '.';
+    int lo = 0;
+    int hi = t->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        PXC_PKG_WORK(1);
+        if (strncmp(t->by_package[mid].package, below, len + 1) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < t->count && strncmp(t->by_package[lo].package, below, len + 1) == 0;
+}
+
 static bool pxc_java_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
     const char **locals = NULL;
     const char **qns = NULL;
     int n = pxc_jvm_file_imports(f, w->scratch, &locals, &qns);
-    cbm_run_java_lsp_cross(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
-                           w->def_count, locals, qns, n, f->result->cached_tree, w->out);
+    /* No shared registry here (an incremental closure of a few files): the
+     * engine judges a library receiver by the run's package table. */
+    CBMJavaProjectPackages packages = {.declared = pxc_package_declared, .ud = f->packages};
+    cbm_run_java_lsp_cross_packages(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
+                                    w->def_count, locals, qns, n, f->result->cached_tree,
+                                    f->packages ? &packages : NULL, w->out);
     pxc_java_one_answer_per_call(f, w);
     return true;
 }

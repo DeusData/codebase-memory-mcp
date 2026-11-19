@@ -84,6 +84,9 @@ typedef struct {
     int import_cap;
     CBMNameRows import_rows; /* import_local_names by name, rows in table order */
     bool imports_scanned;    /* the file's package and import declarations are read */
+    /* The run's project packages, for a cross run without a shared registry
+     * (java_receiver_is_external); NULL when not known. */
+    const struct CBMJavaProjectPackages *project_packages;
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
@@ -197,6 +200,25 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out);
+
+/* The run's project packages: declared(ud, package, len) is true when some
+ * project file declares `package` (len bytes, no trailing dot) or a package
+ * below it. A cross run over a shared registry reads that from the registry;
+ * the per-file run below has none and asks this instead. */
+typedef struct CBMJavaProjectPackages {
+    bool (*declared)(const void *ud, const char *package, size_t len);
+    const void *ud;
+} CBMJavaProjectPackages;
+
+/* cbm_run_java_lsp_cross with the run's project packages (NULL: as
+ * cbm_run_java_lsp_cross), so a receiver of a library type is told apart
+ * from an unresolved project type as on a run over the shared registry. */
+void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int source_len,
+                                     const char *module_qn, CBMLSPDef *defs, int def_count,
+                                     const char **import_names, const char **import_qns,
+                                     int import_count, TSTree *cached_tree,
+                                     const CBMJavaProjectPackages *packages,
+                                     CBMResolvedCallArray *out);
 
 /* Register the Java standard library (java.lang/util/io/etc.) into reg.
  * Implementation lives in generated/java_stdlib_data.c. */

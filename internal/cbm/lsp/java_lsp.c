@@ -2047,7 +2047,9 @@ static bool java_package_is_external(JavaLSPContext *ctx, const CBMTypeRegistry 
  * (project-prefixed) is an unresolved project spelling, never a library. */
 static bool java_receiver_is_external(JavaLSPContext *ctx, const char *recv_qn) {
     const CBMTypeRegistry *base = ctx->registry ? ctx->registry->fallback : NULL;
-    if (!base || !recv_qn || !islower((unsigned char)recv_qn[0]))
+    const CBMJavaProjectPackages *packages = ctx->project_packages;
+    if ((!base && !(packages && packages->declared)) || !recv_qn ||
+        !islower((unsigned char)recv_qn[0]))
         return false;
     const char *type = NULL;
     for (const char *p = recv_qn; (p = strchr(p, '.')) != NULL; p++) {
@@ -2072,6 +2074,11 @@ static bool java_receiver_is_external(JavaLSPContext *ctx, const char *recv_qn) 
     if (ctx->package_name && strlen(ctx->package_name) == pkg_len &&
         strncmp(ctx->package_name, recv_qn, pkg_len) == 0)
         return false;
+    if (!base) {
+        /* No shared registry (a per-file cross run): the run's package table
+         * tells whether the project declares the package or one below it. */
+        return !packages->declared(packages->ud, recv_qn, pkg_len);
+    }
     /* "org.jooq." */
     return java_package_is_external(ctx, base, cbm_arena_strndup(ctx->arena, recv_qn, pkg_len + 1));
 }
@@ -4491,12 +4498,24 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
 }
 
 /* The per-file fallback when no shared cross registry was built. Its
- * registry has no fallback layer, so java_receiver_is_external never fires
- * here: library calls keep the textual registry fallback, as before. */
+ * registry has no fallback layer: java_receiver_is_external judges a
+ * receiver's package by the run's project packages when they are handed in,
+ * and not at all without them (library calls then keep the textual registry
+ * fallback, as before). */
 void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_java_lsp_cross_packages(arena, source, source_len, module_qn, defs, def_count,
+                                    import_names, import_qns, import_count, cached_tree, NULL, out);
+}
+
+void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int source_len,
+                                     const char *module_qn, CBMLSPDef *defs, int def_count,
+                                     const char **import_names, const char **import_qns,
+                                     int import_count, TSTree *cached_tree,
+                                     const CBMJavaProjectPackages *packages,
+                                     CBMResolvedCallArray *out) {
     if (!arena || !source)
         return;
 
@@ -4538,6 +4557,7 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &reg, NULL, module_qn, out);
+    ctx.project_packages = packages;
 
     /* The calling file's verified import identities. */
     for (int i = 0; i < import_count; i++) {
