@@ -1403,6 +1403,31 @@ TEST(regex_compile_accepts_ordinary_intervals) {
 /* Sizing must read the syntax the way the compilers do: nothing inside a
  * bracket expression operates, a backslash escapes one character, braces that
  * do not form an interval are literals, and only an interval multiplies. */
+TEST(regex_perl_class_escapes_match_like_perl) {
+    /* POSIX ERE has no \d: without the rewrite "fn\d+" meant fn + letter d */
+    struct {
+        const char *pattern;
+        const char *subject;
+        bool match;
+    } cases[] = {
+        {"^fn\\d+$", "fn42", true},       {"^fn\\d+$", "fnd", false}, {"^\\D+$", "abc", true},
+        {"^\\D+$", "a1c", false},         {"^\\w+$", "a_1", true},    {"^\\w+$", "a-1", false},
+        {"^a\\sb$", "a b", true},         {"^a\\Sb$", "a b", false},  {"^[\\d_]+$", "1_2", true},
+        {"^[\\d_]+$", "1a", false},       {"^a\\.b$", "a.b", true},   {"^a\\.b$", "axb", false},
+        {"^[[:alpha:]]\\d$", "x7", true}, {"^[]d]+$", "d]", true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cbm_regex_t re;
+        ASSERT_EQ(cbm_regcomp(&re, cases[i].pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+        bool got = cbm_regexec(&re, cases[i].subject, 0, NULL, 0) == CBM_REG_OK;
+        cbm_regfree(&re);
+        ASSERT_EQ(got, cases[i].match);
+    }
+    char *t = cbm_regex_translate_perl_classes("a\\\\d");
+    ASSERT_NULL(t); /* an escaped backslash then 'd' is not a class */
+    PASS();
+}
+
 TEST(regex_estimate_counts_brackets_and_escapes_literally) {
     ASSERT_EQ(regex_units_ere("[{]{2}"), 2);
     ASSERT_EQ(regex_units_ere("\\{"), 1);
@@ -1474,6 +1499,7 @@ SUITE(platform) {
     RUN_TEST(regex_compile_refuses_overlong_pattern);
     RUN_TEST(regex_compile_accepts_ordinary_intervals);
     RUN_TEST(regex_estimate_counts_brackets_and_escapes_literally);
+    RUN_TEST(regex_perl_class_escapes_match_like_perl);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);

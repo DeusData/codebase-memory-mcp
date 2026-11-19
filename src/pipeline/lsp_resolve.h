@@ -451,6 +451,23 @@ static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCal
     return false;
 }
 
+/* True when ctor_qn is "<class_qn>.<class short name>", the constructor of
+ * class_qn (Java/C#/Kotlin naming). One resolver pass that cannot see the
+ * constructor names the class for `new X()`, another names X.X: the same call,
+ * not two candidate targets, and the constructor is the more precise one. */
+static inline bool cbm_pipeline_qn_is_ctor_of(const char *ctor_qn, const char *class_qn) {
+    if (!ctor_qn || !class_qn) {
+        return false;
+    }
+    size_t cl = strlen(class_qn);
+    if (strncmp(ctor_qn, class_qn, cl) != 0 || ctor_qn[cl] != '.') {
+        return false;
+    }
+    const char *short_name = strrchr(class_qn, '.');
+    short_name = short_name ? short_name + 1 : class_qn;
+    return short_name[0] && strcmp(ctor_qn + cl + 1, short_name) == 0;
+}
+
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
  * matches the textual call's enclosing function and whose callee QN
  * short-name matches the textual callee. Returns a pointer into `arr`
@@ -513,7 +530,11 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         }
         if (!cbm_pipeline_invocation_targets_equal(best_exact_caller->callee_qn, rc->callee_qn,
                                                    gbuf, project_name, allow_tail_match)) {
-            exact_caller_ambiguous = true;
+            if (cbm_pipeline_qn_is_ctor_of(rc->callee_qn, best_exact_caller->callee_qn)) {
+                best_exact_caller = rc; /* the explicit constructor beats its class */
+            } else if (!cbm_pipeline_qn_is_ctor_of(best_exact_caller->callee_qn, rc->callee_qn)) {
+                exact_caller_ambiguous = true;
+            }
             continue;
         }
         if (rc->confidence > best_exact_caller->confidence) {
@@ -568,7 +589,11 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         }
         if (!cbm_pipeline_invocation_targets_equal((*best)->callee_qn, rc->callee_qn, gbuf,
                                                    project_name, allow_tail_match)) {
-            *ambiguous = true;
+            if (cbm_pipeline_qn_is_ctor_of(rc->callee_qn, (*best)->callee_qn)) {
+                *best = rc; /* the explicit constructor beats its class */
+            } else if (!cbm_pipeline_qn_is_ctor_of((*best)->callee_qn, rc->callee_qn)) {
+                *ambiguous = true;
+            }
             continue;
         }
         if (rc->confidence > (*best)->confidence) {

@@ -7272,6 +7272,48 @@ char *cbm_glob_to_like(const char *pattern) {
 
 /* ── extractLikeHints ─────────────────────────────────────────── */
 
+static void st_hint_flush(char *buf, int *blen, bool *overflow, char **out, int *count,
+                          int max_out) {
+    if (*blen >= ST_GLOB_MIN_LEN && *count < max_out) {
+        buf[*blen] = '\0';
+        char *dup = strdup(buf);
+        if (dup) {
+            out[(*count)++] = dup;
+        }
+    }
+    *blen = 0;
+    *overflow = false;
+}
+
+/* Index just past the POSIX bracket expression that opens at pattern[i]: a ']'
+ * right after '[' or '[^' is literal, and [:class:] [=e=] [.c.] nest. An
+ * unterminated bracket runs to the end of the pattern. */
+static int st_regex_skip_bracket(const char *pattern, int i) {
+    i++; /* '[' */
+    if (pattern[i] == '^') {
+        i++;
+    }
+    if (pattern[i] == ']') {
+        i++;
+    }
+    while (pattern[i] && pattern[i] != ']') {
+        if (pattern[i] == '[' && pattern[i + SKIP_ONE] &&
+            strchr(":=.", pattern[i + SKIP_ONE]) != NULL) {
+            char close = pattern[i + SKIP_ONE];
+            i += ST_GLOB_SKIP;
+            while (pattern[i] && !(pattern[i] == close && pattern[i + SKIP_ONE] == ']')) {
+                i++;
+            }
+            if (pattern[i]) {
+                i += ST_GLOB_SKIP;
+            }
+            continue;
+        }
+        i++;
+    }
+    return pattern[i] ? i + SKIP_ONE : i;
+}
+
 int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
     if (!pattern || !out || max_out <= 0) {
         return 0;
@@ -7284,58 +7326,94 @@ int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
         }
     }
 
+    /* A hint must be a substring of every match, or the LIKE pre-filter drops
+     * real matches. So: bracket expressions and groups contribute nothing (their
+     * text is not literal, and a group may be optional), a class escape such as
+     * \d or \w ends the run, and a character followed by '*', '?' or '{' may
+     * occur zero times, so it is cut from the run before the run is flushed. */
     int count = 0;
     char buf[CBM_SZ_256];
     int blen = 0;
+    bool overflow = false;
 
     int i = 0;
     while (pattern[i]) {
         char ch = pattern[i];
-        switch (ch) {
-        case '\\':
-            /* Escaped char — the next char is literal */
-            if (pattern[i + SKIP_ONE]) {
-                if (blen < (int)sizeof(buf) - SKIP_ONE) {
-                    buf[blen++] = pattern[i + SKIP_ONE];
-                }
-                i += ST_GLOB_SKIP;
+        if (ch == '\\') {
+            unsigned char next = (unsigned char)pattern[i + SKIP_ONE];
+            if (!next) {
+                break;
+            }
+            if ((next >= '0' && next <= '9') || ((next | 0x20) >= 'a' && (next | 0x20) <= 'z')) {
+                /* \d \w \s \b \1 ...: a class, an anchor or a back-reference */
+                st_hint_flush(buf, &blen, &overflow, out, &count, max_out);
+            } else if (blen < (int)sizeof(buf) - SKIP_ONE) {
+                buf[blen++] = (char)next;
             } else {
+                overflow = true;
+            }
+            i += ST_GLOB_SKIP;
+            continue;
+        }
+        if (ch == '*' || ch == '?' || ch == '{' ||
+            (ch == '+' && pattern[i + SKIP_ONE] && strchr("*?{", pattern[i + SKIP_ONE]) != NULL)) {
+            /* the atom before an optional quantifier may be absent (after an
+             * overflow the buffer holds only a prefix of the run, still literal) */
+            if (blen > 0 && !overflow) {
+                blen--;
+            }
+            st_hint_flush(buf, &blen, &overflow, out, &count, max_out);
+            if (ch == '{') {
+                while (pattern[i] && pattern[i] != '}') {
+                    i++;
+                }
+            }
+            if (pattern[i]) {
                 i++;
             }
-            break;
-        case '.':
-        case '*':
-        case '+':
-        case '?':
-        case '^':
-        case '$':
-        case '(':
-        case ')':
-        case '[':
-        case ']':
-        case '{':
-        case '}':
-            /* Meta character — flush current literal segment */
-            if (blen >= ST_GLOB_MIN_LEN && count < max_out) {
-                buf[blen] = '\0';
-                out[count++] = strdup(buf);
-            }
-            blen = 0;
-            i++;
-            break;
-        default:
-            if (blen < (int)sizeof(buf) - SKIP_ONE) {
-                buf[blen++] = ch;
-            }
-            i++;
-            break;
+            continue;
         }
+        if (ch == '[') {
+            st_hint_flush(buf, &blen, &overflow, out, &count, max_out);
+            i = st_regex_skip_bracket(pattern, i);
+            continue;
+        }
+        if (ch == '(') {
+            st_hint_flush(buf, &blen, &overflow, out, &count, max_out);
+            int depth = 0;
+            while (pattern[i]) {
+                if (pattern[i] == '\\' && pattern[i + SKIP_ONE]) {
+                    i += ST_GLOB_SKIP;
+                    continue;
+                }
+                if (pattern[i] == '[') {
+                    i = st_regex_skip_bracket(pattern, i);
+                    continue;
+                }
+                if (pattern[i] == '(') {
+                    depth++;
+                } else if (pattern[i] == ')' && --depth == 0) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (strchr(".+^$)]}", ch)) {
+            /* '+' keeps its atom: at least one occurrence is required */
+            st_hint_flush(buf, &blen, &overflow, out, &count, max_out);
+            i++;
+            continue;
+        }
+        if (blen < (int)sizeof(buf) - SKIP_ONE) {
+            buf[blen++] = ch;
+        } else {
+            overflow = true;
+        }
+        i++;
     }
-    /* Flush trailing segment */
-    if (blen >= ST_GLOB_MIN_LEN && count < max_out) {
-        buf[blen] = '\0';
-        out[count++] = strdup(buf);
-    }
+    st_hint_flush(buf, &blen, &overflow, out, &count, max_out);
     return count;
 }
 
@@ -7843,6 +7921,103 @@ static void remote_hints_from_regex(remote_search_hints_t *h, const char *patter
     slot[k] = NULL;
 }
 
+/* A Java regex for Neo4j's =~ that keeps every name the POSIX ERE `pattern`
+ * matches anywhere (regexec searches; =~ matches the whole string, hence the
+ * .* wrapper), or NULL when the pattern uses anything whose Java meaning could
+ * differ: POSIX classes or a '[' inside a bracket, a backslash other than an
+ * escaped punctuation mark or \d \D \w \W \s \S, "(?" constructs, "&&", a '{'
+ * not opening a repeat count, non-ASCII bytes (case folding), unbalanced
+ * parentheses. The real regex still runs locally on what comes back. */
+static char *remote_java_regex(const char *pattern, bool case_sensitive) {
+    if (!pattern || !pattern[0]) {
+        return NULL;
+    }
+    size_t len = strlen(pattern);
+    if (len > CBM_SZ_4K) {
+        return NULL;
+    }
+    int depth = 0;
+    bool in_bracket = false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)pattern[i];
+        if (c >= 0x80 || c < 0x20) {
+            return NULL;
+        }
+        if (in_bracket) {
+            if (c == '[' || c == '\\' || (c == '&' && pattern[i + SKIP_ONE] == '&')) {
+                return NULL;
+            }
+            if (c == ']') {
+                in_bracket = false;
+            }
+            continue;
+        }
+        switch (c) {
+        case '\\': {
+            unsigned char n = (unsigned char)pattern[i + SKIP_ONE];
+            bool cls = n && strchr("dDwWsS", n) != NULL;
+            bool punct = n && n < 0x80 && !(n >= '0' && n <= '9') &&
+                         !((n | 0x20) >= 'a' && (n | 0x20) <= 'z');
+            if (!cls && !punct) {
+                return NULL;
+            }
+            i++;
+            break;
+        }
+        case '[':
+            in_bracket = true;
+            if (pattern[i + SKIP_ONE] == '^') {
+                i++;
+            }
+            if (pattern[i + SKIP_ONE] == ']') {
+                i++; /* a leading ']' is a literal member in both */
+            }
+            if (pattern[i + SKIP_ONE] == '[' || pattern[i + SKIP_ONE] == '\0') {
+                return NULL;
+            }
+            break;
+        case '(':
+            if (pattern[i + SKIP_ONE] == '?') {
+                return NULL;
+            }
+            depth++;
+            break;
+        case ')':
+            if (--depth < 0) {
+                return NULL;
+            }
+            break;
+        case '{':
+            if (!(pattern[i + SKIP_ONE] >= '0' && pattern[i + SKIP_ONE] <= '9')) {
+                return NULL;
+            }
+            break;
+        case '*':
+        case '+':
+        case '?':
+        case '}':
+            /* Java reads "x*+" as possessive, which can refuse a match POSIX
+             * finds by backtracking */
+            if (pattern[i + SKIP_ONE] == '+') {
+                return NULL;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    if (depth != 0 || in_bracket) {
+        return NULL;
+    }
+    const char *flags = case_sensitive ? "(?s)" : "(?is)";
+    size_t out_len = strlen(flags) + len + 16;
+    char *out = malloc(out_len);
+    if (out) {
+        snprintf(out, out_len, "%s.*(?:%s).*", flags, pattern);
+    }
+    return out;
+}
+
 /* Literal runs of a LIKE pattern ('%' and '_' are its only wildcards). */
 static void remote_hints_from_like(remote_search_hints_t *h, const char *like, const char **slot) {
     int k = 0;
@@ -7931,6 +8106,8 @@ static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params
     bool name_re_ok = false;
     bool qn_re_ok = false;
     char *file_like = NULL;
+    char *name_java = NULL;
+    char *qn_java = NULL;
     int rc = CBM_STORE_OK;
     int flags = CBM_REG_EXTENDED | CBM_REG_NOSUB | (params->case_sensitive ? 0 : CBM_REG_ICASE);
     if (params->name_pattern) {
@@ -7940,6 +8117,7 @@ static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params
         }
         name_re_ok = true;
         remote_hints_from_regex(&hints, params->name_pattern, hints.name);
+        name_java = remote_java_regex(params->name_pattern, params->case_sensitive);
     }
     if (params->qn_pattern) {
         if (cbm_regcomp(&qn_re, params->qn_pattern, flags) != 0) {
@@ -7949,6 +8127,7 @@ static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params
         }
         qn_re_ok = true;
         remote_hints_from_regex(&hints, params->qn_pattern, hints.qn);
+        qn_java = remote_java_regex(params->qn_pattern, params->case_sensitive);
     }
     if (params->file_pattern) {
         file_like = remote_search_file_like(params->file_pattern);
@@ -7968,6 +8147,8 @@ static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params
         .name_contains_ci = hints.name,
         .qn_contains_ci = hints.qn,
         .file_contains_ci = hints.file,
+        .name_regex = name_java,
+        .qn_regex = qn_java,
         .min_degree = params->min_degree,
         .max_degree = params->max_degree,
         .limit = local_filter ? -1 : limit,
@@ -8013,6 +8194,8 @@ done:
         cbm_regfree(&qn_re);
     }
     free(file_like);
+    free(name_java);
+    free(qn_java);
     for (int i = 0; i < hints.owned_count; i++) {
         free(hints.owned[i]);
     }
@@ -8026,6 +8209,24 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
     if (s->remote_ops) {
         return store_remote_search(s, params, out);
+    }
+    /* Refuse a pattern that does not compile before scanning, with the same
+     * reason the Neo4j path gives (it compiles them up front too); otherwise
+     * SQLite aborts mid-scan and the caller sees "row scan aborted". */
+    const char *const patterns[] = {params->name_pattern, params->qn_pattern};
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        if (!patterns[i]) {
+            continue;
+        }
+        cbm_regex_t probe;
+        int prc = cbm_regcomp(&probe, patterns[i],
+                              CBM_REG_EXTENDED | CBM_REG_NOSUB |
+                                  (params->case_sensitive ? 0 : CBM_REG_ICASE));
+        if (prc != CBM_REG_OK) {
+            store_set_error(s, prc == CBM_REG_ETOOBIG ? CBM_REG_ETOOBIG_REASON : "invalid regex");
+            return CBM_STORE_ERR;
+        }
+        cbm_regfree(&probe);
     }
 
     char sql[CBM_SZ_4K];
@@ -9824,10 +10025,11 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf),
                  "%s AND (n.file_path = ?2 OR n.file_path LIKE ?3) "
-                 "GROUP BY n.id ORDER BY fan_in DESC LIMIT 10",
+                 "GROUP BY n.id ORDER BY fan_in DESC, n.qualified_name LIMIT 10",
                  base);
     } else {
-        snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY n.id ORDER BY fan_in DESC LIMIT 10", base);
+        snprintf(sqlbuf, sizeof(sqlbuf),
+                 "%s GROUP BY n.id ORDER BY fan_in DESC, n.qualified_name LIMIT 10", base);
     }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sqlbuf, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
@@ -10021,10 +10223,16 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     free(nids);
     free(npkgs);
 
-    /* Sort by count descending */
+    /* Sort by count descending, then by (from, to): ties used to keep the
+     * edge-scan order, which follows row ids and so differed between two
+     * indexes of the same code (a Neo4j-backed and a SQLite project). */
     for (int i = SKIP_ONE; i < bn; i++) {
         int j = i;
-        while (j > 0 && bcounts[j] > bcounts[j - SKIP_ONE]) {
+        while (j > 0 && (bcounts[j] > bcounts[j - SKIP_ONE] ||
+                         (bcounts[j] == bcounts[j - SKIP_ONE] &&
+                          (strcmp(bfroms[j], bfroms[j - SKIP_ONE]) < 0 ||
+                           (strcmp(bfroms[j], bfroms[j - SKIP_ONE]) == 0 &&
+                            strcmp(btos[j], btos[j - SKIP_ONE]) < 0))))) {
             int tc = bcounts[j];
             bcounts[j] = bcounts[j - SKIP_ONE];
             bcounts[j - SKIP_ONE] = tc;

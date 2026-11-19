@@ -1370,8 +1370,11 @@ static int try_delta(cbm_neo4j_t *c, sqlite3 *pdb, const char *db_path, const ch
     /* Neo4j must still serve exactly the graph the record describes. */
     cbm_neo4j_result_t r;
     if (run_simple(c,
-                   "MATCH (p:CbmProject {name: $db}) RETURN p.gen, p.generation, "
-                   "coalesce(p.sync_format, 1), p.node_count, p.edge_count",
+                   "MATCH (p:CbmProject {name: $db}) "
+                   "OPTIONAL MATCH (n:CbmNode) WHERE n.db = $db AND n.gen = p.gen "
+                   "AND n.id IS NOT NULL "
+                   "RETURN p.gen, p.generation, coalesce(p.sync_format, 1), p.node_count, "
+                   "p.edge_count, count(n)",
                    project, 0, &r) != 0) {
         (void)snprintf(reason, reason_sz, "could not read the Neo4j project state");
         sqlite3_close(sdb);
@@ -1383,7 +1386,9 @@ static int try_delta(cbm_neo4j_t *c, sqlite3 *pdb, const char *db_path, const ch
                    strcmp(rgen, m.generation) == 0 &&
                    cbm_neo4j_val_int(cbm_neo4j_row_col(row, 2), 1) == N4_SYNC_FORMAT &&
                    cbm_neo4j_val_int(cbm_neo4j_row_col(row, 3), -1) == m.nodes &&
-                   cbm_neo4j_val_int(cbm_neo4j_row_col(row, 4), -1) == m.edges;
+                   cbm_neo4j_val_int(cbm_neo4j_row_col(row, 4), -1) == m.edges &&
+                   /* rows deleted outside this tool: a delta would patch a hole */
+                   cbm_neo4j_val_int(cbm_neo4j_row_col(row, 5), -1) == m.nodes;
     cbm_neo4j_result_free(&r);
     if (!matches) {
         (void)snprintf(reason, reason_sz, "Neo4j graph differs from the last sync record");
@@ -1546,15 +1551,30 @@ int cbm_neo4j_sync_db(cbm_neo4j_t *c, const char *db_path, const char *project,
 static int remote_generation(cbm_neo4j_t *c, const char *project, char *out, size_t out_sz) {
     out[0] = '\0';
     cbm_neo4j_result_t r;
-    if (run_simple(
-            c, "MATCH (p:CbmProject {name: $db}) RETURN p.generation, coalesce(p.sync_format, 1)",
-            project, 0, &r) != 0) {
+    /* The pointer alone does not prove the graph is there: rows deleted (or
+     * the pointer moved) outside this tool leave CbmProject claiming a
+     * generation Neo4j no longer holds. Count its nodes (index-backed, on the
+     * re-index path only) against what the last sync recorded. */
+    if (run_simple(c,
+                   "MATCH (p:CbmProject {name: $db}) "
+                   "OPTIONAL MATCH (n:CbmNode) WHERE n.db = $db AND n.gen = p.gen "
+                   "AND n.id IS NOT NULL "
+                   "RETURN p.generation, coalesce(p.sync_format, 1), p.node_count, count(n)",
+                   project, 0, &r) != 0) {
         return -1;
     }
     yyjson_val *row = yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0));
     yyjson_val *v = cbm_neo4j_row_col(row, 0);
     bool current_format = cbm_neo4j_val_int(cbm_neo4j_row_col(row, 1), 1) >= N4_SYNC_FORMAT;
-    (void)snprintf(out, out_sz, "%s", current_format && yyjson_is_str(v) ? yyjson_get_str(v) : "");
+    int64_t recorded = cbm_neo4j_val_int(cbm_neo4j_row_col(row, 2), -1);
+    int64_t present = cbm_neo4j_val_int(cbm_neo4j_row_col(row, 3), -2);
+    bool complete = recorded > 0 && present == recorded;
+    if (row && !complete) {
+        cbm_log_warn("neo4j.sync", "project", project, "check", "graph_rows", "result",
+                     "missing rows: re-uploading");
+    }
+    (void)snprintf(out, out_sz, "%s",
+                   current_format && complete && yyjson_is_str(v) ? yyjson_get_str(v) : "");
     cbm_neo4j_result_free(&r);
     return 0;
 }
@@ -1640,6 +1660,14 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
         }
         if (result == 0 && up_to_date) {
             g_last_stats.mode = CBM_NEO4J_SYNC_SKIPPED;
+            /* No upload, but the schema indexes are still re-asserted (all IF
+             * NOT EXISTS): an index dropped by hand would otherwise stay gone
+             * until the next source change, and every lookup it served would
+             * scan the label instead. */
+            if (cbm_neo4j_ensure_schema(c) != 0) {
+                cbm_log_warn("neo4j.sync", "project", project, "phase", "ensure_schema", "err",
+                             cbm_neo4j_error(c));
+            }
         }
         if (result == 0 && !up_to_date) {
             char done_gen[N4_GEN_MAX] = "";

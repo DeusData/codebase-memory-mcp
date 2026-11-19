@@ -1246,6 +1246,82 @@ TEST(jlsp_cross_file_basic) {
     PASS();
 }
 
+/* An import names the class by its Java package, but project types carry the
+ * path-derived QN: `new B().run()` across packages must still resolve, with
+ * several run() methods in the project so no name-only fallback can pick it. */
+TEST(jlsp_cross_file_import_maps_to_path_qn) {
+    const char *src = "package com.x.a;\n"
+                      "import com.x.b.B;\n"
+                      "public class A {\n"
+                      "  void viaNew() { new B().run(); }\n"
+                      "  void viaVar() { B b = new B(); b.run(); }\n"
+                      "}\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+
+    CBMLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "proj.src.main.java.com.x.b.B";
+    defs[0].short_name = "B";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "proj.src.main.java.com.x.b.B";
+    defs[1].qualified_name = "proj.src.main.java.com.x.b.B.run";
+    defs[1].short_name = "run";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "proj.src.main.java.com.x.b.B";
+    defs[1].def_module_qn = "proj.src.main.java.com.x.b.B";
+    defs[1].return_types = "int";
+    defs[2].qualified_name = "proj.src.main.java.com.x.c.Other";
+    defs[2].short_name = "Other";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "proj.src.main.java.com.x.c.Other";
+    defs[3].qualified_name = "proj.src.main.java.com.x.c.Other.run";
+    defs[3].short_name = "run";
+    defs[3].label = "Method";
+    defs[3].receiver_type = "proj.src.main.java.com.x.c.Other";
+    defs[3].def_module_qn = "proj.src.main.java.com.x.c.Other";
+    defs[3].return_types = "int";
+
+    /* the AST's Java form and the pipeline's file-node form of one import */
+    static const char *const forms[] = {"com.x.b.B", "proj.src.main.java.com.x.b.B.java.__file__"};
+    for (int f = 0; f < 2; f++) {
+        const char *imp_names[] = {"B"};
+        const char *imp_qns[] = {forms[f]};
+        memset(&out, 0, sizeof(out));
+        cbm_run_java_lsp_cross(&arena, src, (int)strlen(src), "proj.src.main.java.com.x.a.A", defs,
+                               4, imp_names, imp_qns, 1, NULL, &out);
+
+        int via_new = 0;
+        int via_var = 0;
+        for (int i = 0; i < out.count; i++) {
+            const CBMResolvedCall *rc = &out.items[i];
+            if (rc->confidence < 0.5f || !rc->callee_qn || !rc->caller_qn) {
+                continue;
+            }
+            if (strcmp(rc->callee_qn, "proj.src.main.java.com.x.b.B.run") == 0) {
+                via_new |= strstr(rc->caller_qn, "viaNew") != NULL;
+                via_var |= strstr(rc->caller_qn, "viaVar") != NULL;
+            }
+            ASSERT(strstr(rc->callee_qn, "Other") == NULL);
+        }
+        if (!via_new || !via_var) {
+            for (int i = 0; i < out.count; i++) {
+                printf("    %s -> %s [%s %.2f]\n",
+                       out.items[i].caller_qn ? out.items[i].caller_qn : "-",
+                       out.items[i].callee_qn ? out.items[i].callee_qn : "-",
+                       out.items[i].strategy ? out.items[i].strategy : "-",
+                       out.items[i].confidence);
+            }
+        }
+        ASSERT_EQ(via_new, 1);
+        ASSERT_EQ(via_var, 1);
+    }
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Category 25: Java-specific edge cases ──────────────────────── */
 
 TEST(jlsp_objects_requireNonNull) {
@@ -1923,6 +1999,7 @@ void suite_java_lsp(void) {
 
     /* Cross-file */
     RUN_TEST(jlsp_cross_file_basic);
+    RUN_TEST(jlsp_cross_file_import_maps_to_path_qn);
 
     /* Edge cases */
     RUN_TEST(jlsp_objects_requireNonNull);

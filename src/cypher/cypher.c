@@ -496,12 +496,50 @@ static bool match(parser_t *p, cbm_token_type_t type) {
     return false;
 }
 
+/* How a syntax error names a token type the parser wanted. */
+static const char *token_type_desc(cbm_token_type_t type) {
+    static const struct {
+        cbm_token_type_t type;
+        const char *desc;
+    } symbols[] = {
+        {TOK_LPAREN, "'('"},      {TOK_RPAREN, "')'"},      {TOK_LBRACKET, "'['"},
+        {TOK_RBRACKET, "']'"},    {TOK_DASH, "'-'"},        {TOK_GT, "'>'"},
+        {TOK_LT, "'<'"},          {TOK_COLON, "':'"},       {TOK_DOT, "'.'"},
+        {TOK_LBRACE, "'{'"},      {TOK_RBRACE, "'}'"},      {TOK_STAR, "'*'"},
+        {TOK_COMMA, "','"},       {TOK_EQ, "'='"},          {TOK_EQTILDE, "'=~'"},
+        {TOK_GTE, "'>='"},        {TOK_LTE, "'<='"},        {TOK_PIPE, "'|'"},
+        {TOK_DOTDOT, "'..'"},     {TOK_NEQ, "'<>'"},        {TOK_IDENT, "a name"},
+        {TOK_STRING, "a string"}, {TOK_NUMBER, "a number"}, {TOK_EOF, "the end of the query"},
+    };
+    for (size_t i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
+        if (symbols[i].type == type) {
+            return symbols[i].desc;
+        }
+    }
+    for (const kw_entry_t *kw = keywords; kw->name; kw++) {
+        if (kw->type == type) {
+            return kw->name;
+        }
+    }
+    return "another token";
+}
+
 static const cbm_token_t *expect(parser_t *p, cbm_token_type_t type) {
     if (check(p, type)) {
         return advance(p);
     }
-    snprintf(p->error, sizeof(p->error), "expected token type %d, got %d at pos %d", type,
-             peek(p)->type, peek(p)->pos);
+    const cbm_token_t *got = peek(p);
+    if (got->type == TOK_EOF) {
+        snprintf(p->error, sizeof(p->error),
+                 "syntax error: expected %s at position %d but the query ended (query_graph "
+                 "supports a Cypher subset; see the tool description)",
+                 token_type_desc(type), got->pos);
+    } else {
+        snprintf(p->error, sizeof(p->error),
+                 "syntax error: expected %s at position %d but found '%.40s' (query_graph "
+                 "supports a Cypher subset; see the tool description)",
+                 token_type_desc(type), got->pos, got->text ? got->text : "?");
+    }
     return NULL;
 }
 
@@ -885,6 +923,10 @@ static cbm_expr_t *parse_or_expr(parser_t *p);
 /* Multi-arg scalar function support, shared with the RETURN-item parser (#874) */
 static bool is_multiarg_func_call(parser_t *p);
 static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item);
+/* One-argument string functions in WHERE (toLower, toUpper, toString) */
+static bool is_string_func_tok(cbm_token_type_t t);
+static const char *str_func_name(cbm_token_type_t t);
+static int parse_func_arg(parser_t *p, cbm_func_arg_t *arg);
 
 /* Free a multi-arg function argument array. */
 static void func_args_free(cbm_func_arg_t *args, int count) {
@@ -1184,6 +1226,32 @@ enum { COND_LHS_COMPLETE = 1 };
  * Returns CBM_NOT_FOUND on error, 0 when an operator/value should follow, and
  * COND_LHS_COMPLETE when the condition is already complete (label test). */
 static int parse_condition_lhs(parser_t *p, cbm_condition_t *c) {
+    if (is_string_func_tok(peek(p)->type) && p->pos + SKIP_ONE < p->count &&
+        p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
+        /* toLower(n.name) STARTS WITH 'x': a one-argument string function
+         * evaluated like the multi-arg ones (they are lexed as keywords, so
+         * they never reached the function branch below). */
+        const char *fname = str_func_name(peek(p)->type);
+        advance(p);
+        expect(p, TOK_LPAREN);
+        c->args = calloc(1, sizeof(cbm_func_arg_t));
+        if (!c->args) {
+            return CBM_NOT_FOUND;
+        }
+        c->arg_count = 1;
+        if (parse_func_arg(p, &c->args[0]) < 0 || !expect(p, TOK_RPAREN)) {
+            cond_func_fields_free(c);
+            return CBM_NOT_FOUND;
+        }
+        c->func = heap_strdup(fname);
+        if (c->args[0].variable) {
+            c->variable = heap_strdup(c->args[0].variable);
+            if (c->args[0].property) {
+                c->property = heap_strdup(c->args[0].property);
+            }
+        }
+        return 0;
+    }
     if (is_multiarg_func_call(p)) {
         /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
          * Reuse the RETURN-item parser, then move ownership into the condition. */
@@ -1206,8 +1274,8 @@ static int parse_condition_lhs(parser_t *p, cbm_condition_t *c) {
         /* Unrecognised function call in WHERE — fail loudly with the supported
          * set instead of the misleading "unexpected operator" (#874). */
         snprintf(p->error, sizeof(p->error),
-                 "unsupported function '%s' in WHERE (supported: coalesce, substring, replace, "
-                 "left, right)",
+                 "unsupported function '%s' in WHERE (supported: toLower, toUpper, toString, "
+                 "coalesce, substring, replace, left, right)",
                  peek(p)->text);
         return CBM_NOT_FOUND;
     }
@@ -4393,6 +4461,23 @@ static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *ite
                                       size_t bufsz) {
     const char *f = item->func;
     int n = item->arg_count;
+    if (n >= 1 &&
+        (strcmp(f, "toLower") == 0 || strcmp(f, "toUpper") == 0 || strcmp(f, "toString") == 0)) {
+        /* ASCII case mapping, as the RETURN projections of these functions do */
+        const char *s = eval_func_arg(b, &item->args[0]);
+        size_t i = 0;
+        for (; s && s[i] && i + SKIP_ONE < bufsz; i++) {
+            unsigned char ch = (unsigned char)s[i];
+            if (f[2] == 'L') {
+                ch = (unsigned char)tolower(ch);
+            } else if (f[2] == 'U') {
+                ch = (unsigned char)toupper(ch);
+            }
+            buf[i] = (char)ch;
+        }
+        buf[i] = '\0';
+        return buf;
+    }
     if (strcmp(f, "coalesce") == 0) {
         for (int i = 0; i < n; i++) {
             const char *v = eval_func_arg(b, &item->args[i]);

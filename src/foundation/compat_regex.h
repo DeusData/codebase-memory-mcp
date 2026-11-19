@@ -48,6 +48,10 @@ enum {
     CBM_REGEX_COMPILE_BUDGET_UNITS = CBM_SZ_32K
 };
 
+/* \d \D \w \W \s \S rewritten as POSIX classes (cbm_regcomp applies it).
+ * Returns a malloc'd pattern, or NULL when the pattern needs no rewrite. */
+char *cbm_regex_translate_perl_classes(const char *pattern);
+
 /* ── Types ────────────────────────────────────────────────────── */
 
 /* Opaque regex handle — sized to hold the platform's regex_t. */

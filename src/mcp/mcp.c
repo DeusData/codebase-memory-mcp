@@ -4111,6 +4111,16 @@ static sqlite3_destructor_type mcp_sqlite_transient(void) {
 }
 #define MCP_SQLITE_TRANSIENT (mcp_sqlite_transient())
 
+/* A byte FTS5 accepts in a bareword: ASCII letters, digits, '_', and every
+ * byte of a non-ASCII UTF-8 character (the unicode61 tokenizer folds and
+ * splits those itself). Dropping non-ASCII bytes turned "unicode_fn" spelled
+ * with accents into "n OR code_fn", which matches nothing. Quotes, operators
+ * and parentheses stay out, so a query still cannot inject FTS5 syntax. */
+static bool bm25_token_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c >= 0x80;
+}
+
 static int bm25_build_match(const char *query, char *out, size_t out_size) {
     if (!query || !out || out_size < BM25_MIN_BUF) {
         return 0;
@@ -4119,16 +4129,14 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
     int tokens = 0;
     const char *p = query;
     while (*p) {
-        while (*p && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                       (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && !bm25_token_byte((unsigned char)*p)) {
             p++;
         }
         if (!*p) {
             break;
         }
         const char *tok_start = p;
-        while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                      (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && bm25_token_byte((unsigned char)*p)) {
             p++;
         }
         size_t tok_len = (size_t)(p - tok_start);
@@ -6246,13 +6254,15 @@ static void query_graph_native_failed(cbm_cypher_result_t *result, const char *w
     result->error = heap_strdup(msg);
 }
 
-/* Rows the engine can pull from Neo4j and filter within its budget: a whole
- * scan streams about 40k nodes/s over HTTP (817k nodes in 20 s), and matching
- * relationships from each start node costs far more per row. A start scan
- * above these limits cannot finish in MCP_QUERY_ENGINE_REMOTE_BUDGET_MS, so
- * waiting for the engine only delays Neo4j's answer. */
-#define QG_PREDICT_SCAN_ROWS 350000
-#define QG_PREDICT_EXPAND_ROWS 100000
+/* Start rows above which Neo4j answers at once. A whole scan streams about
+ * 40k nodes/s over HTTP (817k nodes in 20 s), and matching relationships from
+ * each start node costs far more per row, while Neo4j answers the same scoped
+ * query from its indexes in well under a second (BATCH-SRVC, 189k Methods:
+ * count in 0.07 s natively, 5 s through the engine). So the limits are about
+ * one second of engine streaming, not the whole budget: past them waiting for
+ * the engine only delays an answer Neo4j gives at once. */
+#define QG_PREDICT_SCAN_ROWS 50000
+#define QG_PREDICT_EXPAND_ROWS 25000
 
 static uint64_t qg_native_memo_key(const char *project, const char *query, const char *generation) {
     uint64_t k = query_graph_params_hash(project, query, generation);
@@ -6476,6 +6486,10 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         char native_db_path[CBM_SZ_1K];
         project_db_path(effective_project, native_db_path, sizeof(native_db_path));
         rc = cbm_neo4j_native_query(native_db_path, effective_project, query, 0, &result);
+        if (rc == 0 && store && cbm_store_is_remote(store)) {
+            /* answered in Neo4j: the reply's graph_backend footer says so */
+            cbm_store_note_remote_queries(store, 1);
+        }
     } else if (cbm_store_is_remote(store) && !missed_graph && effective_project) {
         /* Neo4j-backed: the engine reads the graph over HTTP, so a query that
          * touches much of it (a full count, an aggregation, a hub's callers)
@@ -10235,6 +10249,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
     depth = clamp_mcp_depth(depth, "trace_call_path");
+    if (depth < 1) {
+        /* The schema's minimum. Depth 0 walked no hop and answered "no
+         * callers, no callees" for any function: clamp it like the maximum. */
+        depth = 1;
+    }
     /* Per-direction node budget for the BFS working set. The old fixed
      * MCP_BFS_LIMIT silently truncated hub traces at 100 nodes with no
      * signal; now the limit is a documented parameter and hitting it emits

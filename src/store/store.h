@@ -411,6 +411,12 @@ typedef struct {
     const char *const *name_contains_ci; /* NULL-terminated literals, all required */
     const char *const *qn_contains_ci;
     const char *const *file_contains_ci;
+    /* Java-regex pre-filters (Cypher =~, whole-string), or NULL: built only
+     * for patterns whose Java and POSIX meanings agree, so they never drop a
+     * row the real (local) regex keeps; they spare shipping every candidate
+     * of a weak literal hint. */
+    const char *name_regex;
+    const char *qn_regex;
     int min_degree; /* -1 = none; degree = in + out over the search edge types */
     int max_degree;
     int limit; /* < 0: every match, unpaged */

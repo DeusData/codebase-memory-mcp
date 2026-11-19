@@ -1604,6 +1604,78 @@ TEST(store_glob_to_like_question_marks) {
 
 /* ── ExtractLikeHints edge cases ───────────────────────────────── */
 
+/* Every hint must be a substring of every match: bracket expressions, groups,
+ * class escapes and optional atoms contribute nothing. */
+TEST(store_extract_like_hints_regex_syntax) {
+    char *hints[16];
+    int n;
+
+    /* [a-z]+ is a class, not the literal "a-z" */
+    n = cbm_extract_like_hints("^unused_[a-z]+$", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "unused_");
+    free(hints[0]);
+    n = cbm_extract_like_hints("[a-z]+_helper", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "_helper");
+    free(hints[0]);
+    n = cbm_extract_like_hints("x[]abc]yz", hints, 16);
+    ASSERT_EQ(n, 0);
+    n = cbm_extract_like_hints("[[:alpha:]]+Service", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "Service");
+    free(hints[0]);
+
+    /* \d is a digit class, not the letter d */
+    n = cbm_extract_like_hints("^fn\\d+$", hints, 16);
+    ASSERT_EQ(n, 0);
+    n = cbm_extract_like_hints("helper\\d", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "helper");
+    free(hints[0]);
+
+    /* the atom before ? * {m,n} may be absent */
+    n = cbm_extract_like_hints("colou?r_name", hints, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(hints[0], "colo");
+    ASSERT_STR_EQ(hints[1], "r_name");
+    free(hints[0]);
+    free(hints[1]);
+    n = cbm_extract_like_hints("abcd*", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "abc");
+    free(hints[0]);
+    n = cbm_extract_like_hints("abcd{0,2}", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "abc");
+    free(hints[0]);
+    n = cbm_extract_like_hints("abcd+?", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "abc");
+    free(hints[0]);
+    n = cbm_extract_like_hints("abcd+", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "abcd");
+    free(hints[0]);
+
+    /* groups (possibly optional) contribute nothing */
+    n = cbm_extract_like_hints("(handler)?Request", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "Request");
+    free(hints[0]);
+    n = cbm_extract_like_hints("(?i)handler", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "handler");
+    free(hints[0]);
+
+    /* escaped punctuation stays literal */
+    n = cbm_extract_like_hints("a\\.b\\.c", hints, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(hints[0], "a.b.c");
+    free(hints[0]);
+    PASS();
+}
+
 TEST(store_extract_like_hints_null_out) {
     /* NULL out array */
     int n = cbm_extract_like_hints(".*handler.*", NULL, 16);
@@ -2123,6 +2195,7 @@ SUITE(store_search) {
     RUN_TEST(store_glob_to_like_consecutive_doublestar);
     RUN_TEST(store_glob_to_like_dot_and_brackets);
     RUN_TEST(store_glob_to_like_question_marks);
+    RUN_TEST(store_extract_like_hints_regex_syntax);
     RUN_TEST(store_extract_like_hints_null_out);
     RUN_TEST(store_extract_like_hints_zero_max);
     RUN_TEST(store_extract_like_hints_alternation_complex);

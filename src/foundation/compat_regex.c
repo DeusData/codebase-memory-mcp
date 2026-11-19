@@ -14,7 +14,111 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* ── Perl class escapes ───────────────────────────────────────────
+ *
+ * Callers (and the agents behind them) write \d, \w, \s and their negations,
+ * but POSIX ERE has no \d at all: glibc reads "fn\d+" as "fn" then the letter
+ * 'd', and a search for numbered names silently found nothing. Rewrite the six
+ * escapes into POSIX classes before compiling; every other byte, escapes
+ * included, passes through. Inside a bracket expression a backslash is
+ * literal in POSIX, but "[\d_]" is only ever meant one way, so the class is
+ * spliced in there too. Returns a malloc'd pattern, or NULL when nothing
+ * needed rewriting (or on allocation failure: the original then compiles as
+ * before). */
+static const char *regex_class_escape(char c, bool in_bracket) {
+    switch (c) {
+    case 'd':
+        return in_bracket ? "0-9" : "[0-9]";
+    case 'D':
+        return in_bracket ? NULL : "[^0-9]";
+    case 'w':
+        return in_bracket ? "[:alnum:]_" : "[[:alnum:]_]";
+    case 'W':
+        return in_bracket ? NULL : "[^[:alnum:]_]";
+    case 's':
+        return in_bracket ? "[:space:]" : "[[:space:]]";
+    case 'S':
+        return in_bracket ? NULL : "[^[:space:]]";
+    default:
+        return NULL;
+    }
+}
+
+char *cbm_regex_translate_perl_classes(const char *pattern) {
+    if (!pattern || !strchr(pattern, '\\')) {
+        return NULL;
+    }
+    size_t len = strlen(pattern);
+    /* each 2-byte escape grows to at most 13 bytes */
+    char *out = malloc(len * 7 + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t o = 0;
+    bool changed = false;
+    bool in_bracket = false;
+    for (size_t i = 0; i < len; i++) {
+        char c = pattern[i];
+        if (!in_bracket && c == '[') {
+            in_bracket = true;
+            out[o++] = c;
+            /* a ']' right after '[' or '[^' is a literal member */
+            if (pattern[i + 1] == '^') {
+                out[o++] = pattern[++i];
+            }
+            if (pattern[i + 1] == ']') {
+                out[o++] = pattern[++i];
+            }
+            continue;
+        }
+        if (in_bracket) {
+            if (c == '[' &&
+                (pattern[i + 1] == ':' || pattern[i + 1] == '=' || pattern[i + 1] == '.')) {
+                /* [:class:] [=e=] [.c.]: copy through to the closing pair */
+                char close = pattern[i + 1];
+                out[o++] = pattern[i++];
+                out[o++] = pattern[i++];
+                while (i < len && !(pattern[i] == close && pattern[i + 1] == ']')) {
+                    out[o++] = pattern[i++];
+                }
+                if (i < len) {
+                    out[o++] = pattern[i++];
+                    out[o++] = pattern[i];
+                }
+                continue;
+            }
+            if (c == ']') {
+                in_bracket = false;
+                out[o++] = c;
+                continue;
+            }
+        }
+        if (c == '\\' && i + 1 < len) {
+            const char *cls = regex_class_escape(pattern[i + 1], in_bracket);
+            if (cls) {
+                size_t n = strlen(cls);
+                memcpy(out + o, cls, n);
+                o += n;
+                i++;
+                changed = true;
+                continue;
+            }
+            out[o++] = c;
+            out[o++] = pattern[++i];
+            continue;
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    if (!changed) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
 
 /* ── Compile-size guard (shared by both backends) ─────────────────
  *
@@ -273,12 +377,16 @@ static int translate_flags_tre(int flags) {
 }
 
 int cbm_regcomp(cbm_regex_t *r, const char *pattern, int flags) {
-    int refused = regex_compile_guard(pattern, flags);
+    char *translated = cbm_regex_translate_perl_classes(pattern);
+    const char *use = translated ? translated : pattern;
+    int refused = regex_compile_guard(use, flags);
     if (refused != CBM_REG_OK) {
+        free(translated);
         return refused;
     }
     regex_t *re = (regex_t *)r->opaque;
-    int rc = tre_regcomp(re, pattern, translate_flags_tre(flags));
+    int rc = tre_regcomp(re, use, translate_flags_tre(flags));
+    free(translated);
     return rc == 0 ? CBM_REG_OK : rc;
 }
 
@@ -334,12 +442,16 @@ static int translate_flags(int flags) {
 }
 
 int cbm_regcomp(cbm_regex_t *r, const char *pattern, int flags) {
-    int refused = regex_compile_guard(pattern, flags);
+    char *translated = cbm_regex_translate_perl_classes(pattern);
+    const char *use = translated ? translated : pattern;
+    int refused = regex_compile_guard(use, flags);
     if (refused != CBM_REG_OK) {
+        free(translated);
         return refused;
     }
     regex_t *re = (regex_t *)r->opaque;
-    int rc = regcomp(re, pattern, translate_flags(flags));
+    int rc = regcomp(re, use, translate_flags(flags));
+    free(translated);
     return rc == 0 ? CBM_REG_OK : rc;
 }
 

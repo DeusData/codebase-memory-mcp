@@ -1678,10 +1678,12 @@ static const char k_search_where[] =
     "AND all(h IN $name_hints WHERE toLower(n.name) CONTAINS toLower(h)) "
     "AND all(h IN $qn_hints WHERE toLower(n.qualified_name) CONTAINS toLower(h)) "
     "AND all(h IN $file_hints WHERE toLower(coalesce(n.file_path, '')) CONTAINS toLower(h)) "
+    "AND ($name_re IS NULL OR n.name =~ $name_re) "
+    "AND ($qn_re IS NULL OR n.qualified_name =~ $qn_re) "
     "AND ($kind IS NULL OR n.kind = $kind) "
     "AND ($ns IS NULL OR (size(split(coalesce(n.obj_key, ''), '/')) >= 4 "
     "     AND toLower(split(n.obj_key, '/')[2]) = toLower($ns))) "
-    "AND ($rel IS NULL OR size([(n)-[r]-() WHERE r.type = $rel | 1]) > 0) "
+    "AND %s "
     "AND (NOT $exclude_entry_points OR NOT ("
     "     size([(n)<-[c]-() WHERE c.type = 'CALLS' | 1]) = 0 AND "
     "     size([(n)-[c]->() WHERE c.type = 'CALLS' | 1]) > 0)) "
@@ -1690,6 +1692,27 @@ static const char k_search_where[] =
     "WHERE ($min_degree < 0 OR in_deg + out_deg >= $min_degree) "
     "AND ($max_degree < 0 OR in_deg + out_deg <= $max_degree) ";
 
+/* The relationship filter of k_search_where. A plain identifier is spelled
+ * into an EXISTS over that relationship TYPE, which Neo4j answers from the
+ * node's typed relationship chains (BATCH-SRVC, IMPLEMENTS over 364k nodes:
+ * 0.19 s, against 1.98 s reading the type property of every relationship);
+ * anything else keeps the parameterised property test. */
+static void search_rel_clause(const char *rel, char *out, size_t out_sz) {
+    if (!rel || !rel[0]) {
+        (void)snprintf(out, out_sz, "true");
+        return;
+    }
+    bool ident = (rel[0] == '_' || ((rel[0] | 0x20) >= 'a' && (rel[0] | 0x20) <= 'z'));
+    for (const char *c = rel; ident && *c; c++) {
+        ident = *c == '_' || (*c >= '0' && *c <= '9') || ((*c | 0x20) >= 'a' && (*c | 0x20) <= 'z');
+    }
+    if (ident && strlen(rel) < 64) {
+        (void)snprintf(out, out_sz, "EXISTS { MATCH (n)-[:`%s`]-() }", rel);
+    } else {
+        (void)snprintf(out, out_sz, "size([(n)-[r]-() WHERE r.type = $rel | 1]) > 0");
+    }
+}
+
 static void q_search_params(n4s_q_t *q, const cbm_remote_search_t *s) {
     q_opt_str(q, "project", s->project);
     q_opt_str(q, "label", s->label);
@@ -1697,6 +1720,8 @@ static void q_search_params(n4s_q_t *q, const cbm_remote_search_t *s) {
     q_str_list(q, "name_hints", s->name_contains_ci);
     q_str_list(q, "qn_hints", s->qn_contains_ci);
     q_str_list(q, "file_hints", s->file_contains_ci);
+    q_opt_str(q, "name_re", s->name_regex);
+    q_opt_str(q, "qn_re", s->qn_regex);
     q_opt_str(q, "kind", s->kind);
     q_opt_str(q, "ns", s->namespace_name);
     q_opt_str(q, "rel", s->relationship);
@@ -1713,10 +1738,14 @@ static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_
     *count = 0;
     *total = 0;
     bool paged = s->limit >= 0;
-    char rows_cypher[sizeof(k_search_where) + 256];
+    char rel_clause[128];
+    search_rel_clause(s->relationship, rel_clause, sizeof(rel_clause));
+    char where[sizeof(k_search_where) + 128];
+    (void)snprintf(where, sizeof(where), k_search_where, rel_clause);
+    char rows_cypher[sizeof(where) + 256];
     (void)snprintf(rows_cypher, sizeof(rows_cypher),
                    "%sRETURN " N4S_NODE_COLS("n") ", in_deg, out_deg ORDER BY n.name, n.id%s",
-                   k_search_where, paged ? " SKIP $offset LIMIT $limit" : "");
+                   where, paged ? " SKIP $offset LIMIT $limit" : "");
     cbm_neo4j_batch_t b;
     if (cbm_neo4j_batch_init(&b) != 0) {
         return CBM_STORE_ERR;
@@ -1730,8 +1759,8 @@ static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_
         q_int(&q, "offset", s->offset);
         q_int(&q, "limit", s->limit);
         /* Same filters, counted, in the same transaction. */
-        char count_cypher[sizeof(k_search_where) + 32];
-        (void)snprintf(count_cypher, sizeof(count_cypher), "%sRETURN count(n)", k_search_where);
+        char count_cypher[sizeof(where) + 32];
+        (void)snprintf(count_cypher, sizeof(count_cypher), "%sRETURN count(n)", where);
         yyjson_mut_val *saved = q.params;
         q.params = cbm_neo4j_batch_add(&q.b, count_cypher);
         yyjson_mut_obj_add_strcpy(q.b.doc, q.params, "db", x->db);
@@ -2121,8 +2150,13 @@ static n4s_ctx_t *ctx_open(const char *db_path, const char *project, char *err, 
         op_close(x);
         return NULL;
     }
-    yyjson_mut_val *params =
-        cbm_neo4j_batch_add(&b, "MATCH (p:CbmProject {name: $db}) RETURN p.gen, p.generation");
+    /* The third column proves the published generation still has rows: a graph
+     * deleted (or a pointer moved) behind the tool must be refused, not served
+     * as an empty answer. One index seek (cbm_node_id), at most one row. */
+    yyjson_mut_val *params = cbm_neo4j_batch_add(
+        &b, "MATCH (p:CbmProject {name: $db}) "
+            "OPTIONAL MATCH (n:CbmNode) WHERE n.db = $db AND n.gen = p.gen AND n.id IS NOT NULL "
+            "WITH p, n LIMIT 1 RETURN p.gen, p.generation, n IS NOT NULL");
     yyjson_mut_obj_add_strcpy(b.doc, params, "db", project);
     int run_rc = cbm_neo4j_batch_run(x->c, &b, &r);
     cbm_neo4j_batch_free(&b);
@@ -2140,7 +2174,18 @@ static n4s_ctx_t *ctx_open(const char *db_path, const char *project, char *err, 
     }
     x->gen = cbm_neo4j_val_int(cbm_neo4j_row_col(row, 0), 0);
     char *remote_generation = cbm_neo4j_val_strdup(cbm_neo4j_row_col(row, 1), "");
+    bool has_rows = yyjson_get_bool(cbm_neo4j_row_col(row, 2));
     cbm_neo4j_result_free(&r);
+    if (!has_rows) {
+        free(remote_generation);
+        (void)snprintf(err, err_sz,
+                       "Neo4j holds no graph rows for '%s' at its published generation (the graph "
+                       "was deleted or changed outside this tool); re-run index_repository to "
+                       "upload it again",
+                       project);
+        op_close(x);
+        return NULL;
+    }
 
     /* The local SQLite generation must be the one Neo4j mirrors; otherwise
      * ids from the two would not agree. */

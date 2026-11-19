@@ -496,7 +496,28 @@ struct cbm_index_worker_handle {
     cbm_proc_result_t process_result;
     atomic_bool terminal;
     cbm_index_worker_result_t result;
+    /* index_repository's graph_password, remembered only after it worked */
+    cbm_neo4j_config_t pending_cred;
+    bool has_pending_cred;
 };
+
+/* Remember the request's Neo4j login once the worker reported an index that
+ * published (its graph sync included: a failed sync answers
+ * "graph_sync_failed"). Wipes the pending copy either way. */
+static void worker_remember_credential(cbm_index_worker_handle_t *handle, bool succeeded) {
+    if (!handle->has_pending_cred) {
+        return;
+    }
+    const char *resp = succeeded ? handle->result.response : NULL;
+    if (resp &&
+        (strstr(resp, "\"status\":\"indexed\"") || strstr(resp, "\"status\":\"degraded\"") ||
+         strstr(resp, "\\\"status\\\":\\\"indexed\\\"") ||
+         strstr(resp, "\\\"status\\\":\\\"degraded\\\""))) {
+        cbm_neo4j_config_remember(&handle->pending_cred);
+    }
+    cbm_neo4j_config_wipe(&handle->pending_cred);
+    handle->has_pending_cred = false;
+}
 
 /* The generic subprocess supervisor tails logs in bounded batches to preserve
  * its nonblocking poll contract. A short-lived worker can therefore become
@@ -744,14 +765,19 @@ size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
 
 /* Move index_repository's graph_password out of the worker's argv (visible in
  * the process list) into a CBM_NEO4J_PASSWORD=... environment entry for that
- * child only. The spawning process (the daemon serving later reads) also
- * remembers the credential so it can open the project's Neo4j graph. Returns
- * the args to pass (args_json itself when there is no password, otherwise a
- * malloc'd copy in *owned_args) and fills env_entry (malloc'd, or NULL). */
+ * child only. The credential is resolved into *pending for the spawning
+ * process (the daemon serving later reads) to remember once the worker has
+ * indexed with it (worker_remember_credential): remembering it up front let
+ * one wrong graph_password replace the good login every other project on that
+ * server reads with. Returns the args to pass (args_json itself when there is
+ * no password, otherwise a malloc'd copy in *owned_args) and fills env_entry
+ * (malloc'd, or NULL). */
 static const char *worker_split_graph_password(const char *args_json, char **owned_args,
-                                               char **env_entry) {
+                                               char **env_entry, cbm_neo4j_config_t *pending,
+                                               bool *has_pending) {
     *owned_args = NULL;
     *env_entry = NULL;
+    *has_pending = false;
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     const char *pw = yyjson_get_str(yyjson_obj_get(root, "graph_password"));
@@ -761,14 +787,14 @@ static const char *worker_split_graph_password(const char *args_json, char **own
     }
     const char *uri = yyjson_get_str(yyjson_obj_get(root, "graph_db"));
     if (uri && uri[0]) {
-        cbm_neo4j_config_t cfg;
         char err[CBM_SZ_256];
         if (cbm_neo4j_config_resolve(uri, yyjson_get_str(yyjson_obj_get(root, "graph_user")), pw,
-                                     yyjson_get_str(yyjson_obj_get(root, "graph_database")), &cfg,
-                                     err, sizeof(err)) == 0) {
-            cbm_neo4j_config_remember(&cfg);
+                                     yyjson_get_str(yyjson_obj_get(root, "graph_database")),
+                                     pending, err, sizeof(err)) == 0) {
+            *has_pending = true;
+        } else {
+            cbm_neo4j_config_wipe(pending);
         }
-        cbm_neo4j_config_wipe(&cfg);
     }
     size_t env_len = strlen(CBM_NEO4J_PASSWORD_ENV) + strlen(pw) + 2;
     *env_entry = malloc(env_len);
@@ -858,7 +884,8 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     argv[argc++] = "index_repository";
     char *owned_args = NULL;
     char *password_env = NULL;
-    argv[argc++] = worker_split_graph_password(args_json, &owned_args, &password_env);
+    argv[argc++] = worker_split_graph_password(args_json, &owned_args, &password_env,
+                                               &handle->pending_cred, &handle->has_pending_cred);
     argv[argc++] = "--response-out";
     argv[argc++] = handle->response_path;
     char memory_budget_text[CBM_SZ_32];
@@ -900,6 +927,7 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     free(owned_args);
     worker_free_secret(password_env);
     if (spawn_rc != 0) {
+        worker_remember_credential(handle, false);
         (void)cbm_unlink(handle->response_path);
         (void)cbm_unlink(handle->log_path);
         free(handle);
@@ -980,6 +1008,8 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
                            handle->log_path);
         }
     }
+    worker_remember_credential(handle, worker_result_succeeded(&handle->result) &&
+                                           handle->result.response != NULL);
     (void)cbm_unlink(handle->response_path);
     worker_terminal_log(handle);
     atomic_store_explicit(&handle->terminal, true, memory_order_release);
@@ -1009,6 +1039,7 @@ void cbm_index_worker_destroy(cbm_index_worker_handle_t *handle) {
         return;
     }
     cbm_subprocess_destroy(handle->process);
+    worker_remember_credential(handle, false);
     free(handle->result.response);
     handle->result.response = NULL;
     free(handle);

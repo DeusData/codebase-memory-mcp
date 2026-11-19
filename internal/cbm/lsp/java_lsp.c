@@ -471,6 +471,70 @@ static const CBMType *parse_type_arguments(JavaLSPContext *ctx, TSNode targs_nod
 
 /* ── Type-name resolution (JLS §6.5) ──────────────────────────────── */
 
+/* The registry QN of an imported project type. Project types are registered
+ * under the path-derived QN ("<project>.src.main.java.com.acme.b.B"), but an
+ * import reaches the resolver either as Java text ("com.acme.b.B", from the
+ * AST) or as the defining FILE's node QN ("<project>...b.B.java.__file__",
+ * from the pipeline's import map). Neither named a registered type, so every
+ * method call on `new B()` or a `B`-typed value from another package went
+ * unresolved (the same-package case worked through module_qn).
+ *   file form: the type is <directory of the file>.<short name>;
+ *   Java form: the one type whose QN ends with "." + the import text.
+ * NULL when nothing (or more than one type) matches, or the import already is
+ * a registry QN: the caller then keeps the import text as before. Walks only
+ * the types sharing the short name (indexed). */
+static const char *java_import_registry_qn(JavaLSPContext *ctx, const char *import_qn,
+                                           const char *short_name) {
+    if (!ctx->registry || !import_qn || !short_name ||
+        cbm_registry_lookup_type(ctx->registry, import_qn)) {
+        return NULL;
+    }
+    static const char file_suffix[] = ".__file__";
+    size_t il = strlen(import_qn);
+    size_t fl = sizeof(file_suffix) - 1;
+    if (il > fl && strcmp(import_qn + il - fl, file_suffix) == 0) {
+        /* "<dir>.<Stem>.java.__file__" -> "<dir>.<short_name>" */
+        size_t end = il - fl;
+        int dots = 0;
+        while (end > 0 && dots < 2) {
+            end--;
+            if (import_qn[end] == '.') {
+                dots++;
+            }
+        }
+        if (dots == 2 && end > 0) {
+            const char *cand =
+                cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)end, import_qn, short_name);
+            const CBMRegisteredType *t =
+                cand ? cbm_registry_lookup_type(ctx->registry, cand) : NULL;
+            if (t && t->qualified_name) {
+                return t->qualified_name;
+            }
+        }
+        return NULL;
+    }
+    const char *found = NULL;
+    int matches = 0;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, short_name, &it);
+    int ti;
+    while ((ti = cbm_type_short_iter_next(&it)) >= 0 && matches < 2) {
+        const CBMRegisteredType *t = &it.reg->types[ti];
+        const char *q = t->qualified_name;
+        if (!q || t->alias_of) {
+            continue;
+        }
+        size_t ql = strlen(q);
+        if (ql > il && q[ql - il - 1] == '.' && strcmp(q + ql - il, import_qn) == 0) {
+            if (!found || strcmp(found, q) != 0) {
+                found = q;
+                matches++;
+            }
+        }
+    }
+    return matches == 1 ? found : NULL;
+}
+
 const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     if (!name || !ctx)
         return NULL;
@@ -501,13 +565,29 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         }
     }
 
-    /* 2. Single-type imports. */
-    for (int i = 0; i < ctx->import_count; i++) {
-        if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE)
-            continue;
-        if (strcmp(ctx->import_local_names[i], name) == 0) {
-            return ctx->import_target_qns[i];
+    /* 2. Single-type imports. The same name can be recorded twice (the
+     * pipeline's import map and the AST scan): prefer any entry that maps to
+     * a registered type, else the first entry's text, as before. */
+    {
+        int first = -1;
+        for (int i = 0; i < ctx->import_count; i++) {
+            if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE ||
+                strcmp(ctx->import_local_names[i], name) != 0)
+                continue;
+            if (first < 0)
+                first = i;
+            const char *target = ctx->import_target_qns[i];
+            if (ctx->registry && cbm_registry_lookup_type(ctx->registry, target))
+                return target;
+            const char *mapped = java_import_registry_qn(ctx, target, name);
+            if (mapped) {
+                /* memoize: later lookups in this file skip the mapping */
+                ctx->import_target_qns[i] = mapped;
+                return mapped;
+            }
         }
+        if (first >= 0)
+            return ctx->import_target_qns[first];
     }
 
     /* 3. java.lang auto-import. Try registered first, then the conventional QN. */
