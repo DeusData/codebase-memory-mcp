@@ -291,6 +291,10 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
         cr_str(c, &facts->go_embedded);
         cr_str(c, &facts->class_bindings);
         cr_str(c, &facts->global_names);
+        cr_str(c, &facts->base_kinds);
+        cr_list(c, &facts->mixins);
+        cr_str(c, &facts->mixin_kinds);
+        cr_str(c, &facts->member_rules);
     }
 }
 

@@ -750,6 +750,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->namespace_name =
             src->decl_namespace ? cbm_arena_strdup(arena, src->decl_namespace) : NULL;
     }
+    /* PHP types too, where the extractor recorded it (a file may hold several
+     * namespaces): the member lookup finds a trait by namespace and name. */
+    if (lang == CBM_LANG_PHP && src->decl_namespace && cbm_label_is_type_like(src->label)) {
+        dst->namespace_name = cbm_arena_strdup(arena, src->decl_namespace);
+    }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element
@@ -775,6 +780,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
+    bool raw_bases = !(bs && bs->reg && pxc_lang_resolves_base_qns(lang));
     dst->embedded_types =
         (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
             ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn, src->qualified_name)
@@ -786,6 +792,48 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
             dst->embedded_types && dst->embedded_types[0]
                 ? cbm_arena_sprintf(arena, "%s|%s", dst->embedded_types, facts->go_embedded)
                 : cbm_arena_strdup(arena, facts->go_embedded);
+    }
+    /* Member lookup (member_walk.h): the kind of each supertype, with the
+     * mixins (PHP trait uses) listed after the bases, and the rules of those
+     * uses. Kinds that do not describe exactly the listed entries are left
+     * out: the registrar then knows the ancestry only as unknown. */
+    if (lang != CBM_LANG_GO && raw_bases && facts && (facts->base_kinds || facts->mixins)) {
+        int nb = 0;
+        while (src->base_classes && src->base_classes[nb]) {
+            nb++;
+        }
+        int nm = 0;
+        while (facts->mixins && facts->mixins[nm]) {
+            nm++;
+        }
+        size_t bk = facts->base_kinds ? strlen(facts->base_kinds) : 0;
+        bool more = bk > 0 && facts->base_kinds[bk - 1] == '+';
+        bool kinds_ok = (int)bk - (more ? 1 : 0) == nb &&
+                        (nm == 0 || (facts->mixin_kinds && (int)strlen(facts->mixin_kinds) == nm));
+        const char **all =
+            kinds_ok ? (const char **)cbm_arena_alloc(arena, (size_t)(nb + nm + 1) * sizeof(*all))
+                     : NULL;
+        char *kinds = kinds_ok ? (char *)cbm_arena_alloc(arena, (size_t)(nb + nm + 2)) : NULL;
+        if (all && kinds) {
+            for (int i = 0; i < nb; i++) {
+                all[i] = src->base_classes[i];
+                kinds[i] = facts->base_kinds[i];
+            }
+            for (int i = 0; i < nm; i++) {
+                all[nb + i] = facts->mixins[i];
+                kinds[nb + i] = facts->mixin_kinds[i];
+            }
+            all[nb + nm] = NULL;
+            int nk = nb + nm;
+            if (more) {
+                kinds[nk++] = '+';
+            }
+            kinds[nk] = '\0';
+            dst->embedded_types = pxc_join_pipe(arena, all);
+            dst->supertype_kinds = kinds;
+        }
+        dst->member_rules =
+            facts->member_rules ? cbm_arena_strdup(arena, facts->member_rules) : NULL;
     }
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
@@ -835,6 +883,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         /* Exact impl-block provenance is captured while the Rust impl node is
          * still on hand.  Do not reconstruct it later from leaf names. */
         dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
+        dst->is_abstract = src->is_abstract;
+    }
+    if (lang == CBM_LANG_PHP) {
+        /* A method without a body: a trait's is a requirement to the member
+         * lookup (member_walk.h). */
         dst->is_abstract = src->is_abstract;
     }
     return 0;

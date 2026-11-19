@@ -1687,6 +1687,8 @@ extern void suite_sqlite_writer(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
 extern void suite_php_lsp(void);
+extern void suite_member_walk(void);
+extern void suite_php_member_walk(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
 extern void suite_perl_lsp(void);
@@ -2564,6 +2566,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(go_lsp);
     RUN_SELECTED_SUITE(c_lsp);
     RUN_SELECTED_SUITE(php_lsp);
+    RUN_SELECTED_SUITE(member_walk);
+    RUN_SELECTED_SUITE(php_member_walk);
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
     RUN_SELECTED_SUITE(perl_lsp);
