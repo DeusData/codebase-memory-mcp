@@ -329,7 +329,43 @@ typedef struct {
      * for a defined type `type A B` (its method set is its own) and in every
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
+    /* Go and Python only: the facts the declared-type scope step and the
+     * cross-file registrars read (CBMDefTypeFacts), in the result arena; NULL
+     * for a definition without one and in every other language. One pointer,
+     * so the other languages pay 8 bytes per definition. Tail field:
+     * zero-init stays valid. */
+    const struct CBMDefTypeFacts *type_facts;
 } CBMDefinition;
+
+/* Facts of one Go or Python definition that no graph property carries; only
+ * the cross-file step reads them (src/pipeline/type_scope.h, the Go and
+ * Python cross registrars). Every field is NULL when absent. */
+typedef struct CBMDefTypeFacts {
+    /* The names its type parameter lists declare, '|'-joined: Python PEP 695
+     * (`def f[T, *Ts, **P]`, `class C[T]`), Go (`func F[K, V any]`, a generic
+     * receiver `(s *Set[T])`, `type Box[T any]`). They never name a type of
+     * the project. */
+    const char *type_params;
+    /* Go: the type a package-level `var`/`const` declares, or the type its
+     * single initializer spells (`T{}` is T, `&T{}` and `new(T)` are *T, a
+     * const block's bare spec repeats the previous one's): the Variable's
+     * type in the cross-file LSP (go_lsp.c, package-level values). */
+    const char *value_type;
+    /* Go: the types a struct embeds, '|'-joined as written
+     * ("logging.LogHolder|*Base"): the cross-file LSP promotes their members
+     * and names them as fields (go_lsp.c, embedded-member hook). */
+    const char *go_embedded;
+    /* Python class: the names its body binds other than by a nested def or
+     * class (assignments, annotated assignments with a value, imports,
+     * for/with/except/match targets, walrus, global/nonlocal/del; an
+     * annotation alone binds nothing), '|'-joined. A method annotation naming
+     * one of them means the class attribute, not the module's name. */
+    const char *class_bindings;
+    /* Python function or class: the names its body declares `global` and
+     * binds, '|'-joined. The body rebinds them in the module, so no
+     * annotation of the file names them through the module's other binding. */
+    const char *global_names;
+} CBMDefTypeFacts;
 
 /* extra_props key of a generated member, one the compiler writes and the
  * source never spells: a Java record's implicit accessor carries
@@ -932,6 +968,11 @@ typedef struct CBMFileResult {
     const char **constants;     // NULL-terminated (NULL if none)
     const char **global_vars;   // NULL-terminated (NULL if none)
     const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
+    /* C, C++, CUDA: the repository files the preprocessed pass's #include
+     * lookup read (repository-relative, sorted, NULL-terminated; NULL if none).
+     * The file's graph depends on their bytes as well as its own, so an
+     * incremental refresh re-extracts the file when one of them changes. */
+    const char **included_files;
 
     bool has_error;
     const char *error_msg;
@@ -1280,15 +1321,29 @@ CBMFileResult *cbm_extract_file_ex(
     const CBMReturnTypeTable *return_type_table // OS return types, or NULL
 );
 
+/* The indexed repository as the C-family preprocessed pass's #include lookup
+ * sees it (#2993): `root` is the directory rel_path is relative to, and a
+ * quoted include resolves only to a file is_indexed() accepts -- one of the
+ * files the index run covers -- so the expansion is a function of the indexed
+ * tree alone, never of the process working directory. */
+typedef struct {
+    const char *root;
+    bool (*is_indexed)(const void *userdata, const char *rel_path);
+    const void *userdata;
+} CBMIncludeScope;
+
 /* Additive immutable-snapshot entry point. NULL preserves legacy behavior.
  * Snapshot must outlive this call; returned data is independently result-owned.
  * A non-OK result status is an explicit configured-mapping failure, not a
- * successful empty inventory. error_msg may be NULL on diagnostic OOM. */
+ * successful empty inventory. error_msg may be NULL on diagnostic OOM.
+ * include_scope: where quoted #include names resolve (preprocessor.h); NULL
+ * resolves none. */
 CBMFileResult *cbm_extract_file_ex_with_tests(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
     const char **include_paths, const CBMMacroTable *macro_table,
-    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations);
+    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations,
+    const CBMIncludeScope *include_scope);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);
@@ -1388,6 +1443,9 @@ bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *sou
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_py_namespace_test_capture_fail_after(int successful_allocations);
 void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
+/* Work of building Go structs' embedded-type texts (field-list entries
+ * visited plus spelling bytes): the growth test counts it at three sizes. */
+uint64_t cbm_extract_test_go_embedded_work(void);
 #endif
 
 // Growable array push functions (arena-allocated, no individual free needed).
@@ -1438,6 +1496,11 @@ void cbm_extract_dbt(CBMExtractCtx *ctx);
 // parse past `?>` (#2000). Same length and line breaks as the input; returns
 // `source` itself when nothing needs rewriting. Defined in php_inline_html.c.
 const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int source_len);
+// C-family source with each `\` CR LF line splice rewritten as space `\` LF so
+// the grammars built on tree-sitter-c read it as they read the LF splice
+// (#1546). Same length and line breaks as the input; returns `source` itself
+// when there is no such splice. Defined in cbm.c.
+const char *cbm_c_mask_crlf_splices(CBMArena *arena, const char *source, int source_len);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);

@@ -2416,6 +2416,97 @@ TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
     PASS();
 }
 
+/* IMPORTS edges the Ansible pass drew (via ansible); -1 on a query error. */
+static int ansible_import_edges(cbm_store_t *s, const char *project) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM edges WHERE project=?1 AND type='IMPORTS' AND "
+                           "json_extract(properties,'$.via')='ansible'",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* A playbook extracts no imports of its own: its role and include edges come
+ * from the Ansible pass, so the semantic pass builds its import map from those
+ * IMPORTS edges (the slow path). Those keys were libc copies released through
+ * the memory core, and on macOS, where the core's allocator is not the libc
+ * one, the index worker crashed in the semantic pass on every repository of 50
+ * files or fewer holding a role or an include (any repository at one worker).
+ * Here the memory core's own count binds, whatever the allocator and wherever
+ * the string landed: a block the core takes back without having handed it out
+ * leaves its class below where it started. A first index of the same tree
+ * warms what the process builds once and keeps (the semantic pass's
+ * pretrained token table is one), so the readings are taken around a second,
+ * identical full index and an incremental re-index of the edited playbook
+ * (the incremental route runs the same pass for changed files): the verdict
+ * does not depend on what ran before in the process. */
+TEST(pipeline_semantic_import_map_keys_come_from_the_memory_core) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "site.yml",
+                    "- hosts: localhost\n  roles:\n    - web\n  tasks:\n"
+                    "    - include_tasks: tasks/setup.yml\n");
+    write_temp_file(g_tmpdir, "roles/web/tasks/main.yml",
+                    "- name: Say hi\n  debug:\n    msg: hi\n");
+    write_temp_file(g_tmpdir, "tasks/setup.yml", "- name: Setup\n  debug:\n    msg: setup\n");
+    char warm_path[512];
+    snprintf(warm_path, sizeof(warm_path), "%s/semantic_keys_warm.db", g_tmpdir);
+    int warm_rc = -1;
+    cbm_pipeline_t *warm = cbm_pipeline_new(g_tmpdir, warm_path, CBM_MODE_FULL);
+    if (warm) {
+        warm_rc = cbm_pipeline_run(warm);
+        cbm_pipeline_free(warm);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/semantic_keys.db", g_tmpdir);
+
+    cbm_mem_class_flush_thread();
+    size_t blocks_before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_SEMANTIC);
+    size_t bytes_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+    int full_rc = -1;
+    int incr_rc = -1;
+    int imports = -1;
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    if (p1) {
+        full_rc = cbm_pipeline_run(p1);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        if (s) {
+            imports = ansible_import_edges(s, cbm_pipeline_project_name(p1));
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p1);
+    }
+    write_temp_file(g_tmpdir, "site.yml",
+                    "- hosts: localhost\n  roles:\n    - web\n  tasks:\n"
+                    "    - include_tasks: tasks/setup.yml\n    - debug:\n        msg: edited\n");
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    if (p2) {
+        incr_rc = cbm_pipeline_run(p2);
+        cbm_pipeline_free(p2);
+    }
+    cbm_mem_class_flush_thread();
+    size_t blocks_after = cbm_mem_class_live_blocks(CBM_MEM_CLASS_SEMANTIC);
+    size_t bytes_after = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+    teardown_test_repo();
+
+    ASSERT_EQ(warm_rc, 0);
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(incr_rc, 0);
+    /* The playbook's role and include are the IMPORTS edges the slow path reads. */
+    ASSERT_TRUE(imports >= 2);
+    /* Every SEMANTIC block taken back was handed out: the class is where it began. */
+    ASSERT_TRUE(blocks_after == blocks_before);
+    ASSERT_TRUE(bytes_after == bytes_before);
+    PASS();
+}
+
 /* The CALLS edges an Ansible notify draws (via notify); -1 on a query error. */
 static int ansible_notify_calls(cbm_store_t *s, const char *project) {
     sqlite3_stmt *st = NULL;
@@ -32548,7 +32639,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":4,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":5,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -32679,24 +32770,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"v\":4,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"v\":5,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -32716,7 +32807,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":4,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":5,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -32744,7 +32835,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":4,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":5,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -32837,7 +32928,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             /* The row is the versioned codec envelope (codec version 4) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -35421,7 +35512,399 @@ TEST(pipeline_inc_c_family_fragments) {
     th_rmtree(tmp);
     PASS();
 }
+
+/* ── C/C++ #include lookup against the indexed repository root (#2993) ── */
+
+#ifdef _WIN32
+#include <direct.h>
+#define inc_root_chdir _chdir
+#define inc_root_getcwd _getcwd
+#else
+#define inc_root_chdir chdir
+#define inc_root_getcwd getcwd
+#endif
+
+/* Index `root` into `db` with the process working directory set to `cwd`, and
+ * restore the working directory afterwards. */
+static int inc_root_index_from(const char *root, const char *db, const char *cwd) {
+    char saved[CBM_SZ_4K];
+    if (!inc_root_getcwd(saved, sizeof(saved)) || inc_root_chdir(cwd) != 0) {
+        return -1;
+    }
+    int rc = -1;
+    cbm_pipeline_t *p = cbm_pipeline_new(root, db, CBM_MODE_FULL);
+    if (p) {
+        (void)cbm_pipeline_set_project_name(p, "incroot");
+        cbm_pipeline_set_persistence(p, false);
+        rc = cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    if (inc_root_chdir(saved) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+/* One FNV-1a digest over every node and edge row of the graph, in sorted
+ * order: two graphs with the same digest and row count are the same graph. */
+static uint64_t inc_root_graph_digest(const char *db_path, int *rows) {
+    static const char *const queries[] = {
+        "SELECT label||'|'||qualified_name||'|'||file_path||'|'||start_line||'|'||end_line||'|'||"
+        "properties FROM nodes ORDER BY 1",
+        "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||e.properties FROM edges "
+        "e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id ORDER BY 1",
+    };
+    uint64_t h = 1469598103934665603ULL;
+    *rows = 0;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        for (size_t q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
+            sqlite3_stmt *stmt = NULL;
+            if (sqlite3_prepare_v2(db, queries[q], -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const unsigned char *row = sqlite3_column_text(stmt, 0);
+                    for (const unsigned char *c = row ? row : (const unsigned char *)""; *c; c++) {
+                        h = (h ^ *c) * 1099511628211ULL;
+                    }
+                    h = (h ^ 0xffU) * 1099511628211ULL;
+                    (*rows)++;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    sqlite3_close(db);
+    return h;
+}
+
+/* CALLS edges from the function named `from` to the Function named `to`. */
+static int inc_root_calls(const char *db, const char *from, const char *to) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+             "t.id=e.target_id WHERE e.type='CALLS' AND s.name='%s' AND t.name='%s' AND "
+             "t.label='Function'",
+             from, to);
+    return k8s_inc_count(db, sql);
+}
+
+/* #2993: the graph depended on the directory the indexer was started from:
+ * a quoted #include was looked up relative to the process working directory.
+ * The lookup now resolves against the indexed repository root. The same
+ * fixture, indexed from an empty directory, from a directory holding a
+ * different lib/m.h, and from the repository root, gives one graph, in which
+ * the macro of the repository's own lib/m.h expands to a call that resolves
+ * to its in-tree target. */
+TEST(pipeline_c_include_lookup_uses_repo_root) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incroot_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    char empty[512];
+    char other[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    snprintf(empty, sizeof(empty), "%s/empty", tmp);
+    snprintf(other, sizeof(other), "%s/other", tmp);
+    write_temp_file(root, "lib/a.c",
+                    "#define A_C_LOCAL 1\n"
+                    "#include \"m.h\"\n"
+                    "\n"
+                    "void caller(int v) {\n"
+                    "    DO_WORK(v);\n"
+                    "}\n");
+    write_temp_file(root, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) real_target(x)\n#endif\n");
+    write_temp_file(root, "lib/t.c",
+                    "void real_target(int x) { (void)x; }\n"
+                    "void other_target(int x) { (void)x; }\n");
+    write_temp_file(other, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) other_target(x)\n#endif\n");
+    ASSERT(cbm_mkdir_p(empty, 0755));
+
+    const char *cwds[] = {empty, other, root};
+    enum { RUNS = sizeof(cwds) / sizeof(cwds[0]) };
+    int rc[RUNS];
+    int rows[RUNS];
+    int real[RUNS];
+    int stray[RUNS];
+    uint64_t digest[RUNS];
+    for (int i = 0; i < RUNS; i++) {
+        char db[512];
+        snprintf(db, sizeof(db), "%s/graph%d.db", tmp, i);
+        rc[i] = inc_root_index_from(root, db, cwds[i]);
+        digest[i] = inc_root_graph_digest(db, &rows[i]);
+        real[i] = inc_root_calls(db, "caller", "real_target");
+        stray[i] = inc_root_calls(db, "caller", "other_target");
+    }
+    th_rmtree(tmp);
+    for (int i = 0; i < RUNS; i++) {
+        ASSERT_EQ(rc[i], 0);
+        ASSERT_GT(rows[i], 0);
+        ASSERT_EQ(real[i], 1);
+        ASSERT_EQ(stray[i], 0);
+        ASSERT_EQ(rows[i], rows[0]);
+        ASSERT(digest[i] == digest[0]);
+    }
+    PASS();
+}
+
+/* #2993: simplecpp discards a file's whole expansion when it stops at #error.
+ * An #error reached inside an included header must not cost the file its
+ * expansion: the file keeps its expansion without includes, so the call its
+ * own macro expands to survives. Indexed from the repository root, where the
+ * header is found whichever way the lookup is made. */
+TEST(pipeline_c_include_error_keeps_expansion_without_includes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incerr_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    write_temp_file(root, "cfg.h",
+                    "#ifndef CFG_H\n"
+                    "#define CFG_H\n"
+                    "#ifndef CFG_CONFIGURED\n"
+                    "#error \"configure first\"\n"
+                    "#endif\n"
+                    "#endif\n");
+    write_temp_file(root, "z.c",
+                    "#include \"cfg.h\"\n"
+                    "#define RUN_STEP(x) step_target(x)\n"
+                    "\n"
+                    "int z_entry(int v) {\n"
+                    "    RUN_STEP(v);\n"
+                    "    return v;\n"
+                    "}\n");
+    write_temp_file(root, "steps.c", "void step_target(int x) { (void)x; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    int rc = inc_root_index_from(root, db, root);
+    int step_calls = inc_root_calls(db, "z_entry", "step_target");
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(step_calls, 1);
+    PASS();
+}
+
+/* #2993: an included header's body is the header's own -- indexed as its own
+ * file, with its own lines. The includer's expansion holds only the
+ * includer's tokens (the header's macros still shape them), so a call or a
+ * write inside a header's inline function is never one of the includer's
+ * edges, and no edge of the includer carries a line past the includer's last
+ * line. Indexed from the repository root, where the header is found whichever
+ * way the lookup is made. */
+TEST(pipeline_c_header_body_stays_with_the_header) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_inchdr_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    char header[2048];
+    int used = snprintf(header, sizeof(header), "#ifndef OPS_H\n#define OPS_H\n");
+    for (int i = 0; i < 24; i++) {
+        used += snprintf(header + used, sizeof(header) - (size_t)used, "/* line %d */\n", i);
+    }
+    snprintf(header + used, sizeof(header) - (size_t)used,
+             "extern int header_counter;\n"
+             "static inline int ops_inline(int v) {\n"
+             "    header_counter = v;\n"
+             "    return header_only_callee(v);\n"
+             "}\n"
+             "#endif\n");
+    write_temp_file(root, "ops.h", header);
+    /* user.c is 6 lines long. */
+    write_temp_file(root, "user.c",
+                    "#include \"ops.h\"\n"
+                    "#define USER_FLAG 1\n"
+                    "\n"
+                    "int user_fn(int v) {\n"
+                    "    return main_only_callee(v);\n"
+                    "}\n");
+    write_temp_file(root, "callees.c",
+                    "int header_counter;\n"
+                    "int header_only_callee(int v) { return v; }\n"
+                    "int main_only_callee(int v) { return v; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    int rc = inc_root_index_from(root, db, root);
+    int from_user = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type IN ('CALLS','USAGE','WRITES') AND "
+            "s.file_path='user.c' AND t.name IN ('header_only_callee','header_counter')");
+    int past_end = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE e.type IN "
+            "('CALLS','USAGE') AND s.file_path='user.c' AND "
+            "CAST(json_extract(e.properties,'$.line') AS INTEGER) > 6");
+    int own_call = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type='CALLS' AND s.file_path='ops.h' AND "
+            "t.name='header_only_callee'");
+    int user_call = inc_root_calls(db, "user_fn", "main_only_callee");
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(from_user, 0);
+    ASSERT_EQ(past_end, 0);
+    ASSERT_GT(own_call, 0);
+    ASSERT_EQ(user_call, 1);
+    PASS();
+}
+
+/* #2993: only a name that denotes a file of the indexed tree resolves. Each
+ * of the three includes of lib/a.c names a header that is not part of the
+ * indexed tree (the third is reached through a symbolic link, which discovery
+ * does not index either), so none of the three macros expands, wherever the
+ * indexer runs; here it runs from the repository root. */
+TEST(pipeline_c_include_lookup_stays_in_repo_root) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incside_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    write_temp_file(tmp, "m_side.h", "#define SIDE_M(x) m_target(x)\n");
+    write_temp_file(tmp, "n_side.h", "#define SIDE_N(x) n_target(x)\n");
+    write_temp_file(tmp, "l_side.h", "#define SIDE_L(x) l_target(x)\n");
+    char source[2048];
+    snprintf(source, sizeof(source),
+             "#define A_LOCAL 1\n"
+             "#include \"../../m_side.h\"\n"
+             "#include \"%s/n_side.h\"\n"
+             "#include \"l_side.h\"\n"
+             "\n"
+             "void caller(int v) {\n"
+             "    SIDE_M(v);\n"
+             "    SIDE_N(v);\n"
+             "    SIDE_L(v);\n"
+             "}\n",
+             tmp);
+    write_temp_file(root, "lib/a.c", source);
+    write_temp_file(root, "lib/t.c",
+                    "void m_target(int x) { (void)x; }\n"
+                    "void n_target(int x) { (void)x; }\n"
+                    "void l_target(int x) { (void)x; }\n");
+#ifndef _WIN32
+    char link_target[512];
+    char link_path[512];
+    snprintf(link_target, sizeof(link_target), "%s/l_side.h", tmp);
+    snprintf(link_path, sizeof(link_path), "%s/lib/l_side.h", root);
+    ASSERT_EQ(symlink(link_target, link_path), 0);
+#endif
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    int rc = inc_root_index_from(root, db, root);
+    static const char *const targets[] = {"m_target", "n_target", "l_target"};
+    int wrong = 0;
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        int n = inc_root_calls(db, "caller", targets[i]);
+        if (n != 0) {
+            printf("  caller -> %s: %d\n", targets[i], n);
+            wrong++;
+        }
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(wrong, 0);
+    PASS();
+}
+
+/* #2993: a C file's graph depends on the in-tree headers its includes read,
+ * so an edit to a header alone changes its includers' graphs. lib/a.c
+ * includes lib/m.h directly, lib/b.c through lib/mid.h; only lib/m.h's macro
+ * changes. The incremental refresh (closure repair) must re-extract both
+ * includers and give the graph a fresh full index gives. 60 filler files take
+ * the fixture past MIN_FILES_FOR_PARALLEL, so the fresh full index resolves
+ * calls on the same parallel path as the repair: the sequential path writes
+ * the same CALLS properties in another key order. */
+TEST(pipeline_c_header_edit_refreshes_includers_incrementally) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_incedit_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char root[512];
+    snprintf(root, sizeof(root), "%s/repo", tmp);
+    write_temp_file(root, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) real_target(x)\n#endif\n");
+    write_temp_file(root, "lib/mid.h", "#ifndef MID_H\n#define MID_H\n#include \"m.h\"\n#endif\n");
+    write_temp_file(root, "lib/a.c",
+                    "#define A_LOCAL 1\n"
+                    "#include \"m.h\"\n"
+                    "\n"
+                    "void caller_a(int v) {\n"
+                    "    DO_WORK(v);\n"
+                    "}\n");
+    write_temp_file(root, "lib/b.c",
+                    "#define B_LOCAL 1\n"
+                    "#include \"mid.h\"\n"
+                    "\n"
+                    "void caller_b(int v) {\n"
+                    "    DO_WORK(v);\n"
+                    "}\n");
+    write_temp_file(root, "lib/t.c",
+                    "void real_target(int x) { (void)x; }\n"
+                    "void other_target(int x) { (void)x; }\n");
+    write_temp_file(root, "lib/u.c", "int unrelated(void) { return 1; }\n");
+    for (int i = 0; i < 60; i++) {
+        char name[64];
+        char body[96];
+        snprintf(name, sizeof(name), "fill/fill_%02d.c", i);
+        snprintf(body, sizeof(body), "int fill_%02d(void) { return %d; }\n", i, i);
+        write_temp_file(root, name, body);
+    }
+    char db[512];
+    char fresh_db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    snprintf(fresh_db, sizeof(fresh_db), "%s/fresh.db", tmp);
+    int rc_full = inc_root_index_from(root, db, root);
+    int before_a = inc_root_calls(db, "caller_a", "real_target");
+
+    write_temp_file(root, "lib/m.h",
+                    "#ifndef M_H\n#define M_H\n#define DO_WORK(x) other_target(x)\n#endif\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    int rc_incr = inc_root_index_from(root, db, root);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int rc_fresh = inc_root_index_from(root, fresh_db, root);
+
+    int incr_rows = 0;
+    int fresh_rows = 0;
+    uint64_t incr_digest = inc_root_graph_digest(db, &incr_rows);
+    uint64_t fresh_digest = inc_root_graph_digest(fresh_db, &fresh_rows);
+    unsigned char incr_content[32] = {0};
+    unsigned char fresh_content[32] = {1};
+    cbm_store_t *incr_store = cbm_store_open_path(db);
+    cbm_store_t *fresh_store = cbm_store_open_path(fresh_db);
+    bool contents_read =
+        incr_store && fresh_store &&
+        cbm_store_graph_content_digest(incr_store, "incroot", incr_content) == CBM_STORE_OK &&
+        cbm_store_graph_content_digest(fresh_store, "incroot", fresh_content) == CBM_STORE_OK;
+    cbm_store_close(incr_store);
+    cbm_store_close(fresh_store);
+    static const char *const callers[] = {"caller_a", "caller_b"};
+    int wrong = 0;
+    for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
+        int now = inc_root_calls(db, callers[i], "other_target");
+        int stale = inc_root_calls(db, callers[i], "real_target");
+        if (now != 1 || stale != 0) {
+            printf("  %s: other_target %d, real_target %d\n", callers[i], now, stale);
+            wrong++;
+        }
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(before_a, 1);
+    ASSERT_EQ(rc_incr, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_fresh, 0);
+    ASSERT_EQ(wrong, 0);
+    ASSERT_EQ(incr_rows, fresh_rows);
+    ASSERT(incr_digest == fresh_digest);
+    ASSERT(contents_read);
+    ASSERT(memcmp(incr_content, fresh_content, sizeof(incr_content)) == 0);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_c_header_edit_refreshes_includers_incrementally);
+    RUN_TEST(pipeline_c_include_lookup_uses_repo_root);
+    RUN_TEST(pipeline_c_include_error_keeps_expansion_without_includes);
+    RUN_TEST(pipeline_c_header_body_stays_with_the_header);
+    RUN_TEST(pipeline_c_include_lookup_stays_in_repo_root);
     RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
@@ -35535,6 +36018,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
     RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
+    RUN_TEST(pipeline_semantic_import_map_keys_come_from_the_memory_core);
     RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
     RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);

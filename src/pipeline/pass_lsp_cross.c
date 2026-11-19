@@ -21,6 +21,7 @@
 #include "resolve_stats.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/type_scope.h"
 #include "callable_sig.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
@@ -648,6 +649,74 @@ static const char *pxc_qn_leaf(const char *name) {
     return leaf;
 }
 
+static bool pxc_go_ident_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c >= 0x80;
+}
+
+/* Whether the '|'-joined name list holds exactly `name[0..len)`. */
+static bool pxc_pipe_list_has(const char *list, const char *name, size_t len) {
+    for (const char *p = list; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t n = bar ? (size_t)(bar - p) : strlen(p);
+        if (n == len && memcmp(p, name, len) == 0) {
+            return true;
+        }
+        p = bar ? bar + 1 : p + n;
+    }
+    return false;
+}
+
+/* A Go type text with every bare identifier that names one of the
+ * definition's type parameters (`T` in `[]T`, `map[K]V`, `func(T) T`, not the
+ * `T` of `pkg.T`) spelled `any`: the registrars then type it as nothing of the
+ * project instead of the package's own type of that name. The text itself,
+ * unchanged, when it names none. */
+static const char *pxc_go_mask_type_params(CBMArena *arena, const char *text, const char *params) {
+    if (!text || !text[0] || !params || !params[0]) {
+        return text;
+    }
+    size_t n = strlen(text);
+    char *out = NULL;
+    size_t at = 0;
+    for (size_t i = 0; i < n;) {
+        if (!pxc_go_ident_byte((unsigned char)text[i])) {
+            if (out) {
+                out[at++] = text[i];
+            }
+            i++;
+            continue;
+        }
+        size_t start = i; /* a whole identifier, qualified (`pkg.T`) or bare */
+        while (i < n && pxc_go_ident_byte((unsigned char)text[i])) {
+            i++;
+        }
+        bool param = (start == 0 || text[start - 1] != '.') &&
+                     pxc_pipe_list_has(params, text + start, i - start);
+        if (param && !out) {
+            /* Worst case: every byte a one-byte parameter, 3 bytes each. */
+            out = (char *)cbm_arena_alloc(arena, n * 3 + 1);
+            if (!out) {
+                return text;
+            }
+            memcpy(out, text, start);
+            at = start;
+        }
+        if (param) {
+            memcpy(out + at, "any", 3);
+            at += 3;
+        } else if (out) {
+            memcpy(out + at, text + start, i - start);
+            at += i - start;
+        }
+    }
+    if (!out) {
+        return text;
+    }
+    out[at] = '\0';
+    return out;
+}
+
 /* Convert one CBMDefinition into a CBMLSPDef. Returns 0 on success, -1
  * to skip (unsupported label or missing required field). dst gets borrowed
  * pointers into src and into `arena` for synthesised composites. */
@@ -693,6 +762,12 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     } else {
         dst->return_types = src->return_type ? cbm_arena_strdup(arena, src->return_type) : NULL;
     }
+    const CBMDefTypeFacts *facts = src->type_facts;
+    if (lang == CBM_LANG_GO && !dst->return_types && facts && facts->value_type) {
+        /* A Go package-level value's type: the Go registrars register the
+         * Variable as a value of it (go_lsp.c); the graph never sees it. */
+        dst->return_types = cbm_arena_strdup(arena, facts->value_type);
+    }
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
@@ -700,6 +775,14 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
             ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn, src->qualified_name)
             : pxc_join_pipe(arena, src->base_classes);
+    if (lang == CBM_LANG_GO && facts && facts->go_embedded && facts->go_embedded[0]) {
+        /* A Go struct's embedded types, as written; the Go registrar promotes
+         * their members (the embedded-member hook, go_lsp.c). */
+        dst->embedded_types =
+            dst->embedded_types && dst->embedded_types[0]
+                ? cbm_arena_sprintf(arena, "%s|%s", dst->embedded_types, facts->go_embedded)
+                : cbm_arena_strdup(arena, facts->go_embedded);
+    }
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
     if (src->signature_param_types && src->signature_param_count > 0) {
@@ -713,6 +796,15 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
             }
             dst->signature_param_types = types;
             dst->signature_param_count = src->signature_param_count;
+        }
+    }
+    if (lang == CBM_LANG_GO && facts && facts->type_params) {
+        /* A type parameter is never the package's type of its name: the
+         * registrars see `any` for it (pxc_go_mask_type_params). */
+        dst->return_types = pxc_go_mask_type_params(arena, dst->return_types, facts->type_params);
+        for (int i = 0; i < dst->signature_param_count; i++) {
+            dst->signature_param_types[i] =
+                pxc_go_mask_type_params(arena, dst->signature_param_types[i], facts->type_params);
         }
     }
     dst->lang = lang;
@@ -947,6 +1039,143 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
             used[slot] += (size_t)wrote;
         }
     }
+}
+
+/* Go: a generic type's field_defs ("name:type|...") with its type parameters
+ * masked in the type parts (pxc_go_mask_type_params), never in the names. */
+static const char *pxc_go_mask_field_types(CBMArena *arena, const char *field_defs,
+                                           const char *params) {
+    if (!field_defs || !field_defs[0]) {
+        return field_defs;
+    }
+    char *copy = cbm_arena_strdup(arena, field_defs);
+    size_t cap = strlen(field_defs) * 3 + 1;
+    char *out = copy ? (char *)cbm_arena_alloc(arena, cap) : NULL;
+    if (!out) {
+        return field_defs;
+    }
+    size_t at = 0;
+    for (char *p = copy; p && *p;) {
+        char *bar = strchr(p, '|');
+        if (bar) {
+            *bar = '\0';
+        }
+        char *colon = strchr(p, ':');
+        const char *type = colon ? pxc_go_mask_type_params(arena, colon + 1, params) : NULL;
+        size_t name_len = colon ? (size_t)(colon - p) + 1 : strlen(p);
+        if (at) {
+            out[at++] = '|';
+        }
+        memcpy(out + at, p, name_len);
+        at += name_len;
+        if (type) {
+            size_t tl = strlen(type);
+            memcpy(out + at, type, tl);
+            at += tl;
+        }
+        p = bar ? bar + 1 : NULL;
+    }
+    out[at] = '\0';
+    return out;
+}
+
+/* Python: a class's field_defs with each name its body binds (other than its
+ * nested definitions) added as `name:` -- an attribute of unknown type the
+ * registrar skips (py_split_field_defs keeps typed fields only). The names
+ * decide this file's identities (type_scope.h), so they must be part of its
+ * stored row, which the incremental planner compares. */
+static const char *pxc_py_add_class_bindings(CBMArena *arena, const char *field_defs,
+                                             const char *bindings) {
+    size_t total = (field_defs ? strlen(field_defs) : 0) + 2 * strlen(bindings) + 2;
+    char *out = (char *)cbm_arena_alloc(arena, total);
+    CBMHashTable *have = cbm_ht_create(16);
+    if (!out || !have) {
+        cbm_ht_free(have);
+        return field_defs;
+    }
+    size_t at = 0;
+    for (const char *p = field_defs; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t n = bar ? (size_t)(bar - p) : strlen(p);
+        const char *colon = memchr(p, ':', n);
+        const char *name = cbm_arena_strndup(arena, p, colon ? (size_t)(colon - p) : n);
+        if (name) {
+            cbm_ht_set(have, name, (void *)name);
+        }
+        memcpy(out + at, p, n);
+        at += n;
+        out[at++] = '|';
+        p = bar ? bar + 1 : p + n;
+    }
+    for (const char *p = bindings; *p;) {
+        const char *bar = strchr(p, '|');
+        size_t n = bar ? (size_t)(bar - p) : strlen(p);
+        const char *name = n ? cbm_arena_strndup(arena, p, n) : NULL;
+        if (name && !cbm_ht_get(have, name)) {
+            cbm_ht_set(have, name, (void *)name);
+            memcpy(out + at, p, n);
+            at += n;
+            out[at++] = ':';
+            out[at++] = '|';
+        }
+        p = bar ? bar + 1 : p + n;
+    }
+    cbm_ht_free(have);
+    if (at > 0) {
+        at--; /* the last separator */
+    }
+    out[at] = '\0';
+    return at ? out : field_defs;
+}
+
+/* The facts only the cross-file step reads (CBMDefTypeFacts), on the file's
+ * LSP defs after the field folds: a Go generic type's field types name its
+ * type parameters as `any`; a Python class body's bindings and a Python
+ * body's `global` names join its field_defs (as `name:`, no type), so they are
+ * part of the stored row the planner compares. One hash of the file's defs,
+ * built only when one applies. */
+static void pxc_apply_type_facts(CBMArena *arena, const CBMFileResult *fr, CBMLSPDef *defs,
+                                 int start, int end, CBMLanguage lang) {
+    if (!fr || (lang != CBM_LANG_GO && lang != CBM_LANG_PYTHON) || start >= end) {
+        return;
+    }
+    CBMHashTable *by_qn = NULL;
+    for (int di = 0; di < fr->defs.count; di++) {
+        const CBMDefinition *d = &fr->defs.items[di];
+        const CBMDefTypeFacts *f = d->type_facts;
+        if (!f || !d->qualified_name || !d->label) {
+            continue;
+        }
+        bool type_like = cbm_label_is_type_like(d->label);
+        bool go_generic = lang == CBM_LANG_GO && type_like && f->type_params;
+        bool py_bound = lang == CBM_LANG_PYTHON && type_like && f->class_bindings;
+        bool py_global = lang == CBM_LANG_PYTHON && f->global_names;
+        if (!go_generic && !py_bound && !py_global) {
+            continue;
+        }
+        if (!by_qn) {
+            by_qn = cbm_ht_create((uint32_t)(end - start + 1));
+            for (int si = start; by_qn && si < end; si++) {
+                if (defs[si].qualified_name && !cbm_ht_get(by_qn, defs[si].qualified_name)) {
+                    cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
+                }
+            }
+        }
+        CBMLSPDef *dst = by_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, d->qualified_name) : NULL;
+        if (!dst) {
+            continue;
+        }
+        if (go_generic) {
+            dst->field_defs = pxc_go_mask_field_types(arena, dst->field_defs, f->type_params);
+        }
+        if (py_bound) {
+            dst->field_defs = pxc_py_add_class_bindings(arena, dst->field_defs, f->class_bindings);
+        }
+        if (py_global) {
+            dst->field_defs = pxc_py_add_class_bindings(arena, dst->field_defs, f->global_names);
+        }
+    }
+    cbm_ht_free(by_qn);
 }
 
 /* Carry one Rust type-level impl independently of any method definition.
@@ -1290,14 +1519,20 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                .project_name = project_name,
                                .rel = files[fi].rel_path,
                                .lang = files[fi].language};
-        if (ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language)) {
-            bs.reg = ctx->registry;
-            bs.gbuf = ctx->gbuf;
+        /* The declared-type scope step (type_scope.h) reads the same map. */
+        const cbm_type_scope_lang_t *scope_lang =
+            ctx && ctx->registry ? cbm_type_scope_lang(files[fi].language) : NULL;
+        bool resolve_bases = ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language);
+        if (resolve_bases || scope_lang) {
             /* Bases and field annotations resolve through annotation-only
              * imports too: `if TYPE_CHECKING:` exists for them (#1277). */
             cbm_pxc_build_import_map_ex(ctx->gbuf, project_name, files[fi].rel_path,
                                         files[fi].language, fr, true, &bs.imp_keys, &bs.imp_vals,
                                         &bs.imp_count);
+        }
+        if (resolve_bases) {
+            bs.reg = ctx->registry;
+            bs.gbuf = ctx->gbuf;
         }
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
@@ -1315,7 +1550,6 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 idx += pxc_build_py_namespace_records(arena, fr, def_modules[fi], &defs[idx]);
             }
         }
-        cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
             pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Struct");
         } else if (files[fi].language == CBM_LANG_C || files[fi].language == CBM_LANG_CPP) {
@@ -1323,6 +1557,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
              * the structs its `.c` files access. */
             pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Class");
         }
+        /* Go generic types and Python class bodies (CBMDefTypeFacts). */
+        pxc_apply_type_facts(arena, fr, defs, file_start, idx, files[fi].language);
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < fr->impl_traits.count; ii++) {
                 if (pxc_build_rust_impl_relation(arena, &fr->impl_traits.items[ii], project_name,
@@ -1332,6 +1568,29 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 }
             }
         }
+        /* Every declared type this file wrote, resolved once in this file's
+         * scope; the identities travel with the defs (and their surface). */
+        if (scope_lang) {
+            cbm_type_scope_t scope = {.reg = ctx->registry,
+                                      .module_qn = def_modules[fi],
+                                      .imp_keys = bs.imp_keys,
+                                      .imp_vals = bs.imp_vals,
+                                      .imp_count = bs.imp_count};
+            if (scope_lang->lexical_scopes) {
+                /* The file's own scopes: its definitions and the module's
+                 * ordered namespace facts. */
+                scope.file_defs = fr->defs.items;
+                scope.file_def_count = fr->defs.count;
+                scope.module_facts = &fr->py_namespace;
+                scope.graph = ctx->gbuf; /* the graph the import map read */
+            }
+            cbm_type_scope_file_t *ts_file = cbm_type_scope_file_begin(scope_lang, &scope);
+            for (int di = file_start; ts_file && di < idx; di++) {
+                cbm_type_scope_attach(ts_file, arena, &defs[di]);
+            }
+            cbm_type_scope_file_end(ts_file);
+        }
+        cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         if (fr_loaded) {
             cbm_free_result(fr);
         }
@@ -3059,53 +3318,140 @@ static const pxc_module_entry_t *pxc_py_spec_entry(const CBMModuleDefIndex *idx,
     return NULL;
 }
 
+/* The index entry of the module that declares the definition `qn`: its
+ * nearest proper module prefix (a Python package through its __init__), or
+ * NULL. */
+static const pxc_module_entry_t *pxc_module_of_qn(const CBMModuleDefIndex *idx, const char *qn,
+                                                  size_t len, CBMLanguage lang) {
+    char key[CBM_SZ_1K];
+    if (len + sizeof(".__init__") > sizeof(key)) {
+        return NULL;
+    }
+    memcpy(key, qn, len);
+    key[len] = '\0';
+    for (;;) {
+        char *dot = strrchr(key, '.');
+        if (!dot) {
+            return NULL;
+        }
+        *dot = '\0';
+        const pxc_module_entry_t *e = (const pxc_module_entry_t *)cbm_ht_get(idx->ht, key);
+        if (!e && lang == CBM_LANG_PYTHON) {
+            e = pxc_py_module_entry(idx, key, strlen(key));
+        }
+        if (e) {
+            return e;
+        }
+    }
+}
+
+/* A def the selection reaches through: a Python namespace record, or a def
+ * whose declared types carry identities (type_scope.h). */
+static bool pxc_def_reaches(const CBMLSPDef *d) {
+    return pxc_is_py_reexport_record(d) || d->type_scope;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_pxc_reach_work;
+uint64_t cbm_pxc_test_reach_work(void) {
+    return atomic_load_explicit(&g_pxc_reach_work, memory_order_relaxed);
+}
+#define PXC_REACH_WORK(n) \
+    atomic_fetch_add_explicit(&g_pxc_reach_work, (uint64_t)(n), memory_order_relaxed)
+#else
+#define PXC_REACH_WORK(n) ((void)0)
+#endif
+
+/* Select every def of module entry `e` the caller can use and queue the ones
+ * that reach further (each def is queued at most once). Module entries
+ * partition the defs (one def_module_qn each), so an entry is known by its
+ * first def: each entry is walked once, however many defs point at it. */
+static void pxc_mark_reached_entry(const pxc_module_entry_t *e, bool *selected,
+                                   const CBMLSPDef *all_defs, CBMLanguage caller_lang, bool *queued,
+                                   bool *entry_done, int *work, int *n, int *total) {
+    if (!e || e->count <= 0 || entry_done[e->indices[0]]) {
+        return;
+    }
+    entry_done[e->indices[0]] = true;
+    PXC_REACH_WORK(e->count);
+    for (int j = 0; j < e->count; j++) {
+        int di = e->indices[j];
+        const CBMLSPDef *d = &all_defs[di];
+        if (!pxc_def_lang_matches(caller_lang, d->lang) ||
+            (caller_lang == CBM_LANG_PYTHON && d->lang != CBM_LANG_PYTHON)) {
+            continue;
+        }
+        if (!selected[di]) {
+            selected[di] = true;
+            (*total)++;
+        }
+        if (!queued[di] && pxc_def_reaches(d)) {
+            queued[di] = true;
+            work[(*n)++] = di;
+        }
+    }
+}
+
 /* A per-file selection holds the defs of the caller's own and imported
- * modules. A Python package that re-exports a name keeps only the record;
- * the definition lives in the module the record points at, possibly through
- * further re-exports. Select those modules' defs too, following every
- * selected record once (a worklist over def indices: linear in the defs it
- * reaches), so the per-file LSP can fold the chain as the shared registry
- * does. */
-static void pxc_mark_reexport_targets(const CBMModuleDefIndex *idx, bool *selected,
-                                      const CBMLSPDef *all_defs, int *total) {
+ * modules. Two kinds of selected def point further:
+ *   - A Python package that re-exports a name keeps only the record; the
+ *     definition lives in the module the record points at, possibly through
+ *     further re-exports.
+ *   - A def's declared-type identity names a type in a module the caller
+ *     neither owns nor imports (the return type the callee's file imported).
+ * Select those modules' defs too, following every reaching def once and
+ * walking every module entry once (a worklist over def indices: linear in the
+ * defs it reaches and the identities they hold), so the per-file LSP sees what
+ * the shared registry holds for a full index. */
+static void pxc_mark_reached_targets(const CBMModuleDefIndex *idx, bool *selected,
+                                     const CBMLSPDef *all_defs, CBMLanguage caller_lang,
+                                     int *total) {
     int cap = idx->def_count;
     int *work = (int *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)cap * sizeof(int));
     bool *queued = (bool *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)cap * sizeof(bool));
-    if (!work || !queued) {
+    bool *entry_done = (bool *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)cap * sizeof(bool));
+    if (!work || !queued || !entry_done) {
         cbm_free(CBM_MEM_CLASS_EXTRACT, work);
         cbm_free(CBM_MEM_CLASS_EXTRACT, queued);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, entry_done);
         return;
     }
     int n = 0;
     for (int i = 0; i < cap; i++) {
-        if (selected[i] && pxc_is_py_reexport_record(&all_defs[i])) {
+        if (selected[i] && pxc_def_reaches(&all_defs[i])) {
             queued[i] = true;
             work[n++] = i;
         }
     }
     for (int w = 0; w < n; w++) {
         const CBMLSPDef *r = &all_defs[work[w]];
-        bool star = strcmp(r->label, "PyStarImport") == 0;
-        const pxc_module_entry_t *e =
-            r->def_module_qn ? pxc_py_spec_entry(idx, r->def_module_qn, r->receiver_type,
-                                                 star ? NULL : r->method_names_str)
-                             : NULL;
-        for (int j = 0; e && j < e->count; j++) {
-            int di = e->indices[j];
-            if (di < 0 || di >= cap || all_defs[di].lang != CBM_LANG_PYTHON)
-                continue;
-            if (!selected[di]) {
-                selected[di] = true;
-                (*total)++;
+        /* The modules this def points at: one for a record, one per identity. */
+        if (caller_lang == CBM_LANG_PYTHON && pxc_is_py_reexport_record(r)) {
+            bool star = strcmp(r->label, "PyStarImport") == 0;
+            const pxc_module_entry_t *e =
+                r->def_module_qn ? pxc_py_spec_entry(idx, r->def_module_qn, r->receiver_type,
+                                                     star ? NULL : r->method_names_str)
+                                 : NULL;
+            pxc_mark_reached_entry(e, selected, all_defs, caller_lang, queued, entry_done, work, &n,
+                                   total);
+        }
+        for (const char *p = r->type_scope; p && *p;) {
+            const char *eq = strchr(p, '=');
+            if (!eq) {
+                break;
             }
-            if (!queued[di] && pxc_is_py_reexport_record(&all_defs[di])) {
-                queued[di] = true;
-                work[n++] = di;
-            }
+            const char *bar = strchr(eq, '|');
+            size_t qn_len = bar ? (size_t)(bar - eq - 1) : strlen(eq + 1);
+            PXC_REACH_WORK(1);
+            const pxc_module_entry_t *e = pxc_module_of_qn(idx, eq + 1, qn_len, caller_lang);
+            pxc_mark_reached_entry(e, selected, all_defs, caller_lang, queued, entry_done, work, &n,
+                                   total);
+            p = bar ? bar + 1 : eq + 1 + qn_len;
         }
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, work);
     cbm_free(CBM_MEM_CLASS_EXTRACT, queued);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, entry_done);
 }
 
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
@@ -3140,8 +3486,8 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
         pxc_module_entry_t *e = (pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, namespace_key);
         total += pxc_mark_entry_defs(selected, e, all_defs, caller_lang);
     }
-    if (caller_lang == CBM_LANG_PYTHON) {
-        pxc_mark_reexport_targets(idx, selected, all_defs, &total);
+    if (caller_lang == CBM_LANG_PYTHON || cbm_type_scope_lang(caller_lang)) {
+        pxc_mark_reached_targets(idx, selected, all_defs, caller_lang, &total);
     }
 
     if (total == 0) {
