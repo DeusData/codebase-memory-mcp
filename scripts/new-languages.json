@@ -1291,5 +1291,19 @@
     "filenames": [],
     "has_scanner": true,
     "module_root": "source_file"
+  },
+  {
+    "name": "st",
+    "enum": "ST",
+    "display": "Structured Text",
+    "ts_func": "tree_sitter_iec61131_3_st",
+    "repo": "https://github.com/HeytalePazguato/tree-sitter-iec61131-3-st",
+    "subdir": "",
+    "extensions": [
+      ".st"
+    ],
+    "filenames": [],
+    "has_scanner": true,
+    "module_root": "source_file"
   }
 ]

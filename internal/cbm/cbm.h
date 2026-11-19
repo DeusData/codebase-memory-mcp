@@ -215,6 +215,7 @@ typedef enum {
                        // operations are Routes (openapi.c)
     CBM_LANG_DIAGRAM,  // diagram files (PlantUML, DOT, D2, draw.io, Excalidraw), read
                        // without a grammar (diagram.c)
+    CBM_LANG_ST,       // IEC 61131-3 Structured Text (.st)
     CBM_LANG_COUNT
 } CBMLanguage;
 
