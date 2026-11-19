@@ -860,7 +860,10 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
         }
     }
 
-    /* 5. On-demand imports. */
+    /* 5. On-demand imports: the one type of them that has the name. Two
+     * different ones make the name ambiguous (javac rejects the use): no
+     * answer, never the first import's. */
+    const char *on_demand = NULL;
     for (int i = 0; i < ctx->import_count; i++) {
         if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_ON_DEMAND)
             continue;
@@ -868,9 +871,15 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
         int n = snprintf(buf, sizeof(buf), "%s.%s", ctx->import_target_qns[i], name);
         if (n > 0 && (size_t)n < sizeof(buf)) {
             if (cbm_registry_lookup_type(ctx->registry, buf)) {
-                return cbm_arena_strdup(ctx->arena, buf);
+                if (on_demand && strcmp(on_demand, buf) != 0) {
+                    return NULL;
+                }
+                on_demand = on_demand ? on_demand : cbm_arena_strdup(ctx->arena, buf);
             }
         }
+    }
+    if (on_demand) {
+        return on_demand;
     }
 
     /* Exact already-qualified name. */

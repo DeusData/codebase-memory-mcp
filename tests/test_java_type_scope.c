@@ -17,7 +17,12 @@
  * of a method and of a member type; the default package; a generic return
  * type whose argument the declaring file imports; a field inherited from
  * another file's superclass; a JDK collection receiver; a package over two
- * source trees (the class in one of them; the same class in both).
+ * source trees (the class in one of them; the same class in both); member
+ * types inherited from a project supertype of another file (also through an
+ * enclosing class and another file's return type); type parameters named
+ * like classes of the own package; a decorator whose interface method is a
+ * library super-interface's. A "no pick" case gives each twin a method that
+ * returns its own class, so a pick would show on the following call.
  *
  * The fixture runs on the sequential route and, padded past
  * MIN_FILES_FOR_PARALLEL, on the parallel one; an import edit through the
@@ -135,12 +140,14 @@ static const jts_file_t JTS_FILES[] = {
     {"src/main/java/p1/Twin.java",
      "package p1;\n\n"
      "public class Twin {\n"
-     "    public String turn() { return \"p1.Twin.turn\"; }\n"
+     "    public String turn() { return \"p1.Twin.turn\"; }\n\n"
+     "    public Tag1 tag() { return new Tag1(); }\n"
      "}\n"},
     {"src/main/java/p2/Twin.java",
      "package p2;\n\n"
      "public class Twin {\n"
-     "    public String turn() { return \"p2.Twin.turn\"; }\n"
+     "    public String turn() { return \"p2.Twin.turn\"; }\n\n"
+     "    public Tag2 tag() { return new Tag2(); }\n"
      "}\n"},
     {"src/main/java/app/Process.java",
      "package app;\n\n"
@@ -161,7 +168,8 @@ static const jts_file_t JTS_FILES[] = {
     {"src/main/java/split/Dup.java",
      "package split;\n\n"
      "public class Dup {\n"
-     "    public String probe() { return \"split.Dup.probe (main)\"; }\n"
+     "    public String probe() { return \"split.Dup.probe (main)\"; }\n\n"
+     "    public DupTagM tagDup() { return new DupTagM(); }\n"
      "}\n"},
     {"src/test/java/split/Probe.java",
      "package split;\n\n"
@@ -171,7 +179,8 @@ static const jts_file_t JTS_FILES[] = {
     {"src/test/java/split/Dup.java",
      "package split;\n\n"
      "public class Dup {\n"
-     "    public String probe() { return \"split.Dup.probe (test)\"; }\n"
+     "    public String probe() { return \"split.Dup.probe (test)\"; }\n\n"
+     "    public DupTagT tagDup() { return new DupTagT(); }\n"
      "}\n"},
     {"src/test/java/user/SplitUse.java",
      "package user;\n\n"
@@ -179,7 +188,8 @@ static const jts_file_t JTS_FILES[] = {
      "import split.Probe;\n\n"
      "public class SplitUse {\n"
      "    String splitTree(Probe p) { return p.probe(); }\n\n"
-     "    String splitDup(Dup d) { return d.probe(); }\n"
+     "    String splitDup(Dup d) { return d.probe(); }\n\n"
+     "    String splitDupTag(Dup d) { return d.tagDup().sealDup(); }\n"
      "}\n"},
     {"src/main/java/user/Main.java",
      "package user;\n\n"
@@ -239,7 +249,8 @@ static const jts_file_t JTS_FILES[] = {
      "import p1.*;\n"
      "import p2.*;\n\n"
      "public class Ambig {\n"
-     "    String twin(Twin t) { return t.turn(); }\n"
+     "    String twin(Twin t) { return t.turn(); }\n\n"
+     "    String twinTag(Twin t) { return t.tag().seal(); }\n"
      "}\n"},
     /* A class with a declared constructor and an annotation type of the same
      * name in another package (apollo's audit entity/annotation pair); Make
@@ -431,6 +442,28 @@ static const jts_file_t JTS_FILES[] = {
      "    private final Shape3 inner;\n\n"
      "    public Framed3(Shape3 inner) { this.inner = inner; }\n\n"
      "    public String get() { return inner == null ? \"user.Framed3.get\" : inner.get(); }\n"
+     "}\n"},
+    /* Reveal classes of the two "no pick" cases: each twin's tag method
+     * returns its own class. */
+    {"src/main/java/split/DupTagM.java",
+     "package split;\n\n"
+     "public class DupTagM {\n"
+     "    public String sealDup() { return \"split.DupTagM.sealDup\"; }\n"
+     "}\n"},
+    {"src/test/java/split/DupTagT.java",
+     "package split;\n\n"
+     "public class DupTagT {\n"
+     "    public String sealDup() { return \"split.DupTagT.sealDup\"; }\n"
+     "}\n"},
+    {"src/main/java/p1/Tag1.java",
+     "package p1;\n\n"
+     "public class Tag1 {\n"
+     "    public String seal() { return \"p1.Tag1.seal\"; }\n"
+     "}\n"},
+    {"src/main/java/p2/Tag2.java",
+     "package p2;\n\n"
+     "public class Tag2 {\n"
+     "    public String seal() { return \"p2.Tag2.seal\"; }\n"
      "}\n"},
     {"src/main/java/Def.java",
      "public class Def {\n"
@@ -629,6 +662,8 @@ static int jts_check_on_demand(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "onDemandOne", "spin", "p1.Widget.spin");
     ok &= jts_expect_engine(ix, "onDemandOther", "turn", "p2.Gadget.turn");
     ok &= jts_expect_no_engine(ix, "twin", "turn");
+    /* The twins' tag() return different classes: a pick types seal(). */
+    ok &= jts_expect_no_engine(ix, "twinTag", "seal");
     return ok;
 }
 
@@ -729,6 +764,8 @@ static int jts_check_decorator(jts_index_t *ix) {
 static int jts_check_split_package(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "splitTree", "probe", "split.Probe.probe");
     ok &= jts_expect_no_engine(ix, "splitDup", "probe");
+    /* The two Dups' tagDup() return different classes: a pick types sealDup(). */
+    ok &= jts_expect_no_engine(ix, "splitDupTag", "sealDup");
     return ok;
 }
 
