@@ -52,6 +52,9 @@ pathlib.Path(sys.argv[1]).write_text(
 #include <string.h>
 static const char release_canary[] =
     "codebase-memory-mcp OMIT_LOAD_EXTENSION candidate-derivation-contract";
+/* The build-stamp slot (src/foundation/build_stamp.c): magic + 32-byte payload. */
+__attribute__((used)) static volatile const unsigned char release_stamp_slot[48] = {
+    0x89, 'C', 'B', 'M', '-', 'B', 'U', 'I', 'L', 'D', 'S', 'T', 'A', 'M', 'P', 0x01};
 static _Thread_local unsigned long release_tls_counter;
 static int visible_symbol_for_real_strip(int value) { return value + 17; }
 int main(int argc, char **argv) {
@@ -143,6 +146,7 @@ if [row["transform"] for row in rows] != ["copy", "strip-debug", "strip"]:
     raise SystemExit("FAIL: transforms are not explicit copy/strip-debug/strip")
 if any(row["pair_verification"] != "same-linker-output-v1" for row in rows):
     raise SystemExit("FAIL: common linker-output provenance is not recorded")
+stamp_magic = b"\x89CBM-BUILDSTAMP\x01"
 if target.startswith("darwin-") and any(row["signature"] != "adhoc-verified" for row in rows):
     raise SystemExit("FAIL: both final Darwin candidates must be ad-hoc-signature verified")
 for row in rows:
@@ -153,6 +157,17 @@ for row in rows:
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != row["sha256"] or len(data) != int(row["size"]):
         raise SystemExit(f"FAIL: provenance is not content-bound: {path}")
+    if target.startswith("linux-"):
+        # #2683: each ELF candidate carries the SHA-256 of itself with the
+        # stamp payload read as zeros, written after strip.
+        at = data.find(stamp_magic)
+        if at == -1 or data.find(stamp_magic, at + 1) != -1:
+            raise SystemExit(f"FAIL: candidate does not hold exactly one stamp slot: {path}")
+        start = at + len(stamp_magic)
+        zeroed = bytearray(data)
+        zeroed[start : start + 32] = bytes(32)
+        if data[start : start + 32] != hashlib.sha256(zeroed).digest():
+            raise SystemExit(f"FAIL: candidate build stamp is missing or stale: {path}")
     if stat.S_IMODE(path.stat().st_mode) & 0o222:
         raise SystemExit(f"FAIL: published candidate is writable: {path}")
     if not stat.S_IMODE(path.stat().st_mode) & 0o111:

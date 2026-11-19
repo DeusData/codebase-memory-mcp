@@ -208,4 +208,21 @@ else
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
+# Step 3 (#2683): stamp the build identity into ELF executables so short-lived
+# processes read it instead of hashing the whole image. The stamper only reads
+# and writes bytes; it never runs the binary. Release candidates are stamped
+# again after strip by scripts/ci/prepare-release-candidates.sh.
+case "$(uname -s)" in
+Linux | FreeBSD | NetBSD)
+    if command -v python3 >/dev/null 2>&1; then
+        python3 "$ROOT/scripts/build-stamp.py" "${BUILD_DIR}/codebase-memory-mcp" >/dev/null || {
+            echo "error: build-stamp failed" >&2
+            exit 1
+        }
+    else
+        echo "warning: python3 not found; leaving the build unstamped (it hashes itself at startup)" >&2
+    fi
+    ;;
+esac
+
 echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="
