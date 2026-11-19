@@ -418,11 +418,13 @@ static void push_enclosing_class(JavaLSPContext *ctx, const char *class_qn) {
         ctx->enclosing_class_cap = new_cap;
     }
     ctx->enclosing_class_stack[ctx->enclosing_class_depth++] = class_qn;
+    ctx->class_epoch++;
 }
 
 static void pop_enclosing_class(JavaLSPContext *ctx) {
     if (ctx->enclosing_class_depth > 0)
         ctx->enclosing_class_depth--;
+    ctx->class_epoch++;
 }
 
 /* ── Type-AST → CBMType ───────────────────────────────────────────── */
@@ -904,6 +906,8 @@ static void java_count_unknown_scope_answer(const JavaLSPContext *ctx, const cha
 static void java_lsp_ctx_done(JavaLSPContext *ctx) {
     cbm_ht_free(ctx->unknown_scope_types); /* NULL-safe */
     ctx->unknown_scope_types = NULL;
+    cbm_ht_free(ctx->step0_memo); /* NULL-safe; its entries live in the arena */
+    ctx->step0_memo = NULL;
 }
 
 static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
@@ -918,16 +922,24 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
     return qn;
 }
 
-static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
-                                             unsigned *unseen) {
-    if (!name || !ctx)
-        return NULL;
+/* Step 0 of java_resolve_type_name, the enclosing classes innermost first:
+ * decided when it answers (a member type) or gives no answer (a member two
+ * types share, or rule i); else the name goes on to the imports. unseen: the
+ * kinds of the supertypes met that the registry does not hold. */
+typedef struct {
+    const char *qn;
+    unsigned unseen;
+    bool decided;
+    bool withheld; /* rule (i) */
+} JavaStep0;
 
-    /* 0. The enclosing classes, innermost first: a member type each declares
-     * (`Outer.Inner` is `Inner` inside `Outer`), then one it inherits from a
-     * supertype (JLS 8.5). Both are in scope in the class body and shadow the
-     * imports and the package (JLS 6.4.1); a member whose QN two types share
-     * is that member, which no answer can name. */
+static JavaStep0 java_step0_compute(JavaLSPContext *ctx, const char *name) {
+    JavaStep0 r = {0};
+    /* A member type each enclosing class declares (`Outer.Inner` is `Inner`
+     * inside `Outer`), then one it inherits from a supertype (JLS 8.5). Both
+     * are in scope in the class body and shadow the imports and the package
+     * (JLS 6.4.1); a member whose QN two types share is that member, which no
+     * answer can name. */
     for (int i = ctx->enclosing_class_depth - 1; i >= 0; i--) {
         const char *outer = ctx->enclosing_class_stack[i];
         if (!outer)
@@ -936,7 +948,9 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
         int n = snprintf(buf, sizeof(buf), "%s.%s", outer, name);
         if (n > 0 && (size_t)n < sizeof(buf)) {
             if (cbm_registry_lookup_type(ctx->registry, buf)) {
-                return cbm_arena_strdup(ctx->arena, buf);
+                r.qn = cbm_arena_strdup(ctx->arena, buf);
+                r.decided = true;
+                return r;
             }
         }
         bool unnamed = false;
@@ -944,12 +958,11 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
         JavaUnseenJudge judge = {.reg = ctx->registry, .packages = ctx->project_packages};
         const char *member = java_inherited_member(ctx->registry, ctx->arena, outer, name, &unnamed,
                                                    &judge, &met);
-        *unseen |= met;
-        if (member) {
-            return member;
-        }
-        if (unnamed) {
-            return NULL;
+        r.unseen |= met;
+        if (member || unnamed) {
+            r.qn = member;
+            r.decided = true;
+            return r;
         }
         if ((met & JAVA_UNSEEN_PROJECT) && ctx->cross_run) {
             /* Rule (i): a project type the run's registry does not hold (or a
@@ -961,9 +974,64 @@ static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *na
              * answers as main does, and a cross answer replaces its answer at
              * that call. A supertype known outside the project, or of no
              * known package (rule ii), leaves the answer standing. */
-            atomic_fetch_add_explicit(&g_java_unseen_project, 1, memory_order_relaxed);
-            return NULL;
+            r.decided = true;
+            r.withheld = true;
+            return r;
         }
+    }
+    return r;
+}
+
+/* Step 0 once per (enclosing classes, simple name) in this file: the stack's
+ * epoch and the name key a memo made once the registry is complete and
+ * dropped when its type count changes, so each pair walks once (step 0 is a
+ * function of the registry, the classes, the name and the judge). */
+static JavaStep0 java_step0(JavaLSPContext *ctx, const char *name) {
+    char key[JAVA_LSP_BUF];
+    int n = -1;
+    if (ctx->step0_ready) {
+        n = snprintf(key, sizeof(key), "%u\x1f%s", ctx->class_epoch, name);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(key)) {
+        return java_step0_compute(ctx, name);
+    }
+    if (ctx->step0_memo && ctx->step0_memo_types != ctx->registry->type_count) {
+        cbm_ht_free(ctx->step0_memo);
+        ctx->step0_memo = NULL;
+    }
+    if (!ctx->step0_memo) {
+        ctx->step0_memo = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 64);
+        ctx->step0_memo_types = ctx->registry->type_count;
+    }
+    CBM_LSP_WORK(1);
+    const JavaStep0 *hit =
+        ctx->step0_memo ? (const JavaStep0 *)cbm_ht_get(ctx->step0_memo, key) : NULL;
+    if (hit) {
+        return *hit;
+    }
+    JavaStep0 r = java_step0_compute(ctx, name);
+    JavaStep0 *slot = (JavaStep0 *)cbm_arena_alloc(ctx->arena, sizeof(*slot));
+    const char *k = cbm_arena_strdup(ctx->arena, key);
+    if (slot && k && ctx->step0_memo && ctx->step0_memo_types == ctx->registry->type_count) {
+        *slot = r;
+        cbm_ht_set(ctx->step0_memo, k, slot);
+    }
+    return r;
+}
+
+static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
+                                             unsigned *unseen) {
+    if (!name || !ctx)
+        return NULL;
+
+    /* 0. The enclosing classes (java_step0). */
+    JavaStep0 s0 = java_step0(ctx, name);
+    *unseen |= s0.unseen;
+    if (s0.withheld) {
+        atomic_fetch_add_explicit(&g_java_unseen_project, 1, memory_order_relaxed);
+    }
+    if (s0.decided) {
+        return s0.qn;
     }
 
     /* 1. Same package — registry types whose QN ends with .name. */
@@ -4518,6 +4586,7 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     ctx.func_name_count = 0;
 
     /* Walk the file. */
+    ctx.step0_ready = true; /* the registry is complete: step 0 may be memoized */
     java_lsp_process_file(&ctx, root);
     java_lsp_ctx_done(&ctx);
     cbm_arena_destroy(&scratch);
@@ -4987,6 +5056,7 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     java_own_supertypes(&ctx, &overlay, result);
 
     ctx.cross_run = true;
+    ctx.step0_ready = true; /* the registry is complete: step 0 may be memoized */
     java_lsp_process_file(&ctx, root);
     java_lsp_ctx_done(&ctx);
     cbm_arena_destroy(&idx_arena);
@@ -5085,6 +5155,7 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
     }
 
     ctx.cross_run = true;
+    ctx.step0_ready = true; /* the registry is complete: step 0 may be memoized */
     java_lsp_process_file(&ctx, root);
     java_lsp_ctx_done(&ctx);
     cbm_arena_destroy(&idx_arena);

@@ -1544,6 +1544,61 @@ static uint64_t jts_chain_work(int n, bool cycle, bool *found) {
 /* A supertype chain of 50 / 200 / 800 types: the member at its end is found
  * (no cap decides it), the cycle ends, and the counted work grows linearly
  * with the chain. */
+/* One file: a class nested k deep whose innermost class has an ancestry of
+ * depth d resolves one type name n times. The counted work of the per-file
+ * engine (step 0 runs once per enclosing classes and name). */
+static uint64_t jts_step0_work(int n, int k, int d) {
+    size_t cap = (size_t)(n + k + d) * 96 + 1024;
+    char *src = malloc(cap);
+    if (!src) {
+        return 0;
+    }
+    size_t at = 0;
+    at += (size_t)snprintf(src + at, cap - at, "package g;\n\nclass Help {\n}\n");
+    for (int i = 0; i < d; i++) {
+        if (i + 1 < d) {
+            at += (size_t)snprintf(src + at, cap - at, "class A%d extends A%d {\n}\n", i, i + 1);
+        } else {
+            at += (size_t)snprintf(src + at, cap - at, "class A%d {\n}\n", i);
+        }
+    }
+    for (int i = 0; i + 1 < k; i++) {
+        at += (size_t)snprintf(src + at, cap - at, "class O%d {\n", i);
+    }
+    at += (size_t)snprintf(src + at, cap - at, "class O%d extends A0 {\n void m() {\n", k - 1);
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at, "  Help h%d = new Help();\n", i);
+    }
+    at += (size_t)snprintf(src + at, cap - at, " }\n");
+    for (int i = 0; i < k; i++) {
+        at += (size_t)snprintf(src + at, cap - at, "}\n");
+    }
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)at, CBM_LANG_JAVA, "g", "src/g/Main.java", 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    if (r) {
+        cbm_free_result(r);
+    }
+    free(src);
+    return work;
+}
+
+/* n resolutions in a class nested k deep with an ancestry of depth d, all three
+ * at 1x, 4x, 16x: the counted work grows linearly (step 0 walks the classes and
+ * the ancestry once per name, not once per resolution). */
+TEST(java_type_scope_growth_step0) {
+    uint64_t w1 = jts_step0_work(32, 2, 4);
+    uint64_t w4 = jts_step0_work(128, 8, 16);
+    uint64_t w16 = jts_step0_work(512, 32, 64);
+    printf("\n  step 0, n/k/d 32/2/4, 128/8/16, 512/32/64: work %llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
 TEST(java_type_scope_growth_supertype_chain) {
     bool f1 = false;
     bool f4 = false;
@@ -1654,5 +1709,6 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_growth_large_package);
     RUN_TEST(java_type_scope_growth_package_spread);
     RUN_TEST(java_type_scope_growth_supertype_chain);
+    RUN_TEST(java_type_scope_growth_step0);
 #endif
 }

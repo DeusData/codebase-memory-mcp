@@ -90,6 +90,13 @@ typedef struct {
     bool cross_run;            /* a cross-file run (counts answers, see below) */
     void *unknown_scope_types; /* CBMHashTable of types a simple name resolved to inside a
                                 * class with a supertype the registry does not know */
+    /* Step 0 of java_resolve_type_name per (enclosing classes, simple name),
+     * for this file only (java_step0): a CBMHashTable made once the registry
+     * is complete (step0_ready) and dropped when its type count changes. */
+    void *step0_memo;
+    int step0_memo_types;
+    unsigned class_epoch; /* changes with every push and pop of the enclosing classes */
+    bool step0_ready;
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
