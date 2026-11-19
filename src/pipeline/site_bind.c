@@ -540,9 +540,9 @@ cbm_site_answer_t cbm_pipeline_site_bind_call(cbm_site_file_t *sf, const CBMCall
 }
 
 /* The type reference (a QREF event) that the site [start, end) is the last
- * name of: its text as written, or NULL. Events are sorted by position (a
- * QREF's is its end byte, its index the start byte). */
-static const char *sb_qref_ending(const CBMFileResult *r, uint32_t start, uint32_t end) {
+ * name of, or NULL. Events are sorted by position (a QREF's is its end byte,
+ * its index the start byte). */
+static const CBMScopeEvent *sb_qref_ending(const CBMFileResult *r, uint32_t start, uint32_t end) {
     const CBMScopeEvent *ev = r->scope.items;
     int lo = 0;
     int hi = r->scope.count;
@@ -555,8 +555,9 @@ static const char *sb_qref_ending(const CBMFileResult *r, uint32_t start, uint32
         }
     }
     for (int i = lo; i < r->scope.count && ev[i].pos == end; i++) {
-        if (ev[i].kind == CBM_SCOPE_QREF && ev[i].index >= 0 && (uint32_t)ev[i].index <= start) {
-            return ev[i].name;
+        if (ev[i].kind == CBM_SCOPE_QREF && ev[i].name && ev[i].index >= 0 &&
+            (uint32_t)ev[i].index <= start) {
+            return &ev[i];
         }
     }
     return NULL;
@@ -598,15 +599,18 @@ cbm_site_answer_t cbm_pipeline_site_bind_usage(cbm_site_file_t *sf, const CBMUsa
     if (!sf->active || usage->site_end_byte <= usage->site_start_byte) {
         return sb_no_answer();
     }
-    const char *written = sb_qref_ending(sf->result, usage->site_start_byte, usage->site_end_byte);
-    if (!written) {
+    const CBMScopeEvent *qref =
+        sb_qref_ending(sf->result, usage->site_start_byte, usage->site_end_byte);
+    if (!qref) {
         return sb_no_answer(); /* not the last name of a type reference */
     }
+    const char *written = qref->name;
     const char *dot = strrchr(written, '.');
     if (strcmp(dot ? dot + SKIP_ONE : written, usage->ref_name) != 0) {
         return sb_no_answer();
     }
-    cbm_closure_ref_t ref = {.name = usage->ref_name, .written = dot ? written : NULL};
+    cbm_closure_ref_t ref = {
+        .name = usage->ref_name, .written = dot ? written : NULL, .scope = qref->qual};
     const cbm_site_scope_t *sc = sf->ctx->site_scope;
     cbm_closure_answer_t a = cbm_closure_lookup(sc->closure, sb_memo(sf), sf->file, &ref);
     if (sc->dump) {

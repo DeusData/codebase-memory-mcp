@@ -300,8 +300,12 @@ static void sc_qref(sc_walk_t *w, TSNode n) {
         k += ce - cb;
     }
     text[k] = '\0';
+    /* the innermost scope around it: the enclosing message (NULL when its
+     * full name is unknown), else the file's package */
+    const char *scope = w->nnest > 0 ? w->nest_full[w->nnest - SKIP_ONE]
+                                     : (w->lang->package_kind ? w->pkg : NULL);
     if (k > 0) {
-        sc_emit(w, CBM_SCOPE_QREF, text, NULL, (int32_t)b, e, 0);
+        sc_emit(w, CBM_SCOPE_QREF, text, scope, (int32_t)b, e, 0);
     }
 }
 

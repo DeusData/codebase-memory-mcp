@@ -655,8 +655,40 @@ TEST(site_bind_protobuf_never_proven_where_protoc_rejects) {
     PASS();
 }
 
+/* protoc 3.21.12 on review 3's fx4/scope: A's field is .p.A.Type (the
+ * enclosing message is searched first), B's is .p.Type. Both are proven to
+ * those, and the outer Type never at A's site, where the inner one shadows
+ * it. */
+TEST(site_bind_protobuf_enclosing_message_decides_first) {
+    static const char *const scope[][2] = {
+        {"t.proto", "syntax = \"proto3\";\npackage p;\nenum Type { T0 = 0; }\n"},
+        {"a.proto", "syntax = \"proto3\";\npackage p;\nimport \"t.proto\";\n"
+                    "message A {\n  enum Type { A0 = 0; }\n  Type t = 1;\n}\n"
+                    "message B {\n  Type t = 1;\n}\n"}};
+    char *tmp = th_mktempdir("sb_scope");
+    ASSERT_NOT_NULL(tmp);
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/repo", tmp);
+    int rc = 0;
+    for (int i = 0; i < 2 && rc == 0; i++) {
+        rc = th_write_file(TH_PATH(dir, scope[i][0]), scope[i][1]);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/p.db", tmp);
+    int indexed = rc == 0 ? sb_index(dir, db, 1, NULL) : -1;
+    int inner = indexed == 0 ? sb_proven_to(db, "a.Type") : -1; /* A's site */
+    int outer = indexed == 0 ? sb_proven_to(db, "t.Type") : -1; /* B's site only */
+    th_cleanup(tmp);
+    printf("\n  proven: a.Type %d, t.Type %d\n", inner, outer);
+    ASSERT_EQ(indexed, 0);
+    ASSERT_EQ(inner, 1);
+    ASSERT_EQ(outer, 1);
+    PASS();
+}
+
 SUITE(site_bind) {
     RUN_TEST(site_bind_protobuf_never_proven_where_protoc_rejects);
+    RUN_TEST(site_bind_protobuf_enclosing_message_decides_first);
     RUN_TEST(site_bind_language_without_row_answers_nothing);
     RUN_TEST(site_bind_protobuf_reference_binds_what_protoc_resolves);
     RUN_TEST(site_bind_protobuf_incremental_equals_full);

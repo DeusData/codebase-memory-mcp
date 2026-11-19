@@ -65,8 +65,8 @@ enum {
     CBM_CLOSURE_WHY_AMBIGUOUS = 1u << 5,   /* two or more definitions are visible */
     CBM_CLOSURE_WHY_NO_NODE = 1u << 6,     /* the one definition has no graph node */
     /* the one definition is in a message of the referring file (or the
-     * file's package is unknown): the enclosing message, which the facts do
-     * not give, decides (protoc's scope walk) */
+     * file's package is unknown) and the reference carries no scope: the
+     * enclosing message decides (protoc's scope walk) */
     CBM_CLOSURE_WHY_SCOPE = 1u << 7,
 };
 
@@ -79,12 +79,18 @@ typedef struct {
     /* the reference as written, qualifier included ("common.Status",
      * ".a.b.Outer.Inner"), or NULL for the bare name. A row with qualified
      * references reads it against definitions' full names: a leading dot is
-     * the root; otherwise the full name is the reference itself or a scope
-     * around the referring site followed by it. Those scopes are the
-     * referring file's package and each package around it, and (the
-     * enclosing message being unknown here) any scope inside the package. A
-     * definition whose full name is unknown matches by its name alone. */
+     * the root; otherwise the full name is a scope around the referring site
+     * followed by it, the innermost scope in which its first component names
+     * a symbol deciding. A definition whose full name is unknown matches by
+     * its name alone. */
     const char *written;
+    /* the innermost scope around the site, the first one searched
+     * ("a.b.Outer": the enclosing message; "a.b": the package; "": the
+     * root), or NULL when it is unknown: then the scopes are the referring
+     * file's package and each package around it, and any message of the
+     * file holding a definition of the first component may decide first
+     * (an answer is then at most possible) */
+    const char *scope;
     uint32_t pos;  /* the site's byte (ordered rows; unused in unordered mode) */
     uint8_t ns;    /* namespace (unused in unordered mode) */
     uint8_t flags; /* CBM_CLOSURE_REF_* */

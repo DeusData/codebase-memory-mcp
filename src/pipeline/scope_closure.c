@@ -86,7 +86,8 @@ struct cbm_closure {
     CBMHashTable *by_rel;   /* rel -> file index + 1 */
     /* qualified rows (protoc's scope walk): every definition's full name ->
      * sc_ivec_t* of def indexes; every package and each package around it;
-     * "<file>\x1f<name>" for a definition nested in a message of that file */
+     * "<file>\x1f<name>" -> sc_ivec_t* of the definitions of `name` nested in
+     * a message of that file */
     CBMHashTable *fulls;
     CBMHashTable *pkgs;
     CBMHashTable *nested;
@@ -136,6 +137,8 @@ static bool sc_push(CBMArena *a, sc_ivec_t *x, int val) {
     x->v[x->n++] = val;
     return true;
 }
+
+enum { SC_FULL_MAX = 1024 }; /* a full name or a lookup key */
 
 static sc_ivec_t *sc_slot(CBMArena *a, CBMHashTable *t, const char *key) {
     sc_ivec_t *x = cbm_ht_get(t, key);
@@ -310,11 +313,14 @@ bool cbm_closure_add_def(cbm_closure_t *s, int file, const char *name, const cha
         bool at_package =
             fl == nl ? !pkg[0] : (strlen(pkg) == pl && strncmp(d->full, pkg, pl) == 0);
         if (!at_package) {
-            const char *k = cbm_arena_sprintf(&s->arena, "%d\x1f%s", file, d->name);
-            if (!k) {
+            char key[SC_FULL_MAX];
+            int kn = snprintf(key, sizeof(key), "%d\x1f%s", file, d->name);
+            sc_ivec_t *own = kn > 0 && (size_t)kn < sizeof(key)
+                                 ? sc_slot(&s->arena, s->nested, key)
+                                 : NULL;
+            if (!own || !sc_push(&s->arena, own, s->ndefs)) {
                 return false;
             }
-            cbm_ht_set(s->nested, k, (void *)k);
         }
     }
     s->ndefs++;
@@ -826,22 +832,23 @@ static int sc_sees(const cbm_closure_t *s, cbm_closure_memo_t *m, int file, cons
 
 /* ── Lookup ──────────────────────────────────────────────────────────── */
 
-enum { SC_FULL_MAX = 1024 };
-
 /* protoc's scope walk for a reference written `r` (DescriptorBuilder::
  * LookupSymbol): the innermost scope around the site in which the FIRST
  * component names a symbol decides, and the whole reference must be there (no
- * backtracking). The package scopes are known (the file's package, each
- * package around it, the root); the enclosing message is not: a message of
- * the referring file that holds a definition of the first component's name may
- * decide first, which makes an answer at most possible. Symbols are read from
- * the whole run, a superset of what protoc sees: a scope taken too early only
- * finds nothing visible there (no answer), never another definition. */
+ * backtracking). The scopes are the reference's own (the enclosing message,
+ * each message and package around it, the root) when the facts carry it;
+ * otherwise the file's package, each package around it and the root, and a
+ * message of the referring file that holds a definition of the first
+ * component's name may decide first, which makes an answer at most possible.
+ * Symbols are read from the whole run, a superset of what protoc sees: a scope
+ * taken too early only finds nothing visible there (no answer), never another
+ * definition. */
 typedef struct {
-    const char *target; /* the full name the reference names, or NULL */
-    bool qualified;     /* the row reads references against full names */
-    bool any_scope;     /* the file's package is unknown: every scope may be around the site */
-    bool maybe;         /* a message of the referring file may hold the first component */
+    const char *target;   /* the full name the reference names, or NULL */
+    const sc_ivec_t *own; /* maybe: the referring file's nested definitions of the name */
+    bool qualified;       /* the row reads references against full names */
+    bool any_scope;       /* the file's package is unknown: every scope may be around the site */
+    bool maybe;           /* a message of the referring file may hold the first component */
     char buf[SC_FULL_MAX];
 } sc_scope_t;
 
@@ -850,6 +857,7 @@ static void sc_scope_walk(const cbm_closure_t *s, int file, const cbm_closure_re
     const sc_file_t *f = &s->files[file];
     const char *r = ref->written ? ref->written : ref->name;
     w->target = NULL;
+    w->own = NULL;
     w->qualified = f->row->qualified_refs;
     w->any_scope = false;
     w->maybe = false;
@@ -860,15 +868,21 @@ static void sc_scope_walk(const cbm_closure_t *s, int file, const cbm_closure_re
         w->target = r + SKIP_ONE;
         return;
     }
-    if (!f->package) {
-        w->any_scope = true;
-        return;
-    }
     size_t xl = strcspn(r, ".");
     char key[SC_FULL_MAX];
-    int n = snprintf(key, sizeof(key), "%d\x1f%.*s", file, (int)xl, r);
-    w->maybe = n > 0 && (size_t)n < sizeof(key) && cbm_ht_get(s->nested, key);
-    const char *k = f->package;
+    int n = 0;
+    const char *k = ref->scope; /* the innermost scope around the site */
+    if (!k) {
+        if (!f->package) {
+            w->any_scope = true;
+            return;
+        }
+        n = snprintf(key, sizeof(key), "%d\x1f%s", file, ref->name);
+        w->own = n > 0 && (size_t)n < sizeof(key) ? cbm_ht_get(s->nested, key) : NULL;
+        n = snprintf(key, sizeof(key), "%d\x1f%.*s", file, (int)xl, r);
+        w->maybe = n > 0 && (size_t)n < sizeof(key) && cbm_ht_get(s->nested, key);
+        k = f->package;
+    }
     for (size_t l = strlen(k);;) {
         n = l ? snprintf(key, sizeof(key), "%.*s.%.*s", (int)l, k, (int)xl, r)
               : snprintf(key, sizeof(key), "%.*s", (int)xl, r);
@@ -955,15 +969,19 @@ static void sc_visible(const cbm_closure_t *s, cbm_closure_memo_t *m, int file,
     sc_memo_file(s, m, file);
     *why |= m->file_why;
     const sc_ivec_t *named = cbm_ht_get(s->by_name, ref->name);
-    /* the candidates: the walk's target by its full name, else every
-     * definition of the name */
+    /* the candidates: the walk's target by its full name, and where a message
+     * of the file may decide first, the file's own nested definitions of the
+     * name; every definition of the name only when no scope is known */
     const sc_ivec_t *cands = named;
-    if (w->qualified && w->target && !w->any_scope && !w->maybe) {
-        cands = cbm_ht_get(s->fulls, w->target);
+    const sc_ivec_t *own = NULL;
+    if (w->qualified && !w->any_scope) {
+        cands = w->target ? cbm_ht_get(s->fulls, w->target) : NULL;
+        own = w->maybe ? w->own : NULL;
     }
-    for (int i = 0; cands && i < cands->n && !acc->several; i++) {
+    int ncands = cands ? cands->n : 0;
+    for (int i = 0; i < ncands + (own ? own->n : 0) && !acc->several; i++) {
         m->work++;
-        int d = cands->v[i];
+        int d = i < ncands ? cands->v[i] : own->v[i - ncands];
         int match = d == acc->first ? SC_NO : sc_def_matches(&s->defs[d], file, ref, w);
         if (match == SC_NO) {
             continue;

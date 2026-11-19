@@ -452,6 +452,110 @@ TEST(scope_closure_review_shapes_grow_linearly) {
     PASS();
 }
 
+/* Counted lookup work of review 3's R2 shape at n (one memo): n files
+ * `package p_i; message M { enum Type {..} Type t = 1; }`, each asking its
+ * own Type. `scoped`: the reference carries its enclosing message (proven
+ * p_i.M.Type); otherwise the scope is unknown and the file's own nested Type
+ * may decide (possible). */
+static uint64_t sc_nested_work(int n, bool scoped) {
+    cbm_closure_t *s = cbm_closure_new();
+    if (!s) {
+        return 0;
+    }
+    char rel[32];
+    char pkg[32];
+    char msg[32];
+    char full[48];
+    int first = -1;
+    bool ok = true;
+    for (int i = 0; ok && i < n; i++) {
+        snprintf(rel, sizeof(rel), "f%d.proto", i);
+        snprintf(pkg, sizeof(pkg), "p%d", i);
+        snprintf(msg, sizeof(msg), "p%d.M", i);
+        snprintf(full, sizeof(full), "p%d.M.Type", i);
+        int f = cbm_closure_add_file(s, rel, &ROW_QUAL, pkg);
+        first = first < 0 ? f : first;
+        ok = f >= 0 && cbm_closure_add_def(s, f, "M", msg, msg, false) &&
+             cbm_closure_add_def(s, f, "Type", full, full, false);
+    }
+    ok = ok && cbm_closure_seal(s) == 0;
+    cbm_closure_memo_t *m = ok ? cbm_closure_memo_new() : NULL;
+    bool right = m != NULL;
+    for (int i = 0; right && i < n; i++) {
+        snprintf(msg, sizeof(msg), "p%d.M", i);
+        snprintf(full, sizeof(full), "p%d.M.Type", i);
+        cbm_closure_ref_t ref = {.name = "Type", .scope = scoped ? msg : NULL};
+        cbm_closure_answer_t a = cbm_closure_lookup(s, m, first + i, &ref);
+        right = a.verdict == (scoped ? CBM_CLOSURE_PROVEN : CBM_CLOSURE_POSSIBLE) && a.qn &&
+                strcmp(a.qn, full) == 0;
+    }
+    uint64_t w = m ? cbm_closure_memo_work(m) : 0;
+    cbm_closure_memo_free(m);
+    cbm_closure_free(s);
+    return right ? w : 0;
+}
+
+TEST(scope_closure_nested_name_in_every_file_grows_linearly) {
+    for (int scoped = 0; scoped < 2; scoped++) {
+        uint64_t w1 = sc_nested_work(250, scoped);
+        uint64_t w4 = sc_nested_work(1000, scoped);
+        uint64_t w16 = sc_nested_work(4000, scoped);
+        printf("\n  nested %s: %llu / %llu / %llu at 250 / 1,000 / 4,000", scoped ? "scoped" : "unscoped",
+               (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+        ASSERT_GT(w1, 0);
+        ASSERT_GT(w4, 0);
+        ASSERT_GT(w16, 0);
+        ASSERT_TRUE(w4 * 2 <= w1 * 9);
+        ASSERT_TRUE(w16 * 2 <= w4 * 9);
+    }
+    printf("\n");
+    PASS();
+}
+
+/* protoc on review 3's fx4/scope: `package p; import "t.proto"; message A {
+ * enum Type {..} Type t = 1; } message B { Type t = 1; }` with t.proto's
+ * `package p; enum Type {..}` gives A's field .p.A.Type and B's .p.Type. The
+ * reference's own scope decides innermost first; an outer Type is never the
+ * answer where an inner one is around the site. */
+TEST(scope_closure_reference_scope_decides_innermost_first) {
+    cbm_closure_t *s = cbm_closure_new();
+    int a = cbm_closure_add_file(s, "a.proto", &ROW_QUAL, "p");
+    int t = cbm_closure_add_file(s, "t.proto", &ROW_QUAL, "p");
+    ASSERT_TRUE(cbm_closure_add_def(s, t, "Type", "p.Type", "t.Type", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, a, "A", "p.A", "a.A", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, a, "Type", "p.A.Type", "a.A.Type", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, a, "B", "p.B", "a.B", false));
+    ASSERT_TRUE(cbm_closure_add_include(s, a, t, false));
+    ASSERT_EQ(cbm_closure_seal(s), 0);
+    static const struct {
+        const char *scope;
+        const char *written;
+        const char *want; /* the proven node */
+    } cases[] = {
+        {"p.A", NULL, "a.A.Type"},     /* A's field: the enclosing message first */
+        {"p.B", NULL, "t.Type"},       /* B's field: B holds no Type, the package's */
+        {"p", NULL, "t.Type"},         /* outside any message */
+        {"p.B", "A.Type", "a.A.Type"}, /* qualified from B: A decides at p */
+        {"", "p.Type", "t.Type"},      /* from the root */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cbm_closure_ref_t ref = {.name = "Type", .written = cases[i].written, .scope = cases[i].scope};
+        cbm_closure_answer_t x = cbm_closure_lookup(s, NULL, a, &ref);
+        if (x.verdict != CBM_CLOSURE_PROVEN || !x.qn || strcmp(x.qn, cases[i].want) != 0) {
+            printf("\n  scope %s written %s: verdict %d qn %s, want proven %s\n", cases[i].scope,
+                   cases[i].written ? cases[i].written : "-", (int)x.verdict, x.qn ? x.qn : "-",
+                   cases[i].want);
+            cbm_closure_free(s);
+            FAIL("the reference's own scope did not decide");
+        }
+    }
+    /* `B.Type` from A: B is found at p and holds no Type, no backtracking */
+    cbm_closure_ref_t miss = {.name = "Type", .written = "B.Type", .scope = "p.A"};
+    ASSERT_NEQ(cbm_closure_lookup(s, NULL, a, &miss).verdict, CBM_CLOSURE_PROVEN);
+    cbm_closure_free(s);
+    PASS();
+}
+
 TEST(scope_closure_work_grows_linearly) {
     for (int chain = 0; chain < 2; chain++) {
         for (int lookups = 0; lookups < 2; lookups++) { /* the build, then the lookups */
@@ -475,6 +579,8 @@ TEST(scope_closure_work_grows_linearly) {
 
 SUITE(scope_closure) {
     RUN_TEST(scope_closure_review_shapes_grow_linearly);
+    RUN_TEST(scope_closure_nested_name_in_every_file_grows_linearly);
+    RUN_TEST(scope_closure_reference_scope_decides_innermost_first);
     RUN_TEST(scope_closure_one_definition_through_an_include_is_proven);
     RUN_TEST(scope_closure_reexport_chain_and_cycle);
     RUN_TEST(scope_closure_incomplete_is_possible_or_no_answer);

@@ -789,7 +789,10 @@ typedef struct {
     /* DEF: the full name where the row has packages or nesting (Protobuf:
      * package, enclosing messages, name: "a.b.Outer.Inner"). INCLUDE: the
      * importing file's package ("" when none), which its references are
-     * relative to. NULL elsewhere. */
+     * relative to. QREF: the innermost scope around the reference, its first
+     * scope to search (Protobuf: the enclosing message's full name, or the
+     * file's package outside any message); NULL when it is unknown. NULL
+     * elsewhere. */
     const char *qual;
     uint32_t pos;  /* byte offset after which the event is in effect */
     int32_t index; /* into defs (DEF) or imports (INCLUDE); QREF: start byte; else -1 */
