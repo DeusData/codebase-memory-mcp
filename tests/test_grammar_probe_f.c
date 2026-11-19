@@ -3108,7 +3108,8 @@ static char *gpf_tg_edges(const GpfFile *files, int nfiles) {
             "'$.local_name'), 'read=' || json_extract(e.properties,'$.read'), '-') || ':' || "
             "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
             "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
-            "json_extract(e.properties,'$.via')='terragrunt' ORDER BY x)), '')";
+            "json_extract(e.properties,'$.via') IN ('terragrunt','terragrunt-stack') ORDER BY "
+            "x)), '')";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
             if (sqlite3_step(st) == SQLITE_ROW) {
@@ -3120,6 +3121,17 @@ static char *gpf_tg_edges(const GpfFile *files, int nfiles) {
     gpf_cleanup(&lp, store);
     return out;
 }
+
+#define GPF_ASSERT_TG(files, n, want)                                                              \
+    do {                                                                                           \
+        char *got_ = gpf_tg_edges(files, n);                                                       \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "terragrunt got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);     \
+            free(got_);                                                                            \
+            FAIL("terragrunt edge set");                                                           \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
 
 /* A Terragrunt unit (terragrunt.hcl), evaluated in its own context: an
  * include IMPORTS {local_name} the file its path names; a
@@ -3147,8 +3159,6 @@ TEST(probe_terragrunt_units_compose_their_files) {
          "locals {\n  acct = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n"},
         {"live/db/terragrunt.hcl", "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"},
         {"modules/app/main.tf", "variable \"x\" {}\n"}};
-    int n = (int)(sizeof(files) / sizeof(files[0]));
-    char *got = gpf_tg_edges(files, n);
     static const char want[] =
         "live/app/terragrunt.hcl dependency.db DEPENDS_ON live/db/terragrunt.hcl db:7\n"
         "live/app/terragrunt.hcl include.common IMPORTS _common/app.hcl common:4\n"
@@ -3159,12 +3169,154 @@ TEST(probe_terragrunt_units_compose_their_files) {
         "live/app/terragrunt.hcl terraform IMPORTS Folder:modules/app -:10\n"
         "live/db/terragrunt.hcl include.root IMPORTS live/account.hcl read=root.hcl:2\n"
         "live/db/terragrunt.hcl include.root IMPORTS root.hcl root:1";
-    if (!got || strcmp(got, want) != 0) {
-        fprintf(stderr, "terragrunt got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
-        free(got);
-        FAIL("terragrunt");
-    }
-    free(got);
+    GPF_ASSERT_TG(files, (int)(sizeof(files) / sizeof(files[0])), want);
+    PASS();
+}
+
+/* A Terragrunt stack (terragrunt.stack.hcl): a unit or stack block's local
+ * source IMPORTS {via: terragrunt-stack, kind, local_name} the Folder it
+ * names, the "//" subdirectory marker read as a separator; a bare relative
+ * path and get_terragrunt_dir() are local too. Two units with one source are
+ * two edges; a nested stack is a stack of its own. No terragrunt.hcl here:
+ * Folders resolve without units. */
+TEST(probe_terragrunt_stack_files_link_their_sources) {
+    static const GpfFile files[] = {
+        {"catalog/units/x/main.tf", "variable \"x\" {}\n"},
+        {"catalog/units/y/main.tf", "variable \"y\" {}\n"},
+        {"catalog/stacks/hcloud/units/z/main.tf", "variable \"z\" {}\n"},
+        {"catalog/stacks/core/terragrunt.stack.hcl",
+         "unit \"y\" {\n  source = \"../..//units/y\"\n  path   = \"y\"\n}\n"},
+        {"catalog/stacks/hcloud/terragrunt.stack.hcl",
+         "unit \"network\" {\n  source = \"../..//units/x\"\n  path   = \"network\"\n}\n\n"
+         "unit \"image\" {\n  source = \"../..//units/x\"\n  path   = \"image\"\n}\n\n"
+         "stack \"core\" {\n  source = \"../..//stacks/core\"\n  path   = \".\"\n}\n\n"
+         "unit \"bare\" {\n  source = \"units/z\"\n}\n\n"
+         "unit \"anchored\" {\n  source = \"${get_terragrunt_dir()}/../../units/y\"\n}\n"}};
+    static const char want[] =
+        "catalog/stacks/core/terragrunt.stack.hcl unit.y IMPORTS Folder:catalog/units/y y:1\n"
+        "catalog/stacks/hcloud/terragrunt.stack.hcl stack.core IMPORTS "
+        "Folder:catalog/stacks/core core:11\n"
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.anchored IMPORTS Folder:catalog/units/y "
+        "anchored:20\n"
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.bare IMPORTS "
+        "Folder:catalog/stacks/hcloud/units/z bare:16\n"
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.image IMPORTS Folder:catalog/units/x "
+        "image:6\n"
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.network IMPORTS Folder:catalog/units/x "
+        "network:1";
+    GPF_ASSERT_TG(files, (int)(sizeof(files) / sizeof(files[0])), want);
+    PASS();
+}
+
+/* A stack source that is not a path in the repository is no edge: a remote
+ * git:: source (also through a local), an absolute path, values.X, get_env,
+ * get_repo_root, a
+ * local that reads into another file's locals (talos-clusters' shape), a
+ * local that does not exist. The one plain source shows the file was read. */
+TEST(probe_terragrunt_stack_sources_unknown_are_no_edge) {
+    static const GpfFile files[] = {
+        {"catalog/stacks/x/main.tf", "variable \"x\" {}\n"},
+        {"catalog/stacks/hcloud/terragrunt.stack.hcl",
+         "locals {\n"
+         "  remote    = \"git::ssh://git@github.com/famedly/talos-multicloud.git"
+         "//catalog/stacks/x?ref=v0.2.11\"\n"
+         "  cluster   = read_terragrunt_config(\"cluster.hcl\").locals\n"
+         "  cloud_src = \"../..//stacks/${local.cluster.cloud}\"\n"
+         "}\n"
+         "unit \"git\" {\n  source = \"git::ssh://git@github.com/famedly/talos-multicloud.git"
+         "//catalog/stacks/x?ref=v0.2.11\"\n}\n"
+         "unit \"values\" {\n  source = values.x\n}\n"
+         "unit \"env\" {\n  source = get_env(\"X\")\n}\n"
+         "unit \"root\" {\n  source = \"${get_repo_root()}/catalog/stacks/x\"\n}\n"
+         "unit \"remote\" {\n  source = local.remote\n}\n"
+         "unit \"cloud\" {\n  source = local.cloud_src\n}\n"
+         "unit \"missing\" {\n  source = local.missing\n}\n"
+         "unit \"abs\" {\n  source = \"/catalog/stacks/x\"\n}\n"
+         "unit \"ok\" {\n  source = \"../x\"\n}\n"}};
+    static const char want[] =
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.ok IMPORTS Folder:catalog/stacks/x ok:30";
+    GPF_ASSERT_TG(files, (int)(sizeof(files) / sizeof(files[0])), want);
+    PASS();
+}
+
+/* A stack source through local.X is the local's value, also through another
+ * local; a cycle (direct, or through a call) is unknown. A unit
+ * (terragrunt.hcl) does not resolve local.X. */
+TEST(probe_terragrunt_stack_locals_resolve_source) {
+    static const GpfFile files[] = {
+        {"modules/m/main.tf", "variable \"m\" {}\n"},
+        {"catalog/units/x/terragrunt.hcl",
+         "locals {\n  m = \"../../../modules/m\"\n}\nterraform {\n  source = local.m\n}\n"},
+        {"catalog/stacks/hcloud/terragrunt.stack.hcl",
+         "locals {\n"
+         "  units = \"../..//units\"\n"
+         "  alias = local.units\n"
+         "  loop  = local.loop\n"
+         "  dir   = dirname(local.dir)\n"
+         "}\n\n"
+         "unit \"a\" {\n  source = \"${local.units}/x\"\n}\n\n"
+         "unit \"b\" {\n  source = \"${local.alias}/x\"\n}\n\n"
+         "unit \"c\" {\n  source = local.loop\n}\n\n"
+         "unit \"d\" {\n  source = local.dir\n}\n"}};
+    static const char want[] =
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.a IMPORTS Folder:catalog/units/x a:8\n"
+        "catalog/stacks/hcloud/terragrunt.stack.hcl unit.b IMPORTS Folder:catalog/units/x b:12";
+    GPF_ASSERT_TG(files, (int)(sizeof(files) / sizeof(files[0])), want);
+    PASS();
+}
+
+/* read_terragrunt_config in a stack file's locals IMPORTS {read} the file it
+ * names, as in a unit -- the only edges of a stack whose sources are remote. */
+TEST(probe_terragrunt_stack_reads) {
+    static const GpfFile files[] = {
+        {"dev/env.hcl", "locals {\n  name = \"dev\"\n}\n"},
+        {"dev/talos-dev/cluster.hcl", "locals {\n  cloud = \"hcloud\"\n}\n"},
+        {"dev/talos-dev/terragrunt.stack.hcl",
+         "locals {\n"
+         "  env     = read_terragrunt_config(find_in_parent_folders(\"env.hcl\")).locals\n"
+         "  cluster = read_terragrunt_config(\"${get_terragrunt_dir()}/cluster.hcl\").locals\n"
+         "}\n"}};
+    static const char want[] =
+        "dev/talos-dev/terragrunt.stack.hcl locals IMPORTS dev/env.hcl "
+        "read=dev/talos-dev/terragrunt.stack.hcl:2\n"
+        "dev/talos-dev/terragrunt.stack.hcl locals IMPORTS dev/talos-dev/cluster.hcl "
+        "read=dev/talos-dev/terragrunt.stack.hcl:3";
+    GPF_ASSERT_TG(files, (int)(sizeof(files) / sizeof(files[0])), want);
+    PASS();
+}
+
+/* A stack's include IMPORTS {kind: include} the file it names. That file's
+ * unit and stack blocks and reads are the stack's, wherever the file lives:
+ * in its scope (local.X), paths from the stack's directory (up.stack.hcl's
+ * env.hcl is live/dev's, not live's), from the include block. An included
+ * file is not a stack of its own. */
+TEST(probe_terragrunt_stack_includes) {
+    static const GpfFile files[] = {
+        {"catalog/units/app/main.tf", "variable \"a\" {}\n"},
+        {"catalog/units/vpc/main.tf", "variable \"v\" {}\n"},
+        {"catalog/units/db/main.tf", "variable \"d\" {}\n"},
+        {"live/dev/terragrunt.stack.hcl",
+         "locals {\n  cat = \"../../catalog/units\"\n}\n\n"
+         "include \"shared\" {\n  path = \"shared.stack.hcl\"\n}\n\n"
+         "include \"up\" {\n  path = \"../up.stack.hcl\"\n}\n\n"
+         "unit \"app\" {\n  source = \"${local.cat}/app\"\n  path   = \"app\"\n}\n"},
+        {"live/dev/env.hcl", "locals {\n  name = \"dev\"\n}\n"},
+        {"live/env.hcl", "locals {\n  name = \"live\"\n}\n"},
+        {"live/dev/shared.stack.hcl",
+         "unit \"vpc\" {\n  source = \"${local.cat}/vpc\"\n  path   = \"vpc\"\n}\n"},
+        {"live/up.stack.hcl",
+         "unit \"db\" {\n  source = \"../../catalog/units/db\"\n  path   = \"db\"\n"
+         "  values = {\n    env = read_terragrunt_config(\"env.hcl\")\n  }\n}\n"}};
+    static const char want[] =
+        "live/dev/terragrunt.stack.hcl include.shared IMPORTS Folder:catalog/units/vpc vpc:1\n"
+        "live/dev/terragrunt.stack.hcl include.shared IMPORTS live/dev/shared.stack.hcl "
+        "shared:5\n"
+        "live/dev/terragrunt.stack.hcl include.up IMPORTS Folder:catalog/units/db db:1\n"
+        "live/dev/terragrunt.stack.hcl include.up IMPORTS live/dev/env.hcl "
+        "read=live/up.stack.hcl:5\n"
+        "live/dev/terragrunt.stack.hcl include.up IMPORTS live/up.stack.hcl up:9\n"
+        "live/dev/terragrunt.stack.hcl unit.app IMPORTS Folder:catalog/units/app app:13";
+    GPF_ASSERT_TG(files, (int)(sizeof(files) / sizeof(files[0])), want);
     PASS();
 }
 
@@ -7081,6 +7233,11 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_module_calls_import_their_source);
     RUN_TEST(probe_terraform_tfvars_override_their_variables);
     RUN_TEST(probe_terragrunt_units_compose_their_files);
+    RUN_TEST(probe_terragrunt_stack_files_link_their_sources);
+    RUN_TEST(probe_terragrunt_stack_sources_unknown_are_no_edge);
+    RUN_TEST(probe_terragrunt_stack_locals_resolve_source);
+    RUN_TEST(probe_terragrunt_stack_reads);
+    RUN_TEST(probe_terragrunt_stack_includes);
     RUN_TEST(probe_ansible_files_import_what_they_name);
     RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
     RUN_TEST(probe_kustomize_name_prefix_makes_variants);
